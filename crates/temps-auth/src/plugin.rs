@@ -211,6 +211,7 @@ impl TempsPlugin for AuthPlugin {
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
         let api_key_service = context.require_service::<crate::apikey_service::ApiKeyService>();
         let db = context.require_service::<sea_orm::DatabaseConnection>();
+        let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
         // Request-metadata middleware (runs on BOTH admin and public routers
         // because public ingest endpoints — session-replay init, analytics
@@ -227,6 +228,7 @@ impl TempsPlugin for AuthPlugin {
             user_service,
             cookie_crypto,
             db,
+            audit_service,
         );
         middleware_collection.add_temps_middleware(Arc::new(auth_middleware));
 

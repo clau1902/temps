@@ -18,6 +18,7 @@ use crate::{
     deployment_token_service::DeploymentTokenValidationService, user_service::UserService,
 };
 use temps_core::CookieCrypto;
+use tracing::error;
 
 /// Authentication middleware that implements TempsMiddleware
 pub struct AuthMiddleware {
@@ -26,6 +27,7 @@ pub struct AuthMiddleware {
     user_service: Arc<UserService>,
     cookie_crypto: Arc<CookieCrypto>,
     deployment_token_service: DeploymentTokenValidationService,
+    audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
 impl AuthMiddleware {
@@ -35,6 +37,7 @@ impl AuthMiddleware {
         user_service: Arc<UserService>,
         cookie_crypto: Arc<CookieCrypto>,
         db: Arc<sea_orm::DatabaseConnection>,
+        audit_service: Arc<dyn temps_core::AuditLogger>,
     ) -> Self {
         let deployment_token_service = DeploymentTokenValidationService::new(db);
         Self {
@@ -43,6 +46,7 @@ impl AuthMiddleware {
             user_service,
             cookie_crypto,
             deployment_token_service,
+            audit_service,
         }
     }
 }
@@ -182,6 +186,28 @@ impl AuthMiddleware {
         // routers. Auth used to build it inline; that responsibility moved
         // out so public ingest endpoints get metadata without auth.
 
+        // Captured before the request is consumed so a 403 response can be
+        // audited below. Only the identity summary is kept, not the context.
+        let denied_actor = auth_context.as_ref().map(|ctx| {
+            let source = match &ctx.source {
+                crate::context::AuthSource::Session { .. } => "session".to_string(),
+                crate::context::AuthSource::CliToken { .. } => "cli_token".to_string(),
+                crate::context::AuthSource::ApiKey { key_name, .. } => {
+                    format!("api_key:{}", key_name)
+                }
+                crate::context::AuthSource::DeploymentToken { token_name, .. } => {
+                    format!("deployment_token:{}", token_name)
+                }
+            };
+            (ctx.user_id_opt(), source)
+        });
+        let method = req.method().to_string();
+        let path = req.uri().path().to_string();
+        let request_metadata = req
+            .extensions()
+            .get::<temps_core::RequestMetadata>()
+            .cloned();
+
         // Insert authenticated user and context. Anonymous requests stay
         // anonymous: there is no implicit promotion to a Reader role for
         // unauthenticated callers. Issue an authenticated reader API key
@@ -194,7 +220,33 @@ impl AuthMiddleware {
         }
 
         // Run the next middleware/handler
-        Ok(next.run(req).await)
+        let response = next.run(req).await;
+
+        // Every authorization guard rejects with FORBIDDEN, so observing the
+        // response here covers all of them (including guards added later)
+        // without threading the audit service into the guard macros. Only
+        // denied requests pay the audit write; allowed traffic is untouched.
+        if response.status() == StatusCode::FORBIDDEN {
+            let (user_id, auth_source) = denied_actor
+                .unwrap_or_else(|| (None, "unauthenticated".to_string()));
+            let audit = crate::audit::PermissionDeniedAudit {
+                user_id,
+                auth_source,
+                method,
+                path,
+                ip_address: request_metadata
+                    .as_ref()
+                    .map(|m| m.ip_address.to_string()),
+                user_agent: request_metadata
+                    .map(|m| m.user_agent)
+                    .unwrap_or_else(|| "unknown".to_string()),
+            };
+            if let Err(e) = self.audit_service.create_audit_log(&audit).await {
+                error!("Failed to create audit log: {}", e);
+            }
+        }
+
+        Ok(response)
     }
 
     /// Extract user session from "session" cookie only (for authentication)
