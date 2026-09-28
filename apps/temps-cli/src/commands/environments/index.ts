@@ -28,6 +28,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm, promptSelect, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, warning, keyValue, info, error as errorOutput } from '../../ui/output.js'
+import { formatMicrocores, parseMillicores } from '../../lib/cpu.js'
 
 export function registerEnvironmentsCommands(program: Command): void {
   const environments = program
@@ -138,7 +139,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .command('resources <environment>')
     .description('View or set CPU/memory resources for an environment')
     .option('-p, --project <project>', 'Project slug or ID')
-    .option('--cpu <millicores>', 'CPU limit in millicores (e.g., 500 = 0.5 CPU)')
+    .option('--cpu <millicores>', 'CPU limit in millicores (1000 = 1 core, e.g., 500 = 0.5 CPU)')
     .option('--memory <mb>', 'Memory limit in MB (e.g., 512)')
     .option('--cpu-request <millicores>', 'CPU request in millicores (recorded; not currently enforced)')
     .option('--memory-request <mb>', 'Memory request in MB (recorded; not currently enforced)')
@@ -1112,15 +1113,6 @@ interface ResourcesOptions {
   json?: boolean
 }
 
-/** The API stores CPU in microcores: 1_000_000 = one full core. */
-export const MICROCORES_PER_MILLICORE = 1000
-
-/**
- * Largest millicore value whose microcore equivalent still fits the API's
- * 32-bit CPU fields (about 2147 cores).
- */
-export const MAX_CPU_MILLICORES = Math.floor(2_147_483_647 / MICROCORES_PER_MILLICORE)
-
 export interface ResourceUpdateBody {
   /** Microcores (1_000_000 = one core). */
   cpu_limit?: number | null
@@ -1128,6 +1120,12 @@ export interface ResourceUpdateBody {
   cpu_request?: number | null
   memory_limit?: number | null
   memory_request?: number | null
+}
+
+/** Parse a whole number, rejecting trailing junk (`512mb`) and decimals. */
+function parseWholeNumber(value: string): number | undefined {
+  const trimmed = value.trim()
+  return /^\d+$/.test(trimmed) ? Number(trimmed) : undefined
 }
 
 /**
@@ -1145,43 +1143,33 @@ export function parseResourceUpdate(
 
   let cpuLimit: number | undefined
   if (options.cpu) {
-    const millicores = parseInt(options.cpu, 10)
-    if (isNaN(millicores) || millicores <= 0) {
-      return { error: 'CPU must be a positive number (millicores)' }
-    }
-    if (millicores > MAX_CPU_MILLICORES) {
-      return { error: `CPU must be at most ${MAX_CPU_MILLICORES} millicores` }
-    }
-    cpuLimit = millicores * MICROCORES_PER_MILLICORE
+    const parsed = parseMillicores(options.cpu, 'CPU', true)
+    if ('error' in parsed) return parsed
+    cpuLimit = parsed.microcores
     updateBody.cpu_limit = cpuLimit
   }
 
   let memoryLimit: number | undefined
   if (options.memory) {
-    memoryLimit = parseInt(options.memory, 10)
-    if (isNaN(memoryLimit) || memoryLimit <= 0) {
+    memoryLimit = parseWholeNumber(options.memory)
+    if (memoryLimit === undefined || memoryLimit <= 0) {
       return { error: 'Memory must be a positive number (MB)' }
     }
     updateBody.memory_limit = memoryLimit
   }
 
   if (options.cpuRequest) {
-    const millicores = parseInt(options.cpuRequest, 10)
-    if (isNaN(millicores) || millicores <= 0) {
-      return { error: 'CPU request must be a positive number (millicores)' }
-    }
-    if (millicores > MAX_CPU_MILLICORES) {
-      return { error: `CPU request must be at most ${MAX_CPU_MILLICORES} millicores` }
-    }
-    updateBody.cpu_request = millicores * MICROCORES_PER_MILLICORE
+    const parsed = parseMillicores(options.cpuRequest, 'CPU request', false)
+    if ('error' in parsed) return parsed
+    updateBody.cpu_request = parsed.microcores
   } else if (cpuLimit !== undefined) {
     // Default request to same as limit when setting limit
     updateBody.cpu_request = cpuLimit
   }
 
   if (options.memoryRequest) {
-    const memoryRequest = parseInt(options.memoryRequest, 10)
-    if (isNaN(memoryRequest) || memoryRequest <= 0) {
+    const memoryRequest = parseWholeNumber(options.memoryRequest)
+    if (memoryRequest === undefined || memoryRequest <= 0) {
       return { error: 'Memory request must be a positive number (MB)' }
     }
     updateBody.memory_request = memoryRequest
@@ -1282,9 +1270,7 @@ async function resourcesCmd(environment: string, options: ResourcesOptions): Pro
 /** Render a CPU value stored in microcores (1_000_000 = one core). */
 export function formatCpu(microcores: number | null | undefined): string {
   if (microcores == null) return colors.muted('not set')
-  const millicores = microcores / MICROCORES_PER_MILLICORE
-  const cores = microcores / 1_000_000
-  return `${millicores}m (${cores} CPU)`
+  return formatMicrocores(microcores)
 }
 
 export function formatMemory(mb: number | null | undefined): string {

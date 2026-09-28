@@ -131,8 +131,12 @@ bunx @temps-sdk/cli environments resources production -p my-project \
 ```
 
 <Note>
-In CLI versions up to 0.1.36, `--cpu` and `--cpu-request` pass the number straight through to the API, which stores CPU in microcores (`1_000_000` = 1 core). On those versions `--cpu 1000` asks for a 0.001-core limit, which is too small for Docker to apply, so the container fails to start. Either upgrade the CLI or pass microcores instead (`--cpu 1000000 --cpu-request 500000` for the example above).
+In CLI versions up to 0.1.36, `--cpu` and `--cpu-request` pass the number straight through to the API, which stores CPU in microcores (`1_000_000` = 1 core). On those versions `--cpu 1000` asks for a 0.001-core limit, which is too small for Docker to apply: older servers save it and the container then fails to start, and newer servers reject it when you save it. Either upgrade the CLI or pass microcores instead (`--cpu 1000000 --cpu-request 500000` for the example above).
+
+Newer CLI versions reject CPU values above 256 cores (`256000`), so a script still passing microcores from that workaround fails with an error telling you to divide by 1000, instead of asking for 1000 cores.
 </Note>
+
+A CPU limit must be at least 0.01 cores (`--cpu 10`), the smallest limit Docker accepts.
 
 <Properties>
   <Property name="--cpu" type="millicores">

@@ -12,8 +12,8 @@ import {
   formatMemory,
   parseResourceUpdate,
   parseReplicaCount,
-  MAX_CPU_MILLICORES,
 } from './index.js'
+import { MAX_CPU_MILLICORES } from '../../lib/cpu.js'
 import type { EnvironmentVariableResponse } from '../../api/types.gen.js'
 
 function makeVar(overrides: Partial<EnvironmentVariableResponse> = {}): EnvironmentVariableResponse {
@@ -119,12 +119,25 @@ describe('formatMemory', () => {
 
 describe('parseResourceUpdate', () => {
   test('rejects a non-numeric or non-positive CPU value', () => {
-    expect(parseResourceUpdate({ cpu: 'abc' })).toEqual({
-      error: 'CPU must be a positive number (millicores)',
+    for (const cpu of ['abc', '0', '-5', '1000abc', '1.5']) {
+      const result = parseResourceUpdate({ cpu })
+      expect('error' in result && result.error).toContain('CPU must be a positive whole number of millicores')
+    }
+  })
+
+  test('rejects a CPU limit below Docker minimum of 0.01 cores', () => {
+    expect(parseResourceUpdate({ cpu: '9' })).toEqual({
+      error: 'CPU must be at least 10 millicores (0.01 cores), got 9',
     })
-    expect(parseResourceUpdate({ cpu: '0' })).toEqual({
-      error: 'CPU must be a positive number (millicores)',
+    expect(parseResourceUpdate({ cpu: '10' })).toEqual({
+      body: { cpu_limit: 10_000, cpu_request: 10_000 },
     })
+  })
+
+  test('rejects memory with trailing junk or decimals', () => {
+    for (const memory of ['512mb', '1.5']) {
+      expect(parseResourceUpdate({ memory })).toEqual({ error: 'Memory must be a positive number (MB)' })
+    }
   })
 
   test('rejects a non-numeric or non-positive memory value', () => {
@@ -145,19 +158,26 @@ describe('parseResourceUpdate', () => {
     })
   })
 
-  test('rejects CPU values too large for the API field', () => {
+  test('rejects implausibly large CPU values', () => {
     expect(parseResourceUpdate({ cpu: String(MAX_CPU_MILLICORES) })).toEqual({
       body: {
         cpu_limit: MAX_CPU_MILLICORES * 1000,
         cpu_request: MAX_CPU_MILLICORES * 1000,
       },
     })
-    expect(parseResourceUpdate({ cpu: String(MAX_CPU_MILLICORES + 1) })).toEqual({
-      error: `CPU must be at most ${MAX_CPU_MILLICORES} millicores`,
-    })
-    expect(parseResourceUpdate({ cpu: '1000', cpuRequest: String(MAX_CPU_MILLICORES + 1) })).toEqual({
-      error: `CPU request must be at most ${MAX_CPU_MILLICORES} millicores`,
-    })
+    const tooBig = parseResourceUpdate({ cpu: String(MAX_CPU_MILLICORES + 1) })
+    expect('error' in tooBig && tooBig.error).toContain(`CPU must be at most ${MAX_CPU_MILLICORES} millicores`)
+    const requestTooBig = parseResourceUpdate({ cpu: '1000', cpuRequest: String(MAX_CPU_MILLICORES + 1) })
+    expect('error' in requestTooBig && requestTooBig.error).toContain(
+      `CPU request must be at most ${MAX_CPU_MILLICORES} millicores`
+    )
+  })
+
+  test('points users of the old microcore workaround at the new unit', () => {
+    // CLI 0.1.36 and earlier sent --cpu unconverted, so the docs told users to
+    // pass microcores. Those values must not silently become 1000 cores.
+    const result = parseResourceUpdate({ cpu: '1000000', cpuRequest: '500000' })
+    expect('error' in result && result.error).toContain('divide by 1000')
   })
 
   test('defaults the request to the limit when no explicit request is given', () => {
@@ -175,9 +195,8 @@ describe('parseResourceUpdate', () => {
   })
 
   test('rejects a non-positive explicit request even when the limit is valid', () => {
-    expect(parseResourceUpdate({ cpu: '1000', cpuRequest: '0' })).toEqual({
-      error: 'CPU request must be a positive number (millicores)',
-    })
+    const result = parseResourceUpdate({ cpu: '1000', cpuRequest: '0' })
+    expect('error' in result && result.error).toContain('CPU request must be a positive whole number of millicores')
   })
 
   test('leaves fields untouched when nothing is set', () => {

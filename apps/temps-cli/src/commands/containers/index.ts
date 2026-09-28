@@ -15,6 +15,7 @@ import {
   getEnvironments,
 } from '../../api/sdk.gen.js'
 import type { ContainerInfoResponse, ContainerHistoryEntry } from '../../api/types.gen.js'
+import { formatMicrocores } from '../../lib/cpu.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -337,7 +338,7 @@ async function showContainer(
     newline()
     header('Resource Limits')
     if (container.resource_limits.cpu_limit) {
-      keyValue('CPU Limit', container.resource_limits.cpu_limit)
+      keyValue('CPU Limit', formatMicrocores(container.resource_limits.cpu_limit))
     }
     if (container.resource_limits.memory_limit) {
       keyValue('Memory Limit', container.resource_limits.memory_limit)

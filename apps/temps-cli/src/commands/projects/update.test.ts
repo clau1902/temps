@@ -19,16 +19,24 @@ describe('parseCpuLimitCores', () => {
     expect(parseCpuLimitCores('1.0000004')).toEqual({ microcores: 1_000_000 })
   })
 
-  test('rejects non-numeric, zero, negative and sub-microcore values', () => {
-    for (const value of ['abc', '0', '-1', '0.0000001']) {
+  test('rejects non-numeric, zero, negative and trailing-junk values', () => {
+    for (const value of ['abc', '0', '-1', '1abc', '1e3', 'Infinity']) {
       const result = parseCpuLimitCores(value)
       expect('error' in result && result.error).toContain('positive number of cores')
     }
   })
 
-  test('rejects values too large for the API field', () => {
-    expect(parseCpuLimitCores('2147')).toEqual({ microcores: 2_147_000_000 })
-    const result = parseCpuLimitCores('2148')
-    expect('error' in result && result.error).toContain('at most 2147 cores')
+  test('rejects limits below Docker minimum of 0.01 cores', () => {
+    expect(parseCpuLimitCores('0.01')).toEqual({ microcores: 10_000 })
+    for (const value of ['0.005', '0.0000001']) {
+      const result = parseCpuLimitCores(value)
+      expect('error' in result && result.error).toContain('at least 0.01 cores')
+    }
+  })
+
+  test('rejects implausibly large values', () => {
+    expect(parseCpuLimitCores('256')).toEqual({ microcores: 256_000_000 })
+    const result = parseCpuLimitCores('257')
+    expect('error' in result && result.error).toContain('at most 256 cores')
   })
 })

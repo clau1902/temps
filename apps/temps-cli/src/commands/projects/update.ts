@@ -16,6 +16,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { promptText, promptConfirm, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, error, keyValue } from '../../ui/output.js'
 import { fetchGitConnections, findRepositoryByName } from '../../lib/git-connection.js'
+import { MICROCORES_PER_CORE, parseCores, type CpuParseResult } from '../../lib/cpu.js'
 
 export async function updateProjectAction(
   options: { project?: string; name?: string; json?: boolean; yes?: boolean }
@@ -460,27 +461,14 @@ export async function updateGitAction(
   keyValue('Preset', preset || 'auto')
 }
 
-/** The API stores CPU in microcores: 1_000_000 = one full core. */
-const MICROCORES_PER_CORE = 1_000_000
-/** Upper bound of the API's 32-bit CPU fields. */
-const MAX_CPU_MICROCORES = 2_147_483_647
-
 /**
  * Convert a CPU limit given in cores (as `--cpu-limit` and the prompt accept,
  * e.g. `0.5`, `1`, `2`) to the microcores the API stores. Sending the core
  * count unconverted would store `2` as two microcores, and a fractional value
  * such as `0.5` is not a valid integer for the API at all.
  */
-export function parseCpuLimitCores(value: string): { microcores: number } | { error: string } {
-  const cores = parseFloat(value)
-  const microcores = Math.round(cores * MICROCORES_PER_CORE)
-  if (!Number.isFinite(cores) || microcores < 1) {
-    return { error: `CPU limit must be a positive number of cores (e.g., 0.5, 1, 2), got "${value}"` }
-  }
-  if (microcores > MAX_CPU_MICROCORES) {
-    return { error: `CPU limit must be at most ${Math.floor(MAX_CPU_MICROCORES / MICROCORES_PER_CORE)} cores, got "${value}"` }
-  }
-  return { microcores }
+export function parseCpuLimitCores(value: string): CpuParseResult {
+  return parseCores(value, 'CPU limit')
 }
 
 export async function updateConfigAction(
@@ -537,7 +525,6 @@ export async function updateConfigAction(
   // Collect deployment config interactively if not provided
   let replicas = options.replicas ? parseInt(options.replicas, 10) : undefined
   let cpuLimitInput = options.cpuLimit
-  let cpuLimit = cpuLimitInput ? parseFloat(cpuLimitInput) : undefined
   let memoryLimit = options.memoryLimit ? parseInt(options.memoryLimit, 10) : undefined
   let autoDeploy = options.autoDeploy
   const requestTimeoutSeconds = options.requestTimeout ? parseInt(options.requestTimeout, 10) : undefined
@@ -549,7 +536,7 @@ export async function updateConfigAction(
   // Only prompt if no flags provided AND not in automation mode
   if (
     replicas === undefined &&
-    cpuLimit === undefined &&
+    !cpuLimitInput &&
     memoryLimit === undefined &&
     autoDeploy === undefined &&
     requestTimeoutSeconds === undefined &&
@@ -573,7 +560,6 @@ export async function updateConfigAction(
       default: '1',
     })
     cpuLimitInput = cpuLimitStr
-    cpuLimit = parseFloat(cpuLimitStr)
 
     const memoryLimitStr = await promptText({
       message: 'Memory limit (MB)',
