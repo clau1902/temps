@@ -12,6 +12,7 @@ import {
   formatMemory,
   parseResourceUpdate,
   parseReplicaCount,
+  MAX_CPU_MILLICORES,
 } from './index.js'
 import type { EnvironmentVariableResponse } from '../../api/types.gen.js'
 
@@ -88,9 +89,12 @@ describe('describeForceHttps', () => {
 })
 
 describe('formatCpu', () => {
-  test('renders millicores with the equivalent core count', () => {
-    expect(formatCpu(500)).toBe('500m (0.5 CPU)')
-    expect(formatCpu(1000)).toBe('1000m (1 CPU)')
+  test('renders the stored microcores as millicores with the equivalent core count', () => {
+    // The API stores CPU in microcores (1_000_000 = one core); the default
+    // request of half a core is stored as 500_000.
+    expect(formatCpu(500_000)).toBe('500m (0.5 CPU)')
+    expect(formatCpu(1_000_000)).toBe('1000m (1 CPU)')
+    expect(formatCpu(2_000_000)).toBe('2000m (2 CPU)')
   })
 
   test('renders an unset limit distinctly from 0', () => {
@@ -129,18 +133,45 @@ describe('parseResourceUpdate', () => {
     })
   })
 
+  test('converts CPU millicores to the microcores the API stores', () => {
+    // 1000 millicores is one core, which the API stores as 1_000_000.
+    // Sending the millicore value unconverted would cap the container at
+    // 0.001 cores.
+    expect(parseResourceUpdate({ cpu: '1000' })).toEqual({
+      body: { cpu_limit: 1_000_000, cpu_request: 1_000_000 },
+    })
+    expect(parseResourceUpdate({ cpu: '500', cpuRequest: '250' })).toEqual({
+      body: { cpu_limit: 500_000, cpu_request: 250_000 },
+    })
+  })
+
+  test('rejects CPU values too large for the API field', () => {
+    expect(parseResourceUpdate({ cpu: String(MAX_CPU_MILLICORES) })).toEqual({
+      body: {
+        cpu_limit: MAX_CPU_MILLICORES * 1000,
+        cpu_request: MAX_CPU_MILLICORES * 1000,
+      },
+    })
+    expect(parseResourceUpdate({ cpu: String(MAX_CPU_MILLICORES + 1) })).toEqual({
+      error: `CPU must be at most ${MAX_CPU_MILLICORES} millicores`,
+    })
+    expect(parseResourceUpdate({ cpu: '1000', cpuRequest: String(MAX_CPU_MILLICORES + 1) })).toEqual({
+      error: `CPU request must be at most ${MAX_CPU_MILLICORES} millicores`,
+    })
+  })
+
   test('defaults the request to the limit when no explicit request is given', () => {
     // Otherwise a container gets a limit with no guaranteed minimum, which
     // the scheduler treats as "no request" rather than "same as limit".
     const result = parseResourceUpdate({ cpu: '1000', memory: '512' })
     expect(result).toEqual({
-      body: { cpu_limit: 1000, cpu_request: 1000, memory_limit: 512, memory_request: 512 },
+      body: { cpu_limit: 1_000_000, cpu_request: 1_000_000, memory_limit: 512, memory_request: 512 },
     })
   })
 
   test('an explicit request overrides the limit-derived default', () => {
     const result = parseResourceUpdate({ cpu: '1000', cpuRequest: '250' })
-    expect(result).toEqual({ body: { cpu_limit: 1000, cpu_request: 250 } })
+    expect(result).toEqual({ body: { cpu_limit: 1_000_000, cpu_request: 250_000 } })
   })
 
   test('rejects a non-positive explicit request even when the limit is valid', () => {

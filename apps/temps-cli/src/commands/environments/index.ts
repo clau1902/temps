@@ -140,8 +140,8 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--cpu <millicores>', 'CPU limit in millicores (e.g., 500 = 0.5 CPU)')
     .option('--memory <mb>', 'Memory limit in MB (e.g., 512)')
-    .option('--cpu-request <millicores>', 'CPU request in millicores (guaranteed minimum)')
-    .option('--memory-request <mb>', 'Memory request in MB (guaranteed minimum)')
+    .option('--cpu-request <millicores>', 'CPU request in millicores (recorded; not currently enforced)')
+    .option('--memory-request <mb>', 'Memory request in MB (recorded; not currently enforced)')
     .option('--json', 'Output in JSON format')
     .action(resourcesCmd)
 
@@ -1112,8 +1112,19 @@ interface ResourcesOptions {
   json?: boolean
 }
 
+/** The API stores CPU in microcores: 1_000_000 = one full core. */
+export const MICROCORES_PER_MILLICORE = 1000
+
+/**
+ * Largest millicore value whose microcore equivalent still fits the API's
+ * 32-bit CPU fields (about 2147 cores).
+ */
+export const MAX_CPU_MILLICORES = Math.floor(2_147_483_647 / MICROCORES_PER_MILLICORE)
+
 export interface ResourceUpdateBody {
+  /** Microcores (1_000_000 = one core). */
   cpu_limit?: number | null
+  /** Microcores (1_000_000 = one core). */
   cpu_request?: number | null
   memory_limit?: number | null
   memory_request?: number | null
@@ -1121,7 +1132,8 @@ export interface ResourceUpdateBody {
 
 /**
  * Parse and validate the --cpu/--memory/--cpu-request/--memory-request flags
- * into the API's update body. A request left unspecified defaults to the
+ * into the API's update body. The CPU flags take millicores and are converted
+ * to the microcores the API stores. A request left unspecified defaults to the
  * limit being set in the same call — otherwise a container could get a limit
  * with no matching guaranteed minimum, which the scheduler would silently
  * treat as "no request" rather than "same as limit".
@@ -1133,10 +1145,14 @@ export function parseResourceUpdate(
 
   let cpuLimit: number | undefined
   if (options.cpu) {
-    cpuLimit = parseInt(options.cpu, 10)
-    if (isNaN(cpuLimit) || cpuLimit <= 0) {
+    const millicores = parseInt(options.cpu, 10)
+    if (isNaN(millicores) || millicores <= 0) {
       return { error: 'CPU must be a positive number (millicores)' }
     }
+    if (millicores > MAX_CPU_MILLICORES) {
+      return { error: `CPU must be at most ${MAX_CPU_MILLICORES} millicores` }
+    }
+    cpuLimit = millicores * MICROCORES_PER_MILLICORE
     updateBody.cpu_limit = cpuLimit
   }
 
@@ -1150,11 +1166,14 @@ export function parseResourceUpdate(
   }
 
   if (options.cpuRequest) {
-    const cpuRequest = parseInt(options.cpuRequest, 10)
-    if (isNaN(cpuRequest) || cpuRequest <= 0) {
+    const millicores = parseInt(options.cpuRequest, 10)
+    if (isNaN(millicores) || millicores <= 0) {
       return { error: 'CPU request must be a positive number (millicores)' }
     }
-    updateBody.cpu_request = cpuRequest
+    if (millicores > MAX_CPU_MILLICORES) {
+      return { error: `CPU request must be at most ${MAX_CPU_MILLICORES} millicores` }
+    }
+    updateBody.cpu_request = millicores * MICROCORES_PER_MILLICORE
   } else if (cpuLimit !== undefined) {
     // Default request to same as limit when setting limit
     updateBody.cpu_request = cpuLimit
@@ -1260,9 +1279,11 @@ async function resourcesCmd(environment: string, options: ResourcesOptions): Pro
   }
 }
 
-export function formatCpu(millicores: number | null | undefined): string {
-  if (millicores == null) return colors.muted('not set')
-  const cores = millicores / 1000
+/** Render a CPU value stored in microcores (1_000_000 = one core). */
+export function formatCpu(microcores: number | null | undefined): string {
+  if (microcores == null) return colors.muted('not set')
+  const millicores = microcores / MICROCORES_PER_MILLICORE
+  const cores = microcores / 1_000_000
   return `${millicores}m (${cores} CPU)`
 }
 
@@ -1286,7 +1307,7 @@ function displayResources(env: EnvironmentResponse | null | undefined): void {
   newline()
 
   info(`${colors.bold('Limits')} = maximum resources the container can use`)
-  info(`${colors.bold('Requests')} = guaranteed minimum resources`)
+  info(`${colors.bold('Requests')} = recorded with the settings, not currently enforced`)
   newline()
   info(`Example: ${colors.muted('temps env resources my-project production --cpu 1000 --memory 512')}`)
 }
