@@ -22,7 +22,7 @@ Understanding how HTTP requests flow through Temps from the client to your deplo
 
 ## Overview {{ anchor: true, id: 'overview' }}
 
-Every request to your Temps-hosted application goes through the same pipeline: TLS termination, a global IP block check, route resolution, optional security checks for the project, and then forwarding to one of the environment's containers. Sleeping (scale-to-zero) environments are woken on the way.
+Requests to your Temps-hosted application pass through TLS termination for HTTPS, an early global IP block check, route resolution, optional project security checks, and forwarding to one of the environment's containers. Sleeping (scale-to-zero) environments are woken on the way. The IP check has the exceptions described under IP Access Control below.
 
 ### High-Level Flow
 
@@ -30,7 +30,7 @@ Every request to your Temps-hosted application goes through the same pipeline: T
 graph TB
     Client["Client Request"]
     TLS["TLS Termination<br/>(certificate chosen by SNI)"]
-    Early["early_request_filter<br/>(global IP block list)"]
+    Early["early_request_filter<br/>(global IP block check with exceptions)"]
     Filter["request_filter<br/>(route lookup, wake, project checks)"]
     Peer["upstream_peer<br/>(pick a container)"]
     Upstream["Your Deployment"]
@@ -95,7 +95,7 @@ Temps implements Pingora's `ProxyHttp` trait. These are the hooks that do the wo
 
 | Hook | What Temps does there |
 | ---- | --------------------- |
-| `early_request_filter` | Checks the client IP against the global block list and returns `403` for blocked addresses. Decides whether the response may be compressed (not for SSE, WebSocket or other streaming requests) and whether the client asked for Markdown. |
+| `early_request_filter` | Checks the client IP against the global block list and returns `403` for blocked addresses, except for CAPTCHA WASM assets. If the check errors, the request continues. Decides whether the response may be compressed (not for SSE, WebSocket or other streaming requests) and whether the client asked for Markdown. |
 | `request_filter` | Sets `X-Request-ID`, reads the host, wakes sleeping environments, resolves the project and environment from the route table, and runs project checks: preview and password protection, and the attack-mode challenge. Sets the forwarded headers. |
 | `upstream_peer` | Picks the container that serves the request (round-robin across the environment's containers) and applies the environment's request timeouts. Hosts with no route go to the console. |
 | `upstream_response_filter` | Adjusts the response from your app, for example adding `X-Served-By` with the name of the container that handled it. |
@@ -115,7 +115,7 @@ The proxy does not compress request bodies, decompress responses, or inject scri
 
 ### Request logging
 
-Request log entries are sent to a bounded in-memory queue and written in batches of up to 200 entries, at least every 500 ms, to the `proxy_logs` table (or ClickHouse, when configured). If the queue is full, new entries are dropped rather than slowing down requests.
+Request log entries are sent to a bounded in-memory queue and written in batches of up to 200 entries when a batch fills or on a 500 ms flush interval, to the `proxy_logs` table (or ClickHouse, when configured). If the queue is full, new entries are dropped rather than slowing down requests.
 
 ---
 
@@ -156,26 +156,31 @@ If no route matches the host, the request is forwarded to the Temps console, whi
 
 ### IP Access Control
 
-Before anything else, the proxy checks the client IP against the global block list:
+Early in request processing, the proxy normally checks the resolved client IP against the global block list. CAPTCHA WASM assets bypass the check, and a lookup error lets the request continue:
 
 ```mermaid
 graph TB
     Request["Incoming Request"]
     ExtractIP["Resolve Client IP"]
+    Wasm{"CAPTCHA WASM<br/>asset?"}
     CheckRules["Check global<br/>block list"]
-    Blocked{"IP<br/>blocked?"}
+    Result{"Block-list<br/>check result"}
     Deny["403 Forbidden"]
     Continue["Continue Processing"]
 
     Request --> ExtractIP
-    ExtractIP --> CheckRules
-    CheckRules --> Blocked
-    Blocked -->|Yes| Deny
-    Blocked -->|No| Continue
+    ExtractIP --> Wasm
+    Wasm -->|Yes| Continue
+    Wasm -->|No| CheckRules
+    CheckRules --> Result
+    Result -->|Blocked| Deny
+    Result -->|Allowed or check error| Continue
 ```
 
 **IP Rules**:
-- **Block rules** (single IPs or CIDR ranges) apply to every project and return `403 Forbidden`.
+- **Block rules** (single IPs or CIDR ranges) apply across projects. A matching blocked IP gets `403 Forbidden` when the check succeeds.
+- Requests for `/api/__temps/temps_captcha_wasm*` bypass the block check so the challenge assets remain available.
+- If the IP access service returns an error, the proxy logs it and lets the request continue (fail-open).
 - **Allow rules** can be saved but currently have no effect.
 - There are no per-project IP rules.
 - **Default**: all IPs are allowed.
