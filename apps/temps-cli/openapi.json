@@ -13,11 +13,11 @@
           "challenge_validation": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ChallengeValidationStatus",
                 "description": "Live challenge validation status fetched from Let's Encrypt"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -896,10 +896,10 @@
           "report": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ActivityReport"
               },
               {
-                "$ref": "#/components/schemas/ActivityReport"
+                "type": "null"
               }
             ]
           },
@@ -1438,11 +1438,11 @@
           "run_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/AutofixRunConfig",
                 "description": "Per-run AI options the user chose when starting an autofixer run\n(provider, model, max_turns, branch). NULL for generic agent runs\nand historical rows. Used to prefill the retry dialog."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -1531,6 +1531,18 @@
       "AgentSandboxSettings": {
         "description": "Global agent sandbox settings. Controls whether agent runs are isolated\ninside Docker containers by default. Individual agents can override this.",
         "properties": {
+          "allowed_node_ids": {
+            "default": null,
+            "description": "Nodes allowed to run sandboxes (ADR-048). `None` (the default) =\nevery node, including the control plane. `Some(ids)` = only those\nnodes; the control plane is id `0`. `Some([])` disables sandbox\ncreation. Owned by `PUT /sandboxes/placement`; the generic settings\nupdate preserves the stored value.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "api_key_encrypted": {
             "default": null,
             "description": "DEPRECATED: use `providers[default_provider].credentials_encrypted` instead.",
@@ -2666,11 +2678,11 @@
           "backend": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/LineIndexBackend",
                 "description": "Where the index lives (`clickhouse`, `temps_cloud` or `timescaledb`)\nwhen configured. The TimescaleDB fallback answers the same endpoints\nbut scales with line count on the control-plane database; the\nonboarding copy points at ClickHouse or Temps Cloud for volume."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -3404,11 +3416,11 @@
           "summary": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ApiTrafficSummary",
                 "description": "The AI-generated summary, or `null` when AI is not configured or the\nproject has not opted in (`ai_api_traffic_summary_enabled = false`)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -3430,7 +3442,9 @@
         "description": "Application settings stored in the database\nAll fields have sensible defaults for easy onboarding",
         "properties": {
           "agent_sandbox": {
+            "$ref": "#/components/schemas/AgentSandboxSettings",
             "default": {
+              "allowed_node_ids": null,
               "api_key_encrypted": null,
               "auth_type": "subscription",
               "cpu_limit": 4,
@@ -3442,36 +3456,24 @@
               "providers": {},
               "runtime": "node",
               "sandbox_backend": null
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/AgentSandboxSettings"
-              }
-            ]
+            }
           },
           "ai_chat_limits": {
+            "$ref": "#/components/schemas/AiChatLimitsSettings",
             "default": {
               "turn_timeout_secs": 900
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/AiChatLimitsSettings",
-                "description": "Limits on a single AI chat turn. Operator-tunable because the right\nvalue depends on the model: a turn against a slow self-hosted model can\nlegitimately take ten minutes, while a hosted one finishes in seconds\nand a shorter ceiling keeps costs predictable."
-              }
-            ]
+            "description": "Limits on a single AI chat turn. Operator-tunable because the right\nvalue depends on the model: a turn against a slow self-hosted model can\nlegitimately take ten minutes, while a hosted one finishes in seconds\nand a shorter ceiling keeps costs predictable."
           },
           "ai_config": {
+            "$ref": "#/components/schemas/AiConfigSettings",
             "default": {
               "config_repo": "",
               "config_repo_branch": "main"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/AiConfigSettings"
-              }
-            ]
+            }
           },
           "ai_workspace_file_limits": {
+            "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings",
             "default": {
               "max_download_size_mb": 32,
               "max_file_size_mb": 16,
@@ -3482,27 +3484,19 @@
               "max_workspace_entries": 5000,
               "max_workspace_size_mb": 256
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings",
-                "description": "Transfer and preview limits for files in persistent AI workspaces.\nThese are runtime settings because operators have different control\nplane memory budgets and commonly work with very different asset sizes."
-              }
-            ]
+            "description": "Transfer and preview limits for files in persistent AI workspaces.\nThese are runtime settings because operators have different control\nplane memory budgets and commonly work with very different asset sizes."
           },
           "build_limits": {
+            "$ref": "#/components/schemas/BuildLimitsSettings",
             "default": {
               "cpu_limit_cores": 0,
               "max_concurrent": 2,
               "memory_limit_mb": 0
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/BuildLimitsSettings",
-                "description": "Build-time resource limits applied on the control plane to prevent\n`docker build` from saturating host CPU/RAM. Worker nodes are\nintentionally NOT subject to these limits (each worker is dedicated\nhardware that already has its own per-host headroom)."
-              }
-            ]
+            "description": "Build-time resource limits applied on the control plane to prevent\n`docker build` from saturating host CPU/RAM. Worker nodes are\nintentionally NOT subject to these limits (each worker is dedicated\nhardware that already has its own per-host headroom)."
           },
           "cloud": {
+            "$ref": "#/components/schemas/CloudSettings",
             "default": {
               "backend_url": "https://app.temps.sh",
               "backups_enabled": false,
@@ -3512,34 +3506,21 @@
               "telemetry_enabled": false,
               "telemetry_outbox_max_bytes": 536870912
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/CloudSettings",
-                "description": "Managed control-plane connection. Credentials are deliberately not\nstored here; they live in the owner-only cloud-link state file."
-              }
-            ]
+            "description": "Managed control-plane connection. Credentials are deliberately not\nstored here; they live in the owner-only cloud-link state file."
           },
           "cluster_dns": {
+            "$ref": "#/components/schemas/ClusterDnsSettings",
             "default": {
               "enabled": false
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ClusterDnsSettings",
-                "description": "Cluster-DNS resolver settings (ADR-024, experimental beta). Off by\ndefault — see `ClusterDnsSettings` for the incident background and\ntrade-offs. Must be explicitly enabled by operators who need\n`*.temps.local` service-to-service resolution inside containers."
-              }
-            ]
+            "description": "Cluster-DNS resolver settings (ADR-024, experimental beta). Off by\ndefault — see `ClusterDnsSettings` for the incident background and\ntrade-offs. Must be explicitly enabled by operators who need\n`*.temps.local` service-to-service resolution inside containers."
           },
           "connection_limits": {
+            "$ref": "#/components/schemas/ConnectionLimitSettings",
             "default": {
               "default_max_concurrent_connections": 0
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ConnectionLimitSettings",
-                "description": "Per-upstream concurrent-connection cap applied by the proxy to\ncustomer app traffic. `0` (the default) is unlimited. See issue #646."
-              }
-            ]
+            "description": "Per-upstream concurrent-connection cap applied by the proxy to\ncustomer app traffic. `0` (the default) is unlimited. See issue #646."
           },
           "console_force_https": {
             "default": null,
@@ -3558,6 +3539,7 @@
             ]
           },
           "container_logs": {
+            "$ref": "#/components/schemas/ContainerLogSettings",
             "default": {
               "cache_mb": 2048,
               "head_buffer_mb": 8,
@@ -3565,38 +3547,26 @@
               "max_size": "50m",
               "service_max_file": 3,
               "service_max_size": "20m"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ContainerLogSettings"
-              }
-            ]
+            }
           },
           "disk_space_alert": {
+            "$ref": "#/components/schemas/DiskSpaceAlertSettings",
             "default": {
               "check_interval_seconds": 300,
               "enabled": true,
               "monitor_path": null,
               "threshold_percent": 80
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/DiskSpaceAlertSettings"
-              }
-            ]
+            }
           },
           "dns_provider": {
+            "$ref": "#/components/schemas/DnsProviderSettings",
             "default": {
               "cloudflare_api_key": null,
               "provider": "manual"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/DnsProviderSettings"
-              }
-            ]
+            }
           },
           "docker_registry": {
+            "$ref": "#/components/schemas/DockerRegistrySettings",
             "default": {
               "ca_certificate": null,
               "enabled": false,
@@ -3604,12 +3574,7 @@
               "registry_url": null,
               "tls_verify": true,
               "username": null
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/DockerRegistrySettings"
-              }
-            ]
+            }
           },
           "edge_target": {
             "default": null,
@@ -3627,6 +3592,7 @@
             ]
           },
           "geo": {
+            "$ref": "#/components/schemas/GeoSettings",
             "default": {
               "build_epoch": null,
               "last_check_at": null,
@@ -3638,24 +3604,15 @@
               "source": null,
               "stale_lookup_days": null
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/GeoSettings",
-                "description": "Geolocation database refresh policy, MaxMind credential (encrypted at\nrest), and the self-recorded freshness metadata of the last refresh."
-              }
-            ]
+            "description": "Geolocation database refresh policy, MaxMind credential (encrypted at\nrest), and the self-recorded freshness metadata of the last refresh."
           },
           "image_retention": {
+            "$ref": "#/components/schemas/ImageRetentionSettings",
             "default": {
               "default_hours": 336,
               "enabled": true
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ImageRetentionSettings",
-                "description": "Retention policy for locally-built deployment images. Modeled as a\nsettings row (not an env var) per CLAUDE.md so an operator can change\nthe system-wide default at runtime without restarting the binary.\nIndividual projects override it via `projects.image_retention_hours`."
-              }
-            ]
+            "description": "Retention policy for locally-built deployment images. Modeled as a\nsettings row (not an env var) per CLAUDE.md so an operator can change\nthe system-wide default at runtime without restarting the binary.\nIndividual projects override it via `projects.image_retention_hours`."
           },
           "insecure_tls": {
             "default": false,
@@ -3671,28 +3628,21 @@
             ]
           },
           "letsencrypt": {
+            "$ref": "#/components/schemas/LetsEncryptSettings",
             "default": {
               "email": null,
               "environment": "production"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/LetsEncryptSettings"
-              }
-            ]
+            }
           },
           "mcp_server": {
+            "$ref": "#/components/schemas/McpServerSettings",
             "default": {
               "enabled": false
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/McpServerSettings",
-                "description": "MCP server settings (ADR-039). Off by default — enable via the Settings\nUI to expose the MCP endpoint to the Temps CLI wizard."
-              }
-            ]
+            "description": "MCP server settings (ADR-039). Off by default — enable via the Settings\nUI to expose the MCP endpoint to the Temps CLI wizard."
           },
           "monitoring": {
+            "$ref": "#/components/schemas/MonitoringSettings",
             "default": {
               "clickhouse_url": null,
               "enabled": false,
@@ -3702,14 +3652,10 @@
               "scrape_interval_secs": 30,
               "store": "timescale_db"
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/MonitoringSettings",
-                "description": "Metrics observability settings. Controls the MetricsStore backend,\nscrape interval, and tiered retention windows."
-              }
-            ]
+            "description": "Metrics observability settings. Controls the MetricsStore backend,\nscrape interval, and tiered retention windows."
           },
           "multi_node": {
+            "$ref": "#/components/schemas/MultiNodeSettings",
             "default": {
               "cluster_ca_cert_pem": null,
               "cluster_ca_key_encrypted": null,
@@ -3721,26 +3667,18 @@
               "node_memory_alert_percent": 90,
               "private_address": null,
               "require_mtls": true
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/MultiNodeSettings"
-              }
-            ]
+            }
           },
           "observability_compression": {
+            "$ref": "#/components/schemas/ObservabilityCompressionSettings",
             "default": {
               "otel_spans_after_hours": 24,
               "proxy_logs_after_hours": 24
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ObservabilityCompressionSettings",
-                "description": "TimescaleDB compression delays for immutable observability data.\nChanges are applied at runtime by the Settings API."
-              }
-            ]
+            "description": "TimescaleDB compression delays for immutable observability data.\nChanges are applied at runtime by the Settings API."
           },
           "observability_retention": {
+            "$ref": "#/components/schemas/ObservabilityRetentionSettings",
             "default": {
               "container_logs_days": 30,
               "otel_logs_days": 90,
@@ -3748,26 +3686,17 @@
               "otel_spans_days": 90,
               "proxy_logs_days": 30
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ObservabilityRetentionSettings",
-                "description": "Retention windows for raw proxy and OpenTelemetry telemetry.\nTimescaleDB policies are updated at runtime by the Settings API."
-              }
-            ]
+            "description": "Retention windows for raw proxy and OpenTelemetry telemetry.\nTimescaleDB policies are updated at runtime by the Settings API."
           },
           "on_demand_tls": {
+            "$ref": "#/components/schemas/OnDemandTlsSettings",
             "default": {
               "deployment_url_mode": "http",
               "enabled": false,
               "hourly_cap": 10,
               "max_concurrent": 3,
               "zone": null
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/OnDemandTlsSettings"
-              }
-            ]
+            }
           },
           "plugin_installation_reporting_enabled": {
             "default": false,
@@ -3779,31 +3708,23 @@
             "type": "string"
           },
           "preview_gateway": {
+            "$ref": "#/components/schemas/PreviewGatewaySettings",
             "default": {
               "auto_upgrade": true,
               "container_name": "temps-preview-gateway",
               "host_port": 8090,
               "image": ""
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/PreviewGatewaySettings"
-              }
-            ]
+            }
           },
           "rate_limiting": {
+            "$ref": "#/components/schemas/RateLimitSettings",
             "default": {
               "blacklist_ips": [],
               "enabled": false,
               "max_requests_per_hour": 1000,
               "max_requests_per_minute": 60,
               "whitelist_ips": []
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/RateLimitSettings"
-              }
-            ]
+            }
           },
           "registry_mirror_prefix": {
             "default": null,
@@ -3814,18 +3735,14 @@
             ]
           },
           "request_timeouts": {
+            "$ref": "#/components/schemas/RequestTimeoutSettings",
             "default": {
               "default_http_timeout_seconds": 0,
               "default_sse_idle_timeout_seconds": 0,
               "default_websocket_idle_timeout_seconds": 0,
               "max_request_timeout_seconds": 600
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/RequestTimeoutSettings",
-                "description": "Upstream request/connection timeouts applied by the proxy to customer\napp traffic. Provides a global hard ceiling plus global defaults for\nregular HTTP, SSE, and WebSocket traffic; projects and environments\nmay set a shorter value but never exceed the ceiling here."
-              }
-            ]
+            "description": "Upstream request/connection timeouts applied by the proxy to customer\napp traffic. Provides a global hard ceiling plus global defaults for\nregular HTTP, SSE, and WebSocket traffic; projects and environments\nmay set a shorter value but never exceed the ceiling here."
           },
           "require_mfa_for_admins": {
             "default": false,
@@ -3833,18 +3750,15 @@
             "type": "boolean"
           },
           "screenshots": {
+            "$ref": "#/components/schemas/ScreenshotSettings",
             "default": {
               "enabled": false,
               "provider": "local",
               "url": ""
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ScreenshotSettings"
-              }
-            ]
+            }
           },
           "security_headers": {
+            "$ref": "#/components/schemas/SecurityHeadersSettings",
             "default": {
               "content_security_policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'",
               "enabled": false,
@@ -3855,22 +3769,17 @@
               "x_content_type_options": "nosniff",
               "x_frame_options": "SAMEORIGIN",
               "x_xss_protection": "1; mode=block"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/SecurityHeadersSettings"
-              }
-            ]
+            }
           },
           "self_update": {
             "default": null,
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SelfUpdateSettings",
                 "description": "One-click \"Update now\" from the console. Enabled by default; an admin\ncan turn it off here to keep upgrades on the CLI/config-management path.\n\nThis is the *soft* switch — it is stored in the database, so whoever can\nwrite settings can also turn it back on. Operators who need an upgrade\npath that no console session can re-open should start the server with\n`--disable-self-update`, which wins over this field unconditionally.\n`None` means the client did not express an opinion, NOT \"reset to\ndefault\". Every other field on this struct is safe to re-default on a\npartial write, but this one gates whether the server may replace its own\nbinary — silently flipping it back on because an older client PUT a\nsettings document without it would undo a deliberate security decision.\nThe update handler preserves the stored value when this is absent; read\nit through `self_update()`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -3880,17 +3789,13 @@
             "type": "boolean"
           },
           "tenant_resource_ceilings": {
+            "$ref": "#/components/schemas/TenantResourceCeilings",
             "default": {
               "allow_unlimited_request_timeouts": true,
               "max_concurrent_connections": 0,
               "max_memory_limit_mb": 0
             },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/TenantResourceCeilings",
-                "description": "Ceilings the operator places on what a *tenant* may configure for\ntheir own project/environment. Entirely unenforced by default, so an\nupgrade never changes what an existing config means."
-              }
-            ]
+            "description": "Ceilings the operator places on what a *tenant* may configure for\ntheir own project/environment. Entirely unenforced by default, so an\nupgrade never changes what an existing config means."
           },
           "trust_loopback_forwarded_ip": {
             "default": null,
@@ -4906,11 +4811,11 @@
           "ip_address": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/AuditLogIpInfo",
                 "description": "IP address details"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -4922,11 +4827,11 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/AuditLogUserInfo",
                 "description": "User details who performed the action"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -5018,10 +4923,10 @@
           "mfa_setup": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/MfaSetupResponse"
               },
               {
-                "$ref": "#/components/schemas/MfaSetupResponse"
+                "type": "null"
               }
             ]
           },
@@ -5260,11 +5165,11 @@
           "run_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/AutofixRunConfig",
                 "description": "Per-run options the run was started with; used to prefill the\nretry / start-over dialog."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -5595,11 +5500,11 @@
           "external_service": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ExternalServiceSummary",
                 "description": "External service that owns this backup (Redis, Postgres, etc.).\n`null` for control-plane backups (the Temps server's own database)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -6621,11 +6526,11 @@
           "filter": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/BulkAlarmFilter",
                 "description": "Update every alarm matching these filters, up to 1000 per request.\nUse `{}` to match all active alarms in scope."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -6762,11 +6667,11 @@
           "last_attempt": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/OnDemandCertAttemptResponse",
                 "description": "The most recent on-demand issuance attempt for this hostname, if any."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -6838,11 +6743,11 @@
           "error": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ChallengeError",
                 "description": "Error details if validation failed"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -7064,10 +6969,10 @@
               "stop": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/StopSequence"
                   },
                   {
-                    "$ref": "#/components/schemas/StopSequence"
+                    "type": "null"
                   }
                 ]
               },
@@ -7136,10 +7041,10 @@
           "usage": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/UsageInfo"
               },
               {
-                "$ref": "#/components/schemas/UsageInfo"
+                "type": "null"
               }
             ]
           }
@@ -7181,10 +7086,10 @@
           "content": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/MessageContent"
               },
               {
-                "$ref": "#/components/schemas/MessageContent"
+                "type": "null"
               }
             ]
           },
@@ -8441,11 +8346,11 @@
           "commit": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/CommitInfo",
                 "description": "Commit metadata when the requested SHA exists."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -8567,11 +8472,11 @@
               "policy_check": {
                 "oneOf": [
                   {
-                    "type": "null"
-                  },
-                  {
                     "$ref": "#/components/schemas/ComposeSecurityCheck",
                     "description": "The individual project security check an administrator may review."
+                  },
+                  {
+                    "type": "null"
                   }
                 ]
               }
@@ -8859,11 +8764,11 @@
           "detectedServiceType": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ComposeServiceFamily",
                 "description": "Well-known managed-service family detected from the image, if any."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9295,11 +9200,11 @@
           "resource_limits": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ResourceLimitsResponse",
                 "description": "Resource limits"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -10218,11 +10123,11 @@
               "pending_permission": {
                 "oneOf": [
                   {
-                    "type": "null"
-                  },
-                  {
                     "$ref": "#/components/schemas/PermissionRequest",
                     "description": "A still-unresolved interactive permission request (ADR-038 Phase 2), if\none is pending on this conversation right now. The client renders this\nas a live, answerable `PermissionCard` — without it, a question that\narrived while the tab was away shows only as inert history text with no\nway to answer it."
+                  },
+                  {
+                    "type": "null"
                   }
                 ]
               }
@@ -10299,10 +10204,10 @@
           "native_session": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ConversationNativeDiagnosticResponse"
               },
               {
-                "$ref": "#/components/schemas/ConversationNativeDiagnosticResponse"
+                "type": "null"
               }
             ]
           },
@@ -10351,10 +10256,10 @@
           "context_usage": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ContextWindowUsageResponse"
               },
               {
-                "$ref": "#/components/schemas/ContextWindowUsageResponse"
+                "type": "null"
               }
             ]
           },
@@ -10523,10 +10428,10 @@
           "context_usage": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ContextWindowUsageResponse"
               },
               {
-                "$ref": "#/components/schemas/ContextWindowUsageResponse"
+                "type": "null"
               }
             ]
           },
@@ -10536,10 +10441,10 @@
           "failure": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ChatFailureResponse"
               },
               {
-                "$ref": "#/components/schemas/ChatFailureResponse"
+                "type": "null"
               }
             ]
           },
@@ -10732,11 +10637,11 @@
           "actual_usage": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ResourceFootprint",
                 "description": "Measured usage from the metrics API (`metrics.k8s.io`).\n`None` when metrics-server is not installed."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -10781,11 +10686,11 @@
           "provider": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/CloudProvider",
                 "description": "Detected cloud provider (from node `providerID` prefixes)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -11078,11 +10983,11 @@
           "starter_project": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/CreateApplicationProjectRequest",
                 "description": "Recommended default: create a deployable, Git-less starter project in\nthe application's persistent workspace."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -11515,33 +11420,33 @@
           "scaleway_credentials": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ScalewayCredentialsRequest",
                 "description": "Scaleway credentials (required if provider_type is scaleway)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "ses_credentials": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SesCredentialsRequest",
                 "description": "AWS SES credentials (required if provider_type is ses)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "smtp_credentials": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SmtpCredentialsRequest",
                 "description": "Generic SMTP credentials (required if provider_type is smtp). Use when\nyou only have SMTP creds and want to import an already-set-up domain."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -12658,11 +12563,11 @@
           "preset_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PresetConfigSchema",
                 "description": "Preset-specific configuration\n\nDifferent presets accept different configuration options:\n- **Dockerfile preset**: Accepts `DockerfilePresetConfig` with `dockerfile_path` and `build_context`\n- **Nixpacks preset**: Accepts ordered `providers` (for example `[\"...\", \"python\"]`)\n  and optional inline `nixpacksConfig` TOML\n- **Static presets** (Vite, Next.js, etc.): Accept `StaticPresetConfig` with build commands and output dir\n\nExample for Dockerfile preset:\n```json\n{\n  \"dockerfilePath\": \"docker/Dockerfile\",\n  \"buildContext\": \"./api\"\n}\n```"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -12970,6 +12875,14 @@
             ]
           },
           "networkPolicy": {},
+          "node": {
+            "description": "Node to create the sandbox on (ADR-048): a node name, a node id, or\n`control-plane` / `0` for the control plane. Omit to let Temps place\nit (the control plane when allowed, otherwise the allowed worker with\nthe fewest live sandboxes). The node must be allowed by the operator's\nsandbox placement settings and online; otherwise the request fails\nwith 422 — it never silently falls back to another node.",
+            "example": "worker-1",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "pids_limit": {
             "format": "int64",
             "type": [
@@ -13010,22 +12923,22 @@
           "resources": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ResourcesBody",
                 "description": "`@vercel/sandbox`'s nested resources object. When present, its\n`memory` / `vcpus` populate `memory_limit_mb` / `cpu_limit` if those\nweren't sent directly."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "source": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SourceBody",
                 "description": "Optional initial content to seed into the work dir. Clones a\nrepo or extracts a tarball after the sandbox is created."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -13529,10 +13442,10 @@
           "environment": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/DomainEnvironmentResponse"
               },
               {
-                "$ref": "#/components/schemas/DomainEnvironmentResponse"
+                "type": "null"
               }
             ]
           },
@@ -14195,11 +14108,11 @@
           "security": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SecurityConfig",
                 "description": "Security configuration (headers, rate limiting, attack mode, etc.)\nThese settings inherit and override from parent level (Environment > Project > Global)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -14328,11 +14241,11 @@
           "build": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/BuildConfiguration",
                 "description": "Build configuration (if building from source)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -14366,22 +14279,22 @@
           "git": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/GitSourcePlan",
                 "description": "Where the application's source code lives, when the source platform\nbuilds from a git repository. Execution uses this to link the temps\nproject to the same repository so the real deployment pipeline can\nclone and build it."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "health_check": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/HealthCheckConfiguration",
                 "description": "Health check configuration"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -14751,11 +14664,11 @@
           "deploymentSourceType": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SourceType",
                 "description": "Source type for THIS specific deployment (for Manual/flexible projects)\nThis allows Manual projects to have deployments via different methods\n(docker_image, static_files, or git) while keeping per-deployment tracking"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -14792,11 +14705,11 @@
           "gitPushEvent": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/GitPushEvent",
                 "description": "Git push event that triggered this deployment (if from webhook)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -14938,11 +14851,11 @@
           "deployment_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/DeploymentConfigSnapshot",
                 "description": "Deployment configuration snapshot (CPU, memory, replicas, environment variables, etc.)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -14970,11 +14883,11 @@
           "metadata": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/DeploymentMetadata",
                 "description": "Deployment metadata (build info, git event, etc.)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -16908,22 +16821,22 @@
           "imageRuntime": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ImageRuntimeConfig",
                 "description": "Durable runtime selected for a curated single-container image template."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "variant": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/DockerfileVariant",
                 "description": "Catalog variant. Normally omitted; `custom` selects the generated\nDockerfile compatibility preset."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -17206,6 +17119,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "remaining_sandboxes": {
+            "description": "Sandboxes (any owner) still on this node. Draining does not move\nsandboxes; evict them before removing the node (ADR-048).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "status": {
             "type": "string"
           }
@@ -17215,6 +17134,7 @@
           "node_name",
           "status",
           "remaining_containers",
+          "remaining_sandboxes",
           "drain_complete",
           "can_remove",
           "message"
@@ -18772,11 +18692,11 @@
           "deployment_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/DeploymentConfig",
                 "description": "Deployment configuration for this environment (overrides project-level config)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -19142,11 +19062,11 @@
           "deployment": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ErrorGroupDeploymentResponse",
                 "description": "The deployment this group's `deployment_id` points to, resolved to its commit info.\n`None` when the group has no linked deployment."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -20356,10 +20276,10 @@
           "breakdown": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/EventBreakdown"
               },
               {
-                "$ref": "#/components/schemas/EventBreakdown"
+                "type": "null"
               }
             ]
           },
@@ -20422,6 +20342,43 @@
         "required": [
           "events",
           "applied_kinds"
+        ],
+        "type": "object"
+      },
+      "EvictionFailedSandbox": {
+        "description": "A sandbox an eviction could not destroy.",
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandbox_id",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "EvictionUnconfirmedContainer": {
+        "description": "A sandbox destroyed without the node confirming its container is gone.",
+        "properties": {
+          "cleanup_command": {
+            "description": "Run this on the node, if it comes back, to remove the sandbox's\nleftover containers. Nothing else will: the sandbox is destroyed, and\nits containers are not listed anywhere in Temps.",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandbox_id",
+          "reason",
+          "cleanup_command"
         ],
         "type": "object"
       },
@@ -23768,10 +23725,10 @@
           "context_usage": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ContextWindowUsageResponse"
               },
               {
-                "$ref": "#/components/schemas/ContextWindowUsageResponse"
+                "type": "null"
               }
             ]
           },
@@ -23781,10 +23738,10 @@
           "failure": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ChatFailureResponse"
               },
               {
-                "$ref": "#/components/schemas/ChatFailureResponse"
+                "type": "null"
               }
             ]
           },
@@ -25142,11 +25099,11 @@
           "dns_resolver": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/DnsResolverHeartbeat",
                 "description": "Per-node DNS resolver health (ADR-024), reported by agents new enough\nto have it. `None` means either an older agent binary, or a\nheartbeat that raced before the agent's network-sync loop first\nran — a true single-host node with no `compute_cidr` allocation\nnever touches cluster DNS and always reports `None` here, which is\nexpected, not stale data. The stored columns are left untouched when\n`None`, same treatment as `architecture` above."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -25166,10 +25123,10 @@
           "public_ingress": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PublicIngressHeartbeat"
               },
               {
-                "$ref": "#/components/schemas/PublicIngressHeartbeat"
+                "type": "null"
               }
             ]
           }
@@ -25560,10 +25517,10 @@
           "expiration": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ExpirationRule"
               },
               {
-                "$ref": "#/components/schemas/ExpirationRule"
+                "type": "null"
               }
             ]
           },
@@ -25643,10 +25600,10 @@
           "result": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/VerificationResult"
               },
               {
-                "$ref": "#/components/schemas/VerificationResult"
+                "type": "null"
               }
             ]
           }
@@ -25972,11 +25929,11 @@
           "cost_analysis": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/CostAnalysis",
                 "description": "Cost, overprovisioning, and savings analysis. Populated by importers\nthat can observe the whole source cluster (currently Kubernetes);\n`None` for container/platform imports."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -26255,11 +26212,11 @@
           "plan": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ImportPlan",
                 "description": "Import plan"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -26287,11 +26244,11 @@
           "validation": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ValidationReport",
                 "description": "Validation report"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -26846,10 +26803,10 @@
           "grants": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/PluginGrantConfig"
               },
               {
-                "$ref": "#/components/schemas/PluginGrantConfig"
+                "type": "null"
               }
             ]
           },
@@ -26895,11 +26852,11 @@
           "config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ProviderConfig",
                 "description": "Typed provider config — allowlist and metered-billing mode. Null\nwhen the operator hasn't configured one yet (accept everything)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -28236,11 +28193,11 @@
           "kind": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/TemplateKind",
                 "description": "Filter by gallery (`starter` or `service`)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -28727,11 +28684,11 @@
           "context": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/LineContext",
                 "description": "Raw surrounding lines (grep -C). `None` unless `context_lines > 0` was\nrequested. Overlapping windows between nearby matches are merged: the\nshared neighbors appear on the earlier match only, so the frontend can\nrender one continuous block without duplicated lines."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -28991,11 +28948,11 @@
           "schedule": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ManagedBackupSchedule",
                 "description": "The schedule that writes to the managed destination, when one does.\n`None` on a ready destination means nothing backs up to Cloud yet:\nthe console offers to create the nightly schedule (ADR-044)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -29584,11 +29541,11 @@
           "histogram_summary": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/HistogramSummary",
                 "description": "A reduced histogram summary when the bucketed metric is a histogram."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -30697,13 +30654,9 @@
             "type": "integer"
           },
           "store": {
+            "$ref": "#/components/schemas/MetricsStoreKind",
             "default": "timescale_db",
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/MetricsStoreKind",
-                "description": "Storage backend for metric data."
-              }
-            ]
+            "description": "Storage backend for metric data."
           }
         },
         "type": "object"
@@ -30883,11 +30836,11 @@
           "cluster_network": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ClusterNetworkSettings",
                 "description": "Effective cluster-wide container address pool. `None` only when the\nsingleton network configuration could not be read."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -31374,6 +31327,85 @@
         ],
         "type": "object"
       },
+      "NodeEvictionIncompleteProblem": {
+        "description": "RFC 7807 body of a `503` from `POST /v1/sandboxes/placement/nodes/{node}/evict`\nwhen some sandboxes could not be destroyed. Carries the same per-sandbox\ndetail as a successful eviction, as Problem extension members.",
+        "properties": {
+          "containers_unconfirmed": {
+            "description": "Destroyed sandboxes whose container the node did not confirm\nremoving, with the command to remove it on the node.",
+            "items": {
+              "$ref": "#/components/schemas/EvictionUnconfirmedContainer"
+            },
+            "type": "array"
+          },
+          "destroyed": {
+            "description": "Public ids of the sandboxes destroyed by this eviction.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "failed": {
+            "description": "Sandboxes that could not be destroyed. Running the eviction again\nretries them.",
+            "items": {
+              "$ref": "#/components/schemas/EvictionFailedSandbox"
+            },
+            "type": "array"
+          },
+          "status": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "description": "`https://temps.sh/probs/sandbox-node-eviction-incomplete`",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "destroyed",
+          "containers_unconfirmed",
+          "failed"
+        ],
+        "type": "object"
+      },
+      "NodeEvictionResponse": {
+        "description": "`POST /v1/sandboxes/placement/nodes/{node}/evict`",
+        "properties": {
+          "containers_unconfirmed": {
+            "description": "Destroyed sandboxes whose container the node did not confirm\nremoving: it may still be running there. Check the node, or remove\nit if it is gone for good.",
+            "items": {
+              "$ref": "#/components/schemas/EvictionUnconfirmedContainer"
+            },
+            "type": "array"
+          },
+          "destroyed": {
+            "description": "Public ids of the sandboxes destroyed (their rows are gone, and they\nno longer block removing the node).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "node": {
+            "$ref": "#/components/schemas/PlacementNode"
+          }
+        },
+        "required": [
+          "node",
+          "destroyed",
+          "containers_unconfirmed"
+        ],
+        "type": "object"
+      },
       "NodeInfoResponse": {
         "properties": {
           "address": {
@@ -31489,6 +31521,71 @@
         "required": [
           "nodes",
           "total"
+        ],
+        "type": "object"
+      },
+      "NodeSandboxEntry": {
+        "description": "A live sandbox on a node, with its owner. For sandboxes the caller does\nnot own, owner-only details (preview password hint, source repository\nURL) are omitted.",
+        "properties": {
+          "owner_email": {
+            "description": "Owner's email, when the owner is a user that still exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sandbox": {
+            "$ref": "#/components/schemas/SandboxInner"
+          }
+        },
+        "required": [
+          "sandbox"
+        ],
+        "type": "object"
+      },
+      "NodeSandboxesResponse": {
+        "description": "`GET /v1/sandboxes/placement/nodes/{node}` — every live sandbox on one\nnode, whoever owns it.",
+        "properties": {
+          "node": {
+            "$ref": "#/components/schemas/PlacementNode"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sandboxes": {
+            "description": "One page, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/NodeSandboxEntry"
+            },
+            "type": "array"
+          },
+          "total": {
+            "description": "Every live sandbox on the node, across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "node",
+          "sandboxes",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -34220,11 +34317,11 @@
           "alloc": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/AllocEntry",
                 "description": "Caller's own allocation, or `null` if multi-host networking has\nnot been enabled for this node yet."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -35065,6 +35162,57 @@
         },
         "required": [
           "stats"
+        ],
+        "type": "object"
+      },
+      "PlacementNode": {
+        "description": "One row of `GET /sandboxes/placement`.",
+        "properties": {
+          "allowed": {
+            "description": "Allowed by the operator's sandbox placement settings.",
+            "type": "boolean"
+          },
+          "eligible": {
+            "description": "Can take a new sandbox right now (allowed and active).",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Node id; `0` for the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_control_plane": {
+            "type": "boolean"
+          },
+          "live_sandboxes": {
+            "description": "Sandboxes currently hosted on the node (not destroyed).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why the node is not eligible, when it isn't.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Node status (`active`, `offline`, `draining`, …). Always `active`\nfor the control plane.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "is_control_plane",
+          "status",
+          "allowed",
+          "eligible",
+          "live_sandboxes"
         ],
         "type": "object"
       },
@@ -35936,11 +36084,11 @@
           "effective_reason": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/TelemetryWriteIntervalReason",
                 "description": "Why they differ. Absent when intent and reality agree."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -36434,11 +36582,11 @@
           "docker_socket": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/DockerSocketCapability",
                 "description": "Where this project is granted host Docker access (ADR 045), and what to\nset when it is granted nowhere.\n\nPopulated only on the single-project detail responses — computing it\ncosts a `nodes` query, and the list endpoints must stay cheap. `None`\ntherefore means \"not computed on this response\", never \"not granted\";\nclients read `granted` from the object, not from its presence."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -36526,11 +36674,11 @@
           "preset_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PresetConfigSchema",
                 "description": "Preset-specific configuration (Dockerfile path, build context, etc.)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -36894,11 +37042,11 @@
           "resources": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/TemplateResources",
                 "description": "Minimum/safe runtime resources for this application. These values are\nvalidated against operator-configured tenant ceilings before creation."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -37406,11 +37554,11 @@
           "local_credential": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/LocalCredentialDto",
                 "description": "Importable credential already used by this host's CLI, if one can be\ncopied directly into encrypted Temps settings. Contains metadata only."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -38370,11 +38518,11 @@
           "detected_service_type": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ComposeServiceFamily",
                 "description": "Well-known managed-service family detected from the image, if any."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -40249,10 +40397,10 @@
           "mfa_setup": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/MfaSetupResponse"
               },
               {
-                "$ref": "#/components/schemas/MfaSetupResponse"
+                "type": "null"
               }
             ]
           },
@@ -40401,10 +40549,10 @@
               "overrides_service": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/EnvVarIntegrationInfo"
                   },
                   {
-                    "$ref": "#/components/schemas/EnvVarIntegrationInfo"
+                    "type": "null"
                   }
                 ]
               },
@@ -41795,6 +41943,18 @@
           "name": {
             "type": "string"
           },
+          "node_id": {
+            "description": "Worker node hosting the sandbox (ADR-048). `null` = the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_name": {
+            "description": "Name of the hosting node; `\"control-plane\"` for control-plane\nsandboxes.",
+            "type": "string"
+          },
           "preview_password_hint": {
             "type": [
               "string",
@@ -41862,7 +42022,35 @@
           "cwd",
           "name",
           "preview_url_template",
-          "lifecycle"
+          "lifecycle",
+          "node_name"
+        ],
+        "type": "object"
+      },
+      "SandboxPlacementResponse": {
+        "description": "Sandbox placement state: the operator allow-list and every node.",
+        "properties": {
+          "allowed_node_ids": {
+            "description": "Node ids allowed to run sandboxes. `null` = every node (the default);\n`0` is the control plane.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "nodes": {
+            "description": "Every node (control plane first) with its placement state.",
+            "items": {
+              "$ref": "#/components/schemas/PlacementNode"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes"
         ],
         "type": "object"
       },
@@ -42753,11 +42941,11 @@
           "challengeConfig": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ChallengeConfig",
                 "description": "Challenge configuration (future: CAPTCHA, JS challenge, etc.)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -42771,44 +42959,44 @@
           "geoRestrictions": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/GeoRestrictionsConfig",
                 "description": "Geographic restrictions (future: country blocking, etc.)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "headers": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SecurityHeadersConfig",
                 "description": "Security headers configuration"
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "passwordProtection": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PasswordProtectionConfig",
                 "description": "Password protection: shows an HTML password form before allowing access"
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "rateLimiting": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/RateLimitConfig",
                 "description": "Rate limiting configuration"
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -44314,11 +44502,11 @@
           "latest": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ServiceTemplateInstance",
                 "description": "Latest release for the same service family. Absent when the catalog no\nlonger carries the template; the applied snapshot is still usable."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -48700,11 +48888,11 @@
           "resources": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/TemplateResources",
                 "description": "Curated CPU/memory profile applied when the project is created."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -49677,11 +49865,11 @@
           "tls_certificate": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/TraefikRouteTlsBlock",
                 "description": "TLS authorization state for this host (ADR-041). Present only when a\n`traefik_route_certificates` row exists. `null` means no operator has\never authorized TLS for this host — the container label's `tls` field\n(above) records what the label says, but this is what has been acted on."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -49807,11 +49995,11 @@
           "last_reconciliation": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/TraefikReconciliationResponse",
                 "description": "Last reconciliation pass, absent until the first one completes."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -51208,11 +51396,11 @@
           "blocker": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SelfUpdateBlocker",
                 "description": "Machine-readable reason `can_apply` is false (`disabled_by_flag`,\n`disabled_by_setting`, `container`, `no_supervisor`, `binary_not_writable`,\n`unsupported_platform`, `in_progress`)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -51249,11 +51437,11 @@
           "last_attempt": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SelfUpdateAttempt",
                 "description": "Most recent attempt, including one resolved during this boot — this is\nhow the console reports the outcome of an update that restarted it."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -51371,11 +51559,11 @@
           "config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ProviderConfig",
                 "description": "Typed provider configuration. Setting `config` to `null` clears\nthe stored config back to the accept-everything default. The\nconfig's `provider` tag must match the integration's provider."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -51431,10 +51619,10 @@
           "layout": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/DashboardLayout"
               },
               {
-                "$ref": "#/components/schemas/DashboardLayout"
+                "type": "null"
               }
             ]
           },
@@ -51529,10 +51717,10 @@
           "security": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/SecurityConfig"
               },
               {
-                "$ref": "#/components/schemas/SecurityConfig"
+                "type": "null"
               }
             ]
           },
@@ -51605,11 +51793,11 @@
           "credentials": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/DnsProviderCredentials",
                 "description": "New credentials"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -51663,30 +51851,30 @@
           "scaleway_credentials": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/ScalewayCredentialsRequest"
               },
               {
-                "$ref": "#/components/schemas/ScalewayCredentialsRequest"
+                "type": "null"
               }
             ]
           },
           "ses_credentials": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/SesCredentialsRequest"
               },
               {
-                "$ref": "#/components/schemas/SesCredentialsRequest"
+                "type": "null"
               }
             ]
           },
           "smtp_credentials": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/SmtpCredentialsRequest"
               },
               {
-                "$ref": "#/components/schemas/SmtpCredentialsRequest"
+                "type": "null"
               }
             ]
           },
@@ -51846,11 +52034,11 @@
           "security": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SecurityConfig",
                 "description": "Security configuration for this environment (overrides project-level settings)"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -52051,11 +52239,11 @@
           "preset_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PresetConfigSchema",
                 "description": "Preset-specific configuration (e.g., Dockerfile path for Docker preset)\n\nExample for Dockerfile preset:\n```json\n{\n  \"dockerfilePath\": \"docker/Dockerfile\",\n  \"buildContext\": \"./api\"\n}\n```"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -52234,11 +52422,11 @@
           "detection_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/DetectionConfig",
                 "description": "Replaces the detector wholesale when present (absent = leave unchanged)."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -52514,11 +52702,11 @@
           "analytics_write_mode": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/CloudAnalyticsWriteMode",
                 "description": "ADR-043 §1: the independent switch for non-span telemetry (metrics\nunder Phase C1). Orthogonal to `write_mode` — a project may be\nCloud-primary for spans and local for analytics, or vice versa."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -52534,20 +52722,20 @@
           "fidelity": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CloudTelemetryFidelity"
               },
               {
-                "$ref": "#/components/schemas/CloudTelemetryFidelity"
+                "type": "null"
               }
             ]
           },
           "write_mode": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/CloudTelemetryWriteMode"
               },
               {
-                "$ref": "#/components/schemas/CloudTelemetryWriteMode"
+                "type": "null"
               }
             ]
           }
@@ -52678,11 +52866,11 @@
           "preset_config": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/PresetConfigSchema",
                 "description": "Preset-specific configuration (e.g., Dockerfile path for Docker preset)\n\nExample for Dockerfile preset:\n```json\n{\n  \"dockerfilePath\": \"docker/Dockerfile\",\n  \"buildContext\": \"./api\"\n}\n```"
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -52954,6 +53142,31 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateSandboxPlacementBody": {
+        "additionalProperties": false,
+        "description": "Replace the sandbox placement allow-list.",
+        "properties": {
+          "allowed_node_ids": {
+            "description": "Node ids allowed to run new sandboxes; `0` is the control plane.\nRequired: `null` allows every node, `[]` stops new sandboxes from\nbeing created anywhere. A body without this member is rejected, so\nan empty `{}` can never silently mean \"every node\". Existing\nsandboxes keep running wherever they are.",
+            "example": [
+              0,
+              3
+            ],
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "allowed_node_ids"
+        ],
         "type": "object"
       },
       "UpdateSecretBody": {
@@ -54249,10 +54462,10 @@
             "default": null,
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/VerificationResult"
               },
               {
-                "$ref": "#/components/schemas/VerificationResult"
+                "type": "null"
               }
             ]
           }
@@ -54988,10 +55201,10 @@
           "granularity": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/LocationGranularity"
               },
               {
-                "$ref": "#/components/schemas/LocationGranularity"
+                "type": "null"
               }
             ]
           },
@@ -57515,15 +57728,10 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          }
+          "401": {},
+          "403": {}
         },
         "security": [
           {
@@ -57555,18 +57763,11 @@
                   "$ref": "#/components/schemas/ApplicationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {}
         },
         "security": [
           {
@@ -57594,21 +57795,11 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          }
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "503": {}
         },
         "security": [
           {
@@ -57650,18 +57841,11 @@
                   "$ref": "#/components/schemas/ApplicationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -57732,18 +57916,11 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -57785,18 +57962,11 @@
                   "$ref": "#/components/schemas/ConversationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -57841,18 +58011,11 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -57902,21 +58065,12 @@
                   "$ref": "#/components/schemas/ThreadArtifactResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -57950,18 +58104,11 @@
                   "$ref": "#/components/schemas/ApplicationGitConnectionsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -58003,24 +58150,13 @@
                   "$ref": "#/components/schemas/GitBindingResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -58056,18 +58192,10 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -58111,24 +58239,13 @@
                   "$ref": "#/components/schemas/ApplicationPreviewLinkResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "503": {}
         },
         "security": [
           {
@@ -58174,21 +58291,12 @@
                   "$ref": "#/components/schemas/ApplicationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -58233,21 +58341,12 @@
                   "$ref": "#/components/schemas/ApplicationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -58292,21 +58391,12 @@
                   "$ref": "#/components/schemas/ApplicationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -58361,30 +58451,15 @@
                   "$ref": "#/components/schemas/ApplicationProjectDeploymentResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          },
-          "413": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {},
+          "413": {},
+          "503": {}
         },
         "security": [
           {
@@ -58428,18 +58503,11 @@
                   "$ref": "#/components/schemas/ApplicationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -58494,24 +58562,13 @@
                   "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -58559,27 +58616,13 @@
           "required": true
         },
         "responses": {
-          "204": {
-            "description": ""
-          },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "204": {},
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {},
+          "500": {}
         },
         "security": [
           {
@@ -58615,18 +58658,11 @@
                   "$ref": "#/components/schemas/ApplicationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -58661,21 +58697,12 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {},
+          "503": {}
         },
         "security": [
           {
@@ -58718,21 +58745,12 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -58778,24 +58796,13 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -58850,27 +58857,14 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceChangesResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          },
-          "504": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "503": {},
+          "504": {}
         },
         "security": [
           {
@@ -58912,30 +58906,15 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceDiffResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "413": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          },
-          "504": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "413": {},
+          "503": {},
+          "504": {}
         },
         "security": [
           {
@@ -58998,24 +58977,13 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceDirectoryResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
         },
         "security": [
           {
@@ -59057,24 +59025,13 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceFileContentResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
         },
         "security": [
           {
@@ -59121,27 +59078,14 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "413": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "413": {},
+          "500": {}
         },
         "security": [
           {
@@ -59187,27 +59131,14 @@
                   "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "413": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "413": {},
+          "500": {}
         },
         "security": [
           {
@@ -59280,15 +59211,10 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          }
+          "401": {},
+          "403": {}
         },
         "security": [
           {
@@ -59321,24 +59247,13 @@
                   "$ref": "#/components/schemas/ConversationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "409": {},
+          "503": {}
         },
         "security": [
           {
@@ -59393,21 +59308,12 @@
                   "$ref": "#/components/schemas/ConversationDetailResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -59450,21 +59356,12 @@
                   "$ref": "#/components/schemas/ConversationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -59491,18 +59388,10 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -59546,24 +59435,13 @@
                   "$ref": "#/components/schemas/ChatAttachmentResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "413": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "413": {}
         },
         "security": [
           {
@@ -59618,21 +59496,12 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -59680,18 +59549,11 @@
                   "$ref": "#/components/schemas/ConversationDiagnosticResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -59736,21 +59598,12 @@
                   "$ref": "#/components/schemas/SendMessageAcceptedResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -59788,18 +59641,11 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -59843,24 +59689,13 @@
                   "$ref": "#/components/schemas/ConversationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -59905,27 +59740,13 @@
           "required": true
         },
         "responses": {
-          "204": {
-            "description": ""
-          },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          },
-          "410": {
-            "description": ""
-          }
+          "204": {},
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {},
+          "410": {}
         },
         "security": [
           {
@@ -59952,18 +59773,10 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -59991,18 +59804,10 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -60036,18 +59841,11 @@
                   "$ref": "#/components/schemas/PendingActionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -60081,21 +59879,12 @@
                   "$ref": "#/components/schemas/PendingActionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -60129,21 +59918,12 @@
                   "$ref": "#/components/schemas/PendingActionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -60177,24 +59957,13 @@
                   "$ref": "#/components/schemas/ApplicationPreviewLinkResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "503": {}
         },
         "security": [
           {
@@ -60626,8 +60395,7 @@
                   "$ref": "#/components/schemas/ProviderDetailResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "404": {
             "content": {
@@ -60636,8 +60404,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -60769,8 +60536,7 @@
                   "$ref": "#/components/schemas/ProviderModelResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -60779,8 +60545,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -60820,8 +60585,7 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "404": {
             "content": {
@@ -60830,8 +60594,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -60869,9 +60632,7 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
-          },
+          "204": {},
           "400": {
             "content": {
               "application/json": {
@@ -60879,8 +60640,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -60933,8 +60693,7 @@
                   "$ref": "#/components/schemas/ProviderModelResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "404": {
             "content": {
@@ -60943,8 +60702,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -61980,18 +61738,11 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "503": {}
         },
         "security": [
           {
@@ -62029,18 +61780,11 @@
                   "$ref": "#/components/schemas/WorkspaceActivityResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {}
         },
         "security": [
           {
@@ -62087,24 +61831,13 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceChangesResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          },
-          "504": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "503": {},
+          "504": {}
         },
         "security": [
           {
@@ -62138,30 +61871,15 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceDiffResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "413": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          },
-          "504": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "413": {},
+          "503": {},
+          "504": {}
         },
         "security": [
           {
@@ -62216,24 +61934,13 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceDirectoryResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
         },
         "security": [
           {
@@ -62267,24 +61974,13 @@
                   "$ref": "#/components/schemas/ApplicationWorkspaceFileContentResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
         },
         "security": [
           {
@@ -62309,18 +62005,11 @@
                   "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "500": {}
         },
         "security": [
           {
@@ -62360,27 +62049,14 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "413": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "413": {},
+          "500": {}
         },
         "security": [
           {
@@ -62416,24 +62092,13 @@
                   "$ref": "#/components/schemas/WriteApplicationWorkspaceFilesResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "413": {
-            "description": ""
-          },
-          "500": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "413": {},
+          "500": {}
         },
         "security": [
           {
@@ -62468,21 +62133,12 @@
                   "$ref": "#/components/schemas/ApplicationPreviewLinkResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "503": {}
         },
         "security": [
           {
@@ -63069,10 +62725,10 @@
             "schema": {
               "oneOf": [
                 {
-                  "type": "null"
+                  "$ref": "#/components/schemas/AnalyticsFacet"
                 },
                 {
-                  "$ref": "#/components/schemas/AnalyticsFacet"
+                  "type": "null"
                 }
               ]
             }
@@ -63235,8 +62891,7 @@
                   "$ref": "#/components/schemas/GlobalAnalyticsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Invalid analytics filters"
@@ -63270,8 +62925,7 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "description": "Access denied"
@@ -69605,8 +69259,7 @@
                   "$ref": "#/components/schemas/CloudStatus"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -69630,8 +69283,7 @@
                   "$ref": "#/components/schemas/CloudAiCapability"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -69721,8 +69373,7 @@
                   "$ref": "#/components/schemas/ManagedBackupSetup"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -69746,8 +69397,7 @@
                   "$ref": "#/components/schemas/CloudCapability"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -69781,8 +69431,7 @@
                   "$ref": "#/components/schemas/CloudStatus"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -69816,8 +69465,7 @@
                   "$ref": "#/components/schemas/CloudStatus"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -69841,8 +69489,7 @@
                   "$ref": "#/components/schemas/CloudStatus"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -81300,7 +80947,7 @@
             "description": "Node not found"
           },
           "409": {
-            "description": "Node still has active containers"
+            "description": "Node still has active containers or live sandboxes"
           },
           "500": {
             "description": "Internal server error"
@@ -81783,8 +81430,7 @@
                   "$ref": "#/components/schemas/SetNodePublicIngressResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Node is not a worker"
@@ -83243,8 +82889,7 @@
                   "$ref": "#/components/schemas/AggregateResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -83253,8 +82898,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -83263,8 +82907,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "503": {
             "content": {
@@ -83273,8 +82916,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -83445,8 +83087,7 @@
                   "$ref": "#/components/schemas/AttributeKeysResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -83455,8 +83096,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -83465,8 +83105,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "503": {
             "content": {
@@ -83475,8 +83114,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -83500,8 +83138,7 @@
                   "$ref": "#/components/schemas/GlobalLogCapabilities"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -83510,8 +83147,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -83545,8 +83181,7 @@
                   "$ref": "#/components/schemas/GlobalLogFacetsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -83555,8 +83190,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -83565,8 +83199,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "408": {
             "content": {
@@ -83575,8 +83208,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -83768,8 +83400,7 @@
                   "$ref": "#/components/schemas/FacetsAttrsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -83778,8 +83409,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -83788,8 +83418,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "503": {
             "content": {
@@ -83798,8 +83427,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -84002,8 +83630,7 @@
                   "$ref": "#/components/schemas/HistogramResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -84012,8 +83639,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -84022,8 +83648,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "503": {
             "content": {
@@ -84032,8 +83657,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -84067,8 +83691,7 @@
                   "$ref": "#/components/schemas/GlobalLogSearchResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -84077,8 +83700,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -84087,8 +83709,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "408": {
             "content": {
@@ -84097,8 +83718,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -86951,10 +86571,10 @@
                 "schema": {
                   "oneOf": [
                     {
-                      "type": "null"
+                      "$ref": "#/components/schemas/BulkActivationJobResponse"
                     },
                     {
-                      "$ref": "#/components/schemas/BulkActivationJobResponse"
+                      "type": "null"
                     }
                   ]
                 }
@@ -88652,8 +88272,7 @@
                   "$ref": "#/components/schemas/GlobalTracesResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -88662,8 +88281,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -88867,8 +88485,7 @@
                   "$ref": "#/components/schemas/GlobalTraceSummariesResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -88877,8 +88494,7 @@
                   "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -92429,8 +92045,7 @@
                   "$ref": "#/components/schemas/PreviewGatewayLogsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -92492,8 +92107,7 @@
                   "$ref": "#/components/schemas/PreviewGatewaySettingsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -92525,8 +92139,7 @@
                   "$ref": "#/components/schemas/PreviewGatewaySettingsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -92560,8 +92173,7 @@
                   "$ref": "#/components/schemas/GatewayStatus"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -93132,8 +92744,7 @@
                   "$ref": "#/components/schemas/ComposeSecurityResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "description": "Forbidden"
@@ -93178,8 +92789,7 @@
                   "$ref": "#/components/schemas/ComposeSecurityResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Invalid settings or missing acknowledgement"
@@ -93881,10 +93491,10 @@
                 "schema": {
                   "oneOf": [
                     {
-                      "type": "null"
+                      "$ref": "#/components/schemas/AgentRunResponse"
                     },
                     {
-                      "$ref": "#/components/schemas/AgentRunResponse"
+                      "type": "null"
                     }
                   ]
                 }
@@ -94730,23 +94340,18 @@
                 "schema": {
                   "oneOf": [
                     {
-                      "type": "null"
+                      "$ref": "#/components/schemas/ConversationResponse"
                     },
                     {
-                      "$ref": "#/components/schemas/ConversationResponse"
+                      "type": "null"
                     }
                   ]
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          }
+          "401": {},
+          "403": {}
         },
         "security": [
           {
@@ -94789,18 +94394,11 @@
                   "$ref": "#/components/schemas/ConversationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -94838,15 +94436,10 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          }
+          "401": {},
+          "403": {}
         },
         "security": [
           {
@@ -94909,21 +94502,12 @@
                   "$ref": "#/components/schemas/ConversationDetailResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -94974,21 +94558,12 @@
                   "$ref": "#/components/schemas/ConversationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -95024,18 +94599,10 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -95091,18 +94658,10 @@
             },
             "description": "Turn accepted; output follows on the conversation WebSocket"
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -95149,18 +94708,11 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -95213,24 +94765,13 @@
                   "$ref": "#/components/schemas/ConversationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "400": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -95340,18 +94881,10 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "204": {},
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -95394,18 +94927,11 @@
                   "$ref": "#/components/schemas/PendingActionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {}
         },
         "security": [
           {
@@ -95448,24 +94974,13 @@
                   "$ref": "#/components/schemas/PendingActionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          },
-          "503": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {},
+          "503": {}
         },
         "security": [
           {
@@ -95508,21 +95023,12 @@
                   "$ref": "#/components/schemas/PendingActionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          },
-          "409": {
-            "description": ""
-          }
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {}
         },
         "security": [
           {
@@ -96103,8 +95609,7 @@
                   "$ref": "#/components/schemas/ActivityStatus"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -96186,8 +95691,7 @@
                   "$ref": "#/components/schemas/ActivityGoals"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Invalid public URL or consent missing"
@@ -96247,8 +95751,7 @@
                   "$ref": "#/components/schemas/ActivityPreview"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Invalid goal or sharing disabled"
@@ -96301,8 +95804,7 @@
                   "$ref": "#/components/schemas/ActivityReport"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -106270,8 +105772,7 @@
                   "$ref": "#/components/schemas/ListMcpsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -106318,8 +105819,7 @@
                   "$ref": "#/components/schemas/McpDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -106410,8 +105910,7 @@
                   "$ref": "#/components/schemas/McpDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -106470,8 +105969,7 @@
                   "$ref": "#/components/schemas/McpDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -106531,8 +106029,7 @@
                   "$ref": "#/components/schemas/SensitiveMcpConfigValueResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Field is not revealable"
@@ -107291,8 +106788,7 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -107333,8 +106829,7 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -107379,8 +106874,7 @@
                   "$ref": "#/components/schemas/IntegrationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Validation error"
@@ -107425,9 +106919,7 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
-          }
+          "204": {}
         },
         "security": [
           {
@@ -107482,8 +106974,7 @@
                   "$ref": "#/components/schemas/IntegrationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Validation error"
@@ -107535,8 +107026,7 @@
                   "$ref": "#/components/schemas/ImportOutcomeResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Malformed CSV or wrong provider"
@@ -107591,8 +107081,7 @@
                   "$ref": "#/components/schemas/ImportOutcomeResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Malformed CSV or wrong provider"
@@ -107647,8 +107136,7 @@
                   "$ref": "#/components/schemas/IntegrationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -107704,8 +107192,7 @@
                   "$ref": "#/components/schemas/IntegrationResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Validation error"
@@ -107751,8 +107238,7 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -107792,8 +107278,7 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -107830,8 +107315,7 @@
                   "$ref": "#/components/schemas/MetricsSummaryResponse"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -108310,8 +107794,7 @@
                   "$ref": "#/components/schemas/ListSkillsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -108358,8 +107841,7 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -108408,8 +107890,7 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -108501,8 +107982,7 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -108561,8 +108041,7 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -113381,8 +112860,7 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -113408,8 +112886,7 @@
                   "$ref": "#/components/schemas/GlobalMrrResponse"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -113446,8 +112923,7 @@
                   "$ref": "#/components/schemas/GlobalRevenueSummaryResponse"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -113476,8 +112952,7 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -113801,8 +113276,7 @@
                   "$ref": "#/components/schemas/ProviderCatalogResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -113851,8 +113325,7 @@
                   "$ref": "#/components/schemas/UpdateAiProviderResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Unknown provider"
@@ -113894,8 +113367,7 @@
                   "$ref": "#/components/schemas/ActivateProviderResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Provider not configured"
@@ -113948,8 +113420,7 @@
                   "$ref": "#/components/schemas/SaveCredentialResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Validation error"
@@ -114000,8 +113471,7 @@
                   "$ref": "#/components/schemas/ImportLocalCredentialResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Unknown provider or invalid local credential"
@@ -114059,8 +113529,7 @@
                   "$ref": "#/components/schemas/SaveCredentialResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Invalid model or credential rejected"
@@ -114102,8 +113571,7 @@
                   "$ref": "#/components/schemas/RefreshProviderModelsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Unknown provider"
@@ -114151,8 +113619,7 @@
                   "$ref": "#/components/schemas/HarnessCheckReport"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Unknown provider"
@@ -114213,8 +113680,7 @@
                   "$ref": "#/components/schemas/HarnessCheckReport"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Consent required or unknown provider"
@@ -114573,8 +114039,7 @@
                   "$ref": "#/components/schemas/ListMcpsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -114609,8 +114074,7 @@
                   "$ref": "#/components/schemas/McpDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -114681,8 +114145,7 @@
                   "$ref": "#/components/schemas/McpDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -114731,8 +114194,7 @@
                   "$ref": "#/components/schemas/McpDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -114782,8 +114244,7 @@
                   "$ref": "#/components/schemas/SensitiveMcpConfigValueResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "description": "Field is not revealable"
@@ -115027,8 +114488,7 @@
                   "$ref": "#/components/schemas/ListSkillsResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -115063,8 +114523,7 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -115101,8 +114560,7 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -115174,8 +114632,7 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -115224,8 +114681,7 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "description": "Unauthorized"
@@ -117926,6 +117382,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "422": {
+            "description": "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -117935,6 +117394,224 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/placement": {
+      "get": {
+        "operationId": "get_sandbox_placement",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxPlacementResponse"
+                }
+              }
+            },
+            "description": "Sandbox placement state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the nodes sandboxes can be placed on and the operator allow-list.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "update_sandbox_placement",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSandboxPlacementBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxPlacementResponse"
+                }
+              }
+            },
+            "description": "Updated placement state"
+          },
+          "400": {
+            "description": "Unknown or duplicate node id, or `allowed_node_ids` missing (send `null` to allow every node)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Administrator role required"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set which nodes may run new sandboxes. Admin only.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/placement/nodes/{node}": {
+      "get": {
+        "operationId": "list_node_sandboxes",
+        "parameters": [
+          {
+            "description": "Worker name or id, or `control-plane` / `0`",
+            "in": "path",
+            "name": "node",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1-based page (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeSandboxesResponse"
+                }
+              }
+            },
+            "description": "Sandboxes on the node"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Administrator role required"
+          },
+          "404": {
+            "description": "No such node"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List every live sandbox on one node, from all owners. Admin only: it\nexposes other users' sandboxes.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/placement/nodes/{node}/evict": {
+      "post": {
+        "operationId": "evict_node_sandboxes",
+        "parameters": [
+          {
+            "description": "Worker name or id",
+            "in": "path",
+            "name": "node",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeEvictionResponse"
+                }
+              }
+            },
+            "description": "Sandboxes destroyed"
+          },
+          "400": {
+            "description": "The control plane cannot be evicted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Administrator role required"
+          },
+          "404": {
+            "description": "No such worker node"
+          },
+          "409": {
+            "description": "An eviction of this node is already running"
+          },
+          "428": {
+            "description": "Recent MFA verification required (browser sessions)"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeEvictionIncompleteProblem"
+                }
+              }
+            },
+            "description": "Some sandboxes could not be destroyed; `destroyed`, `containers_unconfirmed` and `failed` list them, and retrying picks the failed ones up"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Destroy every live sandbox on a worker node, from all owners, so the node\ncan be removed. Works on a node that is offline for good: its sandboxes\nare marked destroyed even when the node cannot be reached. Admin only.",
         "tags": [
           "Sandboxes"
         ],
@@ -118181,6 +117858,9 @@
           },
           "409": {
             "description": "Sandbox belongs to an active agent run — stop the run instead"
+          },
+          "503": {
+            "description": "The sandbox's worker node is unreachable; the sandbox was kept"
           }
         },
         "security": [
@@ -119377,6 +119057,9 @@
           },
           "409": {
             "description": "Sandbox belongs to an active agent run — stop the run instead"
+          },
+          "503": {
+            "description": "The sandbox's worker node is unreachable; the sandbox was kept"
           }
         },
         "security": [
