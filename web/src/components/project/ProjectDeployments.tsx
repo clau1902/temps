@@ -64,6 +64,12 @@ import {
   UploadCloud,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
+import {
+  AUTO_REFRESH_MAX_POLLS,
+  defaultDeployEnvironment,
+  projectDeploysImage,
+  shouldStopAutoRefresh,
+} from '@/lib/project-deploy-action'
 
 const ITEMS_PER_PAGE = 10
 
@@ -88,6 +94,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   const [searchParams, setSearchParams] = useSearchParams()
   const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const initialDeploymentCountRef = useRef<number | null>(null)
+  const autoRefreshPollsRef = useRef(0)
   const [currentPage, setCurrentPage] = useState(1)
 
   // Handle opening new deployment modal
@@ -117,7 +124,25 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     ? Math.ceil(deploymentsData.total / ITEMS_PER_PAGE)
     : 1
 
-  // Auto-refresh when coming from deployment details
+  const stopAutoRefresh = useCallback(() => {
+    if (refreshIntervalRef.current) {
+      clearInterval(refreshIntervalRef.current)
+      refreshIntervalRef.current = null
+    }
+    initialDeploymentCountRef.current = null
+    autoRefreshPollsRef.current = 0
+    setSearchParams(
+      (previous) => {
+        const next = new URLSearchParams(previous)
+        next.delete('autoRefresh')
+        return next
+      },
+      { replace: true }
+    )
+  }, [setSearchParams])
+
+  // Auto-refresh after a deployment was started elsewhere (deployment
+  // details, the header Deploy button, a new project's first deploy).
   useEffect(() => {
     const autoRefresh = searchParams.get('autoRefresh')
 
@@ -127,28 +152,28 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         initialDeploymentCountRef.current = deploymentsData.deployments.length
       }
 
-      // Check if a new deployment appeared
-      const hasNewDeployment =
-        deploymentsData.deployments.length > initialDeploymentCountRef.current
-
-      if (hasNewDeployment) {
-        // New deployment found, stop refreshing and clear the query param
-        if (refreshIntervalRef.current) {
-          clearInterval(refreshIntervalRef.current)
-          refreshIntervalRef.current = null
-        }
-        setSearchParams({}, { replace: true })
-        initialDeploymentCountRef.current = null
-      } else {
-        // No new deployment yet, set up refresh interval
-        if (!refreshIntervalRef.current) {
-          refreshIntervalRef.current = setInterval(() => {
-            refetch()
-          }, 1000)
-        }
+      if (
+        shouldStopAutoRefresh({
+          initialCount: initialDeploymentCountRef.current,
+          currentCount: deploymentsData.deployments.length,
+          polls: autoRefreshPollsRef.current,
+        })
+      ) {
+        stopAutoRefresh()
+      } else if (!refreshIntervalRef.current) {
+        // The bound is checked here too: an unchanged list keeps the same
+        // query data, so this effect would not run again to stop it.
+        refreshIntervalRef.current = setInterval(() => {
+          autoRefreshPollsRef.current++
+          if (autoRefreshPollsRef.current >= AUTO_REFRESH_MAX_POLLS) {
+            stopAutoRefresh()
+            return
+          }
+          refetch()
+        }, 1000)
       }
     }
-  }, [deploymentsData, searchParams, setSearchParams, refetch])
+  }, [deploymentsData, searchParams, stopAutoRefresh, refetch])
 
   // Cleanup interval on unmount
   useEffect(() => {
@@ -303,16 +328,18 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   useEffect(() => {
     if (searchParams.get('deploy') !== 'true') return
 
+    const requestedImage = searchParams.get('image')?.trim()
     const nextSearchParams = new URLSearchParams(searchParams)
     nextSearchParams.delete('deploy')
+    nextSearchParams.delete('image')
     setSearchParams(nextSearchParams, { replace: true })
 
     if (project.source_type === 'static_files') {
       setStaticDialogOpen(true)
       return
     }
-    if (project.source_type === 'docker_image') {
-      setImageRefInput(imageRef ?? '')
+    if (projectDeploysImage(project)) {
+      setImageRefInput(requestedImage || imageRef || '')
       setImageDialogOpen(true)
       return
     }
@@ -321,7 +348,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   }, [
     handleOpenNewDeployment,
     imageRef,
-    project.source_type,
+    project,
     searchParams,
     setSearchParams,
   ])
@@ -445,6 +472,15 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       path: { project_id: project.id },
     }),
   })
+  // Until the user picks one, the image dialog targets production so a
+  // first deploy is one click.
+  const effectiveImageEnv =
+    imageEnv ||
+    String(
+      defaultDeployEnvironment(
+        environmentsQuery.data as EnvironmentResponse[] | undefined
+      )?.id ?? ''
+    )
 
   const promoteDeploymentMut = useMutation({
     ...promoteDeploymentMutation(),
@@ -501,10 +537,13 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   // Deploy a specific image ref (may differ from the last one) to an environment.
   const handleDeployImage = async () => {
     const ref = imageRefInput.trim()
-    if (!ref || !imageEnv) return
+    if (!ref || !effectiveImageEnv) return
     try {
       await deployImageMut.mutateAsync({
-        path: { project_id: project.id, environment_id: parseInt(imageEnv) },
+        path: {
+          project_id: project.id,
+          environment_id: parseInt(effectiveImageEnv),
+        },
         body: {
           ...serviceTemplateDeployOverrides(project),
           image_ref: ref,
@@ -608,7 +647,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           </div>
           <div className="space-y-2">
             <Label>Environment</Label>
-            <Select value={imageEnv} onValueChange={setImageEnv}>
+            <Select value={effectiveImageEnv} onValueChange={setImageEnv}>
               <SelectTrigger>
                 <SelectValue placeholder="Select environment..." />
               </SelectTrigger>
@@ -638,7 +677,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           <Button
             onClick={handleDeployImage}
             disabled={
-              !imageRefInput.trim() || !imageEnv || deployImageMut.isPending
+              !imageRefInput.trim() ||
+              !effectiveImageEnv ||
+              deployImageMut.isPending
             }
           >
             {deployImageMut.isPending && (
@@ -797,7 +838,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
                   Upload new source
                 </Link>
               </Button>
-            ) : project.source_type === 'docker_image' ? (
+            ) : projectDeploysImage(project) ? (
               <Button
                 onClick={() => {
                   setImageRefInput(imageRef ?? '')
