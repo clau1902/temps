@@ -563,7 +563,9 @@ mod command_tree_tests {
 
     fn expected_leaf_paths() -> BTreeSet<String> {
         [
-            "agent",
+            "agent service install",
+            "agent service status",
+            "agent service uninstall",
             "api-key",
             "backfill clickhouse",
             "backfill cloud-telemetry",
@@ -574,7 +576,7 @@ mod command_tree_tests {
             "deploy git",
             "deploy image",
             "deploy static",
-            "doctor",
+            "doctor mesh",
             "domain add",
             "domain cert-status",
             "domain delete",
