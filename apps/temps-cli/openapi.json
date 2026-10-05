@@ -7868,7 +7868,7 @@
           },
           "console_access_enabled": {
             "default": false,
-            "description": "ADR-045 §5: explicit consent to let Temps Cloud open this instance's\nconsole over the console-proxy tunnel — no inbound port, but\ninteractive admin access relayed through a third party, with the\nmanaged OIDC provider as the only sign-in path. Unlike\n`telemetry_enabled`/`backups_enabled`, this is **not** always\noperator-initiated: the unattended first-boot bootstrap\n(`TEMPS_CLOUD_ENROLLMENT_CODE`, no operator present) sets this `true`\nonce, at the moment the link is established, and audits the decision\nlike any other write — see `CloudEnrollmentActor::UnattendedBootstrap`\nin `temps-cloud`. An operator-pasted enrollment code leaves this at\nits `false` default, matching `telemetry_enabled`/`backups_enabled`'s\n\"linking never enables export; settings are applied explicitly\" rule.",
+            "description": "Explicit operator consent to let Temps Cloud open this instance's\nconsole over the outbound relay, using managed OIDC authentication.\nDefault off for every enrollment path. Linking, including unattended\nbootstrap, never enables console access; enable it explicitly in\nSettings > Temps Cloud or with `temps cloud console-access enable`.",
             "type": "boolean"
           },
           "notifications_enabled": {
