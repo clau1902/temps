@@ -73,7 +73,11 @@ bunx @temps-sdk/cli containers list -p <project-id>          # note the containe
 ssh your-server 'docker exec <container_name> python manage.py migrate'
 ```
 
-Run this manually (or from your CI/CD pipeline right after the deploy step) every time a deploy includes a schema change. Do not add `python manage.py migrate` to your Dockerfile's `CMD` or start command — with rolling deploys, restarts, or multiple replicas, the container start command can run more than once, and concurrent migration runs against the same database can conflict or corrupt data.
+Run this manually (or from your CI/CD pipeline right after the deploy step) every time a deploy includes a schema change.
+
+On the first deploy the tables don't exist yet. If your app's `/` needs the database, the deploy fails its health check before you can migrate, so point the health check at a view that doesn't, such as a simple `/health` view, with `health.path` in `.temps.yaml` (see [Health checks](#health-checks)).
+
+Do not add `python manage.py migrate` to your Dockerfile's `CMD` or start command — with rolling deploys, restarts, or multiple replicas, the container start command can run more than once, and concurrent migration runs against the same database can conflict or corrupt data.
 
 ---
 
@@ -91,7 +95,7 @@ import os
 # Defaulting to "*" would turn off Django's Host header validation.
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()]
 
-# Injected by Temps when a managed PostgreSQL database is linked
+# If you linked a managed PostgreSQL database: Temps injects these variables
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
@@ -110,10 +114,11 @@ STORAGES = {
     "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
 }
 
+# Keep your existing middleware and add WhiteNoise right after SecurityMiddleware
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
-    # ...
+    # ...the rest of your existing middleware, unchanged
 ]
 ```
 

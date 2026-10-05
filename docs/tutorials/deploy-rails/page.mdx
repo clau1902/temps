@@ -59,6 +59,12 @@ With that preset, the build runs `bundle install`, precompiles assets, and start
 | Port | `PORT` env var injected, defaults to 3000 |
 | Action Cable | WebSocket support via reverse proxy |
 
+Apps generated before Rails 7.1 serve the precompiled assets in `public/` only when `RAILS_SERVE_STATIC_FILES` is set, and Temps doesn't set it. For those apps, set it yourself:
+
+<CliCommands commands={[
+  { args: "environments vars set RAILS_SERVE_STATIC_FILES 1 -e production" },
+]} />
+
 Database migrations are **not** run automatically — see [Run migrations](#migrations) below.
 
 ---
@@ -73,7 +79,11 @@ bunx @temps-sdk/cli containers list -p <project-id>          # note the containe
 ssh your-server 'docker exec <container_name> bundle exec rails db:migrate'
 ```
 
-Run this manually (or from your CI/CD pipeline right after the deploy step) every time a deploy includes a schema change. Do not add `bundle exec rails db:migrate` to your Dockerfile's `CMD` or start command — with rolling deploys, restarts, or multiple replicas, the container start command can run more than once, and concurrent migration runs against the same database can conflict or corrupt data.
+Run this manually (or from your CI/CD pipeline right after the deploy step) every time a deploy includes a schema change.
+
+On the first deploy the tables don't exist yet. If your app's `/` needs the database, the deploy fails its health check before you can migrate, so point the health check at a path that doesn't, such as Rails' built-in `/up` (Rails 7.1 and later), with `health.path` in `.temps.yaml` (see [Health checks](#health-checks)).
+
+Do not add `bundle exec rails db:migrate` to your Dockerfile's `CMD` or start command — with rolling deploys, restarts, or multiple replicas, the container start command can run more than once, and concurrent migration runs against the same database can conflict or corrupt data.
 
 ---
 
