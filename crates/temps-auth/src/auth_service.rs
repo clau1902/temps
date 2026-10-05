@@ -125,18 +125,24 @@ impl AuthService {
     }
 
     pub async fn create_session(&self, user_id: i32) -> Result<String, AuthError> {
-        // Check and insert under a shared lock on the user row. An admin
-        // password reset (`UserService::admin_reset_password`) takes the
-        // exclusive lock to flag the account and delete its sessions, so the
-        // two serialize: either this session is inserted first and the reset
-        // deletes it, or the reset commits first and the flag is seen here.
-        // Without the lock, a login that verified the old password could
-        // insert its session after the reset's delete and survive it.
         let transaction = self.db.begin().await?;
+        let token = self
+            .create_session_in_transaction(user_id, None, &transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(token)
+    }
+
+    async fn create_session_in_transaction(
+        &self,
+        user_id: i32,
+        issuer: Option<&str>,
+        transaction: &sea_orm::DatabaseTransaction,
+    ) -> Result<String, AuthError> {
         let user = temps_entities::users::Entity::find_by_id(user_id)
             .filter(temps_entities::users::Column::DeletedAt.is_null())
             .lock_shared()
-            .one(&transaction)
+            .one(transaction)
             .await?
             .ok_or_else(|| AuthError::NotFound(format!("User {user_id} not found or deleted")))?;
         if user.must_change_password {
@@ -152,12 +158,11 @@ impl AuthService {
             expires_at: Set(expires_at),
             // Fully authenticated session, not an MFA challenge.
             mfa_pending: Set(false),
+            mfa_pending_origin: Set(issuer.map(str::to_owned)),
             ..Default::default()
         };
 
-        new_session.insert(&transaction).await?;
-        transaction.commit().await?;
-
+        new_session.insert(transaction).await?;
         Ok(session_token)
     }
 
@@ -345,7 +350,13 @@ impl AuthService {
             .one(self.db.as_ref())
             .await?;
 
-        Ok(session.and_then(|s| s.mfa_pending_origin))
+        Ok(session.and_then(|s| s.mfa_pending_origin).map(|origin| {
+            if origin.starts_with("oidc:") {
+                "oidc".to_string()
+            } else {
+                origin
+            }
+        }))
     }
 
     // Verifies the MFA code
@@ -360,37 +371,64 @@ impl AuthService {
     }
 
     /// Keep the verified challenge's origin until the final session is issued.
-    /// OIDC MFA must pass the same post-insert revocation fence as direct login.
+    /// OIDC MFA checks its issuing provider in the session-creation transaction.
     pub(crate) async fn create_session_after_mfa(
         &self,
         user: &temps_entities::users::Model,
         origin: Option<&str>,
-        oidc: &crate::oidc_service::OidcService,
     ) -> Result<String, AuthError> {
-        let provider_id = if origin == Some("oidc") {
-            Some(user.oidc_provider_id.ok_or_else(|| {
-                AuthError::Unauthorized(
-                    "The OIDC provider is no longer available. Please log in again.".into(),
-                )
-            })?)
-        } else {
-            None
-        };
-        let token = self.create_session(user.id).await?;
-        if let Some(provider_id) = provider_id {
-            oidc.assert_provider_live_for_session(provider_id, &token)
-                .await
-                .map_err(|error| match error {
-                    crate::oidc_errors::OidcError::ProviderRevokedDuringLogin { .. } => {
-                        AuthError::Unauthorized(
-                            "The OIDC provider was revoked. Please log in again.".into(),
-                        )
-                    }
-                    error => AuthError::InternalServerError(format!(
-                        "OIDC session verification failed: {error}"
-                    )),
+        self.create_authenticated_session(user.id, origin).await
+    }
+
+    pub(crate) async fn create_oidc_session(
+        &self,
+        user_id: i32,
+        provider_id: i32,
+    ) -> Result<String, AuthError> {
+        self.create_authenticated_session(user_id, Some(&format!("oidc:{provider_id}")))
+            .await
+    }
+
+    async fn create_authenticated_session(
+        &self,
+        user_id: i32,
+        origin: Option<&str>,
+    ) -> Result<String, AuthError> {
+        let transaction = self.db.begin().await?;
+        if let Some(origin) = origin.filter(|origin| origin.starts_with("oidc")) {
+            // Bind to the immutable issuer recorded on the challenge, never
+            // the user's mutable provider ID. Old unbound challenges expire
+            // normally but must restart login to gain this protection.
+            let provider_id = origin
+                .strip_prefix("oidc:")
+                .and_then(|id| id.parse::<i32>().ok())
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    AuthError::Unauthorized(
+                        "Restart OIDC login to verify the issuing provider.".into(),
+                    )
                 })?;
+            let provider = temps_entities::oidc_providers::Entity::find_by_id(provider_id)
+                .lock_shared()
+                .one(&transaction)
+                .await?;
+            if !provider.is_some_and(|provider| provider.enabled) {
+                return Err(AuthError::Unauthorized(
+                    "The OIDC provider was revoked. Please log in again.".into(),
+                ));
+            }
         }
+        // Check and insert commit together under the provider lock. Query or
+        // insert failure rolls back; teardown either wins first or deletes
+        // this committed session after acquiring its exclusive provider lock.
+        let token = self
+            .create_session_in_transaction(
+                user_id,
+                origin.filter(|origin| origin.starts_with("oidc:")),
+                &transaction,
+            )
+            .await?;
+        transaction.commit().await?;
         Ok(token)
     }
 
@@ -1479,6 +1517,30 @@ mod tests {
     // Session Management Tests
 
     #[tokio::test]
+    async fn failed_oidc_mfa_provider_check_never_inserts_a_session() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("provider lookup unavailable".into())])
+                .into_connection(),
+        );
+        let auth = AuthService::new(db.clone(), Arc::new(MockEmailService::new()));
+        assert!(auth
+            .create_authenticated_session(7, Some("oidc:5"))
+            .await
+            .is_err());
+        assert!(matches!(
+            auth.create_authenticated_session(7, Some("oidc")).await,
+            Err(AuthError::Unauthorized(_))
+        ));
+        drop(auth);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(
+            !format!("{transactions:?}").contains("INSERT"),
+            "failed provider checks must never create authenticated sessions"
+        );
+    }
+
+    #[tokio::test]
     async fn oidc_mfa_completion_cannot_survive_provider_revocation() {
         let (db, auth, _) = setup_test_env().await;
         let oidc = crate::oidc_service::OidcService::new(
@@ -1501,38 +1563,73 @@ mod tests {
         let mut active: users::ActiveModel = user.into();
         active.oidc_provider_id = Set(Some(provider.id));
         let user = active.update(db.db.as_ref()).await.unwrap();
-        let pending = auth.create_mfa_session(user.id, "oidc").await.unwrap();
+        let pending = auth
+            .create_mfa_session(user.id, &format!("oidc:{}", provider.id))
+            .await
+            .unwrap();
         let code = current_totp_code(user.mfa_secret.as_deref().unwrap());
         let (verified, origin) = auth
             .verify_mfa_challenge_with_origin(&pending, &code)
             .await
             .unwrap();
-        assert_eq!(origin.as_deref(), Some("oidc"));
+        assert_eq!(origin, Some(format!("oidc:{}", provider.id)));
         let token = auth
-            .create_session_after_mfa(&verified, origin.as_deref(), &oidc)
+            .create_session_after_mfa(&verified, origin.as_deref())
             .await
             .unwrap();
         assert!(auth.verify_session(&token).await.is_ok());
 
         // Consume another valid challenge before revocation, then finish the
         // delayed MFA request after teardown has deleted every visible session.
-        let pending = auth.create_mfa_session(user.id, "oidc").await.unwrap();
+        let pending = auth
+            .create_mfa_session(user.id, &format!("oidc:{}", provider.id))
+            .await
+            .unwrap();
         let (verified, origin) = auth
             .verify_mfa_challenge_with_origin(&pending, &code)
             .await
             .unwrap();
+        auth.create_oidc_session(user.id, provider.id)
+            .await
+            .unwrap();
+        auth.create_mfa_session(user.id, &format!("oidc:{}", provider.id))
+            .await
+            .unwrap();
+        let other_provider = temps_entities::oidc_providers::ActiveModel {
+            name: Set("Other provider".into()),
+            issuer_url: Set("https://other.example.com".into()),
+            client_id: Set("other-client".into()),
+            client_secret_encrypted: Set("unused-test-secret".into()),
+            enabled: Set(true),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let mut relinked: users::ActiveModel = verified.into();
+        relinked.oidc_provider_id = Set(Some(other_provider.id));
+        let verified = relinked.update(db.db.as_ref()).await.unwrap();
         assert!(oidc.revoke_managed_cloud_provider().await.unwrap());
         assert!(matches!(
-            auth.create_session_after_mfa(&verified, origin.as_deref(), &oidc)
+            auth.create_session_after_mfa(&verified, origin.as_deref())
                 .await,
             Err(AuthError::Unauthorized(_))
         ));
         assert_eq!(auth.count_active_sessions(user.id).await.unwrap(), 0);
+        assert_eq!(
+            sessions::Entity::find()
+                .filter(sessions::Column::UserId.eq(user.id))
+                .count(db.db.as_ref())
+                .await
+                .unwrap(),
+            0,
+            "revocation removes bound pending and full sessions after user relinking"
+        );
 
         // A password challenge keeps its own authentication semantics.
         let local = create_test_user(&db.db, "local-mfa@example.com", "Password123!").await;
         assert!(auth
-            .create_session_after_mfa(&local, Some("password"), &oidc)
+            .create_session_after_mfa(&local, Some("password"))
             .await
             .is_ok());
     }

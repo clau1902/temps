@@ -319,32 +319,6 @@ impl CloudService {
         *self.console_access_tx.borrow()
     }
 
-    /// ADR-045 §5: set `cloud.console_access_enabled = true`, exactly once,
-    /// at the moment the unattended first-boot bootstrap
-    /// (`CloudEnrollmentActor::UnattendedBootstrap`) establishes a *new*
-    /// Cloud link. Called from `temps-cli`'s
-    /// `bootstrap_cloud_enrollment_from_env`, immediately after the
-    /// `CLOUD_LINK_CONNECTED` audit row is written for the same event — the
-    /// caller is expected to audit this decision too (there is no
-    /// `AuditLogger` in this crate's dependency graph to do so here).
-    ///
-    /// Never called on the operator-pasted `POST /cloud/enroll` path, which
-    /// leaves the field at its `false` default.
-    pub async fn enable_console_access_for_unattended_bootstrap(
-        &self,
-    ) -> Result<(), CloudServiceError> {
-        let settings = self.config.set_console_access_enabled(true).await?;
-        self.apply_console_access_from_settings(&settings);
-        self.link
-            .set_feature_switches(CloudFeatureSwitches {
-                telemetry: settings.cloud.telemetry_enabled,
-                backups: settings.cloud.backups_enabled,
-                notifications: settings.cloud.notifications_enabled,
-                console_access: true,
-            })
-            .map_err(CloudServiceError::State)
-    }
-
     /// Publish `settings.cloud.console_access_enabled` to
     /// [`Self::console_access_enabled_rx`]. A no-op send when the value has
     /// not changed, so subscribers only wake on a real transition.

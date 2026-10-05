@@ -459,8 +459,9 @@ impl OidcService {
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "DELETE FROM sessions WHERE user_id IN \
-                 (SELECT id FROM users WHERE oidc_provider_id = $1 AND deleted_at IS NULL)",
-                vec![provider_id.into()],
+                 (SELECT id FROM users WHERE oidc_provider_id = $1 AND deleted_at IS NULL) \
+                 OR mfa_pending_origin = $2",
+                vec![provider_id.into(), format!("oidc:{provider_id}").into()],
             ))
             .await?;
 

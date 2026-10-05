@@ -24,9 +24,9 @@ pub use console_oidc_bootstrap::{
 };
 pub use handler::{
     cloud_routes, record_backend_url_bootstrapped_audit, record_backup_outcome_audit,
-    record_console_access_default_enabled_audit, record_console_oidc_bootstrapped_audit,
-    record_enrollment_audit, record_link_connected_audit, CloudApiDoc, CloudEnrollmentActor,
-    CLOUD_CONSOLE_OIDC_BOOTSTRAPPED, UNATTENDED_ENROLLMENT_USER_AGENT,
+    record_console_oidc_bootstrapped_audit, record_enrollment_audit, record_link_connected_audit,
+    CloudApiDoc, CloudEnrollmentActor, CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
+    UNATTENDED_ENROLLMENT_USER_AGENT,
 };
 pub use plugin::CloudPlugin;
 pub use service::{

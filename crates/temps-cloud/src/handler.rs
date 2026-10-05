@@ -736,27 +736,6 @@ pub async fn record_link_connected_audit(audit: &dyn AuditLogger, actor: CloudEn
     write_cloud_link_audit(audit, actor, "CLOUD_LINK_CONNECTED", None, None).await;
 }
 
-/// ADR-045 §5: audits the unattended first-boot bootstrap's one-time,
-/// automatic `cloud.console_access_enabled = true` default -- called by
-/// `temps-cli`'s `bootstrap_cloud_enrollment_from_env` right after
-/// [`record_link_connected_audit`] for the same enrollment, since this
-/// default is a direct, disclosed consequence of that specific enrollment
-/// path (never the operator-pasted one) rather than an ordinary settings
-/// change.
-pub async fn record_console_access_default_enabled_audit(
-    audit: &dyn AuditLogger,
-    actor: CloudEnrollmentActor,
-) {
-    write_cloud_link_audit(
-        audit,
-        actor,
-        "cloud.console_access_enabled.default_on_bootstrap",
-        None,
-        None,
-    )
-    .await;
-}
-
 /// `CLOUD_BACKEND_URL_BOOTSTRAPPED` — written when the `TEMPS_CLOUD_BACKEND_URL`
 /// one-shot bootstrap input persists a non-default `cloud.backend_url` before
 /// the unattended enrollment it enables runs. A distinct event from

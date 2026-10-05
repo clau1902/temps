@@ -431,14 +431,10 @@ pub struct CloudSettings { /* ... */ pub console_access_enabled: bool }
 pub struct CloudFeatureSwitches { pub telemetry: bool, pub backups: bool, pub notifications: bool, pub console_access: bool }
 ```
 
-**Default depends on how the link was established**, reusing
-`CloudEnrollmentActor` (`temps-cloud/src/handler.rs:65–68`,
-`console.rs:903–961`): `UnattendedBootstrap` (the
-`TEMPS_CLOUD_ENROLLMENT_CODE` first-boot path — no operator present) →
-**default on**. `Operator(_)` (a pasted code) → **default off**, matching
-`telemetry_enabled`/`backups_enabled`'s "linking never enables export;
-settings are applied explicitly" rule (`temps-cloud-client/src/lib.rs:53–56`).
-Never an env var.
+**Default off for every enrollment path.** Neither unattended bootstrap nor
+operator enrollment changes remote-console consent. Enable access explicitly
+from Settings > Temps Cloud or `temps cloud console-access enable`, matching
+the rule that linking alone never enables export.
 
 **Toggling on** negotiates `Capability::ConsoleProxy`, opens the
 console-proxy connection, provisions the managed OIDC row. **Toggling off**

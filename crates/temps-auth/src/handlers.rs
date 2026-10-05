@@ -391,7 +391,7 @@ pub async fn verify_mfa_challenge(
 
             let session_token = match auth_state
                 .auth_service
-                .create_session_after_mfa(&user, origin.as_deref(), &auth_state.oidc_service)
+                .create_session_after_mfa(&user, origin.as_deref())
                 .await
             {
                 Ok(session_token) => session_token,

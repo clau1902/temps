@@ -1887,7 +1887,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     }
 
     /// Persist only the console-access switch under the shared settings lock.
-    /// Used for the explicit unattended-enrollment bootstrap.
+    /// Used when an operator explicitly configures remote console access.
     pub async fn set_console_access_enabled(
         &self,
         enabled: bool,
