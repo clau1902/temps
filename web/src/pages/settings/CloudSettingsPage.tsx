@@ -692,9 +692,9 @@ function ConsoleAccessCard({
 }) {
   const description =
     'Cloud members with the owner or admin role on this instance can open ' +
-    'this console at its Cloud console URL — no inbound port required. On ' +
-    'by default for instances provisioned through Temps Cloud, off for ' +
-    'instances linked manually. Turning this off immediately revokes the ' +
+    'this console at its Cloud console URL — no inbound port required. ' +
+    'Enable this explicitly after linking the instance. Turning this off ' +
+    'immediately revokes the ' +
     'Cloud sign-in provider and signs out every session created through it.'
 
   return (

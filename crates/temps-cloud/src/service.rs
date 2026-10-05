@@ -985,6 +985,9 @@ impl CloudService {
         &self,
         config: temps_auth::oidc_service::ManagedCloudOidcConfig,
     ) -> Result<(), CloudServiceError> {
+        // Serialize provisioning with consent updates and disconnect. A delayed
+        // configuration must never recreate the provider after revocation.
+        let _update = self.feature_update_lock.lock().await;
         let Some(oidc) = self.oidc_provisioner.get() else {
             tracing::error!(
                 "received a managed console-access OIDC configuration but no OidcService is \
@@ -992,6 +995,11 @@ impl CloudService {
             );
             return Err(CloudServiceError::ConsoleOidcUnavailable);
         };
+        if !self.console_access_enabled() || !self.link.is_linked() {
+            return Err(CloudServiceError::Client(CloudError::FeatureDisabled {
+                feature: "console_access",
+            }));
+        }
         oidc.upsert_managed_cloud_provider(config).await?;
         Ok(())
     }
@@ -1312,6 +1320,7 @@ impl CloudService {
     /// Returns `(status, backup_credential_revoked, console_oidc_revoked)` so
     /// the caller can audit each independently.
     pub async fn disconnect(&self) -> Result<(CloudStatus, bool, bool), CloudServiceError> {
+        let _update = self.feature_update_lock.lock().await;
         if !self.link.is_linked() {
             // Nothing to revoke, so nothing to release either: the answer
             // `revoke` would give, before any schedule is touched.
@@ -2017,6 +2026,58 @@ mod tests {
         ));
         let encryption = Arc::new(EncryptionService::new_from_password("cloud-service-test"));
         (temp, CloudService::new(link, config, db, encryption, true))
+    }
+
+    #[tokio::test]
+    async fn delayed_console_config_rechecks_consent_under_lifecycle_lock() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let (_temp, service) = linked_cloud_service(db.clone());
+        service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password("consent-race-test")),
+            Arc::new(temps_auth::UserService::new(db)),
+        )));
+        service.console_access_tx.send_replace(true);
+        let guard = service.feature_update_lock.lock().await;
+        let mut delayed = Box::pin(service.apply_console_oidc_config(
+            temps_auth::oidc_service::ManagedCloudOidcConfig {
+                issuer: "https://cloud.example.com".into(),
+                client_id: "client".into(),
+                client_secret: "test-secret".into(),
+            },
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut delayed)
+                .await
+                .is_err(),
+            "provisioning must wait for an ongoing lifecycle operation"
+        );
+        // The disable path publishes this value while holding the same lock.
+        service.console_access_tx.send_replace(false);
+        drop(guard);
+        assert!(matches!(
+            delayed.await,
+            Err(CloudServiceError::Client(CloudError::FeatureDisabled {
+                feature: "console_access"
+            }))
+        ));
+        // Even stale enabled consent cannot provision a disconnected link.
+        service.console_access_tx.send_replace(true);
+        service.link.disconnect().unwrap();
+        assert!(matches!(
+            service
+                .apply_console_oidc_config(temps_auth::oidc_service::ManagedCloudOidcConfig {
+                    issuer: "https://cloud.example.com".into(),
+                    client_id: "client".into(),
+                    client_secret: "test-secret".into(),
+                },)
+                .await,
+            Err(CloudServiceError::Client(
+                CloudError::FeatureDisabled { .. }
+            ))
+        ));
     }
 
     #[tokio::test]

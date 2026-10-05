@@ -597,7 +597,7 @@ the WebSocket-upgrade relay.
 2. `temps-cloud-client`: second connection with its own reconnect/backoff; dispatcher with stream table, credit-based flow control, idle-timeout reaper.
 3. `temps-cli`/`temps-cloud`: `ConsoleRouterHandle` slot wiring; the duplex-pipe/hyper-upgrade relay.
 4. `temps-auth`: new columns; `resolve_user` hard-reject check; `login_method` audit fix; `OidcProviderSummary.template`.
-5. `temps-cloud`: managed-provider upsert/teardown on enable/disable and on disconnect; `console_access_enabled` with the bootstrap-actor-dependent default.
+5. `temps-cloud`: managed-provider upsert/teardown on enable/disable and on disconnect; `console_access_enabled` with explicit operator opt-in after enrollment.
 6. `web/`: settings switch with the four onboarding states; login-page button; regenerate `web/src/api/client/`.
 7. `apps/temps-cli`: status/enable/disable parity.
 

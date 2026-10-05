@@ -286,9 +286,16 @@ async fn run(
                     return;
                 }
             }
+            changed = enabled.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                // Explicit operator consent wakes an idle or backed-off worker.
+                retry_in = Duration::ZERO;
+            }
             _ = tokio::time::sleep(retry_in) => {
                 if !link.is_linked() || !*enabled.borrow() {
-                    retry_in = next_reconnect_interval(retry_in, CycleOutcome::NotLinked);
+                    retry_in = BASE_RECONNECT_INTERVAL;
                     continue;
                 }
                 let outcome = connection_cycle(&link, &dispatch, &oidc_sink, &mut enabled, &mut cancel).await;
@@ -306,12 +313,14 @@ async fn run(
 enum CycleOutcome {
     NotLinked,
     Disconnected,
+    Connected,
     Cancelled,
 }
 
 fn next_reconnect_interval(current: Duration, outcome: CycleOutcome) -> Duration {
     match outcome {
         CycleOutcome::Cancelled => Duration::ZERO,
+        CycleOutcome::Connected => BASE_RECONNECT_INTERVAL,
         CycleOutcome::NotLinked | CycleOutcome::Disconnected if current.is_zero() => {
             BASE_RECONNECT_INTERVAL
         }
@@ -398,7 +407,11 @@ async fn connection_cycle(
     drop(shared);
     let _ = tokio::time::timeout(Duration::from_secs(5), writer_handle).await;
 
-    outcome
+    if outcome == CycleOutcome::Disconnected {
+        CycleOutcome::Connected
+    } else {
+        outcome
+    }
 }
 
 async fn connect(
@@ -1803,6 +1816,50 @@ mod tests {
             Ok(())
         }
         async fn on_revoke(&self) {}
+    }
+
+    #[tokio::test]
+    async fn enabling_console_wakes_worker_without_waiting_for_retry() {
+        let Some((backend_url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let (link, _dir) = linked_test_link(&backend_url).await;
+        let (enabled_tx, enabled_rx) = watch::channel(false);
+        let (join, cancel_tx) = ConsoleProxyWorker::spawn(
+            link,
+            enabled_rx,
+            ConsoleDispatchSlot::new(),
+            Arc::new(TestOidcSink),
+        );
+        // Let the disabled worker enter its five-second retry sleep.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), server_rx.recv())
+                .await
+                .is_err()
+        );
+        enabled_tx.send(true).unwrap();
+        let mut cloud = tokio::time::timeout(Duration::from_secs(2), server_rx.recv())
+            .await
+            .expect("enable must wake the worker promptly")
+            .expect("worker must connect");
+        cloud_handshake(&mut cloud).await;
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), join)
+            .await
+            .expect("worker must stop")
+            .unwrap();
+    }
+
+    #[test]
+    fn successful_console_connection_resets_outage_backoff() {
+        assert_eq!(
+            next_reconnect_interval(MAX_RECONNECT_INTERVAL, CycleOutcome::Connected),
+            BASE_RECONNECT_INTERVAL,
+        );
+        assert_eq!(
+            next_reconnect_interval(BASE_RECONNECT_INTERVAL, CycleOutcome::Disconnected),
+            BASE_RECONNECT_INTERVAL * 2,
+        );
     }
 
     struct Harness {
