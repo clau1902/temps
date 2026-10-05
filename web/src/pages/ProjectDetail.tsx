@@ -3,6 +3,7 @@
 
 import {
   getLastDeploymentOptions,
+  getEnvironmentVariablesOptions,
   getProjectBySlugOptions,
   getActiveVisitorsOptions,
   getRepositoryByNameOptions,
@@ -12,6 +13,13 @@ import {
   deployFromImageMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import {
+  MonitoringProjectOverview,
+  MonitoringProjectHeader,
+} from '@/components/project/MonitoringProjectOverview'
+import { AddProjectHosting } from '@/components/project/AddProjectHosting'
+import { GeneralSettings } from '@/components/project/settings/GeneralSettings'
+import { TelemetrySettings } from '@/components/project/settings/TelemetrySettings'
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
@@ -24,6 +32,7 @@ import { ProjectRevenue } from '@/components/project/ProjectRevenue'
 import { ProjectRuntime } from '@/components/project/ProjectRuntime'
 import { ProjectServices } from '@/components/project/ProjectServices'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
+import { EnvironmentVariablePage } from '@/components/project/settings/EnvironmentVariablePage'
 import { EnvironmentVariablesSettings } from '@/components/project/settings/EnvironmentVariablesSettings'
 import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { DomainsSettings } from '@/components/project/settings/DomainsSettings'
@@ -56,6 +65,7 @@ import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import {
   deploymentsAfterStartPath,
   projectDeployLaunchMode,
+  projectDeploysImage,
 } from '@/lib/project-deploy-action'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
@@ -83,6 +93,7 @@ import {
   Route,
   Routes,
   useNavigate,
+  useMatch,
   useParams,
   useSearchParams,
 } from 'react-router'
@@ -96,6 +107,9 @@ export function ProjectDetail() {
   const { slug } = useParams()
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
+  const variableRoute = useMatch('/projects/:slug/environment-variables/*')
+  const variableSubpath = variableRoute?.params['*'] ?? ''
+  const [breadcrumbVariableId, breadcrumbSection] = variableSubpath.split('/')
   const [searchParams, setSearchParams] = useSearchParams()
   const [isDeployDialogOpen, setIsDeployDialogOpen] = useState(false)
 
@@ -116,6 +130,30 @@ export function ProjectDetail() {
     enabled: !!slug,
   })
 
+  // The project layout owns this trail so parent refreshes cannot overwrite
+  // a nested page's breadcrumbs. Reuse the detail page's query cache.
+  const breadcrumbVariables = useQuery({
+    ...getEnvironmentVariablesOptions({
+      path: { project_id: project?.id || 0 },
+    }),
+    enabled:
+      !!project?.id &&
+      !!breadcrumbVariableId &&
+      Number.isSafeInteger(Number(breadcrumbVariableId)) &&
+      Number(breadcrumbVariableId) > 0,
+  })
+  const breadcrumbVariable = breadcrumbVariables.data?.find(
+    (variable) => variable.id === Number(breadcrumbVariableId)
+  )
+  const variableBreadcrumbLabel =
+    breadcrumbVariable?.key ||
+    (breadcrumbVariables.isFetching
+      ? 'Loading variable…'
+      : breadcrumbVariables.isError
+        ? 'Variable unavailable'
+        : 'Variable not found')
+  const isVariableRoute = !!variableRoute
+
   const { data: lastDeployment, isLoading: isLoadingLastDeployment } = useQuery(
     {
       ...getLastDeploymentOptions({
@@ -123,7 +161,7 @@ export function ProjectDetail() {
           id: project?.id || 0,
         },
       }),
-      enabled: !!project?.id,
+      enabled: !!project?.id && project.source_type !== 'external',
       refetchInterval: (query) => {
         const data = query.state.data
         // Poll more frequently for active deployments
@@ -245,7 +283,7 @@ export function ProjectDetail() {
   }) => {
     if (!project) return
 
-    if (project.source_type === 'docker_image') {
+    if (projectDeploysImage(project)) {
       const savedRuntime = serviceTemplateDeployOverrides(project)
       const imageRef =
         editedImageRef?.trim() ||
@@ -272,10 +310,39 @@ export function ProjectDetail() {
   }
 
   useEffect(() => {
+    const projectPath = `/projects/${project?.slug || slug}`
+    const variablesPath = `${projectPath}/environment-variables`
     setBreadcrumbs([
       { label: 'Projects', href: '/projects' },
-      { label: project?.slug || 'Project Details' },
+      { label: project?.slug || 'Project Details', href: projectPath },
+      ...(isVariableRoute
+        ? [
+            { label: 'Environment variables', href: variablesPath },
+            ...(breadcrumbVariableId
+              ? [
+                  {
+                    label: variableBreadcrumbLabel,
+                    href: `${variablesPath}/${breadcrumbVariableId}`,
+                  },
+                  ...(breadcrumbSection === 'checks'
+                    ? [{ label: 'Check configuration' }]
+                    : []),
+                ]
+              : []),
+          ]
+        : []),
     ])
+  }, [
+    setBreadcrumbs,
+    project?.slug,
+    slug,
+    isVariableRoute,
+    breadcrumbVariableId,
+    breadcrumbSection,
+    variableBreadcrumbLabel,
+  ])
+
+  useEffect(() => {
     // Remove confetti parameter after showing
     if (showConfetti) {
       const timer = setTimeout(() => {
@@ -284,7 +351,7 @@ export function ProjectDetail() {
       }, 500)
       return () => clearTimeout(timer)
     }
-  }, [setBreadcrumbs, project, showConfetti, searchParams, setSearchParams])
+  }, [showConfetti, searchParams, setSearchParams])
 
   usePageTitle(project?.slug ? `${project.slug}` : '')
 
@@ -376,6 +443,93 @@ export function ProjectDetail() {
     return <NotFound />
   }
 
+  if (project.source_type === 'external') {
+    return (
+      <div className="flex h-full min-w-0 flex-col overflow-hidden">
+        <MonitoringProjectHeader project={project} />
+        <div className="min-w-0 flex-1 overflow-y-auto p-4">
+          <ProjectSectionLayout project={project}>
+            <Routes>
+              <Route index element={<Navigate to="project" replace />} />
+              {['project', 'integrations', 'setup'].map((path) => (
+                <Route
+                  key={path}
+                  path={path}
+                  element={<MonitoringProjectOverview project={project} />}
+                />
+              ))}
+              <Route
+                path="hosting"
+                element={<AddProjectHosting project={project} />}
+              />
+              {[
+                'connect-repository',
+                'connect-repository/connections/:connectionId',
+                'connect-repository/connections/:connectionId/repositories/:repositoryId',
+              ].map((path) => (
+                <Route
+                  key={path}
+                  path={path}
+                  element={
+                    <ChangeRepositoryPage project={project} refetch={refetch} />
+                  }
+                />
+              ))}
+              <Route
+                path="analytics/*"
+                element={<ProjectAnalytics project={project} />}
+              />
+              <Route
+                path="errors"
+                element={<ErrorTracking project={project} />}
+              />
+              <Route
+                path="errors/setup"
+                element={<ErrorTrackingSetup project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId"
+                element={<ErrorGroupDetail project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId/event/:eventId"
+                element={<ErrorEventDetail project={project} />}
+              />
+              <Route path="traces/*" element={<Traces project={project} />} />
+              <Route
+                path="telemetry-logs"
+                element={<LogsList project={project} />}
+              />
+              <Route path="metrics/*" element={<Metrics project={project} />} />
+              <Route
+                path="monitors"
+                element={<ProjectMonitors project={project} />}
+              />
+              <Route
+                path="monitors/:monitorId"
+                element={<MonitorDetail project={project} />}
+              />
+              <Route
+                path="settings/telemetry"
+                element={<TelemetrySettings project={project} />}
+              />
+              <Route
+                path="settings/*"
+                element={
+                  <GeneralSettings project={project} refetch={refetch} />
+                }
+              />
+              <Route
+                path="*"
+                element={<AddProjectHosting project={project} />}
+              />
+            </Routes>
+          </ProjectSectionLayout>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="flex h-full w-full overflow-hidden">
       <Confetti active={showConfetti} duration={4000} particleCount={100} />
@@ -440,6 +594,14 @@ export function ProjectDetail() {
             <Routes>
               <Route index element={<Navigate to="project" replace />} />
               <Route
+                path="hosting"
+                element={<Navigate to="../settings/delivery" replace />}
+              />
+              <Route
+                path="integrations"
+                element={<MonitoringProjectOverview project={project} />}
+              />
+              <Route
                 path="project"
                 element={
                   <ProjectOverview
@@ -468,6 +630,16 @@ export function ProjectDetail() {
               <Route
                 path="environment-variables"
                 element={<EnvironmentVariablesSettings project={project} />}
+              />
+              <Route
+                path="environment-variables/:variableId"
+                element={<EnvironmentVariablePage project={project} />}
+              />
+              <Route
+                path="environment-variables/:variableId/checks"
+                element={
+                  <EnvironmentVariablePage project={project} configure />
+                }
               />
               <Route
                 path="flags"
@@ -584,7 +756,12 @@ export function ProjectDetail() {
               />
               <Route
                 path="ai-gateway"
-                element={<ProjectAgentActivity projectId={project.id} />}
+                element={
+                  <ProjectAgentActivity
+                    projectId={project.id}
+                    projectSlug={project.slug}
+                  />
+                }
               />
               <Route
                 path="revenue"

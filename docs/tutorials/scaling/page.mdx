@@ -31,7 +31,7 @@ Temps runs your application in Docker containers on your own server. Scaling mea
   </Col>
 </Row>
 
-**Multi-node scaling** — if you need more capacity than a single server provides, you can [add worker nodes](/docs/multi-node) to distribute containers across multiple machines. The control plane schedules replicas across all active nodes using round-robin.
+**Multi-node scaling** — if you need more capacity than a single server provides, you can [add worker nodes](/docs/multi-node) to distribute containers across multiple machines; see that guide for how the scheduler picks which node runs a given replica.
 
 Before scaling, check whether optimization can solve the problem for free. A slow database query or missing index can make an application feel overloaded when the server has plenty of capacity.
 
@@ -109,33 +109,51 @@ app.use(session({
 
 ## Resource limits {{ anchor: true, id: 'resource-limits' }}
 
-Each container runs with configurable CPU and memory limits:
+Each container can be given CPU and memory limits. New projects start with a conservative default profile rather than being fully uncapped — a hard memory limit, so a runaway app can't OOM a small single-node host, plus recorded CPU and memory request values. You can raise, lower, or uncap these per environment at any time.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| CPU request | 100m | Minimum guaranteed CPU (0.1 cores) |
-| CPU limit | 1000m | Maximum CPU (1 core) |
-| Memory request | 128Mi | Minimum guaranteed memory |
-| Memory limit | 512Mi | Maximum memory |
+| CPU request | 0.5 CPU | Recorded, but not currently enforced (see below) |
+| CPU limit | Unset (uncapped) | Maximum CPU, if configured |
+| Memory request | 128 MB | Recorded, but not currently enforced (see below) |
+| Memory limit | 512 MB | Maximum memory |
 
-Configure these per environment in **Environment Settings**:
+Only the **limits** are applied to the container. The **request** values are stored and shown in the dashboard and CLI, but Temps doesn't currently pass them to Docker as reservations or use them when choosing a node, so they don't guarantee any minimum CPU or memory. On a shared host, other workloads can still contend for those resources.
+
+Set these per environment from the dashboard (Project → Environments → select environment → Settings), which takes plain CPU core counts (e.g. `0.5`, `1`, `2`) and converts them correctly.
+
+From the CLI, use `environments resources`. The CPU flags take millicores (`1000` = 1 core):
+
+```bash
+# Sets a 1 CPU core limit and a 0.5 CPU core request
+bunx @temps-sdk/cli environments resources production -p my-project \
+  --cpu 1000 --cpu-request 500 --memory 1024 --memory-request 128
+```
+
+<Note>
+In CLI versions up to 0.1.36, `--cpu` and `--cpu-request` pass the number straight through to the API, which stores CPU in microcores (`1_000_000` = 1 core). On those versions `--cpu 1000` asks for a 0.001-core limit, which is too small for Docker to apply: older servers save it and the container then fails to start, and newer servers reject it when you save it. Either upgrade the CLI or pass microcores instead (`--cpu 1000000 --cpu-request 500000` for the example above).
+
+Newer CLI versions reject CPU values above 256 cores (`256000`), so a script still passing microcores from that workaround fails with an error telling you to divide by 1000, instead of asking for 1000 cores.
+</Note>
+
+A CPU limit must be at least 0.01 cores (`--cpu 10`), the smallest limit Docker accepts.
 
 <Properties>
-  <Property name="cpu_limit" type="string">
-    Maximum CPU allocation. `1000m` = 1 full CPU core. `500m` = half a core.
+  <Property name="--cpu" type="millicores">
+    Maximum CPU allocation. `1000` = 1 full CPU core, `500` = half a core.
   </Property>
-  <Property name="memory_limit" type="string">
-    Maximum memory allocation. `512Mi` = 512 MB. `1024Mi` = 1 GB.
+  <Property name="--memory" type="MB">
+    Maximum memory allocation in megabytes, e.g. `512`.
   </Property>
-  <Property name="cpu_request" type="string">
-    Minimum guaranteed CPU. Used for scheduling decisions.
+  <Property name="--cpu-request" type="millicores">
+    CPU request. Recorded only — not currently enforced or used for scheduling.
   </Property>
-  <Property name="memory_request" type="string">
-    Minimum guaranteed memory.
+  <Property name="--memory-request" type="MB">
+    Memory request. Recorded only — not currently enforced or used for scheduling.
   </Property>
 </Properties>
 
-If your container exceeds its memory limit, Docker kills it and Temps restarts it (restart policy is `always`). If this happens repeatedly, increase the memory limit or investigate memory leaks.
+If you do set a memory limit and your container exceeds it, Docker kills it and Temps restarts it (restart policy is `always`). If this happens repeatedly, raise the memory limit or investigate memory leaks. A CPU limit is not set by default, so a CPU-bound container can use all available cores unless you cap it explicitly.
 
 ---
 

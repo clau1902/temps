@@ -228,6 +228,7 @@ fn problem(error: CloudServiceError) -> Problem {
         | CloudServiceError::Database(_)
         | CloudServiceError::ManagedBackupCredential(_)
         | CloudServiceError::ConsoleOidcProvisioning(_)
+        | CloudServiceError::ConsoleOidcUnavailable
         | CloudServiceError::Client(
             temps_cloud_client::CloudError::InvalidBackendUrl { .. }
             | temps_cloud_client::CloudError::ClientConfiguration { .. },
@@ -756,6 +757,57 @@ pub async fn record_console_access_default_enabled_audit(
     .await;
 }
 
+/// `CLOUD_BACKEND_URL_BOOTSTRAPPED` — written when the `TEMPS_CLOUD_BACKEND_URL`
+/// one-shot bootstrap input persists a non-default `cloud.backend_url` before
+/// the unattended enrollment it enables runs. A distinct event from
+/// `CLOUD_LINK_CONNECTED`: this one records a *configuration* change (which
+/// Cloud tenant this instance will ever talk to), separately from the
+/// credential the enrollment that follows may or may not establish. Only ever
+/// written with [`CloudEnrollmentActor::UnattendedBootstrap`] today -- there
+/// is no operator-facing way to set this field yet -- but takes the actor
+/// like every other Cloud audit event so that changes if one is added.
+#[derive(Debug, Serialize)]
+struct CloudBackendUrlBootstrappedAudit {
+    context: CloudAuditActor,
+    backend_url: String,
+}
+
+impl AuditOperation for CloudBackendUrlBootstrappedAudit {
+    fn operation_type(&self) -> String {
+        "CLOUD_BACKEND_URL_BOOTSTRAPPED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        self.context.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(Into::into)
+    }
+}
+
+pub async fn record_backend_url_bootstrapped_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    backend_url: &str,
+) {
+    let event = CloudBackendUrlBootstrappedAudit {
+        context: actor.into(),
+        backend_url: backend_url.to_string(),
+    };
+    if let Err(error) = audit.create_audit_log(&event).await {
+        tracing::error!(
+            %error,
+            backend_url,
+            "failed to record CLOUD_BACKEND_URL_BOOTSTRAPPED audit event"
+        );
+    }
+}
+
 /// The managed-backup half of [`record_enrollment_audit`]: one of the
 /// `cloud.backup_credential.*` events when
 /// [`CloudService::provision_managed_backups_after_enrollment`] changed
@@ -787,6 +839,72 @@ pub async fn record_backup_outcome_audit(
             .await;
         }
         ManagedBackupOutcome::NotConfigured { .. } | ManagedBackupOutcome::Unavailable(_) => {}
+    }
+}
+
+/// Audit action recorded when the `<TEMPS_DATA_DIR>/cloud-oidc.json`
+/// first-boot bootstrap file (ADR-045 §4) is consumed: the sibling of
+/// `CLOUD_LINK_CONNECTED` for the managed console-access OIDC provider.
+pub const CLOUD_CONSOLE_OIDC_BOOTSTRAPPED: &str = "CLOUD_CONSOLE_OIDC_BOOTSTRAPPED";
+
+/// The `cloud-oidc.json` bootstrap file's audit shape. A dedicated struct
+/// rather than reusing [`CloudLinkAudit`] because this event carries the
+/// issuer and client id it provisioned -- context an operator needs to
+/// confirm the right IdP was applied -- and, unlike every other Cloud audit
+/// event here, never a `previous_features`/`new_features` pair. The client
+/// secret is never included.
+#[derive(Debug, Serialize)]
+struct CloudConsoleOidcBootstrapAudit {
+    context: CloudAuditActor,
+    action: &'static str,
+    issuer: String,
+    client_id: String,
+}
+
+impl AuditOperation for CloudConsoleOidcBootstrapAudit {
+    fn operation_type(&self) -> String {
+        self.action.to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        self.context.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(Into::into)
+    }
+}
+
+/// Record that this boot consumed the `cloud-oidc.json` bootstrap file and
+/// applied the managed console-access OIDC provider it described. Called
+/// exactly once per successful application, from `temps-cli`'s startup
+/// sequence (mirroring [`record_link_connected_audit`] for
+/// `TEMPS_CLOUD_ENROLLMENT_CODE`). `issuer` and `client_id` are recorded so
+/// an operator can confirm which IdP was applied; the client secret never
+/// is. Failures to write the audit row are logged, never propagated: the
+/// provider has already been persisted.
+pub async fn record_console_oidc_bootstrapped_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    issuer: &str,
+    client_id: &str,
+) {
+    let event = CloudConsoleOidcBootstrapAudit {
+        context: actor.into(),
+        action: CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
+        issuer: issuer.to_string(),
+        client_id: client_id.to_string(),
+    };
+    if let Err(error) = audit.create_audit_log(&event).await {
+        tracing::error!(
+            %error,
+            action = CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
+            "failed to record managed console-access OIDC bootstrap audit event"
+        );
     }
 }
 
@@ -1073,6 +1191,12 @@ mod tests {
         }
     }
 
+    fn reconnected() -> temps_cloud_client::EnrollmentKind {
+        temps_cloud_client::EnrollmentKind::Reconnected {
+            instance_id: uuid::Uuid::new_v4(),
+        }
+    }
+
     #[test]
     fn a_fresh_enrollment_by_an_instance_admin_still_queues_the_activation() {
         // The behaviour ADR-042 P3 shipped, and the one both gates must leave
@@ -1096,6 +1220,14 @@ mod tests {
         assert!(
             !may_start_activation(&principal(temps_auth::Role::Admin), re_enrollment()),
             "a credential recovery is not a purchase"
+        );
+    }
+
+    #[test]
+    fn reconnecting_historical_identity_does_not_trigger_purchase_activation() {
+        assert!(
+            !may_start_activation(&principal(temps_auth::Role::Admin), reconnected()),
+            "a replacement installation reconnecting historical identity must not repeat purchase activation"
         );
     }
 
@@ -1328,6 +1460,28 @@ mod tests {
             rows(&audit),
             vec![(
                 "CLOUD_LINK_CONNECTED".to_string(),
+                None,
+                None,
+                UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_url_bootstrap_records_the_url_with_no_user_actor() {
+        let audit = actor_recorder();
+
+        record_backend_url_bootstrapped_audit(
+            &audit,
+            CloudEnrollmentActor::UnattendedBootstrap,
+            "https://cloud.staging.example",
+        )
+        .await;
+
+        assert_eq!(
+            rows(&audit),
+            vec![(
+                "CLOUD_BACKEND_URL_BOOTSTRAPPED".to_string(),
                 None,
                 None,
                 UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),

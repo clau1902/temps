@@ -12,12 +12,15 @@
 
 use std::sync::{Arc, OnceLock};
 
-use bollard::Docker;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseBackend, DatabaseConnection,
     EntityTrait, FromQueryResult, QueryFilter, Statement, Value,
 };
-use temps_core::telemetry::{NoopTelemetryReporter, TelemetryReporter};
+use temps_core::telemetry::{
+    NoopTelemetryReporter, OperationFailureCode, TelemetryEvent, TelemetryEventKind,
+    TelemetryReporter,
+};
+use temps_core::DockerHandle;
 use temps_entities::{external_services, postgres_major_upgrades};
 use temps_logs::LogService;
 use uuid::Uuid;
@@ -78,7 +81,7 @@ pub struct StartMajorUpgradeRequest {
 
 pub struct PostgresUpgradeService {
     db: Arc<DatabaseConnection>,
-    docker: Arc<Docker>,
+    docker_handle: Arc<DockerHandle>,
     backup_provider: Arc<dyn PreUpgradeBackupProvider>,
     lifecycle: Arc<dyn PostgresContainerLifecycle>,
     log_service: Arc<LogService>,
@@ -90,14 +93,14 @@ pub struct PostgresUpgradeService {
 impl PostgresUpgradeService {
     pub fn new(
         db: Arc<DatabaseConnection>,
-        docker: Arc<Docker>,
+        docker_handle: Arc<DockerHandle>,
         backup_provider: Arc<dyn PreUpgradeBackupProvider>,
         lifecycle: Arc<dyn PostgresContainerLifecycle>,
         log_service: Arc<LogService>,
     ) -> Self {
         Self {
             db,
-            docker,
+            docker_handle,
             backup_provider,
             lifecycle,
             log_service,
@@ -125,6 +128,12 @@ impl PostgresUpgradeService {
         &self,
         req: StartMajorUpgradeRequest,
     ) -> Result<postgres_major_upgrades::Model, PostgresUpgradeError> {
+        // Resolve the Docker daemon up front — a major upgrade always
+        // creates/removes containers, so there is no point validating the
+        // request or inserting a row when this process has no daemon at all
+        // (e.g. `--profile control-plane`).
+        let docker = self.docker_handle.require()?;
+
         // 1-3. Fetch the service and run the full pre-flight validation.
         let svc = external_services::Entity::find_by_id(req.service_id)
             .one(self.db.as_ref())
@@ -185,7 +194,7 @@ impl PostgresUpgradeService {
         //    lifetime is independent of this request.
         let orchestrator = PostgresUpgradeOrchestrator::new(
             self.db.clone(),
-            self.docker.clone(),
+            docker,
             self.backup_provider.clone(),
             self.lifecycle.clone(),
             self.log_service.clone(),
@@ -195,6 +204,7 @@ impl PostgresUpgradeService {
         let log_id_for_err = log_id.clone();
         let log_service = self.log_service.clone();
         let db_for_err = self.db.clone();
+        let telemetry = self.telemetry();
         tokio::spawn(async move {
             if let Err(e) = orchestrator.run(upgrade_id).await {
                 tracing::error!(
@@ -209,7 +219,15 @@ impl PostgresUpgradeService {
                 // Don't stamp failed when the error is a cancel request —
                 // the cancel handler already wrote `status=cancelled`.
                 if !matches!(e, PostgresUpgradeError::CancelRequested { .. }) {
-                    Self::mark_failed(&db_for_err, &log_service, upgrade_id, &reason).await;
+                    Self::mark_failed(
+                        &db_for_err,
+                        &log_service,
+                        telemetry.as_ref(),
+                        upgrade_id,
+                        &reason,
+                        pg_upgrade_failure_code(&e),
+                    )
+                    .await;
                 }
             }
         });
@@ -323,6 +341,7 @@ impl PostgresUpgradeService {
         &self,
         upgrade_id: i32,
     ) -> Result<postgres_major_upgrades::Model, PostgresUpgradeError> {
+        let docker = self.docker_handle.require()?;
         let row = postgres_major_upgrades::Entity::find_by_id(upgrade_id)
             .one(self.db.as_ref())
             .await?
@@ -352,7 +371,7 @@ impl PostgresUpgradeService {
 
         let orchestrator = PostgresUpgradeOrchestrator::new(
             self.db.clone(),
-            self.docker.clone(),
+            docker,
             self.backup_provider.clone(),
             self.lifecycle.clone(),
             self.log_service.clone(),
@@ -360,6 +379,7 @@ impl PostgresUpgradeService {
         orchestrator.set_telemetry(self.telemetry());
         let log_service = self.log_service.clone();
         let db_for_err = self.db.clone();
+        let telemetry = self.telemetry();
         tokio::spawn(async move {
             if let Err(e) = orchestrator.run(row_id).await {
                 tracing::error!(upgrade_id = row_id, "retry orchestrator failed: {}", e);
@@ -368,7 +388,15 @@ impl PostgresUpgradeService {
                     .log_error(&log_id, format!("retry orchestrator failed: {}", reason))
                     .await;
                 if !matches!(e, PostgresUpgradeError::CancelRequested { .. }) {
-                    Self::mark_failed(&db_for_err, &log_service, row_id, &reason).await;
+                    Self::mark_failed(
+                        &db_for_err,
+                        &log_service,
+                        telemetry.as_ref(),
+                        row_id,
+                        &reason,
+                        pg_upgrade_failure_code(&e),
+                    )
+                    .await;
                 }
             }
         });
@@ -422,8 +450,10 @@ impl PostgresUpgradeService {
     async fn mark_failed(
         db: &DatabaseConnection,
         log_service: &LogService,
+        telemetry: &dyn TelemetryReporter,
         upgrade_id: i32,
         reason: &str,
+        failure_code: OperationFailureCode,
     ) {
         let row = match postgres_major_upgrades::Entity::find_by_id(upgrade_id)
             .one(db)
@@ -446,6 +476,12 @@ impl PostgresUpgradeService {
             return;
         }
         let log_id = row.log_id.clone();
+        // Non-identifying: major versions and the fixed phase label only.
+        let event = TelemetryEvent::new(TelemetryEventKind::PgMajorUpgradeFailed)
+            .with("from_version", major_version_label(&row.from_version))
+            .with("to_version", major_version_label(&row.to_version))
+            .with("phase", row.phase.clone())
+            .with_failure(failure_code);
         let mut active: postgres_major_upgrades::ActiveModel = row.into();
         active.status = Set(status::FAILED.to_string());
         active.finished_at = Set(Some(chrono::Utc::now()));
@@ -453,6 +489,7 @@ impl PostgresUpgradeService {
         if let Err(e) = active.update(db).await {
             tracing::error!(upgrade_id, "mark_failed: update failed: {}", e);
         }
+        telemetry.report(event);
         let _ = log_service
             .log_error(&log_id, format!("upgrade marked failed: {}", reason))
             .await;
@@ -467,9 +504,10 @@ impl PostgresUpgradeService {
         &self,
         upgrade_id: i32,
     ) -> Result<postgres_major_upgrades::Model, PostgresUpgradeError> {
+        let docker = self.docker_handle.require()?;
         let orchestrator = PostgresUpgradeOrchestrator::new(
             self.db.clone(),
-            self.docker.clone(),
+            docker,
             self.backup_provider.clone(),
             self.lifecycle.clone(),
             self.log_service.clone(),
@@ -482,9 +520,10 @@ impl PostgresUpgradeService {
     /// 7-day retention window. Delegates to the orchestrator so the logic
     /// lives next to the snapshot/restore phases it mirrors.
     pub async fn sweep_expired_rollback_volumes(&self) -> Result<u64, PostgresUpgradeError> {
+        let docker = self.docker_handle.require()?;
         let orchestrator = PostgresUpgradeOrchestrator::new(
             self.db.clone(),
-            self.docker.clone(),
+            docker,
             self.backup_provider.clone(),
             self.lifecycle.clone(),
             self.log_service.clone(),
@@ -501,6 +540,7 @@ impl PostgresUpgradeService {
     /// Each phase is idempotent, so re-running the orchestrator from the
     /// current phase is safe. Returns the number of upgrades resumed.
     pub async fn resume_active_upgrades(&self) -> Result<u64, PostgresUpgradeError> {
+        let docker = self.docker_handle.require()?;
         let rows = postgres_major_upgrades::Entity::find()
             .filter(
                 postgres_major_upgrades::Column::Status
@@ -530,7 +570,7 @@ impl PostgresUpgradeService {
 
             let orchestrator = PostgresUpgradeOrchestrator::new(
                 self.db.clone(),
-                self.docker.clone(),
+                docker.clone(),
                 self.backup_provider.clone(),
                 self.lifecycle.clone(),
                 self.log_service.clone(),
@@ -539,6 +579,7 @@ impl PostgresUpgradeService {
             let log_service = self.log_service.clone();
             let log_id_for_err = log_id.clone();
             let db_for_err = self.db.clone();
+            let telemetry = self.telemetry();
             tokio::spawn(async move {
                 if let Err(e) = orchestrator.run(upgrade_id).await {
                     tracing::error!(upgrade_id, "resumed orchestrator failed: {}", e);
@@ -550,7 +591,15 @@ impl PostgresUpgradeService {
                         )
                         .await;
                     if !matches!(e, PostgresUpgradeError::CancelRequested { .. }) {
-                        Self::mark_failed(&db_for_err, &log_service, upgrade_id, &reason).await;
+                        Self::mark_failed(
+                            &db_for_err,
+                            &log_service,
+                            telemetry.as_ref(),
+                            upgrade_id,
+                            &reason,
+                            pg_upgrade_failure_code(&e),
+                        )
+                        .await;
                     }
                 }
             });
@@ -562,9 +611,47 @@ impl PostgresUpgradeService {
     }
 }
 
+/// Fixed telemetry label for a failed major upgrade. Configuration mismatches
+/// map directly; phase failures (dump, restore, ...) are classified from the
+/// message locally, and the message itself never leaves the instance.
+fn pg_upgrade_failure_code(error: &PostgresUpgradeError) -> OperationFailureCode {
+    match error {
+        PostgresUpgradeError::InvalidVersionTransition { .. }
+        | PostgresUpgradeError::OsFamilyMismatch { .. } => OperationFailureCode::UnsupportedVersion,
+        PostgresUpgradeError::UnsupportedImage { .. }
+        | PostgresUpgradeError::SourceImageMismatch { .. }
+        | PostgresUpgradeError::WrongServiceType { .. }
+        | PostgresUpgradeError::ServiceConfiguration { .. }
+        | PostgresUpgradeError::NoDefaultS3Source { .. } => {
+            OperationFailureCode::InvalidConfiguration
+        }
+        PostgresUpgradeError::ConcurrentUpgrade { .. } => OperationFailureCode::Conflict,
+        PostgresUpgradeError::CancelRequested { .. } => OperationFailureCode::Cancelled,
+        other => OperationFailureCode::classify(&other.to_string()),
+    }
+}
+
+/// Major version as sent in telemetry. Rows are validated as numeric majors
+/// on creation, but the label is re-derived here so a row written by any
+/// other path can never put free text into an event.
+fn major_version_label(raw: &str) -> String {
+    raw.trim()
+        .parse::<u32>()
+        .map(|major| major.to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn major_version_label_only_passes_numeric_majors() {
+        assert_eq!(major_version_label("17"), "17");
+        assert_eq!(major_version_label(" 16 "), "16");
+        assert_eq!(major_version_label("16-custom-build"), "unknown");
+        assert_eq!(major_version_label(""), "unknown");
+    }
     use crate::externalsvc::postgres_upgrade::{
         PostgresConnection, PostgresContainerLifecycle, PreUpgradeBackupProvider,
     };
@@ -629,10 +716,30 @@ mod tests {
     ) -> PostgresUpgradeService {
         PostgresUpgradeService::new(
             db,
-            Arc::new(
-                Docker::connect_with_local_defaults()
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()
                     .expect("construct Docker client without contacting daemon"),
-            ),
+            ))),
+            Arc::new(StubProvider),
+            Arc::new(StubLifecycle),
+            Arc::new(LogService::new(log_base_path)),
+        )
+    }
+
+    /// Build a service backed by a [`DockerHandle::disabled`] handle, the
+    /// same shape a `--profile control-plane` process registers. Used to
+    /// prove Docker-dependent methods return a typed `DockerUnavailable`
+    /// instead of panicking or trying to reach a daemon.
+    fn build_no_docker_service(
+        db: Arc<DatabaseConnection>,
+        log_base_path: std::path::PathBuf,
+    ) -> PostgresUpgradeService {
+        PostgresUpgradeService::new(
+            db,
+            Arc::new(DockerHandle::disabled(
+                temps_core::PROFILE_CONTROL_PLANE,
+                temps_core::CONTROL_PLANE_DOCKER_REASON,
+            )),
             Arc::new(StubProvider),
             Arc::new(StubLifecycle),
             Arc::new(LogService::new(log_base_path)),
@@ -948,5 +1055,36 @@ mod tests {
             err,
             PostgresUpgradeError::SourceImageMismatch { service_id: 7, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_start_major_upgrade_without_docker_returns_typed_error() {
+        // Arrange: a `control-plane`-shaped service — no Docker daemon in
+        // this process — and a MockDatabase that expects zero queries,
+        // proving the Docker check happens before any DB round-trip.
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = build_no_docker_service(db.clone(), logs.path().to_path_buf());
+
+        // Act.
+        let error = service
+            .start_major_upgrade(sample_request())
+            .await
+            .expect_err("a process with no Docker daemon cannot start a major upgrade");
+
+        // Assert.
+        assert!(matches!(error, PostgresUpgradeError::DockerUnavailable(_)));
+        let rendered = error.to_string();
+        assert!(rendered.contains("control-plane"), "{rendered}");
+        assert!(rendered.contains("temps join"), "{rendered}");
+
+        drop(service);
+        let statements = Arc::try_unwrap(db)
+            .expect("service dropped, leaving one DB reference")
+            .into_transaction_log();
+        assert!(
+            statements.is_empty(),
+            "Docker unavailability must be caught before any DB query: {statements:?}"
+        );
     }
 }

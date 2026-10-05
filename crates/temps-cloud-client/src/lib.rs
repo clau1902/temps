@@ -50,8 +50,9 @@ pub use link::{
     FlushOutcome, OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,
 };
 pub use outbox::{
-    ClaimedSpan, ClaimedTelemetryRow, DeadLetterSummary, EnqueueOutcome, OutboxStats, SpanOutbox,
-    SpanOutboxError, TelemetryOutbox, TelemetryOutboxError, DEAD_LETTER_PAYLOAD_RETENTION,
+    ClaimedSpan, ClaimedTelemetryRow, DeadLetterSummary, DeliveryFailureSummary, DeliveryGap,
+    EnqueueOutcome, OutboxStats, SpanOutbox, SpanOutboxError, TelemetryOutbox,
+    TelemetryOutboxError, DEAD_LETTER_PAYLOAD_RETENTION, DELIVERY_GAP_SEPARATION,
     OUTBOX_BATCH_SIZE, OUTBOX_MAX_ATTEMPTS,
 };
 pub use outbox_worker::{DrainObserver, DrainOutcome, OutboxCapSource};
@@ -299,6 +300,19 @@ impl CloudClient {
         instance_id: Uuid,
         agent_version: &str,
     ) -> Result<EnrollResponse, CloudError> {
+        self.enroll_with_instance_reassignment(code, instance_id, agent_version, false)
+            .await
+    }
+
+    /// Enroll with explicit permission to adopt a returned Cloud identity.
+    /// Callers enabling this must persist the returned identity with the token.
+    pub async fn enroll_with_instance_reassignment(
+        &self,
+        code: &str,
+        instance_id: Uuid,
+        agent_version: &str,
+        supports_instance_reassignment: bool,
+    ) -> Result<EnrollResponse, CloudError> {
         let res = self
             .http
             .post(self.backend.endpoint("/v1/enroll"))
@@ -306,6 +320,7 @@ impl CloudClient {
                 enrollment_code: code.trim().to_uppercase(),
                 instance_id,
                 agent_version: agent_version.to_string(),
+                supports_instance_reassignment,
             })
             .send()
             .await

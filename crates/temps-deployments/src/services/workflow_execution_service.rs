@@ -12,8 +12,8 @@ use sea_orm::{
 };
 use std::sync::Arc;
 use temps_core::{
-    DockerHandle, Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError,
-    WorkflowExecutor,
+    DockerHandle, Job, JobQueue, JobTracker, WorkflowBuilder, WorkflowCancellationProvider,
+    WorkflowError, WorkflowExecutor,
 };
 use temps_database::DbConnection;
 use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
@@ -608,6 +608,33 @@ fn deploy_failed_telemetry_event(
     )
 }
 
+/// The node chosen to build a source image in the control-plane profile.
+struct SelectedNodeBuilder {
+    node_id: i32,
+    platform: String,
+    remote: Arc<dyn ImageBuilder>,
+}
+
+fn validate_worker_build_scope(
+    deployment_id: i32,
+    platforms: &[String],
+    needs_static_extraction: bool,
+) -> Result<(), WorkflowExecutionError> {
+    let reason = if needs_static_extraction {
+        Some("Static image builds require artifact extraction, which worker build protocol v1 does not support. Use a full-profile control plane or deploy a prebuilt static bundle.")
+    } else if platforms.len() != 1 {
+        Some("Worker build protocol v1 requires exactly one target architecture. Restrict target nodes/labels to a single architecture, or deploy a prebuilt multi-platform registry image.")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(WorkflowExecutionError::InvalidJobConfig(format!(
+            "Deployment {deployment_id}: {reason} Reported target platforms: {platforms:?}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Service for executing deployment workflows
 pub struct WorkflowExecutionService {
     db: Arc<DbConnection>,
@@ -622,7 +649,7 @@ pub struct WorkflowExecutionService {
     agent_sync_service: Arc<dyn AgentSyncService>,
     config_service: Arc<temps_config::ConfigService>,
     screenshot_service: Arc<ScreenshotService>,
-    docker: Arc<bollard::Docker>,
+    docker_handle: Arc<DockerHandle>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
     encryption_service: OnceCell<Arc<temps_core::EncryptionService>>,
@@ -631,6 +658,13 @@ pub struct WorkflowExecutionService {
     /// [`Self::set_telemetry`]; defaults to a no-op when unset so the deploy
     /// path never depends on telemetry being wired.
     telemetry: OnceCell<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
+    /// Audit sink for deploy-path security events (late-bound, optional).
+    ///
+    /// Currently the ADR-045 "this deployment received the host Docker socket"
+    /// record. Late-bound like `telemetry` so the deploy path never depends on
+    /// auditing being wired, and a missing sink degrades to a log line rather
+    /// than failing a deployment.
+    audit_logger: OnceCell<Arc<dyn temps_core::AuditLogger>>,
 }
 
 impl WorkflowExecutionService {
@@ -648,7 +682,7 @@ impl WorkflowExecutionService {
         agent_sync_service: Arc<dyn AgentSyncService>,
         config_service: Arc<temps_config::ConfigService>,
         screenshot_service: Arc<ScreenshotService>,
-        docker: Arc<bollard::Docker>,
+        docker_handle: Arc<DockerHandle>,
     ) -> Self {
         Self {
             db,
@@ -663,13 +697,19 @@ impl WorkflowExecutionService {
             agent_sync_service,
             config_service,
             screenshot_service,
-            docker,
+            docker_handle,
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
             encryption_service: OnceCell::new(),
             file_store: OnceCell::new(),
             telemetry: OnceCell::new(),
+            audit_logger: OnceCell::new(),
         }
+    }
+
+    /// Set the audit sink used for deploy-path security events (ADR 045).
+    pub fn set_audit_logger(&self, logger: Arc<dyn temps_core::AuditLogger>) {
+        let _ = self.audit_logger.set(logger);
     }
 
     /// Set the anonymous telemetry reporter used to emit deploy-funnel events.
@@ -774,64 +814,48 @@ impl WorkflowExecutionService {
         workflow_builder = workflow_builder.with_var("repo_owner", &project.repo_owner)?;
         workflow_builder = workflow_builder.with_var("repo_name", &project.repo_name)?;
 
-        // Convert database job records to actual job instances
-        // Create log paths for each job
-        for db_job in &db_jobs {
-            // Create log path for this job
-            self.log_service
-                .create_log_path(&db_job.log_id)
-                .await
-                .map_err(|e| {
-                    WorkflowExecutionError::JobCreationFailed(format!(
-                        "Failed to create log path for job {}: {}",
-                        db_job.job_id, e
-                    ))
-                })?;
-
-            debug!(
-                "📝 Created log path for job {} at {}",
-                db_job.job_id, db_job.log_id
-            );
-
-            let job = self
-                .create_job_from_record(&project, &environment, &deployment, db_job)
-                .await?;
-
-            // Parse dependencies from database record
-            let dependencies: Vec<String> = if let Some(ref deps_json) = db_job.dependencies {
-                serde_json::from_value(deps_json.clone()).unwrap_or_else(|e| {
-                    warn!(
-                        "Failed to parse dependencies for job {}: {}",
-                        db_job.job_id, e
-                    );
-                    vec![]
-                })
-            } else {
-                vec![]
-            };
-
-            // Parse _required_for_completion from job config (defaults to true for backwards compatibility)
-            let required_for_completion = db_job
-                .job_config
-                .as_ref()
-                .and_then(|config| config.get("_required_for_completion"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-
-            workflow_builder =
-                workflow_builder.with_job_config(job, dependencies, required_for_completion);
-        }
-
-        let workflow = workflow_builder.build()?;
-
-        info!("Built workflow with {} jobs", workflow.jobs.len());
-
-        // Create job tracker for updating deployment_jobs table
+        // Create the job tracker before anything can fail below. The planner
+        // has already inserted one `pending` `deployment_jobs` row per job, and
+        // only the tracker ever moves those rows out of `pending` — so any
+        // failure between here and `WorkflowExecutor` running must go through
+        // it, or the deployment ends up terminally failed while its job
+        // timeline shows every step still "pending" forever.
         let job_tracker = Arc::new(DeploymentJobTracker::new(
             self.db.clone(),
             deployment_id,
             self.log_service.clone(),
         ));
+
+        // Convert database job records to actual job instances
+        let workflow_builder = match self
+            .add_jobs_to_workflow(
+                workflow_builder,
+                &project,
+                &environment,
+                &deployment,
+                &db_jobs,
+            )
+            .await
+        {
+            Ok(builder) => builder,
+            Err(e) => {
+                self.cancel_pending_jobs_after_setup_failure(&job_tracker, deployment_id, &e)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        let workflow = match workflow_builder.build() {
+            Ok(workflow) => workflow,
+            Err(e) => {
+                let e = WorkflowExecutionError::from(e);
+                self.cancel_pending_jobs_after_setup_failure(&job_tracker, deployment_id, &e)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        info!("Built workflow with {} jobs", workflow.jobs.len());
 
         // Execute workflow
         let executor = WorkflowExecutor::new(Some(job_tracker));
@@ -1063,6 +1087,98 @@ impl WorkflowExecutionService {
             .await?)
     }
 
+    /// Turn every planned `deployment_jobs` row into a runnable job and add it
+    /// to the workflow.
+    ///
+    /// Split out of `execute_deployment_workflow` so the caller has one
+    /// fallible unit to recover from: every error raised here happens *before*
+    /// `WorkflowExecutor` exists, which is the only component that otherwise
+    /// moves `deployment_jobs` rows out of `pending`.
+    async fn add_jobs_to_workflow(
+        &self,
+        mut workflow_builder: WorkflowBuilder,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        db_jobs: &[deployment_jobs::Model],
+    ) -> Result<WorkflowBuilder, WorkflowExecutionError> {
+        for db_job in db_jobs {
+            // Create log path for this job
+            self.log_service
+                .create_log_path(&db_job.log_id)
+                .await
+                .map_err(|e| {
+                    WorkflowExecutionError::JobCreationFailed(format!(
+                        "Failed to create log path for job {}: {}",
+                        db_job.job_id, e
+                    ))
+                })?;
+
+            debug!(
+                "📝 Created log path for job {} at {}",
+                db_job.job_id, db_job.log_id
+            );
+
+            let job = self
+                .create_job_from_record(project, environment, deployment, db_job)
+                .await?;
+
+            // Parse dependencies from database record
+            let dependencies: Vec<String> = if let Some(ref deps_json) = db_job.dependencies {
+                serde_json::from_value(deps_json.clone()).unwrap_or_else(|e| {
+                    warn!(
+                        "Failed to parse dependencies for job {}: {}",
+                        db_job.job_id, e
+                    );
+                    vec![]
+                })
+            } else {
+                vec![]
+            };
+
+            // Parse _required_for_completion from job config (defaults to true for backwards compatibility)
+            let required_for_completion = db_job
+                .job_config
+                .as_ref()
+                .and_then(|config| config.get("_required_for_completion"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            workflow_builder =
+                workflow_builder.with_job_config(job, dependencies, required_for_completion);
+        }
+
+        Ok(workflow_builder)
+    }
+
+    /// Close out the planned-but-never-started `deployment_jobs` rows when the
+    /// workflow could not be assembled at all.
+    ///
+    /// Without this the deployment is marked `failed` by the job processor
+    /// while every one of its job rows stays `pending` — a timeline that never
+    /// resolves, on a page the operator is watching for an answer. Best-effort:
+    /// the setup error is what the caller returns, and failing to tidy the rows
+    /// must not replace it with a less informative one.
+    async fn cancel_pending_jobs_after_setup_failure(
+        &self,
+        job_tracker: &DeploymentJobTracker,
+        deployment_id: i32,
+        error: &WorkflowExecutionError,
+    ) {
+        let reason = format!("Deployment {} could not start: {}", deployment_id, error);
+        if let Err(cancel_error) = job_tracker
+            .cancel_pending_jobs(&format!("deployment-{}", deployment_id), reason)
+            .await
+        {
+            error!(
+                deployment_id,
+                error = %cancel_error,
+                "Failed to cancel pending deployment jobs after workflow setup failure; \
+                 the job timeline may show rows stuck in pending",
+            );
+        }
+    }
+
     async fn create_job_from_record(
         &self,
         project: &projects::Model,
@@ -1178,6 +1294,17 @@ impl WorkflowExecutionService {
                     builder = builder.commit_sha(commit);
                 }
 
+                if let Some(directory) = config.get("directory").and_then(|v| v.as_str()) {
+                    builder = builder.project_directory(directory.to_string());
+                }
+                if config
+                    .get("pull_only_root_directory")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    builder = builder.pull_only_root_directory(true);
+                }
+
                 let job = builder.build(self.git_provider.clone())?;
 
                 Ok(Arc::new(job))
@@ -1227,12 +1354,8 @@ impl WorkflowExecutionService {
                     .ok()
                     .and_then(|settings| settings.registry_mirror_prefix);
 
-                // Same source of truth the cross-build platform detection
-                // below already reads: the `NodeScheduler` wired at plugin
-                // registration from `LocalWorkloadPolicy`. A control plane
-                // with no local Docker daemon must refuse this job before it
-                // ever reaches `ImageBuilder` -- worker-side builds are
-                // deferred to ADR-045, so today this is a hard refusal.
+                // Same source of truth as placement: a control-plane profile
+                // must select a remote builder before constructing the job.
                 let local_workloads_enabled = self
                     .node_scheduler
                     .get()
@@ -1307,7 +1430,7 @@ impl WorkflowExecutionService {
                     })
                     .unwrap_or(false);
 
-                if !cross_builds_enabled {
+                if !cross_builds_enabled && local_workloads_enabled {
                     debug!(
                         deployment_id = db_job.deployment_id,
                         "Cross-architecture builds disabled; building for the control plane's \
@@ -1315,7 +1438,10 @@ impl WorkflowExecutionService {
                     );
                 }
 
-                if let (true, Some(scheduler)) = (cross_builds_enabled, self.node_scheduler.get()) {
+                if let (true, Some(scheduler)) = (
+                    cross_builds_enabled && local_workloads_enabled,
+                    self.node_scheduler.get(),
+                ) {
                     let target_nodes = environment
                         .deployment_config
                         .as_ref()
@@ -1338,7 +1464,11 @@ impl WorkflowExecutionService {
                         });
 
                     match scheduler
-                        .required_build_platforms(target_labels.as_ref(), target_nodes.as_deref())
+                        .required_build_platforms_for_project(
+                            target_labels.as_ref(),
+                            target_nodes.as_deref(),
+                            Some(&project.slug),
+                        )
                         .await
                     {
                         Ok(platforms) if !platforms.is_empty() => {
@@ -1367,7 +1497,54 @@ impl WorkflowExecutionService {
                     }
                 }
 
-                let job = builder.build(self.image_builder.clone())?;
+                let image_builder: Arc<dyn ImageBuilder> = if local_workloads_enabled {
+                    self.image_builder.clone()
+                } else {
+                    // Fail before sending source or starting a build that the
+                    // downstream static job cannot extract without a daemon.
+                    let static_job = deployment_jobs::Entity::find()
+                        .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
+                        .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
+                        .one(self.db.as_ref())
+                        .await?;
+                    if static_job.is_some() {
+                        validate_worker_build_scope(deployment.id, &[], true)?;
+                    }
+                    // No local daemon: build on a node. The image is then
+                    // handed to each replica's node by DeployImageJob.
+                    let target_nodes = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.configured_target_nodes().map(|ids| ids.to_vec()))
+                        .or_else(|| {
+                            project.deployment_config.as_ref().and_then(|config| {
+                                config.configured_target_nodes().map(|ids| ids.to_vec())
+                            })
+                        });
+                    let target_labels = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.configured_target_labels().cloned())
+                        .or_else(|| {
+                            project
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|config| config.configured_target_labels().cloned())
+                        });
+                    let selected = self
+                        .select_node_builder(
+                            deployment.id,
+                            &project.slug,
+                            target_nodes.as_deref(),
+                            target_labels.as_ref(),
+                        )
+                        .await?;
+                    builder = builder
+                        .remote_builder_node_id(selected.node_id)
+                        .target_platforms(vec![selected.platform.clone()]);
+                    selected.remote
+                };
+                let job = builder.build(image_builder)?;
 
                 Ok(Arc::new(job))
             }
@@ -1544,28 +1721,40 @@ impl WorkflowExecutionService {
                     memory_request: memory_request_mb.map(|mb| format!("{}Mi", mb)),
                 };
 
-                let mut builder = DeployImageJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .build_job_id(build_job_id)
-                    .target(DeploymentTarget::Docker {
-                        registry_url: "local".to_string(),
-                        network: Some(temps_core::NETWORK_NAME.to_string()),
-                    })
-                    .service_name(deployment.slug.clone())
-                    .namespace("default".to_string())
-                    .port(port as u32)
-                    .configured_port(configured_port)
-                    .replicas(replicas)
-                    .environment_variables(env_variables)
-                    .remote_environment_variables(remote_env_variables)
-                    .cross_node_service_blockers(
-                        crate::services::workflow_planner::read_cross_node_blockers(config),
-                    )
-                    .secrets(secrets)
-                    .resources(resources)
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .failed_container_retention(self.db.clone(), deployment.id);
+                // ADR 045: the executing host compares this against its own
+                // grant. A constructor argument, so no deploy path can omit it.
+                //
+                // The authority comes from the plan, not from an `AuthContext`
+                // — there is no request here, this runs from the queue. The
+                // planner recorded whether the principal that asked for the
+                // deployment was allowed to deploy a host-root project, and
+                // `planned_deploy_caller` fails closed when it did not say.
+                let mut builder = DeployImageJobBuilder::new(
+                    project.slug.clone(),
+                    crate::services::workflow_planner::planned_deploy_caller(config),
+                )
+                .job_id(db_job.job_id.clone())
+                .build_job_id(build_job_id)
+                .target(DeploymentTarget::Docker {
+                    registry_url: "local".to_string(),
+                    network: Some(temps_core::NETWORK_NAME.to_string()),
+                })
+                .service_name(deployment.slug.clone())
+                .namespace("default".to_string())
+                .audit_logger(self.audit_logger.get().cloned())
+                .port(port as u32)
+                .configured_port(configured_port)
+                .replicas(replicas)
+                .environment_variables(env_variables)
+                .remote_environment_variables(remote_env_variables)
+                .cross_node_service_blockers(
+                    crate::services::workflow_planner::read_cross_node_blockers(config),
+                )
+                .secrets(secrets)
+                .resources(resources)
+                .log_id(db_job.log_id.clone())
+                .log_service(self.log_service.clone())
+                .failed_container_retention(self.db.clone(), deployment.id);
 
                 if let Some(command) = deployment
                     .metadata
@@ -1679,6 +1868,12 @@ impl WorkflowExecutionService {
                     debug!("🐳 Using external image tag for deployment: {}", image_tag);
                     builder = builder.external_image_tag(image_tag.clone());
                 }
+
+                // Where the image lives (registry vs. only on this control
+                // plane) — decides whether a remote worker pulls it or receives
+                // it via import. Absent on job configs planned before the field
+                // existed; the job then derives it (see `DeployImageSource::resolve`).
+                builder = builder.image_source_from_job_config(config);
 
                 // Apply container log rotation settings from config, and — for a
                 // registry-sourced image — the same private-registry credentials
@@ -1995,12 +2190,7 @@ impl WorkflowExecutionService {
                     download_job_id,
                     build_job_id,
                     self.db.clone(),
-                    // This service always owns a real Docker client today
-                    // (see the `docker: Arc<bollard::Docker>` field above);
-                    // wrap it so `TrivyScanner` gets a `DockerUnavailable`
-                    // error instead of a panic on the day this service is
-                    // itself constructed without one.
-                    Arc::new(DockerHandle::available(self.docker.clone())),
+                    self.docker_handle.clone(),
                 )
                 .with_log_id(db_job.log_id.clone())
                 .with_log_service(self.log_service.clone());
@@ -2364,7 +2554,7 @@ impl WorkflowExecutionService {
                     db_job.job_id.clone(),
                     image_ref,
                     external_image_id,
-                    self.docker.clone(),
+                    self.docker_handle.clone(),
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
@@ -2430,7 +2620,7 @@ impl WorkflowExecutionService {
                     db_job.job_id.clone(),
                     image_ref,
                     expected_image_id,
-                    self.docker.clone(),
+                    self.docker_handle.clone(),
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
@@ -2633,10 +2823,38 @@ impl WorkflowExecutionService {
                     })
                     .unwrap_or_default();
 
-                let compose_executor = Arc::new(temps_deployer::compose::ComposeExecutor::new(
-                    self.docker.clone(),
-                    self.config_service.data_dir(),
-                ));
+                let compose_policy =
+                    temps_entities::compose_security_policies::Entity::find_by_id(project.id)
+                        .one(self.db.as_ref())
+                        .await
+                        .map_err(|error| {
+                            WorkflowError::JobExecutionFailed(format!(
+                                "Failed to load Compose security policy for project {}: {error}",
+                                project.id
+                            ))
+                        })?
+                        .map(|row| row.policy)
+                        .unwrap_or_default();
+                // Build the executor from the handle rather than from a
+                // resolved client: `ComposeExecutor` already carries the
+                // "no daemon here" case (`docker_available()`), and
+                // `DeployComposeJob::execute_locked` uses it to refuse with a
+                // `LocalWorkloadsDisabled` failure naming the remedy.
+                //
+                // Resolving the daemon *here* instead would abort job
+                // construction, which happens before `WorkflowExecutor`
+                // exists — so the deployment would be failed by the outer
+                // processor while its already-inserted `deployment_jobs` rows
+                // stayed `pending` forever, with no per-job reason anywhere in
+                // the UI. Constructing unconditionally keeps the refusal on
+                // the job's own execution path, where the tracker records it.
+                let compose_executor = Arc::new(
+                    temps_deployer::compose::ComposeExecutor::new_with_handle(
+                        self.docker_handle.clone(),
+                        self.config_service.data_dir(),
+                    )
+                    .with_security_policy(compose_policy),
+                );
 
                 let job = crate::jobs::DeployComposeJobBuilder::new()
                     .job_id(db_job.job_id.clone())
@@ -2675,13 +2893,148 @@ impl WorkflowExecutionService {
     }
 
     #[allow(dead_code)]
-    async fn update_deployment_status(
+    /// Choose the node that builds a source image when the control plane
+    /// has no Docker daemon.
+    ///
+    /// Placement is resolved first (one replica, with the deployment's own
+    /// node and label constraints) because the architecture of the node that
+    /// will run the image decides what to build. A build-only node
+    /// (`temps.sh/role=builder`) of that architecture is preferred so build
+    /// load stays off application hosts; without one, the placement target
+    /// builds the image itself and no transfer is needed for it.
+    async fn select_node_builder(
         &self,
         deployment_id: i32,
-        status: temps_entities::types::PipelineStatus,
-    ) -> Result<(), WorkflowExecutionError> {
-        self.update_deployment_status_with_reason(deployment_id, status, None)
+        project_slug: &str,
+        target_nodes: Option<&[i32]>,
+        target_labels: Option<&serde_json::Value>,
+    ) -> Result<SelectedNodeBuilder, WorkflowExecutionError> {
+        let scheduler = self.node_scheduler.get().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Deployment {deployment_id} cannot select a build node: node scheduler is unavailable"
+            ))
+        })?;
+        let required_platforms = scheduler
+            .required_build_platforms_for_project(target_labels, target_nodes, Some(project_slug))
             .await
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Deployment {deployment_id} cannot determine worker build platforms: {error}"
+                ))
+            })?;
+        // Inspect the entire eligible target set, not just the first replica.
+        // Protocol v1 has one image owner; never silently drop other platforms.
+        validate_worker_build_scope(deployment_id, &required_platforms, false)?;
+        let outcome = scheduler
+            .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                replica_count: 1,
+                labels: target_labels,
+                target_node_ids: target_nodes,
+                anti_affinity: true,
+                exclude_node_ids: &[],
+                image_platforms: &required_platforms,
+                project_slug: Some(project_slug),
+            })
+            .await
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Deployment {deployment_id} cannot select a build node: {error}"
+                ))
+            })?;
+        let Some(crate::services::NodeAssignment::Remote {
+            node_id: target_id,
+            node_name: target_name,
+            platform: target_platform,
+            ..
+        }) = outcome.assignments.into_iter().next()
+        else {
+            return Err(WorkflowExecutionError::JobCreationFailed(format!(
+                "Deployment {deployment_id} has no worker node to build on: this control plane \
+                 runs no builds — join a worker with `temps join`"
+            )));
+        };
+        let platform = target_platform
+            .filter(|value| temps_deployer::platform::is_buildable_platform(value))
+            .ok_or_else(|| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Worker '{target_name}' (id={target_id}) has not reported a buildable \
+                     architecture for deployment {deployment_id}; wait for its next heartbeat"
+                ))
+            })?;
+
+        let dedicated = scheduler
+            .select_builder_node(&platform)
+            .await
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Deployment {deployment_id} cannot list build nodes: {error}"
+                ))
+            })?;
+        let node = match dedicated {
+            Some(node) => node,
+            None => scheduler
+                .node_service()
+                .get_by_id(target_id)
+                .await
+                .map_err(|error| {
+                    WorkflowExecutionError::JobCreationFailed(format!(
+                        "Cannot load worker '{target_name}' (id={target_id}) to build \
+                         deployment {deployment_id}: {error}"
+                    ))
+                })?,
+        };
+        let build_only = crate::services::node_scheduler::is_build_only_node(&node);
+        let sealed_token = node.token_encrypted.as_deref().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Build node '{}' (id={}) has no encrypted agent token; re-register it",
+                node.name, node.id
+            ))
+        })?;
+        let encryption = self.encryption_service.get().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Deployment {deployment_id} cannot decrypt the token for build node '{}' (id={})",
+                node.name, node.id
+            ))
+        })?;
+        let token = encryption.decrypt(sealed_token).map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Cannot decrypt build node '{}' (id={}) token: {error}",
+                node.name, node.id
+            ))
+        })?;
+        let token = String::from_utf8(token).map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Build node '{}' (id={}) token is not UTF-8: {error}",
+                node.name, node.id
+            ))
+        })?;
+        let remote = crate::cluster_ca::build_node_deployer(
+            &node.address,
+            token,
+            node.name.clone(),
+            self.config_service.as_ref(),
+            encryption.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Cannot connect to build node '{}' (id={}): {error}",
+                node.name, node.id
+            ))
+        })?;
+        info!(
+            deployment_id,
+            node_id = node.id,
+            node_name = %node.name,
+            build_only,
+            platform = %platform,
+            "Building source image on node"
+        );
+        Ok(SelectedNodeBuilder {
+            node_id: node.id,
+            platform: platform.clone(),
+            remote: Arc::new(remote.with_platform(Some(platform))),
+        })
     }
 
     async fn update_deployment_status_with_reason(
@@ -3306,6 +3659,13 @@ impl WorkflowExecutionService {
         // state determine eligibility, not the container status. Keep failure
         // history intact while removing these containers after a newer success.
         // Prioritize unattempted rows, then rotate timestamped retries fairly.
+        //
+        // Terminal "stopped"/"cancelled" deployments are swept here too: the
+        // capped scan above excludes them, so a container row a teardown
+        // failed to retire would otherwise stay live forever — an orphaned
+        // container on the host that nothing routes to or ever removes. This
+        // query only matches live rows, so it stays bounded by leaked
+        // containers rather than by deployment history.
         const MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT: u64 = 20;
         const RETAINED_CLEANUP_CONCURRENCY: usize = 4;
         let retained_failed = deployment_containers::Entity::find()
@@ -3313,7 +3673,7 @@ impl WorkflowExecutionService {
             .filter(deployment_containers::Column::DeletedAt.is_null())
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::State.eq("failed"))
+            .filter(deployments::Column::State.is_in(["failed", "stopped", "cancelled"]))
             .filter(
                 Condition::any()
                     .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
@@ -3489,6 +3849,18 @@ impl From<anyhow::Error> for WorkflowExecutionError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_build_scope_rejects_mixed_architectures_and_static_before_building() {
+        use super::validate_worker_build_scope;
+        assert!(validate_worker_build_scope(42, &["linux/amd64".into()], false).is_ok());
+        for platforms in [vec![], vec!["linux/amd64".into(), "linux/arm64".into()]] {
+            let error = validate_worker_build_scope(42, &platforms, false).unwrap_err();
+            assert!(error.to_string().contains("Deployment 42"));
+            assert!(error.to_string().contains("target nodes/labels"));
+        }
+        let error = validate_worker_build_scope(42, &["linux/arm64".into()], true).unwrap_err();
+        assert!(error.to_string().contains("artifact extraction"));
+    }
     use super::*;
     use async_trait::async_trait;
     use chrono::Utc;
@@ -4060,6 +4432,7 @@ mod tests {
                 container_port: 3000,
                 host_port: 3000,
                 status: temps_deployer::ContainerStatus::Running,
+                docker_socket_mounted: false,
             })
         }
 
@@ -4244,10 +4617,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
         let _service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -4270,6 +4643,140 @@ mod tests {
         Ok(())
     }
 
+    /// Build the service under test with an explicit Docker handle, so the
+    /// Dockerless (`--profile control-plane`) paths can be exercised without a
+    /// daemon on the machine running the tests.
+    async fn service_with_docker_handle(
+        db: Arc<DbConnection>,
+        docker_handle: Arc<DockerHandle>,
+    ) -> Result<WorkflowExecutionService, Box<dyn std::error::Error>> {
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+
+        Ok(WorkflowExecutionService::new(
+            db,
+            Arc::new(queue) as Arc<dyn temps_core::JobQueue>,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            docker_handle,
+        ))
+    }
+
+    fn disabled_docker_handle() -> Arc<DockerHandle> {
+        Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ))
+    }
+
+    /// Building a Compose job must not need a daemon.
+    ///
+    /// `DeployComposeJob` already refuses Dockerless hosts from inside its own
+    /// `execute`, where the workflow executor records the refusal against the
+    /// job row. Resolving the daemon at *construction* time instead would fail
+    /// the deployment before the executor exists — leaving every planned
+    /// `deployment_jobs` row `pending` forever with no reason anywhere.
+    #[tokio::test]
+    async fn a_compose_job_is_built_without_a_local_docker_daemon(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment) = create_test_data(&db).await?;
+
+        let compose_job = deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("deploy_compose".to_string()),
+            job_type: Set("DeployComposeJob".to_string()),
+            name: Set("Deploy Compose".to_string()),
+            status: Set(JobStatus::Pending),
+            log_id: Set(format!("deployment-{}-job-deploy_compose", deployment.id)),
+            job_config: Set(Some(serde_json::json!({ "compose_path": "compose.yaml" }))),
+            execution_order: Set(Some(0)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        service
+            .create_job_from_record(&project, &environment, &deployment, &compose_job)
+            .await
+            .expect("compose job construction must not depend on a local daemon");
+
+        Ok(())
+    }
+
+    /// Whatever stops a workflow from being assembled, the planned job rows
+    /// must not be left saying "pending" on a deployment that is over. A
+    /// self-hosted operator staring at a timeline that never resolves has no
+    /// way to tell a stuck deployment from a slow one.
+    #[tokio::test]
+    async fn planned_jobs_are_closed_out_when_the_workflow_cannot_be_built(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = create_test_data(&db).await?;
+
+        // `BuildStaticJob` is a planned-but-unimplemented type: constructing it
+        // always fails, which is exactly the shape of a setup failure.
+        let doomed = deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("build_static".to_string()),
+            job_type: Set("BuildStaticJob".to_string()),
+            name: Set("Build Static".to_string()),
+            status: Set(JobStatus::Pending),
+            log_id: Set(format!("deployment-{}-job-build_static", deployment.id)),
+            job_config: Set(Some(serde_json::json!({}))),
+            execution_order: Set(Some(0)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        let error = service
+            .execute_deployment_workflow(deployment.id)
+            .await
+            .expect_err("an unbuildable workflow must fail the deployment");
+
+        let row = deployment_jobs::Entity::find_by_id(doomed.id)
+            .one(db.as_ref())
+            .await?
+            .expect("the planned job row still exists");
+
+        assert_ne!(
+            row.status,
+            JobStatus::Pending,
+            "a planned job must never be left pending after the deployment is over",
+        );
+        let reason = row
+            .error_message
+            .clone()
+            .expect("the closed-out row must say why it never ran");
+        assert!(
+            reason.contains(&deployment.id.to_string()),
+            "the reason must identify the deployment: {reason}",
+        );
+        assert!(
+            reason.contains(&error.to_string()),
+            "the reason must carry the underlying setup failure: {reason}",
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_execute_deployment_workflow_no_jobs() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
@@ -4288,10 +4795,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
         let service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -4366,10 +4873,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
         let service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -4461,7 +4968,9 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
-            Arc::new(bollard::Docker::connect_with_local_defaults()?),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()?,
+            ))),
         );
         let telemetry = Arc::new(CapturingTelemetryReporter::default());
         service.set_telemetry(telemetry.clone());
@@ -4726,6 +5235,37 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // A superseded deployment that was flipped to "stopped" while its
+        // container removal failed left a live row behind. The capped scan
+        // above never revisits "stopped" deployments, so this sweep must
+        // retire it — otherwise the exited container lingers on the host
+        // indefinitely.
+        let stopped_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("stopped-deployment".to_string()),
+            state: Set("stopped".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(20)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let leaked_container = deployment_containers::ActiveModel {
+            deployment_id: Set(stopped_deployment.id),
+            container_id: Set("leaked-stopped-container".to_string()),
+            container_name: Set("leaked-stopped-container".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("exited".to_string())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
         // Older failed deployments and interrupted cleanup need not have the
         // retained prefix. They must still be selected by the failure sweep.
         let mut legacy_containers = Vec::new();
@@ -4850,10 +5390,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
 
         let service = WorkflowExecutionService::new(
             db.clone(),
@@ -4891,6 +5431,16 @@ mod tests {
             .expect("retained container row still exists");
         assert!(retained_refreshed.deleted_at.is_some());
         assert_eq!(retained_refreshed.status.as_deref(), Some("deleted"));
+
+        let leaked_refreshed = deployment_containers::Entity::find_by_id(leaked_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("leaked container row still exists");
+        assert!(
+            leaked_refreshed.deleted_at.is_some(),
+            "a live row under a stopped deployment must be removed by the sweep"
+        );
+        assert_eq!(leaked_refreshed.status.as_deref(), Some("deleted"));
 
         let retry_refreshed = deployment_containers::Entity::find_by_id(retry_container.id)
             .one(db.as_ref())
@@ -5054,6 +5604,7 @@ mod tests {
             deployment_config: None,
             promoted_from_deployment_id: None,
             upload_request_id: None,
+            docker_socket_mounted: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

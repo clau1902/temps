@@ -1247,8 +1247,9 @@ at an already-running `temps serve` (started via the `start-temps` skill)
 and drives it over HTTP. Multi-node clustering can't be proven that way:
 it needs a genuinely SEPARATE node — its own Docker daemon, its own binary,
 its own network identity — registering into the first node's mesh over
-single-use enrollment and real mTLS. WireGuard relay enrollment is a separate
-topology and is not claimed by this scenario. `tls-scenario` already established the precedent that a
+single-use enrollment and real mTLS. Built-in WireGuard relay enrollment is not
+claimed by this scenario (no relay ships with Temps); `--topology wireguard`
+covers the supported alternative, described below. `tls-scenario` already established the precedent that a
 scenario can need "a dedicated instance on a fixed port, not a normal dev
 slot" (see that section above) because of Pebble's hardcoded port; this
 scenario takes the same idea further: it brings up its own 2-node
@@ -1310,9 +1311,45 @@ tears the whole thing down at the end. It does NOT accept `--url`/
     container migrated off the worker. In this 2-node cluster it has
     nowhere to go but the control plane, so this step also implicitly
     re-tests the `Local` scheduling fallback path.
-13. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+13. sandboxes on the worker (ADR-048 §13,
+    `src/commands/multinode-sandbox-phases.ts`). This runs after the drain
+    because the worker then hosts no deployment containers, so only
+    sandboxes can block its removal. The worker is reactivated first, then:
+    - `GET /v1/sandboxes/placement` lists it as eligible;
+      `PUT allowed_node_ids` `[worker]` and back to `null`.
+    - The sandbox image the control plane reports is pre-pulled on the
+      worker. This is best effort: a build without a release manifest names
+      an unpublished tag, so the first create builds the image on the worker
+      from the embedded Dockerfile. That create gets 15 minutes.
+    - Create with `node: worker-1`. The response must carry the worker's
+      `node_id`/`node_name`. `temps-sandbox-<label>` must be in the worker's
+      `docker ps` and not in the control plane's, and its work dir must exist
+      under the agent's `<data dir>/sandboxes/<label>`.
+    - exec `echo` + `hostname`; the hostname must match the container's own.
+    - Write a file, read it back, and find it in the worker's work dir.
+    - pause (stop) and then resume (start); exec works and the file is still
+      there.
+    - `docker restart` the control plane. Exec must work again once the
+      worker has sent a fresh heartbeat (lazy recovery).
+    - A snapshot is refused with `422`, and the sandbox keeps running.
+    - Allow-list `[0]` + `node: worker-1` returns
+      `422 sandbox-node-not-allowed`. Allow-list `[worker]` with no `node`
+      lands on the worker.
+    - `docker pause` the worker until it is marked offline. Exec must return
+      `503` naming it. Then unpause and wait for it to come back.
+    - `DELETE /internal/nodes/{id}` returns `409`, and the drain status
+      reports `remaining_sandboxes >= 2`.
+    - Destroying the second sandbox removes its container and work dir.
+      Evicting the worker destroys the rest with no unconfirmed containers,
+      leaves no `temps-sandbox-` containers on the worker, and brings
+      `remaining_sandboxes` to 0.
+    - Drain again; the drain status must allow removal.
+
+    Cleanup always unpauses the worker, destroys leftover sandboxes and
+    restores `allowed_node_ids` to `null`.
+14. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
     gone from `GET /internal/nodes`.
-14. teardown (in a `finally`, same discipline as every other scenario):
+15. teardown (in a `finally`, same discipline as every other scenario):
     `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
     workspace-target cache volumes survive for a near-instant re-run), then
     explicitly `docker volume rm` the identity/state volumes (postgres
@@ -1341,6 +1378,32 @@ bun run src/index.ts multinode-join-scenario
 bun run src/index.ts multinode-join-scenario --keep --json    # inspect the running cluster after (CI)
 bun run src/index.ts multinode-join-scenario --build-timeout 2400000   # more generous on a slow machine
 ```
+
+
+#### `--topology wireguard`
+
+Runs every step above against `tools/e2e-wireguard-cluster/docker-compose.yml`
+instead: the nodes share no network. The worker sits alone on its LAN behind a
+NAT router with no port forwards, the control plane's "public" interface
+accepts only WireGuard (UDP 51820), and the two are joined by a kernel
+WireGuard tunnel (`wg-node.sh`). The worker joins with its tunnel address
+`10.57.0.11` as `--private-address`, and the control plane sets up its overlay
+with `--private-address 10.57.0.1 --underlay-dev wg0`. On top of the steps
+above it asserts:
+
+- before the tunnel exists, the worker cannot reach the control plane's public
+  address, API, LAN or database (`wg-node.sh` exits otherwise);
+- after the join, each node reaches the other only at its tunnel address (the
+  worker's agent port is unreachable on its LAN address), and a handshake
+  happened;
+- both VXLAN overlays fit inside the tunnel (MTU at most 1370), and each
+  node's largest unfragmentable overlay packet reaches the other node;
+- a 1 MiB response proxied by the control plane from the app on the worker
+  grows the worker's WireGuard send counter by at least 1 MiB.
+
+It uses host port 18280 and its own `temps-e2e-wg-*` names, subnets and
+volumes, so it can run next to the bridge topology. The how-to is
+`docs/howto/test-multi-node-wireguard/page.mdx`.
 
 ### `deploy-lifecycle-scenario` steps
 
@@ -1604,13 +1667,17 @@ This starts:
   web UI + REST API (`GET /api/v1/messages`) on `http://localhost:8025`. Same
   image already proven for this in `crates/temps-notifications`'s Rust
   integration tests.
-- **MinIO** (`minio/minio`) — S3-compatible target for `backup-restore-scenario`.
-  S3 API on `http://localhost:9092` (not MinIO's own default of 9000 — see
-  the compose file comment for why), console on `http://localhost:9093`.
-  Same image + credentials (`minioadmin`/`minioadmin`) already proven in
-  `crates/temps-backup`'s own testcontainers-based Rust integration tests.
-  Create the bucket once before running the scenario:
-  `docker exec <minio-container> mc alias set local http://localhost:9000 minioadmin minioadmin && docker exec <minio-container> mc mb local/temps-e2e-backups`.
+- **S3 target** (compose service `minio`, image `rustfs/rustfs`) — S3-compatible
+  target for `backup-restore-scenario` and the other backup scenarios. It runs
+  RustFS because MinIO no longer publishes images; the service keeps the
+  `minio` name and `minioadmin`/`minioadmin` credentials so the scenarios'
+  `--minio-*` flags stay unchanged. S3 API on `http://localhost:9092` (not
+  the default 9000 — see the compose file comment for why), console on
+  `http://localhost:9093`. The same image is used by `crates/temps-backup`'s
+  own Rust integration tests.
+  Create the bucket once before running the scenario (`rc` is RustFS's
+  mc-compatible CLI; the server image does not ship a client):
+  `docker run --rm --network temps-e2e_default -e RC_HOST_local=http://minioadmin:minioadmin@minio:9000 rustfs/rc:v0.1.36 mb --ignore-existing local/temps-e2e-backups`.
   Since `temps serve` runs natively on the host (not in a container), point
   `--minio-endpoint` at `http://localhost:9092` — the default — not
   `host.docker.internal`, which only resolves from inside a container.

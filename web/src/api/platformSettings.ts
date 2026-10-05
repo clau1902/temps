@@ -135,6 +135,22 @@ export interface ObservabilityCompressionSettings {
   otel_spans_after_hours: number
 }
 
+/**
+ * Collected container-log budgets (ADR-046). Mirrors the Rust
+ * `ContainerLogSettings`; the Docker `--log-opt` rotation fields are
+ * round-tripped untouched from the server response.
+ */
+export interface ContainerLogSettings {
+  max_size: string
+  max_file: number
+  service_max_size: string
+  service_max_file: number
+  /** Disk budget (MiB) for the read cache of chunk blocks/indexes/blooms. */
+  cache_mb: number
+  /** Per-container cap (MiB) on unsealed lines held before sealing a chunk. */
+  head_buffer_mb: number
+}
+
 export interface ObservabilityRetentionSettings {
   /** Raw proxy request-log retention in days. */
   proxy_logs_days: number
@@ -144,6 +160,8 @@ export interface ObservabilityRetentionSettings {
   otel_logs_days: number
   /** OpenTelemetry metric-point retention in days. */
   otel_metrics_days: number
+  /** Collected container log retention in days (chunks, manifest, line index). */
+  container_logs_days: number
 }
 
 /**
@@ -187,6 +205,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   preview_domain: string
   /** Public address synced DNS records point at (IP → A/AAAA, else CNAME). */
   edge_target?: string | null
+  cloudflare_new_projects: boolean
+  bunny_new_projects: boolean
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
@@ -200,6 +220,7 @@ export interface PlatformSettings extends AppSettingsResponse {
   monitored_services_count: number | null
   observability_compression: ObservabilityCompressionSettings
   observability_retention: ObservabilityRetentionSettings
+  container_logs: ContainerLogSettings
   /** Geolocation refresh policy, with the MaxMind key masked to a boolean. */
   geo: GeoSettings
   /** Effective backend for proxy logs and OTel spans. */
@@ -267,7 +288,11 @@ export async function updatePlatformSettings(
   // fields; `maxmind_license_key_saved` (already on `updated.geo`) is what
   // the UI actually reads back.
   if (updated.geo) {
-    const { maxmind_license_key: _key, clear_maxmind_license_key: _clear, ...maskedGeo } = updated.geo
+    const {
+      maxmind_license_key: _key,
+      clear_maxmind_license_key: _clear,
+      ...maskedGeo
+    } = updated.geo
     return { ...updated, geo: maskedGeo as GeoSettings }
   }
   return updated
@@ -283,6 +308,8 @@ export function buildPlatformSettingsUpdateBody(
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
     edge_target: updated.edge_target,
+    cloudflare_new_projects: updated.cloudflare_new_projects,
+    bunny_new_projects: updated.bunny_new_projects,
     // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
     // omitting this would silently reset the console's HTTPS policy back to
     // "automatic" whenever any other settings page is saved.
@@ -316,6 +343,9 @@ export function buildPlatformSettingsUpdateBody(
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
     observability_retention: updated.observability_retention,
+    // Same reasoning: omitting this would reset Docker log rotation and the
+    // collected-log cache/head budgets to defaults on every unrelated save.
+    container_logs: updated.container_logs,
     // Same `#[serde(default)]` reasoning as the blocks below: omitting this
     // would reset the geolocation refresh interval and staleness window to
     // their defaults on every unrelated settings save. The server preserves
@@ -352,6 +382,9 @@ export function buildPlatformSettingsUpdateBody(
  * @throws Error if settings are invalid
  */
 function validateSettings(settings: PlatformSettings): void {
+  if (settings.cloudflare_new_projects && settings.bunny_new_projects) {
+    throw new Error('Choose Cloudflare or Bunny for new projects, not both')
+  }
   // Validate external URL format
   if (settings.external_url && !isValidUrl(settings.external_url)) {
     throw new Error('Invalid external URL format')

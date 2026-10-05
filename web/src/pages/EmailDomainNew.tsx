@@ -54,6 +54,10 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import {
+  discoverableDomainOptions,
+  selectionAfterProviderChange,
+} from '@/lib/email-domain-options'
 
 // ============================================================================
 // Schemas (reused from EmailDomainsManagement)
@@ -427,19 +431,21 @@ function ConfigureStep({
           <div className="space-y-2">
             <Label htmlFor="domain-picker">Domain</Label>
             <SearchableSelect
-              value={domain || undefined}
-              onValueChange={(value) => {
+              // Keyed by the provider identity, not the name: a provider can
+              // hold two identities for one domain name, and picking by name
+              // would bind whichever came first.
+              value={providerIdentityId || undefined}
+              onValueChange={(identityId) => {
                 const match = discoverableDomains?.domains.find(
-                  (d) => d.domain === value
+                  (d) => d.provider_identity_id === identityId
                 )
-                onDomainChange(value)
-                onProviderIdentityIdChange(match?.provider_identity_id ?? '')
+                if (!match) return
+                onDomainChange(match.domain)
+                onProviderIdentityIdChange(match.provider_identity_id)
               }}
-              options={(discoverableDomains?.domains ?? []).map((d) => ({
-                value: d.domain,
-                label: d.domain,
-                keywords: d.status,
-              }))}
+              options={discoverableDomainOptions(
+                discoverableDomains?.domains ?? []
+              )}
               placeholder="Select a domain from your provider"
               searchPlaceholder="Search domains..."
               emptyText="No matching domain."
@@ -912,6 +918,14 @@ export function EmailDomainNew() {
                     providerIdentityId={providerIdentityId}
                     errors={step2Errors}
                     onProviderChange={(id) => {
+                      const next = selectionAfterProviderChange(
+                        mode,
+                        providerId,
+                        id,
+                        { domain, providerIdentityId }
+                      )
+                      setDomain(next.domain)
+                      setProviderIdentityId(next.providerIdentityId)
                       setProviderId(id)
                       setStep2Errors((prev) => ({
                         ...prev,

@@ -8,6 +8,10 @@ pub mod handlers;
 pub mod managed_schedule;
 pub mod plugin;
 pub mod services;
+pub mod telemetry;
+
+#[cfg(test)]
+pub(crate) mod test_rustfs;
 
 pub use handlers::{configure_routes, create_backup_app_state, BackupAppState};
 pub use services::*;

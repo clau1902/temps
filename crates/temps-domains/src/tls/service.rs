@@ -480,6 +480,7 @@ impl TlsService {
             .await?;
 
         let mut report = RenewalReport {
+            renewed_verification_methods: Vec::new(),
             total_checked: expiring.len(),
             auto_renewed: Vec::new(),
             renewal_failed: Vec::new(),
@@ -600,6 +601,9 @@ impl TlsService {
                 // Certificate was immediately available (shouldn't happen for renewals, but handle it)
                 info!("✅ Successfully renewed certificate for {}", cert.domain);
                 report.auto_renewed.push(cert.domain.clone());
+                report
+                    .renewed_verification_methods
+                    .push(cert.verification_method.clone());
                 return;
             }
             Err(TlsError::ManualActionRequired(_)) => {
@@ -640,6 +644,9 @@ impl TlsService {
             Ok(_new_cert) => {
                 info!("✅ Successfully renewed certificate for {}", cert.domain);
                 report.auto_renewed.push(cert.domain.clone());
+                report
+                    .renewed_verification_methods
+                    .push(cert.verification_method.clone());
             }
             Err(e) => {
                 error!("❌ Failed to complete renewal for {}: {}", cert.domain, e);
@@ -671,7 +678,10 @@ impl TlsService {
         report: &mut RenewalReport,
     ) {
         // Step 1: Create + persist a new ACME order (sets domain to `challenge_requested`).
-        let challenge = match domain_service.request_challenge(&cert.domain, email).await {
+        let challenge = match domain_service
+            .request_challenge_unreported(&cert.domain, email)
+            .await
+        {
             Ok(challenge) => challenge,
             Err(e) => {
                 error!("❌ Failed to initiate renewal for {}: {}", cert.domain, e);
@@ -694,6 +704,9 @@ impl TlsService {
         if challenge.status == "completed" {
             info!("✅ Successfully renewed certificate for {}", cert.domain);
             report.auto_renewed.push(cert.domain.clone());
+            report
+                .renewed_verification_methods
+                .push(cert.verification_method.clone());
             return;
         }
 
@@ -705,10 +718,16 @@ impl TlsService {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
         // Step 3: Accept the challenge and finalize the persisted order.
-        match domain_service.complete_challenge(&cert.domain, email).await {
+        match domain_service
+            .complete_challenge_unreported(&cert.domain, email)
+            .await
+        {
             Ok(_renewed) => {
                 info!("✅ Successfully renewed certificate for {}", cert.domain);
                 report.auto_renewed.push(cert.domain.clone());
+                report
+                    .renewed_verification_methods
+                    .push(cert.verification_method.clone());
             }
             Err(e) => {
                 // The order remains persisted (pending) and recoverable from the UI.
@@ -811,7 +830,10 @@ impl TlsService {
         let email = self.get_acme_email().await;
 
         // Step 1: Create + persist a new ACME order (sets domain to `challenge_requested`).
-        let challenge = match domain_service.request_challenge(&cert.domain, &email).await {
+        let challenge = match domain_service
+            .request_challenge_unreported(&cert.domain, &email)
+            .await
+        {
             Ok(challenge) => challenge,
             Err(e) => {
                 error!(
@@ -837,6 +859,9 @@ impl TlsService {
         if challenge.status == "completed" {
             info!("✅ Successfully renewed certificate for {}", cert.domain);
             report.auto_renewed.push(cert.domain.clone());
+            report
+                .renewed_verification_methods
+                .push(cert.verification_method.clone());
             return true;
         }
 
@@ -1025,12 +1050,15 @@ impl TlsService {
 
         // Step 4: Accept the challenge and finalize the persisted order.
         match domain_service
-            .complete_challenge(&cert.domain, &email)
+            .complete_challenge_unreported(&cert.domain, &email)
             .await
         {
             Ok(_renewed) => {
                 info!("✅ Successfully renewed certificate for {}", cert.domain);
                 report.auto_renewed.push(cert.domain.clone());
+                report
+                    .renewed_verification_methods
+                    .push(cert.verification_method.clone());
             }
             Err(e) => {
                 // The order remains persisted (pending) and recoverable from the UI.
@@ -1372,6 +1400,7 @@ impl TlsService {
     pub async fn start_certificate_renewal_scheduler(
         &self,
         cancellation_token: tokio_util::sync::CancellationToken,
+        telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     ) -> Result<(), TlsError> {
         use chrono::Timelike;
         use tokio::time;
@@ -1381,6 +1410,9 @@ impl TlsService {
         // Run initial check on startup
         match self.check_and_renew_certificates(30).await {
             Ok(report) => {
+                for event in renewal_telemetry_events(&report) {
+                    telemetry.report(event);
+                }
                 if report.total_checked > 0 {
                     info!(
                         "Initial certificate check: {} checked, {} renewed, {} failed, {} manual",
@@ -1438,6 +1470,9 @@ impl TlsService {
 
                     match self.check_and_renew_certificates(30).await {
                         Ok(report) => {
+                            for event in renewal_telemetry_events(&report) {
+                                telemetry.report(event);
+                            }
                             info!(
                                 "Certificate renewal check: {} checked, {} renewed, {} failed, {} manual",
                                 report.total_checked,
@@ -1458,6 +1493,42 @@ impl TlsService {
             }
         }
     }
+}
+
+/// Anonymous telemetry for one automatic renewal pass: one
+/// `ssl_certificate_issued` per renewed certificate and one
+/// `ssl_certificate_failed` per failure. The scheduler is the only reporter
+/// for automatic renewals: it calls `DomainService`'s unreported challenge
+/// methods, so failures before an ACME order exists are counted too and none
+/// are counted twice. Domain names and error messages stay on the instance;
+/// failures carry only a fixed code.
+fn renewal_telemetry_events(report: &RenewalReport) -> Vec<temps_core::telemetry::TelemetryEvent> {
+    use crate::domain_service::verification_method_label;
+    use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+
+    let renewed = (0..report.auto_renewed.len()).map(|i| {
+        let method = report
+            .renewed_verification_methods
+            .get(i)
+            .map_or("unknown", |raw| verification_method_label(raw));
+        TelemetryEvent::new(TelemetryEventKind::SslCertificateIssued)
+            .with("success", true)
+            .with("verification_method", method)
+            .with("renewal", true)
+            .with("automatic", true)
+    });
+    let failed = report.renewal_failed.iter().map(|failure| {
+        TelemetryEvent::new(TelemetryEventKind::SslCertificateFailed)
+            .with("stage", "renewal")
+            .with(
+                "verification_method",
+                verification_method_label(&failure.verification_method),
+            )
+            .with("renewal", true)
+            .with("automatic", true)
+            .with_failure_from_message(&failure.error)
+    });
+    renewed.chain(failed).collect()
 }
 
 #[derive(Debug)]
@@ -1546,6 +1617,75 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
+
+    #[test]
+    fn renewal_telemetry_reports_outcomes_without_domains_or_messages() {
+        let report = RenewalReport {
+            renewed_verification_methods: vec!["dns-01".to_string()],
+            total_checked: 3,
+            auto_renewed: vec!["shop.example.com".to_string()],
+            renewal_failed: vec![
+                RenewalFailure {
+                    domain: "api.example.com".to_string(),
+                    error: "urn:ietf:params:acme:error:rateLimited: too many certificates"
+                        .to_string(),
+                    verification_method: "http-01".to_string(),
+                },
+                // Fails before an ACME order exists; still a renewal failure.
+                RenewalFailure {
+                    domain: "www.example.com".to_string(),
+                    error: "No ACME order found for domain: www.example.com".to_string(),
+                    verification_method: "http-01".to_string(),
+                },
+            ],
+            manual_action_needed: vec![],
+        };
+
+        let events = renewal_telemetry_events(&report);
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_type, "ssl_certificate_issued");
+        assert_eq!(events[0].properties["verification_method"], "dns-01");
+        assert_eq!(events[0].properties["renewal"], true);
+        assert_eq!(events[0].properties["automatic"], true);
+        assert_eq!(events[1].event_type, "ssl_certificate_failed");
+        assert_eq!(events[1].properties["failure_code"], "rate_limited");
+        assert_eq!(events[1].properties["verification_method"], "http-01");
+        assert_eq!(events[2].event_type, "ssl_certificate_failed");
+        assert_eq!(events[2].properties["failure_code"], "not_found");
+
+        // Legacy aliases and unexpected column values map to fixed labels.
+        let legacy = RenewalReport {
+            renewed_verification_methods: Vec::new(),
+            total_checked: 1,
+            auto_renewed: vec![],
+            renewal_failed: vec![RenewalFailure {
+                domain: "legacy.example.com".to_string(),
+                error: "timed out".to_string(),
+                verification_method: "operator-typed value".to_string(),
+            }],
+            manual_action_needed: vec![],
+        };
+        assert_eq!(
+            renewal_telemetry_events(&legacy)[0].properties["verification_method"],
+            "unknown"
+        );
+        let serialized = serde_json::to_string(&events).unwrap();
+        assert!(!serialized.contains("example.com"));
+        assert!(!serialized.contains("too many certificates"));
+    }
+
+    #[test]
+    fn renewal_telemetry_is_empty_when_nothing_was_due() {
+        let report = RenewalReport {
+            renewed_verification_methods: Vec::new(),
+            total_checked: 0,
+            auto_renewed: vec![],
+            renewal_failed: vec![],
+            manual_action_needed: vec![],
+        };
+        assert!(renewal_telemetry_events(&report).is_empty());
+    }
 
     #[test]
     fn dns_automation_audit_redacts_acme_values() {
@@ -1869,6 +2009,7 @@ mod tests {
                 status: CertificateStatus::Active,
             };
             let mut report = RenewalReport {
+                renewed_verification_methods: Vec::new(),
                 total_checked: 1,
                 auto_renewed: vec![],
                 renewal_failed: vec![],
@@ -1974,6 +2115,7 @@ mod tests {
                 AddManagedDomainRequest {
                     domain: "example.com".to_string(),
                     auto_manage: true,
+                    proxied_by_default: false,
                     generated_hostname_mode: None,
                     sync_generated_records: false,
                 },
@@ -2162,6 +2304,7 @@ mod tests {
                 AddManagedDomainRequest {
                     domain: "example.com".to_string(),
                     auto_manage: true,
+                    proxied_by_default: false,
                     generated_hostname_mode: None,
                     sync_generated_records: false,
                 },
@@ -2195,6 +2338,7 @@ mod tests {
         std::env::set_var("TEMPS_ALLOW_PEBBLE_PROVIDER", "1");
         let task = tokio::spawn(async move {
             let mut report = RenewalReport {
+                renewed_verification_methods: Vec::new(),
                 total_checked: 1,
                 auto_renewed: vec![],
                 renewal_failed: vec![],

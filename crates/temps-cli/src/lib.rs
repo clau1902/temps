@@ -9,6 +9,7 @@
 //! described in ADR 0001 §"Extension points exposed by OSS".
 
 pub mod commands;
+mod docker_context;
 
 use clap::{Parser, Subcommand};
 use commands::{
@@ -112,6 +113,10 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
         } else {
             format!("{extra},")
         };
+        // `sqlx::postgres::notice` re-emits server NOTICE/WARNING messages —
+        // TimescaleDB's schema advisories on every migration run (e.g.
+        // `column "id" should be used for segmenting`). They're not actionable
+        // at runtime, so they're hidden unless RUST_LOG asks for them.
         tracing_subscriber::EnvFilter::new(format!(
             "{extra}\
              temps_cli={level},\
@@ -184,6 +189,7 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
              temps_sandbox={level},\
              pingora=warn,\
              sqlx=warn,\
+             sqlx::postgres::notice=error,\
              sea_orm=warn,\
              sea_orm_migration=warn,\
              h2=warn,\
@@ -302,7 +308,11 @@ pub fn dispatch_with_request_policy_gate(
 ) -> anyhow::Result<()> {
     // Commands are now synchronous to be compatible with pingora
     match cli.command {
-        Commands::Serve(serve_cmd) => serve_cmd.execute_with_extra_plugins(extra_plugins),
+        Commands::Serve(serve_cmd) => serve_cmd.execute_with_gates(
+            extra_plugins,
+            ip_gate_builder,
+            request_policy_gate_builder,
+        ),
         Commands::Proxy(proxy_cmd) => {
             proxy_cmd.execute_with_gates(ip_gate_builder, request_policy_gate_builder)
         }
@@ -466,12 +476,22 @@ unsafe fn scrub_argv_raw(argc: usize, argv: *mut *mut libc::c_char, sensitive_fl
 /// Used by both the OSS `temps` binary (`extra_plugins = vec![]`) and any
 /// EE-bundled binary that wraps the same CLI surface.
 pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyhow::Result<()> {
+    // Mutates the environment, so it runs before anything can spawn a thread.
+    let docker_context = docker_context::adopt_active_docker_context();
     install_crypto_provider();
     let cli = Cli::parse();
     // Scrub sensitive flag values from argv *after* clap has parsed them so
     // they no longer appear in `pgrep -af` or /proc/self/cmdline.
     scrub_sensitive_argv();
     install_tracing(&cli.log_level, &cli.log_format);
+    match docker_context {
+        Ok(adopted) => tracing::info!(
+            "Using Docker context '{}' ({}) because DOCKER_HOST is not set",
+            adopted.name,
+            adopted.host
+        ),
+        Err(skip) => tracing::debug!("Not adopting a Docker context: {:?}", skip),
+    }
     dispatch(cli, extra_plugins)
 }
 
@@ -543,7 +563,9 @@ mod command_tree_tests {
 
     fn expected_leaf_paths() -> BTreeSet<String> {
         [
-            "agent",
+            "agent service install",
+            "agent service status",
+            "agent service uninstall",
             "api-key",
             "backfill clickhouse",
             "backfill cloud-telemetry",
@@ -554,7 +576,7 @@ mod command_tree_tests {
             "deploy git",
             "deploy image",
             "deploy static",
-            "doctor",
+            "doctor mesh",
             "domain add",
             "domain cert-status",
             "domain delete",

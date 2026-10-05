@@ -17,8 +17,9 @@ use openidconnect::{
     RequestTokenError, Scope, TokenResponse,
 };
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
+    DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    Statement, TransactionTrait,
 };
 use tokio::sync::Mutex;
 
@@ -37,13 +38,6 @@ use temps_entities::types::RoleType;
 use temps_entities::users;
 
 const LOGIN_STATE_TTL_MINUTES: i64 = 10;
-/// ADR-045 §Security Model: the Cloud-managed console-access provider's
-/// authorization codes are single-use and expire in 60s on Cloud's side, with
-/// reuse detection. The RP's own `state` TTL is tightened to match rather
-/// than using the generic [`LOGIN_STATE_TTL_MINUTES`], which would leave a
-/// much longer window than the code it is paired with actually lives for —
-/// narrowing the window a compromised Hub has to replay a captured callback.
-const CLOUD_MANAGED_LOGIN_STATE_TTL_SECONDS: i64 = 60;
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// Hard cap on how long an OIDC discovery or token-exchange round-trip
 /// can take. openidconnect 4.x lets us own the `reqwest::Client`, so
@@ -434,7 +428,7 @@ impl OidcService {
         self.discovery_cache.lock().await.remove(&provider_id);
 
         if disabling {
-            self.revoke_sessions_for_provider(provider_id).await?;
+            Self::revoke_sessions_for_provider(self.db.as_ref(), provider_id).await?;
         }
 
         Ok(updated)
@@ -447,16 +441,21 @@ impl OidcService {
     /// returns the error so the caller can decide whether to surface
     /// it (we currently propagate it; the surrounding admin handler
     /// already records the audit row regardless).
-    async fn revoke_sessions_for_provider(&self, provider_id: i32) -> Result<(), OidcError> {
-        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-
+    ///
+    /// Generic over the connection so provider deletion/revocation can run it
+    /// inside the same transaction that drops the provider row — see
+    /// [`Self::revoke_managed_cloud_provider`] for why the two must commit
+    /// together.
+    async fn revoke_sessions_for_provider<C: ConnectionTrait>(
+        conn: &C,
+        provider_id: i32,
+    ) -> Result<(), OidcError> {
         // Single-statement: DELETE … WHERE user_id IN (SELECT …).
         // Sea-ORM has no first-class subquery DELETE; raw SQL is
         // both safer (one round-trip, one lock) and clearer here.
         // Parameterised via $1 — no injection surface even though
         // the input is an i32.
-        let result = self
-            .db
+        let result = conn
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "DELETE FROM sessions WHERE user_id IN \
@@ -510,13 +509,112 @@ impl OidcService {
         // `sessions.user_id → users.id` is ON DELETE CASCADE, but
         // deleting a provider does not delete users, so the cascade
         // doesn't help here.
-        self.revoke_sessions_for_provider(provider_id).await?;
-
+        //
+        // All of it in one transaction that takes an exclusive lock on the
+        // provider row first, so a login already in flight for this provider
+        // cannot slip a freshly-created session past the session delete —
+        // see [`Self::assert_provider_live_for_session`] for the other half
+        // of that handshake.
+        let txn = self.db.begin().await?;
+        Self::lock_provider_for_write(&txn, provider_id).await?;
+        Self::purge_provider_login_states(&txn, provider_id).await?;
+        Self::revoke_sessions_for_provider(&txn, provider_id).await?;
         oidc_providers::Entity::delete_by_id(provider.id)
-            .exec(self.db.as_ref())
+            .exec(&txn)
             .await?;
+        txn.commit().await?;
+
         self.discovery_cache.lock().await.remove(&provider_id);
         Ok(())
+    }
+
+    /// Take the exclusive row lock that serializes provider teardown against
+    /// a login in flight for the same provider. Returns `Ok(false)` when the
+    /// row is already gone (another teardown won the race).
+    async fn lock_provider_for_write<C: ConnectionTrait>(
+        conn: &C,
+        provider_id: i32,
+    ) -> Result<bool, OidcError> {
+        Ok(oidc_providers::Entity::find_by_id(provider_id)
+            .lock_exclusive()
+            .one(conn)
+            .await?
+            .is_some())
+    }
+
+    /// Drop every pending `oidc_login_states` row for a provider that is
+    /// being deleted or revoked. SECURITY: a login that already redirected to
+    /// the IdP must not be able to come back and complete against a provider
+    /// the operator (or Cloud) just took away — without this, the callback
+    /// would consume a state row that outlived its provider.
+    async fn purge_provider_login_states<C: ConnectionTrait>(
+        conn: &C,
+        provider_id: i32,
+    ) -> Result<(), OidcError> {
+        let deleted = oidc_login_states::Entity::delete_many()
+            .filter(oidc_login_states::Column::ProviderId.eq(provider_id))
+            .exec(conn)
+            .await?;
+        if deleted.rows_affected > 0 {
+            tracing::info!(
+                target: "temps_auth::oidc",
+                provider_id = provider_id,
+                login_states_purged = deleted.rows_affected,
+                "Discarded in-flight OIDC login states for a provider being removed"
+            );
+        }
+        Ok(())
+    }
+
+    /// SECURITY: the second half of the teardown handshake described on
+    /// [`Self::delete_provider`] / [`Self::revoke_managed_cloud_provider`].
+    ///
+    /// A callback that has already resolved its user can be overtaken by a
+    /// concurrent revocation: the revocation deletes every session the
+    /// provider issued, and only *then* does the callback insert its own
+    /// session row — which would survive the revocation and hand a live
+    /// console session to an identity the instance no longer trusts.
+    ///
+    /// Called immediately after the session row is created, this closes that
+    /// window without holding a transaction open across the IdP round-trip.
+    /// It takes a *shared* lock on the provider row, so it blocks behind an
+    /// in-progress teardown (which holds the exclusive lock) and only then
+    /// re-reads the row. Either the provider is still there and enabled — in
+    /// which case the teardown has not started yet, so its own session delete
+    /// is guaranteed to observe the session just committed — or it is gone /
+    /// disabled, and the freshly-created session is deleted again before the
+    /// cookie ever reaches the browser.
+    pub async fn assert_provider_live_for_session(
+        &self,
+        provider_id: i32,
+        session_token: &str,
+    ) -> Result<(), OidcError> {
+        let txn = self.db.begin().await?;
+        let live = oidc_providers::Entity::find_by_id(provider_id)
+            .lock_shared()
+            .one(&txn)
+            .await?
+            .is_some_and(|provider| provider.enabled);
+        if live {
+            txn.commit().await?;
+            return Ok(());
+        }
+
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM sessions WHERE session_token = $1",
+            vec![session_token.into()],
+        ))
+        .await?;
+        txn.commit().await?;
+
+        tracing::warn!(
+            target: "temps_auth::oidc::abuse",
+            provider_id = provider_id,
+            "Discarded a session created by a login that completed while its OIDC provider was \
+             being revoked or disabled"
+        );
+        Err(OidcError::ProviderRevokedDuringLogin { provider_id })
     }
 
     /// The single Cloud-managed console-access `oidc_providers` row, if one
@@ -526,9 +624,18 @@ impl OidcService {
     /// the first match rather than asserting exactly one so a hand-edited DB
     /// can't turn a read into a panic.
     pub async fn managed_cloud_provider(&self) -> Result<Option<oidc_providers::Model>, OidcError> {
+        Self::managed_cloud_provider_on(self.db.as_ref()).await
+    }
+
+    /// [`Self::managed_cloud_provider`] against an arbitrary connection, so
+    /// the provisioning/revocation transactions read the row through the same
+    /// filter they then write under.
+    async fn managed_cloud_provider_on<C: ConnectionTrait>(
+        conn: &C,
+    ) -> Result<Option<oidc_providers::Model>, OidcError> {
         Ok(oidc_providers::Entity::find()
             .filter(oidc_providers::Column::ManagedByCloud.eq(true))
-            .one(self.db.as_ref())
+            .one(conn)
             .await?)
     }
 
@@ -544,8 +651,8 @@ impl OidcService {
     /// `admin_only_role_required` entirely even though the IdP itself is the
     /// one Cloud provisioned for instance-admin access. Comparing the
     /// issuer conservatively without a trailing slash closes that gap
-    /// regardless of provider name or template. Discovery still preserves
-    /// the exact issuer required by OIDC metadata verification.
+    /// regardless of the provider name or template. OIDC discovery still
+    /// preserves the exact issuer required for metadata verification.
     async fn assert_issuer_not_shadowing_managed_cloud_provider(
         &self,
         issuer_url: &str,
@@ -573,15 +680,6 @@ impl OidcService {
     ) -> Result<oidc_providers::Model, OidcError> {
         validate_issuer_url(&config.issuer)?;
         let issuer_url = normalize_issuer_url(&config.issuer)?;
-        let ordinary = oidc_providers::Entity::find()
-            .filter(oidc_providers::Column::ManagedByCloud.eq(false))
-            .all(self.db.as_ref())
-            .await?;
-        if ordinary.iter().any(|provider| {
-            provider.issuer_url.trim_end_matches('/') == issuer_url.trim_end_matches('/')
-        }) {
-            return Err(OidcError::IssuerMatchesManagedCloudProvider { issuer_url });
-        }
         let client_id = config.client_id.trim().to_string();
         let encrypted_secret = self
             .encryption_service
@@ -591,15 +689,63 @@ impl OidcService {
                 reason: format!("failed to encrypt managed console-access client secret: {e}"),
             })?;
 
-        let provider = match self.managed_cloud_provider().await? {
+        // ADR-045 §4: the provider row and its role mappings are one unit of
+        // configuration — a partial apply (row updated, mappings deleted but
+        // not re-inserted) would leave an enabled, admin-gated provider whose
+        // every login resolves to no mapping at all, locking out exactly the
+        // Cloud owners and admins this provider exists to let in. One
+        // transaction, so a failure anywhere leaves the previous
+        // configuration untouched.
+        let txn = self.db.begin().await?;
+        // The same exclusive row lock `revoke_managed_cloud_provider` takes,
+        // so a revocation arriving concurrently with a provisioning frame is
+        // serialized instead of interleaving with it.
+        let existing = oidc_providers::Entity::find()
+            .filter(oidc_providers::Column::ManagedByCloud.eq(true))
+            .lock_exclusive()
+            .one(&txn)
+            .await?;
+        // SECURITY: an ordinary provider that already points at this issuer
+        // is a second, *unguarded* relying-party registration for the very
+        // IdP this provider exists to gate — a Cloud identity signing in
+        // through that row skips `admin_only_role_required` entirely. The
+        // create/update guard
+        // (`assert_issuer_not_shadowing_managed_cloud_provider`) only stops
+        // one being added *after* the managed row exists; this is the other
+        // direction, and it refuses rather than deleting the operator's own
+        // provider behind their back. The instance reports the conflict and
+        // console access stays unprovisioned until the operator removes the
+        // duplicate: fail closed, not "gate silently bypassable".
+        if let Some(conflict) = oidc_providers::Entity::find()
+            .filter(oidc_providers::Column::ManagedByCloud.eq(false))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .find(|provider| {
+                provider.issuer_url.trim_end_matches('/') == issuer_url.trim_end_matches('/')
+            })
+        {
+            return Err(OidcError::ManagedIssuerAlreadyUsed {
+                provider_id: conflict.id,
+                name: conflict.name,
+                issuer_url,
+            });
+        }
+
+        let provider = match existing {
             Some(existing) => {
                 let provider_id = existing.id;
+                // SECURITY: only ever converges the row that is *already*
+                // `managed_by_cloud` — an ordinary provider is never adopted
+                // into managed status (that would silently take an operator's
+                // own provider away from them), and the managed row is never
+                // demoted to an ordinary one.
                 let mut active: oidc_providers::ActiveModel = existing.into();
                 active.issuer_url = Set(issuer_url);
                 active.client_id = Set(client_id);
                 active.client_secret_encrypted = Set(encrypted_secret);
                 active.enabled = Set(true);
-                let updated = active.update(self.db.as_ref()).await?;
+                let updated = active.update(&txn).await?;
                 self.discovery_cache.lock().await.remove(&provider_id);
                 updated
             }
@@ -640,12 +786,13 @@ impl OidcService {
                     admin_only_role_required: Set(true),
                     ..Default::default()
                 }
-                .insert(self.db.as_ref())
+                .insert(&txn)
                 .await?
             }
         };
 
-        self.sync_managed_cloud_role_mappings(provider.id).await?;
+        Self::sync_managed_cloud_role_mappings(&txn, provider.id).await?;
+        txn.commit().await?;
         Ok(provider)
     }
 
@@ -655,10 +802,18 @@ impl OidcService {
     /// rather than diffing -- three rows, and this keeps the mapping table
     /// always in sync with the code that defines what it must mean, with no
     /// risk of stale rows accumulating across reconnects.
-    async fn sync_managed_cloud_role_mappings(&self, provider_id: i32) -> Result<(), OidcError> {
+    ///
+    /// Takes the connection rather than `&self` because it must run inside
+    /// [`Self::upsert_managed_cloud_provider`]'s transaction: the delete and
+    /// the three inserts have to commit together with the provider row, or a
+    /// failure between them leaves an enabled provider with no mappings.
+    async fn sync_managed_cloud_role_mappings<C: ConnectionTrait>(
+        conn: &C,
+        provider_id: i32,
+    ) -> Result<(), OidcError> {
         oidc_role_mappings::Entity::delete_many()
             .filter(oidc_role_mappings::Column::ProviderId.eq(provider_id))
-            .exec(self.db.as_ref())
+            .exec(conn)
             .await?;
         for (priority, (idp_group, role)) in CLOUD_MANAGED_ROLE_MAPPINGS.iter().enumerate() {
             oidc_role_mappings::ActiveModel {
@@ -668,7 +823,7 @@ impl OidcService {
                 role: Set(role.to_string()),
                 ..Default::default()
             }
-            .insert(self.db.as_ref())
+            .insert(conn)
             .await?;
         }
         Ok(())
@@ -680,20 +835,40 @@ impl OidcService {
     /// never enabled console access and for a second `ConsoleOidcRevoke`
     /// hitting an already-clean instance.
     pub async fn revoke_managed_cloud_provider(&self) -> Result<bool, OidcError> {
-        let Some(provider) = self.managed_cloud_provider().await? else {
+        // One transaction, holding the provider row's exclusive lock for its
+        // whole duration. SECURITY: this is what makes revocation win against
+        // a login that is already in flight — a concurrent upsert blocks on
+        // the same lock, and a callback that completes mid-revocation is
+        // rejected by `assert_provider_live_for_session`, which waits on this
+        // lock before deciding whether its session may live. Committing the
+        // session delete and the row delete together also removes the window
+        // where sessions were gone but the provider row was still usable.
+        let txn = self.db.begin().await?;
+        let Some(provider) = oidc_providers::Entity::find()
+            .filter(oidc_providers::Column::ManagedByCloud.eq(true))
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+        else {
+            txn.commit().await?;
             return Ok(false);
         };
+        // In-flight login attempts die with the provider: a state row that
+        // outlived its provider would let a callback already redirected to
+        // the IdP come back and complete after revocation.
+        Self::purge_provider_login_states(&txn, provider.id).await?;
         // Session revocation before the row delete, same ordering
         // `delete_provider` uses and for the same reason: an admin account
         // whose provider just disappeared must not keep a live session.
-        self.revoke_sessions_for_provider(provider.id).await?;
+        Self::revoke_sessions_for_provider(&txn, provider.id).await?;
         oidc_role_mappings::Entity::delete_many()
             .filter(oidc_role_mappings::Column::ProviderId.eq(provider.id))
-            .exec(self.db.as_ref())
+            .exec(&txn)
             .await?;
         oidc_providers::Entity::delete_by_id(provider.id)
-            .exec(self.db.as_ref())
+            .exec(&txn)
             .await?;
+        txn.commit().await?;
         self.discovery_cache.lock().await.remove(&provider.id);
         Ok(true)
     }
@@ -718,12 +893,14 @@ impl OidcService {
         request: CreateOidcRoleMappingRequest,
     ) -> Result<OidcRoleMappingResponse, OidcError> {
         let provider = self.get_provider(provider_id).await?;
-        if provider.managed_by_cloud {
-            return Err(OidcError::ManagedByCloudEdit {
-                provider_id,
-                name: provider.name,
-            });
-        }
+        // SECURITY: the managed provider's mappings *are* its role gate. An
+        // operator-added mapping (`member -> admin`, or a higher-priority
+        // `* -> admin`) resolves before the canonical wildcard row and passes
+        // `enforce_admin_only_role`, which would turn the admin-only gate
+        // into "anyone with a Cloud account on this instance". Only
+        // `sync_managed_cloud_role_mappings` may write these rows, for the
+        // same reason the provider row itself is not hand-editable.
+        Self::reject_managed_cloud_mapping_change(&provider)?;
         let idp_group = request.idp_group.trim();
         if idp_group.is_empty() {
             return Err(OidcError::InvalidIssuer {
@@ -763,22 +940,41 @@ impl OidcService {
     }
 
     pub async fn delete_role_mapping(&self, mapping_id: i32) -> Result<(), OidcError> {
+        // Resolve the owning provider first: deleting the managed provider's
+        // `owner -> admin` / `admin -> admin` rows would leave only the
+        // `* -> user` wildcard, locking every Cloud owner and admin out of
+        // the console — the mirror image of the escalation
+        // `create_role_mapping` refuses, and just as much a change to a
+        // Cloud-owned configuration.
         let mapping = oidc_role_mappings::Entity::find_by_id(mapping_id)
             .one(self.db.as_ref())
             .await?
             .ok_or(OidcError::RoleMappingNotFound { mapping_id })?;
         let provider = self.get_provider(mapping.provider_id).await?;
-        if provider.managed_by_cloud {
-            return Err(OidcError::ManagedByCloudEdit {
-                provider_id: provider.id,
-                name: provider.name,
-            });
-        }
+        Self::reject_managed_cloud_mapping_change(&provider)?;
+
         let deleted = oidc_role_mappings::Entity::delete_by_id(mapping_id)
             .exec(self.db.as_ref())
             .await?;
         if deleted.rows_affected == 0 {
             return Err(OidcError::RoleMappingNotFound { mapping_id });
+        }
+        Ok(())
+    }
+
+    /// Refuse any hand-made change to a Cloud-managed provider's role
+    /// mappings. Shared by [`Self::create_role_mapping`] and
+    /// [`Self::delete_role_mapping`] so both directions — escalation and
+    /// lock-out — are refused by the same check, and any future mutation has
+    /// one obvious place to call.
+    fn reject_managed_cloud_mapping_change(
+        provider: &oidc_providers::Model,
+    ) -> Result<(), OidcError> {
+        if provider.managed_by_cloud {
+            return Err(OidcError::ManagedByCloudRoleMapping {
+                provider_id: provider.id,
+                name: provider.name.clone(),
+            });
         }
         Ok(())
     }
@@ -1733,19 +1929,15 @@ fn evaluate_role(
     parse_sso_role(&provider.default_role).unwrap_or(RoleType::User)
 }
 
-/// ADR-045 §Security Model: the `oidc_login_states.expires_at` window for a
-/// login attempt. The Cloud-managed provider's authorization codes are
-/// single-use and expire in 60s on Cloud's side, so its `state` window is
-/// tightened to match rather than the generic [`LOGIN_STATE_TTL_MINUTES`]
-/// every other provider gets -- narrowing how long a compromised Hub has to
-/// replay a captured callback. A free function so the decision is testable
-/// without a database or network discovery round-trip.
-fn login_state_ttl(managed_by_cloud: bool) -> ChronoDuration {
-    if managed_by_cloud {
-        ChronoDuration::seconds(CLOUD_MANAGED_LOGIN_STATE_TTL_SECONDS)
-    } else {
-        ChronoDuration::minutes(LOGIN_STATE_TTL_MINUTES)
-    }
+/// The `oidc_login_states.expires_at` window for a login attempt. The same
+/// for every provider, the Cloud-managed console-access one included: the
+/// window has to cover the user's *interactive* sign-in at the issuer
+/// (password, a social round trip, MFA), which routinely takes longer than
+/// a minute. Replay of a captured callback is bounded on the issuer's side
+/// -- the managed provider's authorization codes are single-use and expire
+/// in 60s -- not by how long the RP is willing to wait for the user.
+fn login_state_ttl(_managed_by_cloud: bool) -> ChronoDuration {
+    ChronoDuration::minutes(LOGIN_STATE_TTL_MINUTES)
 }
 
 /// ADR-045 §4 role gate, layer 2 (belt-and-suspenders behind Cloud's own
@@ -2394,55 +2586,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_provider_rejects_preexisting_shadow_and_mapping_edits() {
-        let Some((db, service)) = test_oidc_service().await else {
-            return;
-        };
-        let mut ordinary = cloud_managed_provider_fixture(123);
-        ordinary.name = "ordinary".into();
-        ordinary.managed_by_cloud = false;
-        ordinary.admin_only_role_required = false;
-        let ordinary: oidc_providers::ActiveModel = ordinary.into();
-        let ordinary = ordinary.insert(db.db.as_ref()).await.unwrap();
-        assert!(matches!(
-            service
-                .upsert_managed_cloud_provider(managed_config("https://cloud.example.com/"))
-                .await,
-            Err(OidcError::IssuerMatchesManagedCloudProvider { .. })
-        ));
-        oidc_providers::Entity::delete_by_id(ordinary.id)
-            .exec(db.db.as_ref())
-            .await
-            .unwrap();
-        let provider = service
-            .upsert_managed_cloud_provider(managed_config("https://cloud.example.com"))
-            .await
-            .unwrap();
-        let mappings = service.list_role_mappings(provider.id).await.unwrap();
-        assert!(matches!(
-            service
-                .create_role_mapping(
-                    provider.id,
-                    CreateOidcRoleMappingRequest {
-                        priority: 0,
-                        idp_group: "*".into(),
-                        role: "admin".into()
-                    }
-                )
-                .await,
-            Err(OidcError::ManagedByCloudEdit { .. })
-        ));
-        assert!(matches!(
-            service.delete_role_mapping(mappings[0].id).await,
-            Err(OidcError::ManagedByCloudEdit { .. })
-        ));
-        assert_eq!(
-            service.list_role_mappings(provider.id).await.unwrap().len(),
-            mappings.len()
-        );
-    }
-
-    #[tokio::test]
     async fn upsert_managed_cloud_provider_creates_a_single_admin_gated_row() {
         let Some((_db, service)) = test_oidc_service().await else {
             return;
@@ -2881,12 +3024,14 @@ mod tests {
     // against a stub issuer" case in ADR-045's Testing section for the
     // network-level version of this test.
     #[test]
-    fn login_state_ttl_is_60_seconds_for_the_managed_cloud_provider() {
+    fn login_state_ttl_covers_an_interactive_sign_in_for_the_managed_provider_too() {
+        // A user who needs a minute or more to sign in at Cloud must not
+        // come back to an expired `state`; replay is bounded by the
+        // issuer's single-use 60s code, not by this window.
         assert_eq!(
             login_state_ttl(true),
-            ChronoDuration::seconds(CLOUD_MANAGED_LOGIN_STATE_TTL_SECONDS)
+            ChronoDuration::minutes(LOGIN_STATE_TTL_MINUTES)
         );
-        assert_eq!(login_state_ttl(true), ChronoDuration::seconds(60));
     }
 
     #[test]
@@ -2894,6 +3039,441 @@ mod tests {
         assert_eq!(
             login_state_ttl(false),
             ChronoDuration::minutes(LOGIN_STATE_TTL_MINUTES)
+        );
+    }
+
+    /// A minimal ordinary provider request, so the tests below differ only in
+    /// the field each one is actually about.
+    fn ordinary_provider_request(name: &str, issuer_url: &str) -> CreateOidcProviderRequest {
+        CreateOidcProviderRequest {
+            name: name.to_string(),
+            issuer_url: issuer_url.to_string(),
+            client_id: "ordinary-client".to_string(),
+            client_secret: "ordinary-secret".to_string(),
+            scopes: "openid email profile".to_string(),
+            jit_provisioning: true,
+            enabled: true,
+            template: "generic".to_string(),
+            group_claim: "groups".to_string(),
+            role_claim: "roles".to_string(),
+            default_role: "user".to_string(),
+            trust_idp_email: false,
+        }
+    }
+
+    /// SECURITY: the other direction of the shadowing guard — an ordinary
+    /// provider that *already* uses the incoming Cloud issuer. Provisioning
+    /// the managed provider alongside it would leave the same IdP reachable
+    /// through an ungated row, so the role gate could be skipped simply by
+    /// signing in through that provider's slug.
+    #[tokio::test]
+    async fn upsert_managed_cloud_provider_refuses_an_issuer_an_ordinary_provider_already_uses() {
+        let Some((_db, service)) = test_oidc_service().await else {
+            return;
+        };
+        let ordinary = service
+            .create_provider(ordinary_provider_request(
+                "Pre-existing",
+                "https://cloud.example.com",
+            ))
+            .await
+            .expect("the ordinary provider must be creatable before Cloud provisions anything");
+
+        let err = service
+            .upsert_managed_cloud_provider(managed_config("https://cloud.example.com"))
+            .await
+            .expect_err("provisioning onto an issuer an ordinary provider already uses must fail");
+        assert!(matches!(
+            err,
+            OidcError::ManagedIssuerAlreadyUsed { provider_id, ref issuer_url, .. }
+                if provider_id == ordinary.id && issuer_url == "https://cloud.example.com"
+        ));
+
+        // Fail closed *and* leave the operator's own configuration alone: no
+        // managed row was written, and the existing row was neither adopted
+        // into managed status nor deleted.
+        assert!(
+            service
+                .managed_cloud_provider()
+                .await
+                .expect("query must succeed")
+                .is_none(),
+            "no managed provider may exist after a refused provisioning"
+        );
+        let unchanged = service
+            .get_provider(ordinary.id)
+            .await
+            .expect("the ordinary provider must still exist");
+        assert!(!unchanged.managed_by_cloud);
+        assert!(!unchanged.admin_only_role_required);
+    }
+
+    /// SECURITY: an ordinary provider on a *different* issuer must be left
+    /// completely alone by provisioning — the managed upsert converges only
+    /// the row that is already `managed_by_cloud`, never adopting an
+    /// operator's provider into Cloud ownership (which would make it
+    /// uneditable and undeletable for them).
+    #[tokio::test]
+    async fn upsert_managed_cloud_provider_never_adopts_an_ordinary_provider() {
+        let Some((_db, service)) = test_oidc_service().await else {
+            return;
+        };
+        let ordinary = service
+            .create_provider(ordinary_provider_request(
+                "Keycloak",
+                "https://keycloak.example.com/realms/temps",
+            ))
+            .await
+            .expect("ordinary provider must be creatable");
+
+        let managed = service
+            .upsert_managed_cloud_provider(managed_config("https://cloud.example.com"))
+            .await
+            .expect("provisioning on a free issuer must succeed");
+
+        assert_ne!(
+            managed.id, ordinary.id,
+            "provisioning must insert its own row, never take over an existing one"
+        );
+        let untouched = service
+            .get_provider(ordinary.id)
+            .await
+            .expect("the ordinary provider must still exist");
+        assert!(!untouched.managed_by_cloud);
+        assert!(!untouched.admin_only_role_required);
+        assert_eq!(
+            untouched.issuer_url,
+            "https://keycloak.example.com/realms/temps"
+        );
+    }
+
+    /// SECURITY: the managed provider's role mappings *are* its admin-only
+    /// gate. A settings administrator who can add `member -> admin` (or a
+    /// higher-priority `* -> admin`) turns "Cloud owners and admins" into
+    /// "anyone with a Cloud account on this instance", because
+    /// `evaluate_role` returns the first match and `enforce_admin_only_role`
+    /// accepts any role that resolved to Admin.
+    #[tokio::test]
+    async fn role_mapping_mutations_are_refused_for_the_managed_provider() {
+        let Some((_db, service)) = test_oidc_service().await else {
+            return;
+        };
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://cloud.example.com"))
+            .await
+            .expect("upsert must succeed");
+
+        let escalation = service
+            .create_role_mapping(
+                provider.id,
+                CreateOidcRoleMappingRequest {
+                    idp_group: "member".to_string(),
+                    role: "admin".to_string(),
+                    // Ahead of the canonical rows, so it would win.
+                    priority: -1,
+                },
+            )
+            .await
+            .expect_err("adding a role mapping to the managed provider must be refused");
+        assert!(matches!(
+            escalation,
+            OidcError::ManagedByCloudRoleMapping { provider_id, .. } if provider_id == provider.id
+        ));
+
+        let mappings = service
+            .list_role_mappings(provider.id)
+            .await
+            .expect("mappings must be readable");
+        assert_eq!(
+            mappings.len(),
+            3,
+            "the refused mapping must not have been written"
+        );
+
+        // The opposite direction: deleting `owner -> admin` would lock every
+        // Cloud owner out of the console, which is just as much a change to
+        // a Cloud-owned configuration.
+        let owner_mapping = mappings
+            .iter()
+            .find(|m| m.idp_group == "owner")
+            .expect("the canonical owner mapping must exist");
+        let lockout = service
+            .delete_role_mapping(owner_mapping.id)
+            .await
+            .expect_err("deleting a managed provider's role mapping must be refused");
+        assert!(matches!(
+            lockout,
+            OidcError::ManagedByCloudRoleMapping { provider_id, .. } if provider_id == provider.id
+        ));
+        assert_eq!(
+            service
+                .list_role_mappings(provider.id)
+                .await
+                .expect("mappings must be readable")
+                .len(),
+            3,
+            "the refused delete must not have removed the mapping anyway"
+        );
+    }
+
+    /// An ordinary provider's mappings stay fully editable — the guard keys
+    /// off `managed_by_cloud`, not off "is an OIDC provider".
+    #[tokio::test]
+    async fn role_mapping_mutations_still_work_for_ordinary_providers() {
+        let Some((_db, service)) = test_oidc_service().await else {
+            return;
+        };
+        let provider = service
+            .create_provider(ordinary_provider_request(
+                "Keycloak",
+                "https://keycloak.example.com/realms/temps",
+            ))
+            .await
+            .expect("ordinary provider must be creatable");
+
+        let mapping = service
+            .create_role_mapping(
+                provider.id,
+                CreateOidcRoleMappingRequest {
+                    idp_group: "platform-admins".to_string(),
+                    role: "admin".to_string(),
+                    priority: 0,
+                },
+            )
+            .await
+            .expect("an ordinary provider's mappings must remain editable");
+        service
+            .delete_role_mapping(mapping.id)
+            .await
+            .expect("an ordinary provider's mappings must remain deletable");
+        assert!(service
+            .list_role_mappings(provider.id)
+            .await
+            .expect("mappings must be readable")
+            .is_empty());
+    }
+
+    /// Provisioning is one unit of work: the provider row and the complete
+    /// mapping set commit together, or neither does. This drives the real
+    /// `sync_managed_cloud_role_mappings` inside a transaction that is then
+    /// rolled back (exactly what happens when any step after the delete
+    /// fails) and asserts the previously-provisioned mappings survived
+    /// untouched — rather than the enabled, admin-gated provider being left
+    /// with no mapping at all, which locks out every Cloud owner and admin.
+    #[tokio::test]
+    async fn managed_role_mapping_replacement_only_takes_effect_on_commit() {
+        let Some((db, service)) = test_oidc_service().await else {
+            return;
+        };
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://cloud.example.com"))
+            .await
+            .expect("upsert must succeed");
+        let before: Vec<i32> = service
+            .list_role_mappings(provider.id)
+            .await
+            .expect("mappings must be readable")
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(before.len(), 3);
+
+        let txn = db.db.begin().await.expect("transaction must begin");
+        OidcService::sync_managed_cloud_role_mappings(&txn, provider.id)
+            .await
+            .expect("the replacement itself must succeed inside the transaction");
+        // Dropping without committing is what a failure anywhere later in
+        // `upsert_managed_cloud_provider` does.
+        drop(txn);
+
+        let after: Vec<i32> = service
+            .list_role_mappings(provider.id)
+            .await
+            .expect("mappings must be readable")
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            before, after,
+            "a rolled-back provisioning must leave the previous mappings exactly as they were"
+        );
+    }
+
+    /// SECURITY: revocation must win against a login that is already in
+    /// flight. A callback that resolved its user before the revocation
+    /// started inserts its session afterwards, so the revocation's session
+    /// delete never saw it; this check runs immediately after that insert and
+    /// deletes the session again rather than handing out the cookie.
+    #[tokio::test]
+    async fn a_session_created_after_revocation_is_discarded_instead_of_returned() {
+        use temps_entities::sessions;
+
+        let Some((db, service)) = test_oidc_service().await else {
+            return;
+        };
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://cloud.example.com"))
+            .await
+            .expect("upsert must succeed");
+        let user = users::ActiveModel {
+            name: Set("Cloud Admin".to_string()),
+            email: Set("cloud-admin@example.com".to_string()),
+            email_verified: Set(true),
+            oidc_provider_id: Set(Some(provider.id)),
+            oidc_subject: Set(Some("cloud-account-1".to_string())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .expect("test user must insert");
+
+        // A live provider: the login keeps its session.
+        sessions::ActiveModel {
+            user_id: Set(user.id),
+            session_token: Set("live-session".to_string()),
+            expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
+            mfa_pending: Set(false),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .expect("session must insert");
+        service
+            .assert_provider_live_for_session(provider.id, "live-session")
+            .await
+            .expect("a login completing against a live provider must keep its session");
+        assert!(sessions::Entity::find()
+            .filter(sessions::Column::SessionToken.eq("live-session"))
+            .one(db.db.as_ref())
+            .await
+            .expect("query must succeed")
+            .is_some());
+
+        assert!(service
+            .revoke_managed_cloud_provider()
+            .await
+            .expect("revoke must succeed"));
+
+        // The losing side of the race: the session row lands after the
+        // revocation already deleted everything it could see.
+        sessions::ActiveModel {
+            user_id: Set(user.id),
+            session_token: Set("raced-session".to_string()),
+            expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
+            mfa_pending: Set(false),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .expect("session must insert");
+
+        let err = service
+            .assert_provider_live_for_session(provider.id, "raced-session")
+            .await
+            .expect_err("a login completing against a revoked provider must fail closed");
+        assert!(matches!(
+            err,
+            OidcError::ProviderRevokedDuringLogin { provider_id } if provider_id == provider.id
+        ));
+        assert!(
+            sessions::Entity::find()
+                .filter(sessions::Column::SessionToken.eq("raced-session"))
+                .one(db.db.as_ref())
+                .await
+                .expect("query must succeed")
+                .is_none(),
+            "the session created by the losing callback must be deleted again"
+        );
+    }
+
+    /// SECURITY: a login that already redirected to the IdP must not be able
+    /// to come back and complete against a provider that was revoked in the
+    /// meantime. Dropping the pending `oidc_login_states` rows inside the
+    /// revocation transaction makes the callback fail at `consume_login_state`
+    /// instead of proceeding to a token exchange for a provider that is gone.
+    #[tokio::test]
+    async fn revoking_the_managed_provider_discards_in_flight_login_states() {
+        let Some((db, service)) = test_oidc_service().await else {
+            return;
+        };
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://cloud.example.com"))
+            .await
+            .expect("upsert must succeed");
+
+        oidc_login_states::ActiveModel {
+            state: Set("in-flight-state".to_string()),
+            nonce: Set("nonce".to_string()),
+            pkce_verifier: Set("verifier".to_string()),
+            provider_id: Set(provider.id),
+            return_to: Set(None),
+            expires_at: Set(Utc::now() + ChronoDuration::seconds(60)),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .expect("login state must insert");
+
+        assert!(service
+            .revoke_managed_cloud_provider()
+            .await
+            .expect("revoke must succeed"));
+
+        // `OidcLoginState` deliberately has no `Debug` (it carries the nonce
+        // and PKCE verifier), so match the result rather than `expect_err`.
+        match service.consume_login_state("in-flight-state").await {
+            Err(OidcError::StateNotFound { .. }) => {}
+            Err(other) => panic!("expected StateNotFound, got {other}"),
+            Ok(_) => panic!("a login state for a revoked provider must no longer be consumable"),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_provider_rejects_preexisting_shadow_and_mapping_edits() {
+        let Some((db, service)) = test_oidc_service().await else {
+            return;
+        };
+        let mut ordinary = cloud_managed_provider_fixture(123);
+        ordinary.name = "ordinary".into();
+        ordinary.managed_by_cloud = false;
+        ordinary.admin_only_role_required = false;
+        let ordinary: oidc_providers::ActiveModel = ordinary.into();
+        let ordinary = ordinary.insert(db.db.as_ref()).await.unwrap();
+        assert!(matches!(
+            service
+                .upsert_managed_cloud_provider(managed_config("https://cloud.example.com/"))
+                .await,
+            Err(OidcError::ManagedIssuerAlreadyUsed { .. })
+        ));
+        oidc_providers::Entity::delete_by_id(ordinary.id)
+            .exec(db.db.as_ref())
+            .await
+            .unwrap();
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://cloud.example.com"))
+            .await
+            .unwrap();
+        let mappings = service.list_role_mappings(provider.id).await.unwrap();
+        assert!(matches!(
+            service
+                .create_role_mapping(
+                    provider.id,
+                    CreateOidcRoleMappingRequest {
+                        priority: 0,
+                        idp_group: "*".into(),
+                        role: "admin".into()
+                    }
+                )
+                .await,
+            Err(OidcError::ManagedByCloudRoleMapping { .. })
+        ));
+        assert!(matches!(
+            service.delete_role_mapping(mappings[0].id).await,
+            Err(OidcError::ManagedByCloudRoleMapping { .. })
+        ));
+        assert_eq!(
+            service.list_role_mappings(provider.id).await.unwrap().len(),
+            mappings.len()
         );
     }
 }

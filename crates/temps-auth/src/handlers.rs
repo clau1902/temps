@@ -3,10 +3,11 @@
 
 use super::AuthState;
 use crate::audit::{
-    ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit, LoginFailedAudit, LogoutAudit,
-    MfaDisabledAudit, MfaEnabledAudit, MfaVerificationFailedAudit, MfaVerifiedAudit,
-    PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, StepUpVerificationAudit,
-    UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
+    AdminPasswordResetAudit, ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit,
+    LoginFailedAudit, LogoutAudit, MfaDisabledAudit, MfaEnabledAudit, MfaVerificationFailedAudit,
+    MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit,
+    StepUpVerificationAudit, UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit,
+    UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
@@ -39,9 +40,9 @@ use utoipa::{OpenApi, ToSchema};
 use crate::types::{
     AssignRoleRequest, AuthStatusResponse, AuthTokenResponse, ChangePasswordRequest,
     CliLoginRequest, CreateUserRequest, DisableMfaRequest, InitAuthResponse, MfaRequiredResponse,
-    MfaSetupResponse, MfaVerificationRequest, RouteRole, RouteUser, RouteUserWithRoles,
-    SetupMfaRequest, StepUpResponse, TokenRenewalRequest, UpdateSelfRequest, UpdateUserRequest,
-    UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
+    MfaSetupResponse, MfaVerificationRequest, ResetUserPasswordResponse, RouteRole, RouteUser,
+    RouteUserWithRoles, SetupMfaRequest, StepUpResponse, TokenRenewalRequest, UpdateSelfRequest,
+    UpdateUserRequest, UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
 };
 use temps_core::problemdetails::{new as problem_new, Problem};
 
@@ -742,10 +743,6 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/cli/device/start",
             post(crate::cli_device_handler::cli_device_start),
         )
-        .route(
-            "/auth/cli/device/poll",
-            post(crate::cli_device_handler::cli_device_poll),
-        )
         .route("/auth/password-reset/request", post(request_password_reset))
         .route("/auth/password-reset/verify", post(reset_password))
         .route(
@@ -755,6 +752,13 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route(
             "/auth/oidc/login/{slug}",
             get(crate::oidc_handler::start_oidc_login_by_slug),
+        )
+        // Fixed address for the Cloud-managed provider (Cloud's "Open
+        // console" links here); rate-limited with the slug route because it
+        // is the same login start.
+        .route(
+            "/auth/oidc/cloud/login",
+            get(crate::oidc_handler::start_managed_cloud_login),
         )
         .route(
             "/auth/oidc/callback",
@@ -766,6 +770,21 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         // everything before it, seeing the request first.
         .layer(axum::middleware::from_fn(auth_rate_limit_middleware))
         .layer(axum::Extension(rate_limiter));
+
+    // Device polling runs every few seconds for the whole login, so it has
+    // its own budget instead of the brute-force limiter above; see
+    // `DevicePollRateLimiter`. Same layer order as above.
+    let device_poll_routes = Router::new()
+        .route(
+            "/auth/cli/device/poll",
+            post(crate::cli_device_handler::cli_device_poll),
+        )
+        .layer(axum::middleware::from_fn(
+            crate::cli_device_handler::device_poll_rate_limit_middleware,
+        ))
+        .layer(axum::Extension(
+            crate::cli_device_handler::DevicePollRateLimiter::new(),
+        ));
 
     // Non-rate-limited routes (require authentication already)
     let authenticated_routes = Router::new()
@@ -799,10 +818,13 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/users/{user_id}", delete(delete_user))
         .route("/users/{user_id}", patch(update_user))
         .route("/users/{user_id}/restore", post(restore_user))
+        .route("/users/{user_id}/password", post(reset_user_password))
         .route("/users/{user_id}/roles", post(assign_role))
         .route("/users/{user_id}/roles/{role_type}", delete(remove_role));
 
-    rate_limited_auth_routes.merge(authenticated_routes)
+    rate_limited_auth_routes
+        .merge(device_poll_routes)
+        .merge(authenticated_routes)
 }
 
 // Service error conversions will be added as needed
@@ -1014,9 +1036,24 @@ pub async fn login(
             if user.must_change_password {
                 let reset_token = state
                     .auth_service
-                    .create_required_password_change_token(user.id)
+                    .create_required_password_change_token(&user)
                     .await
                     .map_err(|error| {
+                        // An admin reset replaced the password this request
+                        // verified: the credential it presented is no longer
+                        // valid, so answer exactly as for a wrong password.
+                        if matches!(
+                            error,
+                            crate::auth_service::UserAuthError::CredentialsChanged { .. }
+                        ) {
+                            warn!(
+                                user_id = user.id,
+                                "Password changed after verification; refusing password-change session"
+                            );
+                            return problem_new(StatusCode::UNAUTHORIZED)
+                                .with_title("Invalid Credentials")
+                                .with_detail("Invalid email or password.");
+                        }
                         error!(
                             user_id = user.id,
                             error = %error,
@@ -1277,6 +1314,22 @@ pub async fn login(
                                 password_change_required: false,
                             }),
                         ))
+                    }
+                    Err(crate::auth_service::AuthError::PasswordChangeRequired { .. }) => {
+                        // An admin reset flagged the account after this
+                        // request verified the (now replaced) password.
+                        record_login_failure(
+                            state.as_ref(),
+                            &metadata,
+                            Some(user.id),
+                            &login_email,
+                            "password",
+                            "password_reset_during_login",
+                        )
+                        .await;
+                        Err(problem_new(StatusCode::UNAUTHORIZED)
+                            .with_title("Invalid Credentials")
+                            .with_detail("Invalid email or password."))
                     }
                     Err(e) => {
                         // The credentials were already verified, so the actor
@@ -1796,6 +1849,14 @@ impl From<UserServiceError> for Problem {
                     .with_title("Invalid Current Password")
                     .with_detail("The current password you entered is incorrect.")
             }
+            UserServiceError::PasswordResetOnDeletedUser { user_id } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_title("User Deleted")
+                    .with_detail(format!(
+                        "User {} is deleted. Restore the user before resetting their password.",
+                        user_id
+                    ))
+            }
         }
     }
 }
@@ -1810,13 +1871,14 @@ impl From<UserServiceError> for Problem {
         remove_role,
         update_user,
         restore_user,
+        reset_user_password,
         update_self,
         setup_mfa,
         verify_and_enable_mfa,
         disable_mfa
     ),
     components(
-        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
+        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, ResetUserPasswordResponse, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
     ),
     tags(
         (name = "Users", description = "User management API")
@@ -2491,6 +2553,96 @@ async fn restore_user(
     }
 
     Ok(Json(RouteUserWithRoles::from(restored_user)).into_response())
+}
+
+/// Reset another user's password to a generated temporary one (admin only).
+///
+/// The recovery path for a user who lost their password when outbound email
+/// is not configured. Every browser session of the user is revoked and they
+/// must choose a new password at next sign-in. API keys are deliberately left
+/// alone, matching `POST /users/me/password`: revoking them would silently
+/// break the user's automation. The temporary password is returned once and
+/// cannot be retrieved again.
+///
+/// Any `users:manage` principal may reset any other user, including another
+/// admin. That is the existing trust model for this permission (it can already
+/// delete users and change their roles); only resetting yourself is refused.
+#[utoipa::path(
+    tag = "Users",
+    post,
+    path = "/users/{user_id}/password",
+    responses(
+        (status = 200, description = "Password reset; the temporary password is returned once", body = ResetUserPasswordResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "users:manage required, or attempted to reset your own password (use POST /users/me/password)"),
+        (status = 404, description = "User not found"),
+        (status = 409, description = "User is deleted"),
+        (status = 428, description = "Recent identity verification (step-up) required"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("user_id" = i32, Path, description = "User ID")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn reset_user_password(
+    State(app_state): State<Arc<AuthState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(user_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    // `users:manage` gate (+ no self-target) lives in authorize_admin_target.
+    // Callers change their own password via POST /users/me/password, which
+    // requires the current one.
+    if let Err(denied) = authorize_admin_target(&auth, user_id) {
+        error!(
+            "Denied password reset by user {} for target {}: {:?}",
+            auth.user_id(),
+            user_id,
+            denied
+        );
+        return Err(temps_core::error_builder::forbidden().build());
+    }
+
+    crate::require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::ResetUserPassword { user_id },
+    )
+    .await?;
+
+    let (user, temporary_password) = app_state.user_service.admin_reset_password(user_id).await?;
+
+    info!(
+        "Admin {} reset the password of user {}",
+        auth.user_id(),
+        user_id
+    );
+
+    let audit = AdminPasswordResetAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        target_user_id: user_id,
+        username: user.name.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    // The body carries a credential: keep it out of every cache.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(ResetUserPasswordResponse {
+            temporary_password,
+            must_change_password: user.must_change_password,
+        }),
+    )
+        .into_response())
 }
 
 #[utoipa::path(
@@ -3610,6 +3762,67 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "the 11th request in the window should have been rate limited"
         );
+    }
+
+    /// Regression: `/auth/cli/device/poll` used to share the 10-per-minute
+    /// brute-force limiter, so `temps login` (polling every 2 s) got a 429
+    /// about 20 s in, and the polls spent the login budget of the browser
+    /// the user approves from. A full minute of polling for several
+    /// concurrent logins must pass, must leave `/auth/login` untouched, and
+    /// an over-budget poll must get `slow_down` rather than a 429.
+    #[tokio::test]
+    async fn test_device_poll_has_its_own_budget_and_answers_slow_down() {
+        use tower::ServiceExt;
+
+        let app = super::configure_routes().with_state(admin_owner_state());
+        let peer: std::net::SocketAddr = "203.0.113.2:12345".parse().unwrap();
+        // Invalid bodies fail in the JSON extractor before the mock database
+        // is touched; only the rate-limit decision is under test.
+        let send = |app: axum::Router, uri: &'static str| async move {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            app.oneshot(request).await.unwrap()
+        };
+
+        // Four concurrent logins, each polling every 2 s for a minute.
+        for i in 0..120 {
+            let response = send(app.clone(), "/auth/cli/device/poll").await;
+            assert_ne!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "poll {i} was rejected with a 429"
+            );
+            assert_ne!(
+                response.status(),
+                StatusCode::OK,
+                "poll {i} was answered by the limiter, not the handler"
+            );
+        }
+
+        let over_budget = send(app.clone(), "/auth/cli/device/poll").await;
+        assert_eq!(over_budget.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(over_budget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "slow_down");
+
+        // Polling must not have spent the login budget of the same IP.
+        for i in 0..10 {
+            let status = send(app.clone(), "/auth/login").await.status();
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "login {i} was rate limited after device polling from the same IP"
+            );
+        }
     }
 
     /// The login handler must return a constant 401 detail for both

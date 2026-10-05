@@ -27,6 +27,19 @@ import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import { toast, Toaster } from 'sonner'
+import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
+import {
+  nodeCapabilityQueryKey,
+  type NodeCapability,
+} from '@/hooks/useNodeCapability'
+import {
+  canAddWorkerNode,
+  WORKER_NODE_ASK_ADMIN_MESSAGE,
+  WORKER_NODE_REQUIRED_ERROR_CODE,
+  WORKER_NODE_REQUIRED_MESSAGE,
+  WORKER_NODE_REQUIRED_TITLE,
+  sameOriginSetupPath,
+} from '@/lib/worker-nodes'
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'
 import { Header } from './components/dashboard/Header'
@@ -59,6 +72,9 @@ const Account = lazy(() =>
 )
 const Setup = lazy(() =>
   import('./pages/Setup').then((m) => ({ default: m.Setup }))
+)
+const GetStarted = lazy(() =>
+  import('./pages/GetStarted').then((m) => ({ default: m.GetStarted }))
 )
 const AiOnboarding = lazy(() =>
   import('./pages/AiOnboarding').then((m) => ({ default: m.AiOnboarding }))
@@ -150,6 +166,7 @@ const AddGitProvider = lazy(() =>
   import('./pages/AddGitProvider').then((m) => ({ default: m.AddGitProvider }))
 )
 const GitProviderDetail = lazy(() => import('./pages/GitProviderDetail'))
+const GitConnectionDetail = lazy(() => import('./pages/GitConnectionDetail'))
 const DnsProviders = lazy(() =>
   import('./pages/DnsProviders').then((m) => ({ default: m.DnsProviders }))
 )
@@ -157,6 +174,10 @@ const AddDnsProvider = lazy(() =>
   import('./pages/AddDnsProvider').then((m) => ({ default: m.AddDnsProvider }))
 )
 const DnsProviderDetail = lazy(() => import('./pages/DnsProviderDetail'))
+const DeliveryProfiles = lazy(() => import('./pages/DeliveryProfiles'))
+const DeliveryProfileDetail = lazy(
+  () => import('./pages/DeliveryProfileDetail')
+)
 const Domains = lazy(() =>
   import('./pages/Domains').then((m) => ({ default: m.Domains }))
 )
@@ -595,6 +616,7 @@ const FullAppRoutes = () => {
                     />
                     <Route path="/account" element={<Account />} />
                     <Route path="/setup" element={<Setup />} />
+                    <Route path="/get-started" element={<GetStarted />} />
                     <Route path="/setup/ai" element={<AiOnboarding />} />
                     <Route path="/tools" element={<PlatformTools />} />
                     <Route path="/projects" element={<Projects />} />
@@ -882,7 +904,19 @@ const FullAppRoutes = () => {
                       path="/git-providers/:id"
                       element={<GitProviderDetail />}
                     />
+                    <Route
+                      path="/git-providers/:id/connections/:connectionId"
+                      element={<GitConnectionDetail />}
+                    />
                     <Route path="/dns-providers" element={<DnsProviders />} />
+                    <Route
+                      path="/delivery-profiles"
+                      element={<DeliveryProfiles />}
+                    />
+                    <Route
+                      path="/delivery-profiles/:id"
+                      element={<DeliveryProfileDetail />}
+                    />
                     <Route
                       path="/dns-providers/add"
                       element={<AddDnsProvider />}
@@ -1140,6 +1174,54 @@ const queryClient = new QueryClient({
           (problemDetails as ProblemDetails & { error_code?: string })
             .error_code ?? problemDetails.extensions?.error_code
         if (errorCode === 'STEP_UP_REQUIRED') return
+
+        if (problemDetails.title === 'Git Provider Rate Limit') {
+          const safeSetupPath = gitProviderSetupPath(problemDetails)
+          toast.error(problemDetails.title, {
+            description: problemDetails.detail,
+            duration: 10000,
+            action: safeSetupPath
+              ? {
+                  label: 'Connect Git',
+                  onClick: () => window.location.assign(safeSetupPath),
+                }
+              : undefined,
+          })
+          return
+        }
+
+        // Nothing can run the work: this installation has no local Docker and
+        // no worker node has joined. The raw detail is accurate but leaves the
+        // operator to work out what to do, so surface the fix as an action.
+        // `window.location` rather than the router: this handler is defined
+        // outside the Router, and a worker-node refusal means the current page
+        // cannot do anything useful anyway.
+        if (errorCode === WORKER_NODE_REQUIRED_ERROR_CODE) {
+          const setupPath = sameOriginSetupPath(
+            problemSetupPath(problemDetails)
+          )
+          // Only offer the action to someone who can complete it. The Worker
+          // Nodes page needs Settings permissions, so for everyone else the
+          // button would land on "Failed to load worker nodes" — say who to
+          // ask instead. The capability read is already cached app-wide by
+          // the banner; absent (never fetched) means "assume not".
+          const canManage = canAddWorkerNode(
+            queryClient.getQueryData<NodeCapability>(nodeCapabilityQueryKey)
+          )
+          const detail = problemDetails.detail || WORKER_NODE_REQUIRED_MESSAGE
+          toast.error(WORKER_NODE_REQUIRED_TITLE, {
+            description: canManage
+              ? detail
+              : `${detail} ${WORKER_NODE_ASK_ADMIN_MESSAGE}`,
+            action: canManage
+              ? {
+                  label: 'Add worker node',
+                  onClick: () => window.location.assign(setupPath),
+                }
+              : undefined,
+          })
+          return
+        }
 
         // Get custom error title
         const customTitle = getErrorTitle(context, problemDetails.title)

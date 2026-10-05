@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use sysinfo::System;
 use tempfile::TempDir;
+use temps_core::docker_socket_grant::DockerSocketGrant;
 use temps_core::static_files::MAX_STATIC_PATH_COMPONENTS;
 use temps_core::DockerHandle;
 use tokio::io::AsyncWriteExt;
@@ -39,6 +40,41 @@ const MAX_STATIC_ARCHIVE_STREAM_BYTES: u64 =
 /// retaining more on a worker only increases memory and transfer cost.
 const MAX_CONTAINER_LOG_BYTES: usize = 8 * 1024 * 1024;
 const LOG_TRUNCATION_NOTICE: &str = "[… earlier container logs truncated by worker …]\n";
+
+fn parse_inspected_port_mappings(
+    ports: HashMap<String, Option<Vec<bollard::models::PortBinding>>>,
+) -> Vec<PortMapping> {
+    let mut mappings = Vec::new();
+    for (port_key, bindings) in ports {
+        let Some((container_port, protocol)) = port_key.split_once('/') else {
+            continue;
+        };
+        let Ok(container_port) = container_port.parse() else {
+            continue;
+        };
+        let protocol = match protocol {
+            "tcp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            _ => continue,
+        };
+        for binding in bindings.unwrap_or_default() {
+            let Some(host_port) = binding
+                .host_port
+                .as_deref()
+                .and_then(|port| port.parse().ok())
+            else {
+                continue;
+            };
+            mappings.push(PortMapping {
+                host_port,
+                container_port,
+                protocol: protocol.clone(),
+                host_ip: binding.host_ip,
+            });
+        }
+    }
+    mappings
+}
 
 fn append_printable_log_utf8(output: &mut String, input: &str) {
     for character in input.chars() {
@@ -663,6 +699,85 @@ pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
     merge_dns_with_fallback(primary, &host_default_dns_servers())
 }
 
+/// The one bind a project granted host Docker access receives, or `None`.
+///
+/// Pure so the decision — the single most security-relevant branch in the
+/// deployer — is unit-testable without a daemon. An absent `project_slug`
+/// (a pre-ADR-045 caller) can never match, and an empty grant (every install
+/// that never set the variable) can never match either.
+///
+/// **Both ends must agree (ADR 045).** `grant` is this process's own
+/// environment — the host's decision to provide the socket — and
+/// `control_plane_grants_socket` is the control plane's decision that the
+/// project requires it, carried in the `DeployRequest`. Neither alone is
+/// enough:
+///
+/// - Without the host's grant, a control plane (or anything that can forge a
+///   request to this agent) could turn any container root-equivalent here.
+///   This was always enforced and still is.
+/// - Without the control plane's declaration, a worker whose operator set the
+///   variable for some slug would mount the socket for *whoever* manages to
+///   get a project of that name scheduled onto it — and because the control
+///   plane never declared the slug, neither the admin-only claim guard nor the
+///   placement gate would have applied. That is the hole this parameter
+///   closes.
+///
+/// For local placement the two are the same process's grant, so this is a
+/// no-op there: `declares()` delegates to `allows()`.
+pub fn docker_socket_bind_for(
+    grant: &DockerSocketGrant,
+    project_slug: Option<&str>,
+    control_plane_grants_socket: bool,
+) -> Option<&'static str> {
+    if !control_plane_grants_socket {
+        return None;
+    }
+    project_slug
+        .filter(|slug| grant.allows(slug))
+        .map(|_| temps_core::docker_socket_grant::DOCKER_SOCKET_BIND)
+}
+
+/// The security-hardening half of every application container's `HostConfig`.
+///
+/// Split out from the single build site so the invariant that matters can be
+/// asserted in a test: adding the Docker socket bind does **not** relax
+/// `cap_drop: ALL`, `no-new-privileges`, the PID limit or the init process.
+/// The socket is one extra file descriptor, not a privileged container.
+///
+/// Binds are collected rather than assigned so adding a second bind here can
+/// never silently drop the secrets mount.
+pub fn hardened_host_config(
+    secrets_bind: Option<String>,
+    docker_socket_bind: Option<&str>,
+) -> bollard::models::HostConfig {
+    let binds: Vec<String> = secrets_bind
+        .into_iter()
+        .chain(docker_socket_bind.map(str::to_string))
+        .collect();
+    bollard::models::HostConfig {
+        // Security hardening: drop all Linux capabilities by default
+        cap_drop: Some(vec!["ALL".to_string()]),
+        // Security hardening: prevent privilege escalation via setuid/setgid
+        security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+        // Security hardening: limit number of processes to prevent fork bombs
+        pids_limit: Some(512),
+        // Security hardening: use init process for proper signal handling and zombie reaping
+        init: Some(true),
+        binds: (!binds.is_empty()).then_some(binds),
+        ..Default::default()
+    }
+}
+
+/// Host address published container ports bind to, shared with whoever may
+/// move it at runtime (the agent's `network_sync` loop moves a node that
+/// joined with a public address onto its WireGuard mesh address). Read at
+/// container-creation time, so every container created after a move
+/// publishes on the new address.
+pub type SharedHostBindAddress = Arc<std::sync::RwLock<String>>;
+
+/// Where published ports go when the configured bind address is unusable.
+const FALLBACK_HOST_BIND_ADDRESS: &str = "127.0.0.1";
+
 pub struct DockerRuntime {
     /// The process-wide Docker client, which may be unavailable on a
     /// control-plane node that has no local daemon. All operations that
@@ -673,8 +788,10 @@ pub struct DockerRuntime {
     network_name: String,
     /// Address to bind host ports to: "127.0.0.1" for the control plane's
     /// own local containers, or a worker agent's private/overlay address
-    /// (never "0.0.0.0" — see [`Self::with_host_bind_address`]).
-    host_bind_address: String,
+    /// (never "0.0.0.0" — see [`Self::with_host_bind_address`]). Shared via
+    /// [`Self::with_host_bind_slot`] when the address can move at runtime;
+    /// always read through [`Self::current_host_bind_address`].
+    host_bind_address: SharedHostBindAddress,
     /// Optional secondary network for multi-host overlay (e.g. "temps-overlay").
     /// When set, every container is additionally connected to this network
     /// after creation. Skipped silently when the network doesn't exist —
@@ -722,6 +839,14 @@ pub struct DockerRuntime {
     /// which is tmpfs on most Linux distros and got wiped on every
     /// reboot, forcing a redeploy. Override via [`Self::with_secrets_root`].
     secrets_root: PathBuf,
+    /// Projects this host grants `/var/run/docker.sock` to (ADR 045).
+    ///
+    /// Read once from this process's own environment at startup and injected
+    /// via [`Self::with_docker_socket_grant`]; empty by default, which is the
+    /// behaviour of every install that never sets the variable. The comparison
+    /// happens here, in the process that creates the container, so a control
+    /// plane can never talk a worker into mounting the socket.
+    docker_socket_grant: DockerSocketGrant,
     /// Optional global cap on concurrent `build_image` calls. Set via
     /// [`Self::with_build_limits`] on the control plane to prevent N
     /// simultaneous deploys from each grabbing 50% of host CPU/RAM and
@@ -1294,13 +1419,16 @@ impl DockerRuntime {
             docker: handle,
             use_buildkit,
             network_name,
-            host_bind_address: "127.0.0.1".to_string(),
+            host_bind_address: Arc::new(std::sync::RwLock::new(
+                FALLBACK_HOST_BIND_ADDRESS.to_string(),
+            )),
             overlay_network: None,
             extra_networks: Vec::new(),
             dns_servers: Vec::new(),
             overlay_dns_slot: None,
             overlay_peers: None,
             secrets_root,
+            docker_socket_grant: DockerSocketGrant::default(),
             build_semaphore: None,
             build_permits: None,
             builds_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1488,9 +1616,90 @@ impl DockerRuntime {
     /// reachable from the control-plane proxy over the private network but
     /// never on the node's public interface. Never pass "0.0.0.0" — Docker
     /// treats it as "bind every interface", including any public one.
+    ///
+    /// The address is fixed for this runtime's lifetime; use
+    /// [`Self::with_host_bind_slot`] when it can move.
     pub fn with_host_bind_address(mut self, address: String) -> Self {
-        self.host_bind_address = address;
+        self.host_bind_address = Arc::new(std::sync::RwLock::new(address));
         self
+    }
+
+    /// Share the host bind address with the code that may move it at runtime.
+    ///
+    /// The agent passes the same slot its own service handlers read and its
+    /// `network_sync` loop updates when a node that joined with a public
+    /// address moves onto its WireGuard mesh address, so application
+    /// containers created after the move publish on the mesh address the
+    /// control plane now dials (`nodes::Model::data_address`) instead of the
+    /// public address captured at startup.
+    pub fn with_host_bind_slot(mut self, slot: SharedHostBindAddress) -> Self {
+        self.host_bind_address = slot;
+        self
+    }
+
+    /// The address to publish a port on right now, for port mappings that do
+    /// not name their own `host_ip`.
+    ///
+    /// Never returns an all-interfaces address: an empty or unspecified value
+    /// (`0.0.0.0`, `::`) in the slot falls back to loopback, because binding it
+    /// would expose the container on every interface, public ones included.
+    /// A poisoned lock still holds a complete `String`, so its value is used.
+    fn current_host_bind_address(&self) -> String {
+        let address = match self.host_bind_address.read() {
+            Ok(guard) => guard.trim().to_string(),
+            Err(poisoned) => poisoned.into_inner().trim().to_string(),
+        };
+        let all_interfaces = address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified());
+        if address.is_empty() || all_interfaces {
+            warn!(
+                configured = %address,
+                fallback = FALLBACK_HOST_BIND_ADDRESS,
+                "refusing to publish container ports on all interfaces; the configured host \
+                 bind address is empty or unspecified, binding to loopback instead"
+            );
+            return FALLBACK_HOST_BIND_ADDRESS.to_string();
+        }
+        address
+    }
+
+    /// Docker port binding for one requested mapping: the mapping's own
+    /// `host_ip` when set, otherwise this runtime's current bind address.
+    fn host_port_binding(&self, port_mapping: &PortMapping) -> bollard::models::PortBinding {
+        bollard::models::PortBinding {
+            host_ip: Some(
+                port_mapping
+                    .host_ip
+                    .clone()
+                    .unwrap_or_else(|| self.current_host_bind_address()),
+            ),
+            // When host_port is 0, let Docker pick an available port
+            host_port: if port_mapping.host_port == 0 {
+                None
+            } else {
+                Some(port_mapping.host_port.to_string())
+            },
+        }
+    }
+
+    /// Declare which projects this host grants `/var/run/docker.sock` to
+    /// (ADR 045).
+    ///
+    /// Built from this process's own environment
+    /// (`TEMPS_DOCKER_SOCKET_PROJECTS`) exactly once at startup by
+    /// `temps serve` and `temps agent`. Left at the default (empty) everywhere
+    /// else — including tests and the proxy's on-demand lifecycle adapter,
+    /// which never creates a container from a `DeployRequest`.
+    pub fn with_docker_socket_grant(mut self, grant: DockerSocketGrant) -> Self {
+        self.docker_socket_grant = grant;
+        self
+    }
+
+    /// The grant this runtime evaluates. Exposed so a caller can report what
+    /// this host would do without re-reading the environment.
+    pub fn docker_socket_grant(&self) -> &DockerSocketGrant {
+        &self.docker_socket_grant
     }
 
     /// Configure a secondary multi-host overlay network. When set, every
@@ -1825,27 +2034,17 @@ impl DockerRuntime {
     pub async fn ensure_network_exists(&self) -> Result<(), DeployerError> {
         let docker = self.require_docker()?;
 
-        // Check if network exists
-        let networks = docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
-            .map_err(|e| DeployerError::NetworkError(format!("Failed to list networks: {}", e)))?;
-
-        let network_exists = networks
-            .iter()
-            .any(|network| network.name.as_ref() == Some(&self.network_name));
-
-        if !network_exists {
-            info!("Creating network: {}", self.network_name);
-            let create_options = bollard::models::NetworkCreateRequest {
-                name: self.network_name.clone(),
-                driver: Some("bridge".to_string()),
-                ..Default::default()
-            };
-
-            docker.create_network(create_options).await.map_err(|e| {
-                DeployerError::NetworkError(format!("Failed to create network: {}", e))
-            })?;
+        let outcome =
+            temps_core::docker_network::ensure_bridge_network(&docker, &self.network_name)
+                .await
+                .map_err(|e| {
+                    DeployerError::NetworkError(format!(
+                        "Failed to create network {}: {}",
+                        self.network_name, e
+                    ))
+                })?;
+        if outcome != temps_core::docker_network::NetworkEnsured::Existing {
+            info!("Network {} ready ({:?})", self.network_name, outcome);
         }
 
         // Re-applied on every deploy (not just network creation) so the block
@@ -1896,21 +2095,21 @@ impl DockerRuntime {
         use http_body_util::Full;
 
         // Write the tar archive to a temporary file to avoid holding the entire
-        // build context in memory.  The temp file is cleaned up when `_tmp` drops.
+        // build context in memory. Keep its cleanup owner in the blocking
+        // task so cancellation cannot unlink then recreate an orphan archive.
         let tmp = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
         let tmp_path = tmp.path().to_path_buf();
 
         // Tar creation is synchronous and CPU-bound — run it on a blocking thread.
         let ctx = context_path.clone();
-        let out_path = tmp_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::create(&out_path).map_err(BuilderError::IoError)?;
+        let _tmp = tokio::task::spawn_blocking(move || {
+            let file = tmp.reopen().map_err(BuilderError::IoError)?;
             let mut tar_builder = tar::Builder::new(file);
             tar_builder
                 .append_dir_all(".", ctx)
                 .map_err(BuilderError::IoError)?;
             tar_builder.finish().map_err(BuilderError::IoError)?;
-            Ok::<(), BuilderError>(())
+            Ok::<_, BuilderError>(tmp)
         })
         .await
         .map_err(|e| BuilderError::Other(format!("Tar task panicked: {}", e)))??;
@@ -2824,6 +3023,35 @@ impl ImageBuilder for DockerRuntime {
         import_stream_into_docker(&docker, image_stream, tag).await
     }
 
+    async fn export_image_stream(
+        &self,
+        image_name: &str,
+    ) -> Result<crate::ImageImportStream, BuilderError> {
+        info!(image = %image_name, "Streaming image export from Docker");
+        let docker = self.require_docker_for_build()?;
+        // Fail with a typed not-found before a 200 is sent: `export_image`
+        // only reports a missing image once the stream is polled.
+        match docker.inspect_image(image_name).await {
+            Ok(_) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Err(BuilderError::ImageNotFound(image_name.to_string())),
+            Err(error) => {
+                return Err(BuilderError::Other(format!(
+                    "Failed to inspect image '{image_name}' before export: {error}"
+                )))
+            }
+        }
+        let name = image_name.to_string();
+        Ok(Box::pin(docker.export_image(image_name).map(
+            move |chunk| {
+                chunk.map_err(|error| {
+                    std::io::Error::other(format!("Failed to export image '{name}': {error}"))
+                })
+            },
+        )))
+    }
+
     async fn save_image(&self, image_name: &str, output_path: &Path) -> Result<(), BuilderError> {
         info!("Exporting image '{}' to {:?}", image_name, output_path);
 
@@ -3080,6 +3308,20 @@ impl ImageBuilder for DockerRuntime {
         Ok(())
     }
 
+    async fn image_identity(
+        &self,
+        image_name: &str,
+    ) -> Result<crate::LocalImageIdentity, BuilderError> {
+        let docker = self.require_docker_for_build()?;
+        let inspect = docker.inspect_image(image_name).await.map_err(|e| {
+            BuilderError::ImageNotFound(format!("Failed to inspect image '{}': {}", image_name, e))
+        })?;
+        Ok(crate::LocalImageIdentity {
+            id: inspect.id.unwrap_or_default(),
+            repo_digests: inspect.repo_digests.unwrap_or_default(),
+        })
+    }
+
     async fn inspect_image(&self, image_name: &str) -> Result<crate::ImageInfo, BuilderError> {
         let docker = self.require_docker_for_build()?;
         let inspect = docker.inspect_image(image_name).await.map_err(|e| {
@@ -3197,20 +3439,7 @@ impl ContainerDeployer for DockerRuntime {
         for port_mapping in &request.port_mappings {
             let container_port_key =
                 format!("{}/{}", port_mapping.container_port, port_mapping.protocol);
-            let host_port_binding = bollard::models::PortBinding {
-                host_ip: Some(
-                    port_mapping
-                        .host_ip
-                        .clone()
-                        .unwrap_or_else(|| self.host_bind_address.clone()),
-                ),
-                // When host_port is 0, let Docker pick an available port
-                host_port: if port_mapping.host_port == 0 {
-                    None
-                } else {
-                    Some(port_mapping.host_port.to_string())
-                },
-            };
+            let host_port_binding = self.host_port_binding(port_mapping);
 
             port_bindings.insert(container_port_key.clone(), Some(vec![host_port_binding]));
             exposed_ports.push(container_port_key);
@@ -3263,6 +3492,31 @@ impl ContainerDeployer for DockerRuntime {
 
         let dns_for_container = self.dns_for_container();
 
+        // ADR 045: this host's own grant decides, not the caller. The control
+        // plane only says "this is project X"; the answer comes from the
+        // environment of the process creating the container.
+        let docker_socket_bind = docker_socket_bind_for(
+            &self.docker_socket_grant,
+            request.project_slug.as_deref(),
+            request.control_plane_grants_socket,
+        );
+        if docker_socket_bind.is_some() {
+            // Carries a stable `event` field so host-side log shipping can
+            // select these lines without pattern-matching prose. The control
+            // plane's audit record for the same mount is written from this
+            // host's *self-report* and is therefore not tamper-evident against
+            // a compromise of this host; this line is the independent,
+            // host-local record of the same fact (ADR 045).
+            warn!(
+                event = "docker_socket_mounted",
+                container_name = %request.container_name,
+                project_slug = request.project_slug.as_deref().unwrap_or("<unknown>"),
+                "Mounting the host Docker socket into this container: the project is named in \
+                 {}. It is root-equivalent on this host.",
+                temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
+            );
+        }
+
         let host_config = bollard::models::HostConfig {
             port_bindings: Some(port_bindings),
             network_mode: Some(self.network_name.clone()),
@@ -3293,21 +3547,12 @@ impl ContainerDeployer for DockerRuntime {
                 .cpu_limit
                 .map(|cores| (cores * 1_000_000_000.0) as i64),
             log_config,
-            // Security hardening: drop all Linux capabilities by default
-            cap_drop: Some(vec!["ALL".to_string()]),
-            // Security hardening: prevent privilege escalation via setuid/setgid
-            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-            // Security hardening: limit number of processes to prevent fork bombs
-            pids_limit: Some(512),
-            // Security hardening: use init process for proper signal handling and zombie reaping
-            init: Some(true),
-            // Collected rather than assigned so adding a second bind here does
-            // not silently drop the secrets mount.
-            binds: {
-                let binds: Vec<String> = secrets_bind.into_iter().collect();
-                (!binds.is_empty()).then_some(binds)
-            },
-            ..Default::default()
+            // Capability drops, no-new-privileges, the PID limit, the init
+            // process and every bind (secrets, plus the ADR-045 Docker socket
+            // when this host grants it) come from one pure helper so the
+            // hardening cannot drift between call sites or be weakened by
+            // adding a mount.
+            ..hardened_host_config(secrets_bind, docker_socket_bind)
         };
 
         // Build container labels (used by log aggregator for container discovery)
@@ -3450,6 +3695,7 @@ impl ContainerDeployer for DockerRuntime {
             container_port,
             host_port,
             status: ContainerStatus::Running,
+            docker_socket_mounted: docker_socket_bind.is_some(),
         })
     }
 
@@ -3588,33 +3834,8 @@ impl ContainerDeployer for DockerRuntime {
         let port_mappings = container
             .network_settings
             .and_then(|ns| ns.ports)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(port_key, bindings)| {
-                if let Some(bindings) = bindings {
-                    if let Some(binding) = bindings.first() {
-                        let parts: Vec<&str> = port_key.split('/').collect();
-                        if parts.len() == 2 {
-                            let container_port = parts[0].parse().ok()?;
-                            let protocol = match parts[1] {
-                                "tcp" => Protocol::Tcp,
-                                "udp" => Protocol::Udp,
-                                _ => Protocol::Tcp,
-                            };
-                            let host_port = binding.host_port.as_ref()?.parse().ok()?;
-
-                            return Some(PortMapping {
-                                host_port,
-                                container_port,
-                                protocol,
-                                host_ip: binding.host_ip.clone(),
-                            });
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
+            .map(parse_inspected_port_mappings)
+            .unwrap_or_default();
 
         let status =
             Self::map_container_status(&state.status.map(|s| s.to_string()).unwrap_or_default());
@@ -4141,6 +4362,188 @@ mod docker_tests {
     use tokio::time::{timeout, Duration};
 
     #[test]
+    fn inspected_ports_preserve_every_interface_binding() {
+        let ports = HashMap::from([(
+            "3000/tcp".to_string(),
+            Some(vec![
+                bollard::models::PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some("32001".to_string()),
+                },
+                bollard::models::PortBinding {
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: Some("32002".to_string()),
+                },
+            ]),
+        )]);
+
+        let mappings = parse_inspected_port_mappings(ports);
+
+        assert_eq!(mappings.len(), 2);
+        assert!(mappings.iter().any(|mapping| {
+            mapping.host_ip.as_deref() == Some("127.0.0.1") && mapping.host_port == 32001
+        }));
+        assert!(mappings.iter().any(|mapping| {
+            mapping.host_ip.as_deref() == Some("0.0.0.0") && mapping.host_port == 32002
+        }));
+    }
+
+    /// ADR 045: the grant is evaluated here, by the process that builds the
+    /// container, and it adds exactly one bind without relaxing anything else.
+    mod docker_socket_grant {
+        use super::*;
+        use temps_core::docker_socket_grant::{DockerSocketGrant, DOCKER_SOCKET_BIND};
+
+        fn binds_of(config: &bollard::models::HostConfig) -> Vec<String> {
+            config.binds.clone().unwrap_or_default()
+        }
+
+        fn assert_still_hardened(config: &bollard::models::HostConfig) {
+            assert_eq!(config.cap_drop, Some(vec!["ALL".to_string()]));
+            assert_eq!(
+                config.security_opt,
+                Some(vec!["no-new-privileges:true".to_string()])
+            );
+            assert_eq!(config.pids_limit, Some(512));
+            assert_eq!(config.init, Some(true));
+            assert_ne!(config.privileged, Some(true));
+        }
+
+        #[test]
+        fn granted_slug_gets_the_socket_bind() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon,infra-agent"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"), true);
+            assert_eq!(bind, Some(DOCKER_SOCKET_BIND));
+
+            let config = hardened_host_config(None, bind);
+            assert_eq!(binds_of(&config), vec![DOCKER_SOCKET_BIND.to_string()]);
+            assert_still_hardened(&config);
+        }
+
+        #[test]
+        fn granted_slug_keeps_the_secrets_bind_alongside_the_socket() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"), true);
+            let config = hardened_host_config(
+                Some("/var/lib/temps/secrets/c:/run/secrets:ro".into()),
+                bind,
+            );
+
+            let binds = binds_of(&config);
+            assert!(binds.contains(&"/var/lib/temps/secrets/c:/run/secrets:ro".to_string()));
+            assert!(binds.contains(&DOCKER_SOCKET_BIND.to_string()));
+            assert_eq!(binds.len(), 2);
+            assert_still_hardened(&config);
+        }
+
+        #[test]
+        fn ungranted_slug_gets_no_socket_bind() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("infra-agent"), true),
+                None
+            );
+
+            let config = hardened_host_config(None, None);
+            assert!(config.binds.is_none());
+            assert_still_hardened(&config);
+        }
+
+        #[test]
+        fn absent_slug_gets_no_socket_bind_even_when_the_host_grants_something() {
+            // A pre-ADR-045 control plane sends no slug at all. It must never
+            // be interpreted as "any project".
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(docker_socket_bind_for(&grant, None, true), None);
+        }
+
+        #[test]
+        fn a_host_that_grants_nothing_never_mounts_the_socket() {
+            let grant = DockerSocketGrant::default();
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), true),
+                None
+            );
+            assert!(hardened_host_config(None, None).binds.is_none());
+        }
+
+        #[test]
+        fn a_host_grant_alone_never_mounts_without_the_control_plane_declaration() {
+            // The finding this parameter exists for: an operator sets
+            // TEMPS_DOCKER_SOCKET_PROJECTS on a worker, the control plane does
+            // not declare the slug (removed, forgotten, never set), so the
+            // admin-only claim guard and the placement gate are both inert —
+            // anyone can create a project with that name and have it land
+            // here. The worker must refuse to mount from its own environment
+            // alone.
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), false),
+                None
+            );
+            assert!(hardened_host_config(None, None).binds.is_none());
+        }
+
+        #[test]
+        fn the_control_plane_declaration_alone_never_mounts_either() {
+            // The symmetric half, which was always true and must stay true:
+            // authorization is not instruction. A control plane (or anything
+            // that can forge a request to this agent) cannot make this host
+            // mount a socket its own environment does not grant.
+            let grant = DockerSocketGrant::default();
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), true),
+                None
+            );
+        }
+
+        #[test]
+        fn both_halves_together_mount_exactly_one_bind() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"), true);
+            assert_eq!(bind, Some(DOCKER_SOCKET_BIND));
+            assert_eq!(
+                binds_of(&hardened_host_config(None, bind)),
+                vec![DOCKER_SOCKET_BIND.to_string()]
+            );
+        }
+
+        #[test]
+        fn a_request_that_lost_the_authorization_field_fails_closed() {
+            // `#[serde(default)]` is `false`: a pre-ADR-045 control plane, or
+            // a request whose field was dropped in transit, must deploy
+            // without the socket rather than with it.
+            let deserialized: serde_json::Value = serde_json::json!({});
+            assert!(!deserialized
+                .get("control_plane_grants_socket")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false));
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), false),
+                None
+            );
+        }
+
+        #[test]
+        fn runtime_defaults_to_granting_nothing() {
+            let runtime = DockerRuntime::new_with_handle(
+                Arc::new(DockerHandle::disabled(
+                    temps_core::PROFILE_CONTROL_PLANE,
+                    temps_core::CONTROL_PLANE_DOCKER_REASON,
+                )),
+                false,
+                "temps".to_string(),
+            );
+            assert!(runtime.docker_socket_grant().is_empty());
+
+            let runtime =
+                runtime.with_docker_socket_grant(DockerSocketGrant::parse(Some("node-daemon")));
+            assert!(runtime.docker_socket_grant().allows("node-daemon"));
+        }
+    }
+
+    #[test]
     fn docker_log_tail_keeps_memory_bounded_and_retains_newest_bytes() {
         let mut logs = DockerLogTail::new(8);
         logs.push(bytes::Bytes::from_static(b"abcd"));
@@ -4562,6 +4965,95 @@ mod docker_tests {
         assert!(dns.len() <= 3, "glibc/musl ignore nameservers past the 3rd");
     }
 
+    fn unpinned_port(host_port: u16) -> PortMapping {
+        PortMapping {
+            host_port,
+            container_port: 8080,
+            protocol: Protocol::Tcp,
+            host_ip: None,
+        }
+    }
+
+    #[test]
+    fn test_host_port_binding_follows_a_moved_bind_slot() {
+        // A worker that joined with a public address starts publishing there,
+        // then network_sync moves the shared slot onto its mesh address. Ports
+        // created afterwards must land on the mesh address, not the public
+        // one captured at startup.
+        let slot: SharedHostBindAddress =
+            Arc::new(std::sync::RwLock::new("203.0.113.10".to_string()));
+        let runtime = test_runtime().with_host_bind_slot(slot.clone());
+        assert_eq!(
+            runtime
+                .host_port_binding(&unpinned_port(0))
+                .host_ip
+                .as_deref(),
+            Some("203.0.113.10")
+        );
+
+        *slot.write().expect("test slot lock") = "10.99.0.4".to_string();
+
+        let binding = runtime.host_port_binding(&unpinned_port(31000));
+        assert_eq!(binding.host_ip.as_deref(), Some("10.99.0.4"));
+        assert_eq!(binding.host_port.as_deref(), Some("31000"));
+    }
+
+    #[test]
+    fn test_host_port_binding_keeps_an_explicit_host_ip() {
+        // The control plane pins app deploys to the node's data address; that
+        // request-level choice wins over the runtime's own bind address.
+        let runtime = test_runtime().with_host_bind_address("10.99.0.4".to_string());
+        let mapping = PortMapping {
+            host_ip: Some("10.0.0.8".to_string()),
+            ..unpinned_port(0)
+        };
+
+        let binding = runtime.host_port_binding(&mapping);
+
+        assert_eq!(binding.host_ip.as_deref(), Some("10.0.0.8"));
+        assert_eq!(binding.host_port, None, "port 0 lets Docker pick");
+    }
+
+    #[test]
+    fn test_host_port_binding_defaults_to_loopback() {
+        let binding = test_runtime().host_port_binding(&unpinned_port(0));
+        assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_host_port_binding_never_binds_all_interfaces() {
+        for unusable in ["0.0.0.0", "::", "", "   "] {
+            let slot: SharedHostBindAddress =
+                Arc::new(std::sync::RwLock::new(unusable.to_string()));
+            let runtime = test_runtime().with_host_bind_slot(slot);
+
+            let binding = runtime.host_port_binding(&unpinned_port(0));
+
+            assert_eq!(
+                binding.host_ip.as_deref(),
+                Some("127.0.0.1"),
+                "bind address {unusable:?} must fall back to loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn test_host_port_binding_reads_a_poisoned_slot() {
+        let slot: SharedHostBindAddress = Arc::new(std::sync::RwLock::new("10.99.0.4".to_string()));
+        let poisoner = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.write().expect("test slot lock");
+            panic!("poison the bind slot");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+        let runtime = test_runtime().with_host_bind_slot(slot);
+
+        let binding = runtime.host_port_binding(&unpinned_port(0));
+
+        assert_eq!(binding.host_ip.as_deref(), Some("10.99.0.4"));
+    }
+
     #[test]
     fn test_dns_for_container_overlay_slot_present_but_unpopulated() {
         // Slot exists (agent wired it) but network_sync hasn't published the
@@ -4748,6 +5240,8 @@ mod docker_tests {
             command: Some(vec!["sleep".to_string(), "60".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         let info = match runtime.deploy_container(deploy_request).await {
@@ -4812,6 +5306,8 @@ mod docker_tests {
             command: Some(vec!["sleep".to_string(), "30".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         }
     }
 
@@ -5658,6 +6154,8 @@ CMD ["cat", "/hello.txt"]
                     command: Some(vec!["sleep".to_string(), "30".to_string()]),
                     log_config: Some(ContainerLogConfig::app_default()),
                     labels: HashMap::new(),
+                    project_slug: None,
+                    control_plane_grants_socket: false,
                 };
 
                 let deploy_result = runtime.deploy_container(deploy_request).await;
@@ -5747,6 +6245,8 @@ CMD ["cat", "/hello.txt"]
             command: Some(vec!["sleep".to_string(), "30".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         let inspect_caps = |id: String| {
@@ -6668,6 +7168,8 @@ CMD ["cat", "/hello.txt"]
             command: None,
             log_config: None,
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         };
         let err = runtime
             .deploy_container(req)

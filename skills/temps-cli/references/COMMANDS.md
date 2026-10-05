@@ -60,7 +60,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`backups`](#backups) - Manage backup schedules and backups
 - [`runtime-logs`](#runtime-logs) - View runtime container logs (use -f to follow in real-time)
 - [`notifications`](#notifications) - Manage notification providers (Slack, Email, Webhook, etc.)
-- [`dns`](#dns) - Manage DNS providers for automated domain verification
+- [`dns`](#dns) - Manage DNS providers and Temps-managed DNS records
 - [`services`](#services) - Manage external services (databases, caches, storage)
 - [`settings`](#settings) - Manage platform settings
 - [`users`](#users) - Manage platform users
@@ -71,6 +71,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`webhooks`](#webhooks) - Manage webhooks for project events
 - [`containers`](#containers) - Manage project containers in environments
 - [`cluster`](#cluster) - Cluster-wide multi-node operations
+- [`nodes`](#nodes) - Worker nodes and workload placement
 - [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
 - [`errors`](#errors) - Manage error tracking and error groups
 - [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
@@ -87,12 +88,16 @@ Use this index or search for a top-level command heading to load only the releva
 - [`scans`](#scans) - Manage vulnerability scans
 - [`custom-domains`](#custom-domains) - Manage project custom domains
 - [`dns-provider`](#dns-provider) - Manage DNS providers and managed domains
+- [`delivery-profiles`](#delivery-profiles) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
+- [`delivery`](#delivery) - Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
 - [`ip-access`](#ip-access) - Manage IP access control rules
 - [`audit`](#audit) - View audit logs
 - [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
+- [`logs`](#logs) - Search collected logs across every project and database you can access
 - [`email-domains`](#email-domains) - Manage email domains for transactional email
 - [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
 - [`incidents`](#incidents) - Manage incidents for status pages and monitoring
+- [`alarms`](#alarms) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
 - [`emails`](#emails) - Manage and send emails
 - [`load-balancer`](#load-balancer) - Manage load balancer routes
 - [`migrate`](#migrate) - Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps
@@ -265,6 +270,7 @@ Manage projects
 - `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 - `list` (`ls`) - List all projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
+- `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
 - `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
@@ -371,7 +377,18 @@ Create a new project (git-based or manual deployment)
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | No |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
+| `--delivery-provider <provider>` | Delivery provider for the new project: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
+
+### `projects cloudflare-capability` (alias: `delivery-capability`)
+
+Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `projects show` (alias: `get`)
 
@@ -1025,6 +1042,7 @@ Set an environment variable
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | No |
+| `--preview` | Also include in current and future preview environments | - | No |
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
@@ -1071,10 +1089,10 @@ View or set CPU/memory resources for an environment
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
-| `--cpu <millicores>` | CPU limit in millicores (e.g., 500 = 0.5 CPU) | - | No |
+| `--cpu <millicores>` | CPU limit in millicores (1000 = 1 core, e.g., 500 = 0.5 CPU) | - | No |
 | `--memory <mb>` | Memory limit in MB (e.g., 512) | - | No |
-| `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | No |
-| `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | No |
+| `--cpu-request <millicores>` | CPU request in millicores (recorded; not currently enforced) | - | No |
+| `--memory-request <mb>` | Memory request in MB (recorded; not currently enforced) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments timeouts`
@@ -1316,7 +1334,7 @@ List available repositories
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--id <id>` | Provider ID (optional, lists all if not provided) | - | No |
+| `--id <id>` | Connection ID (lists every synced repository if omitted) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `--search <term>` | Search repositories by name | - | No |
 | `--page <n>` | Page number | - | No |
@@ -1333,6 +1351,7 @@ Manage Git provider connections
 **Subcommands:**
 
 - `list` (`ls`) - List all Git connections
+- `get` - Show one Git connection: account, health and sync state
 - `show` - Show connection details for a provider
 - `delete` (`rm`) - Delete a Git connection
 - `activate` - Activate a Git connection
@@ -1354,6 +1373,17 @@ List all Git connections
 | `--per-page <n>` | Items per page (default: 30, max: 100) | - | No |
 | `--sort <field>` | Sort by field (created_at, updated_at, account_name) | - | No |
 | `--direction <dir>` | Sort direction: asc or desc (default: desc) | - | No |
+
+#### `providers connections get`
+
+Show one Git connection: account, health and sync state
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 #### `providers connections show`
 
@@ -1911,7 +1941,7 @@ Remove a notification route
 
 ## `dns`
 
-Manage DNS providers for automated domain verification
+Manage DNS providers and Temps-managed DNS records
 
 **Subcommands:**
 
@@ -1921,6 +1951,7 @@ Manage DNS providers for automated domain verification
 - `remove` (`rm`) - Remove a DNS provider
 - `test` - Test DNS provider connection
 - `zones` - List available zones in a DNS provider
+- `records` (`record`) - Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
 
 ### `dns list` (alias: `ls`)
 
@@ -1940,25 +1971,30 @@ Add a new DNS provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual) | - | No |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual) | - | No |
 | `-n, --name <name>` | Provider name | - | No |
 | `-d, --description <description>` | Provider description | - | No |
-| `--api-token <token>` | Cloudflare API token | - | No |
+| `--api-token <token>` | API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history) | - | No |
+| `--api-token-stdin` | Read the API token from stdin | - | No |
 | `--account-id <id>` | Cloudflare account ID (optional) | - | No |
 | `--access-key-id <key>` | AWS access key ID | - | No |
-| `--secret-access-key <secret>` | AWS secret access key | - | No |
+| `--secret-access-key <secret>` | AWS secret access key (prefer --secret-access-key-stdin to keep it out of shell history) | - | No |
+| `--secret-access-key-stdin` | Read the AWS secret access key from stdin | - | No |
 | `--region <region>` | AWS region | - | No |
 | `--api-user <user>` | Namecheap API user | - | No |
-| `--api-key <key>` | Namecheap API key | - | No |
+| `--api-key <key>` | API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the Bunny or Namecheap API key from stdin | - | No |
 | `--username <username>` | Namecheap username | - | No |
 | `--client-ip <ip>` | Namecheap whitelisted client IP | - | No |
 | `--project-id <id>` | GCP project ID | - | No |
 | `--service-account-email <email>` | GCP service account email | - | No |
 | `--private-key-id <id>` | GCP private key ID | - | No |
-| `--private-key <key>` | GCP private key | - | No |
+| `--private-key <key>` | GCP private key (prefer --private-key-stdin to keep it out of shell history) | - | No |
+| `--private-key-stdin` | Read the GCP private key from stdin | - | No |
 | `--tenant-id <id>` | Azure tenant ID | - | No |
 | `--client-id <id>` | Azure client ID | - | No |
-| `--client-secret <secret>` | Azure client secret | - | No |
+| `--client-secret <secret>` | Azure client secret (prefer --client-secret-stdin to keep it out of shell history) | - | No |
+| `--client-secret-stdin` | Read the Azure client secret from stdin | - | No |
 | `--subscription-id <id>` | Azure subscription ID | - | No |
 | `--resource-group <name>` | Azure resource group | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
@@ -2006,6 +2042,78 @@ List available zones in a DNS provider
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+
+### `dns records` (alias: `record`)
+
+Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
+
+**Subcommands:**
+
+- `ownership` (`owner`) - Show whether Temps owns a DNS record and may change it
+- `set` (`create`) - Create or update a Temps-owned DNS record
+- `import` (`adopt`) - Adopt an existing DNS record into Temps management
+- `remove` (`rm`, `delete`) - Delete a Temps-owned DNS record
+
+#### `dns records ownership` (alias: `owner`)
+
+Show whether Temps owns a DNS record and may change it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records set` (alias: `create`)
+
+Create or update a Temps-owned DNS record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `--value <value>` | Record value: IPv4 address (A), IPv6 address (AAAA) or target hostname (CNAME) | - | No |
+| `--ttl <seconds>` | TTL in seconds, 60-86400; omit (or use 1) for the provider default | - | No |
+| `--proxied` | Proxy through the provider CDN (Cloudflare orange cloud) | - | No |
+| `--no-proxied` | Do not proxy (DNS only) | - | No |
+| `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | No |
+| `--environment-id <id>` | Environment ID to stamp as the record owner | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records import` (alias: `adopt`)
+
+Adopt an existing DNS record into Temps management
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | No |
+| `--environment-id <id>` | Environment ID to stamp as the record owner | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records remove` (alias: `rm`, `delete`)
+
+Delete a Temps-owned DNS record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ## `services` (alias: `svc`)
 
@@ -2525,6 +2633,7 @@ Manage platform settings
 
 - `show` (`get`) - Show current platform settings
 - `update` (`set`) - Update platform settings
+- `geo-status` - Show the freshness of the geolocation (GeoLite2) database
 - `set-external-url` - Set the external URL for the platform
 - `set-preview-domain` - Set the preview domain pattern
 
@@ -2565,6 +2674,16 @@ Update platform settings
 | `--console-force-https <mode>` | Redirect the console host to HTTPS: auto (once a cert exists), always, or never | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
+### `settings geo-status`
+
+Show the freshness of the geolocation (GeoLite2) database
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ### `settings set-external-url`
 
 Set the external URL for the platform
@@ -2596,6 +2715,7 @@ Manage platform users
 - `me` - Show current user info
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
+- `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)
@@ -2653,6 +2773,18 @@ Restore a deleted user
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | User ID | - | Yes |
+
+### `users reset-password`
+
+Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompt (for automation) | - | No |
 
 ### `users role`
 
@@ -3296,6 +3428,187 @@ Cluster DNS resolver (ADR-024) operations
 #### `cluster dns status`
 
 Show whether cluster DNS is healthy across every node — resolver status, last sync, and errors — without SSHing into a node to read logs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+## `nodes`
+
+Worker nodes and workload placement
+
+**Subcommands:**
+
+- `capability` - Show whether this install can run workloads at all — local workloads plus joined worker nodes — so a deploy that could never be scheduled is visible before it is queued
+- `mesh` - WireGuard mesh: lets nodes that only share the internet with the control plane join it, encrypted. Shows whether it is on and how each node is connected
+- `pair` - Pair nodes this control plane dials: for a control plane nodes cannot reach (a laptop, a server behind NAT). Lists recent pairings and their progress
+- `ssh` - Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
+
+### `nodes capability`
+
+Show whether this install can run workloads at all — local workloads plus joined worker nodes — so a deploy that could never be scheduled is visible before it is queued
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes mesh`
+
+WireGuard mesh: lets nodes that only share the internet with the control plane join it, encrypted. Shows whether it is on and how each node is connected
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+**Subcommands:**
+
+- `enable` - Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it cannot be turned off again
+- `hub` - Mesh hub: a member that relays between members that cannot reach each other (two nodes behind NAT). Shows the hub and every pair it carries
+- `doctor` - Check the mesh from the control plane: its end, every node link and every pairing in progress, each failure with what fixes it. Exits 1 when a check fails. For a node's own end, run `temps doctor mesh` on it
+
+#### `nodes mesh enable`
+
+Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it cannot be turned off again
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--cidr <cidr>` | Mesh address pool (private IPv4, clear of the compute pool) | - | No |
+| `--port <port>` | UDP port every node must accept from the others | - | No |
+| `--node-api-port <port>` | TCP port nodes reach this control plane on over the mesh (default: the mesh port) | - | No |
+| `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes mesh hub`
+
+Mesh hub: a member that relays between members that cannot reach each other (two nodes behind NAT). Shows the hub and every pair it carries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+**Subcommands:**
+
+- `set` - Make <member> the hub: control-plane, or a node name. Pairs that never connect move onto it within a few minutes. The hub can read the traffic it relays: pick your own machine
+- `unset` - Remove the hub: relayed pairs go back to trying the direct path
+
+##### `nodes mesh hub set`
+
+Make <member> the hub: control-plane, or a node name. Pairs that never connect move onto it within a few minutes. The hub can read the traffic it relays: pick your own machine
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `nodes mesh hub unset`
+
+Remove the hub: relayed pairs go back to trying the direct path
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes mesh doctor`
+
+Check the mesh from the control plane: its end, every node link and every pairing in progress, each failure with what fixes it. Exits 1 when a check fails. For a node's own end, run `temps doctor mesh` on it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes pair`
+
+Pair nodes this control plane dials: for a control plane nodes cannot reach (a laptop, a server behind NAT). Lists recent pairings and their progress
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+**Subcommands:**
+
+- `create` - Start pairing the node at --address. Prints the one command to run on it; the control plane then dials it on the mesh port until it answers (30 minutes)
+- `cancel` - Cancel a pending pairing: its command stops working and its address is released
+
+#### `nodes pair create`
+
+Start pairing the node at --address. Prints the one command to run on it; the control plane then dials it on the mesh port until it answers (30 minutes)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--address <ip[:port]>` | The node's public IP (and mesh port, if not the default) | - | Yes |
+| `--name <name>` | Name the node registers under (default: worker-<random>) | - | No |
+| `--json` | Output in JSON format (includes the command, which holds a secret) | - | No |
+
+#### `nodes pair cancel`
+
+Cancel a pending pairing: its command stops working and its address is released
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+
+### `nodes ssh`
+
+Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+**Subcommands:**
+
+- `add` - Add the server at --host. Shows its SSH host key to confirm first (or pass --host-key). Credentials are used for this enrollment only and never stored
+- `show` - Show one enrollment: its progress and the log with the server output
+
+#### `nodes ssh add`
+
+Add the server at --host. Shows its SSH host key to confirm first (or pass --host-key). Credentials are used for this enrollment only and never stored
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--host <host>` | Hostname or IP address of the server | - | Yes |
+| `--port <port>` | SSH port | `22` | No |
+| `--user <user>` | User to log in as: root, or a user with sudo | `root` | No |
+| `--identity-file <path>` | Log in with this private key | - | No |
+| `--ask-passphrase` | Prompt for the private key passphrase | - | No |
+| `--agent` | Log in with the SSH agent of the control plane's temps serve process | - | No |
+| `--password-stdin` | Read the password from stdin (default: prompt for it) | - | No |
+| `--host-key <fingerprint>` | The SHA256:… host key fingerprint you verified | - | No |
+| `--name <name>` | Name the node registers under (default: worker-<random>) | - | No |
+| `--node-address <ip[:port]>` | The server's public address for WireGuard, if not the one SSH connects to | - | No |
+| `--no-wait` | Return once started instead of following the progress | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes ssh show`
+
+Show one enrollment: its progress and the log with the server output
 
 **Options:**
 
@@ -4853,24 +5166,29 @@ Create a new DNS provider
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Provider name | - | No |
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
 | `-d, --description <description>` | Provider description | - | No |
-| `--api-token <token>` | API token (Cloudflare, DigitalOcean) | - | No |
+| `--api-token <token>` | API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history) | - | No |
+| `--api-token-stdin` | Read the API token from stdin | - | No |
 | `--account-id <id>` | Cloudflare account ID (optional) | - | No |
 | `--access-key-id <key>` | AWS access key ID | - | No |
-| `--secret-access-key <secret>` | AWS secret access key | - | No |
+| `--secret-access-key <secret>` | AWS secret access key (prefer --secret-access-key-stdin to keep it out of shell history) | - | No |
+| `--secret-access-key-stdin` | Read the AWS secret access key from stdin | - | No |
 | `--region <region>` | AWS region | - | No |
 | `--api-user <user>` | Namecheap API user | - | No |
-| `--api-key <key>` | Namecheap API key | - | No |
+| `--api-key <key>` | API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the Bunny or Namecheap API key from stdin | - | No |
 | `--username <username>` | Namecheap username | - | No |
 | `--client-ip <ip>` | Namecheap whitelisted client IP | - | No |
 | `--project-id <id>` | GCP project ID | - | No |
 | `--service-account-email <email>` | GCP service account email | - | No |
 | `--private-key-id <id>` | GCP private key ID | - | No |
-| `--private-key <key>` | GCP private key | - | No |
+| `--private-key <key>` | GCP private key (prefer --private-key-stdin to keep it out of shell history) | - | No |
+| `--private-key-stdin` | Read the GCP private key from stdin | - | No |
 | `--tenant-id <id>` | Azure tenant ID | - | No |
 | `--client-id <id>` | Azure client ID | - | No |
-| `--client-secret <secret>` | Azure client secret | - | No |
+| `--client-secret <secret>` | Azure client secret (prefer --client-secret-stdin to keep it out of shell history) | - | No |
+| `--client-secret-stdin` | Read the Azure client secret from stdin | - | No |
 | `--subscription-id <id>` | Azure subscription ID | - | No |
 | `--resource-group <name>` | Azure resource group | - | No |
 | `--management-url <url>` | pebble-challtestsrv management API URL (local ACME test server only) | - | No |
@@ -4898,7 +5216,8 @@ Update a DNS provider
 | `--id <id>` | Provider ID | - | Yes |
 | `-n, --name <name>` | New provider name | - | No |
 | `-d, --description <description>` | New description | - | No |
-| `--api-key <key>` | New API key/token | - | No |
+| `--api-key <key>` | New API key/token (prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the new API key/token from stdin | - | No |
 | `--active <boolean>` | Set active status (true/false) | - | No |
 
 ### `dns-provider remove` (alias: `rm`)
@@ -5002,6 +5321,181 @@ Lookup DNS A records for a domain
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name to lookup | - | Yes |
 | `--json` | Output in JSON format | - | No |
+
+## `delivery-profiles` (alias: `delivery-profile`)
+
+Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
+
+**Subcommands:**
+
+- `capabilities` (`caps`) - Show which delivery providers are available and what each one still needs
+- `list` (`ls`) - List delivery profiles, one page at a time (newest first)
+- `create` (`add`) - Create a delivery profile
+- `remove` (`rm`, `delete`) - Delete a delivery profile
+
+### `delivery-profiles capabilities` (alias: `caps`)
+
+Show which delivery providers are available and what each one still needs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `delivery-profiles list` (alias: `ls`)
+
+List delivery profiles, one page at a time (newest first)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Profiles per page, 1-100 (default: 20) | - | No |
+| `--sort-by <field>` | Sort field: created_at, name (default: created_at) | - | No |
+| `--sort-order <order>` | asc or desc (default: desc) | - | No |
+| `--search <text>` | Only profiles whose name contains this text, ignoring case (at most 100 characters) | - | No |
+| `--json` | Output the page as JSON (items, total, page, page_size) | - | No |
+
+### `delivery-profiles create` (alias: `add`)
+
+Create a delivery profile
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Profile name (1-100 characters) | - | No |
+| `-k, --kind <kind>` | Delivery provider (cloudflare, bunny, direct) | - | No |
+| `--pull-zone-id <id>` | Bunny Pull Zone ID (required for --kind bunny) | - | No |
+| `--api-key <key>` | Bunny account API key (prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the Bunny API key from stdin | - | No |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Never prompt (for automation) | - | No |
+
+### `delivery-profiles remove` (alias: `rm`, `delete`)
+
+Delete a delivery profile
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Profile ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+## `delivery`
+
+Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
+
+**Subcommands:**
+
+- `settings` - Project default delivery profile and per-environment overrides
+- `bindings` (`binding`) - Domain delivery bindings: the DNS record + provider routing for a hostname
+
+### `delivery settings`
+
+Project default delivery profile and per-environment overrides
+
+**Subcommands:**
+
+- `get` (`show`) - Show the delivery profile a project and its environments use
+- `set` - Change the project default profile and/or environment overrides
+
+#### `delivery settings get` (alias: `show`)
+
+Show the delivery profile a project and its environments use
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `delivery settings set`
+
+Change the project default profile and/or environment overrides
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--default-profile <id>` | Project default delivery profile ID, or "none" to clear it | - | No |
+| `--env <environment-id=profile-id>` | Environment override, e.g. 12=3; use 12=inherit to fall back to the project default (repeatable) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `delivery bindings` (alias: `binding`)
+
+Domain delivery bindings: the DNS record + provider routing for a hostname
+
+**Subcommands:**
+
+- `list` (`ls`) - List domain delivery bindings for a project, one page at a time (newest first)
+- `preview` - Plan a delivery binding without changing DNS; prints a preview ID to apply
+- `apply` - Apply a previewed delivery binding (writes DNS)
+- `remove` (`rm`, `delete`) - Remove a delivery binding and the DNS record it manages
+
+#### `delivery bindings list` (alias: `ls`)
+
+List domain delivery bindings for a project, one page at a time (newest first)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Bindings per page, 1-100 (default: 20) | - | No |
+| `--sort-by <field>` | Sort field: created_at, hostname, updated_at (default: created_at) | - | No |
+| `--sort-order <order>` | asc or desc (default: desc) | - | No |
+| `--json` | Output the page as JSON (items, total, page, page_size) | - | No |
+
+#### `delivery bindings preview`
+
+Plan a delivery binding without changing DNS; prints a preview ID to apply
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Environment ID the hostname serves | - | No |
+| `--hostname <hostname>` | Hostname to route, e.g. app.example.com | - | No |
+| `--zone <zone>` | DNS zone that contains the hostname, e.g. example.com | - | No |
+| `--dns-provider <id>` | DNS provider ID that manages the zone | - | No |
+| `--origin-target <target>` | Origin the record points at (IP for A/AAAA, hostname for CNAME) | - | No |
+| `--profile <id>` | Delivery profile ID (defaults to the environment or project profile) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `delivery bindings apply`
+
+Apply a previewed delivery binding (writes DNS)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--preview-id <id>` | Preview ID returned by `delivery bindings preview` | - | Yes |
+| `--adopt <TYPE:name>` | Adopt an existing unmanaged record the preview flagged, e.g. CNAME:www (repeatable) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `delivery bindings remove` (alias: `rm`, `delete`)
+
+Remove a delivery binding and the DNS record it manages
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--id <id>` | Binding ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ## `ip-access` (alias: `ipa`)
 
@@ -5195,6 +5689,168 @@ Get time bucket statistics (last 24 hours)
 ### `proxy-logs today`
 
 Get today's request statistics
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+## `logs` (alias: `glogs`)
+
+Search collected logs across every project and database you can access
+
+**Subcommands:**
+
+- `search` - Search log lines across projects (newest first)
+- `facets` - Distinct values and counts per field for the same filter scope
+- `attributes` - Attribute keys observed in the window, most common first (requires the ClickHouse line index)
+- `histogram` - Line counts bucketed over time, optionally split by a label or attribute (requires the ClickHouse line index)
+- `aggregate` - Group-by aggregation over lines (requires the ClickHouse line index)
+- `capabilities` - Whether container logs are being collected, and whether attribute facets, histograms and aggregates are available
+
+### `logs search`
+
+Search log lines across projects (newest first)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--limit <n>` | Lines per request (default: 200, max: 1000) | - | No |
+| `--cursor <token>` | Resume from a previous next_cursor | - | No |
+| `--all` | Follow next_cursor automatically until the results run out (or --max-pages is reached, default 20 pages) | - | No |
+| `--max-pages <n>` | Page ceiling for --all (default: 20) | - | No |
+| `--since <duration>` | Relative window ending now, e.g. 30m, 6h, 7d (default: 1h) | - | No |
+| `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
+| `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
+| `--source <kind>` | collected (default), application, or service | - | No |
+| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
+| `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
+| `--env <name>` | Environment, repeatable | `` | No |
+| `--service <name>` | Container service label (web, worker, …), repeatable | `` | No |
+| `--container <id>` | Container ID, repeatable | `` | No |
+| `--node <id>` | Worker node ID, repeatable | `` | No |
+| `--deploy <id>` | Deployment ID | - | No |
+| `--text <substring>` | Case-insensitive message substring match | - | No |
+| `--attr <pred>` | Attribute predicate, repeatable: <key>=<value>, <key>!=<value>, <key>^=<prefix>, <key>><value>, <key><<value>, or <key>? for "exists" (requires the ClickHouse line index) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs facets`
+
+Distinct values and counts per field for the same filter scope
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--field <name>` | Facet field, repeatable: env, service, level, stream, project, external_service, node, deploy, container (default: env, service, level, node, deploy) | `` | No |
+| `--attr-keys <keys>` | Comma-separated label names and/or attr:<name> (e.g. worker,attr:cache) — routes to the attribute-aware endpoint, which requires the ClickHouse line index | - | No |
+| `--limit <n>` | Max values per key when using --attr-keys or --attr (default 50, cap 1000) | - | No |
+| `--since <duration>` | Relative window ending now, e.g. 30m, 6h, 7d (default: 1h) | - | No |
+| `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
+| `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
+| `--source <kind>` | collected (default), application, or service | - | No |
+| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
+| `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
+| `--env <name>` | Environment, repeatable | `` | No |
+| `--service <name>` | Container service label (web, worker, …), repeatable | `` | No |
+| `--container <id>` | Container ID, repeatable | `` | No |
+| `--node <id>` | Worker node ID, repeatable | `` | No |
+| `--deploy <id>` | Deployment ID | - | No |
+| `--text <substring>` | Case-insensitive message substring match | - | No |
+| `--attr <pred>` | Attribute predicate, repeatable: <key>=<value>, <key>!=<value>, <key>^=<prefix>, <key>><value>, <key><<value>, or <key>? for "exists" (requires the ClickHouse line index) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs attributes`
+
+Attribute keys observed in the window, most common first (requires the ClickHouse line index)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--limit <n>` | Max keys returned (default 100, cap 1000) | - | No |
+| `--since <duration>` | Relative window ending now, e.g. 30m, 6h, 7d (default: 1h) | - | No |
+| `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
+| `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
+| `--source <kind>` | collected (default), application, or service | - | No |
+| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
+| `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
+| `--env <name>` | Environment, repeatable | `` | No |
+| `--service <name>` | Container service label (web, worker, …), repeatable | `` | No |
+| `--container <id>` | Container ID, repeatable | `` | No |
+| `--node <id>` | Worker node ID, repeatable | `` | No |
+| `--deploy <id>` | Deployment ID | - | No |
+| `--text <substring>` | Case-insensitive message substring match | - | No |
+| `--attr <pred>` | Attribute predicate, repeatable: <key>=<value>, <key>!=<value>, <key>^=<prefix>, <key>><value>, <key><<value>, or <key>? for "exists" (requires the ClickHouse line index) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs histogram`
+
+Line counts bucketed over time, optionally split by a label or attribute (requires the ClickHouse line index)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--bucket-secs <n>` | Bucket width in seconds (default 60) | - | No |
+| `--group-by <key>` | One label name or attr:<name> to split series by | - | No |
+| `--max-groups <n>` | Max series before folding the rest into "other" (default 8) | - | No |
+| `--since <duration>` | Relative window ending now, e.g. 30m, 6h, 7d (default: 1h) | - | No |
+| `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
+| `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
+| `--source <kind>` | collected (default), application, or service | - | No |
+| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
+| `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
+| `--env <name>` | Environment, repeatable | `` | No |
+| `--service <name>` | Container service label (web, worker, …), repeatable | `` | No |
+| `--container <id>` | Container ID, repeatable | `` | No |
+| `--node <id>` | Worker node ID, repeatable | `` | No |
+| `--deploy <id>` | Deployment ID | - | No |
+| `--text <substring>` | Case-insensitive message substring match | - | No |
+| `--attr <pred>` | Attribute predicate, repeatable: <key>=<value>, <key>!=<value>, <key>^=<prefix>, <key>><value>, <key><<value>, or <key>? for "exists" (requires the ClickHouse line index) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs aggregate`
+
+Group-by aggregation over lines (requires the ClickHouse line index)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--group-by <keys>` | Comma-separated label names and/or attr:<name> | - | Yes |
+| `--metric <spec>` | count \| count_distinct:<k> \| avg:<k> \| p50:<k> \| p95:<k> \| p99:<k> \| max:<k> \| sum:<k> | - | Yes |
+| `--limit <n>` | Max rows returned (default 50, cap 1000) | - | No |
+| `--since <duration>` | Relative window ending now, e.g. 30m, 6h, 7d (default: 1h) | - | No |
+| `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
+| `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
+| `--source <kind>` | collected (default), application, or service | - | No |
+| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
+| `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
+| `--env <name>` | Environment, repeatable | `` | No |
+| `--service <name>` | Container service label (web, worker, …), repeatable | `` | No |
+| `--container <id>` | Container ID, repeatable | `` | No |
+| `--node <id>` | Worker node ID, repeatable | `` | No |
+| `--deploy <id>` | Deployment ID | - | No |
+| `--text <substring>` | Case-insensitive message substring match | - | No |
+| `--attr <pred>` | Attribute predicate, repeatable: <key>=<value>, <key>!=<value>, <key>^=<prefix>, <key>><value>, <key><<value>, or <key>? for "exists" (requires the ClickHouse line index) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs capabilities`
+
+Whether container logs are being collected, and whether attribute facets, histograms and aggregates are available
 
 **Options:**
 
@@ -5534,6 +6190,88 @@ Get bucketed incident data for a project
 | `--environment-id <id>` | Filter by environment ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
+## `alarms` (alias: `alarm`)
+
+List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
+
+**Subcommands:**
+
+- `list` (`ls`) - List alarms, newest first
+- `summary` - Show active alarm counts by status, severity, and type
+- `ack` (`acknowledge`) - Acknowledge alarms by ID, or every alarm matching the filters with --all
+- `resolve` - Resolve alarms by ID, or every alarm matching the filters with --all
+
+### `alarms list` (alias: `ls`)
+
+List alarms, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json or TEMPS_PROJECT) | - | No |
+| `--project-id <id>` | Project ID (instead of --project) | - | No |
+| `--system` | Target host-wide system alarms (disk space, worker nodes) instead of a project | - | No |
+| `--status <status>` | Filter by status (firing, acknowledged, resolved) | - | No |
+| `--severity <severity>` | Filter by severity (info, warning, critical) | - | No |
+| `--type <type>` | Filter by alarm type (e.g. container_crash) | - | No |
+| `--environment-id <id>` | Filter by environment ID | - | No |
+| `--deployment-id <id>` | Filter by deployment ID | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `alarms summary`
+
+Show active alarm counts by status, severity, and type
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json or TEMPS_PROJECT) | - | No |
+| `--project-id <id>` | Project ID (instead of --project) | - | No |
+| `--system` | Target host-wide system alarms (disk space, worker nodes) instead of a project | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `alarms ack` (alias: `acknowledge`)
+
+Acknowledge alarms by ID, or every alarm matching the filters with --all
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json or TEMPS_PROJECT) | - | No |
+| `--project-id <id>` | Project ID (instead of --project) | - | No |
+| `--system` | Target host-wide system alarms (disk space, worker nodes) instead of a project | - | No |
+| `--status <status>` | Filter by status (firing, acknowledged, resolved) | - | No |
+| `--severity <severity>` | Filter by severity (info, warning, critical) | - | No |
+| `--type <type>` | Filter by alarm type (e.g. container_crash) | - | No |
+| `--environment-id <id>` | Filter by environment ID | - | No |
+| `--deployment-id <id>` | Filter by deployment ID | - | No |
+| `--all` | Target every alarm matching the filters instead of explicit IDs | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `alarms resolve`
+
+Resolve alarms by ID, or every alarm matching the filters with --all
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json or TEMPS_PROJECT) | - | No |
+| `--project-id <id>` | Project ID (instead of --project) | - | No |
+| `--system` | Target host-wide system alarms (disk space, worker nodes) instead of a project | - | No |
+| `--status <status>` | Filter by status (firing, acknowledged, resolved) | - | No |
+| `--severity <severity>` | Filter by severity (info, warning, critical) | - | No |
+| `--type <type>` | Filter by alarm type (e.g. container_crash) | - | No |
+| `--environment-id <id>` | Filter by environment ID | - | No |
+| `--deployment-id <id>` | Filter by deployment ID | - | No |
+| `--all` | Target every alarm matching the filters instead of explicit IDs | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `emails` (alias: `email`)
 
 Manage and send emails
@@ -5817,6 +6555,7 @@ View platform and server information
 **Subcommands:**
 
 - `info` - Get platform information
+- `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
 - `private-ip` - Get the server private IP address
 - `public-ip` - Get the server public IP address
@@ -5826,6 +6565,16 @@ View platform and server information
 ### `platform info`
 
 Get platform information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform features`
+
+Show which capabilities the server process actually provides
 
 **Options:**
 
@@ -5992,6 +6741,7 @@ View project analytics
 - `api-path` - Show client IPs calling one path with latency and error analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+- `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
 
 ### `analytics keys`
 
@@ -6299,6 +7049,20 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics enrich`
+
+Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --data <json>` | JSON object to merge, e.g. '{"user_id":"user_123"}' | - | No |
+| `-f, --file <path>` | Read the JSON object to merge from a file | - | No |
+| `--set <key=value>` | Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values) | `` | No |
+| `--unset <key>` | Remove one top-level key (repeatable; sends null) | `` | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `funnels` (alias: `funnel`)
@@ -6705,6 +7469,7 @@ Manage standalone sandboxes (/v1/sandbox API)
 
 - `create` - Create a new sandbox
 - `list` (`ls`) - List your sandboxes
+- `nodes` - List nodes that can run sandboxes and control which ones take new sandboxes
 - `show` - Show details for a sandbox
 - `rm` (`stop`, `destroy`) - Remove a sandbox permanently (aliases: stop, destroy)
 - `pause` - Pause a running sandbox (non-destructive — resume later with `sandbox resume`)
@@ -6750,6 +7515,7 @@ Create a new sandbox
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
+| `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox list` (alias: `ls`)
@@ -6765,6 +7531,104 @@ List your sandboxes
 | `--workspace` | Show only persistent workspaces | - | No |
 | `--lifecycle <class>` | Filter by lifecycle class: ephemeral \| workspace | - | No |
 | `--project <slug>` | Show only sandboxes created from this project | - | No |
+| `--json` | Output as JSON | - | No |
+
+### `sandbox nodes`
+
+List nodes that can run sandboxes and control which ones take new sandboxes
+
+**Subcommands:**
+
+- `list` - List nodes with their sandbox placement state (the default)
+- `show` - Show a node's placement state and every live sandbox on it, from all users (name, id, or 'control-plane'). Admin only
+- `set` - Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, or 'control-plane'). Admin only
+- `allow` - Add nodes to the list allowed to run new sandboxes. Admin only
+- `deny` - Stop nodes from taking new sandboxes (existing ones keep running). Admin only
+- `allow-all` - Allow every node, including the control plane, to run sandboxes (the default). Admin only
+- `deny-all` - Stop every node from taking new sandboxes (existing ones keep running). Admin only
+- `evict` - Destroy every sandbox on a worker node, from all users, so the node can be removed. Works on a node that is offline for good. Admin only
+
+#### `sandbox nodes list`
+
+List nodes with their sandbox placement state (the default)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes show`
+
+Show a node's placement state and every live sandbox on it, from all users (name, id, or 'control-plane'). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (default 1) | - | No |
+| `--page-size <n>` | Items per page (default 20, max 100) | - | No |
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes set`
+
+Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, or 'control-plane'). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes allow`
+
+Add nodes to the list allowed to run new sandboxes. Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes deny`
+
+Stop nodes from taking new sandboxes (existing ones keep running). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes allow-all`
+
+Allow every node, including the control plane, to run sandboxes (the default). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes deny-all`
+
+Stop every node from taking new sandboxes (existing ones keep running). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes evict`
+
+Destroy every sandbox on a worker node, from all users, so the node can be removed. Works on a node that is offline for good. Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation prompt | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox show`
@@ -7782,6 +8646,7 @@ Install a GitHub TypeScript plugin on the configured Temps server; the server us
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--path <path>` | Plugin subdirectory containing package.json and bun.lock (default: repository root) | - | No |
 | `--name <name>` | Advanced: require this plugin name (otherwise auto-detected) | - | No |
 | `--ref <ref>` | Advanced: branch, tag, or commit (otherwise repository default branch) | - | No |
 | `-y, --yes` | Trust the repository and allow installation without prompting | - | No |

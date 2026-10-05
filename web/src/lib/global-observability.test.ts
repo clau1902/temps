@@ -8,25 +8,21 @@ import {
   positiveInteger,
   readObservationWindow,
   normalizeObservationWindow,
+  facetProjectLabels,
 } from './global-observability'
 
 const now = Date.parse('2026-09-09T12:00:00Z')
 describe('global observability URL state', () => {
-  test('normalizing timestamp format retains the cursor for the same query window', () => {
+  test('normalizing a custom timestamp format retains its cursor', () => {
     const initial = new URLSearchParams(
-      'from=2026-09-08T12:00:00Z&to=2026-09-09T12:00:00Z&cursor=next-token'
+      'range=custom&from=2026-09-08T12:00:00Z&to=2026-09-09T12:00:00Z&cursor=next-token'
     )
     expect(normalizeObservationWindow(initial, now).get('cursor')).toBe(
       'next-token'
     )
-    const frozen = normalizeObservationWindow(new URLSearchParams(), now)
-    frozen.set('cursor', 'next-token')
-    expect(normalizeObservationWindow(frozen, now).get('cursor')).toBe(
-      'next-token'
-    )
     expect(
       normalizeObservationWindow(
-        new URLSearchParams('from=invalid&cursor=stale'),
+        new URLSearchParams('range=custom&from=invalid&cursor=stale'),
         now
       ).has('cursor')
     ).toBe(false)
@@ -47,12 +43,27 @@ describe('global observability URL state', () => {
     )
     expect(oversized).toEqual(window)
   })
-  test('reloading and paging preserves the exact window a log cursor was issued for', () => {
+  test('reloading a preset resolves a fresh window and removes old fixed dates', () => {
     const params = new URLSearchParams(
-      'from=2026-09-08T12:00:00Z&to=2026-09-09T12:00:00Z&cursor=opaque-token'
+      'range=1d&from=2026-09-08T12:00:00Z&to=2026-09-09T12:00:00Z&cursor=opaque-token'
+    )
+    expect(readObservationWindow(params, now + 60000)).toEqual({
+      range: '1d',
+      from: '2026-09-08T12:01:00.000Z',
+      to: '2026-09-09T12:01:00.000Z',
+    })
+    const normalized = normalizeObservationWindow(params, now + 60000)
+    expect(normalized.toString()).toBe('range=1d')
+  })
+  test('custom windows remain fixed when reloaded', () => {
+    const params = new URLSearchParams(
+      'range=custom&from=2026-09-08T12:00:00Z&to=2026-09-09T12:00:00Z&cursor=opaque-token'
     )
     expect(readObservationWindow(params, now + 60000)).toEqual(
       readObservationWindow(params, now)
+    )
+    expect(normalizeObservationWindow(params, now + 60000).get('cursor')).toBe(
+      'opaque-token'
     )
   })
   test('changing any filter drops pagination tokens but preserves scope and time', () => {
@@ -102,4 +113,20 @@ test('custom windows and legacy one-day links retain their meaning', () => {
     readObservationWindow(new URLSearchParams('range=custom&from=invalid'), now)
       .range
   ).toBe('1d')
+})
+
+describe('facetProjectLabels', () => {
+  test('names projects the server resolved and marks the rest unknown', () => {
+    expect(facetProjectLabels([1, 2], { '1': 'storefront' })).toEqual({
+      labels: { '1': 'storefront', '2': 'Unknown project #2' },
+      existing: [1],
+    })
+  })
+
+  test('a server that sends no names does not make every project unknown', () => {
+    expect(facetProjectLabels([1, 2], undefined)).toEqual({
+      labels: {},
+      existing: [1, 2],
+    })
+  })
 })

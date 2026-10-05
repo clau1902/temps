@@ -35,6 +35,23 @@ pub enum SensitiveAction {
     DrainNode {
         node_id: i32,
     },
+    /// Turn on the cluster's WireGuard mesh: every node's firewall and
+    /// underlay change, and it cannot be turned off again from the API.
+    EnableWireguardMesh,
+    /// Pair a node the control plane dials (ADR 048 D2b): whoever runs the
+    /// returned command at the given address joins the cluster.
+    CreateNodePairing,
+    /// Add a server over SSH (ADR 048 D2c): the control plane logs in to it
+    /// with the operator's credentials, runs commands as root and pairs it.
+    AddNodeOverSsh,
+    /// Make a mesh member the hub (ADR 048 D4): it relays, and can read,
+    /// traffic between members that cannot reach each other.
+    SetWireguardMeshHub,
+    /// Destroy every sandbox on a worker node, from all owners, including
+    /// their files (ADR-048). `node` is the name or id the caller gave.
+    EvictNodeSandboxes {
+        node: String,
+    },
     CreateOidcProvider,
     UpdateOidcProvider {
         provider_id: i32,
@@ -46,6 +63,11 @@ pub enum SensitiveAction {
         mapping_id: i32,
     },
     AssignRole {
+        user_id: i32,
+    },
+    /// Reset another user's password to a generated temporary one, revoking
+    /// all of their sessions.
+    ResetUserPassword {
         user_id: i32,
     },
     UpdateAccountEmail,
@@ -87,6 +109,19 @@ pub enum SensitiveAction {
     RetentionRetroactiveApply {
         project_id: i32,
     },
+    /// Create a project with — or rename one onto — a slug this host grants
+    /// `/var/run/docker.sock` to (ADR 045). The project's containers become
+    /// root-equivalent on every host that grants the slug.
+    ClaimDockerSocketSlug {
+        project_id: i32,
+    },
+    /// Rename a project away from a slug this host grants the Docker socket
+    /// to (ADR 045). Revokes that service's host access everywhere and frees
+    /// the slug for the next project created — a separate variant from the
+    /// claim so the audit record and the 428 response name the direction.
+    ReleaseDockerSocketSlug {
+        project_id: i32,
+    },
 }
 
 impl SensitiveAction {
@@ -101,11 +136,17 @@ impl SensitiveAction {
             Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",
             Self::DrainNode { .. } => "drain_node",
+            Self::EnableWireguardMesh => "enable_wireguard_mesh",
+            Self::CreateNodePairing => "create_node_pairing",
+            Self::AddNodeOverSsh => "add_node_over_ssh",
+            Self::SetWireguardMeshHub => "set_wireguard_mesh_hub",
+            Self::EvictNodeSandboxes { .. } => "evict_node_sandboxes",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
             Self::CreateOidcRoleMapping { .. } => "create_oidc_role_mapping",
             Self::DeleteOidcRoleMapping { .. } => "delete_oidc_role_mapping",
             Self::AssignRole { .. } => "assign_role",
+            Self::ResetUserPassword { .. } => "reset_user_password",
             Self::UpdateAccountEmail => "update_account_email",
             Self::RotateClusterCa => "rotate_cluster_ca",
             Self::RestoreExternalService { .. } => "restore_external_service",
@@ -118,6 +159,8 @@ impl SensitiveAction {
             Self::RotateDeploymentToken { .. } => "rotate_deployment_token",
             Self::DeleteDeploymentToken { .. } => "delete_deployment_token",
             Self::RetentionRetroactiveApply { .. } => "retention_retroactive_apply",
+            Self::ClaimDockerSocketSlug { .. } => "claim_docker_socket_slug",
+            Self::ReleaseDockerSocketSlug { .. } => "release_docker_socket_slug",
         }
     }
 }
@@ -212,6 +255,13 @@ mod tests {
             "drain_node"
         );
         assert_eq!(
+            SensitiveAction::EvictNodeSandboxes {
+                node: "worker-1".into()
+            }
+            .as_str(),
+            "evict_node_sandboxes"
+        );
+        assert_eq!(
             SensitiveAction::CreateOidcProvider.as_str(),
             "create_oidc_provider"
         );
@@ -230,6 +280,10 @@ mod tests {
         assert_eq!(
             SensitiveAction::AssignRole { user_id: 1 }.as_str(),
             "assign_role"
+        );
+        assert_eq!(
+            SensitiveAction::ResetUserPassword { user_id: 1 }.as_str(),
+            "reset_user_password"
         );
         assert_eq!(
             SensitiveAction::UpdateAccountEmail.as_str(),

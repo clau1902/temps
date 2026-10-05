@@ -37,6 +37,7 @@ members = [
     "crates/temps-backup-core",
     "crates/temps-notifications",
     "crates/temps-monitoring",
+    "crates/temps-credential-checks",
     "crates/temps-network",
     "crates/temps-analytics",
     "crates/temps-audit",
@@ -74,6 +75,7 @@ members = [
     "crates/temps-flags",
     "crates/temps-blob",
     "crates/temps-log-aggregator",
+    "crates/temps-clickhouse",
     "crates/temps-otel",
     "crates/temps-telemetry",
     "crates/temps-environments",
@@ -113,6 +115,7 @@ repository = "https://github.com/gotempsh/temps"
 homepage = "https://github.com/gotempsh/temps"
 
 [workspace.dependencies]
+arc-swap = "1.7"
 # ============================================================================
 # Async Runtime & Concurrency
 # ============================================================================
@@ -183,6 +186,7 @@ rusqlite = { version = "0.32.0", features = ["bundled", "trace"] }
 # HTTP Framework & Web Server
 # ============================================================================
 axum = { version = "0.8", features = ["multipart", "form", "ws"] }
+axum-extra = { version = "0.12", features = ["query"] }
 axum-macros = "0.5.0-alpha.1"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors", "fs", "catch-panic", "trace"] }
@@ -200,10 +204,10 @@ reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rus
 # ============================================================================
 # API Documentation (OpenAPI/Swagger)
 # ============================================================================
-utoipa = { version = "5.4.0", features = ["axum_extras", "debug"] }
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"], default-features = false }
+utoipa = { version = "6.0.0", features = ["axum_extras", "debug"] }
+utoipa-swagger-ui = { version = "10.0.1", features = ["axum", "vendored"], default-features = false }
 schemars = { version = "1.2", features = ["preserve_order"] }
-jsonschema = { version = "0.56.0", default-features = false }
+jsonschema = { version = "0.57.0", default-features = false }
 
 # ============================================================================
 # Cryptography & Security
@@ -262,6 +266,16 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "logging",
 ] }
 webpki-roots = "1.0"
+
+# ============================================================================
+# ClickHouse
+# ============================================================================
+# Canonical version/feature pin for the whole workspace. Four crates
+# (temps-otel, temps-analytics-backend, temps-proxy, temps-metrics) currently
+# vendor their own ClickHouse config/client/migration-runner code against this
+# same version; temps-clickhouse is the shared crate those are meant to
+# migrate onto. Keep this pin in lockstep with `crates/temps-clickhouse`.
+clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 # ============================================================================
 # Reverse Proxy (Pingora)
@@ -407,6 +421,8 @@ debug = false
 #      (verified by probe build). So the block is not "we haven't moved the pin":
 #      relay must first adopt opentelemetry-proto 0.32. Moving the pin 897 commits
 #      forward would buy relay-protocol API churn and still leave the alert open.
+#      Re-checked 2026-10-04: relay master @c4e9930 still declares
+#      opentelemetry-proto 0.31, so this remains blocked upstream.
 #    - Reachability: the unbounded-alloc bug is in the W3C BaggagePropagator. relay
 #      pulls opentelemetry-proto only for OTLP span TYPE conversion; the propagation
 #      module is compiled in (trace feature) but BaggagePropagator is never

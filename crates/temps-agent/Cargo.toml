@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -33,8 +34,10 @@ http-body-util = "0.1"
 bollard = { workspace = true }
 bytes = { workspace = true }
 temps-core = { path = "../temps-core" }
+temps-auth = { path = "../temps-auth" }
 temps-deployer = { path = "../temps-deployer" }
 temps-network = { path = "../temps-network" }
+temps-wireguard = { path = "../temps-wireguard" }
 temps-dns-resolver = { path = "../temps-dns-resolver" }
 chrono = { workspace = true }
 temps-providers = { path = "../temps-providers" }
@@ -48,7 +51,12 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-a
 # mTLS: the agent serves rustls TLS with client-cert verification (WS-2.1).
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+x509-parser = "0.18"
 tokio-rustls = { workspace = true }
+tar = { workspace = true }
+temps-agents = { path = "../temps-agents" }
+base64 = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

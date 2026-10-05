@@ -11,7 +11,10 @@ import {
   TableRow,
   Skeleton,
 } from '@temps-sdk/ui'
-import { ResponsivePagination, type ResponsivePaginationProps } from '../responsive-pagination'
+import {
+  ResponsivePagination,
+  type ResponsivePaginationProps,
+} from '../responsive-pagination'
 import { cn } from '../lib/cn'
 
 export interface DataTableColumn<T> {
@@ -19,13 +22,13 @@ export interface DataTableColumn<T> {
   header: ReactNode
   render: (row: T) => ReactNode
   className?: string
+  ariaSort?: 'ascending' | 'descending' | 'none'
 }
 
 export interface DataTableProps<T> {
   columns: DataTableColumn<T>[]
   rows: T[]
   rowKey: (row: T) => string | number
-  onRowClick?: (row: T) => void
   /** Advanced rows own their cells, expansion and interactions; return table rows only. */
   renderRow?: (row: T) => ReactNode
   isLoading?: boolean
@@ -48,7 +51,6 @@ export function DataTable<T>({
   columns,
   rows,
   rowKey,
-  onRowClick,
   renderRow,
   isLoading = false,
   'aria-label': ariaLabel,
@@ -67,7 +69,11 @@ export function DataTable<T>({
           <TableHeader>
             <TableRow>
               {columns.map((column) => (
-                <TableHead key={column.key} className={column.className}>
+                <TableHead
+                  key={column.key}
+                  className={column.className}
+                  aria-sort={column.ariaSort}
+                >
                   {column.header}
                 </TableHead>
               ))}
@@ -88,11 +94,7 @@ export function DataTable<T>({
                   renderRow ? (
                     <Fragment key={rowKey(row)}>{renderRow(row)}</Fragment>
                   ) : (
-                    <TableRow
-                      key={rowKey(row)}
-                      className={cn(onRowClick && 'cursor-pointer')}
-                      onClick={onRowClick ? () => onRowClick(row) : undefined}
-                    >
+                    <TableRow key={rowKey(row)}>
                       {columns.map((column) => (
                         <TableCell
                           key={column.key}

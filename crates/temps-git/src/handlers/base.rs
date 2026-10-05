@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{
     check_commit_exists, get_branches_by_repository_id, get_repository_branches,
     get_repository_tags, get_tags_by_repository_id, list_commits_by_repository_id,
@@ -16,14 +17,17 @@ use crate::services::{
     repository::RepositoryFilter,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_auth::{permission_check, require_sensitive_action, Permission, RequireAuth};
+use temps_auth::{
+    permission_check, permission_guard, require_sensitive_action, Permission, RequireAuth,
+};
+use temps_core::telemetry::OperationFailureCode;
 use temps_core::SensitiveAction;
 use tracing::info;
 
@@ -94,6 +98,11 @@ impl From<GitProviderManagerError> for Problem {
                 problem_new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Configuration")
                     .with_detail(msg)
+            }
+            GitProviderManagerError::ComposePreview { path, source } => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Compose Preview Failed")
+                    .with_detail(format!("Compose preview for '{}' could not be rendered: {}", path, source))
             }
             GitProviderManagerError::JsonError(e) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("JSON Error")
@@ -377,37 +386,32 @@ pub struct ProviderDeletionCheckResponse {
     pub message: String,
 }
 
-// Helper function to convert preset cache to Vec<ProjectPresetResponse>
-// This flattens all presets from all branches into a single list
-fn convert_preset_json(cache: Option<sea_orm::JsonValue>) -> Option<Vec<ProjectPresetResponse>> {
-    cache.and_then(|json| {
-        // Deserialize Json to RepositoryPresetCache
-        let cache: temps_entities::repositories::RepositoryPresetCache =
-            serde_json::from_value(json).ok()?;
-
-        // Flatten all presets from all branches into a single list
-        Some(
-            cache
-                .branches
-                .into_values()
-                .flat_map(|branch_data| {
-                    branch_data
-                        .presets
-                        .into_iter()
-                        .map(|p| ProjectPresetResponse {
-                            path: p.path,
-                            preset: p.preset,
-                            preset_label: p.preset_label,
-                            exposed_port: p.exposed_port.map(|port| port as i32),
-                            icon_url: p.icon_url,
-                            project_type: p.project_type,
-                            compose_files: p.compose_files,
-                            dockerfile_path: p.dockerfile_path,
-                        })
-                })
-                .collect(),
-        )
-    })
+// A repository row describes its default branch; other cached branches must
+// not appear as detections for that row. None means not inspected; [] means
+// inspected with no matching preset.
+fn convert_preset_json(
+    cache: Option<sea_orm::JsonValue>,
+    default_branch: &str,
+) -> Option<Vec<ProjectPresetResponse>> {
+    let json = cache?;
+    let branch: temps_entities::repositories::BranchPresetData =
+        serde_json::from_value(json.get(default_branch)?.clone()).ok()?;
+    Some(
+        branch
+            .presets
+            .into_iter()
+            .map(|p| ProjectPresetResponse {
+                path: p.path,
+                preset: p.preset,
+                preset_label: p.preset_label,
+                exposed_port: p.exposed_port.map(i32::from),
+                icon_url: p.icon_url,
+                project_type: p.project_type,
+                compose_files: p.compose_files,
+                dockerfile_path: p.dockerfile_path,
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -437,6 +441,11 @@ pub struct ConnectionResponse {
     #[schema(value_type = Option<String>, format = DateTime)]
     pub last_health_check_at: Option<UtcDateTime>,
     pub consecutive_health_failures: i32,
+    /// Why the most recent repository sync failed or timed out; null once a
+    /// sync succeeds.
+    pub last_sync_error: Option<String>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub last_sync_error_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = DateTime)]
     pub created_at: UtcDateTime,
     #[schema(value_type = String, format = DateTime)]
@@ -474,6 +483,8 @@ impl From<git_provider_connections::Model> for ConnectionResponse {
             health_message: conn.health_message,
             last_health_check_at: conn.last_health_check_at,
             consecutive_health_failures: conn.consecutive_health_failures,
+            last_sync_error: conn.last_sync_error,
+            last_sync_error_at: conn.last_sync_error_at,
             created_at: conn.created_at,
             updated_at: conn.updated_at,
         }
@@ -574,6 +585,10 @@ pub struct RepositoryListQuery {
     pub owner: Option<String>,
     pub language: Option<String>,
     pub private: Option<bool>,
+    /// Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+    pub preset: Option<String>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub updated_after: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -586,6 +601,10 @@ pub struct SyncedRepositoryListQuery {
     pub owner: Option<String>,
     pub language: Option<String>,
     pub private: Option<bool>,
+    /// Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+    pub preset: Option<String>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub updated_after: Option<chrono::DateTime<chrono::Utc>>,
     pub git_provider_connection_id: Option<i32>,
 }
 
@@ -684,7 +703,9 @@ pub async fn create_git_provider(
                 .with_detail(e)
         })?;
 
-    let provider = state
+    let provider_label = provider_type.to_string();
+    let (flow, connects_later) = git_auth_flow(&auth_method);
+    let result = state
         .git_provider_manager
         .create_provider(
             request.name,
@@ -695,14 +716,13 @@ pub async fn create_git_provider(
             request.webhook_secret,
             request.is_default,
         )
-        .await?;
-
-    state.telemetry.report(
-        temps_core::telemetry::TelemetryEvent::new(
-            temps_core::telemetry::TelemetryEventKind::GitProviderConnected,
-        )
-        .with("provider", provider.provider_type.clone()),
-    );
+        .await;
+    // OAuth and app providers are only connected once the callback or the
+    // app installation completes, which report the outcome themselves.
+    if !(connects_later && result.is_ok()) {
+        report_git_provider_result(&state, Some(&provider_label), flow, &result);
+    }
+    let provider = result?;
 
     Ok((
         StatusCode::CREATED,
@@ -847,6 +867,43 @@ pub async fn list_connections(
     }))
 }
 
+/// Get a single git provider connection
+///
+/// Returns the connection's account, sync and health state. Credential values
+/// are never included; `has_authenticated_credentials` reports only whether
+/// the connection can make authenticated provider requests.
+#[utoipa::path(
+    get,
+    path = "/git-connections/{connection_id}",
+    params(
+        ("connection_id" = i32, Path, description = "Connection ID")
+    ),
+    responses(
+        (status = 200, description = "Connection details", body = ConnectionResponse),
+        (status = 404, description = "Connection not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_connection(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(connection_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, GitConnectionsRead);
+
+    let connection = state
+        .git_provider_manager
+        .get_connection(connection_id)
+        .await?;
+
+    Ok(Json(ConnectionResponse::from(connection)))
+}
+
 /// Start a repository sync for a connection
 ///
 /// Kicks off a background sync of the connection's repositories from the
@@ -919,7 +976,9 @@ pub async fn sync_repositories(
         ("search" = Option<String>, Query, description = "Search term to filter repositories"),
         ("owner" = Option<String>, Query, description = "Filter by repository owner"),
         ("language" = Option<String>, Query, description = "Filter by programming language"),
-        ("private" = Option<bool>, Query, description = "Filter by private status (true/false)")
+        ("private" = Option<bool>, Query, description = "Filter by private status (true/false)"),
+        ("preset" = Option<String>, Query, description = "Cached default-branch preset slug; __undetected__ means not inspected"),
+        ("updated_after" = Option<String>, Query, description = "Updated on or after this RFC3339 timestamp")
     ),
     responses(
         (status = 200, description = "List of repositories", body = RepositoryListResponse),
@@ -982,6 +1041,8 @@ pub async fn list_repositories_by_connection(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort,
         limit: Some(per_page),
         offset: Some((page - 1) * per_page),
@@ -990,7 +1051,7 @@ pub async fn list_repositories_by_connection(
     // Use repository service for fast database query instead of API calls
     let repository_models = state.repository_service.list_repositories(filter).await?;
 
-    // For total count, we need to make a separate call without pagination
+    // Total across all pages: counted in the database, never by loading rows
     let count_filter = RepositoryFilter {
         git_provider_connection_id: Some(connection_id),
         provider_id: None,
@@ -999,15 +1060,16 @@ pub async fn list_repositories_by_connection(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort: None,
         limit: None,
         offset: None,
     };
-    let all_repositories = state
+    let total_count = state
         .repository_service
-        .list_repositories(count_filter)
-        .await?;
-    let total_count = all_repositories.len();
+        .count_repositories(count_filter)
+        .await? as usize;
 
     // Convert service models to HTTP response format
     let repositories: Vec<RepositoryResponse> = repository_models
@@ -1019,12 +1081,12 @@ pub async fn list_repositories_by_connection(
             full_name: r.full_name,
             description: r.description,
             private: r.private,
-            default_branch: r.default_branch,
+            default_branch: r.default_branch.clone(),
             language: r.language,
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: convert_preset_json(r.preset.clone()),
+            preset: convert_preset_json(r.preset.clone(), &r.default_branch),
             clone_url: r.clone_url,
             ssh_url: r.ssh_url,
             git_provider_connection_id: r.git_provider_connection_id,
@@ -1053,7 +1115,9 @@ pub async fn list_repositories_by_connection(
         ("search" = Option<String>, Query, description = "Search term to filter repositories"),
         ("owner" = Option<String>, Query, description = "Filter by repository owner"),
         ("language" = Option<String>, Query, description = "Filter by programming language"),
-        ("private" = Option<bool>, Query, description = "Filter by private status (true/false)")
+        ("private" = Option<bool>, Query, description = "Filter by private status (true/false)"),
+        ("preset" = Option<String>, Query, description = "Cached default-branch preset slug; __undetected__ means not inspected"),
+        ("updated_after" = Option<String>, Query, description = "Updated on or after this RFC3339 timestamp")
     ),
     responses(
         (status = 200, description = "List of repositories", body = RepositoryListResponse),
@@ -1113,6 +1177,8 @@ pub async fn list_repositories_by_provider(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort,
         limit: Some(per_page),
         offset: Some((page - 1) * per_page),
@@ -1129,6 +1195,8 @@ pub async fn list_repositories_by_provider(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         ..Default::default()
     };
     let total_count = state
@@ -1146,12 +1214,12 @@ pub async fn list_repositories_by_provider(
             full_name: r.full_name,
             description: r.description,
             private: r.private,
-            default_branch: r.default_branch,
+            default_branch: r.default_branch.clone(),
             language: r.language,
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: convert_preset_json(r.preset.clone()),
+            preset: convert_preset_json(r.preset.clone(), &r.default_branch),
             clone_url: r.clone_url,
             ssh_url: r.ssh_url,
             git_provider_connection_id: r.git_provider_connection_id,
@@ -1179,6 +1247,8 @@ pub async fn list_repositories_by_provider(
         ("owner" = Option<String>, Query, description = "Filter by repository owner"),
         ("language" = Option<String>, Query, description = "Filter by programming language"),
         ("private" = Option<bool>, Query, description = "Filter by private status (true/false)"),
+        ("preset" = Option<String>, Query, description = "Cached default-branch preset slug; __undetected__ means not inspected"),
+        ("updated_after" = Option<String>, Query, description = "Updated on or after this RFC3339 timestamp"),
         ("git_provider_connection_id" = Option<i32>, Query, description = "Filter by git provider connection ID")
     ),
     responses(
@@ -1231,6 +1301,8 @@ pub async fn list_synced_repositories(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort,
         limit: Some(per_page),
         offset: Some((page - 1) * per_page),
@@ -1239,7 +1311,7 @@ pub async fn list_synced_repositories(
     // Use repository service instead of direct database access
     let repository_models = state.repository_service.list_repositories(filter).await?;
 
-    // For total count, we need to make a separate call without pagination
+    // Total across all pages: counted in the database, never by loading rows
     let count_filter = RepositoryFilter {
         git_provider_connection_id: query.git_provider_connection_id,
         provider_id: None,
@@ -1248,15 +1320,16 @@ pub async fn list_synced_repositories(
         owner: query.owner.clone(),
         language: query.language.clone(),
         private: query.private,
+        preset: query.preset.clone(),
+        updated_after: query.updated_after,
         sort: None,
         limit: None,
         offset: None,
     };
-    let all_repositories = state
+    let total_count = state
         .repository_service
-        .list_repositories(count_filter)
-        .await?;
-    let total_count = all_repositories.len();
+        .count_repositories(count_filter)
+        .await? as usize;
 
     // Convert service models to HTTP response format
     let repositories: Vec<RepositoryResponse> = repository_models
@@ -1268,12 +1341,12 @@ pub async fn list_synced_repositories(
             full_name: r.full_name,
             description: r.description,
             private: r.private,
-            default_branch: r.default_branch,
+            default_branch: r.default_branch.clone(),
             language: r.language,
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: convert_preset_json(r.preset.clone()),
+            preset: convert_preset_json(r.preset.clone(), &r.default_branch),
             clone_url: r.clone_url,
             ssh_url: r.ssh_url,
             git_provider_connection_id: r.git_provider_connection_id,
@@ -1429,12 +1502,12 @@ pub async fn get_repository_by_name(
             full_name: repository.full_name,
             description: repository.description,
             private: repository.private,
-            default_branch: repository.default_branch,
+            default_branch: repository.default_branch.clone(),
             language: repository.language,
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: convert_preset_json(repository.preset),
+            preset: convert_preset_json(repository.preset, &repository.default_branch),
             clone_url: repository.clone_url,
             ssh_url: repository.ssh_url,
             git_provider_connection_id: repository.git_provider_connection_id,
@@ -1488,12 +1561,12 @@ pub async fn get_repository_by_id(
             full_name: repository.full_name,
             description: repository.description,
             private: repository.private,
-            default_branch: repository.default_branch,
+            default_branch: repository.default_branch.clone(),
             language: repository.language,
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: convert_preset_json(repository.preset),
+            preset: convert_preset_json(repository.preset, &repository.default_branch),
             clone_url: repository.clone_url,
             ssh_url: repository.ssh_url,
             git_provider_connection_id: repository.git_provider_connection_id,
@@ -1555,12 +1628,12 @@ pub async fn get_all_repositories_by_name(
             full_name: repository.full_name,
             description: repository.description,
             private: repository.private,
-            default_branch: repository.default_branch,
+            default_branch: repository.default_branch.clone(),
             language: repository.language,
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: convert_preset_json(repository.preset),
+            preset: convert_preset_json(repository.preset, &repository.default_branch),
             clone_url: repository.clone_url,
             ssh_url: repository.ssh_url,
             git_provider_connection_id: repository.git_provider_connection_id,
@@ -1634,7 +1707,7 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
         .route("/git-connections", get(list_connections))
         .route(
             "/git-connections/{connection_id}",
-            delete(delete_connection),
+            get(get_connection).delete(delete_connection),
         )
         .route(
             "/git-connections/{connection_id}/deactivate",
@@ -1849,10 +1922,23 @@ pub async fn handle_git_provider_oauth_callback(
             format!("{}://{}/api", scheme, host)
         });
 
-    let connection = state
+    let result = state
         .git_provider_manager
         .handle_oauth_callback(provider_id, code, oauth_state, state_user_id, host)
-        .await?;
+        .await;
+    if state.telemetry.is_enabled() {
+        let provider_label = state
+            .git_provider_manager
+            .get_provider(provider_id)
+            .await
+            .ok()
+            // Re-validate the stored column through the typed enum so only a
+            // fixed label can be reported.
+            .and_then(|provider| GitProviderType::try_from(provider.provider_type.as_str()).ok())
+            .map(|provider_type| provider_type.to_string());
+        report_git_provider_result(&state, provider_label.as_deref(), "oauth", &result);
+    }
+    let connection = result?;
 
     // Redirect to success page or dashboard
     let redirect_url = format!(
@@ -1860,6 +1946,60 @@ pub async fn handle_git_provider_oauth_callback(
         provider_id, connection.id
     );
     Ok(axum::response::Redirect::to(&redirect_url))
+}
+
+/// Fixed telemetry label for a failed git provider connection. Typed variants
+/// map directly; anything else is classified from the message locally, and the
+/// message itself (which can carry hostnames or token fragments) is never sent.
+fn git_connect_failure_code(error: &GitProviderManagerError) -> OperationFailureCode {
+    match error {
+        GitProviderManagerError::ProviderError(GitProviderError::AuthenticationFailed(_))
+        | GitProviderManagerError::OAuthStateInvalid(_) => OperationFailureCode::Authentication,
+        GitProviderManagerError::ProviderError(GitProviderError::PermissionDenied { .. }) => {
+            OperationFailureCode::PermissionDenied
+        }
+        GitProviderManagerError::InvalidConfiguration(_)
+        | GitProviderManagerError::ProviderError(GitProviderError::InvalidConfiguration(_)) => {
+            OperationFailureCode::InvalidConfiguration
+        }
+        GitProviderManagerError::DatabaseError(_) => OperationFailureCode::Database,
+        other => OperationFailureCode::classify(&other.to_string()),
+    }
+}
+
+/// Telemetry `flow` label for a provider's credential, and whether the
+/// connection only completes later (OAuth callback or app installation), in
+/// which case creating the provider row is not yet a connection.
+fn git_auth_flow(auth_method: &AuthMethod) -> (&'static str, bool) {
+    match auth_method {
+        AuthMethod::GitHubApp { .. } => ("app", true),
+        AuthMethod::GitLabApp { .. } | AuthMethod::OAuth { .. } => ("oauth", true),
+        AuthMethod::PersonalAccessToken { .. } => ("pat", false),
+        AuthMethod::BasicAuth { .. } => ("basic", false),
+        AuthMethod::SSHKey { .. } => ("ssh", false),
+    }
+}
+
+/// Report the outcome of connecting a git provider: `git_provider_connected`
+/// on success, `git_provider_connect_failed` with a fixed code otherwise.
+/// `flow` is how the credential arrived (`pat`, `oauth`, `app`, ...).
+fn report_git_provider_result<T>(
+    state: &AppState,
+    provider: Option<&str>,
+    flow: &'static str,
+    result: &Result<T, GitProviderManagerError>,
+) {
+    use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+    let event = match result {
+        Ok(_) => TelemetryEvent::new(TelemetryEventKind::GitProviderConnected),
+        Err(error) => TelemetryEvent::new(TelemetryEventKind::GitProviderConnectFailed)
+            .with_failure(git_connect_failure_code(error)),
+    };
+    state.telemetry.report(
+        event
+            .with("flow", flow)
+            .with_opt("provider", provider.map(str::to_string)),
+    );
 }
 
 fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<AuthMethod, String> {
@@ -1956,6 +2096,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         get_provider_connections,
         sync_repositories,
         list_repositories_by_connection,
+        get_connection,
         list_repositories_by_provider,
         list_synced_repositories,
         get_repository_preset_live,
@@ -2002,6 +2143,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             ComposePortMapping,
             ComposePreviewRequest,
             ComposePreviewResponse,
+            ComposePreviewProblemResponse,
             RepositoryListQuery,
             SyncedRepositoryListQuery,
             RepositoryListResponse,
@@ -2052,10 +2194,12 @@ pub async fn create_github_pat_provider(
 
     let user_id = auth.user_id();
 
-    let provider = state
+    let result = state
         .git_provider_manager
         .create_github_pat_provider(request.name.clone(), request.token, user_id)
-        .await?;
+        .await;
+    report_git_provider_result(&state, Some("github"), "pat", &result);
+    let provider = result?;
 
     Ok((
         StatusCode::CREATED,
@@ -2102,7 +2246,7 @@ pub async fn create_gitlab_pat_provider(
 
     let user_id = auth.user_id();
 
-    let provider = state
+    let result = state
         .git_provider_manager
         .create_gitlab_pat_provider(
             request.name.clone(),
@@ -2110,7 +2254,9 @@ pub async fn create_gitlab_pat_provider(
             user_id,
             request.base_url,
         )
-        .await?;
+        .await;
+    report_git_provider_result(&state, Some("gitlab"), "pat", &result);
+    let provider = result?;
 
     Ok((
         StatusCode::CREATED,
@@ -2220,7 +2366,7 @@ pub async fn create_gitea_pat_provider(
 
     let user_id = auth.user_id();
 
-    let provider = state
+    let result = state
         .git_provider_manager
         .create_gitea_pat_provider(
             request.name.clone(),
@@ -2228,7 +2374,9 @@ pub async fn create_gitea_pat_provider(
             user_id,
             request.base_url,
         )
-        .await?;
+        .await;
+    report_git_provider_result(&state, Some("gitea"), "pat", &result);
+    let provider = result?;
 
     info!(
         provider_id = provider.id,
@@ -2286,10 +2434,12 @@ pub async fn create_bitbucket_provider(
         }
     };
 
-    let provider = state
+    let result = state
         .git_provider_manager
         .create_bitbucket_provider(request.name.clone(), auth_method, user_id)
-        .await?;
+        .await;
+    report_git_provider_result(&state, Some("bitbucket"), "pat", &result);
+    let provider = result?;
 
     info!(
         provider_id = provider.id,
@@ -2363,7 +2513,7 @@ pub async fn create_generic_provider(
         _ => "x-access-token".to_string(),
     };
 
-    let provider = state
+    let result = state
         .git_provider_manager
         .create_generic_provider(
             request.name.clone(),
@@ -2373,7 +2523,9 @@ pub async fn create_generic_provider(
             request.base_url,
             user_id,
         )
-        .await?;
+        .await;
+    report_git_provider_result(&state, Some("generic"), "manual", &result);
+    let provider = result?;
 
     info!(
         provider_id = provider.id,
@@ -2654,6 +2806,9 @@ pub struct ComposePreviewRequest {
     pub compose_override: Option<String>,
     #[serde(default)]
     pub excluded_services: Vec<String>,
+    /// Advisory preview only. Deployment reloads the saved project policy.
+    #[serde(default)]
+    pub preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2732,7 +2887,7 @@ pub async fn get_repository_compose_services_live(
     request_body = ComposePreviewRequest,
     responses(
         (status = 200, description = "Effective Compose preview rendered", body = ComposePreviewResponse),
-        (status = 400, description = "Compose file or override is invalid"),
+        (status = 400, description = "Compose file or override is invalid", body = ComposePreviewProblemResponse, content_type = "application/problem+json"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found")
     ),
@@ -2742,12 +2897,13 @@ pub async fn get_repository_compose_services_live(
 pub async fn get_repository_compose_preview(
     State(state): State<Arc<AppState>>,
     Path(repository_id): Path<i32>,
+    OriginalUri(uri): OriginalUri,
     RequireAuth(auth): RequireAuth,
     Json(request): Json<ComposePreviewRequest>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<axum::response::Response, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
 
-    let result = state
+    let result = match state
         .git_provider_manager
         .calculate_repository_compose_preview_live(
             repository_id,
@@ -2755,8 +2911,22 @@ pub async fn get_repository_compose_preview(
             request.path,
             request.compose_override,
             request.excluded_services,
+            request.preview_policy,
         )
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(GitProviderManagerError::ComposePreview { path, source }) => {
+            return Ok(ComposePreviewProblemResponse::new(
+                "Compose Preview Failed",
+                &path,
+                &uri,
+                &source,
+            )
+            .into_response());
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     Ok((
         StatusCode::OK,
@@ -2768,7 +2938,8 @@ pub async fn get_repository_compose_preview(
             disabled_services: result.preview.disabled_services,
             redacted_values: result.preview.redacted_values,
         }),
-    ))
+    )
+        .into_response())
 }
 
 /// Get connections for a specific git provider
@@ -3308,7 +3479,7 @@ mod convert_preset_json_tests {
         let cache = RepositoryPresetCache { branches };
         let json = serde_json::to_value(&cache).unwrap();
 
-        let converted = convert_preset_json(Some(json)).expect("cache should convert");
+        let converted = convert_preset_json(Some(json), "main").expect("cache should convert");
         assert_eq!(converted.len(), 1);
         assert_eq!(
             converted[0].dockerfile_path.as_deref(),
@@ -3338,7 +3509,42 @@ mod convert_preset_json_tests {
         let cache = RepositoryPresetCache { branches };
         let json = serde_json::to_value(&cache).unwrap();
 
-        let converted = convert_preset_json(Some(json)).expect("cache should convert");
+        let converted = convert_preset_json(Some(json), "main").expect("cache should convert");
         assert_eq!(converted[0].dockerfile_path, None);
+    }
+    #[test]
+    fn repository_presets_only_use_default_branch() {
+        let entry = |slug: &str| {
+            serde_json::json!({
+                "presets": [{"path": "./", "preset": slug, "presetLabel": slug,
+                    "projectType": "backend"}],
+                "calculatedAt": "2026-01-01T00:00:00Z"
+            })
+        };
+        let cache = serde_json::json!({"main": entry("nextjs"), "feature": entry("django")});
+        let result = convert_preset_json(Some(cache.clone()), "main").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].preset, "nextjs");
+        assert!(convert_preset_json(Some(cache), "missing").is_none());
+        let empty =
+            serde_json::json!({"main": {"presets": [], "calculatedAt": "2026-01-01T00:00:00Z"}});
+        assert!(convert_preset_json(Some(empty), "main").unwrap().is_empty());
+        assert!(convert_preset_json(None, "main").is_none());
+    }
+
+    #[test]
+    fn repository_updated_after_rejects_invalid_timestamp() {
+        assert!(serde_json::from_value::<RepositoryListQuery>(
+            serde_json::json!({"updated_after": "yesterday"})
+        )
+        .is_err());
+        let query: RepositoryListQuery = serde_json::from_value(
+            serde_json::json!({"updated_after": "2026-01-01T01:00:00+01:00", "preset": "nextjs"}),
+        )
+        .unwrap();
+        assert_eq!(
+            query.updated_after.unwrap().to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
     }
 }

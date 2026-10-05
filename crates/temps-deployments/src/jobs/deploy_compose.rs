@@ -44,6 +44,29 @@ fn route_binding_for_service<'a>(
         .or_else(|| bindings.first())
 }
 
+/// Every published TCP port of a Compose service, one entry per container
+/// port. Persisted so each public route can reach its own host mapping.
+fn published_port_bindings(
+    bindings: &[temps_deployer::compose::ComposePortBinding],
+) -> deployment_containers::ContainerPortBindings {
+    let mut published: Vec<deployment_containers::ContainerPortBinding> = Vec::new();
+    for binding in bindings {
+        let is_tcp = binding.protocol.is_empty() || binding.protocol.eq_ignore_ascii_case("tcp");
+        let container_port = i32::from(binding.container_port);
+        if is_tcp
+            && !published
+                .iter()
+                .any(|existing| existing.container_port == container_port)
+        {
+            published.push(deployment_containers::ContainerPortBinding {
+                container_port,
+                host_port: i32::from(binding.host_port),
+            });
+        }
+    }
+    deployment_containers::ContainerPortBindings(published)
+}
+
 fn health_check_path_for_public_route(
     public_ports: &[ComposePublicPort],
     compose_services: &[temps_entities::preset::ComposeServiceSnapshot],
@@ -474,6 +497,7 @@ impl DeployComposeJob {
                     .map(|port| i32::from(port.container_port))
                     .unwrap_or(0)),
                 host_port: Set(binding.map(|port| i32::from(port.host_port))),
+                port_bindings: Set(Some(published_port_bindings(&service.ports))),
                 image_name: Set(Some(service.image_name.clone())),
                 status: Set(Some("retained:stopped-after-failure".to_string())),
                 service_name: Set(Some(service.service_name.clone())),
@@ -716,6 +740,24 @@ impl DeployComposeJob {
             }
         };
 
+        let (compose_content, compose_override) = self
+            .compose_executor
+            .resolve_security_configuration(
+                &project_name,
+                repo_path.as_deref(),
+                compose_file_name,
+                &compose_content,
+                self.compose_override.as_deref(),
+                &self.environment_vars,
+            )
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to resolve Compose policy for project {}: {error}",
+                    self.project_id
+                ))
+            })?;
+
         // Full service list from the raw compose file, *before* exclusion
         // stripping — so excluded services still show up as re-includable
         // options in the settings-page checklist. Best-effort: a parse
@@ -725,7 +767,7 @@ impl DeployComposeJob {
         let compose_services: Vec<temps_entities::preset::ComposeServiceSnapshot> =
             temps_presets::list_compose_services_with_override(
                 &compose_content,
-                self.compose_override.as_deref(),
+                compose_override.as_deref(),
             )
             .map(|services| {
                 services
@@ -883,7 +925,7 @@ impl DeployComposeJob {
             if !self.secrets.is_empty() {
                 let documents = [
                     compose_content.as_str(),
-                    self.compose_override.as_deref().unwrap_or_default(),
+                    compose_override.as_deref().unwrap_or_default(),
                 ];
                 let services = self.compose_executor.all_service_names(&documents);
                 let skipped = ComposeExecutor::services_managing_own_secrets(&documents);
@@ -900,7 +942,7 @@ impl DeployComposeJob {
                     keys.sort();
                     let message = if keys.is_empty() {
                         format!(
-                            "Service '{service}' receives no secrets                              (every secret is scoped to other services)"
+                            "Service '{service}' receives no secrets (every secret is scoped to other services)"
                         )
                     } else {
                         format!(
@@ -921,7 +963,7 @@ impl DeployComposeJob {
                         .log_warning(
                             log_id,
                             &format!(
-                                "Service(s) {} already define their own /run/secrets mount or                                  compose `secrets:` entry — Temps secrets are NOT mounted there.                                  Remove that mount if you want Temps to deliver them.",
+                                "Service(s) {} already define their own /run/secrets mount or compose `secrets:` entry — Temps secrets are NOT mounted there. Remove that mount if you want Temps to deliver them.",
                                 skipped.join(", ")
                             ),
                         )
@@ -940,7 +982,7 @@ impl DeployComposeJob {
                         .log_warning(
                             log_id,
                             &format!(
-                                "Secret '{}' is scoped to compose service '{}', which does not                                  exist in this stack (services: {}). It was not delivered to that                                  service. Update the secret's scope or the compose file.",
+                                "Secret '{}' is scoped to compose service '{}', which does not exist in this stack (services: {}). It was not delivered to that service. Update the secret's scope or the compose file.",
                                 key,
                                 missing,
                                 if services.is_empty() {
@@ -960,7 +1002,7 @@ impl DeployComposeJob {
         // deployment for what is purely a configuration problem.
         if let Err(error) = self
             .compose_executor
-            .preflight_validate(&compose_content, self.compose_override.as_deref())
+            .preflight_validate(&compose_content, compose_override.as_deref())
         {
             let error_msg = format!("Compose security policy rejected deployment: {error}");
             tracing::error!(error = %error_msg, "Docker Compose preflight validation failed");
@@ -974,7 +1016,7 @@ impl DeployComposeJob {
                 selected_repo_dir,
                 compose_file_name,
                 &compose_content,
-                self.compose_override.as_deref(),
+                compose_override.as_deref(),
             ) {
                 let error_msg =
                     format!("Compose filesystem security policy rejected deployment: {e}");
@@ -1001,7 +1043,7 @@ impl DeployComposeJob {
             build_args: self.build_args.clone(),
             labels,
             repo_dir: repo_path.clone(),
-            compose_override: self.compose_override.clone(),
+            compose_override: compose_override.clone(),
             relaxed_capability_services: self.relaxed_capability_services.clone(),
             unsandboxed_services: self.unsandboxed_services.clone(),
         };
@@ -1442,6 +1484,14 @@ impl DeployComposeJob {
         context.set_output("deploy_container", "service_names", &service_names)?;
         context.set_output("deploy_container", "container_names", &container_names)?;
         context.set_output("deploy_container", "container_ports", &container_ports)?;
+        context.set_output(
+            "deploy_container",
+            "port_bindings",
+            services
+                .iter()
+                .map(|service| published_port_bindings(&service.ports))
+                .collect::<Vec<_>>(),
+        )?;
         context.set_output(
             "deploy_container",
             "image_names",
@@ -1901,6 +1951,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         };
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)

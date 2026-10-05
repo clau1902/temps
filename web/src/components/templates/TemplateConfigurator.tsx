@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -99,6 +100,7 @@ import {
   toggleDatabaseSelection,
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   AlertCircle,
   Building2,
@@ -257,6 +259,9 @@ export function TemplateConfigurator({
 }: TemplateConfiguratorProps) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const [deliveryProvider, setDeliveryProvider] = useState<
+    'none' | 'cloudflare' | 'bunny' | undefined
+  >(undefined)
 
   // State
   const [showSecrets, setShowSecrets] = useState<Record<number, boolean>>({})
@@ -538,6 +543,11 @@ export function TemplateConfigurator({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repositoryNameWatch, baseKey])
 
+  // ADR 045: a template deploy is another way to name a slug this host
+  // grants the Docker socket to, so the create can come back 428.
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+
   // Create project mutation
   const createFromTemplateMutation = useMutation({
     ...createProjectFromTemplateMutation(),
@@ -555,7 +565,18 @@ export function TemplateConfigurator({
       onSuccess?.()
       navigate(`/projects/${data.project_slug}?new=true`)
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      // ADR 045: a slug this host grants the Docker socket to is admin-only
+      // and step-up verified, so this can be a 428 asking the admin to
+      // re-verify rather than a failure. Checked first — the toast below
+      // would otherwise report a create that is about to succeed as failed.
+      if (
+        handleSensitiveActionError(error, () =>
+          createFromTemplateMutation.mutate(variables)
+        )
+      ) {
+        return
+      }
       // The backend returns RFC 7807 Problem Details, which surface their
       // message via `detail` / `title` rather than `error.message` (which is
       // `undefined` and previously rendered as "Failed to create project: undefined").
@@ -640,6 +661,7 @@ export function TemplateConfigurator({
 
     createFromTemplateMutation.mutate({
       body: {
+        delivery_provider: deliveryProvider,
         template_slug: template.slug,
         project_name: data.projectName,
         git_provider_connection_id: data.gitProviderConnectionId ?? undefined,
@@ -748,6 +770,7 @@ export function TemplateConfigurator({
 
   return (
     <div className={cn('space-y-6', className)}>
+      {verificationDialog}
       {/* Template Info Header */}
       <Card>
         <CardHeader className="pb-3">
@@ -1991,6 +2014,10 @@ export function TemplateConfigurator({
           </Card>
 
           {/* Actions */}
+          <DeliveryProjectOption
+            value={deliveryProvider}
+            onChange={setDeliveryProvider}
+          />
           <div className="flex justify-end gap-3">
             {onCancel && (
               <Button

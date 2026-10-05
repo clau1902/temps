@@ -27,6 +27,10 @@ pub struct AppSettings {
     /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
     /// disables DNS record sync regardless of per-domain opt-in.
     pub edge_target: Option<String>,
+    /// Enable Cloudflare delivery by default for projects created after this is set.
+    pub cloudflare_new_projects: bool,
+    /// Enable Bunny delivery by default only for projects created after this is set.
+    pub bunny_new_projects: bool,
 
     /// Managed control-plane connection. Credentials are deliberately not
     /// stored here; they live in the owner-only cloud-link state file.
@@ -100,7 +104,10 @@ pub struct AppSettings {
     // Agent sandbox settings (global defaults)
     pub agent_sandbox: AgentSandboxSettings,
 
-    // Workspace preview gateway settings (single shared container per node)
+    /// Workspace preview gateway settings (single shared container per node).
+    /// Owned by `PATCH /preview-gateway/settings` and
+    /// `POST /preview-gateway/upgrade`, which change the gateway's containers
+    /// to match; the generic settings update preserves the stored value.
     pub preview_gateway: PreviewGatewaySettings,
 
     // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). Off by default;
@@ -989,6 +996,18 @@ pub struct ContainerLogSettings {
     /// Maximum rotated log files for external service containers
     #[schema(example = 3)]
     pub service_max_file: u32,
+    /// Disk budget, in MiB, for the collected-log read cache (`logs/cache`
+    /// under the data dir): recently read chunk blocks, block indexes and
+    /// bloom filters kept locally so searches over object storage do not
+    /// re-fetch them (ADR-046 §6). Applied within a minute of saving;
+    /// shrinking evicts immediately.
+    #[schema(minimum = 64, maximum = 1048576, example = 2048)]
+    pub cache_mb: u32,
+    /// Per-container cap, in MiB, on unsealed log lines held in memory (and
+    /// the WAL) before they are sealed into a chunk object. Larger buffers
+    /// mean fewer, bigger chunks; smaller ones bound memory per container.
+    #[schema(minimum = 1, maximum = 256, example = 8)]
+    pub head_buffer_mb: u32,
 }
 
 /// Per-provider credential and configuration entry stored inside
@@ -1010,7 +1029,7 @@ pub struct ProviderConfig {
     /// Auth flavor for this provider. Valid values depend on the provider:
     ///   - `claude_cli`: "subscription" (OAuth token) | "api_key"
     ///   - `codex_cli`: "api_key"
-    ///   - `opencode`:  "config_file"
+    ///   - `opencode`:  "config_file" | "openai_compatible"
     pub auth_type: String,
     /// Encrypted credential payload. The decrypted bytes are interpreted
     /// according to the catalog entry's `credential_format`:
@@ -1098,6 +1117,13 @@ pub struct AgentSandboxSettings {
     #[serde(default)]
     #[schema(example = "docker")]
     pub sandbox_backend: Option<String>,
+    /// Nodes allowed to run sandboxes (ADR-048). `None` (the default) =
+    /// every node, including the control plane. `Some(ids)` = only those
+    /// nodes; the control plane is id `0`. `Some([])` disables sandbox
+    /// creation. Owned by `PUT /sandboxes/placement`; the generic settings
+    /// update preserves the stored value.
+    #[serde(default)]
+    pub allowed_node_ids: Option<Vec<i32>>,
 }
 
 /// Global AI configuration settings. Controls the default config repo
@@ -1146,6 +1172,7 @@ impl Default for AgentSandboxSettings {
             memory_limit_mb: 8192,
             network_mode: "full".to_string(),
             sandbox_backend: None,
+            allowed_node_ids: None,
         }
     }
 }
@@ -1310,6 +1337,14 @@ pub struct MultiNodeSettings {
     /// `None` disables disk alerting. Default 90.
     #[serde(default = "default_node_disk_alert_percent")]
     pub node_disk_alert_percent: Option<f64>,
+    /// Seconds a worker node must go without a heartbeat before its workloads
+    /// are failed over to healthy nodes. A node is reported offline (and
+    /// operators alerted) well before this; the gap is a grace period so a
+    /// brief network partition or a control-plane stall does not redeploy a
+    /// whole node's worth of apps that never stopped serving. `None` disables
+    /// automatic failover entirely. Default 300.
+    #[serde(default = "default_node_failover_after_secs")]
+    pub node_failover_after_secs: Option<u64>,
 }
 
 fn default_node_cpu_alert_percent() -> Option<f64> {
@@ -1320,6 +1355,9 @@ fn default_node_memory_alert_percent() -> Option<f64> {
 }
 fn default_node_disk_alert_percent() -> Option<f64> {
     Some(90.0)
+}
+fn default_node_failover_after_secs() -> Option<u64> {
+    Some(300)
 }
 
 fn default_legacy_shared_token_enabled() -> bool {
@@ -1338,6 +1376,7 @@ impl Default for MultiNodeSettings {
             node_cpu_alert_percent: default_node_cpu_alert_percent(),
             node_memory_alert_percent: default_node_memory_alert_percent(),
             node_disk_alert_percent: default_node_disk_alert_percent(),
+            node_failover_after_secs: default_node_failover_after_secs(),
         }
     }
 }
@@ -1354,8 +1393,12 @@ impl Default for MultiNodeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct PreviewGatewaySettings {
-    /// Docker image reference for the gateway. Empty follows this Temps
-    /// release's digest; any nonempty value is an explicit operator pin.
+    /// Whether Temps runs the shared preview gateway. While false its
+    /// containers are removed, so workspace preview URLs are not served.
+    #[schema(example = true)]
+    pub enabled: bool,
+    /// Docker image reference. Empty follows this Temps release's digest;
+    /// a nonempty value is an explicit operator pin.
     #[schema(
         example = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448"
     )]
@@ -1408,6 +1451,7 @@ fn default_preview_gateway_container() -> String {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             image: String::new(),
             host_port: 8090,
             container_name: default_preview_gateway_container(),
@@ -1577,6 +1621,12 @@ pub struct ObservabilityRetentionSettings {
     /// Retain OpenTelemetry metric points for this many days.
     #[schema(minimum = 1, maximum = 3650, example = 90)]
     pub otel_metrics_days: u32,
+
+    /// Retain collected container logs (chunk objects on disk/S3, their
+    /// manifest rows, and the ClickHouse line index when configured) for
+    /// this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub container_logs_days: u32,
 }
 
 impl Default for ObservabilityRetentionSettings {
@@ -1586,6 +1636,7 @@ impl Default for ObservabilityRetentionSettings {
             otel_spans_days: 90,
             otel_logs_days: 90,
             otel_metrics_days: 90,
+            container_logs_days: 30,
         }
     }
 }
@@ -1933,6 +1984,8 @@ impl Default for AppSettings {
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
+            cloudflare_new_projects: false,
+            bunny_new_projects: false,
             cloud: CloudSettings::default(),
             console_force_https: None,
             screenshots: ScreenshotSettings::default(),
@@ -2027,6 +2080,8 @@ impl Default for ContainerLogSettings {
             max_file: 3,
             service_max_size: "20m".to_string(),
             service_max_file: 3,
+            cache_mb: 2048,
+            head_buffer_mb: 8,
         }
     }
 }
@@ -2964,6 +3019,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_preview_gateway_settings_default_to_enabled() {
+        let legacy = serde_json::json!({
+            "image": "ghcr.io/gotempsh/temps-preview-gateway:latest",
+            "host_port": 8090,
+            "auto_upgrade": true
+        });
+
+        let parsed: PreviewGatewaySettings =
+            serde_json::from_value(legacy).expect("legacy preview gateway settings should parse");
+
+        assert!(
+            parsed.enabled,
+            "legacy settings must keep preview gateway reconciliation enabled"
+        );
+    }
+
+    #[test]
     fn on_demand_tls_round_trips_through_json() {
         let mut s = AppSettings::default();
         s.on_demand_tls.enabled = true;
@@ -3279,5 +3351,39 @@ mod tests {
         });
         let parsed = AppSettings::from_json(legacy);
         assert!(!parsed.multi_node.require_mtls);
+    }
+}
+
+#[cfg(test)]
+mod cloudflare_new_project_tests {
+    use super::AppSettings;
+
+    #[test]
+    fn legacy_settings_keep_future_projects_opted_out() {
+        let settings =
+            AppSettings::from_json(serde_json::json!({"preview_domain": "example.test"}));
+        assert!(!settings.cloudflare_new_projects);
+        assert!(!settings.bunny_new_projects);
+    }
+
+    #[test]
+    fn cloudflare_default_round_trips_without_retroactive_state() {
+        let settings = AppSettings {
+            cloudflare_new_projects: true,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(settings.to_json());
+        assert!(restored.cloudflare_new_projects);
+    }
+
+    #[test]
+    fn bunny_default_round_trips_without_retroactive_state() {
+        let settings = AppSettings {
+            bunny_new_projects: true,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(settings.to_json());
+        assert!(restored.bunny_new_projects);
+        assert!(!restored.cloudflare_new_projects);
     }
 }

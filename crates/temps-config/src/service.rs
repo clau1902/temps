@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::resolve_installation_secrets;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -13,10 +14,6 @@ use std::sync::Arc;
 use temps_database::DbConnection;
 use temps_entities::{external_services, network_config, node_enrollment_tokens, nodes, settings};
 use thiserror::Error;
-use tokio::{
-    fs as tokio_fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-};
 use tracing::{debug, info, warn};
 // Well-known paths relative to data_dir
 pub const STATIC_DIR_NAME: &str = "static";
@@ -31,7 +28,10 @@ pub const SQLITE_DB_NAME: &str = "temps.db";
 const GEO_SETTINGS_KEY: &str = "geo";
 
 use serde_derive::{Deserialize, Serialize};
-use temps_core::{AgentSandboxSettings, AppSettings, GeoLicenseKeyIntent, PublicHostnameStrategy};
+use temps_core::{
+    AgentSandboxSettings, AppSettings, GeoLicenseKeyIntent, PreviewGatewaySettings,
+    PublicHostnameStrategy,
+};
 
 /// Rebase credential-owned fields onto the row locked by the settings writer.
 /// A bulk settings payload (including one built from an older GET) is never
@@ -108,11 +108,64 @@ pub enum ConfigServiceError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
+    #[error("Failed to determine persisted installation mode while {operation}: {source}")]
+    InstallationModeDatabase {
+        operation: &'static str,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
     #[error("AI provider '{provider_id}' credential changed during verification")]
     ProviderCredentialChanged { provider_id: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Invalid value for environment variable {variable}: {details}")]
+    InvalidEnvironmentValue {
+        variable: &'static str,
+        details: String,
+    },
+
+    #[error("Conflicting secret sources: set only one of {value_variable} or {file_variable}")]
+    ConflictingSecretSources {
+        value_variable: &'static str,
+        file_variable: &'static str,
+    },
+
+    #[error("Stateless mode requires {value_variable} or {file_variable}")]
+    MissingStatelessSecret {
+        value_variable: &'static str,
+        file_variable: &'static str,
+    },
+
+    #[error("Invalid installation secret from {origin}: {details}")]
+    InvalidInjectedSecret {
+        origin: &'static str,
+        details: String,
+    },
+
+    #[error("Failed to read installation secret file from {variable} at {path}: {source}")]
+    SecretFileRead {
+        variable: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to read local installation secret at {path}: {source}")]
+    LocalSecretRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to write local installation secret at {path}: {source}")]
+    LocalSecretWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("Setting not found: {key}")]
     SettingNotFound { key: String },
@@ -162,10 +215,7 @@ pub struct ClusterCaRotationResult {
     pub revoked_enrollment_tokens: u64,
 }
 
-fn fill_secure_random_bytes(operation: &str, bytes: &mut [u8]) -> Result<(), ConfigServiceError> {
-    fill_random_bytes_with(&mut rand::rngs::SysRng, operation, bytes)
-}
-
+#[cfg(test)]
 fn fill_random_bytes_with<R: rand::TryCryptoRng>(
     rng: &mut R,
     operation: &str,
@@ -403,27 +453,9 @@ impl ServerConfig {
         // Create data directory if it doesn't exist
         fs::create_dir_all(&data_dir)?;
 
-        // Generate or load auth_secret (32 bytes in hex format)
-        let auth_secret_path = data_dir.join("auth_secret");
-        let auth_secret = if auth_secret_path.exists() {
-            fs::read_to_string(&auth_secret_path)?.trim().to_string()
-        } else {
-            let secret = Self::generate_auth_secret()?;
-            fs::write(&auth_secret_path, &secret)?;
-            Self::restrict_file_permissions(&auth_secret_path);
-            secret
-        };
-
-        // Generate or load encryption_key (32 bytes in hex format)
-        let encryption_key_path = data_dir.join("encryption_key");
-        let encryption_key = if encryption_key_path.exists() {
-            fs::read_to_string(&encryption_key_path)?.trim().to_string()
-        } else {
-            let key = Self::generate_encryption_key()?;
-            fs::write(&encryption_key_path, &key)?;
-            Self::restrict_file_permissions(&encryption_key_path);
-            key
-        };
+        let installation_secrets = resolve_installation_secrets(&data_dir)?;
+        let auth_secret = installation_secrets.auth_secret;
+        let encryption_key = installation_secrets.encryption_key;
 
         // Get console address - use a random available port
         let console_address = console_address.unwrap_or_else(Self::get_random_console_address);
@@ -546,32 +578,6 @@ impl ServerConfig {
             && self.clickhouse_password.is_some()
     }
 
-    /// Generate a 32-byte auth secret (64 hex characters)
-    fn generate_auth_secret() -> Result<String, ConfigServiceError> {
-        let mut bytes = [0u8; 32];
-        fill_secure_random_bytes("generating the server auth secret", &mut bytes)?;
-        Ok(hex::encode(bytes))
-    }
-
-    /// Generate a 32-byte encryption key (64 hex characters)
-    fn generate_encryption_key() -> Result<String, ConfigServiceError> {
-        let mut bytes = [0u8; 32];
-        fill_secure_random_bytes("generating the server encryption key", &mut bytes)?;
-        Ok(hex::encode(bytes))
-    }
-
-    /// Set file permissions to owner-only (0o600) for sensitive files.
-    #[cfg(unix)]
-    fn restrict_file_permissions(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-
-    #[cfg(not(unix))]
-    fn restrict_file_permissions(_path: &std::path::Path) {
-        // File permissions are handled differently on non-Unix platforms
-    }
-
     /// Get a random available port for console address
     fn get_random_console_address() -> String {
         let listener =
@@ -637,6 +643,144 @@ pub const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 /// proxy's per-request hot path (`request_filter`) never hammers Postgres.
 const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallationMode {
+    Local,
+    Stateless,
+}
+
+impl InstallationMode {
+    pub const fn is_stateless(self) -> bool {
+        matches!(self, Self::Stateless)
+    }
+}
+
+/// Read the installation mode persisted in PostgreSQL.
+///
+/// A missing table or singleton row means the installation has not been bound
+/// to stateless mode. `TEMPS_STATELESS` is deliberately not consulted here:
+/// it is only a bootstrap request and must not change runtime behavior.
+pub async fn installation_mode(db: &DbConnection) -> Result<InstallationMode, ConfigServiceError> {
+    let table = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT to_regclass('stateless_control_plane') IS NOT NULL AS present".to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "checking the installation identity table",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details: "database returned no result while checking installation mode".to_string(),
+        })?;
+    if !table.try_get::<bool>("", "present").map_err(|source| {
+        ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the installation identity table status",
+            source,
+        }
+    })? {
+        return Ok(InstallationMode::Local);
+    }
+
+    let identity = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM stateless_control_plane WHERE id = 1) AS present"
+                .to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the persisted installation identity",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details: "database returned no result while reading installation identity".to_string(),
+        })?;
+    let present = identity.try_get::<bool>("", "present").map_err(|source| {
+        ConfigServiceError::InstallationModeDatabase {
+            operation: "decoding the persisted installation identity",
+            source,
+        }
+    })?;
+    Ok(if present {
+        InstallationMode::Stateless
+    } else {
+        InstallationMode::Local
+    })
+}
+
+/// Return the stable instance identifier for a stateless installation.
+pub async fn stateless_instance_id(
+    db: &DbConnection,
+) -> Result<Option<String>, ConfigServiceError> {
+    if !installation_mode(db).await?.is_stateless() {
+        return Ok(None);
+    }
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT instance_id FROM stateless_control_plane WHERE id = 1".to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the persisted stateless instance ID",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details: "stateless installation identity disappeared while it was being read"
+                .to_string(),
+        })?;
+    row.try_get::<String>("", "instance_id")
+        .map(Some)
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "decoding the persisted stateless instance ID",
+            source,
+        })
+}
+
+/// Return the anonymous telemetry ID of a stateless installation, or `None`
+/// for a local installation (which keeps its ID in the data directory).
+///
+/// The ID is a random `inst_<32 hex>` value generated by the
+/// `stateless_control_plane.telemetry_anonymous_id` column default and shared
+/// by every replica. It is deliberately NOT derived from the operator-chosen
+/// instance ID, which anyone could hash to predict it.
+pub async fn stateless_telemetry_anonymous_id(
+    db: &DbConnection,
+) -> Result<Option<String>, ConfigServiceError> {
+    if !installation_mode(db).await?.is_stateless() {
+        return Ok(None);
+    }
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT telemetry_anonymous_id FROM stateless_control_plane WHERE id = 1".to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the stateless telemetry anonymous ID",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details:
+                "stateless installation identity disappeared while its telemetry ID was being read"
+                    .to_string(),
+        })?;
+    let id = row
+        .try_get::<String>("", "telemetry_anonymous_id")
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "decoding the stateless telemetry anonymous ID",
+            source,
+        })?;
+    if id.trim().is_empty() {
+        return Err(ConfigServiceError::InvalidConfiguration {
+            details: "stateless_control_plane.telemetry_anonymous_id is empty".to_string(),
+        });
+    }
+    Ok(Some(id))
+}
+
 #[derive(Default)]
 struct SettingsCacheState {
     snapshot: Option<(AppSettings, std::time::Instant)>,
@@ -674,6 +818,19 @@ impl ConfigService {
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Return the durable installation mode recorded in PostgreSQL.
+    pub async fn installation_mode(&self) -> Result<InstallationMode, ConfigServiceError> {
+        installation_mode(self.db.as_ref()).await
+    }
+
+    pub async fn is_stateless_installation(&self) -> Result<bool, ConfigServiceError> {
+        Ok(self.installation_mode().await?.is_stateless())
+    }
+
+    pub async fn stateless_instance_id(&self) -> Result<Option<String>, ConfigServiceError> {
+        stateless_instance_id(self.db.as_ref()).await
     }
 
     /// Get the base data directory path
@@ -901,65 +1058,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// Get or create the encryption key
     /// Loads from data_dir/encryption_key if exists, otherwise generates and saves a new one
     pub async fn get_or_create_encryption_key(&self) -> Result<String, ConfigServiceError> {
-        let key_path = self.data_dir().join(ENCRYPTION_KEY_FILE);
-
-        if self.path_exists(&key_path).await {
-            // Read existing key
-            let mut file = tokio_fs::File::open(&key_path).await?;
-            let mut key = String::new();
-            file.read_to_string(&mut key).await?;
-            Ok(key.trim().to_string())
-        } else {
-            // Generate new key using OS CSPRNG
-            let mut bytes = [0u8; 32];
-            fill_secure_random_bytes("creating the persisted encryption key", &mut bytes)?;
-            let key = hex::encode(bytes);
-
-            // Ensure data directory exists
-            tokio_fs::create_dir_all(self.data_dir()).await?;
-
-            // Write key to file
-            let mut file = tokio_fs::File::create(&key_path).await?;
-            file.write_all(key.as_bytes()).await?;
-            file.sync_all().await?;
-
-            // Restrict permissions to owner-only
-            ServerConfig::restrict_file_permissions(&key_path);
-
-            Ok(key)
-        }
+        Ok(resolve_installation_secrets(&self.data_dir())?.encryption_key)
     }
 
     /// Get or create the auth secret
     /// Loads from data_dir/auth_secret if exists, otherwise generates and saves a new one
     pub async fn get_or_create_auth_secret(&self) -> Result<String, ConfigServiceError> {
-        let secret_path = self.data_dir().join(AUTH_SECRET_FILE);
-
-        if self.path_exists(&secret_path).await {
-            // Read existing secret
-            let mut file = tokio_fs::File::open(&secret_path).await?;
-            let mut secret = String::new();
-            file.read_to_string(&mut secret).await?;
-            Ok(secret.trim().to_string())
-        } else {
-            // Generate new secret using OS CSPRNG (32 bytes as 64 hex characters)
-            let mut bytes = [0u8; 32];
-            fill_secure_random_bytes("creating the persisted auth secret", &mut bytes)?;
-            let secret = hex::encode(bytes);
-
-            // Ensure data directory exists
-            tokio_fs::create_dir_all(self.data_dir()).await?;
-
-            // Write secret to file
-            let mut file = tokio_fs::File::create(&secret_path).await?;
-            file.write_all(secret.as_bytes()).await?;
-            file.sync_all().await?;
-
-            // Restrict permissions to owner-only
-            ServerConfig::restrict_file_permissions(&secret_path);
-
-            Ok(secret)
-        }
+        Ok(resolve_installation_secrets(&self.data_dir())?.auth_secret)
     }
     pub async fn get_external_url(&self) -> Result<Option<String>, ConfigServiceError> {
         let settings = self.get_settings().await?;
@@ -985,6 +1090,50 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             Some(url) if url.starts_with("http://") => "http".to_string(),
             _ => "https".to_string(),
         })
+    }
+
+    /// Why CDN `provider` (`"cloudflare"` or `"bunny"`) cannot be turned on as
+    /// the delivery default for new projects, or `None` when it is usable.
+    ///
+    /// Mirrors what project creation needs to attach a delivery profile, so a
+    /// default the settings page accepts is one project creation can honour.
+    pub async fn delivery_default_unavailable_reason(
+        &self,
+        provider: &str,
+    ) -> Result<Option<String>, ConfigServiceError> {
+        use temps_entities::{delivery_profiles, dns_providers};
+
+        let label = match provider {
+            "cloudflare" => "Cloudflare",
+            "bunny" => "Bunny",
+            other => {
+                return Ok(Some(format!(
+                    "Unknown delivery provider '{other}'; choose cloudflare or bunny"
+                )))
+            }
+        };
+        if provider == "cloudflare" {
+            let active_dns_provider = dns_providers::Entity::find()
+                .filter(dns_providers::Column::ProviderType.eq("cloudflare"))
+                .filter(dns_providers::Column::IsActive.eq(true))
+                .one(self.db.as_ref())
+                .await?;
+            if active_dns_provider.is_none() {
+                return Ok(Some(
+                    "Cloudflare cannot be the delivery default for new projects: no active Cloudflare DNS provider is connected. Connect one in Settings > DNS Providers (/dns-providers) first".to_string(),
+                ));
+            }
+        }
+        let profile = delivery_profiles::Entity::find()
+            .filter(delivery_profiles::Column::ProviderKind.eq(provider))
+            .one(self.db.as_ref())
+            .await?;
+        if profile.is_none() {
+            return Ok(Some(format!(
+                "{label} cannot be the delivery default for new projects: no {label} delivery profile exists. Create one in Delivery Profiles (/delivery-profiles) first"
+            )));
+        }
+        Ok(None)
     }
 
     /// Get the application settings
@@ -1030,6 +1179,34 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         };
         serde_json::from_value(value).map_err(|_| ConfigServiceError::MalformedSettingsSection {
             section: "agent_sandbox",
+        })
+    }
+
+    /// Load only the sandbox placement allow-list (ADR-048) from the
+    /// authoritative settings row. `None` = every node may run sandboxes.
+    ///
+    /// The allow-list is a security boundary, so it never falls back to a
+    /// default: [`Self::get_settings`] returns the whole default document when
+    /// any field fails to decode, which would silently read as "allow every
+    /// node". Unrelated malformed settings are ignored; a missing or `null`
+    /// list means every node; anything else that is not a list of node ids
+    /// is an error, so placement fails closed.
+    pub async fn get_sandbox_allowed_node_ids(
+        &self,
+    ) -> Result<Option<Vec<i32>>, ConfigServiceError> {
+        let record = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(value) = record.and_then(|row| {
+            row.data
+                .get("agent_sandbox")
+                .and_then(|section| section.get("allowed_node_ids"))
+                .cloned()
+        }) else {
+            return Ok(None);
+        };
+        serde_json::from_value(value).map_err(|_| ConfigServiceError::MalformedSettingsSection {
+            section: "agent_sandbox.allowed_node_ids",
         })
     }
 
@@ -1135,14 +1312,37 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         // The handler's earlier snapshot is advisory only. Rebase against the
         // authoritative row while its write lock is held, before serializing.
-        let locked_settings = existing
-            .as_ref()
-            .map(|model| AppSettings::from_json(model.data.clone()))
-            .unwrap_or_default();
+        let locked_settings = match existing.as_ref() {
+            Some(model) => serde_json::from_value(model.data.clone()).map_err(|_| {
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "settings",
+                }
+            })?,
+            None => AppSettings::default(),
+        };
         // Consent belongs to the SystemAdmin-only plugin endpoint. A generic
         // settings save must not undo a consent update committed before this lock.
         settings.plugin_installation_reporting_enabled =
             locked_settings.plugin_installation_reporting_enabled;
+        // CA lifecycle and join tokens have dedicated, locked write paths. Generic
+        // settings saves must neither erase them nor revert a concurrent rotation.
+        settings.multi_node.cluster_ca_cert_pem =
+            locked_settings.multi_node.cluster_ca_cert_pem.clone();
+        settings.multi_node.cluster_ca_key_encrypted =
+            locked_settings.multi_node.cluster_ca_key_encrypted.clone();
+        settings.multi_node.join_token_hash = locked_settings.multi_node.join_token_hash.clone();
+        // The sandbox placement allow-list is owned by
+        // `set_sandbox_allowed_node_ids` (ADR-048); a settings-page save built
+        // from an older snapshot must not revert it.
+        settings.agent_sandbox.allowed_node_ids =
+            locked_settings.agent_sandbox.allowed_node_ids.clone();
+        // The preview gateway section is owned by
+        // `update_preview_gateway_settings`, which its handlers call while
+        // holding the gateway's operations lock, so the saved settings and the
+        // gateway's containers change together. A generic save must neither
+        // change the section outside that lock nor revert it from an older
+        // snapshot.
+        settings.preview_gateway = locked_settings.preview_gateway.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
         // The geo section's freshness metadata belongs to the refresh job, and
         // its license key belongs to whichever request last submitted one.
@@ -1434,6 +1634,199 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         self.update_settings(settings).await
     }
 
+    /// Change the preview gateway settings under the settings-row lock and
+    /// return them as saved. Generic settings saves restore this section
+    /// from the locked row, so this is its only write path: the preview
+    /// gateway handlers call it while holding the gateway's operations lock.
+    ///
+    /// A stored section that does not parse is reported rather than
+    /// replaced, so nothing in it is lost to a partial update.
+    pub async fn update_preview_gateway_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<PreviewGatewaySettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut PreviewGatewaySettings),
+    {
+        let malformed = || ConfigServiceError::MalformedSettingsSection {
+            section: "preview_gateway",
+        };
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        let mut document = existing
+            .as_ref()
+            .map(|model| model.data.clone())
+            .unwrap_or_else(|| AppSettings::default().to_json());
+        let fields = document.as_object_mut().ok_or_else(malformed)?;
+        let mut gateway = match fields.get("preview_gateway") {
+            None | Some(serde_json::Value::Null) => PreviewGatewaySettings::default(),
+            Some(section) => serde_json::from_value(section.clone()).map_err(|_| malformed())?,
+        };
+        update_fn(&mut gateway);
+        let section = serde_json::to_value(&gateway).map_err(|error| {
+            ConfigServiceError::Serialization(format!(
+                "Failed to serialize the preview gateway settings section: {error}"
+            ))
+        })?;
+        fields.insert("preview_gateway".to_string(), section);
+
+        if let Some(model) = existing {
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(document),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(gateway)
+    }
+
+    /// Set the sandbox placement allow-list (ADR-048) under the settings-row
+    /// lock. Generic settings saves restore this value from the locked row,
+    /// so this is its only write path. `None` = every node may run sandboxes.
+    pub async fn set_sandbox_allowed_node_ids(
+        &self,
+        allowed_node_ids: Option<Vec<i32>>,
+    ) -> Result<(), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        if let Some(model) = existing {
+            let mut document = model.data.clone();
+            let fields =
+                document
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "agent_sandbox",
+                    })?;
+            let section = fields
+                .entry("agent_sandbox")
+                .or_insert_with(|| serde_json::json!({}));
+            if section.is_null() {
+                *section = serde_json::json!({});
+            }
+            let section =
+                section
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "agent_sandbox",
+                    })?;
+            section.insert(
+                "allowed_node_ids".to_string(),
+                serde_json::json!(allowed_node_ids),
+            );
+
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            let mut settings = AppSettings::default();
+            settings.agent_sandbox.allowed_node_ids = allowed_node_ids;
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(settings.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(())
+    }
+
+    /// Set the legacy join-token hash under the settings-row lock.
+    ///
+    /// Bulk settings saves deliberately restore this server-owned value from
+    /// the locked row. Token generation and revocation must therefore write
+    /// this field directly, without a cached whole-document snapshot. Keep
+    /// every other key, including cluster CA material, as it was committed.
+    pub async fn set_join_token_hash(
+        &self,
+        token_hash: Option<String>,
+    ) -> Result<(), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        if let Some(model) = existing {
+            let mut document = model.data.clone();
+            let fields =
+                document
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "multi_node",
+                    })?;
+            let multi_node = fields
+                .entry("multi_node")
+                .or_insert_with(|| serde_json::json!({}));
+            if multi_node.is_null() {
+                *multi_node = serde_json::json!({});
+            }
+            let multi_node =
+                multi_node
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "multi_node",
+                    })?;
+            multi_node.insert("join_token_hash".to_string(), serde_json::json!(token_hash));
+
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            let mut settings = AppSettings::default();
+            settings.multi_node.join_token_hash = token_hash;
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(settings.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(())
+    }
+
     /// Atomically update only managed Cloud export consent. The settings row
     /// is shared by many subsystems, so reading through the cache and writing
     /// the whole document would lose concurrent unrelated changes.
@@ -1493,18 +1886,8 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         Ok(current)
     }
 
-    /// ADR-045 §5: set `cloud.console_access_enabled` in isolation, exactly
-    /// once, the moment the unattended first-boot bootstrap
-    /// (`TEMPS_CLOUD_ENROLLMENT_CODE`) establishes a *new* Cloud link --
-    /// never called on the operator-pasted enrollment path, which leaves the
-    /// field at its `false` default per `update_cloud_features`'s normal
-    /// explicit-consent rule.
-    ///
-    /// Same exclusive-row-lock-and-merge shape as [`Self::update_cloud_features`]
-    /// (touching only this one field, not the whole document) rather than a
-    /// read/mutate/`update_settings` round-trip through the 5s cache, for the
-    /// same reason: the settings row is shared by many subsystems and a
-    /// concurrent unrelated write must not be lost.
+    /// Persist only the console-access switch under the shared settings lock.
+    /// Used for the explicit unattended-enrollment bootstrap.
     pub async fn set_console_access_enabled(
         &self,
         enabled: bool,
@@ -1540,6 +1923,58 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .await?;
         }
         transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(current)
+    }
+
+    /// Atomically set only `cloud.backend_url`, leaving the rest of the
+    /// shared settings row untouched. Mirrors [`Self::update_cloud_features`]'s
+    /// locked read-modify-write for the same reason: the settings row is
+    /// shared, and a `get_settings`/`update_settings` round trip through the
+    /// 5s cache would lose a concurrent unrelated write.
+    ///
+    /// Used by the `TEMPS_CLOUD_BACKEND_URL` one-shot bootstrap input, which
+    /// runs once at first boot before any admin has touched Cloud settings --
+    /// the caller is responsible for validating `backend_url` first (see
+    /// `CloudService::apply_bootstrap_backend_url`); this just persists it.
+    pub async fn set_cloud_backend_url(
+        &self,
+        backend_url: &str,
+    ) -> Result<AppSettings, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        current.cloud.backend_url = backend_url.to_string();
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        // Invalidate instead of publishing this transaction's clone: another
+        // writer may commit later but update the cache earlier, and publishing
+        // here would then regress the cache out of commit order.
         self.invalidate_settings_cache().await;
         Ok(current)
     }
@@ -2171,7 +2606,21 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         &self,
         deployment_slug: &str,
     ) -> Result<String, ConfigServiceError> {
+        self.get_deployment_url_by_slug_with_source(deployment_slug)
+            .await
+            .map(|(url, _)| url)
+    }
+
+    /// Get the deployment URL and whether an explicit external URL supplied
+    /// its transport scheme/port. Monitor routing consumes both values from a
+    /// single settings snapshot so public/manual checks do not gain a second
+    /// database failure path.
+    pub async fn get_deployment_url_by_slug_with_source(
+        &self,
+        deployment_slug: &str,
+    ) -> Result<(String, bool), ConfigServiceError> {
         let settings = self.get_settings().await?;
+        let uses_external_url = settings.external_url.is_some();
 
         // Determine protocol and port from external_url if set.
         //
@@ -2221,7 +2670,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             format!("{}://{}", protocol, hostname)
         };
 
-        Ok(url)
+        Ok((url, uses_external_url))
     }
 }
 
@@ -2262,6 +2711,79 @@ mod tests {
     }
 
     impl rand::TryCryptoRng for FailingCryptoRng {}
+
+    #[tokio::test]
+    async fn persisted_installation_mode_is_authoritative() {
+        let database = match temps_database::test_utils::TestDatabase::new().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping installation mode test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("installation mode test database failed: {error}"),
+        };
+
+        assert_eq!(
+            installation_mode(&database.db).await.expect("fresh mode"),
+            InstallationMode::Local
+        );
+        database
+            .db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "CREATE TABLE stateless_control_plane (id INTEGER PRIMARY KEY, instance_id TEXT NOT NULL)".to_string(),
+            ))
+            .await
+            .expect("create identity table");
+        assert_eq!(
+            installation_mode(&database.db).await.expect("unbound mode"),
+            InstallationMode::Local
+        );
+        database
+            .db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "INSERT INTO stateless_control_plane (id, instance_id) VALUES (1, 'durable-instance')".to_string(),
+            ))
+            .await
+            .expect("bind stateless identity");
+        assert_eq!(
+            installation_mode(&database.db)
+                .await
+                .expect("persisted mode"),
+            InstallationMode::Stateless
+        );
+        assert_eq!(
+            stateless_instance_id(&database.db)
+                .await
+                .expect("persisted instance ID")
+                .as_deref(),
+            Some("durable-instance")
+        );
+    }
+
+    #[tokio::test]
+    async fn installation_mode_preserves_database_failure_context() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "identity database unavailable".to_string(),
+            )])
+            .into_connection();
+
+        let error = installation_mode(&db)
+            .await
+            .expect_err("database lookup must fail closed");
+        assert!(matches!(
+            error,
+            ConfigServiceError::InstallationModeDatabase { operation, source }
+                if operation == "checking the installation identity table"
+                    && source.to_string().contains("identity database unavailable")
+        ));
+    }
 
     #[test]
     fn randomness_failure_preserves_config_operation_context() {
@@ -2390,6 +2912,88 @@ mod tests {
                 AgentSandboxSettings::default().default_provider
             );
         }
+    }
+
+    async fn allowed_node_ids_from(
+        data: serde_json::Value,
+    ) -> Result<Option<Vec<i32>>, ConfigServiceError> {
+        let row = settings::Model {
+            id: 1,
+            data,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        ConfigService::new(test_config(), db)
+            .get_sandbox_allowed_node_ids()
+            .await
+    }
+
+    #[tokio::test]
+    async fn allow_list_survives_malformed_unrelated_settings() {
+        // The whole-document decode fails here and would fall back to the
+        // default ("every node"); the allow-list must still be read.
+        let mut row = settings_row("example.test");
+        row.data["preview_domain"] = serde_json::json!(false);
+        row.data["agent_sandbox"]["providers"] = serde_json::json!("not-a-map");
+        row.data["agent_sandbox"]["allowed_node_ids"] = serde_json::json!([3, 7]);
+        assert!(AppSettings::from_json(row.data.clone())
+            .agent_sandbox
+            .allowed_node_ids
+            .is_none());
+
+        assert_eq!(
+            allowed_node_ids_from(row.data).await.expect("allow-list"),
+            Some(vec![3, 7])
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_allow_list_fails_closed() {
+        for malformed in [
+            serde_json::json!("3,7"),
+            serde_json::json!([3, "seven"]),
+            serde_json::json!({"ids": [3]}),
+        ] {
+            let error = allowed_node_ids_from(serde_json::json!({
+                "agent_sandbox": {"allowed_node_ids": malformed}
+            }))
+            .await
+            .expect_err("a malformed allow-list must not read as 'every node'");
+            assert!(matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "agent_sandbox.allowed_node_ids"
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_or_null_allow_list_allows_every_node() {
+        for data in [
+            serde_json::json!({"unrelated": true}),
+            serde_json::json!({"agent_sandbox": {}}),
+            serde_json::json!({"agent_sandbox": {"allowed_node_ids": null}}),
+        ] {
+            assert_eq!(allowed_node_ids_from(data).await.expect("default"), None);
+        }
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<settings::Model>::new()])
+                .into_connection(),
+        );
+        assert_eq!(
+            ConfigService::new(test_config(), db)
+                .get_sandbox_allowed_node_ids()
+                .await
+                .expect("no settings row"),
+            None
+        );
     }
 
     #[test]
@@ -2837,6 +3441,445 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_settings_save_preserves_authoritative_ca_and_join_token() {
+        for submitted in [None, Some("stale-or-client-supplied")] {
+            let mut locked =
+                settings_row_with_cluster_ca(Some("authoritative-cert"), Some("authoritative-key"));
+            let mut locked_settings = AppSettings::from_json(locked.data.clone());
+            locked_settings.multi_node.join_token_hash = Some("authoritative-token-hash".into());
+            locked.data = locked_settings.to_json();
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Sqlite)
+                    .append_query_results([
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                    ])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db.clone());
+            let mut incoming = AppSettings {
+                preview_domain: "updated.example.test".into(),
+                ..Default::default()
+            };
+            incoming.multi_node.cluster_ca_cert_pem = submitted.map(str::to_string);
+            incoming.multi_node.cluster_ca_key_encrypted = submitted.map(str::to_string);
+            incoming.multi_node.join_token_hash = submitted.map(str::to_string);
+            service
+                .update_settings(incoming)
+                .await
+                .expect("unrelated settings save");
+            let saved = service.get_settings().await.unwrap();
+            assert_eq!(saved.preview_domain, "updated.example.test");
+            assert_eq!(
+                saved.multi_node.cluster_ca_cert_pem.as_deref(),
+                Some("authoritative-cert")
+            );
+            assert_eq!(
+                saved.multi_node.cluster_ca_key_encrypted.as_deref(),
+                Some("authoritative-key")
+            );
+            assert_eq!(
+                saved.multi_node.join_token_hash.as_deref(),
+                Some("authoritative-token-hash")
+            );
+            drop(service);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let sql = transactions
+                .iter()
+                .flat_map(|t| t.statements())
+                .map(ToString::to_string)
+                .find(|sql| sql.starts_with("UPDATE "))
+                .expect("saved settings SQL");
+            assert!(sql.contains("authoritative-cert") && sql.contains("authoritative-key"));
+            assert!(!sql.contains("stale-or-client-supplied"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_settings_save_rejects_malformed_unrelated_field_before_touching_cluster_trust() {
+        let mut row =
+            settings_row_with_cluster_ca(Some("authoritative-cert"), Some("authoritative-key"));
+        row.data["multi_node"]["join_token_hash"] = serde_json::json!("authoritative-hash");
+        row.data["preview_domain"] = serde_json::json!(42);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row.clone()], [row.clone()], [row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .update_settings(AppSettings::default())
+            .await
+            .expect_err("malformed stored settings must abort the bulk save");
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "settings"
+                }
+            ),
+            "unexpected settings-save error: {error:?}"
+        );
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
+    async fn join_token_writes_survive_stale_bulk_settings_saves() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping join-token integration test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("join-token test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+
+        service
+            .set_join_token_hash(Some("new-token-hash".into()))
+            .await
+            .expect("generate join token");
+        let generated = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read generated token")
+            .expect("settings row");
+        assert_eq!(
+            AppSettings::from_json(generated.data)
+                .multi_node
+                .join_token_hash
+                .as_deref(),
+            Some("new-token-hash")
+        );
+
+        service
+            .update_settings(stale_bulk_document.clone())
+            .await
+            .expect("stale bulk save after token creation");
+        assert_eq!(
+            service
+                .get_settings()
+                .await
+                .expect("settings after stale save")
+                .multi_node
+                .join_token_hash
+                .as_deref(),
+            Some("new-token-hash")
+        );
+
+        service
+            .set_join_token_hash(None)
+            .await
+            .expect("revoke join token");
+        service
+            .update_settings(stale_bulk_document)
+            .await
+            .expect("stale bulk save after token revocation");
+        let revoked = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read revoked token")
+            .expect("settings row");
+        assert_eq!(
+            AppSettings::from_json(revoked.data)
+                .multi_node
+                .join_token_hash,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_gateway_settings_change_only_through_their_own_write_path() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping preview gateway settings test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("preview gateway settings test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+        assert!(stale_bulk_document.preview_gateway.enabled);
+
+        let saved = service
+            .update_preview_gateway_settings(|gateway| {
+                gateway.enabled = false;
+                gateway.host_port = 18_090;
+            })
+            .await
+            .expect("disable the preview gateway");
+        assert!(!saved.enabled);
+        assert_eq!(saved.host_port, 18_090);
+
+        // A settings-page save built before the change does not revert it,
+        // and one that sets the section itself does not change it.
+        service
+            .update_settings(stale_bulk_document.clone())
+            .await
+            .expect("stale bulk save");
+        let mut rewrite = stale_bulk_document;
+        rewrite.preview_gateway.enabled = true;
+        rewrite.preview_gateway.image = "registry.example.test/gateway:other".into();
+        service
+            .update_settings(rewrite)
+            .await
+            .expect("bulk save that sets the gateway section");
+
+        let stored = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read settings")
+            .expect("settings row");
+        let gateway = AppSettings::from_json(stored.data).preview_gateway;
+        assert!(
+            !gateway.enabled,
+            "a generic settings save re-enabled the gateway"
+        );
+        assert_eq!(gateway.host_port, 18_090);
+        assert!(
+            gateway.image.is_empty(),
+            "a generic settings save changed the gateway image to {}",
+            gateway.image
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_gateway_write_rejects_a_malformed_section_without_overwriting_it() {
+        let mut row = settings_row("preserved.example.test");
+        row.data["preview_gateway"] = serde_json::json!({ "enabled": "sometimes" });
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .update_preview_gateway_settings(|gateway| gateway.enabled = false)
+            .await
+            .expect_err("a malformed preview gateway section must abort the write");
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "preview_gateway"
+                }
+            ),
+            "unexpected preview gateway write error: {error:?}"
+        );
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
+    async fn join_token_write_rejects_malformed_multi_node_without_overwriting_settings() {
+        let mut row = settings_row("preserved.example.test");
+        row.data["multi_node"] = serde_json::json!(["invalid"]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .set_join_token_hash(Some("new-token-hash".into()))
+            .await
+            .expect_err("malformed multi-node settings must abort token write");
+        assert!(matches!(
+            error,
+            ConfigServiceError::MalformedSettingsSection {
+                section: "multi_node"
+            }
+        ));
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    fn update_and_insert_sql(db: Arc<DbConnection>) -> Vec<String> {
+        Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|t| t.statements())
+            // Postgres escapes the JSON's quotes in the logged literal.
+            .map(|statement| statement.to_string().replace('\\', ""))
+            .filter(|sql| sql.starts_with("UPDATE ") || sql.starts_with("INSERT "))
+            .collect()
+    }
+
+    /// ADR-048: the placement allow-list write touches only its own key and
+    /// keeps every other setting as stored.
+    #[tokio::test]
+    async fn sandbox_allow_list_write_updates_only_its_key() {
+        for (allowed, expected) in [
+            (Some(vec![0, 3]), r#""allowed_node_ids":[0,3]"#),
+            (None, r#""allowed_node_ids":null"#),
+        ] {
+            let mut row = settings_row("keep.example.test");
+            row.data["agent_sandbox"]["allowed_node_ids"] = serde_json::json!([7]);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    // Locked read, then UPDATE ... RETURNING.
+                    .append_query_results([[row.clone()], [row]])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db.clone());
+
+            service
+                .set_sandbox_allowed_node_ids(allowed.clone())
+                .await
+                .expect("save allow-list");
+            drop(service);
+
+            let sql = update_and_insert_sql(db);
+            assert_eq!(sql.len(), 1, "{sql:?}");
+            assert!(sql[0].starts_with("UPDATE "), "{}", sql[0]);
+            assert!(sql[0].contains(expected), "{allowed:?}: {}", sql[0]);
+            assert!(sql[0].contains("keep.example.test"), "{}", sql[0]);
+            assert!(!sql[0].contains(r#""allowed_node_ids":[7]"#), "{}", sql[0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_allow_list_write_creates_the_settings_row_when_missing() {
+        let mut created = AppSettings::default();
+        created.agent_sandbox.allowed_node_ids = Some(vec![0]);
+        let created_row = settings::Model {
+            id: 1,
+            data: created.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<settings::Model>::new()])
+                // INSERT ... RETURNING.
+                .append_query_results([[created_row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        service
+            .set_sandbox_allowed_node_ids(Some(vec![0]))
+            .await
+            .expect("create settings with the allow-list");
+        drop(service);
+
+        let sql = update_and_insert_sql(db);
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(sql[0].starts_with("INSERT "), "{}", sql[0]);
+        assert!(sql[0].contains(r#""allowed_node_ids":[0]"#), "{}", sql[0]);
+    }
+
+    /// A stored `agent_sandbox` that is not an object is reported, not
+    /// replaced (that would reset every other sandbox setting).
+    #[tokio::test]
+    async fn sandbox_allow_list_write_refuses_a_malformed_section() {
+        for malformed in [
+            serde_json::json!(["not", "an", "object"]),
+            serde_json::json!({ "agent_sandbox": "not an object" }),
+        ] {
+            let row = settings::Model {
+                id: 1,
+                data: malformed.clone(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([[row]])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db.clone());
+
+            let error = service
+                .set_sandbox_allowed_node_ids(Some(vec![0]))
+                .await
+                .expect_err("malformed settings must not be overwritten");
+            assert!(
+                matches!(
+                    error,
+                    ConfigServiceError::MalformedSettingsSection {
+                        section: "agent_sandbox"
+                    }
+                ),
+                "{malformed}: {error:?}"
+            );
+            drop(service);
+            assert!(update_and_insert_sql(db).is_empty(), "{malformed}");
+        }
+    }
+
+    /// A settings-page save built from a snapshot taken before the
+    /// allow-list changed must not revert it: the locked row's value wins.
+    #[tokio::test]
+    async fn bulk_settings_save_preserves_the_sandbox_allow_list() {
+        let mut locked = settings_row("old.example.test");
+        locked.data["agent_sandbox"]["allowed_node_ids"] = serde_json::json!([0, 3]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([vec![locked.clone()], vec![locked.clone()], vec![locked]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+        let mut stale = AppSettings {
+            preview_domain: "new.example.test".into(),
+            ..Default::default()
+        };
+        stale.agent_sandbox.allowed_node_ids = None;
+
+        service
+            .update_settings(stale)
+            .await
+            .expect("unrelated settings save");
+        let saved = service.get_settings().await.expect("saved settings");
+        assert_eq!(saved.preview_domain, "new.example.test");
+        assert_eq!(saved.agent_sandbox.allowed_node_ids, Some(vec![0, 3]));
+        drop(service);
+
+        let sql = update_and_insert_sql(db);
+        let update = sql
+            .iter()
+            .find(|s| s.starts_with("UPDATE "))
+            .expect("settings update");
+        assert!(update.contains(r#""allowed_node_ids":[0,3]"#), "{update}");
+    }
+
+    #[tokio::test]
     async fn initialize_cluster_ca_material_persists_first_complete_pair() {
         let empty = settings_row_with_cluster_ca(None, None);
         let persisted = settings_row_with_cluster_ca(Some("generated-cert"), Some("generated-key"));
@@ -3018,6 +4061,14 @@ mod tests {
             control_plane_underlay_address: Some("10.200.4.1".to_string()),
             control_plane_overlay_ready: control_plane_compute_cidr.is_some(),
             control_plane_setup_generation: 1,
+            wireguard_enabled: false,
+            wireguard_cidr: "10.201.0.0/16".into(),
+            wireguard_port: 51820,
+            control_plane_wg_public_key: None,
+            control_plane_wg_endpoint: None,
+            node_api_port: None,
+            mesh_hub_node_id: None,
+            mesh_hub_control_plane: false,
             updated_at: Utc::now(),
         }
     }
@@ -3627,7 +4678,183 @@ mod tests {
         temps_core::tls::set_insecure_tls(false);
     }
 
-    // ── ADR-045 §5: `cloud.console_access_enabled` ─────────────────────
+    /// The `TEMPS_CLOUD_BACKEND_URL` bootstrap path's only write: confirms
+    /// `set_cloud_backend_url` persists just that one field, round trips
+    /// through the cache, and leaves unrelated settings (here, the preview
+    /// domain) untouched.
+    #[tokio::test]
+    async fn set_cloud_backend_url_persists_and_round_trips() {
+        let mut row = settings_row("example.test");
+        let mut initial = AppSettings::from_json(row.data.clone());
+        initial.cloud.backend_url = "https://app.temps.sh".to_string();
+        row.data = initial.to_json();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        let returned = svc
+            .set_cloud_backend_url("https://cloud.staging.example")
+            .await
+            .expect("set_cloud_backend_url");
+        assert_eq!(returned.cloud.backend_url, "https://cloud.staging.example");
+        assert_eq!(
+            returned.preview_domain, "example.test",
+            "unrelated settings must survive the targeted write"
+        );
+
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(update_sql.contains("cloud.staging.example"), "{update_sql}");
+    }
+
+    #[tokio::test]
+    async fn stateless_telemetry_id_is_random_stored_and_not_derived_from_instance_id() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!(
+                    "Skipping stateless telemetry id integration test: Docker unavailable: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("stateless telemetry id test database failed: {error}"),
+        };
+        let db = database.db.as_ref();
+
+        // Local installation: no binding row, so the data-directory file is used.
+        assert_eq!(stateless_telemetry_anonymous_id(db).await.unwrap(), None);
+
+        // Bind a stateless installation under a guessable operator-chosen name.
+        db.execute_unprepared(
+            "INSERT INTO stateless_control_plane \
+             (id, instance_id, management_url, storage_identity, secret_verifier) \
+             VALUES (1, 'production', 'https://console.example.test', \
+             'bucket/prefix', 'verifier')",
+        )
+        .await
+        .expect("bind stateless installation");
+
+        let id = stateless_telemetry_anonymous_id(db)
+            .await
+            .expect("read telemetry id")
+            .expect("stateless installations have a telemetry id");
+        let hex = id.strip_prefix("inst_").expect("inst_ prefix");
+        assert_eq!(hex.len(), 32, "{id}");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+
+        // Every replica reads the same stored value.
+        assert_eq!(
+            stateless_telemetry_anonymous_id(db)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(id.as_str())
+        );
+
+        // The old scheme was inst_ + hex(sha256(instance_id)[..16]), which anyone
+        // could precompute from common names. The stored id must not match it.
+        use sha2::{Digest, Sha256};
+        let guessable = format!("inst_{}", hex::encode(&Sha256::digest(b"production")[..16]));
+        assert_ne!(id, guessable);
+    }
+
+    #[tokio::test]
+    async fn delivery_default_requires_a_usable_provider_and_profile() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping delivery default test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("delivery default test database failed: {error}"),
+        };
+        let db = database.db.clone();
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let reason = service
+            .delivery_default_unavailable_reason("cloudflare")
+            .await
+            .expect("query")
+            .expect("no Cloudflare DNS provider yet");
+        assert!(reason.contains("DNS Providers"), "{reason}");
+        let reason = service
+            .delivery_default_unavailable_reason("bunny")
+            .await
+            .expect("query")
+            .expect("no Bunny profile yet");
+        assert!(reason.contains("Bunny delivery profile"), "{reason}");
+
+        temps_entities::dns_providers::ActiveModel {
+            name: Set("Cloudflare".into()),
+            provider_type: Set("cloudflare".into()),
+            credentials: Set("{}".into()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert DNS provider");
+        let reason = service
+            .delivery_default_unavailable_reason("cloudflare")
+            .await
+            .expect("query")
+            .expect("no Cloudflare profile yet");
+        assert!(reason.contains("Cloudflare delivery profile"), "{reason}");
+
+        for (name, kind) in [("Cloudflare", "cloudflare"), ("Bunny", "bunny")] {
+            temps_entities::delivery_profiles::ActiveModel {
+                name: Set(name.into()),
+                provider_kind: Set(kind.into()),
+                bunny_pull_zone_id: Set((kind == "bunny").then_some(42)),
+                bunny_hostname: Set((kind == "bunny").then(|| "edge.example.com".into())),
+                bunny_api_key_encrypted: Set((kind == "bunny").then(|| "encrypted".into())),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert delivery profile");
+        }
+        for provider in ["cloudflare", "bunny"] {
+            assert_eq!(
+                service
+                    .delivery_default_unavailable_reason(provider)
+                    .await
+                    .expect("query"),
+                None,
+                "{provider} should be usable"
+            );
+        }
+        assert!(service
+            .delivery_default_unavailable_reason("other")
+            .await
+            .expect("query")
+            .is_some());
+    }
 
     fn settings_row_with_document(document: serde_json::Value) -> settings::Model {
         settings::Model {

@@ -28,6 +28,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm, promptSelect, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, warning, keyValue, info, error as errorOutput } from '../../ui/output.js'
+import { formatMicrocores, parseMillicores } from '../../lib/cpu.js'
 
 export function registerEnvironmentsCommands(program: Command): void {
   const environments = program
@@ -92,6 +93,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .command('set <key> [value]')
     .description('Set an environment variable')
     .option('-e, --environments <names>', 'Comma-separated environment names (interactive if not provided)')
+    .option('--preview', 'Also include in current and future preview environments')
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
     .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew')
@@ -137,10 +139,10 @@ export function registerEnvironmentsCommands(program: Command): void {
     .command('resources <environment>')
     .description('View or set CPU/memory resources for an environment')
     .option('-p, --project <project>', 'Project slug or ID')
-    .option('--cpu <millicores>', 'CPU limit in millicores (e.g., 500 = 0.5 CPU)')
+    .option('--cpu <millicores>', 'CPU limit in millicores (1000 = 1 core, e.g., 500 = 0.5 CPU)')
     .option('--memory <mb>', 'Memory limit in MB (e.g., 512)')
-    .option('--cpu-request <millicores>', 'CPU request in millicores (guaranteed minimum)')
-    .option('--memory-request <mb>', 'Memory request in MB (guaranteed minimum)')
+    .option('--cpu-request <millicores>', 'CPU request in millicores (recorded; not currently enforced)')
+    .option('--memory-request <mb>', 'Memory request in MB (recorded; not currently enforced)')
     .option('--json', 'Output in JSON format')
     .action(resourcesCmd)
 
@@ -654,6 +656,7 @@ async function setEnvVar(
   }
 
   const projectId = await getProjectId(project)
+  const includeInPreview = resolvePreviewInclusion(options.preview, options.update, existingVar?.include_in_preview)
 
   if (existingVar && options.update) {
     // Update existing variable
@@ -665,7 +668,7 @@ async function setEnvVar(
           key,
           value: actualValue,
           environment_ids: environmentIds,
-          include_in_preview: options.preview !== false,
+          include_in_preview: includeInPreview,
           // Only sent when --secret is passed. Omitting it leaves the existing
           // flag untouched; sending false against an already-secret variable is
           // rejected by the API, since promotion is deliberately one-way.
@@ -685,7 +688,7 @@ async function setEnvVar(
           key,
           value: actualValue,
           environment_ids: environmentIds,
-          include_in_preview: options.preview !== false,
+          include_in_preview: includeInPreview,
           ...(options.secret ? { is_secret: true } : {}),
         },
       })
@@ -695,6 +698,17 @@ async function setEnvVar(
   }
 
   info(`Environments: ${envs.filter(e => environmentIds.includes(e.id)).map(e => e.name).join(', ')}`)
+  info(includeInPreview
+    ? 'Current and future preview environments are also included.'
+    : 'Other and future preview environments are excluded (use --preview to include them).')
+}
+
+export function resolvePreviewInclusion(
+  requested: boolean | undefined,
+  updating: boolean | undefined,
+  existing: boolean | undefined,
+): boolean {
+  return requested ?? (updating ? existing ?? false : false)
 }
 
 async function deleteEnvVar(
@@ -1100,15 +1114,24 @@ interface ResourcesOptions {
 }
 
 export interface ResourceUpdateBody {
+  /** Microcores (1_000_000 = one core). */
   cpu_limit?: number | null
+  /** Microcores (1_000_000 = one core). */
   cpu_request?: number | null
   memory_limit?: number | null
   memory_request?: number | null
 }
 
+/** Parse a whole number, rejecting trailing junk (`512mb`) and decimals. */
+function parseWholeNumber(value: string): number | undefined {
+  const trimmed = value.trim()
+  return /^\d+$/.test(trimmed) ? Number(trimmed) : undefined
+}
+
 /**
  * Parse and validate the --cpu/--memory/--cpu-request/--memory-request flags
- * into the API's update body. A request left unspecified defaults to the
+ * into the API's update body. The CPU flags take millicores and are converted
+ * to the microcores the API stores. A request left unspecified defaults to the
  * limit being set in the same call — otherwise a container could get a limit
  * with no matching guaranteed minimum, which the scheduler would silently
  * treat as "no request" rather than "same as limit".
@@ -1120,36 +1143,33 @@ export function parseResourceUpdate(
 
   let cpuLimit: number | undefined
   if (options.cpu) {
-    cpuLimit = parseInt(options.cpu, 10)
-    if (isNaN(cpuLimit) || cpuLimit <= 0) {
-      return { error: 'CPU must be a positive number (millicores)' }
-    }
+    const parsed = parseMillicores(options.cpu, 'CPU', true)
+    if ('error' in parsed) return parsed
+    cpuLimit = parsed.microcores
     updateBody.cpu_limit = cpuLimit
   }
 
   let memoryLimit: number | undefined
   if (options.memory) {
-    memoryLimit = parseInt(options.memory, 10)
-    if (isNaN(memoryLimit) || memoryLimit <= 0) {
+    memoryLimit = parseWholeNumber(options.memory)
+    if (memoryLimit === undefined || memoryLimit <= 0) {
       return { error: 'Memory must be a positive number (MB)' }
     }
     updateBody.memory_limit = memoryLimit
   }
 
   if (options.cpuRequest) {
-    const cpuRequest = parseInt(options.cpuRequest, 10)
-    if (isNaN(cpuRequest) || cpuRequest <= 0) {
-      return { error: 'CPU request must be a positive number (millicores)' }
-    }
-    updateBody.cpu_request = cpuRequest
+    const parsed = parseMillicores(options.cpuRequest, 'CPU request', false)
+    if ('error' in parsed) return parsed
+    updateBody.cpu_request = parsed.microcores
   } else if (cpuLimit !== undefined) {
     // Default request to same as limit when setting limit
     updateBody.cpu_request = cpuLimit
   }
 
   if (options.memoryRequest) {
-    const memoryRequest = parseInt(options.memoryRequest, 10)
-    if (isNaN(memoryRequest) || memoryRequest <= 0) {
+    const memoryRequest = parseWholeNumber(options.memoryRequest)
+    if (memoryRequest === undefined || memoryRequest <= 0) {
       return { error: 'Memory request must be a positive number (MB)' }
     }
     updateBody.memory_request = memoryRequest
@@ -1162,6 +1182,17 @@ export function parseResourceUpdate(
 }
 
 async function resourcesCmd(environment: string, options: ResourcesOptions): Promise<void> {
+  // Validate the flags before any network call, so a bad value fails fast and
+  // with a non-zero exit (a script passing microcores from the old workaround
+  // must stop instead of carrying on as if it worked).
+  const hasResourceOptions = options.cpu || options.memory || options.cpuRequest || options.memoryRequest
+  const parsed = hasResourceOptions ? parseResourceUpdate(options) : undefined
+  if (parsed && 'error' in parsed) {
+    errorOutput(parsed.error)
+    process.exitCode = 1
+    return
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -1188,16 +1219,8 @@ async function resourcesCmd(environment: string, options: ResourcesOptions): Pro
     return
   }
 
-  // Check if any resource options are provided
-  const hasResourceOptions = options.cpu || options.memory || options.cpuRequest || options.memoryRequest
-
-  if (hasResourceOptions) {
+  if (parsed) {
     // Update resources
-    const parsed = parseResourceUpdate(options)
-    if ('error' in parsed) {
-      errorOutput(parsed.error)
-      return
-    }
     const updateBody = parsed.body
 
     const updatedEnv = await withSpinner('Updating resources...', async () => {
@@ -1247,10 +1270,10 @@ async function resourcesCmd(environment: string, options: ResourcesOptions): Pro
   }
 }
 
-export function formatCpu(millicores: number | null | undefined): string {
-  if (millicores == null) return colors.muted('not set')
-  const cores = millicores / 1000
-  return `${millicores}m (${cores} CPU)`
+/** Render a CPU value stored in microcores (1_000_000 = one core). */
+export function formatCpu(microcores: number | null | undefined): string {
+  if (microcores == null) return colors.muted('not set')
+  return formatMicrocores(microcores)
 }
 
 export function formatMemory(mb: number | null | undefined): string {
@@ -1273,7 +1296,7 @@ function displayResources(env: EnvironmentResponse | null | undefined): void {
   newline()
 
   info(`${colors.bold('Limits')} = maximum resources the container can use`)
-  info(`${colors.bold('Requests')} = guaranteed minimum resources`)
+  info(`${colors.bold('Requests')} = recorded with the settings, not currently enforced`)
   newline()
   info(`Example: ${colors.muted('temps env resources my-project production --cpu 1000 --memory 512')}`)
 }
@@ -1564,6 +1587,14 @@ export function parseReplicaCount(
 async function scaleCmd(
   options: { project?: string; environment: string; replicas?: string; json?: boolean }
 ): Promise<void> {
+  // Validate before any network call so a bad count fails fast and non-zero.
+  const parsedReplicas = options.replicas !== undefined ? parseReplicaCount(options.replicas) : undefined
+  if (parsedReplicas && 'error' in parsedReplicas) {
+    errorOutput(parsedReplicas.error)
+    process.exitCode = 1
+    return
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -1596,13 +1627,8 @@ async function scaleCmd(
     return
   }
 
-  if (options.replicas !== undefined) {
+  if (parsedReplicas) {
     // Set replicas
-    const parsedReplicas = parseReplicaCount(options.replicas)
-    if ('error' in parsedReplicas) {
-      errorOutput(parsedReplicas.error)
-      return
-    }
     const replicaCount = parsedReplicas.replicas
     if (parsedReplicas.warning) {
       warning(parsedReplicas.warning)

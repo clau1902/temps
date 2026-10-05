@@ -17,9 +17,13 @@
 //! application. So it takes `&self`, returns `()`, and the worst it can do is
 //! silently... no: the worst it can do is *count a drop the operator can see*.
 
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
+use sqlx::{Connection as _, PgConnection};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use temps_cloud_protocol::{
@@ -47,6 +51,10 @@ const INCOMING_BATCH_CAPACITY: usize = 8;
 /// offering the next, so this is headroom rather than a working set, and it
 /// bounds what such a caller can cost a 4 GB instance.
 const SCOPE_SPOOL_CAPACITY: usize = BATCH_SIZE * 2;
+#[cfg(not(test))]
+const STATE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STATE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// What a flush attempt did. Returned so a caller can log or schedule backoff.
 #[derive(Debug, Clone, PartialEq)]
@@ -143,6 +151,16 @@ struct IncomingBatch {
     spans: Vec<SpanRecord>,
 }
 
+struct PostgresStateWrite {
+    ciphertext: String,
+    response: SyncSender<Result<(), String>>,
+}
+
+enum StatePersistence {
+    Local,
+    Postgres(SyncSender<PostgresStateWrite>),
+}
+
 /// Refused because a submission scope is already open on this link.
 ///
 /// Scoped submissions are deliberately serialized: two of them would
@@ -176,15 +194,17 @@ pub struct SubmissionScopeBusy;
 /// after the first activation — a decision they made once and cannot see being
 /// undone.
 ///
-/// The distinction is drawn on the **tenant**, not on the token, because that is
-/// what "a link that did not exist before" actually means. A fresh token for the
-/// same tenant is the same customer proving themselves again. A different tenant
-/// is a different customer, and binding to one is a new link no matter what
-/// stale credential happened to be on disk.
+/// Ordinary enrollment distinguishes links by **tenant**, not token. Targeted
+/// reconnect is explicit because a replacement installation has no local token
+/// or tenant even though Cloud already holds the instance and its history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrollmentKind {
     /// No credential was held before this call: the link is new.
     First,
+    /// A targeted code reattached this installation to an existing Cloud
+    /// identity. Cloud already holds this instance's history, so purchase-time
+    /// activation must not run again.
+    Reconnected { instance_id: Uuid },
     /// A credential was already held, and it was for a *different* tenant than
     /// the one just enrolled — or for no recorded tenant at all, which a
     /// half-written legacy state can produce and which cannot be shown to be
@@ -199,7 +219,21 @@ pub enum EnrollmentKind {
 }
 
 impl EnrollmentKind {
-    fn classify(was_linked: bool, previous_tenant_id: Option<Uuid>, new_tenant_id: Uuid) -> Self {
+    fn classify(
+        was_linked: bool,
+        previous_tenant_id: Option<Uuid>,
+        new_tenant_id: Uuid,
+        requested_instance_id: Uuid,
+        returned_instance_id: Option<Uuid>,
+        reconnected: bool,
+    ) -> Self {
+        if reconnected
+            || returned_instance_id.is_some_and(|instance_id| instance_id != requested_instance_id)
+        {
+            return Self::Reconnected {
+                instance_id: returned_instance_id.unwrap_or(requested_instance_id),
+            };
+        }
         if !was_linked {
             return Self::First;
         }
@@ -227,6 +261,7 @@ impl EnrollmentKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::First => "first",
+            Self::Reconnected { .. } => "reconnected",
             Self::ReboundToNewTenant { .. } => "rebound_to_new_tenant",
             Self::ReEnrolled { .. } => "re_enrolled",
         }
@@ -240,9 +275,8 @@ impl EnrollmentKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstLinkEnrollment {
     /// No credential was held; the code was redeemed and this instance now
-    /// holds the resulting link. Always [`EnrollmentKind::First`] in practice —
-    /// carried so callers log and audit with the same vocabulary as
-    /// [`CloudLink::enroll`].
+    /// holds the resulting link. Carries the kind so callers can distinguish a
+    /// genuinely fresh link from a targeted reconnect.
     Established(EnrollmentKind),
     /// A credential was already held when the call started. The code was
     /// **not** sent to the backend; nothing changed anywhere.
@@ -345,6 +379,11 @@ pub struct CloudLink {
     /// only that layer needs `.changed()` semantics.
     console_access_enabled: AtomicBool,
     encryption: Option<Arc<temps_core::EncryptionService>>,
+    state_persistence: StatePersistence,
+    /// A timed-out PostgreSQL write may still commit after the caller returns.
+    /// Once that outcome is uncertain, every later mutation must fail rather
+    /// than reorder state around the late commit.
+    persistence_poisoned: AtomicBool,
     /// ADR-041 §7c. Set once at startup by whoever owns the write mode.
     telemetry_fallback: RwLock<Option<Arc<dyn CloudTelemetryFallback>>>,
     /// How many projects the most recent fallback handed back to local span
@@ -378,6 +417,112 @@ impl CloudLink {
         encryption: Arc<temps_core::EncryptionService>,
     ) -> Self {
         Self::load_inner(data_dir, agent_version, false, Some(encryption))
+    }
+
+    /// Load Cloud credentials from PostgreSQL for a replaceable stateless
+    /// control plane. PostgreSQL is authoritative after an optional one-time
+    /// migration from the encrypted local state file.
+    pub async fn load_encrypted_postgres(
+        data_dir: PathBuf,
+        agent_version: impl Into<String>,
+        encryption: Arc<temps_core::EncryptionService>,
+        db: Arc<DatabaseConnection>,
+        database_url: String,
+        allow_loopback_development: bool,
+    ) -> Result<Self, crate::state::StateError> {
+        const LOCATION: &str = "PostgreSQL stateless_cloud_link_state";
+        let row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT ciphertext FROM stateless_cloud_link_state WHERE id = 1".to_string(),
+            ))
+            .await
+            .map_err(|error| crate::state::StateError::Database {
+                operation: "load stateless Cloud link state",
+                reason: error.to_string(),
+            })?;
+        let state_path = data_dir.join("cloud-link").join("state.json");
+        let database_state_missing = row.is_none();
+        let state = match row {
+            Some(row) => {
+                let ciphertext: String = row.try_get("", "ciphertext").map_err(|error| {
+                    crate::state::StateError::Database {
+                        operation: "decode stateless Cloud link state",
+                        reason: error.to_string(),
+                    }
+                })?;
+                Some(EnrollmentState::from_encrypted_ciphertext(
+                    &ciphertext,
+                    &encryption,
+                    LOCATION,
+                )?)
+            }
+            None => EnrollmentState::load_encrypted(&state_path, &encryption)?,
+        };
+
+        let (sender, receiver) = sync_channel::<PostgresStateWrite>(1);
+        std::thread::Builder::new()
+            .name("temps-cloud-state-writer".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        while let Ok(write) = receiver.recv() {
+                            let _ = write.response.send(Err(format!(
+                                "could not create Cloud state database runtime: {error}"
+                            )));
+                        }
+                        return;
+                    }
+                };
+                let mut connection = match runtime.block_on(PgConnection::connect(&database_url)) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        while let Ok(write) = receiver.recv() {
+                            let _ = write.response.send(Err(format!(
+                                "could not connect dedicated Cloud state writer: {error}"
+                            )));
+                        }
+                        return;
+                    }
+                };
+                while let Ok(write) = receiver.recv() {
+                    let result = runtime.block_on(
+                        sqlx::query(
+                            "INSERT INTO stateless_cloud_link_state (id, ciphertext, updated_at) \
+                             VALUES (1, $1, NOW()) ON CONFLICT (id) DO UPDATE SET \
+                             ciphertext = EXCLUDED.ciphertext, updated_at = EXCLUDED.updated_at",
+                        )
+                        .bind(write.ciphertext)
+                        .execute(&mut connection),
+                    );
+                    let _ = write
+                        .response
+                        .send(result.map(|_| ()).map_err(|error| error.to_string()));
+                }
+            })
+            .map_err(|error| crate::state::StateError::Database {
+                operation: "start stateless Cloud state writer",
+                reason: error.to_string(),
+            })?;
+        let link = Self::from_loaded(
+            state.clone(),
+            None,
+            state_path,
+            agent_version.into(),
+            allow_loopback_development,
+            Some(encryption),
+            StatePersistence::Postgres(sender),
+        );
+        if database_state_missing {
+            if let Some(state) = state.as_ref() {
+                link.save_state(state)?;
+            }
+        }
+        Ok(link)
     }
 
     /// Local-test constructor. Production callers must use [`CloudLink::load`].
@@ -418,6 +563,26 @@ impl CloudLink {
                 (None, Some(state_path.display().to_string()))
             }
         };
+        Self::from_loaded(
+            state,
+            unreadable_state_path,
+            state_path,
+            agent_version.into(),
+            allow_loopback_development,
+            encryption,
+            StatePersistence::Local,
+        )
+    }
+
+    fn from_loaded(
+        state: Option<EnrollmentState>,
+        unreadable_state_path: Option<String>,
+        state_path: PathBuf,
+        agent_version: String,
+        allow_loopback_development: bool,
+        encryption: Option<Arc<temps_core::EncryptionService>>,
+        state_persistence: StatePersistence,
+    ) -> Self {
         let linked = state.as_ref().is_some_and(EnrollmentState::is_linked);
         let pending_submission = state
             .as_ref()
@@ -439,7 +604,7 @@ impl CloudLink {
             scoped_submission: Mutex::new(None),
             health: RwLock::new(MirrorHealth::Healthy),
             state_path,
-            agent_version: agent_version.into(),
+            agent_version,
             credential_rejected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             telemetry_revocations,
@@ -451,6 +616,8 @@ impl CloudLink {
             notifications_enabled: AtomicBool::new(false),
             console_access_enabled: AtomicBool::new(false),
             encryption,
+            state_persistence,
+            persistence_poisoned: AtomicBool::new(false),
             telemetry_fallback: RwLock::new(None),
             telemetry_reverted_projects: AtomicUsize::new(0),
             telemetry_fallback_pending: AtomicBool::new(false),
@@ -503,6 +670,48 @@ impl CloudLink {
     }
 
     fn save_state(&self, state: &EnrollmentState) -> Result<(), crate::state::StateError> {
+        if let StatePersistence::Postgres(sender) = &self.state_persistence {
+            if self.persistence_poisoned.load(Ordering::Acquire) {
+                return Err(crate::state::StateError::Write {
+                    path: "PostgreSQL stateless_cloud_link_state".to_string(),
+                    reason: "persistence is blocked after an earlier write had an uncertain outcome; restart the control plane before retrying".to_string(),
+                });
+            }
+            let encryption =
+                self.encryption
+                    .as_ref()
+                    .ok_or_else(|| crate::state::StateError::Encryption {
+                        path: "PostgreSQL stateless_cloud_link_state".to_string(),
+                        operation: "encrypt",
+                        reason: "stateless Cloud state requires the installation encryption key"
+                            .to_string(),
+                    })?;
+            let ciphertext = state
+                .to_encrypted_ciphertext(encryption, "PostgreSQL stateless_cloud_link_state")?;
+            let (response, result) = sync_channel(1);
+            sender
+                .try_send(PostgresStateWrite {
+                    ciphertext,
+                    response,
+                })
+                .map_err(|error| crate::state::StateError::Write {
+                    path: "PostgreSQL stateless_cloud_link_state".to_string(),
+                    reason: error.to_string(),
+                })?;
+            let outcome = result.recv_timeout(STATE_WRITE_TIMEOUT).map_err(|error| {
+                self.persistence_poisoned.store(true, Ordering::Release);
+                crate::state::StateError::Write {
+                    path: "PostgreSQL stateless_cloud_link_state".to_string(),
+                    reason: format!(
+                        "write outcome is uncertain after waiting {STATE_WRITE_TIMEOUT:?}: {error}"
+                    ),
+                }
+            })?;
+            return outcome.map_err(|reason| crate::state::StateError::Write {
+                path: "PostgreSQL stateless_cloud_link_state".to_string(),
+                reason,
+            });
+        }
         match &self.encryption {
             Some(encryption) => state.save_encrypted(&self.state_path, encryption),
             None => state.save(&self.state_path),
@@ -1029,7 +1238,7 @@ impl CloudLink {
         if let Some(error) = self.outbound_blocked_error() {
             return Err(error);
         }
-        let (base_url, instance_id, generation) = {
+        let (base_url, instance_id, supports_instance_reassignment, generation) = {
             let guard = self.state.read().unwrap_or_else(|p| p.into_inner());
             let s = guard.as_ref().ok_or(CloudError::NotEnrolled)?;
             // Same guard as the generation snapshot below: a concurrent
@@ -1040,13 +1249,19 @@ impl CloudLink {
             (
                 s.base_url.clone(),
                 s.instance_id,
+                !s.is_linked(),
                 self.generation.load(Ordering::SeqCst),
             )
         };
 
         let backend = self.parse_backend(&base_url)?;
         let res = CloudClient::new(backend)?
-            .enroll(code, instance_id, &self.agent_version)
+            .enroll_with_instance_reassignment(
+                code,
+                instance_id,
+                &self.agent_version,
+                supports_instance_reassignment,
+            )
             .await?;
 
         let mut guard = self.state.write().unwrap_or_else(|p| p.into_inner());
@@ -1068,12 +1283,29 @@ impl CloudLink {
                 detail: "link state changed while enrollment was in progress; try again".into(),
             });
         }
+        if !supports_instance_reassignment
+            && res
+                .instance_id
+                .is_some_and(|response_id| response_id != instance_id)
+        {
+            return Err(CloudError::EnrollmentRefused {
+                detail: "Cloud returned a different instance identity while this installation is linked; disconnect it before reconnecting with that enrollment code".into(),
+            });
+        }
         // Read *before* the overwrite below: after it, there is no record on
         // this instance that a different credential was ever held, and a caller
         // asking "did this call establish the link?" would have to guess.
-        let kind = EnrollmentKind::classify(current.is_linked(), current.tenant_id, res.tenant_id);
+        let kind = EnrollmentKind::classify(
+            current.is_linked(),
+            current.tenant_id,
+            res.tenant_id,
+            instance_id,
+            res.instance_id,
+            res.reconnected,
+        );
 
         let mut next = current.clone();
+        next.instance_id = res.instance_id.unwrap_or(instance_id);
         next.token = Some(res.instance_token);
         next.tenant_id = Some(res.tenant_id);
         next.account_email = res.account_email;
@@ -2056,13 +2288,164 @@ impl Drop for SubmissionScope<'_> {
 }
 
 #[cfg(test)]
+mod postgres_persistence_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn postgres_state_save_does_not_depend_on_the_callers_runtime() {
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key"),
+        );
+        let state = EnrollmentState::new("https://cloud.example.test");
+        let (sender, receiver) = sync_channel::<PostgresStateWrite>(1);
+        let writer = std::thread::spawn(move || {
+            let write = receiver.recv().expect("state write request");
+            assert!(!write.ciphertext.is_empty());
+            write.response.send(Ok(())).expect("state write response");
+        });
+        let link = CloudLink::from_loaded(
+            Some(state.clone()),
+            None,
+            PathBuf::from("unused-in-postgres-mode"),
+            "test-agent".to_string(),
+            false,
+            Some(encryption),
+            StatePersistence::Postgres(sender),
+        );
+
+        link.save_state(&state)
+            .expect("dedicated writer must complete while current-thread runtime is blocked");
+        writer.join().expect("writer thread");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn uncertain_postgres_write_poisons_later_mutations() {
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key"),
+        );
+        let state = EnrollmentState::new("https://cloud.example.test");
+        let (sender, receiver) = sync_channel::<PostgresStateWrite>(1);
+        let writer = std::thread::spawn(move || {
+            let write = receiver.recv().expect("state write request");
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = write.response.send(Ok(()));
+        });
+        let link = CloudLink::from_loaded(
+            Some(state.clone()),
+            None,
+            PathBuf::from("unused-in-postgres-mode"),
+            "test-agent".to_string(),
+            false,
+            Some(encryption),
+            StatePersistence::Postgres(sender),
+        );
+
+        let first = link
+            .save_state(&state)
+            .expect_err("timed-out write must have an uncertain outcome");
+        assert!(first.to_string().contains("uncertain"));
+        let second = link
+            .save_state(&state)
+            .expect_err("later mutations must remain blocked");
+        assert!(second.to_string().contains("restart the control plane"));
+        writer.join().expect("writer thread");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn postgres_state_survives_scratch_directory_replacement() {
+        let database = match temps_database::test_utils::TestDatabase::new().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping Cloud state integration test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("Cloud state test database failed: {error}"),
+        };
+        database
+            .db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "CREATE TABLE stateless_cloud_link_state (\
+                    id SMALLINT PRIMARY KEY CHECK (id = 1), \
+                    ciphertext TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL\
+                )"
+                .to_string(),
+            ))
+            .await
+            .expect("create Cloud state table");
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key"),
+        );
+        let first_directory = tempfile::tempdir().expect("first scratch directory");
+        let state_path = first_directory.path().join("cloud-link/state.json");
+        let tenant_id = Uuid::new_v4();
+        let mut original = EnrollmentState::new("https://cloud.example.test");
+        original.token = Some("test-instance-token".to_string());
+        original.tenant_id = Some(tenant_id);
+        original
+            .save_encrypted(&state_path, &encryption)
+            .expect("persist legacy local Cloud state");
+        let expected_instance_id = original.instance_id;
+
+        let migrated = CloudLink::load_encrypted_postgres(
+            first_directory.path().to_path_buf(),
+            "test-agent",
+            encryption.clone(),
+            database.db.clone(),
+            database.database_url.clone(),
+            false,
+        )
+        .await
+        .expect("migrate local Cloud state to PostgreSQL");
+        assert!(migrated.is_linked());
+        assert_eq!(migrated.instance_id(), Some(expected_instance_id));
+        assert_eq!(migrated.tenant_id(), Some(tenant_id));
+        drop(migrated);
+        drop(first_directory);
+
+        let replacement_directory = tempfile::tempdir().expect("replacement scratch directory");
+        let restored = CloudLink::load_encrypted_postgres(
+            replacement_directory.path().to_path_buf(),
+            "test-agent",
+            encryption,
+            database.db.clone(),
+            database.database_url.clone(),
+            false,
+        )
+        .await
+        .expect("load Cloud state after scratch replacement");
+        assert!(restored.is_linked());
+        assert_eq!(restored.instance_id(), Some(expected_instance_id));
+        assert_eq!(restored.tenant_id(), Some(tenant_id));
+        assert!(!replacement_directory
+            .path()
+            .join("cloud-link/state.json")
+            .exists());
+    }
+}
+
+#[cfg(test)]
 mod enrollment_kind_tests {
     use super::*;
 
     #[test]
     fn an_instance_with_no_credential_is_a_first_enrollment() {
         let tenant = Uuid::new_v4();
-        let kind = EnrollmentKind::classify(false, None, tenant);
+        let instance = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(false, None, tenant, instance, None, false);
 
         assert_eq!(kind, EnrollmentKind::First);
         assert!(kind.establishes_new_link());
@@ -2076,7 +2459,9 @@ mod enrollment_kind_tests {
         // Nothing about the link is new, so nothing that belongs to linking —
         // least of all a spend — may fire again.
         let tenant = Uuid::new_v4();
-        let kind = EnrollmentKind::classify(true, Some(tenant), tenant);
+        let instance = Uuid::new_v4();
+        let kind =
+            EnrollmentKind::classify(true, Some(tenant), tenant, instance, Some(instance), false);
 
         assert_eq!(kind, EnrollmentKind::ReEnrolled { tenant_id: tenant });
         assert!(!kind.establishes_new_link());
@@ -2090,7 +2475,9 @@ mod enrollment_kind_tests {
         // a genuinely new link the side effects it is entitled to.
         let previous = Uuid::new_v4();
         let next = Uuid::new_v4();
-        let kind = EnrollmentKind::classify(true, Some(previous), next);
+        let instance = Uuid::new_v4();
+        let kind =
+            EnrollmentKind::classify(true, Some(previous), next, instance, Some(instance), false);
 
         assert_eq!(
             kind,
@@ -2110,7 +2497,8 @@ mod enrollment_kind_tests {
         // can cancel, treating it as the same silently withholds one from a
         // customer who just paid.
         let tenant = Uuid::new_v4();
-        let kind = EnrollmentKind::classify(true, None, tenant);
+        let instance = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(true, None, tenant, instance, None, false);
 
         assert_eq!(
             kind,
@@ -2119,6 +2507,45 @@ mod enrollment_kind_tests {
             }
         );
         assert!(kind.establishes_new_link());
+    }
+
+    #[test]
+    fn a_targeted_reconnect_does_not_establish_a_new_link() {
+        let requested_instance_id = Uuid::new_v4();
+        let historical_instance_id = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(
+            false,
+            None,
+            Uuid::new_v4(),
+            requested_instance_id,
+            Some(historical_instance_id),
+            true,
+        );
+
+        assert_eq!(
+            kind,
+            EnrollmentKind::Reconnected {
+                instance_id: historical_instance_id
+            }
+        );
+        assert!(!kind.establishes_new_link());
+        assert_eq!(kind.as_str(), "reconnected");
+    }
+
+    #[test]
+    fn a_same_identity_targeted_reconnect_uses_the_explicit_marker() {
+        let instance_id = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(
+            false,
+            None,
+            Uuid::new_v4(),
+            instance_id,
+            Some(instance_id),
+            true,
+        );
+
+        assert_eq!(kind, EnrollmentKind::Reconnected { instance_id });
+        assert!(!kind.establishes_new_link());
     }
 }
 
@@ -2524,6 +2951,7 @@ mod first_link_enrollment_tests {
         slow_requests_parked: Arc<AtomicUsize>,
         release: Arc<Notify>,
         redeemed: Arc<AtomicUsize>,
+        reassignment_support: Arc<Mutex<Vec<bool>>>,
     }
 
     fn tenant_for(code: &str) -> Uuid {
@@ -2541,10 +2969,22 @@ mod first_link_enrollment_tests {
                             stub.release.notified().await;
                         }
                         stub.redeemed.fetch_add(1, Ordering::SeqCst);
-                        Json(serde_json::json!({
-                            "tenant_id": tenant_for(&request.enrollment_code),
-                            "instance_token": format!("inst_{}", request.enrollment_code),
-                        }))
+                        stub.reassignment_support
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(request.supports_instance_reassignment);
+                        let reassigned_instance_id =
+                            (request.enrollment_code.starts_with("RECONNECT-")
+                                || request.enrollment_code.starts_with("UNSAFE-RECONNECT-"))
+                            .then(|| tenant_for("historical-instance"));
+                        Json(temps_cloud_protocol::EnrollResponse {
+                            tenant_id: tenant_for(&request.enrollment_code),
+                            instance_id: reassigned_instance_id,
+                            reconnected: request.enrollment_code.starts_with("RECONNECT-"),
+                            instance_token: format!("inst_{}", request.enrollment_code),
+                            account_email: None,
+                            capabilities: vec![],
+                        })
                     },
                 ),
             )
@@ -2636,6 +3076,95 @@ mod first_link_enrollment_tests {
             "a stale code must not be redeemed on the backend"
         );
         assert_eq!(link.tenant_id(), Some(tenant_for("OPERATOR-CODE")));
+    }
+
+    #[tokio::test]
+    async fn a_targeted_enrollment_atomically_adopts_and_persists_the_cloud_identity() {
+        let stub = Stub::default();
+        let Some((link, directory)) = configured_link(stub.clone()).await else {
+            return;
+        };
+        let generated_instance_id = link.instance_id().expect("configured instance identity");
+        let historical_instance_id = tenant_for("historical-instance");
+
+        let kind = link
+            .enroll("reconnect-abcd-efgh")
+            .await
+            .expect("targeted enrollment must succeed");
+
+        assert_eq!(
+            kind,
+            EnrollmentKind::Reconnected {
+                instance_id: historical_instance_id
+            }
+        );
+        assert!(!kind.establishes_new_link());
+        assert_ne!(generated_instance_id, historical_instance_id);
+        assert_eq!(link.instance_id(), Some(historical_instance_id));
+        assert_eq!(
+            stub.reassignment_support
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[true]
+        );
+
+        drop(link);
+        let restored = CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "first-link-test",
+        );
+        assert_eq!(restored.instance_id(), Some(historical_instance_id));
+        assert!(restored.is_linked());
+    }
+
+    #[tokio::test]
+    async fn credential_recovery_does_not_advertise_identity_reassignment() {
+        let stub = Stub::default();
+        let Some((link, _directory)) = configured_link(stub.clone()).await else {
+            return;
+        };
+
+        link.enroll("first-code").await.expect("first enrollment");
+        link.enroll("recovery-code")
+            .await
+            .expect("credential recovery enrollment");
+
+        assert_eq!(
+            stub.reassignment_support
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[true, false]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_linked_instance_rejects_a_different_returned_identity_without_persisting_it() {
+        let stub = Stub::default();
+        let Some((link, directory)) = configured_link(stub.clone()).await else {
+            return;
+        };
+        link.enroll("first-code").await.expect("first enrollment");
+        let linked_instance_id = link.instance_id().expect("linked instance identity");
+        let linked_tenant_id = link.tenant_id().expect("linked tenant identity");
+
+        let error = link
+            .enroll("unsafe-reconnect-abcd-efgh")
+            .await
+            .expect_err("a linked installation must not change identity");
+
+        assert!(error.to_string().contains("disconnect"));
+        assert_eq!(link.instance_id(), Some(linked_instance_id));
+        assert_eq!(link.tenant_id(), Some(linked_tenant_id));
+        drop(link);
+
+        let restored = CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "first-link-test",
+        );
+        assert_eq!(restored.instance_id(), Some(linked_instance_id));
+        assert_eq!(restored.tenant_id(), Some(linked_tenant_id));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'Multi-Node Deployment',
   description:
-    'Distribute containers across multiple servers with worker nodes, round-robin scheduling, and optional WireGuard networking.',
+    'Distribute containers across multiple servers with worker nodes, resource-aware scheduling, and optional WireGuard networking.',
   alternates: {
     canonical: '/docs/multi-node',
   },
@@ -12,10 +12,12 @@ export const sections = [
   { title: 'Architecture', id: 'architecture' },
   { title: 'Prerequisites', id: 'prerequisites' },
   { title: 'Adding a worker node (direct mode)', id: 'direct-mode' },
+  { title: 'Joining over the internet (WireGuard mesh)', id: 'wireguard-mesh' },
   { title: 'Adding a worker node (WireGuard mode)', id: 'wireguard-mode' },
   { title: 'Running the agent directly', id: 'agent-command' },
   { title: 'Verifying nodes', id: 'verifying-nodes' },
   { title: 'How scheduling works', id: 'scheduling' },
+  { title: 'Sandboxes on worker nodes', id: 'sandboxes' },
   { title: 'A control plane that runs no workloads', id: 'control-plane-profile' },
   { title: 'Building from source', id: 'control-plane-builds' },
   { title: 'Mixed architectures', id: 'mixed-architectures' },
@@ -137,35 +139,163 @@ The agent reads its config from `~/.temps/agent.json` and begins sending heartbe
 
 ---
 
-## Adding a worker node (WireGuard mode) {{ anchor: true, id: 'wireguard-mode' }}
+## Joining over the internet (WireGuard mesh) {{ anchor: true, id: 'wireguard-mesh' }}
 
-WireGuard mode creates an encrypted tunnel between the worker and the control plane. Use this when nodes are on different networks without direct connectivity. It needs a relay that brokers the WireGuard key exchange, and you point the worker at it with `--relay-url` (or `TEMPS_RELAY_URL`).
+Direct mode needs a private network the worker shares with the control plane. When a worker only shares the internet with it — another provider, another region, a box at home — turn on the managed WireGuard mesh. Every node gets a private address on an encrypted WireGuard tunnel, the container overlay runs over it, and the control plane reaches the worker's agent and published ports on that address.
 
-<Note>
-There is no public relay at the moment. Without `--relay-url`, `temps join` refuses to start and tells you to choose direct mode or supply a relay you run. Direct mode is the supported path for most setups.
-</Note>
+Turn it on from **Settings → Worker Nodes → Over the internet → Enable WireGuard mesh**, or with the CLI:
 
 ```bash
-temps join <cluster-id> <join-token> --relay-url https://relay.example.com
+bunx @temps-sdk/cli nodes mesh enable
 ```
 
-With `--relay-url`, the join command:
+The running `temps serve` and every agent move onto the mesh within a minute, with no restart. Cross-node traffic pauses while nodes switch over. Once on, the mesh stays on; workers on your private network keep using it.
 
-1. Generates a WireGuard keypair
-2. Contacts your relay for key exchange
-3. Sets up a WireGuard tunnel (`wg0` interface) with a `10.100.0.x` address
-4. Registers with the control plane using the WireGuard address
-5. Saves the agent config to `~/.temps/agent.json`
+Requirements:
 
-Then start the agent:
+- Nodes run Linux with kernel WireGuard (5.6 or newer).
+- Every link needs one end the other can dial on the mesh port (UDP `51820` by default): open it inbound on that end in your provider's firewall. WireGuard is symmetric, so a control plane behind NAT (a laptop, a home server) works as long as the workers accept UDP `51820`.
+- Workers reach the control plane over the mesh on TCP `51820` too (the node API, on the control plane's mesh address only). Pick another port with `bunx @temps-sdk/cli nodes mesh enable --node-api-port <port>`.
+
+There are two ways to join a worker, depending on which side can reach the other.
+
+**The worker reaches the control plane** (the control plane has a public URL). Join the worker with its **public** IP:
 
 ```bash
+temps join https://temps.example.com <join-token> --private-address <worker-public-ip>
 temps agent
 ```
 
+Behind NAT, or reachable on a different public IP? Start the agent with `temps agent --wg-endpoint <public-ip>:51820`.
+
+**The control plane reaches the worker** (the control plane has no address workers can reach). On **Settings → Worker Nodes → Over the internet → This server reaches the worker**, enter the worker's public IP, or run:
+
+```bash
+bunx @temps-sdk/cli nodes pair create --address <worker-public-ip> --name worker-1
+```
+
+It prints one command. Run it on the worker as root, then start the agent:
+
+```bash
+temps join --pair tpair1.…
+temps agent service install
+```
+
+`temps join --pair -` reads the code from stdin instead, which keeps it out of the process list and shell history.
+
+The worker waits on UDP `51820` until the control plane reaches it (the command expires after 30 minutes). The two exchange WireGuard **public** keys over a message authenticated with a one-time secret in the command; no private key leaves either machine. The worker then registers over the mesh, trusting only the cluster CA whose fingerprint the command carries. Pairings in progress, with why a worker has not been reached yet, show on the same page and with `bunx @temps-sdk/cli nodes pair`.
+
+### Adding a server over SSH
+
+When the control plane can log in to the server, it can do the whole setup itself. Open **Settings → Worker Nodes → Over the internet → Add it over SSH**, or run:
+
+```bash
+bunx @temps-sdk/cli nodes ssh add --host 203.0.113.10 --user root
+```
+
+1. The control plane connects and shows the server's SSH host key. Compare it with the server's own before continuing, from its console or a session you trust: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. The CLI asks you to confirm it; pass `--host-key SHA256:…` for automation. If the server presents another key during the setup, the setup stops.
+2. It logs in with a password, a private key (`--identity-file`, `--ask-passphrase`) or the SSH agent of the `temps serve` process (`--agent`). A user other than root needs sudo. If sudo asks for a password, log in with that user's password and it is used for sudo too.
+3. It checks the server runs Linux and Docker, installs Temps if missing, runs `temps join --pair -` with a pairing code on stdin, and installs the agent as `temps-agent.service`. Without systemd it starts the agent in the background and says so: that agent does not come back after a reboot.
+4. It waits for the node's first heartbeat. Progress and the server's output show on the page, and with `bunx @temps-sdk/cli nodes ssh show <id>`.
+
+The credentials are used for this setup only and are never stored. The server must accept UDP `51820` from the control plane, as for any pairing. `--node-address` gives the server's public IP for WireGuard when it differs from the address SSH connects to. Loopback, link-local and cloud metadata addresses are refused; private addresses are allowed, for servers on the same LAN or VPC.
+
+### Checking the mesh
+
+Check each node's connection on the Worker Nodes page (the **Mesh** column; **What to fix** lists anything the control plane sees wrong), or with:
+
+```bash
+bunx @temps-sdk/cli nodes mesh doctor
+```
+
+It checks the control plane's end, every node's link and every pairing in progress, and says what fixes each failure. On a node (or the control plane host), check that machine's own end: its key, the `temps-wg0` interface, each peer's handshake, the path MTU, the mesh firewall and the control plane's node API:
+
+```bash
+temps doctor mesh
+```
+
+A node that stays **Not connected** almost always has the mesh UDP port blocked on the end that is dialed; both doctors name the port and the side to open.
+
+### Nodes that cannot reach each other: mesh hubs
+
+Two nodes that both sit behind NAT (a home lab and an office box, say) can each reach the control plane but cannot dial each other. The mesh finds this by itself: every agent reports when it last completed a WireGuard handshake with each peer, and a pair that has not connected after a couple of minutes shows as **Cannot connect** under **Settings → Worker Nodes → Mesh hub**, with the fix.
+
+The fix is a **hub**: a member that both sides reach and that relays between them. Choose it on the same card, or run:
+
+```bash
+bunx @temps-sdk/cli nodes mesh hub set control-plane   # or a node name
+bunx @temps-sdk/cli nodes mesh hub                     # the hub and every pair it carries
+bunx @temps-sdk/cli nodes mesh hub unset
+```
+
+- The control plane moves a pair onto the hub only when the direct path never came up, both nodes are reporting, and the hub reaches both. Pairs that connect directly are left alone.
+- A pair goes back to trying the direct path when one of its nodes gets a new endpoint, when the hub is removed or changed to one of the two nodes, or when the hub stops reaching one of them. It is never switched on a timer, so a working relayed path is not broken to probe a direct one.
+- The hub decrypts what it relays and encrypts it again for the other node, so it can read that traffic. Pick a machine you control; setting the hub is recorded in the audit log.
+- The hub needs a public address both nodes can dial. If no member has one, the Mesh hub card says so.
+
+---
+
+## Adding a worker node (WireGuard mode) {{ anchor: true, id: 'wireguard-mode' }}
+
 <Note>
-WireGuard mode requires the `wireguard-tools` package installed on both the control plane and the worker. On Ubuntu/Debian: `apt install wireguard-tools`. On macOS: `brew install wireguard-tools`.
+For nodes on different networks, prefer the [WireGuard mesh](#wireguard-mesh) above: Temps creates and manages the tunnels itself. The steps below are for running your own WireGuard network instead.
 </Note>
+
+Use WireGuard when nodes are on different networks without direct connectivity: behind NAT, in another cloud, or in another region. Run a WireGuard network yourself, then join each worker in **direct mode** with its WireGuard address as `--private-address`. Temps then sends everything between nodes (agent API, heartbeats, proxied requests and the container overlay) through the tunnel.
+
+<Note>
+`temps join <cluster-id> --relay-url ...` ("relay mode") is not usable yet. It needs a relay service that is not part of Temps, the tunnel it creates lives only inside the `temps join` process and is gone once the command exits, and the control plane never configures its side of the tunnel. Use your own WireGuard network as described below.
+</Note>
+
+**1. Connect the nodes with WireGuard.**
+
+A hub-and-spoke layout on the control plane needs only one open port: UDP 51820 on the control plane. Workers dial out, so they need no inbound ports at all, even behind NAT. Install WireGuard (`apt install wireguard-tools`) on every node and create `/etc/wireguard/wg0.conf`:
+
+```ini
+# Control plane (hub)
+[Interface]
+Address = 10.57.0.1/24
+ListenPort = 51820
+PrivateKey = <control-plane private key>
+
+[Peer]
+# worker-1
+PublicKey = <worker-1 public key>
+AllowedIPs = 10.57.0.11/32
+```
+
+```ini
+# Worker (spoke)
+[Interface]
+Address = 10.57.0.11/24
+PrivateKey = <worker-1 private key>
+
+[Peer]
+PublicKey = <control-plane public key>
+Endpoint = <control-plane public IP>:51820
+AllowedIPs = 10.57.0.0/24
+PersistentKeepalive = 25
+```
+
+Generate keys with `wg genkey | tee private.key | wg pubkey > public.key`, then run `systemctl enable --now wg-quick@wg0` on each node. To let workers reach each other through the hub as well, enable IP forwarding on the control plane and allow forwarding between `wg0` and itself.
+
+**2. Put the control plane's overlay on the tunnel:**
+
+```bash
+temps network setup-multi-node --private-address 10.57.0.1 --underlay-dev wg0
+```
+
+**3. Join each worker with its tunnel address:**
+
+```bash
+temps join https://<control-plane-name> <join-token> \
+  --private-address 10.57.0.11 \
+  --agent-address 0.0.0.0:3100
+```
+
+The control-plane URL must reach the control plane through the tunnel, for example a hostname that resolves to `10.57.0.1` on the worker, and its TLS certificate must be valid for that name. The agent finds its overlay device from the route to its private address, so the overlay uses `wg0` and an MTU that fits inside the tunnel. On releases before this behaviour, add `--underlay-dev wg0`.
+
+A complete, runnable version of this setup, with nodes that share no network at all, is described in [Test multi-node over WireGuard locally](/docs/test-multi-node-wireguard).
 
 ---
 
@@ -188,6 +318,18 @@ The agent loads its configuration from `~/.temps/agent.json` (saved by `temps jo
 | `TEMPS_NODE_ID` / `--node-id` | — | Node ID assigned during registration |
 
 If no `~/.temps/agent.json` exists and required fields are missing, the agent exits with an error suggesting you run `temps join` first.
+
+### Run the agent as a service
+
+On a server with systemd, install the agent as `temps-agent.service` so it restarts on failure and comes back after a reboot:
+
+```bash
+sudo temps agent service install     # writes the unit, enables and starts it
+temps agent service status
+sudo temps agent service uninstall
+```
+
+The unit runs this `temps` binary with the data directory `temps join` wrote (`--binary` and `--data-dir` override them; `--dry-run` prints the unit without installing it). The enrollment token and TLS key stay in that owner-only directory: the unit only points at it. It refuses to replace a `temps-agent.service` that Temps did not write. Without systemd, run `temps agent` under your own supervisor.
 
 The agent sends a **heartbeat** to the control plane every 30 seconds. If heartbeats stop (e.g., the agent is stopped or the machine goes down), the control plane marks the node as **offline** after 90 seconds and excludes it from scheduling.
 
@@ -245,18 +387,79 @@ A node is considered **active** if it has sent a heartbeat within the last 90 se
 
 ## How scheduling works {{ anchor: true, id: 'scheduling' }}
 
-When you deploy an application with multiple replicas, the **node scheduler** distributes containers across available nodes using **round-robin** scheduling:
+When you deploy an application with multiple replicas, the **node scheduler** decides which node each replica lands on:
 
-1. The scheduler queries all nodes with `status = "active"` and a heartbeat within the last 90 seconds
-2. If no active worker nodes exist, all replicas run locally on the control plane — unless it was started with [`--profile control-plane`](#control-plane-profile), in which case the deployment fails with an explanation instead
-3. If active workers exist, replicas are distributed evenly across all nodes (including local) in round-robin order
-4. Each container records which node it was assigned to in the database
+1. It starts from every node with `status = "active"` and a heartbeat within the last 90 seconds, plus the control plane itself (node `0`). If no active worker nodes exist, all replicas run locally on the control plane — unless it was started with [`--profile control-plane`](#control-plane-profile), in which case the deployment fails with an explanation instead.
+2. **Target nodes** and **label selectors**, if set in the environment's or project's deployment settings, narrow the pool first. A label selector matches a node only if every key matches (a list of values matches any of them). The control plane has no labels, so a label selector never places replicas on it; target node `0` selects it explicitly. If these constraints leave no eligible node, the deployment fails with an error instead of ignoring them.
+3. **Architecture compatibility** narrows it further: a node is only eligible if this deployment has a built image for the platform its agent last reported (`linux/amd64`, `linux/arm64`, ...) — otherwise the container would pull the image, start, and immediately fail with `exec format error`. A node that hasn't reported its architecture yet (e.g. mid-upgrade) is kept in the pool with a warning instead of being dropped. Either way, the deploy log says so, e.g. `Skipping node 'worker-2' runs linux/arm64, and this deployment only has images for [linux/amd64]`. This filter needs to know which platforms the image exists for, either from a cross-architecture build or by inspecting the image on the control plane. When it can't tell (for example, the image isn't in the control plane's local image store, or the control plane has no local Docker daemon), the filter is skipped: every node stays eligible, and the deploy log doesn't mention it.
+4. From what's left, replicas are placed with **least-loaded** scheduling by default — each replica goes to the node with the lowest load score (60% CPU, 40% memory usage, from the node's last heartbeat), falling back to round-robin when no node reports capacity data. The control plane doesn't report capacity, so it (like any node without capacity data) counts as 50% loaded. Nodes at or above a 90% load score are skipped unless every remaining node is over that threshold, in which case the threshold is relaxed rather than failing the deployment.
+5. **Anti-affinity** (on by default) tries to give each replica its own node. When there are simply fewer nodes than replicas, replicas wrap around and share nodes. But if nodes were excluded for a lasting reason — for example, an architecture mismatch — and that leaves too few eligible nodes, the deployment fails with an error naming the excluded nodes instead of silently stacking replicas on the same node.
+6. Each container records which node it was assigned to in the database.
 
 The deployment job creates a `RemoteNodeDeployer` for each remote assignment, which communicates with the worker's agent API to deploy, stop, and manage containers.
 
-<Note>
-The scheduler currently uses simple round-robin. Label-based scheduling (e.g., "only deploy to nodes with `gpu=true`") is planned but not yet implemented — labels are stored but not used for filtering.
-</Note>
+---
+
+## Sandboxes on worker nodes {{ anchor: true, id: 'sandboxes' }}
+
+Sandboxes can run on any node: the control plane or a worker joined with `temps join`. A sandbox stays on the node it was created on for its whole life. The control plane keeps the sandbox API, its database row and every permission check; the worker only runs the container.
+
+### Where a new sandbox goes
+
+- **No node requested, control plane allowed** (the default): the sandbox runs on the control plane. A single-node install behaves exactly as before.
+- **No node requested, control plane not allowed**: the sandbox goes to the allowed, active worker with the fewest live sandboxes.
+- **A node requested**: the sandbox runs there or the request fails. It never falls back to another node.
+
+```bash
+bunx @temps-sdk/cli sandbox create --node worker-1        # name, id, or control-plane
+bunx @temps-sdk/cli sandbox list                          # NODE column
+```
+
+Over the API, pass the optional `node` field to `POST /api/v1/sandboxes` (`"node": "worker-1"`). The `@temps-sdk/sandbox` package takes the same value: `Sandbox.create({ node: 'worker-1' })`.
+
+### Choosing which nodes run sandboxes
+
+By default every node may run sandboxes, including nodes added later. Administrators can restrict this to an allow-list in the console under **AI Workflows > Sandbox > Sandbox nodes**, or from the CLI:
+
+```bash
+bunx @temps-sdk/cli sandbox nodes                     # every node, whether it is allowed, and why not
+bunx @temps-sdk/cli sandbox nodes allow worker-1      # add to the allow-list
+bunx @temps-sdk/cli sandbox nodes deny control-plane  # keep sandboxes off the control plane
+bunx @temps-sdk/cli sandbox nodes set worker-1 worker-2
+bunx @temps-sdk/cli sandbox nodes allow-all           # back to the default
+```
+
+Changing the list only affects new sandboxes; existing ones keep running where they are. Leaving the control plane out sends every sandbox created without a node to a worker, so both the console and the CLI warn before saving that change. Managed AI application workspaces always run on the control plane, whatever the list says.
+
+### Requirements on the worker
+
+- **Docker** on the worker, as for deployments.
+- **An upgraded agent.** The worker must run a `temps` version that includes the sandbox host API. An older agent is reported as not supporting sandboxes; upgrade `temps` on the node and restart `temps agent`.
+- **An `https://` agent address.** The control plane talks to the worker over the mutual-TLS connection set up when the node joined. A node registered with a plain `http://` address is listed as not eligible, with the reason.
+- **An active node.** Offline nodes, and nodes whose sandboxes are being destroyed, don't take new sandboxes. `sandbox nodes` and the console show why.
+
+### Not available on worker nodes yet
+
+These features only work for sandboxes on the control plane for now. On a worker sandbox they fail with a message naming the node (`422`) instead of doing something different:
+
+- the interactive terminal and the agent runtime (Temps Fleet)
+- snapshots, both taking and restoring them
+- preview URLs (the sandbox page explains why there is none)
+- disk resize and workspace volumes
+- the Firecracker backend, and the git, model and harness relays
+
+Create the sandbox with `--node control-plane` when you need one of them.
+
+### Removing a node that hosts sandboxes
+
+Draining a node moves its deployments but **does not move sandboxes**, and a node that still hosts live sandboxes cannot be removed (the request is refused with a `409`). To clear it, destroy every sandbox on it, from all users:
+
+```bash
+bunx @temps-sdk/cli sandbox nodes show worker-1     # who has sandboxes there
+bunx @temps-sdk/cli sandbox nodes evict worker-1    # destroy them all (asks to confirm; --force to skip)
+```
+
+The console offers the same: open the node under **Settings > Worker Nodes**, then **Sandboxes > Destroy all**. Eviction works even if the node is gone for good. If the node does not confirm removing a container, the sandbox is still destroyed and the output lists a cleanup command to run on the node if it comes back. If some sandboxes cannot be destroyed, the eviction reports which ones and exits with an error; run it again to retry them.
 
 ---
 
@@ -301,7 +504,7 @@ background tasks:
 | Local backup execution | Backup engines exec into containers on this host | The node that owns the service. Backup scheduling, retention, listing and restore orchestration keep running here |
 | Local container log tailing | The local collector tails containers on this host's daemon | Worker-node logs are collected over the agent. `/logs/search` and `/logs/tail` keep working |
 | Vulnerability scanning | Trivy scans images in the *local* image store, and in this profile no image is ever stored here | Nowhere, in this profile. Reported as `vulnerability_scanning: false` — see the note below |
-| Agent sandboxes and the sandbox API | Sandboxes are local containers | A `full`-profile host |
+| Agent sandboxes and the sandbox API | The sandbox API is built on the local container provider, so it is not constructed here, even for sandboxes that would run on workers | A `full`-profile control plane, which can also [place sandboxes on worker nodes](#sandboxes) |
 | Workload importers | Every importer adopts containers from the local daemon | A `full`-profile host |
 | Image builds from source | Builds run against a local daemon; there is none | Not yet supported — see [Building from source](#control-plane-builds) below |
 | On-demand wake/sleep, workspace preview gateway, Traefik label discovery | All operate on local containers | The node that owns the containers |
@@ -352,6 +555,10 @@ curl -H "Authorization: Bearer $TEMPS_API_KEY" https://your-temps/api/platform/f
 }
 ```
 
+`sandboxes` is `false` because this profile serves no sandbox API at all. It
+does not mean worker nodes can't run sandboxes: on a `full`-profile control
+plane they can (see [Sandboxes on worker nodes](#sandboxes)).
+
 `docker` reports whether a Docker client exists in this process *and* a daemon
 answered a ping at startup. It is deliberately separate from `profile`:
 mounting a socket into a control-plane container does not turn it into a
@@ -392,8 +599,10 @@ Each agent reports its Docker daemon's platform (`linux/amd64`, `linux/arm64`)
 on registration and on every heartbeat. The console shows it in the node list,
 and the platform drives three things:
 
-1. **Scheduling** — a node is only considered for a deployment when an image
-   exists for its architecture. A node that reports nothing (an agent older
+1. **Scheduling** — when the image's platforms are known, a node is only
+   considered for a deployment if an image exists for its architecture (see
+   [How scheduling works](#scheduling) for when they aren't). A node that
+   reports nothing (an agent older
    than this feature, or one that hasn't heartbeated since upgrading) is
    treated as compatible and logged as unverified.
 2. **Building** — *opt-in.* When enabled and the eligible nodes span more than
@@ -462,11 +671,10 @@ node's native architecture automatically.
 
 Multi-node is functional but still evolving. Known limitations:
 
-- **No label-based scheduling** — labels are stored on nodes but the scheduler does not filter by them yet. All active nodes receive deployments equally.
-- **No remote image transfer** — the worker node must be able to pull the Docker image independently. If you are using a local registry on the control plane, the worker needs network access to it.
-- **No log streaming from remote nodes** — deployment logs from containers on worker nodes are not yet streamed back to the control plane dashboard in real-time.
-- **No remote node removal from UI** — nodes can be removed via the API (`DELETE` is not yet exposed) or by stopping the agent and waiting for the heartbeat to expire.
-- **Round-robin only** — no resource-aware scheduling, no affinity/anti-affinity rules, no bin-packing.
+- **No bin-packing** — placement is least-loaded plus anti-affinity, not full bin-packing across resource dimensions.
+- **Worker sandboxes are a subset** — sandboxes on worker nodes have no terminal, agent runtime (Fleet), snapshots, preview URLs, disk resize, workspace volumes or Firecracker backend yet. See [Sandboxes on worker nodes](#sandboxes).
+- **Sandboxes don't move** — a sandbox stays on the node it was created on. Draining a node does not move its sandboxes; [evict them](#sandboxes) before removing the node.
+- **Sandboxes need a `full`-profile control plane** — a control plane started with `--profile control-plane` serves no sandbox API, so it cannot place sandboxes on workers either.
 
 ---
 

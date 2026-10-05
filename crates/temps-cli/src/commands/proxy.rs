@@ -396,6 +396,29 @@ impl ProxyCommand {
                 .map(|s| s.preview_domain.clone())
                 .unwrap_or_else(|| "localhost".to_string()),
         );
+        let internal_dns_sync_address = match settings.as_ref() {
+            Some(settings) if settings.cluster_dns.enabled => {
+                match rt.block_on(temps_dns::start_proxy_dns_sync_service(db.clone())) {
+                    Ok(address) => Some(address.to_string()),
+                    Err(error) => {
+                        warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if settings
+            .as_ref()
+            .is_some_and(|settings| settings.cluster_dns.enabled)
+        {
+            super::serve::proxy::spawn_control_plane_dns_bootstrap_with_docker_discovery(
+                rt.handle(),
+                db.clone(),
+                data_dir.join("dns"),
+                Arc::new(std::sync::RwLock::new(None)),
+            );
+        }
 
         info!(
             "Starting proxy server with preview_domain: {:?}",
@@ -449,10 +472,15 @@ impl ProxyCommand {
         let proxy_config = temps_proxy::ProxyConfig {
             address,
             console_address,
+            internal_dns_sync_address,
             tls_address,
             preview_domain,
             disable_https_redirect: self.disable_https_redirect,
             on_demand_cert_manager,
+            // The console is a separate process in split topology; this
+            // proxy cannot observe its startup, so console-bound failures
+            // keep the generic unavailable page.
+            console_startup: None,
         };
         let listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),
@@ -626,6 +654,19 @@ impl ProxyCommand {
             db.clone(),
             data_dir.clone(),
         )) as Box<dyn ProxyShutdownSignal>;
+        let stateless_instance_id =
+            rt.block_on(temps_config::stateless_instance_id(db.as_ref()))?;
+        let stateless_storage = temps_file_store::s3_config::resolve_stateless_storage_for(
+            stateless_instance_id.as_deref(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("❌ Stateless storage configuration is invalid\n\n{error}")
+        })?;
+
+        let settings_retention: Arc<dyn temps_core::RetentionResolver> =
+            rt.block_on(temps_config::settings_retention_resolver(Arc::new(
+                temps_config::ConfigService::new(config.clone(), db.clone()),
+            )));
 
         match temps_proxy::setup_proxy_server(
             db,
@@ -635,12 +676,14 @@ impl ProxyCommand {
             route_table,
             shutdown_signal,
             config.clone(),
+            stateless_storage,
             on_demand_manager, // wired in split mode (ADR-017 Phase 2); None if Docker unavailable
             admin_gate_handle,
             // This standalone `temps proxy` process never loads a console or
             // its plugins — there is nothing here to register an alternative
-            // resolver.
-            Arc::new(temps_core::FixedRetentionResolver),
+            // resolver, so proxy-log rows follow `observability_retention.
+            // proxy_logs_days`, refreshed in the background on `rt`.
+            settings_retention,
             // Supplied by the caller when the embedding binary knows how to
             // build one; `temps_core::OpenIpGate` (allow everything) otherwise,
             // which is what the plain `temps proxy` entrypoint passes.
@@ -673,18 +716,17 @@ fn build_on_demand_sleeping_callback(
     manager: Arc<OnDemandManager>,
 ) -> temps_routes::route_table::OnSleepingCallback {
     Arc::new(move |entries, on_demand_configs| {
-        manager.clear_sleeping_domains();
-        for entry in entries {
-            manager.register_sleeping_domain(
-                entry.domain.clone(),
+        manager.replace_sleeping_domains(entries.into_iter().map(|entry| {
+            (
+                entry.domain,
                 temps_proxy::on_demand::SleepingEnvironmentInfo {
                     environment_id: entry.environment_id,
                     project_id: entry.project_id,
                     deployment_id: entry.deployment_id,
                     wake_timeout_seconds: entry.wake_timeout_seconds,
                 },
-            );
-        }
+            )
+        }));
         for config in on_demand_configs {
             manager.register_on_demand_environment(
                 config.environment_id,

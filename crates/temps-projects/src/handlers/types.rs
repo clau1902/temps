@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use temps_core::docker_socket_grant::DockerSocketCapability;
 use temps_core::templates::{EnvVarTemplate, ServiceTemplateInstance, TemplateService};
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
@@ -40,6 +41,12 @@ pub struct AppState {
     /// is guaranteed to see all registered services because `configure_routes`
     /// runs after every plugin's `initialize_plugin_services` has completed.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Central policy evaluator for sensitive mutations — challenges with MFA
+    /// step-up when the acting user has one enrolled. Threaded into
+    /// `ProjectService` on the slug-claim path (ADR 045) rather than checked
+    /// in the handler, so the challenge cannot drift away from the guard it
+    /// protects. See [`temps_core::SensitiveActionAuthorizer`].
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 // Domain-related types
@@ -170,8 +177,24 @@ pub struct ProjectEnvVarInput {
     pub is_secret: bool,
 }
 
+/// Cloudflare availability and the default used by future project creation.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CloudflareProjectCapability {
+    pub configured: bool,
+    pub default_enabled: bool,
+    pub reason: Option<String>,
+    pub setup_path: Option<String>,
+    pub bunny_configured: bool,
+    pub bunny_default_enabled: bool,
+    pub bunny_reason: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
+    /// Override the instance default for this new project.
+    pub cloudflare_enabled: Option<bool>,
+    /// Choose a delivery provider for this project. `none` disables the global default.
+    pub delivery_provider: Option<String>,
     pub name: String,
     /// Optimistically reserved slug used by template creation to ensure the
     /// persisted project receives the URL shown during configuration.
@@ -179,8 +202,11 @@ pub struct CreateProjectRequest {
     pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
+    #[serde(default)]
     pub directory: String,
+    #[serde(default)]
     pub main_branch: String,
+    #[serde(default)]
     pub preset: String,
     /// Preset-specific configuration
     ///
@@ -215,6 +241,7 @@ pub struct CreateProjectRequest {
     pub is_web_app: Option<bool>,
     #[serde(default = "default_performance_metrics")]
     pub performance_metrics_enabled: bool,
+    #[serde(default)]
     pub storage_service_ids: Vec<i32>,
     pub use_default_wildcard: Option<bool>,
     pub custom_domain: Option<String>,
@@ -324,6 +351,8 @@ pub struct ProjectResponse {
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,
+    /// When true, deploy clones only `directory` via git sparse-checkout.
+    pub pull_only_root_directory: bool,
     pub main_branch: String,
     pub preset: Option<String>,
     /// Product lifecycle classification. `service` projects are tied to a
@@ -416,6 +445,15 @@ pub struct ProjectResponse {
     /// system-wide default from settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_retention_hours: Option<i32>,
+    /// Where this project is granted host Docker access (ADR 045), and what to
+    /// set when it is granted nowhere.
+    ///
+    /// Populated only on the single-project detail responses — computing it
+    /// costs a `nodes` query, and the list endpoints must stay cheap. `None`
+    /// therefore means "not computed on this response", never "not granted";
+    /// clients read `granted` from the object, not from its presence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_socket: Option<DockerSocketCapability>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -426,6 +464,16 @@ pub struct EnvironmentDomains {
 }
 
 impl ProjectResponse {
+    /// Attach the ADR-045 host Docker socket capability.
+    ///
+    /// Used by the single-project detail handlers only. Always attach it
+    /// there, granted or not: an unconfigured capability must onboard the
+    /// operator, not disappear from the response.
+    pub fn with_docker_socket(mut self, capability: DockerSocketCapability) -> Self {
+        self.docker_socket = Some(capability);
+        self
+    }
+
     pub fn map_from_project(project: crate::services::types::Project) -> Self {
         ProjectResponse {
             id: project.id,
@@ -434,6 +482,7 @@ impl ProjectResponse {
             repo_name: project.repo_name,
             repo_owner: project.repo_owner,
             directory: project.directory,
+            pull_only_root_directory: project.pull_only_root_directory,
             main_branch: project.main_branch,
             preset: project.preset,
             project_type: project.project_type,
@@ -463,6 +512,9 @@ impl ProjectResponse {
             gitlab_webhook_id: project.gitlab_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
             image_retention_hours: project.image_retention_hours,
+            // Filled in by the detail handlers via `with_docker_socket`; the
+            // list path deliberately leaves it unset.
+            docker_socket: None,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -962,6 +1014,9 @@ pub struct UpdateGitSettingsRequest {
     pub repo_name: String,
     pub preset: Option<String>,
     pub directory: String,
+    /// When true, deploy clones only `directory`. Ignored when directory is the repo root.
+    #[serde(default)]
+    pub pull_only_root_directory: Option<bool>,
     /// Git clone URL for public repositories
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_url: Option<String>,
@@ -1032,6 +1087,8 @@ pub struct ProjectStats {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ProjectStatisticsResponse {
     pub total_count: i64,
+    /// Whether an accessible project's deployment has reached the ready state.
+    pub has_completed_deployment: bool,
 }
 
 // Add this struct with the other response types
@@ -1151,6 +1208,18 @@ impl From<ProjectError> for Problem {
                 .with_title("GitHub Error")
                 .with_detail(msg),
 
+            ProjectError::PublicRepoRateLimited {
+                project_id,
+                project_slug,
+                provider,
+            } => problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                .with_title("Git Provider Rate Limit")
+                .with_detail(format!(
+                    "{} is rate limiting project {}. Connect this project's repository to your Git provider or retry after the limit resets.",
+                    provider, project_id
+                ))
+                .with_value("setup_path", format!("/projects/{project_slug}/git/change-repository")),
+
             ProjectError::DeploymentError(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Deployment Error")
@@ -1169,6 +1238,12 @@ impl From<ProjectError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectError::DeliveryBindingsExist { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Project Has Active Domain Delivery")
+                    .with_detail(error.to_string())
+            }
+
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -1176,6 +1251,37 @@ impl From<ProjectError> for Problem {
             ProjectError::InvalidGitUrl { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Git URL")
                 .with_detail(error.to_string()),
+
+            // 403, not 409: the slug is not taken, the caller is not allowed
+            // to take it. An admin sending the same request succeeds.
+            ProjectError::DockerSocketSlugReserved { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Project Slug Reserved For Host Docker Access")
+                    .with_detail(error.to_string())
+            }
+
+            // Passed through verbatim: `require_sensitive_action` already
+            // built the 428 the console's step-up dialog parses (error_code,
+            // action name, mfa_setup_required). Rebuilding it here would be a
+            // second, drifting copy of that contract.
+            ProjectError::SlugClaimStepUpRequired { problem } => *problem,
+
+            // Also 403 and also admin-only, but a different refusal: the
+            // caller may write this project, just not run code as host root
+            // on its behalf.
+            ProjectError::DockerSocketDeployRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Deployment Requires An Admin")
+                    .with_detail(error.to_string())
+            }
+
+            // 403 again, and a third distinct refusal: the caller is not
+            // deploying, they are changing what a later deployment will run.
+            ProjectError::DockerSocketWriteRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Project Settings Require An Admin")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -1204,6 +1310,16 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Circular Redirect")
                     .with_detail(msg)
+            }
+            CustomDomainError::DeliveryBindingExists { domain_id, binding_id } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Domain delivery is configured")
+                    .with_detail(format!("Custom domain {domain_id} has CDN/DNS delivery binding {binding_id}; remove the domain's delivery before deleting the domain. Removing delivery requires DNS management permissions, so ask an administrator if you do not have them"))
+            }
+            CustomDomainError::DeliveryBindingBlocksChange { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Domain delivery is configured")
+                    .with_detail(error.to_string())
             }
             CustomDomainError::InvalidRedirectUrl(msg) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
@@ -1347,6 +1463,39 @@ mod tests {
     use axum::response::IntoResponse;
 
     #[test]
+    fn external_project_request_only_needs_name() {
+        let request: CreateProjectRequest = serde_json::from_value(serde_json::json!({
+            "name": "External app", "source_type": "external"
+        }))
+        .unwrap();
+        assert_eq!(request.source_type, SourceType::External);
+        assert!(request.preset.is_empty());
+        assert!(request.repo_name.is_none());
+        assert!(request.storage_service_ids.is_empty());
+    }
+
+    #[test]
+    fn public_repo_rate_limit_returns_actionable_429() {
+        let problem: Problem = ProjectError::PublicRepoRateLimited {
+            project_id: 42,
+            project_slug: "example-app".to_string(),
+            provider: "github".to_string(),
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            problem.body.get("setup_path"),
+            Some(&serde_json::json!(
+                "/projects/example-app/git/change-repository"
+            ))
+        );
+        assert!(problem.body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Connect this project")));
+    }
+
+    #[test]
     fn test_custom_domain_error_assignment_changed_maps_to_conflict_with_context() {
         let problem: Problem = CustomDomainError::AssignmentChanged {
             domain_id: 41,
@@ -1379,5 +1528,80 @@ mod tests {
         assert_eq!(omitted.image_retention_hours, None);
         assert_eq!(cleared.image_retention_hours, Some(None));
         assert_eq!(set.image_retention_hours, Some(Some(72)));
+    }
+
+    /// ADR 045 refusals are 403, not 400: an admin sending the identical
+    /// request succeeds, so the request itself is not malformed.
+    #[test]
+    fn docker_socket_refusals_map_to_forbidden_and_explain_themselves() {
+        let reserved: Problem = ProjectError::DockerSocketSlugReserved {
+            slug: "node-daemon".to_string(),
+            change: crate::services::types::ReservedSlugChange::Claim,
+        }
+        .into();
+        assert_eq!(reserved.status_code, StatusCode::FORBIDDEN);
+        let detail = reserved
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains("ADR 045"), "{detail}");
+        assert!(detail.contains("TEMPS_DOCKER_SOCKET_PROJECTS"), "{detail}");
+
+        let deploy: Problem = ProjectError::DockerSocketDeployRequiresAdmin {
+            slug: "node-daemon".to_string(),
+        }
+        .into();
+        assert_eq!(deploy.status_code, StatusCode::FORBIDDEN);
+        // The two must not read alike — one is about naming the project, the
+        // other about running code inside it.
+        assert_ne!(reserved.body.get("title"), deploy.body.get("title"));
+
+        // And the third: changing what a declared project runs, without
+        // deploying anything. Telling this caller to "ask an admin to deploy
+        // it" would describe an operation they never attempted, and the
+        // refusal has to name the field so an operator who sent a settings
+        // patch with six of them can tell which one was the problem.
+        let write: Problem = ProjectError::DockerSocketWriteRequiresAdmin {
+            slug: "node-daemon".to_string(),
+            field: "the source repository".to_string(),
+        }
+        .into();
+        assert_eq!(write.status_code, StatusCode::FORBIDDEN);
+        assert_ne!(write.body.get("title"), deploy.body.get("title"));
+        assert_ne!(write.body.get("title"), reserved.body.get("title"));
+        let write_detail = write
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(write_detail.contains("ADR 045"), "{write_detail}");
+        assert!(
+            write_detail.contains("the source repository"),
+            "{write_detail}"
+        );
+    }
+
+    /// The step-up challenge is passed through byte for byte. Rebuilding it
+    /// here would be a second, drifting copy of the contract the console's
+    /// verification dialog parses.
+    #[test]
+    fn a_step_up_challenge_reaches_the_client_unchanged() {
+        let built = temps_core::error_builder::ErrorBuilder::new(StatusCode::PRECONDITION_REQUIRED)
+            .title("Additional Verification Required")
+            .value("error_code", "STEP_UP_REQUIRED")
+            .value("action", "claim_docker_socket_slug")
+            .value("mfa_setup_required", false)
+            .build();
+
+        let problem: Problem = ProjectError::SlugClaimStepUpRequired {
+            problem: Box::new(built.clone()),
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(problem.body, built.body);
     }
 }

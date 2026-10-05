@@ -45,6 +45,12 @@ pub enum OidcError {
     #[error("OIDC provider {provider_id} is disabled")]
     ProviderDisabled { provider_id: i32 },
 
+    /// An administrator reset the user's password between identity
+    /// resolution and issuing the forced password-change session. Nothing is
+    /// wrong with the provider; the login just has to start again.
+    #[error("Password of user {user_id} was reset during OIDC login")]
+    CredentialsChanged { user_id: i32 },
+
     #[error("Invalid issuer URL: {reason}")]
     InvalidIssuer { reason: String },
 
@@ -88,6 +94,39 @@ pub enum OidcError {
     )]
     IssuerMatchesManagedCloudProvider { issuer_url: String },
 
+    /// SECURITY: refuses a hand-made change to the Cloud-managed provider's
+    /// role mappings -- those rows *are* the admin-only gate, so adding a
+    /// `member -> admin` row (or removing `owner -> admin`) rewrites who may
+    /// sign in. Only `OidcService::sync_managed_cloud_role_mappings` writes
+    /// them.
+    #[error(
+        "OIDC provider {provider_id} ('{name}') is managed by Temps Cloud; its role mappings define its admin-only sign-in gate and cannot be changed manually"
+    )]
+    ManagedByCloudRoleMapping { provider_id: i32, name: String },
+
+    /// SECURITY: refuses to provision the Cloud-managed provider while an
+    /// operator-created provider already points at the same issuer -- that
+    /// row would be a second, unguarded relying-party registration for the
+    /// same IdP, so the admin-only gate could be sidestepped simply by
+    /// signing in through it.
+    #[error(
+        "OIDC provider {provider_id} ('{name}') already uses issuer '{issuer_url}'; remove or repoint it before Temps Cloud can provision console access on that issuer, because a second provider on the same issuer would not enforce the admin-only role gate"
+    )]
+    ManagedIssuerAlreadyUsed {
+        provider_id: i32,
+        name: String,
+        issuer_url: String,
+    },
+
+    /// SECURITY: the provider was revoked or disabled while this login was in
+    /// flight, so the session it had just created was deleted again before
+    /// the cookie was issued -- see
+    /// `OidcService::assert_provider_live_for_session`.
+    #[error(
+        "OIDC provider {provider_id} was revoked or disabled while this login was in progress; the session it created was discarded"
+    )]
+    ProviderRevokedDuringLogin { provider_id: i32 },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
@@ -116,6 +155,11 @@ impl From<OidcError> for Problem {
                 .with_detail(format!(
                     "OIDC login state {state} was not found or was already used"
                 )),
+            OidcError::CredentialsChanged { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("Sign-in Interrupted")
+                .with_detail(
+                    "Your password was reset by an administrator while you were signing in. Start sign-in again.",
+                ),
             OidcError::StateExpired { state, age_secs } => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("OIDC State Expired")
                 .with_detail(format!(
@@ -161,11 +205,17 @@ impl From<OidcError> for Problem {
                 .with_detail(format!(
                     "Role '{role}' is invalid for Temps SSO mapping (use 'admin' or 'user')"
                 )),
-            OidcError::ManagedByCloudEdit { .. } | OidcError::ManagedByCloudDelete { .. } => {
-                problem_new(StatusCode::CONFLICT)
-                    .with_title("Managed By Temps Cloud")
-                    .with_detail(err.to_string())
-            }
+            OidcError::ManagedByCloudEdit { .. }
+            | OidcError::ManagedByCloudDelete { .. }
+            | OidcError::ManagedByCloudRoleMapping { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("Managed By Temps Cloud")
+                .with_detail(err.to_string()),
+            OidcError::ManagedIssuerAlreadyUsed { .. } => problem_new(StatusCode::CONFLICT)
+                .with_title("Issuer Already In Use")
+                .with_detail(err.to_string()),
+            OidcError::ProviderRevokedDuringLogin { .. } => problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Provider Revoked")
+                .with_detail(err.to_string()),
             OidcError::InsufficientRole { .. } => problem_new(StatusCode::FORBIDDEN)
                 .with_title("Insufficient Role")
                 .with_detail(err.to_string()),

@@ -130,6 +130,12 @@ pub enum GitProviderManagerError {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("Compose preview for '{path}' could not be rendered: {source}")]
+    ComposePreview {
+        path: String,
+        #[source]
+        source: temps_presets::ComposeParseError,
+    },
     #[error("Repository not found: {0}")]
     RepositoryNotFound(String),
 
@@ -1729,7 +1735,9 @@ impl GitProviderManager {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
-                GitProviderManagerError::ConnectionNotFound(connection_id.to_string())
+                GitProviderManagerError::ConnectionNotFound(format!(
+                    "no git connection with id {connection_id}"
+                ))
             })?;
 
         Ok(connection)
@@ -2049,11 +2057,11 @@ impl GitProviderManager {
             self.sync_repositories_internal(connection_id),
         )
         .await;
-        drop(guard);
 
-        match outcome {
+        let failure = match &outcome {
             Ok(Ok(())) => {
                 tracing::info!(connection_id, "Repository sync completed");
+                None
             }
             Ok(Err(e)) => {
                 tracing::error!(
@@ -2061,6 +2069,7 @@ impl GitProviderManager {
                     error = %e,
                     "Repository sync failed; syncing flag has been reset"
                 );
+                Some(e.to_string())
             }
             Err(_elapsed) => {
                 tracing::error!(
@@ -2068,14 +2077,62 @@ impl GitProviderManager {
                     deadline_secs = SYNC_HARD_DEADLINE.as_secs(),
                     "Repository sync exceeded hard deadline and was aborted"
                 );
+                Some(format!(
+                    "Repository sync exceeded the {}s deadline and was aborted",
+                    SYNC_HARD_DEADLINE.as_secs()
+                ))
             }
+        };
+
+        // Record the outcome BEFORE the guard releases `syncing`: a client
+        // that sees `syncing = false` must already be able to read how the
+        // sync ended, or a failure would briefly look like a success.
+        if let Err(e) = self.record_sync_outcome(connection_id, failure).await {
+            tracing::error!(
+                connection_id,
+                error = %e,
+                "Failed to record repository sync outcome"
+            );
         }
+        drop(guard);
+    }
+
+    /// Persist how a sync ended: the failure reason and when it happened, or
+    /// cleared on success so a stale error never outlives a working sync.
+    async fn record_sync_outcome(
+        &self,
+        connection_id: i32,
+        failure: Option<String>,
+    ) -> Result<(), GitProviderManagerError> {
+        let failed_at = failure.as_ref().map(|_| chrono::Utc::now());
+        git_provider_connections::Entity::update_many()
+            .col_expr(
+                git_provider_connections::Column::LastSyncError,
+                sea_orm::sea_query::Expr::value(failure),
+            )
+            .col_expr(
+                git_provider_connections::Column::LastSyncErrorAt,
+                sea_orm::sea_query::Expr::value(failed_at),
+            )
+            .filter(git_provider_connections::Column::Id.eq(connection_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
     }
 
     /// Wrap `&self` in an `Arc` copy of the manager. Used to hand the
     /// manager into a `Drop` guard that needs owned access.
     fn clone_arc(&self) -> Arc<Self> {
         Arc::new(self.clone())
+    }
+
+    /// HTTPS clone username for a stored provider type.
+    fn clone_username_for_provider_type(provider_type: &str) -> &'static str {
+        match provider_type {
+            "gitlab" => "oauth2",
+            "bitbucket" => "x-token-auth",
+            _ => "x-access-token",
+        }
     }
 
     async fn sync_repositories_internal(
@@ -3557,6 +3614,7 @@ impl GitProviderManager {
         path: String,
         compose_override: Option<String>,
         excluded_services: Vec<String>,
+        preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
     ) -> Result<RepositoryComposePreviewDomain, GitProviderManagerError> {
         let repository = self.get_repository_for_user(repository_id).await?;
 
@@ -3582,16 +3640,15 @@ impl GitProviderManager {
             .await?;
 
         let content = decode_file_content(&file.content, &file.encoding);
-        let preview = temps_presets::render_effective_compose_preview(
+        let preview = temps_presets::render_effective_compose_preview_with_policy(
             &content,
             compose_override.as_deref(),
             &excluded_services,
+            &preview_policy,
         )
-        .map_err(|error| {
-            GitProviderManagerError::InvalidConfiguration(format!(
-                "Compose preview for '{}' could not be rendered: {}",
-                path, error
-            ))
+        .map_err(|source| GitProviderManagerError::ComposePreview {
+            path: path.clone(),
+            source,
         })?;
 
         Ok(RepositoryComposePreviewDomain {
@@ -5556,6 +5613,184 @@ impl GitProviderManagerTrait for GitProviderManager {
         Ok(())
     }
 
+    async fn clone_sparse_subdirectory(
+        &self,
+        connection_id: i32,
+        repo_owner: &str,
+        repo_name: &str,
+        target_dir: &Path,
+        subdirectory: &str,
+        branch_or_ref: Option<&str>,
+    ) -> Result<(), super::git_provider_manager_trait::GitProviderManagerError> {
+        use super::git_provider_manager_trait::GitProviderManagerError as TraitError;
+
+        let subdirectory = super::git_ops::validate_sparse_subdirectory(subdirectory)
+            .map_err(|e| TraitError::CloneError(e.to_string()))?;
+
+        if target_dir.exists() {
+            let is_empty = std::fs::read_dir(target_dir)
+                .map_err(|e| TraitError::CloneError(format!("Failed to read directory: {}", e)))?
+                .next()
+                .is_none();
+
+            if !is_empty {
+                return Err(TraitError::DirectoryNotEmpty(
+                    target_dir.display().to_string(),
+                ));
+            }
+        } else {
+            std::fs::create_dir_all(target_dir).map_err(|e| {
+                TraitError::CloneError(format!("Failed to create directory: {}", e))
+            })?;
+        }
+
+        let connection = self
+            .get_connection(connection_id)
+            .await
+            .map_err(|_| TraitError::ConnectionNotFound(connection_id))?;
+
+        let provider = self
+            .get_provider(connection.provider_id)
+            .await
+            .map_err(|_| TraitError::ProviderNotFound(connection.provider_id))?;
+
+        let provider_service = self
+            .get_provider_service(connection.provider_id)
+            .await
+            .map_err(|_| TraitError::ProviderNotFound(connection.provider_id))?;
+
+        let access_token = self
+            .validate_and_refresh_connection_token(connection_id)
+            .await
+            .map_err(|e| TraitError::DecryptionError(e.to_string()))?;
+
+        let repo = match provider_service
+            .get_repository(&access_token, repo_owner, repo_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if Self::is_auth_failure(&e.to_string()) => {
+                tracing::warn!(
+                    connection_id,
+                    "get_repository hit auth failure ({}); force-refreshing token and retrying",
+                    e
+                );
+                let refreshed = self
+                    .force_refresh_connection_token(connection_id)
+                    .await
+                    .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
+                provider_service
+                    .get_repository(&refreshed, repo_owner, repo_name)
+                    .await
+                    .map_err(|err| {
+                        TraitError::CloneError(format!(
+                            "Failed to get repository after token refresh: {}",
+                            err
+                        ))
+                    })?
+            }
+            Err(e) => {
+                return Err(TraitError::CloneError(format!(
+                    "Failed to get repository: {}",
+                    e
+                )))
+            }
+        };
+
+        let username = Self::clone_username_for_provider_type(&provider.provider_type).to_string();
+        let clone_url = repo.clone_url.clone();
+        let target_dir_owned = target_dir.to_path_buf();
+        let subdirectory_owned = subdirectory.clone();
+        let checkout_ref = branch_or_ref.map(|value| value.to_string());
+
+        const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+        let run_sparse_clone = |token: String| {
+            let clone_url = clone_url.clone();
+            let target_dir_owned = target_dir_owned.clone();
+            let subdirectory_owned = subdirectory_owned.clone();
+            let checkout_ref = checkout_ref.clone();
+            let username = username.clone();
+            async move {
+                super::git_ops::sparse_clone_repo(
+                    &clone_url,
+                    &target_dir_owned,
+                    &subdirectory_owned,
+                    checkout_ref.as_deref(),
+                    Some((username.as_str(), token.as_str())),
+                )
+                .await
+            }
+        };
+
+        let clone_result =
+            match tokio::time::timeout(CLONE_TIMEOUT, run_sparse_clone(access_token.clone())).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(TraitError::CloneError(format!(
+                        "Git sparse clone timed out after {}s",
+                        CLONE_TIMEOUT.as_secs()
+                    )))
+                }
+            };
+
+        if let Err(e) = clone_result {
+            if Self::is_auth_failure(&e.to_string()) {
+                tracing::warn!(
+                    connection_id,
+                    "clone_sparse_subdirectory hit auth failure ({}); force-refreshing token and retrying once",
+                    e
+                );
+
+                if target_dir.exists() {
+                    if let Err(rm) = std::fs::remove_dir_all(target_dir) {
+                        return Err(TraitError::CloneError(format!(
+                            "Auth retry: failed to clean partial clone at {}: {}",
+                            target_dir.display(),
+                            rm
+                        )));
+                    }
+                    std::fs::create_dir_all(target_dir).map_err(|err| {
+                        TraitError::CloneError(format!(
+                            "Auth retry: failed to recreate target directory: {}",
+                            err
+                        ))
+                    })?;
+                }
+
+                let refreshed = self
+                    .force_refresh_connection_token(connection_id)
+                    .await
+                    .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
+
+                match tokio::time::timeout(CLONE_TIMEOUT, run_sparse_clone(refreshed)).await {
+                    Ok(result) => {
+                        result.map_err(|err| {
+                            TraitError::CloneError(format!(
+                                "Failed to sparse clone after refresh: {}",
+                                err
+                            ))
+                        })?;
+                    }
+                    Err(_) => {
+                        return Err(TraitError::CloneError(format!(
+                            "Git sparse clone retry timed out after {}s",
+                            CLONE_TIMEOUT.as_secs()
+                        )))
+                    }
+                }
+            } else {
+                return Err(TraitError::CloneError(format!(
+                    "Failed to sparse clone: {}",
+                    e
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn get_connection_access_token(
         &self,
         connection_id: i32,
@@ -6162,6 +6397,8 @@ mod tests {
             health_message: None,
             last_health_check_at: None,
             consecutive_health_failures: 0,
+            last_sync_error: None,
+            last_sync_error_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -6583,6 +6820,7 @@ services:
                         .to_string(),
                 ),
                 vec!["db".to_string()],
+                Default::default(),
             )
             .await
             .expect("connected Compose preview should render");
@@ -6618,6 +6856,7 @@ services:
                 "ops/custom.compose.yaml".to_string(),
                 None,
                 Vec::new(),
+                Default::default(),
             )
             .await
             .expect_err("invalid repository YAML must fail preview rendering");
@@ -6806,6 +7045,8 @@ services:
             health_message: None,
             last_health_check_at: None,
             consecutive_health_failures: 0,
+            last_sync_error: None,
+            last_sync_error_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -7301,5 +7542,98 @@ services:
         // Verify the other template's files were not included
         assert!(!file_names.contains(&"main.py"));
         assert!(!file_names.contains(&"README.md"));
+    }
+
+    /// A sync runs detached, so its failure used to reach only the server log:
+    /// the console saw `syncing` flip back to false and could not tell a failed
+    /// sync from one that succeeded and found nothing. The reason must be
+    /// persisted before `syncing` is released, and a later success clears it.
+    #[tokio::test]
+    async fn failed_sync_is_recorded_on_the_connection_and_cleared_on_success() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+
+        // An auth config that doesn't deserialize makes the sync fail before
+        // any provider request, exactly like a misconfigured provider does.
+        let provider = git_providers::ActiveModel {
+            name: Set("broken-provider".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({})),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("sync-account".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(None),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(true),
+            last_synced_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        );
+        let manager = Arc::new(GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db.clone()),
+        ));
+
+        manager.clone().run_sync_guarded(connection.id).await;
+
+        let failed = manager.get_connection(connection.id).await.unwrap();
+        let reason = failed
+            .last_sync_error
+            .as_deref()
+            .expect("a failed sync must record why it failed");
+        assert!(!reason.is_empty());
+        assert!(failed.last_sync_error_at.is_some());
+
+        // The guard releases `syncing` from a spawned task; give it a moment.
+        let mut released = false;
+        for _ in 0..50 {
+            if !manager.get_connection(connection.id).await.unwrap().syncing {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            released,
+            "a failed sync must still release the syncing flag"
+        );
+
+        manager
+            .record_sync_outcome(connection.id, None)
+            .await
+            .unwrap();
+        let recovered = manager.get_connection(connection.id).await.unwrap();
+        assert_eq!(recovered.last_sync_error, None);
+        assert_eq!(recovered.last_sync_error_at, None);
     }
 }

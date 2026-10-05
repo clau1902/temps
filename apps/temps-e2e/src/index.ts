@@ -405,7 +405,7 @@ program
 program
   .command('s3-restore-scenario')
   .description(
-    'S3/MinIO managed-service restore: provision a real MinIO service with known credentials, upload pre-backup objects, mirror-backup via mc, diverge (add + delete), restore in-place with --overwrite --remove, and verify via the platform data-browser API that the live bucket exactly matches the backup-time state (deleted object restored, post-backup object gone)',
+    'S3/MinIO managed-service restore: provision a real MinIO service with known credentials, upload pre-backup objects, mirror-backup via rc (RustFS CLI), diverge (add + delete), restore in-place with --overwrite --remove, and verify via the platform data-browser API that the live bucket exactly matches the backup-time state (deleted object restored, post-backup object gone)',
   )
   .option('--minio-endpoint <url>', 'backup-destination MinIO S3 API endpoint (must already have the bucket)', 'http://localhost:9092')
   .option('--minio-bucket <name>', 'backup-destination bucket (must already exist)', 'temps-e2e-backups')
@@ -539,11 +539,18 @@ program
       'worker to register via POST /internal/nodes/register, pins a deployment to it via target_nodes, ' +
       'proves the container actually landed on the worker (not the control plane) via a docker-exec side ' +
       'channel, proves app-to-app and managed-Postgres *.temps.local DNS from deployed containers, drains ' +
-      'the worker, and removes it from the cluster -- the first e2e coverage this feature ' +
+      'the worker, runs sandboxes on it (ADR-048: placement, exec/files/stop-start, control-plane restart, ' +
+      'offline node, eviction), and removes it from the cluster -- the first e2e coverage this feature ' +
       'has ever had. First run compiles the temps binary from source TWICE (once per node) inside Docker, ' +
       'so budget 15-20+ minutes; subsequent runs are fast (cargo/target caches persist across runs).',
   )
-  .option('--compose-file <path>', 'path to the cluster docker-compose.yml', undefined)
+  .option(
+    '--topology <name>',
+    "cluster to run against: 'bridge' (both nodes on one Docker network, tools/e2e-multinode-cluster/) or " +
+      "'wireguard' (nodes in isolated networks behind NAT, joined only by a WireGuard tunnel, tools/e2e-wireguard-cluster/)",
+    'bridge',
+  )
+  .option('--compose-file <path>', "override the topology's docker-compose.yml", undefined)
   .option('--build-timeout <ms>', 'max wait for the cluster/worker to come up (real cargo build inside Docker)', '1800000')
   .option('--keep', 'do not tear down the cluster (leaves the entire 2-node cluster running, not just one container)')
   .option('--json', 'machine-readable output')

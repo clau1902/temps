@@ -24,8 +24,11 @@ pub struct AppState {
     pub workflow_planner: Arc<WorkflowPlanner>,
     pub workflow_executor: Arc<WorkflowExecutionService>,
     pub queue_service: Arc<dyn temps_core::JobQueue>,
-    // Blob service for static bundle uploads (optional, falls back to local storage)
-    pub blob_service: Arc<temps_blob::BlobService>,
+    // Blob service for static bundle uploads. `None` when this process has
+    // no local Docker daemon (`--profile control-plane`) or the operator
+    // hasn't enabled the Blob RustFS service — falls back to local storage
+    // (`data_dir`) in that case rather than failing plugin registration.
+    pub blob_service: Option<Arc<temps_blob::BlobService>>,
     /// Data directory for local file storage (static bundles, etc.)
     pub data_dir: std::path::PathBuf,
     /// Image builder for importing Docker images from tarballs
@@ -34,6 +37,10 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Node service for listing/getting worker nodes (UI-facing)
     pub node_service: Arc<NodeService>,
+    /// Placement policy for this process, used by the node capability
+    /// endpoint to answer "can anything run here?" with the same rules the
+    /// deploy path applies.
+    pub node_scheduler: Arc<crate::services::NodeScheduler>,
     /// Encryption service for decrypting node tokens (used by drain to stop remote containers)
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// Config service — gives drain/exit-facing handlers access to the cluster
@@ -72,6 +79,11 @@ pub struct AppState {
     /// Builds and sends deploy-failure reports (redacted trace, user-edited,
     /// sent on request) -- see [`crate::services::failure_report_service`].
     pub failure_report_service: Arc<crate::services::FailureReportService>,
+    /// Single-use enrollment tokens that `temps join` redeems (ADR-020 WS-1.1).
+    pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
+    /// Starts and cancels node pairings (ADR 048 D2b); shared with the admin
+    /// pairing routes so SSH enrollment pairs nodes the same way.
+    pub node_pairing_admin: Arc<crate::services::node_pairing_admin::NodePairingAdminService>,
     /// Central policy evaluator for sensitive mutations (e.g. draining a
     /// node) -- challenges with MFA step-up when the acting user has one
     /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
@@ -280,6 +292,10 @@ pub struct DeploymentEnvironmentResponse {
     pub name: String,
     pub slug: String,
     pub domains: Vec<String>,
+    /// Public URLs of this environment's Docker Compose services, one per
+    /// configured public port. Empty for non-Compose projects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_urls: Vec<ServicePublicUrl>,
 }
 
 impl DeploymentResponse {
@@ -293,6 +309,7 @@ impl DeploymentResponse {
                 name: deployment.environment.name,
                 slug: deployment.environment.slug,
                 domains: deployment.environment.domains,
+                service_urls: Vec::new(),
             },
             status: deployment.status,
             url: deployment.url,
@@ -716,9 +733,13 @@ pub struct ContainerInfoResponse {
     /// Compose service name (e.g. "web", "redis"). None for single-container deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
-    /// Per-service URL for compose deployments (e.g. "https://web-myapp.localho.st")
+    /// Per-service URL for compose deployments (e.g. "https://web-myapp.localho.st").
+    /// The service's first public URL when it exposes several ports.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_url: Option<String>,
+    /// Every public URL of this compose service, one per public port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_urls: Vec<ServicePublicUrl>,
     /// Process exit code reported by Docker. None while still running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -751,12 +772,25 @@ pub struct ContainerInfoResponse {
     pub cpu_limit_cores: Option<f64>,
 }
 
+/// A public URL of a compose service and the container port it routes to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ServicePublicUrl {
+    /// Compose service this URL routes to.
+    #[schema(example = "web")]
+    pub service: String,
+    /// Container port this URL routes to.
+    #[schema(example = 3000)]
+    pub port: u16,
+    #[schema(example = "https://web--production.localho.st")]
+    pub url: String,
+}
+
 impl ContainerInfoResponse {
     pub fn from_info(
         info: temps_deployer::ContainerInfo,
         node_name: Option<String>,
         service_name: Option<String>,
-        service_url: Option<String>,
+        service_urls: Vec<ServicePublicUrl>,
     ) -> Self {
         Self {
             container_id: info.container_id,
@@ -766,7 +800,8 @@ impl ContainerInfoResponse {
             created_at: info.created_at.to_rfc3339(),
             node_name,
             service_name,
-            service_url,
+            service_url: service_urls.first().map(|route| route.url.clone()),
+            service_urls,
             exit_code: info.exit_code,
             exit_reason: info.exit_reason,
             oom_killed: info.oom_killed,
@@ -781,7 +816,7 @@ impl ContainerInfoResponse {
 
 impl From<temps_deployer::ContainerInfo> for ContainerInfoResponse {
     fn from(info: temps_deployer::ContainerInfo) -> Self {
-        Self::from_info(info, None, None, None)
+        Self::from_info(info, None, None, Vec::new())
     }
 }
 
@@ -827,9 +862,13 @@ pub struct ContainerDetailResponse {
     /// Compose service name (e.g. "web", "redis"). None for single-container deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
-    /// Per-service URL for compose deployments
+    /// Per-service URL for compose deployments. The service's first public URL
+    /// when it exposes several ports.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_url: Option<String>,
+    /// Every public URL of this compose service, one per public port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_urls: Vec<ServicePublicUrl>,
     /// Process exit code reported by Docker. None while still running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,

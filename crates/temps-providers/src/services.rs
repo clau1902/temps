@@ -531,6 +531,77 @@ fn default_topology() -> String {
     "standalone".to_string()
 }
 
+/// The parameter schema for a service type, without touching Docker.
+///
+/// Every engine's `get_parameter_schema` is pure `schemars` metadata derived
+/// from its input-config type: it never talks to a daemon. Routing schema
+/// lookups through `create_service_instance` (which needs a `bollard::Docker`
+/// only so it can construct the engine struct) made a control-plane process —
+/// which deliberately has no daemon — answer a plain metadata question with a
+/// 500. This dispatch is the Docker-free path those callers use instead.
+///
+/// The arms mirror `ExternalServiceManager::create_service_instance` exactly,
+/// including the KV/Blob aliases, so the published schema can never disagree
+/// with the engine that will actually be provisioned.
+#[allow(deprecated)]
+pub fn parameter_schema_for_service_type(service_type: ServiceType) -> Option<serde_json::Value> {
+    match service_type {
+        ServiceType::Mariadb => MariaDbService::parameter_schema(),
+        ServiceType::Mongodb => MongodbService::parameter_schema(),
+        ServiceType::Postgres => PostgresService::parameter_schema(),
+        // Temps KV is Redis-backed; the name differs, the parameters do not.
+        ServiceType::Redis | ServiceType::Kv => RedisService::parameter_schema(),
+        // S3 and Blob are RustFS-backed by default.
+        ServiceType::S3 | ServiceType::Blob | ServiceType::Rustfs => {
+            RustfsService::parameter_schema()
+        }
+        ServiceType::Minio => S3Service::parameter_schema(),
+    }
+}
+
+/// The parameter schema for an **existing** service, honouring the managed-S3
+/// backend recorded in its parameters.
+///
+/// Detail responses must describe the engine the service actually runs: an S3
+/// service created on the legacy MinIO backend has a different parameter set
+/// from a RustFS one. This mirrors
+/// `ExternalServiceManager::create_service_instance_for_parameter_value`'s
+/// backend selection, minus the Docker client it only needed in order to build
+/// an engine it then asked a static question.
+#[allow(deprecated)]
+pub fn parameter_schema_for_parameters(
+    service_type: ServiceType,
+    parameters: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, ExternalServiceError> {
+    if !matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
+        return Ok(parameter_schema_for_service_type(service_type));
+    }
+
+    let backend_selection =
+        ManagedS3BackendSelection::from_parameters(parameters).map_err(|e| {
+            ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason: e.to_string(),
+            }
+        })?;
+    match backend_selection.backend {
+        ManagedS3BackendKind::Rustfs => Ok(parameter_schema_for_service_type(service_type)),
+        ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
+            Ok(S3Service::parameter_schema())
+        }
+        ManagedS3BackendKind::Minio => Err(ExternalServiceError::ParameterValidationFailed {
+            service_id: 0,
+            reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services"
+                .to_string(),
+        }),
+        ManagedS3BackendKind::Garage => Err(ExternalServiceError::ParameterValidationFailed {
+            service_id: 0,
+            reason: "managed S3 backend 'garage' is not supported for service operations"
+                .to_string(),
+        }),
+    }
+}
+
 /// Add the canonical create-form defaults to a service parameter schema.
 ///
 /// Both the console and AI chat read this schema. Keeping the suggested name
@@ -1837,6 +1908,54 @@ impl ExternalServiceManager {
         ))
     }
 
+    /// Server kind and image of a MinIO-engine service created on a remote
+    /// node. The image lives on the node, so its metadata can't be read here:
+    /// an explicit `server` wins; without one the config predates the field,
+    /// i.e. it was created as MinIO — the MinIO image this path used to
+    /// default to when none is stored, the stored image run as MinIO otherwise (logged, since a
+    /// mislabelled RustFS image would then fail its healthcheck). New
+    /// services always store `server` (see `MinioParameterStrategy`).
+    fn remote_s3_server_kind_and_image(
+        parameters: &HashMap<String, String>,
+    ) -> Result<(crate::externalsvc::s3::S3ServerKind, String), ExternalServiceError> {
+        use crate::externalsvc::s3::S3ServerKind;
+
+        let explicit = parameters
+            .get("server")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(S3ServerKind::parse)
+            .transpose()
+            .map_err(|e| ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason: e.to_string(),
+            })?;
+        let image = parameters
+            .get("docker_image")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        Ok(match (explicit, image) {
+            (Some(kind), Some(image)) => (kind, image),
+            (Some(kind), None) => (kind, kind.default_image().to_string()),
+            // The image this path defaulted to before the field existed, so
+            // a node that still holds it keeps using it.
+            (None, None) => (
+                S3ServerKind::Minio,
+                "quay.io/minio/minio:latest".to_string(),
+            ),
+            (None, Some(image)) => {
+                warn!(
+                    "Remote S3 service image '{}' has no stored server kind; running it as MinIO, \
+                     as it was created. Set the service's `server` parameter to 'rustfs' or \
+                     'minio' if that is wrong.",
+                    image
+                );
+                (S3ServerKind::Minio, image)
+            }
+        })
+    }
+
     /// Build the `RemoteServiceCreateParams` that the agent needs to create a
     /// Docker container for a given service type and parameters.
     fn build_remote_create_params(
@@ -2000,9 +2119,13 @@ impl ExternalServiceManager {
                     .cloned()
                     .unwrap_or_else(|| "minioadmin".to_string());
                 let secret_key = parameters.get("secret_key").cloned().unwrap_or_default();
+                // RustFS reads RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY. It ignores
+                // RUSTFS_ROOT_USER/RUSTFS_ROOT_PASSWORD, which left remote
+                // containers on RustFS's built-in credentials instead of the
+                // ones stored for the service.
                 let env = HashMap::from([
-                    ("RUSTFS_ROOT_USER".to_string(), access_key),
-                    ("RUSTFS_ROOT_PASSWORD".to_string(), secret_key),
+                    ("RUSTFS_ACCESS_KEY".to_string(), access_key),
+                    ("RUSTFS_SECRET_KEY".to_string(), secret_key),
                 ]);
                 let cmd = vec![
                     "rustfs".to_string(),
@@ -2032,21 +2155,22 @@ impl ExternalServiceManager {
             }
             #[allow(deprecated)]
             ServiceType::Minio => {
-                let image = parameters
-                    .get("docker_image")
-                    .cloned()
-                    .unwrap_or_else(|| "quay.io/minio/minio:latest".to_string());
+                let (kind, image) = Self::remote_s3_server_kind_and_image(parameters)?;
                 let access_key = parameters
                     .get("access_key")
                     .cloned()
                     .unwrap_or_else(|| "minioadmin".to_string());
                 let secret_key = parameters.get("secret_key").cloned().unwrap_or_default();
-                let env = HashMap::from([
-                    ("MINIO_ROOT_USER".to_string(), access_key),
-                    ("MINIO_ROOT_PASSWORD".to_string(), secret_key),
-                ]);
+                let env = crate::externalsvc::s3::s3_server_credentials_env(
+                    kind,
+                    &access_key,
+                    &secret_key,
+                )
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect::<HashMap<_, _>>();
                 let cmd = vec![
-                    "minio".to_string(),
+                    kind.as_str().to_string(),
                     "server".to_string(),
                     "/data".to_string(),
                 ];
@@ -2653,12 +2777,9 @@ impl ExternalServiceManager {
                 }
             })?;
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service_info.name.clone(),
-            service_type,
-            &parameters,
-        )?;
-        let parameter_schema = service_instance.get_parameter_schema();
+        // Schema only — resolved statically so a service's detail page still
+        // renders on a process with no local Docker daemon.
+        let parameter_schema = Self::parameter_schema_for(service_type, &parameters)?;
         let sensitive_parameters = Self::mask_sensitive_parameter_values(&mut parameters);
 
         Ok(ExternalServiceDetails {
@@ -3726,7 +3847,7 @@ impl ExternalServiceManager {
                         member.container_name, service_id, node_id
                     ),
                 })?;
-            node.private_address
+            node.data_address().to_string()
         } else {
             // Local members publish their container port on the control-plane
             // host; Docker-internal names and addresses are not host-routable.
@@ -3947,7 +4068,7 @@ impl ExternalServiceManager {
                 .one(self.db.as_ref())
                 .await
             {
-                Ok(Some(n)) => n.private_address,
+                Ok(Some(n)) => n.data_address().to_string(),
                 _ => {
                     return ClusterProbeResult::down(format!(
                         "Monitor's node {} not found in nodes table",
@@ -4116,7 +4237,7 @@ impl ExternalServiceManager {
                 .one(self.db.as_ref())
                 .await
             {
-                Ok(Some(n)) => n.private_address,
+                Ok(Some(n)) => n.data_address().to_string(),
                 _ => {
                     return ClusterHealthReport {
                         checked_at: chrono::Utc::now(),
@@ -6125,7 +6246,7 @@ echo "[restore] Pre-seed complete"
                     .ok_or(ExternalServiceError::InternalError {
                         reason: format!("Node {} not found", node_id),
                     })?;
-                Some(node.private_address.clone())
+                Some(node.data_address().to_string())
             } else {
                 // Local member: use control plane's private IP if available
                 // (so remote workers can reach it), otherwise None (Docker DNS)
@@ -7294,7 +7415,7 @@ echo "[restore] Pre-seed complete"
                         .ok_or(ExternalServiceError::InternalError {
                             reason: format!("Monitor's node {} not found", nid),
                         })?;
-                    node.private_address.clone()
+                    node.data_address().to_string()
                 }
                 MonitorReachability::LocalControlPlane => Self::get_local_private_ip()
                     .unwrap_or_else(|_| format!("postgres-{}-monitor", service.name)),
@@ -7347,7 +7468,7 @@ echo "[restore] Pre-seed complete"
                 .ok_or(ExternalServiceError::InternalError {
                     reason: format!("Node {} not found", nid),
                 })?;
-            Some(node.private_address.clone())
+            Some(node.data_address().to_string())
         } else {
             local_private_ip
         };
@@ -8287,7 +8408,7 @@ echo "[restore] Pre-seed complete"
                 .await
                 .ok()
                 .flatten()
-                .map(|n| n.private_address)
+                .map(|n| n.data_address().to_string())
         } else {
             // Local member (control plane). Use the same probe the
             // initialize_cluster path uses to learn this node's IP.
@@ -8823,6 +8944,10 @@ echo "[restore] Pre-seed complete"
                 // is recreated, so it must be refreshed like `port` rather
                 // than treated as user-provided config.
                 | "compute_ip"
+                // S3/MinIO server kind (`rustfs`/`minio`) that `init()`
+                // resolved from the image metadata for a service created
+                // without one; an explicit value comes back unchanged.
+                | "server"
         )
     }
 
@@ -10512,9 +10637,9 @@ echo "[restore] Pre-seed complete"
         &self,
         service_type: ServiceType,
     ) -> Result<Option<serde_json::Value>, ExternalServiceError> {
-        let service_instance = self.create_service_instance("temp".to_string(), service_type)?;
-        Ok(service_instance
-            .get_parameter_schema()
+        // Pure metadata: no engine instance, no Docker client. A control
+        // plane must answer this identically to a full node.
+        Ok(parameter_schema_for_service_type(service_type)
             .map(|schema| service_creation_schema(service_type, schema)))
     }
 
@@ -10527,12 +10652,9 @@ echo "[restore] Pre-seed complete"
         let mut parameters = self.get_service_parameters(service.id).await?;
         let service_type = ServiceType::from_str(&service_info.service_type.to_string())?;
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service_info.name.clone(),
-            service_type,
-            &parameters,
-        )?;
-        let parameter_schema = service_instance.get_parameter_schema();
+        // Schema only — resolved statically so a service's detail page still
+        // renders on a process with no local Docker daemon.
+        let parameter_schema = Self::parameter_schema_for(service_type, &parameters)?;
         let sensitive_parameters = Self::mask_sensitive_parameter_values(&mut parameters);
 
         Ok(ExternalServiceDetails {
@@ -10541,6 +10663,20 @@ echo "[restore] Pre-seed complete"
             current_parameters: Some(parameters),
             sensitive_parameters,
         })
+    }
+
+    /// Docker-free parameter-schema lookup for an existing service's stored
+    /// parameters. Wraps [`parameter_schema_for_parameters`] with the
+    /// `HashMap` -> `serde_json::Value` conversion both detail paths need.
+    fn parameter_schema_for(
+        service_type: ServiceType,
+        parameters: &HashMap<String, serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, ExternalServiceError> {
+        let parameter_value =
+            serde_json::to_value(parameters).map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to inspect managed S3 backend parameters: {}", e),
+            })?;
+        parameter_schema_for_parameters(service_type, &parameter_value)
     }
 
     /// Consolidated method for getting environment variables with flexible options
@@ -12817,6 +12953,64 @@ mod tests {
         }
     }
 
+    /// The remote MinIO-engine path configures the container from the
+    /// stored `server` kind, never from the image name: a private mirror of
+    /// RustFS with a neutral name runs RustFS, and a config stored before the
+    /// field existed runs as the MinIO service it was created as.
+    #[test]
+    #[allow(deprecated)]
+    fn remote_minio_engine_configures_the_container_from_the_server_kind() {
+        let manager = mock_service_manager(vec![]);
+        let build = |parameters: &[(&str, &str)]| {
+            let parameters = parameters
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>();
+            manager.build_remote_create_params("orders", &ServiceType::Minio, &parameters)
+        };
+
+        let mirror = "registry.internal:5000/mirror/object-store:1.0.0";
+        let params = build(&[
+            ("docker_image", mirror),
+            ("server", "rustfs"),
+            ("access_key", "AKIAEXAMPLE"),
+            ("secret_key", "secret"),
+        ])
+        .unwrap();
+        assert_eq!(params.image, mirror);
+        assert_eq!(
+            params
+                .environment
+                .get("RUSTFS_ACCESS_KEY")
+                .map(String::as_str),
+            Some("AKIAEXAMPLE")
+        );
+        assert!(!params.environment.contains_key("MINIO_ROOT_USER"));
+        assert_eq!(params.command.as_ref().unwrap()[0], "rustfs");
+
+        let params = build(&[("server", "rustfs")]).unwrap();
+        assert_eq!(params.image, DEFAULT_RUSTFS_IMAGE);
+
+        // Legacy rows (no `server`): MinIO, whatever the image is called.
+        for parameters in [
+            vec![("docker_image", "registry.internal:5000/mirror/rustfs:1.0.0")],
+            vec![],
+        ] {
+            let params = build(&parameters).unwrap();
+            assert!(
+                params.environment.contains_key("MINIO_ROOT_USER"),
+                "{parameters:?}"
+            );
+            assert_eq!(params.command.as_ref().unwrap()[0], "minio");
+        }
+        assert_eq!(build(&[]).unwrap().image, "quay.io/minio/minio:latest");
+
+        assert!(matches!(
+            build(&[("server", "ceph")]),
+            Err(ExternalServiceError::ParameterValidationFailed { .. })
+        ));
+    }
+
     /// Regression for the `ExternalServiceManager::Clone` fix: background
     /// tasks (create_service's cluster-init task and its retry path) must
     /// `self.clone()` rather than `::new(...)` so a role reconciler they
@@ -12874,12 +13068,23 @@ mod tests {
             compute_cidr: None,
             architecture: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -13159,12 +13364,23 @@ mod tests {
             compute_cidr: None,
             architecture: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -14898,6 +15114,7 @@ mod tests {
             repo_name: "preview-project".to_string(),
             repo_owner: "test".to_string(),
             directory: String::new(),
+            pull_only_root_directory: false,
             main_branch: "main".to_string(),
             preset: temps_entities::preset::Preset::NextJs,
             preset_config: None,
@@ -17274,6 +17491,109 @@ mod tests {
     }
 
     // --- Docker-optional / control-plane policy tests ---
+
+    /// Build a manager whose `DockerHandle` is disabled, i.e. exactly the
+    /// state of a `temps serve --profile control-plane` process.
+    fn control_plane_manager() -> ExternalServiceManager {
+        use sea_orm::DatabaseBackend;
+        use sea_orm::MockDatabase;
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = Arc::new(EncryptionService::new(&"0".repeat(64)).unwrap());
+        let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+
+        ExternalServiceManager::new_with_handle(db, enc, handle, false, dns)
+    }
+
+    /// The regression this work fixes: asking for a service type's parameter
+    /// schema is a pure metadata question — every engine answers it from
+    /// `schemars` and never touches a daemon — yet it used to be routed
+    /// through `create_service_instance`, which needs one. On a control plane
+    /// that produced a 500 ("Failed to get parameter schema: This process has
+    /// no local Docker daemon") for a request that cannot fail.
+    #[tokio::test]
+    async fn parameter_schema_is_served_without_a_docker_daemon() {
+        let manager = control_plane_manager();
+
+        for service_type in [
+            ServiceType::Postgres,
+            ServiceType::Mariadb,
+            ServiceType::Mongodb,
+            ServiceType::Redis,
+            ServiceType::S3,
+            ServiceType::Kv,
+            ServiceType::Blob,
+            ServiceType::Rustfs,
+        ] {
+            let schema = manager
+                .get_service_type_schema(service_type)
+                .await
+                .unwrap_or_else(|e| panic!("{service_type} schema must not need Docker: {e}"))
+                .unwrap_or_else(|| panic!("{service_type} must publish a schema"));
+
+            assert_eq!(
+                schema.get("type").and_then(|t| t.as_str()),
+                Some("object"),
+                "{service_type} schema must be a JSON Schema object: {schema}"
+            );
+            assert!(
+                schema.get("x-temps-creation-defaults").is_some(),
+                "{service_type} schema must keep the creation defaults: {schema}"
+            );
+        }
+    }
+
+    /// The static dispatch must agree with the engine a provisioning request
+    /// would actually build, or the console publishes a form that the create
+    /// validator then rejects.
+    #[test]
+    fn static_schema_matches_the_engine_schema_for_every_service_type() {
+        #[allow(deprecated)]
+        let cases = [
+            (ServiceType::Postgres, PostgresService::parameter_schema()),
+            (ServiceType::Mariadb, MariaDbService::parameter_schema()),
+            (ServiceType::Mongodb, MongodbService::parameter_schema()),
+            (ServiceType::Redis, RedisService::parameter_schema()),
+            (ServiceType::Kv, RedisService::parameter_schema()),
+            (ServiceType::S3, RustfsService::parameter_schema()),
+            (ServiceType::Blob, RustfsService::parameter_schema()),
+            (ServiceType::Rustfs, RustfsService::parameter_schema()),
+            (ServiceType::Minio, S3Service::parameter_schema()),
+        ];
+
+        for (service_type, expected) in cases {
+            assert_eq!(
+                parameter_schema_for_service_type(service_type),
+                expected,
+                "static dispatch disagrees with the engine for {service_type}"
+            );
+        }
+    }
+
+    /// An existing managed-S3 service on the legacy MinIO backend must keep
+    /// describing MinIO's parameters, without a daemon.
+    #[test]
+    fn parameters_aware_schema_honours_the_managed_s3_backend() {
+        let minio = serde_json::json!({ "backend": "minio" });
+        #[allow(deprecated)]
+        let expected = S3Service::parameter_schema();
+        assert_eq!(
+            parameter_schema_for_parameters(ServiceType::S3, &minio)
+                .expect("minio is a valid S3 backend"),
+            expected
+        );
+
+        let default = serde_json::json!({});
+        assert_eq!(
+            parameter_schema_for_parameters(ServiceType::S3, &default)
+                .expect("the default backend is valid"),
+            RustfsService::parameter_schema()
+        );
+    }
 
     /// A disabled `DockerHandle` causes `require_docker()` to return a typed
     /// `DockerUnavailable` error. The policy flag is independent: even when

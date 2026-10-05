@@ -8,6 +8,9 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder,
 };
 use std::sync::Arc;
+use temps_core::telemetry::{
+    NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter,
+};
 use temps_entities::domains;
 use temps_entities::on_demand_cert_attempts;
 use temps_entities::renewal_attempts;
@@ -19,6 +22,51 @@ use crate::tls::{
     CertificateProvider, CertificateRepository, ChallengeType, ProvisioningResult, RepositoryError,
     TlsError,
 };
+
+/// Allowlisted sort columns for the paginated domain collection.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainSort {
+    #[default]
+    CreatedAt,
+    Domain,
+    Status,
+    Expiration,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainSortDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
+fn sorted_domains_query(
+    search: Option<&str>,
+    sort: DomainSort,
+    direction: DomainSortDirection,
+) -> sea_orm::Select<domains::Entity> {
+    use sea_orm::{sea_query::NullOrdering, Order};
+    let column = match sort {
+        DomainSort::CreatedAt => domains::Column::CreatedAt,
+        DomainSort::Domain => domains::Column::Domain,
+        DomainSort::Status => domains::Column::Status,
+        DomainSort::Expiration => domains::Column::ExpirationTime,
+    };
+    let order = match direction {
+        DomainSortDirection::Asc => Order::Asc,
+        DomainSortDirection::Desc => Order::Desc,
+    };
+    let mut query = domains::Entity::find();
+    if let Some(search) = search.filter(|value| !value.is_empty()) {
+        query = query.filter(domains::Column::Domain.contains(search));
+    }
+    query
+        .order_by_with_nulls(column, order, NullOrdering::Last)
+        .order_by_asc(domains::Column::Domain)
+        .order_by_asc(domains::Column::Id)
+}
 
 #[derive(Error, Debug)]
 pub enum DomainServiceError {
@@ -70,11 +118,26 @@ pub enum DomainServiceError {
     CertificateAlreadyActive(String),
 }
 
+/// Fixed telemetry label for a certificate's verification method. The column is
+/// free text and holds legacy aliases (`acme`, `http`), so it is mapped rather
+/// than sent verbatim.
+pub(crate) fn verification_method_label(raw: &str) -> &'static str {
+    match raw {
+        "http-01" | "acme" | "http" => "http-01",
+        "dns-01" => "dns-01",
+        "manual" => "manual",
+        _ => "unknown",
+    }
+}
+
 pub struct DomainService {
     db: Arc<DatabaseConnection>,
     cert_provider: Arc<dyn CertificateProvider>,
     repository: Arc<dyn CertificateRepository>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    /// Anonymous product telemetry. No-op unless wired with
+    /// [`Self::with_telemetry`].
+    telemetry: Arc<dyn TelemetryReporter>,
 }
 
 impl DomainService {
@@ -89,7 +152,15 @@ impl DomainService {
             cert_provider,
             repository,
             encryption_service,
+            telemetry: Arc::new(NoopTelemetryReporter),
         }
+    }
+
+    /// Report failed certificate attempts as anonymous `ssl_certificate_failed`
+    /// telemetry.
+    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetryReporter>) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     /// Whether a domain still holds a certificate that can safely keep being served:
@@ -210,6 +281,7 @@ impl DomainService {
     /// Append one row to the `renewal_attempts` audit log. Best-effort: a
     /// failure to write the audit row must never fail the caller's actual
     /// renewal outcome, so errors are logged and swallowed here.
+    #[allow(clippy::too_many_arguments)]
     async fn record_renewal_attempt(
         &self,
         domain_id: i32,
@@ -218,7 +290,19 @@ impl DomainService {
         outcome: &str,
         error: Option<String>,
         error_type: Option<String>,
+        report_telemetry: bool,
     ) {
+        if report_telemetry && outcome == "failed" {
+            self.telemetry.report(
+                TelemetryEvent::new(TelemetryEventKind::SslCertificateFailed)
+                    .with("stage", stage.to_string())
+                    .with(
+                        "verification_method",
+                        verification_method_label(verification_method),
+                    )
+                    .with_failure_from_message(error.as_deref().unwrap_or_default()),
+            );
+        }
         let row = renewal_attempts::ActiveModel {
             domain_id: Set(domain_id),
             stage: Set(stage.to_string()),
@@ -259,6 +343,28 @@ impl DomainService {
         &self,
         domain_name: &str,
         user_email: &str,
+    ) -> Result<ChallengeData, DomainServiceError> {
+        self.request_challenge_with(domain_name, user_email, true)
+            .await
+    }
+
+    /// [`Self::request_challenge`] without `ssl_certificate_failed` telemetry,
+    /// for the renewal scheduler, which reports every renewal outcome itself
+    /// (including failures before an ACME order exists).
+    pub(crate) async fn request_challenge_unreported(
+        &self,
+        domain_name: &str,
+        user_email: &str,
+    ) -> Result<ChallengeData, DomainServiceError> {
+        self.request_challenge_with(domain_name, user_email, false)
+            .await
+    }
+
+    async fn request_challenge_with(
+        &self,
+        domain_name: &str,
+        user_email: &str,
+        report_telemetry: bool,
     ) -> Result<ChallengeData, DomainServiceError> {
         info!(
             "Requesting Let's Encrypt challenge for domain: {} with email: {}",
@@ -341,6 +447,7 @@ impl DomainService {
                     "failed",
                     Some(e.to_string()),
                     Some("challenge_request".to_string()),
+                    report_telemetry,
                 )
                 .await;
 
@@ -437,6 +544,7 @@ impl DomainService {
                     "success",
                     None,
                     None,
+                    report_telemetry,
                 )
                 .await;
 
@@ -485,6 +593,7 @@ impl DomainService {
                     "success",
                     None,
                     None,
+                    report_telemetry,
                 )
                 .await;
 
@@ -507,6 +616,28 @@ impl DomainService {
         &self,
         domain_name: &str,
         user_email: &str,
+    ) -> Result<domains::Model, DomainServiceError> {
+        self.complete_challenge_with(domain_name, user_email, true)
+            .await
+    }
+
+    /// [`Self::complete_challenge`] without `ssl_certificate_failed`
+    /// telemetry, for the renewal scheduler (see
+    /// [`Self::request_challenge_unreported`]).
+    pub(crate) async fn complete_challenge_unreported(
+        &self,
+        domain_name: &str,
+        user_email: &str,
+    ) -> Result<domains::Model, DomainServiceError> {
+        self.complete_challenge_with(domain_name, user_email, false)
+            .await
+    }
+
+    async fn complete_challenge_with(
+        &self,
+        domain_name: &str,
+        user_email: &str,
+        report_telemetry: bool,
     ) -> Result<domains::Model, DomainServiceError> {
         debug!(
             "Completing challenge for domain: {} with email: {}",
@@ -661,6 +792,7 @@ impl DomainService {
                     "success",
                     None,
                     None,
+                    report_telemetry,
                 )
                 .await;
 
@@ -716,6 +848,7 @@ impl DomainService {
                     "failed",
                     Some(e.to_string()),
                     Some("challenge_completion".to_string()),
+                    report_telemetry,
                 )
                 .await;
 
@@ -775,14 +908,12 @@ impl DomainService {
         page: u64,
         page_size: u64,
         search: Option<&str>,
+        sort: DomainSort,
+        direction: DomainSortDirection,
     ) -> Result<(Vec<domains::Model>, u64), DomainServiceError> {
-        let mut query = domains::Entity::find();
-
-        if let Some(search) = search {
-            if !search.is_empty() {
-                query = query.filter(domains::Column::Domain.contains(search));
-            }
-        }
+        let query = sorted_domains_query(search, sort, direction);
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
@@ -1595,6 +1726,120 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn domain_sorted_pagination_handles_nulls_search_and_empty_results() {
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::ImmediateCert).await
+        else {
+            return;
+        };
+        let now = Utc::now();
+        for (name, expires) in [
+            ("later.example", Some(now + Duration::days(30))),
+            ("unknown.example", None),
+            ("soon.example", Some(now + Duration::days(2))),
+            ("expired.example", Some(now - Duration::days(2))),
+        ] {
+            let mut model = domain_with_cert(None, None, expires);
+            model.domain = name.to_string();
+            let mut active: domains::ActiveModel = model.into();
+            active.id = sea_orm::ActiveValue::NotSet;
+            active.insert(db.as_ref()).await.unwrap();
+        }
+        let (first, total) = service
+            .list_domains_with_total(
+                1,
+                2,
+                Some("example"),
+                DomainSort::Expiration,
+                DomainSortDirection::Asc,
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.domain.as_str())
+                .collect::<Vec<_>>(),
+            ["expired.example", "soon.example"]
+        );
+        let (second, _) = service
+            .list_domains_with_total(2, 2, None, DomainSort::Expiration, DomainSortDirection::Asc)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|row| row.domain.as_str())
+                .collect::<Vec<_>>(),
+            ["later.example", "unknown.example"]
+        );
+        let (descending, _) = service
+            .list_domains_with_total(
+                1,
+                20,
+                None,
+                DomainSort::Expiration,
+                DomainSortDirection::Desc,
+            )
+            .await
+            .unwrap();
+        assert_eq!(descending.first().unwrap().domain, "later.example");
+        assert_eq!(descending.last().unwrap().domain, "unknown.example");
+        let (empty, total) = service
+            .list_domains_with_total(
+                1,
+                20,
+                Some("missing"),
+                DomainSort::Domain,
+                DomainSortDirection::Asc,
+            )
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn domain_sorting_is_bounded_and_stable() {
+        use sea_orm::{DbBackend, QuerySelect, QueryTrait};
+        for (direction, sql_direction) in [
+            (DomainSortDirection::Asc, "ASC"),
+            (DomainSortDirection::Desc, "DESC"),
+        ] {
+            let sql = sorted_domains_query(Some("example"), DomainSort::Expiration, direction)
+                .limit(20)
+                .offset(20)
+                .build(DbBackend::Postgres)
+                .to_string();
+            assert!(
+                sql.contains(&format!("\"expiration_time\" {sql_direction} NULLS LAST")),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("\"domain\" ASC, \"domains\".\"id\" ASC"),
+                "{sql}"
+            );
+            assert!(sql.contains("LIKE '%example%'"), "{sql}");
+            assert!(sql.contains("LIMIT 20 OFFSET 20"), "{sql}");
+        }
+        for (sort, column) in [
+            (DomainSort::Domain, "domain"),
+            (DomainSort::Status, "status"),
+            (DomainSort::CreatedAt, "created_at"),
+        ] {
+            let sql = sorted_domains_query(None, sort, DomainSortDirection::Desc)
+                .build(DbBackend::Postgres)
+                .to_string();
+            assert!(
+                sql.contains(&format!(
+                    "ORDER BY \"domains\".\"{column}\" DESC NULLS LAST"
+                )),
+                "{sql}"
+            );
+        }
+    }
 
     #[test]
     fn acme_orders_with_dns_cleanup_receipts_are_retained_after_issuance() {

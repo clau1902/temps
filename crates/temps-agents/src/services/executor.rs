@@ -36,6 +36,40 @@ use crate::services::config_service::AgentConfigService;
 use crate::services::prompt_builder::PromptBuilder;
 use crate::services::run_service::{AgentRunService, UpdateRunFields};
 
+/// ADR 045: refuse the agent executor's push+PR step for a project this host
+/// declares (`TEMPS_DOCKER_SOCKET_PROJECTS`).
+///
+/// Pushing AI-written code to a granted project's repository (and, once
+/// merged or previewed via the `GitPushEvent` this step emits, having it
+/// deployed) is the same "plant the payload a later deploy executes as host
+/// root" escalation `SourceDropService` already refuses, and for the same
+/// reason: nothing on this path has an `AuthContext` to prove instance-admin
+/// authority with, since a run may be triggered by any `Role::User` holding
+/// `ProjectsWrite`, an automated error-group trigger, or a public webhook
+/// trigger. Fails closed unconditionally rather than trusting whoever (or
+/// whatever) triggered the run — an admin who wants this deploys through a
+/// path that can actually establish who they are.
+///
+/// `pub(crate)`: called from [`AgentExecutor::prepare_sandbox_workspace`]
+/// (the required chokepoint every run path goes through to get a container
+/// at all) and, as defense in depth, directly from `autofixer::create_pr` —
+/// the sibling push+PR call site in this crate.
+pub(crate) fn refuse_granted_project_push(
+    grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+    project_slug: &str,
+) -> Result<(), AgentError> {
+    if temps_core::docker_socket_grant::deploy_requires_instance_admin(
+        grant,
+        project_slug,
+        temps_core::docker_socket_grant::DeployCaller::default(),
+    ) {
+        return Err(AgentError::DockerSocketWriteRequiresAdmin {
+            slug: project_slug.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Parameters for [`AgentExecutor::prepare_sandbox_workspace`].
 ///
 /// Kept as a struct (not positional args) because the setup function is the
@@ -400,6 +434,23 @@ impl AgentExecutor {
             ephemeral_yaml,
         } = params;
 
+        // ADR 045: refuse *before* the sandbox is ever built, not only before
+        // the executor's own push step. This sandbox is about to be seeded
+        // with a push-capable git credential for `project`'s repository
+        // (`inject_config_repos_and_secrets` writes `.git-credentials` /
+        // `gh`/`glab` config below) on a full-network sandbox by default --
+        // an AI process holding that credential can `git push` directly,
+        // which is strictly stronger than the PR-branch push
+        // `refuse_granted_project_push`'s other call site blocks, and would
+        // otherwise reach it ungated. This is the one call every run path
+        // (the executor and the autofixer) makes to get a container at all,
+        // so refusing here is a required chokepoint rather than one more
+        // call site to remember.
+        refuse_granted_project_push(
+            temps_core::docker_socket_grant::process_grant(),
+            &project.slug,
+        )?;
+
         // Load settings row once: used for both sandbox config and external_url.
         let settings_row = settings::Entity::find_by_id(1)
             .one(self.db.as_ref())
@@ -477,6 +528,16 @@ impl AgentExecutor {
                             }
                             Some(crate::ai_cli::catalog::CredentialFormat::ConfigFile) => {
                                 deferred_credential = Some((key, auth_type));
+                            }
+                            Some(crate::ai_cli::catalog::CredentialFormat::OpenAiCompatible) => {
+                                // This path hands credentials to the sandbox
+                                // directly; an endpoint key is only ever used
+                                // through the workspace model relay.
+                                return Err(AgentError::Validation {
+                                    message: format!(
+                                        "Agent run {run_id} cannot use {ai_provider}: it is connected to an OpenAI-compatible endpoint, which is supported only in AI workspaces. Connect {ai_provider} with auth.json or choose another harness for agent runs."
+                                    ),
+                                });
                             }
                             None => {
                                 tracing::warn!(
@@ -585,6 +646,7 @@ impl AgentExecutor {
             .and_then(|r| r.triggered_by_user_id);
 
         let sandbox_config = SandboxCreateConfig {
+            node_id: None,
             run_id,
             owner_user_id,
             container_name_override: None,
@@ -1528,9 +1590,77 @@ impl AgentExecutor {
             return Ok(());
         }
 
-        // Resolve ${TEMPS_SECRET:name} placeholders in .json files before uploading
+        // Stage the overlay as plain files before uploading. `.claude/`
+        // commonly links in skills kept elsewhere in the same repository
+        // (`.claude/skills/foo -> ../../skills/foo`), so links are followed
+        // while they resolve anywhere inside the clone — the repository the
+        // operator configured — and never beyond it, so a config repo cannot
+        // pull control-plane host files into a sandbox. The staged copy has
+        // no links left, which every sandbox provider uploads unchanged.
+        let staging = tempfile::Builder::new()
+            .prefix("temps-config-overlay-")
+            .tempdir()
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id,
+                sandbox_id: String::new(),
+                reason: format!(
+                    "Failed to create a staging directory for the {} config repo {}/{} .claude/ overlay: {}",
+                    label, owner, repo, e
+                ),
+            })?;
+        let staged = {
+            let source = claude_dir.clone();
+            let root = clone_dir.clone();
+            let destination = staging.path().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                crate::sandbox::docker::stage_directory_upload(&source, &root, &destination)
+            })
+            .await
+        };
+        // The clone is not needed past this point, whatever the outcome.
+        let _ = fs::remove_dir_all(&clone_dir).await;
+        let plan = match staged {
+            Ok(Ok(plan)) => plan,
+            Ok(Err(e)) => {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id,
+                    sandbox_id: String::new(),
+                    reason: format!(
+                        "Failed to prepare {} config repo {}/{} .claude/ for upload: {}",
+                        label, owner, repo, e
+                    ),
+                });
+            }
+            Err(e) => {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id,
+                    sandbox_id: String::new(),
+                    reason: format!(
+                        "Staging task for {} config repo {}/{} .claude/ did not complete: {}",
+                        label, owner, repo, e
+                    ),
+                });
+            }
+        };
+        if let Some(message) = skipped_overlay_entries_message(label, owner, repo, &plan.skipped) {
+            tracing::warn!(
+                run_id,
+                label,
+                owner,
+                repo,
+                skipped = plan.skipped.len(),
+                "Config repo .claude/ overlay left out entries that cannot be uploaded"
+            );
+            self.run_service
+                .append_log(run_id, "warning", &message, None)
+                .await?;
+        }
+
+        // Resolve ${TEMPS_SECRET:name} placeholders in .json files before
+        // uploading. Done on the staged copy: it holds only regular files,
+        // so a link can never redirect the resolved secrets elsewhere.
         if !secrets.is_empty() {
-            Self::resolve_secrets_in_dir(&claude_dir, secrets).await;
+            Self::resolve_secrets_in_dir(staging.path(), secrets).await;
         }
 
         // Upload the .claude/ directory into the sandbox under the sandbox
@@ -1538,20 +1668,21 @@ impl AgentExecutor {
         // bind-mounted from the cloned repo and anything there would land in
         // the PR diff (including any secret values we just resolved above).
         self.sandbox_registry
-            .write_directory(run_id, &claude_dir, "/home/temps/.claude")
+            .write_directory(run_id, staging.path(), "/home/temps/.claude")
             .await?;
 
         self.run_service
             .append_log(
                 run_id,
                 "info",
-                &format!("Overlaid {} config repo .claude/ into sandbox", label),
+                &format!(
+                    "Overlaid {} config repo .claude/ into sandbox ({} file(s))",
+                    label,
+                    plan.files.len()
+                ),
                 None,
             )
             .await?;
-
-        // Clean up temp clone
-        let _ = fs::remove_dir_all(&clone_dir).await;
 
         Ok(())
     }
@@ -2714,6 +2845,13 @@ impl AgentExecutor {
             return Ok(());
         }
 
+        // ADR 045: see `refuse_granted_project_push`. Checked before any file
+        // is even read off disk.
+        refuse_granted_project_push(
+            temps_core::docker_socket_grant::process_grant(),
+            &project.slug,
+        )?;
+
         // Safety check: abort if the AI modified an unreasonable number of files.
         // This guards against runaway AI behaviour that could produce enormous PRs.
         const MAX_FILES_CHANGED: usize = 50;
@@ -3746,6 +3884,51 @@ pub fn extract_report_text(output: &str) -> String {
     output.to_string()
 }
 
+/// Most skipped entries named individually in a run-log warning; the rest
+/// are counted, so a pathological repository cannot flood the run log.
+const MAX_SKIPPED_OVERLAY_ENTRIES_LISTED: usize = 20;
+
+/// Run-log warning naming the `.claude/` overlay entries of a config repo
+/// that were not uploaded, or `None` when nothing was left out.
+fn skipped_overlay_entries_message(
+    label: &str,
+    owner: &str,
+    repo: &str,
+    skipped: &[crate::sandbox::docker::SkippedUploadEntry],
+) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let mut listed: Vec<String> = skipped
+        .iter()
+        .take(MAX_SKIPPED_OVERLAY_ENTRIES_LISTED)
+        .map(|entry| {
+            format!(
+                ".claude/{} ({})",
+                entry.relative_path.display(),
+                entry.reason
+            )
+        })
+        .collect();
+    if skipped.len() > MAX_SKIPPED_OVERLAY_ENTRIES_LISTED {
+        listed.push(format!(
+            "and {} more",
+            skipped.len() - MAX_SKIPPED_OVERLAY_ENTRIES_LISTED
+        ));
+    }
+    Some(format!(
+        "{} {} config repo {}/{} entr{} not copied into the sandbox: {}. Links are only followed while they stay inside the {}/{} repository.",
+        skipped.len(),
+        label,
+        owner,
+        repo,
+        if skipped.len() == 1 { "y was" } else { "ies were" },
+        listed.join(", "),
+        owner,
+        repo
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3754,6 +3937,34 @@ mod tests {
     use std::sync::Mutex;
     use temps_entities::{agent_run_logs, agent_runs, project_agents};
     use temps_git::{GitProviderManagerError, PullRequest, RepositoryInfo};
+
+    #[test]
+    fn refuse_granted_project_push_refuses_a_project_this_host_declares() {
+        let grant = temps_core::docker_socket_grant::DockerSocketGrant::parse(Some("node-daemon"));
+
+        let error = refuse_granted_project_push(&grant, "node-daemon")
+            .expect_err("the agent executor must not push to a granted project");
+        assert!(matches!(
+            error,
+            AgentError::DockerSocketWriteRequiresAdmin { ref slug } if slug == "node-daemon"
+        ));
+    }
+
+    #[test]
+    fn refuse_granted_project_push_allows_an_undeclared_project() {
+        let grant = temps_core::docker_socket_grant::DockerSocketGrant::parse(Some("node-daemon"));
+
+        refuse_granted_project_push(&grant, "ordinary-app")
+            .expect("an undeclared project's repository is untouched by ADR 045");
+    }
+
+    #[test]
+    fn refuse_granted_project_push_allows_every_project_on_an_ungranted_install() {
+        let grant = temps_core::docker_socket_grant::DockerSocketGrant::default();
+
+        refuse_granted_project_push(&grant, "node-daemon")
+            .expect("an install that never set TEMPS_DOCKER_SOCKET_PROJECTS declares nothing");
+    }
 
     #[test]
     fn test_branch_name_format() {
@@ -4151,6 +4362,7 @@ mod tests {
             repo_name: "repo".into(),
             repo_owner: "testowner".into(),
             directory: ".".into(),
+            pull_only_root_directory: false,
             main_branch: "main".into(),
             preset: temps_entities::preset::Preset::NextJs,
             preset_config: None,
@@ -5616,5 +5828,62 @@ mod tests {
         let executor = make_executor_for_memory_tests();
         // Should return without panicking even if the service is absent.
         executor.revoke_run_token(42, 999).await;
+    }
+
+    #[test]
+    fn skipped_overlay_entries_message_is_none_when_nothing_was_skipped() {
+        assert_eq!(
+            skipped_overlay_entries_message("global", "acme", "agent-config", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn skipped_overlay_entries_message_names_each_entry_and_reason() {
+        use crate::sandbox::docker::{SkippedUploadEntry, UploadSkipReason};
+        let skipped = vec![
+            SkippedUploadEntry {
+                relative_path: PathBuf::from("skills/leak"),
+                reason: UploadSkipReason::OutsideRoot,
+            },
+            SkippedUploadEntry {
+                relative_path: PathBuf::from("skills/self"),
+                reason: UploadSkipReason::LinkLoop,
+            },
+        ];
+        let message =
+            skipped_overlay_entries_message("per-agent", "acme", "agent-config", &skipped).unwrap();
+        assert!(
+            message
+                .starts_with("2 per-agent config repo acme/agent-config entries were not copied"),
+            "{message}"
+        );
+        assert!(
+            message.contains(".claude/skills/leak (link points outside the allowed directory)"),
+            "{message}"
+        );
+        assert!(
+            message.contains(".claude/skills/self (link loops back into its own parent)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("inside the acme/agent-config repository"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn skipped_overlay_entries_message_caps_the_listed_entries() {
+        use crate::sandbox::docker::{SkippedUploadEntry, UploadSkipReason};
+        let skipped: Vec<SkippedUploadEntry> = (0..MAX_SKIPPED_OVERLAY_ENTRIES_LISTED + 5)
+            .map(|i| SkippedUploadEntry {
+                relative_path: PathBuf::from(format!("link-{i}")),
+                reason: UploadSkipReason::Unreadable,
+            })
+            .collect();
+        let message =
+            skipped_overlay_entries_message("global", "acme", "agent-config", &skipped).unwrap();
+        assert!(message.contains("and 5 more"), "{message}");
+        assert!(!message.contains(&format!("link-{}", MAX_SKIPPED_OVERLAY_ENTRIES_LISTED)));
     }
 }

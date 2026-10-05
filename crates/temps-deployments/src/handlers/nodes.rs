@@ -14,7 +14,7 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use sea_orm::{DatabaseConnection, EntityTrait};
@@ -25,10 +25,11 @@ use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::NodeArchitectureChangedAudit;
+use crate::handlers::audit::{NodeArchitectureChangedAudit, NodePublicIngressChangedAudit};
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
-    HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
+    node_address_host, HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
+    RegistrationContext,
 };
 use crate::services::CONTROL_PLANE_NODE_ID;
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
@@ -204,6 +205,27 @@ pub struct HeartbeatApiRequest {
     /// expected, not stale data. The stored columns are left untouched when
     /// `None`, same treatment as `architecture` above.
     pub dns_resolver: Option<DnsResolverHeartbeat>,
+    /// Project slugs this node grants host Docker access to (ADR 045), read
+    /// by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
+    ///
+    /// Advisory only: it tells the scheduler where a granted project *may* be
+    /// placed. It can never cause a socket to be mounted — that decision is
+    /// made by the executing process against its own environment. `None` from
+    /// a pre-ADR-045 agent leaves the stored value untouched; an empty array
+    /// clears it.
+    pub docker_socket_projects: Option<Vec<String>>,
+    pub public_ingress: Option<PublicIngressHeartbeat>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct PublicIngressHeartbeat {
+    pub running: bool,
+    pub last_error: Option<String>,
+    pub certificate_count: i64,
+    pub route_count: i64,
+    pub unsupported_route_count: i64,
+    #[serde(default)]
+    pub unsupported_reasons: Vec<String>,
 }
 
 /// Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
@@ -266,6 +288,24 @@ pub struct NodeInfoResponse {
     pub architecture: Option<String>,
     pub last_heartbeat: Option<String>,
     pub created_at: String,
+    pub public_ingress_enabled: bool,
+    pub public_ingress_running: Option<bool>,
+    pub public_ingress_last_error: Option<String>,
+    pub public_ingress_certificate_count: Option<i32>,
+    pub public_ingress_route_count: Option<i32>,
+    pub public_ingress_unsupported_route_count: Option<i32>,
+    pub public_ingress_unsupported_reasons: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetNodePublicIngressRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SetNodePublicIngressResponse {
+    pub node_id: i32,
+    pub enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -318,6 +358,9 @@ pub struct DrainStatusResponse {
     pub status: String,
     /// Number of containers still on this node
     pub remaining_containers: usize,
+    /// Sandboxes (any owner) still on this node. Draining does not move
+    /// sandboxes; evict them before removing the node (ADR-048).
+    pub remaining_sandboxes: u64,
     /// Whether the source node is empty and safe to remove. Replacement
     /// deployments may still be converging asynchronously on other nodes.
     pub drain_complete: bool,
@@ -436,6 +479,8 @@ pub struct ClusterDnsStatusResponse {
         node_heartbeat,
         get_s3_credentials,
         crate::handlers::network::list_peers,
+        crate::handlers::network::register_mesh,
+        crate::handlers::network::report_mesh_handshakes,
         admin_list_nodes,
         admin_get_node,
         admin_list_node_containers,
@@ -443,8 +488,20 @@ pub struct ClusterDnsStatusResponse {
         admin_undrain_node,
         admin_remove_node,
         admin_drain_status,
+        admin_set_node_public_ingress,
         cluster_dns_status,
         node_docker_disk_usage,
+        node_capability,
+        crate::handlers::wireguard_mesh::wireguard_mesh_status,
+        crate::handlers::wireguard_mesh::enable_wireguard_mesh,
+        crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
+        crate::handlers::node_pairings::create_node_pairing,
+        crate::handlers::node_pairings::list_node_pairings,
+        crate::handlers::node_pairings::cancel_node_pairing,
+        crate::handlers::node_ssh::node_ssh_host_key,
+        crate::handlers::node_ssh::create_node_ssh_enrollment,
+        crate::handlers::node_ssh::list_node_ssh_enrollments,
+        crate::handlers::node_ssh::get_node_ssh_enrollment,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -456,6 +513,13 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
         crate::handlers::network::PeerListResponse,
+        crate::handlers::network::WireguardMeshEntry,
+        crate::handlers::network::WireguardMeshSelfEntry,
+        crate::handlers::network::WireguardMeshPeerEntry,
+        crate::handlers::network::RegisterWireguardMeshRequest,
+        crate::handlers::network::RegisterWireguardMeshResponse,
+        crate::handlers::network::ReportWireguardHandshakesRequest,
+        crate::handlers::network::WireguardHandshakeReport,
         NodeInfoResponse,
         NodeListResponse,
         NodeContainerResponse,
@@ -468,6 +532,32 @@ pub struct ClusterDnsStatusResponse {
         ClusterDnsStatusResponse,
         DockerDiskUsage,
         DockerDiskUsageCategory,
+        NodeCapabilityResponse,
+        crate::handlers::wireguard_mesh::WireguardMeshState,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeConnection,
+        crate::handlers::wireguard_mesh::WireguardMeshControlPlaneEntry,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshCheck,
+        crate::handlers::wireguard_mesh::WireguardMeshCheckStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshStatusResponse,
+        crate::handlers::wireguard_mesh::EnableWireguardMeshRequest,
+        crate::handlers::wireguard_mesh::SetWireguardMeshHubRequest,
+        crate::handlers::wireguard_mesh::WireguardMeshHubTarget,
+        crate::handlers::wireguard_mesh::WireguardMeshHub,
+        crate::handlers::wireguard_mesh::WireguardMeshLink,
+        crate::handlers::wireguard_mesh::WireguardMeshLinkState,
+        crate::handlers::node_pairings::CreateNodePairingRequest,
+        crate::handlers::node_pairings::CreateNodePairingResponse,
+        crate::handlers::node_pairings::NodePairingResponse,
+        crate::handlers::node_pairings::NodePairingListResponse,
+        crate::handlers::node_ssh::SshHostKeyRequest,
+        crate::handlers::node_ssh::SshHostKeyResponse,
+        crate::handlers::node_ssh::SshCredentials,
+        crate::handlers::node_ssh::CreateSshEnrollmentRequest,
+        crate::handlers::node_ssh::NodeSshEnrollmentResponse,
+        crate::handlers::node_ssh::NodeSshEnrollmentListResponse,
+        SetNodePublicIngressRequest,
+        SetNodePublicIngressResponse,
     )),
     info(
         title = "Node Registration API",
@@ -491,6 +581,14 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
             "/internal/nodes/{node_id}/network/peers",
             get(crate::handlers::network::list_peers),
         )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard",
+            put(crate::handlers::network::register_mesh),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard/handshakes",
+            put(crate::handlers::network::report_mesh_handshakes),
+        )
         .route("/internal/edge/routes", get(edge_routes))
 }
 
@@ -506,6 +604,10 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         .route(
             "/internal/nodes/{node_id}/containers",
             get(admin_list_node_containers),
+        )
+        .route(
+            "/internal/nodes/{node_id}/public-ingress",
+            axum::routing::patch(admin_set_node_public_ingress),
         )
         .route(
             "/internal/nodes/{node_id}/drain",
@@ -532,6 +634,40 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         )
         .route("/internal/edge/nodes", get(list_edge_nodes))
         .route("/cluster/dns/status", get(cluster_dns_status))
+        // Literal segment, so it can never be shadowed by the `{node_id}`
+        // routes below it.
+        .route("/nodes/capability", get(node_capability))
+        .route(
+            "/nodes/wireguard",
+            get(crate::handlers::wireguard_mesh::wireguard_mesh_status)
+                .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh),
+        )
+        .route(
+            "/nodes/wireguard/hub",
+            put(crate::handlers::wireguard_mesh::set_wireguard_mesh_hub),
+        )
+        .route(
+            "/nodes/pairings",
+            get(crate::handlers::node_pairings::list_node_pairings)
+                .post(crate::handlers::node_pairings::create_node_pairing),
+        )
+        .route(
+            "/nodes/pairings/{pairing_id}",
+            delete(crate::handlers::node_pairings::cancel_node_pairing),
+        )
+        .route(
+            "/nodes/ssh/host-key",
+            post(crate::handlers::node_ssh::node_ssh_host_key),
+        )
+        .route(
+            "/nodes/ssh/enrollments",
+            get(crate::handlers::node_ssh::list_node_ssh_enrollments)
+                .post(crate::handlers::node_ssh::create_node_ssh_enrollment),
+        )
+        .route(
+            "/nodes/ssh/enrollments/{enrollment_id}",
+            get(crate::handlers::node_ssh::get_node_ssh_enrollment),
+        )
         .route(
             "/nodes/{node_id}/docker-disk-usage",
             get(node_docker_disk_usage),
@@ -773,30 +909,6 @@ pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, Nod
     Ok(ip)
 }
 
-/// Extract the host from a validated node agent URL or private address for use
-/// as a server-authoritative certificate SAN.
-fn node_address_host(address: &str) -> String {
-    let address = address.trim();
-    let authority = address
-        .strip_prefix("https://")
-        .or_else(|| address.strip_prefix("http://"))
-        .unwrap_or(address)
-        .split('/')
-        .next()
-        .unwrap_or(address);
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        if let Some(end) = bracketed.find(']') {
-            return bracketed[..end].to_string();
-        }
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            host.to_string()
-        }
-        _ => authority.to_string(),
-    }
-}
-
 fn mtls_agent_address(address: &str) -> String {
     let address = address.trim();
     if address.starts_with("https://") {
@@ -906,6 +1018,112 @@ async fn register_node(
     // The router is served with `into_make_service_with_connect_info`, so the
     // peer address is always present in production; unit tests inject it via a
     // `MockConnectInfo` layer.
+    connect_info: ConnectInfo<std::net::SocketAddr>,
+    request: Json<RegisterNodeApiRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    // Every rejection below returns early, so the outcome is reported once
+    // here rather than at each exit.
+    let telemetry = app_state.telemetry.clone();
+    let result = register_node_inner(State(app_state), connect_info, request).await;
+    if let Err(problem) = &result {
+        let title = problem.body.get("title").and_then(|t| t.as_str());
+        if let Some(code) = node_join_failure_code(problem.status_code, title) {
+            telemetry.report(
+                temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::WorkerNodeJoinFailed,
+                )
+                .with_failure(code),
+            );
+        }
+    }
+    result
+}
+
+/// Titles of the rejections for a missing or unknown join token. Anyone who
+/// can reach the endpoint can produce these, so they are not join attempts.
+const TITLE_JOIN_TOKEN_REQUIRED: &str = "Join Token Required";
+const TITLE_UNKNOWN_ENROLLMENT_TOKEN: &str = "Invalid Enrollment Token";
+
+/// Fixed telemetry label for a rejected node registration, from the response
+/// status (and, for token rejections, the fixed title); response details can
+/// name nodes, so they are never read. `None` for rejections anyone can
+/// trigger against this unauthenticated endpoint -- rate-limited requests and
+/// missing or unknown tokens -- so scanners can neither drive outbound
+/// telemetry nor drown real join failures. A token that exists but is
+/// expired, revoked, exhausted or bound elsewhere is still reported.
+fn node_join_failure_code(
+    status: StatusCode,
+    title: Option<&str>,
+) -> Option<temps_core::telemetry::OperationFailureCode> {
+    use temps_core::telemetry::OperationFailureCode as Code;
+    if matches!(
+        title,
+        Some(TITLE_JOIN_TOKEN_REQUIRED | TITLE_UNKNOWN_ENROLLMENT_TOKEN)
+    ) {
+        return None;
+    }
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => None,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some(Code::Authentication),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Some(Code::InvalidConfiguration)
+        }
+        StatusCode::NOT_FOUND => Some(Code::NotFound),
+        StatusCode::CONFLICT => Some(Code::Conflict),
+        StatusCode::SERVICE_UNAVAILABLE => Some(Code::NoEligibleNode),
+        StatusCode::GATEWAY_TIMEOUT => Some(Code::Timeout),
+        _ => Some(Code::Unknown),
+    }
+}
+
+/// Give the enrollment token back the use a registration that was refused
+/// or undone consumed. Best effort: a failure only means the operator needs a
+/// new pairing.
+async fn release_token_use(app_state: &NodeAppState, token_id: i32) {
+    if let Err(error) = app_state
+        .enrollment_token_service
+        .release_use(token_id)
+        .await
+    {
+        error!(token_id, %error, "could not give the enrollment token its use back");
+    }
+}
+
+/// Why a paired node could not complete its registration, and what to do.
+fn pairing_problem(error: &temps_network::mesh::MeshError) -> Problem {
+    use temps_network::mesh::MeshError;
+    match error {
+        MeshError::PairingClosed => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Pairing Closed")
+            .with_detail(
+                "This pairing is no longer waiting for this node (it was cancelled, expired or \
+                 already used). Create a new pairing: bunx @temps-sdk/cli nodes pair create \
+                 --address <node-ip>",
+            ),
+        MeshError::PublicKeyInUse => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Key In Use")
+            .with_detail(
+                "Another cluster member already uses this node's WireGuard key, usually because \
+                 the key file was copied from another machine. Delete the node's mesh key, \
+                 then create a new pairing.",
+            ),
+        MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Mesh Off")
+            .with_detail("The WireGuard mesh was turned off while this node was pairing."),
+        other => {
+            error!(error = %other, "could not complete a node pairing");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(
+                    "Failed to complete the node's pairing; nothing was registered, so running \
+                     `temps join --pair` again retries it. See the server logs.",
+                )
+        }
+    }
+}
+
+async fn register_node_inner(
+    State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<RegisterNodeApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -944,16 +1162,20 @@ async fn register_node(
             request.name
         );
         problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Join Token Required")
+            .with_title(TITLE_JOIN_TOKEN_REQUIRED)
             .with_detail("A token is required to register a node. Generate an enrollment token in Settings > Worker Nodes.")
     })?;
 
+    // The enrollment token this node registered with, when it was one: a
+    // token minted for a node pairing links the pairing to the node.
+    let mut enrollment_token_id = None;
     match app_state
         .enrollment_token_service
         .validate_and_consume(provided_token)
         .await
     {
         Ok(token_row) => {
+            enrollment_token_id = Some(token_row.id);
             // Enforce a node-name pin if the token was scoped to one node.
             if let Some(ref bound) = token_row.bound_node_name {
                 if bound != request.name.trim() {
@@ -1011,7 +1233,7 @@ async fn register_node(
                     request.name
                 );
                 return Err(problemdetails::new(StatusCode::FORBIDDEN)
-                    .with_title("Invalid Enrollment Token")
+                    .with_title(TITLE_UNKNOWN_ENROLLMENT_TOKEN)
                     .with_detail("The provided token is invalid or expired. Generate a new enrollment token in Settings > Worker Nodes."));
             }
             warn!(
@@ -1176,11 +1398,31 @@ async fn register_node(
         prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
     };
 
-    let node = app_state
+    // The service refuses a node claiming the control plane's own identity
+    // and links a paired node (ADR 048 D2b) to its pairing, undoing the
+    // registration if that fails.
+    let context = RegistrationContext {
+        pairing_token_id: enrollment_token_id,
+        control_plane_hosts: settings
+            .external_url
+            .as_deref()
+            .map(node_address_host)
+            .into_iter()
+            .collect(),
+    };
+    let node = match app_state
         .node_service
-        .register(register_request)
+        .register_with_context(register_request, &context)
         .await
-        .map_err(Problem::from)?;
+    {
+        Ok(node) => node,
+        Err(error) => {
+            if let (NodeError::Pairing { token_id, .. }, Some(_)) = (&error, enrollment_token_id) {
+                release_token_use(&app_state, *token_id).await;
+            }
+            return Err(Problem::from(error));
+        }
+    };
 
     info!(node_id = node.id, name = %node.name, "Node registered successfully");
 
@@ -1231,10 +1473,14 @@ async fn persist_underlay_address(db: &sea_orm::DatabaseConnection, node_id: i32
     use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
     use temps_entities::nodes;
 
+    // A node on the WireGuard mesh keeps its mesh address as underlay across
+    // re-registration; the address it joined with is only its endpoint.
+    // Decided in the UPDATE itself so a concurrent mesh registration can't be
+    // overwritten from a stale read.
     let result = nodes::Entity::update_many()
         .col_expr(
             nodes::Column::UnderlayAddress,
-            Expr::value(Some(underlay.to_string())),
+            Expr::cust_with_values("COALESCE(mesh_wg_address, $1)", [underlay.to_string()]),
         )
         .filter(nodes::Column::Id.eq(node_id))
         .exec(db)
@@ -1290,6 +1536,7 @@ async fn allocate_overlay_cidr(db: std::sync::Arc<sea_orm::DatabaseConnection>, 
     request_body = HeartbeatApiRequest,
     responses(
         (status = 200, description = "Heartbeat received", body = HeartbeatResponse),
+        (status = 400, description = "Invalid heartbeat payload", ),
         (status = 401, description = "Unauthorized", ),
         (status = 404, description = "Node not found", ),
         (status = 500, description = "Internal server error", )
@@ -1333,6 +1580,21 @@ async fn node_heartbeat(
         labels: request.labels,
         architecture: normalize_reported_platform(request.architecture.as_deref()),
         dns_resolver: request.dns_resolver.map(dns_resolver_heartbeat_update),
+        docker_socket_projects: request.docker_socket_projects.clone(),
+        public_ingress: request
+            .public_ingress
+            .map(|ingress| {
+                crate::services::node_service::PublicIngressHeartbeatUpdate::validated(
+                    ingress.running,
+                    ingress.last_error,
+                    ingress.certificate_count,
+                    ingress.route_count,
+                    ingress.unsupported_route_count,
+                    ingress.unsupported_reasons,
+                )
+            })
+            .transpose()
+            .map_err(Problem::from)?,
     };
 
     let architecture_change = app_state
@@ -1912,6 +2174,13 @@ fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
         architecture: app_state.image_builder.discovered_platform(),
         last_heartbeat,
         created_at: chrono::Utc::now().to_rfc3339(),
+        public_ingress_enabled: false,
+        public_ingress_running: None,
+        public_ingress_last_error: None,
+        public_ingress_certificate_count: None,
+        public_ingress_route_count: None,
+        public_ingress_unsupported_route_count: None,
+        public_ingress_unsupported_reasons: Vec::new(),
     }
 }
 
@@ -1952,6 +2221,16 @@ async fn admin_list_nodes(
             architecture: n.architecture,
             last_heartbeat: n.last_heartbeat.map(|t| t.to_rfc3339()),
             created_at: n.created_at.to_rfc3339(),
+            public_ingress_enabled: n.public_ingress_enabled,
+            public_ingress_running: n.public_ingress_running,
+            public_ingress_last_error: n.public_ingress_last_error,
+            public_ingress_certificate_count: n.public_ingress_certificate_count,
+            public_ingress_route_count: n.public_ingress_route_count,
+            public_ingress_unsupported_route_count: n.public_ingress_unsupported_route_count,
+            public_ingress_unsupported_reasons: serde_json::from_value(
+                n.public_ingress_unsupported_reasons,
+            )
+            .unwrap_or_default(),
         })
         .collect();
 
@@ -2009,6 +2288,59 @@ async fn admin_get_node(
         architecture: node.architecture,
         last_heartbeat: node.last_heartbeat.map(|t| t.to_rfc3339()),
         created_at: node.created_at.to_rfc3339(),
+        public_ingress_enabled: node.public_ingress_enabled,
+        public_ingress_running: node.public_ingress_running,
+        public_ingress_last_error: node.public_ingress_last_error,
+        public_ingress_certificate_count: node.public_ingress_certificate_count,
+        public_ingress_route_count: node.public_ingress_route_count,
+        public_ingress_unsupported_route_count: node.public_ingress_unsupported_route_count,
+        public_ingress_unsupported_reasons: serde_json::from_value(
+            node.public_ingress_unsupported_reasons,
+        )
+        .unwrap_or_default(),
+    }))
+}
+
+#[utoipa::path(
+    tag = "Nodes",
+    patch,
+    path = "/internal/nodes/{node_id}/public-ingress",
+    operation_id = "admin_set_node_public_ingress",
+    request_body = SetNodePublicIngressRequest,
+    responses(
+        (status = 200, body = SetNodePublicIngressResponse),
+        (status = 400, description = "Node is not a worker"),
+        (status = 404, description = "Node not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn admin_set_node_public_ingress(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(node_id): Path<i32>,
+    Json(request): Json<SetNodePublicIngressRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    let node = app_state
+        .node_service
+        .set_public_ingress_enabled(node_id, request.enabled)
+        .await
+        .map_err(Problem::from)?;
+    let audit = NodePublicIngressChangedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: None,
+            user_agent: "temps-api".to_string(),
+        },
+        node_id,
+        enabled: request.enabled,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(node_id, %error, "public ingress changed but audit record failed");
+    }
+    Ok(Json(SetNodePublicIngressResponse {
+        node_id: node.id,
+        enabled: node.public_ingress_enabled,
     }))
 }
 
@@ -2130,6 +2462,95 @@ async fn node_docker_disk_usage(
         .map_err(Problem::from)?;
 
     Ok(Json(usage))
+}
+
+/// Whether this installation can run a workload anywhere, and if not, why.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeCapabilityResponse {
+    /// Whether the control plane itself may run containers, builds and
+    /// managed services (false in the `control-plane` serve profile).
+    pub local_workloads: bool,
+    /// Worker nodes that are active and heartbeating. Excludes the control
+    /// plane, which `local_workloads` already reports.
+    pub active_worker_nodes: u32,
+    /// Whether a workload can be placed at all.
+    pub schedulable: bool,
+    /// Why nothing can be placed, when `schedulable` is false. Rendered
+    /// verbatim by the client.
+    pub reason: Option<String>,
+    /// Console path that fixes it: where an operator joins a worker node.
+    pub setup_path: String,
+    /// Whether *this caller* can act on `setup_path`.
+    ///
+    /// The capability itself is readable by every authenticated session, but
+    /// the remedy is not: the Worker Nodes page needs `SettingsRead` to list
+    /// the node inventory and `SettingsWrite` to mint an enrollment token.
+    /// Sending a caller without both to that page produces "Failed to load
+    /// worker nodes" — an advertised fix that denies the user who followed it.
+    /// Clients render a non-admin variant ("ask an administrator") when this
+    /// is false rather than a dead link.
+    pub can_manage_nodes: bool,
+}
+
+/// Whether `auth` can actually add a worker node, not merely learn that one is
+/// needed.
+///
+/// Mirrors the guards the Worker Nodes surfaces already apply —
+/// `permission_guard!(auth, SettingsRead)` on the node list in this module and
+/// `permission_guard!(auth, SettingsWrite)` on enrollment-token creation — so
+/// the console never advertises an action the API would refuse.
+fn can_manage_worker_nodes(auth: &temps_auth::AuthContext) -> bool {
+    auth.has_permission(&temps_auth::Permission::SettingsRead)
+        && auth.has_permission(&temps_auth::Permission::SettingsWrite)
+}
+
+/// Report whether this install can schedule workloads.
+///
+/// A control plane with no local workloads and no joined worker node accepts
+/// deploys it can never run. Rather than letting every surface learn that by
+/// failing, this endpoint states it up front so the console can render an
+/// onboarding state with a link to join a node — and so a client can tell
+/// "not set up" apart from "not built", which a 404 or a 500 cannot.
+#[utoipa::path(
+    tag = "Nodes",
+    get,
+    path = "/nodes/capability",
+    operation_id = "NodeCapabilityGet",
+    responses(
+        (status = 200, description = "Scheduling capability of this install", body = NodeCapabilityResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn node_capability(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // Deliberately no permission beyond a session: this answers "can this
+    // installation run anything at all", which every user who can open the
+    // Projects page needs before they try to deploy. It discloses one
+    // boolean, a count and a fixed remedy -- not the node inventory, which
+    // stays behind SettingsRead on the list endpoint.
+    //
+    // Whether the caller can *act* on the remedy is a different question, and
+    // one the client cannot answer on its own, so it is reported here.
+
+    let capability = app_state
+        .node_scheduler
+        .scheduling_capability()
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(NodeCapabilityResponse {
+        local_workloads: capability.local_workloads,
+        active_worker_nodes: capability.active_worker_nodes,
+        schedulable: capability.schedulable,
+        reason: capability.reason,
+        setup_path: crate::services::NODE_SETUP_PATH.to_string(),
+        can_manage_nodes: can_manage_worker_nodes(&auth),
+    }))
 }
 
 impl From<DockerDiskUsageError> for Problem {
@@ -2553,7 +2974,7 @@ async fn admin_undrain_node(
         (status = 200, description = "Node removed", body = RemoveNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 409, description = "Node still has active containers"),
+        (status = 409, description = "Node still has active containers or live sandboxes"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2647,35 +3068,67 @@ async fn admin_drain_status(
         .await
         .map_err(Problem::from)?;
 
-    let remaining = containers.len();
-    let is_draining = node.status == "draining";
-    let is_drained = node.status == "drained";
-    let drain_complete = is_drained || (is_draining && remaining == 0);
-    let can_remove = drain_complete || (node.status == "offline" && remaining == 0);
+    let remaining_sandboxes = app_state
+        .node_service
+        .live_sandbox_count(node_id)
+        .await
+        .map_err(Problem::from)?;
 
-    let message = if is_drained || (is_draining && remaining == 0) {
+    Ok(Json(drain_status(
+        node_id,
+        node.name,
+        node.status,
+        containers.len(),
+        remaining_sandboxes,
+    )))
+}
+
+/// Drain progress of a node from what is still on it. Draining moves
+/// containers, never sandboxes (ADR-048): a node still hosting sandboxes
+/// cannot be removed, and the message says how to clear them.
+fn drain_status(
+    node_id: i32,
+    node_name: String,
+    status: String,
+    remaining_containers: usize,
+    remaining_sandboxes: u64,
+) -> DrainStatusResponse {
+    let is_draining = status == "draining";
+    let is_drained = status == "drained";
+    let drain_complete = is_drained || (is_draining && remaining_containers == 0);
+    let can_remove = remaining_sandboxes == 0
+        && (drain_complete || (status == "offline" && remaining_containers == 0));
+
+    let message = if remaining_sandboxes > 0 && (drain_complete || status == "offline") {
         format!(
-            "Drain complete. Node '{}' has no remaining containers and can be safely removed.",
-            node.name
+            "Node '{node_name}' still hosts {remaining_sandboxes} sandbox(es). Draining does \
+             not move sandboxes: destroy them from the node's Sandboxes tab or with \
+             `bunx @temps-sdk/cli sandbox nodes evict {node_name}`, then remove the node."
+        )
+    } else if drain_complete {
+        format!(
+            "Drain complete. Node '{node_name}' has no remaining containers and can be safely \
+             removed."
         )
     } else if is_draining {
         format!(
-            "Draining: {} container(s) still on node '{}'. Workloads are being migrated.",
-            remaining, node.name
+            "Draining: {remaining_containers} container(s) still on node '{node_name}'. \
+             Workloads are being migrated."
         )
     } else {
-        format!("Node '{}' is {} (not draining)", node.name, node.status)
+        format!("Node '{node_name}' is {status} (not draining)")
     };
 
-    Ok(Json(DrainStatusResponse {
+    DrainStatusResponse {
         node_id,
-        node_name: node.name,
-        status: node.status,
-        remaining_containers: remaining,
+        node_name,
+        status,
+        remaining_containers,
+        remaining_sandboxes,
         drain_complete,
         can_remove,
         message,
-    }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2927,6 +3380,20 @@ async fn proxy_edge_analytics_timeseries(
     Ok(Json(results))
 }
 
+/// Problem type of the `409` refusing to remove a node that still hosts
+/// sandboxes (ADR-048).
+pub const NODE_HOSTS_SANDBOXES_PROBLEM_TYPE: &str = "https://temps.sh/probs/node-hosts-sandboxes";
+
+/// Detail for [`NodeError::HasLiveSandboxes`], with copy-pasteable commands
+/// for the node in question.
+fn node_hosts_sandboxes_detail(error: &NodeError, node_name: &str) -> String {
+    format!(
+        "{error}. See them on the node's Sandboxes tab or with \
+         `bunx @temps-sdk/cli sandbox nodes show {node_name}`; destroy them all with \
+         `bunx @temps-sdk/cli sandbox nodes evict {node_name}`."
+    )
+}
+
 impl From<NodeError> for Problem {
     fn from(error: NodeError) -> Self {
         match error {
@@ -2939,6 +3406,17 @@ impl From<NodeError> for Problem {
             NodeError::AlreadyExists { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Already Exists")
                 .with_detail(format!("Node '{}' already exists", name)),
+            NodeError::HasLiveSandboxes {
+                node_id,
+                ref node_name,
+                count,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(NODE_HOSTS_SANDBOXES_PROBLEM_TYPE)
+                .with_title("Node Hosts Sandboxes")
+                .with_detail(node_hosts_sandboxes_detail(&error, node_name))
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("live_sandboxes", count),
             NodeError::IdentityConflict { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Identity Conflict")
                 .with_detail(format!(
@@ -2978,6 +3456,23 @@ impl From<NodeError> for Problem {
                     .with_title("Placement Constraints Unsatisfied")
                     .with_detail(error.to_string())
             }
+            // Reuses the platform's existing worker-node problem rather than
+            // inventing a second "nowhere to put this" shape: the remedy is
+            // the same page, and the console already renders this error code
+            // as an actionable onboarding state.
+            NodeError::DockerSocketNotSchedulable { .. } => {
+                temps_core::worker_node_required_problem(error.to_string())
+            }
+            NodeError::ControlPlaneIdentity { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Control Plane Identity")
+                .with_detail(error.to_string()),
+            NodeError::Pairing { ref source, .. } => pairing_problem(source),
+            NodeError::MeshSettings { ref source, .. } => {
+                error!("Failed to read mesh settings in node operation: {}", source);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
+            }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -2995,6 +3490,48 @@ impl From<NodeError> for Problem {
 }
 
 #[cfg(test)]
+mod join_telemetry_tests {
+    use super::*;
+    use temps_core::telemetry::OperationFailureCode as Code;
+
+    #[test]
+    fn join_failures_map_status_to_fixed_codes() {
+        assert_eq!(
+            node_join_failure_code(StatusCode::FORBIDDEN, Some("Enrollment Token Not Usable")),
+            Some(Code::Authentication)
+        );
+        assert_eq!(
+            node_join_failure_code(StatusCode::BAD_REQUEST, None),
+            Some(Code::InvalidConfiguration)
+        );
+        assert_eq!(
+            node_join_failure_code(StatusCode::CONFLICT, None),
+            Some(Code::Conflict)
+        );
+        assert_eq!(
+            node_join_failure_code(StatusCode::INTERNAL_SERVER_ERROR, None),
+            Some(Code::Unknown)
+        );
+    }
+
+    #[test]
+    fn rejections_anyone_can_trigger_are_not_reported() {
+        assert_eq!(
+            node_join_failure_code(StatusCode::TOO_MANY_REQUESTS, None),
+            None
+        );
+        assert_eq!(
+            node_join_failure_code(StatusCode::FORBIDDEN, Some(TITLE_JOIN_TOKEN_REQUIRED)),
+            None
+        );
+        assert_eq!(
+            node_join_failure_code(StatusCode::FORBIDDEN, Some(TITLE_UNKNOWN_ENROLLMENT_TOKEN)),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
@@ -3002,6 +3539,155 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
+
+    // ── Drain status and node removal with sandboxes (ADR-048) ──────────
+
+    #[test]
+    fn a_drained_node_with_sandboxes_cannot_be_removed() {
+        let status = drain_status(4, "worker-4".into(), "drained".into(), 0, 2);
+        assert!(status.drain_complete);
+        assert!(!status.can_remove);
+        assert_eq!(status.remaining_sandboxes, 2);
+        assert!(
+            status
+                .message
+                .contains("`bunx @temps-sdk/cli sandbox nodes evict worker-4`"),
+            "{}",
+            status.message
+        );
+    }
+
+    #[test]
+    fn an_offline_node_with_sandboxes_cannot_be_removed() {
+        let status = drain_status(4, "worker-4".into(), "offline".into(), 0, 1);
+        assert!(!status.can_remove);
+        assert!(status.message.contains("still hosts 1 sandbox(es)"));
+    }
+
+    #[test]
+    fn an_empty_drained_or_offline_node_can_be_removed() {
+        for node_status in ["drained", "offline"] {
+            let status = drain_status(4, "worker-4".into(), node_status.into(), 0, 0);
+            assert!(status.can_remove, "{node_status}");
+        }
+        let draining = drain_status(4, "worker-4".into(), "draining".into(), 0, 0);
+        assert!(draining.drain_complete && draining.can_remove);
+    }
+
+    #[test]
+    fn a_node_still_draining_or_active_cannot_be_removed() {
+        let draining = drain_status(4, "worker-4".into(), "draining".into(), 3, 0);
+        assert!(!draining.drain_complete && !draining.can_remove);
+        assert!(draining.message.contains("3 container(s)"));
+        let active = drain_status(4, "worker-4".into(), "active".into(), 0, 0);
+        assert!(!active.can_remove);
+        assert!(active.message.contains("not draining"));
+    }
+
+    #[tokio::test]
+    async fn removing_a_node_with_sandboxes_is_a_typed_conflict_naming_the_node() {
+        let problem = Problem::from(NodeError::HasLiveSandboxes {
+            node_id: 4,
+            node_name: "worker-4".into(),
+            count: 2,
+        });
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["type"], NODE_HOSTS_SANDBOXES_PROBLEM_TYPE);
+        assert_eq!(body["node_id"], 4);
+        assert_eq!(body["node_name"], "worker-4");
+        assert_eq!(body["live_sandboxes"], 2);
+        let detail = body["detail"].as_str().expect("detail");
+        assert!(
+            detail.contains("`bunx @temps-sdk/cli sandbox nodes evict worker-4`"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`bunx @temps-sdk/cli sandbox nodes show worker-4`"),
+            "{detail}"
+        );
+        assert!(!detail.contains("<node>"), "{detail}");
+    }
+
+    // ── Capability: who can act on the advertised remedy ────────────────
+
+    fn sample_user() -> temps_entities::users::Model {
+        temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "user@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// An admin follows "Add worker node" to a page that works.
+    #[test]
+    fn capability_lets_an_admin_add_a_worker_node() {
+        let auth = temps_auth::AuthContext::new_session(sample_user(), temps_auth::Role::Admin);
+        assert!(can_manage_worker_nodes(&auth));
+    }
+
+    /// A regular project user can see *that* a worker node is needed — that is
+    /// why the endpoint needs no permission — but must not be handed an action
+    /// that lands on "Failed to load worker nodes".
+    #[test]
+    fn capability_does_not_offer_a_regular_user_an_action_they_cannot_take() {
+        for role in [
+            temps_auth::Role::User,
+            temps_auth::Role::Reader,
+            temps_auth::Role::ApiReader,
+        ] {
+            let auth = temps_auth::AuthContext::new_session(sample_user(), role.clone());
+            assert!(
+                !can_manage_worker_nodes(&auth),
+                "role {role} must not be offered the add-worker-node action"
+            );
+        }
+    }
+
+    /// Read-only settings access is not enough: minting an enrollment token is
+    /// a `SettingsWrite` operation, so the page would half-work.
+    #[test]
+    fn capability_requires_settings_write_not_just_read() {
+        let auth = temps_auth::AuthContext::new_api_key(
+            sample_user(),
+            None,
+            Some(vec![temps_auth::Permission::SettingsRead]),
+            "read-only".to_string(),
+            7,
+        );
+        assert!(!can_manage_worker_nodes(&auth));
+
+        let auth = temps_auth::AuthContext::new_api_key(
+            sample_user(),
+            None,
+            Some(vec![
+                temps_auth::Permission::SettingsRead,
+                temps_auth::Permission::SettingsWrite,
+            ]),
+            "node-admin".to_string(),
+            8,
+        );
+        assert!(can_manage_worker_nodes(&auth));
+    }
 
     fn sample_node() -> nodes::Model {
         nodes::Model {
@@ -3022,12 +3708,23 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -3344,10 +4041,85 @@ mod tests {
         assert!(rl.check(ip2).is_ok());
     }
 
+    /// A registration request body for `name` at `private_address`.
+    fn register_body(name: &str, private_address: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "token": "test-token",
+            "join_token": "test-join-token",
+            "address": format!("https://{private_address}:3100"),
+            "private_address": private_address,
+        })
+    }
+
+    async fn post_register(app: Router, body: &serde_json::Value) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/nodes/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_the_control_plane_external_host_as_name() {
+        // A worker named after the control plane's host would get a cluster-CA
+        // leaf valid for it. Refused before any database work.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let mut settings = settings_with_join_token();
+        settings.external_url = Some("https://Temps.Example.com/".to_string());
+        let app = make_app_with_settings(db, settings);
+
+        let response = post_register(app, &register_body("temps.example.com", "10.100.0.2")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["title"], "Control Plane Identity");
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("'temps.example.com' is the control plane's host"));
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_the_control_plane_mesh_address() {
+        // Mesh-paired nodes verify the control plane at its mesh address
+        // against the cluster CA, so no worker may hold that address as a SAN.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(true, true),
+            ]])
+            .into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+
+        let response = post_register(app, &register_body("worker-9", "10.201.0.1")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("'10.201.0.1' is the control plane's mesh address"));
+    }
+
     #[tokio::test]
     async fn test_register_node_success() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Control-plane identity guard: the mesh is off
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
             // Check for duplicate name (returns empty)
             .append_query_results(vec![Vec::<nodes::Model>::new()])
             // Identity guard: name/address not claimed by another node
@@ -3568,10 +4340,29 @@ mod tests {
         assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn invalid_public_ingress_heartbeat_maps_to_bad_request() {
+        let error = crate::services::node_service::PublicIngressHeartbeatUpdate::validated(
+            true,
+            None,
+            -1,
+            0,
+            0,
+            Vec::new(),
+        )
+        .expect_err("negative ingress count must be rejected");
+        let problem: Problem = error.into();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn test_register_node_with_valid_join_token_succeeds() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // control-plane identity guard: the mesh is off
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // duplicate name
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard
             .append_query_results(vec![vec![node.clone()]])
@@ -3705,6 +4496,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         };
         let c2 = deployment_containers::Model {
             id: 2,
@@ -3728,6 +4520,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         };
         let mut c2_updated = c2.clone();
         c2_updated.status = Some("removed".to_string());
@@ -3840,6 +4633,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         };
         let mut c1_updated = c1.clone();
         c1_updated.status = Some("removed".to_string());

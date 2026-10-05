@@ -88,27 +88,107 @@ fn require_container_environment_reveal(auth: &temps_auth::AuthContext) -> Resul
     Ok(())
 }
 
-fn public_compose_service_url(
+/// Every public Compose route URL of an environment, one per configured public
+/// port, in `public_ports` order.
+fn public_compose_route_urls(
+    settings: &AppSettings,
+    strategy: PublicHostnameStrategy,
+    environment: &str,
+    public_ports: &[temps_entities::preset::ComposePublicPort],
+    proxy_port: u16,
+) -> Vec<crate::handlers::types::ServicePublicUrl> {
+    let labels = temps_entities::preset::compose_public_route_labels(public_ports);
+    public_ports
+        .iter()
+        .zip(&labels)
+        .enumerate()
+        .map(|(index, (port, label))| {
+            // The route table uses the first public port as the environment's
+            // main backend. Its Visit link must therefore use the same stable
+            // environment hostname as deployment links. Every other public
+            // port keeps its explicit per-route hostname.
+            let hostname = if index == 0 {
+                strategy.environment_hostname(&settings.preview_domain, environment)
+            } else {
+                strategy.service_hostname(&settings.preview_domain, environment, label)
+            };
+            crate::handlers::types::ServicePublicUrl {
+                service: port.service.clone(),
+                port: port.port,
+                url: public_url_for_hostname(settings, &hostname, proxy_port),
+            }
+        })
+        .collect()
+}
+
+/// Every public URL of one Compose service, in `public_ports` order.
+fn public_compose_service_urls(
     settings: &AppSettings,
     strategy: PublicHostnameStrategy,
     environment: &str,
     service: &str,
     public_ports: &[temps_entities::preset::ComposePublicPort],
     proxy_port: u16,
-) -> Option<String> {
-    let public_port_index = public_ports
+) -> Vec<crate::handlers::types::ServicePublicUrl> {
+    public_compose_route_urls(settings, strategy, environment, public_ports, proxy_port)
+        .into_iter()
+        .filter(|route| route.service == service)
+        .collect()
+}
+
+/// Build deployment responses with their environment's public Compose service
+/// URLs, so deployment views list every public service port and not just the
+/// primary environment URL.
+async fn deployment_responses_with_service_urls(
+    state: &AppState,
+    project_id: i32,
+    deployments: Vec<crate::services::types::Deployment>,
+) -> Result<Vec<DeploymentResponse>, Problem> {
+    let mut responses: Vec<DeploymentResponse> = deployments
+        .into_iter()
+        .map(DeploymentResponse::from_service_deployment)
+        .collect();
+    let mut environment_ids: Vec<i32> = responses
         .iter()
-        .position(|port| port.service == service)?;
-    // The route table uses the first public port as the environment's main
-    // backend. Its Visit link must therefore use the same stable environment
-    // hostname as deployment links. Additional public services retain their
-    // explicit per-service hostnames.
-    let hostname = if public_port_index == 0 {
-        strategy.environment_hostname(&settings.preview_domain, environment)
-    } else {
-        strategy.service_hostname(&settings.preview_domain, environment, service)
-    };
-    Some(public_url_for_hostname(settings, &hostname, proxy_port))
+        .map(|response| response.environment_id)
+        .collect();
+    environment_ids.sort_unstable();
+    environment_ids.dedup();
+
+    let context = state
+        .deployment_service
+        .compose_public_url_context(project_id, &environment_ids)
+        .await?;
+    if context.public_ports.is_empty() {
+        return Ok(responses);
+    }
+    let strategy = state
+        .hostname_resolver
+        .strategy_for(&context.app_settings.preview_domain)
+        .await;
+    let proxy_port = state.config_service.proxy_port();
+    for response in &mut responses {
+        if let Some(subdomain) = context.environment_subdomains.get(&response.environment_id) {
+            response.environment.service_urls = public_compose_route_urls(
+                &context.app_settings,
+                strategy,
+                subdomain,
+                &context.public_ports,
+                proxy_port,
+            );
+        }
+    }
+    Ok(responses)
+}
+
+async fn deployment_response_with_service_urls(
+    state: &AppState,
+    project_id: i32,
+    deployment: crate::services::types::Deployment,
+) -> Result<DeploymentResponse, Problem> {
+    let mut responses =
+        deployment_responses_with_service_urls(state, project_id, vec![deployment]).await?;
+    Ok(responses.remove(0))
 }
 
 #[derive(OpenApi)]
@@ -160,6 +240,7 @@ fn public_compose_service_url(
         ContainerListResponse,
         ContainerInfoResponse,
         ContainerDetailResponse,
+        crate::handlers::types::ServicePublicUrl,
         ContainerEnvironmentVariableValueResponse,
         EnvVarResponse,
         ResourceLimitsResponse,
@@ -425,6 +506,14 @@ impl From<crate::services::services::DeploymentError> for Problem {
             DeploymentError::NotFound(msg) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Deployment Not Found")
                 .with_detail(msg),
+            // ADR 045: the caller may deploy this project in general, but not
+            // this one — its containers run as host root. An admin sending the
+            // same request succeeds, so 403, not 400.
+            DeploymentError::DockerSocketDeployRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Deployment Requires An Admin")
+                    .with_detail(err.to_string())
+            }
             DeploymentError::DatabaseError { reason } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
@@ -463,6 +552,9 @@ impl From<crate::services::services::DeploymentError> for Problem {
                 .with_detail(format!(
                     "Container {operation} failed for {container_id} on {location}: {reason}"
                 )),
+            // Never a 500: this host structurally cannot run containers, and
+            // the single shared mapping in `temps_core` carries the remedy.
+            DeploymentError::DockerUnavailable(ref error) => Problem::from(error),
             DeploymentError::ContainerExecTimeout {
                 container_id,
                 timeout_seconds,
@@ -510,7 +602,8 @@ pub async fn get_last_deployment(
 
     debug!("Getting last deployment for project with id: {}", id);
     let deployment = state.deployment_service.get_last_deployment(id).await?;
-    Ok(Json(DeploymentResponse::from_service_deployment(deployment)).into_response())
+    let response = deployment_response_with_service_urls(&state, id, deployment).await?;
+    Ok(Json(response).into_response())
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
@@ -625,11 +718,8 @@ pub async fn get_project_deployments(
         .get_project_deployments(id, params.page, params.per_page, params.environment_id)
         .await?;
 
-    let deployment_responses = list_response
-        .deployments
-        .into_iter()
-        .map(DeploymentResponse::from_service_deployment)
-        .collect();
+    let deployment_responses =
+        deployment_responses_with_service_urls(&state, id, list_response.deployments).await?;
 
     let response = DeploymentListResponse {
         deployments: deployment_responses,
@@ -674,7 +764,8 @@ pub async fn get_deployment(
         .deployment_service
         .get_deployment(project_id, deployment_id)
         .await?;
-    Ok(Json(DeploymentResponse::from_service_deployment(deployment)).into_response())
+    let response = deployment_response_with_service_urls(&state, project_id, deployment).await?;
+    Ok(Json(response).into_response())
 }
 
 // Add the new route handler
@@ -709,7 +800,15 @@ pub async fn rollback_to_deployment(
 
     let deployment = state
         .deployment_service
-        .rollback_to_deployment(project_id, deployment_id)
+        // ADR 045: a project that holds host Docker access may only be
+        // deployed — in any direction — by an instance admin.
+        .rollback_to_deployment_as(
+            project_id,
+            deployment_id,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit = DeploymentRollbackAudit {
@@ -771,7 +870,14 @@ pub async fn promote_deployment(
 
     let deployment = state
         .deployment_service
-        .promote_deployment(project_id, deployment_id, request.target_environment_id)
+        .promote_deployment_as(
+            project_id,
+            deployment_id,
+            request.target_environment_id,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit = DeploymentPromotedAudit {
@@ -1110,6 +1216,7 @@ pub async fn teardown_environment(
         (status = 200, description = "List of containers", body = ContainerListResponse),
         (status = 400, description = "Not a server-type project"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "A container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1157,20 +1264,23 @@ pub async fn list_containers(
         .into_iter()
         .map(|(info, node_id, service_name)| {
             let node_name = node_id.and_then(|id| presentation.node_names.get(&id).cloned());
-            // Build a URL only for services with a configured public port.
-            // The first public service uses the canonical environment URL;
-            // later services use their per-service route.
-            let service_url = service_name.as_ref().and_then(|svc| {
-                public_compose_service_url(
-                    &presentation.app_settings,
-                    hostname_strategy,
-                    &presentation.environment_subdomain,
-                    svc,
-                    &presentation.public_ports,
-                    state.config_service.proxy_port(),
-                )
-            });
-            ContainerInfoResponse::from_info(info, node_name, service_name, service_url)
+            // Build URLs only for services with a configured public port.
+            // The first public route uses the canonical environment URL;
+            // every other route uses its per-route hostname.
+            let service_urls = service_name
+                .as_ref()
+                .map(|svc| {
+                    public_compose_service_urls(
+                        &presentation.app_settings,
+                        hostname_strategy,
+                        &presentation.environment_subdomain,
+                        svc,
+                        &presentation.public_ports,
+                        state.config_service.proxy_port(),
+                    )
+                })
+                .unwrap_or_default();
+            ContainerInfoResponse::from_info(info, node_name, service_name, service_urls)
         })
         .collect();
 
@@ -1601,6 +1711,18 @@ pub async fn get_deployment_jobs(
     }))
 }
 
+/// Largest `tail` a job-log read may request.
+const MAX_JOB_LOG_TAIL_LINES: usize = 100_000;
+
+/// Query parameters for reading a deployment job's log.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+pub struct JobLogsQuery {
+    /// Return the most recent complete lines (1-100000), reading at most
+    /// 8 MiB from local or archived storage. Omit to read the whole log.
+    #[param(minimum = 1, maximum = 100000)]
+    pub tail: Option<usize>,
+}
+
 /// Get logs for a specific deployment job
 #[utoipa::path(
     get,
@@ -1609,10 +1731,12 @@ pub async fn get_deployment_jobs(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("deployment_id" = i32, Path, description = "Deployment ID"),
-        ("job_id" = String, Path, description = "Job ID")
+        ("job_id" = String, Path, description = "Job ID"),
+        JobLogsQuery
     ),
     responses(
         (status = 200, description = "Job logs retrieved successfully", body = String),
+        (status = 400, description = "Invalid tail parameter"),
         (status = 404, description = "Job or logs not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1624,10 +1748,12 @@ pub async fn get_deployment_job_logs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    Query(query): Query<JobLogsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    let tail = validate_job_log_tail(query.tail, &job_id, deployment_id)?;
 
     // Get the job to verify it exists and get its log_id
     let jobs = state
@@ -1641,16 +1767,70 @@ pub async fn get_deployment_job_logs(
         .ok_or_else(|| problemdetails::new(StatusCode::NOT_FOUND).with_detail("Job not found"))?;
 
     // Get logs using the log_id
-    let log_content = state
-        .log_service
-        .get_log_content(&job.log_id)
-        .await
-        .map_err(|e| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_detail(format!("Failed to read logs: {}", e))
-        })?;
+    let read = match tail {
+        Some(max_lines) => state.log_service.get_log_tail(&job.log_id, max_lines).await,
+        None => state.log_service.get_log_content(&job.log_id).await,
+    };
+    let log_content = match read {
+        Ok(content) => content,
+        Err(error) => job_logs_read_failure(&job_id, deployment_id, &job.status, &error)?,
+    };
 
     Ok((StatusCode::OK, log_content))
+}
+
+/// Validate the optional `tail` of a job-log read.
+fn validate_job_log_tail(
+    tail: Option<usize>,
+    job_id: &str,
+    deployment_id: i32,
+) -> Result<Option<usize>, Problem> {
+    match tail {
+        None => Ok(None),
+        Some(lines) if (1..=MAX_JOB_LOG_TAIL_LINES).contains(&lines) => Ok(Some(lines)),
+        Some(lines) => Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail(format!(
+                "tail={lines} for job '{job_id}' of deployment {deployment_id} must be between 1 and {MAX_JOB_LOG_TAIL_LINES}"
+            ))),
+    }
+}
+
+/// Map a failed job-log read to a response.
+///
+/// A job that has not written anything yet (queued, waiting on a dependency,
+/// skipped, or cancelled before it ran) has no log file, and that is not an
+/// error: the console polls these jobs and gets an empty log. A job that ran
+/// to completion and has no log any more is a 404. Anything else is a real
+/// read failure and stays a 500.
+fn job_logs_read_failure(
+    job_id: &str,
+    deployment_id: i32,
+    status: &temps_entities::types::JobStatus,
+    error: &std::io::Error,
+) -> Result<String, Problem> {
+    use temps_entities::types::JobStatus;
+
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Failed to Read Job Logs")
+            .with_detail(format!(
+                "Failed to read logs for job '{job_id}' of deployment {deployment_id}: {error}"
+            )));
+    }
+
+    match status {
+        JobStatus::Pending
+        | JobStatus::Waiting
+        | JobStatus::Running
+        | JobStatus::Skipped
+        | JobStatus::Cancelled => Ok(String::new()),
+        JobStatus::Success | JobStatus::Failure => Err(problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Job Logs Not Found")
+            .with_detail(format!(
+                "Logs for job '{job_id}' of deployment {deployment_id} are no longer available"
+            ))),
+    }
 }
 
 /// List the captured (historical) container-log dumps for a deployment.
@@ -1874,6 +2054,7 @@ async fn handle_job_log_socket(mut socket: WebSocket, state: Arc<AppState>, log_
     responses(
         (status = 200, description = "Container details", body = ContainerDetailResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1937,7 +2118,7 @@ pub async fn get_container_detail(
 
     // Resolve the public Compose URL using the same primary-service rule as
     // the container list and route table.
-    let service_url = if let Some(ref svc_name) = container.service_name {
+    let service_urls = if let Some(ref svc_name) = container.service_name {
         if presentation
             .public_ports
             .iter()
@@ -1947,7 +2128,7 @@ pub async fn get_container_detail(
                 .hostname_resolver
                 .strategy_for(&presentation.app_settings.preview_domain)
                 .await;
-            public_compose_service_url(
+            public_compose_service_urls(
                 &presentation.app_settings,
                 hostname_strategy,
                 &presentation.environment_subdomain,
@@ -1956,10 +2137,10 @@ pub async fn get_container_detail(
                 state.config_service.proxy_port(),
             )
         } else {
-            None
+            Vec::new()
         }
     } else {
-        None
+        Vec::new()
     };
 
     let response = crate::handlers::types::ContainerDetailResponse {
@@ -1978,7 +2159,8 @@ pub async fn get_container_detail(
         restart_count,
         resource_limits,
         service_name: container.service_name,
-        service_url,
+        service_url: service_urls.first().map(|route| route.url.clone()),
+        service_urls,
         exit_code: container.exit_code,
         exit_reason: container.exit_reason,
         oom_killed: container.oom_killed,
@@ -2005,6 +2187,7 @@ pub async fn get_container_detail(
         (status = 200, description = "Environment variable value", body = ContainerEnvironmentVariableValueResponse),
         (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Container or environment variable not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2115,6 +2298,7 @@ fn mask_container_environment_variables(variables: Vec<(String, String)>) -> Vec
     responses(
         (status = 200, description = "Container stopped successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2171,6 +2355,7 @@ pub async fn stop_container(
     responses(
         (status = 200, description = "Container started successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2227,6 +2412,7 @@ pub async fn start_container(
     responses(
         (status = 200, description = "Container restarted successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2283,6 +2469,7 @@ pub async fn restart_container(
     responses(
         (status = 200, description = "Container metrics retrieved successfully", body = ContainerMetricsResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2707,6 +2894,84 @@ pub async fn purge_environment_asset_cache(
 
 #[cfg(test)]
 mod tests {
+
+    mod job_log_tail_tests {
+        use super::super::{validate_job_log_tail, MAX_JOB_LOG_TAIL_LINES};
+        use axum::http::StatusCode;
+
+        #[test]
+        fn omitted_tail_reads_the_whole_log() {
+            assert_eq!(
+                validate_job_log_tail(None, "build_image", 7).ok(),
+                Some(None)
+            );
+        }
+
+        #[test]
+        fn tail_within_range_is_accepted() {
+            for lines in [1, 10_000, MAX_JOB_LOG_TAIL_LINES] {
+                assert_eq!(
+                    validate_job_log_tail(Some(lines), "build_image", 7).ok(),
+                    Some(Some(lines))
+                );
+            }
+        }
+
+        #[test]
+        fn tail_out_of_range_is_a_400_with_context() {
+            for lines in [0, MAX_JOB_LOG_TAIL_LINES + 1] {
+                let problem = validate_job_log_tail(Some(lines), "build_image", 7).unwrap_err();
+                assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+                let body = serde_json::to_string(&problem.body).unwrap();
+                assert!(body.contains("build_image"), "{body}");
+                assert!(body.contains("deployment 7"), "{body}");
+            }
+        }
+    }
+
+    mod job_logs_read_failure_tests {
+        use super::super::job_logs_read_failure;
+        use axum::http::StatusCode;
+        use temps_entities::types::JobStatus;
+
+        fn not_found() -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such file")
+        }
+
+        #[test]
+        fn jobs_without_output_yet_return_an_empty_log() {
+            for status in [
+                JobStatus::Pending,
+                JobStatus::Waiting,
+                JobStatus::Running,
+                JobStatus::Skipped,
+                JobStatus::Cancelled,
+            ] {
+                let result = job_logs_read_failure("deploy_container", 2, &status, &not_found());
+                assert_eq!(result.ok().as_deref(), Some(""), "status {status}");
+            }
+        }
+
+        #[test]
+        fn finished_jobs_with_missing_logs_return_404_with_context() {
+            for status in [JobStatus::Success, JobStatus::Failure] {
+                let problem = job_logs_read_failure("build_image", 7, &status, &not_found())
+                    .expect_err("finished job without logs must be an error");
+                assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+                let body = serde_json::to_string(&problem.body).unwrap_or_default();
+                assert!(body.contains("build_image"), "{body}");
+                assert!(body.contains('7'), "{body}");
+            }
+        }
+
+        #[test]
+        fn other_read_failures_stay_500() {
+            let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+            let problem = job_logs_read_failure("build_image", 7, &JobStatus::Pending, &error)
+                .expect_err("permission errors are real failures");
+            assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
     use super::*;
     use async_trait::async_trait;
     use axum::Router;
@@ -2854,6 +3119,66 @@ mod tests {
             .paths
             .paths
             .contains_key("/deployments/latest-media"));
+    }
+
+    fn public_compose_service_url(
+        settings: &AppSettings,
+        strategy: PublicHostnameStrategy,
+        environment: &str,
+        service: &str,
+        public_ports: &[temps_entities::preset::ComposePublicPort],
+        proxy_port: u16,
+    ) -> Option<String> {
+        public_compose_service_urls(
+            settings,
+            strategy,
+            environment,
+            service,
+            public_ports,
+            proxy_port,
+        )
+        .into_iter()
+        .next()
+        .map(|route| route.url)
+    }
+
+    #[test]
+    fn compose_service_exposes_one_url_per_public_port() {
+        let settings = AppSettings {
+            external_url: Some("http://localhost:3013".to_string()),
+            preview_domain: "localho.st".to_string(),
+            ..Default::default()
+        };
+        let route = |service: &str, port: u16| temps_entities::preset::ComposePublicPort {
+            service: service.to_string(),
+            port,
+            ..Default::default()
+        };
+        let ports = vec![route("web", 80), route("trawl", 3000), route("trawl", 9222)];
+
+        let urls = public_compose_service_urls(
+            &settings,
+            PublicHostnameStrategy::Standard,
+            "browser-production",
+            "trawl",
+            &ports,
+            8210,
+        );
+        assert_eq!(
+            urls,
+            vec![
+                crate::handlers::types::ServicePublicUrl {
+                    service: "trawl".to_string(),
+                    port: 3000,
+                    url: "http://trawl--browser-production.localho.st:3013".to_string(),
+                },
+                crate::handlers::types::ServicePublicUrl {
+                    service: "trawl".to_string(),
+                    port: 9222,
+                    url: "http://trawl-9222--browser-production.localho.st:3013".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -4389,9 +4714,8 @@ mod tests {
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
         );
-        let docker_log_service = Arc::new(DockerLogService::new(Arc::new(
-            temps_core::DockerHandle::available(docker.clone()),
-        )));
+        let docker_handle = Arc::new(temps_core::DockerHandle::available(docker.clone()));
+        let docker_log_service = Arc::new(DockerLogService::new(docker_handle.clone()));
 
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
@@ -4428,8 +4752,9 @@ mod tests {
             config_service.clone(),
             queue_service.clone(),
             docker_log_service,
-            docker.clone(),
+            docker_handle,
             deployer,
+            Arc::new(MockImageBuilder),
             encryption_service.clone(),
         ));
 
@@ -4478,7 +4803,7 @@ mod tests {
                 .expect("enc"),
             ),
         ));
-        let blob_service = Arc::new(temps_blob::BlobService::new(rustfs_service));
+        let blob_service = Some(Arc::new(temps_blob::BlobService::new(rustfs_service)));
 
         // Use noop screenshot provider via env var
         // SAFETY: This is test-only code; tests are run single-threaded or this env var
@@ -4522,7 +4847,9 @@ mod tests {
                 db.clone(),
             )),
             screenshot_service,
-            Arc::new(bollard::Docker::connect_with_local_defaults().expect("docker")),
+            Arc::new(temps_core::DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults().expect("docker"),
+            ))),
         ));
 
         let failure_report_service = Arc::new(
@@ -4534,6 +4861,32 @@ mod tests {
                 ),
             )
             .expect("Failed to build test FailureReportService"),
+        );
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let config_service = Arc::new(ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:0".to_string(),
+                    "postgresql://test:test@localhost:5432/test".to_string(),
+                    None,
+                    None,
+                )
+                .expect("config"),
+            ),
+            db.clone(),
+        ));
+        let enrollment_token_service =
+            Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
+        let node_pairing_admin = Arc::new(
+            crate::services::node_pairing_admin::NodePairingAdminService::new(
+                db.clone(),
+                config_service.clone(),
+                encryption_service.clone(),
+                enrollment_token_service.clone(),
+            ),
         );
 
         Arc::new(AppState {
@@ -4551,21 +4904,11 @@ mod tests {
             image_builder: Arc::new(MockImageBuilder) as Arc<dyn temps_deployer::ImageBuilder>,
             audit_service: Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>,
             node_service: Arc::new(crate::services::NodeService::new(db.clone())),
-            encryption_service: Arc::new(
-                temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
-            ),
-            config_service: Arc::new(ConfigService::new(
-                Arc::new(
-                    temps_config::ServerConfig::new(
-                        "127.0.0.1:0".to_string(),
-                        "postgresql://test:test@localhost:5432/test".to_string(),
-                        None,
-                        None,
-                    )
-                    .expect("config"),
-                ),
-                db.clone(),
-            )),
+            node_scheduler: Arc::new(crate::services::NodeScheduler::new(Arc::new(
+                crate::services::NodeService::new(db.clone()),
+            ))),
+            encryption_service,
+            config_service,
             docker: Arc::new(temps_core::DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
@@ -4577,6 +4920,8 @@ mod tests {
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
             failure_report_service,
+            enrollment_token_service,
+            node_pairing_admin,
             sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
         })
     }

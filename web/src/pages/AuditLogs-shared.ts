@@ -49,6 +49,7 @@ export const OPERATION_GROUPS: OperationGroup[] = [
     operations: [
       { value: 'LOGIN_SUCCESS', label: 'Login Success' },
       { value: 'LOGIN_FAILURE', label: 'Login Failure' },
+      { value: 'OIDC_LOGIN_DENIED', label: 'SSO Login Denied' },
       { value: 'USER_LOGOUT', label: 'User Logout' },
       { value: 'PASSWORD_RESET', label: 'Password Reset' },
       { value: 'EMAIL_VERIFIED', label: 'Email Verified' },
@@ -64,6 +65,7 @@ export const OPERATION_GROUPS: OperationGroup[] = [
       { value: 'USER_RESTORED', label: 'User Restored' },
       { value: 'ROLE_ASSIGNED', label: 'Role Assigned' },
       { value: 'ROLE_REMOVED', label: 'Role Removed' },
+      { value: 'ADMIN_PASSWORD_RESET', label: 'Password Reset by Admin' },
     ],
   },
   {
@@ -284,6 +286,10 @@ export const OPERATION_GROUPS: OperationGroup[] = [
       },
       { value: 'WEEKLY_DIGEST_TRIGGERED', label: 'Weekly Digest Triggered' },
     ],
+  },
+  {
+    label: 'Analytics & Visitors',
+    operations: [{ value: 'VISITOR_ENRICHED', label: 'Visitor Enriched' }],
   },
   {
     label: 'Storage (Blob / KV)',

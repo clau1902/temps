@@ -5,7 +5,9 @@
 //!
 //! See [`crate`] and [`temps_core::telemetry`] for the abstraction and privacy
 //! contract. This service:
-//! - persists a stable random `anonymous_id` in the data directory,
+//! - persists a stable random `anonymous_id` in the data directory (local
+//!   installs) or reads the random one stored in PostgreSQL (stateless
+//!   control planes, whose replicas share no data directory),
 //! - honours the `TEMPS_TELEMETRY` opt-out env var,
 //! - sends each event as a fire-and-forget timed HTTP POST so a dead endpoint
 //!   never affects the running server.
@@ -88,6 +90,19 @@ impl TelemetryService {
         data_dir: &Path,
         temps_version: impl Into<String>,
     ) -> Result<Self, TelemetryInitError> {
+        Self::new_for_installation(data_dir, temps_version, None)
+    }
+
+    /// Build a reporter using the telemetry identity already resolved from
+    /// PostgreSQL. Stateless callers pass the random anonymous ID stored in
+    /// `stateless_control_plane.telemetry_anonymous_id` (see
+    /// `temps_config::stateless_telemetry_anonymous_id`); local callers pass
+    /// `None` and retain the data-directory identity file.
+    pub fn new_for_installation(
+        data_dir: &Path,
+        temps_version: impl Into<String>,
+        stateless_anonymous_id: Option<&str>,
+    ) -> Result<Self, TelemetryInitError> {
         let version = temps_version.into();
         let enabled = Self::enabled_from_env();
         let endpoint = std::env::var("TEMPS_TELEMETRY_ENDPOINT")
@@ -95,7 +110,7 @@ impl TelemetryService {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_TELEMETRY_ENDPOINT.to_string());
 
-        let anonymous_id = Self::load_or_create_anonymous_id(data_dir)?;
+        let anonymous_id = Self::load_or_create_anonymous_id(data_dir, stateless_anonymous_id)?;
 
         let client = reqwest::Client::builder()
             .timeout(SEND_TIMEOUT)
@@ -160,7 +175,24 @@ impl TelemetryService {
     /// Load the persisted anonymous id, generating and persisting a new random
     /// one on first run. The id is a random UUID v4 — not derived from anything
     /// machine-identifying.
-    fn load_or_create_anonymous_id(data_dir: &Path) -> Result<String, TelemetryInitError> {
+    ///
+    /// Stateless control planes pass the random id already stored in
+    /// PostgreSQL; it is used verbatim and no local file is written.
+    fn load_or_create_anonymous_id(
+        data_dir: &Path,
+        stateless_anonymous_id: Option<&str>,
+    ) -> Result<String, TelemetryInitError> {
+        if let Some(id) = stateless_anonymous_id {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(TelemetryInitError::AnonymousIdIo {
+                    path: "stateless_control_plane.telemetry_anonymous_id".to_string(),
+                    reason: "persisted stateless telemetry identity is empty".to_string(),
+                });
+            }
+            return Ok(id.to_string());
+        }
+
         let path = Self::anonymous_id_path(data_dir);
 
         if path.exists() {
@@ -188,6 +220,46 @@ impl TelemetryService {
         })?;
 
         Ok(id)
+    }
+
+    /// Send one event and wait for the request to finish (bounded by the
+    /// client timeout). Only for paths where the process is about to exit, such
+    /// as a failed startup, where a fire-and-forget task would never run.
+    /// Never returns an error: telemetry must not change the caller's outcome.
+    pub async fn send_now(&self, event: TelemetryEvent) {
+        if !self.inner.enabled {
+            return;
+        }
+        let payload = EventPayload {
+            anonymous_id: &self.inner.anonymous_id,
+            event_type: &event.event_type,
+            properties: &event.properties,
+            temps_version: if self.inner.temps_version.is_empty() {
+                None
+            } else {
+                Some(&self.inner.temps_version)
+            },
+        };
+        match self
+            .inner
+            .client
+            .post(&self.inner.endpoint)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => tracing::debug!(
+                event = %event.event_type,
+                status = %response.status(),
+                "telemetry endpoint rejected the event (ignored)"
+            ),
+            Err(e) => tracing::debug!(
+                event = %event.event_type,
+                error = %e,
+                "telemetry send failed (ignored)"
+            ),
+        }
     }
 
     /// The stable anonymous id for this instance (exposed for diagnostics).
@@ -344,6 +416,19 @@ mod tests {
     use super::*;
     use temps_core::telemetry::TelemetryEventKind;
 
+    /// `TEMPS_TELEMETRY` is process-wide, and the test harness runs tests in
+    /// parallel: one test opting out would flip another's `enabled` mid-run.
+    /// Every test that reads or writes the variable holds this lock.
+    static TELEMETRY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_telemetry_env() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test poisons the lock; the variable is reset by the next
+        // holder anyway, so the poison carries no information.
+        TELEMETRY_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A temp dir helper that doesn't pull in extra deps.
     fn temp_dir() -> PathBuf {
         let base = std::env::temp_dir();
@@ -356,8 +441,8 @@ mod tests {
     #[test]
     fn anonymous_id_is_stable_across_loads() {
         let dir = temp_dir();
-        let id1 = TelemetryService::load_or_create_anonymous_id(&dir).unwrap();
-        let id2 = TelemetryService::load_or_create_anonymous_id(&dir).unwrap();
+        let id1 = TelemetryService::load_or_create_anonymous_id(&dir, None).unwrap();
+        let id2 = TelemetryService::load_or_create_anonymous_id(&dir, None).unwrap();
         assert_eq!(id1, id2, "anonymous id must be stable once generated");
         assert!(id1.starts_with("inst_"));
         std::fs::remove_dir_all(&dir).ok();
@@ -368,27 +453,67 @@ mod tests {
         let dir = temp_dir();
         let path = TelemetryService::anonymous_id_path(&dir);
         std::fs::write(&path, "   ").unwrap();
-        let id = TelemetryService::load_or_create_anonymous_id(&dir).unwrap();
+        let id = TelemetryService::load_or_create_anonymous_id(&dir, None).unwrap();
         assert!(id.starts_with("inst_"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persisted_stateless_identity_is_used_verbatim_without_a_local_file() {
+        let dir = temp_dir();
+        let stored = "inst_0123456789abcdef0123456789abcdef";
+        let service =
+            TelemetryService::new_for_installation(&dir, "0.0.0-test", Some(stored)).unwrap();
+
+        // The random id stored in PostgreSQL is reported as-is: nothing is
+        // derived from the operator-chosen instance name.
+        assert_eq!(service.anonymous_id(), stored);
+        assert!(!TelemetryService::anonymous_id_path(&dir).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_persisted_stateless_identity_is_rejected() {
+        let dir = temp_dir();
+        let error = TelemetryService::load_or_create_anonymous_id(&dir, Some("  "))
+            .expect_err("an empty stored id must not become the telemetry identity");
+        assert!(error
+            .to_string()
+            .contains("stateless_control_plane.telemetry_anonymous_id"));
+        assert!(!TelemetryService::anonymous_id_path(&dir).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn disabled_service_is_noop_and_reports_disabled() {
         let dir = temp_dir();
-        // Force opt-out for this construction.
-        std::env::set_var("TEMPS_TELEMETRY", "0");
-        let svc = TelemetryService::new(&dir, "0.0.0-test").unwrap();
-        std::env::remove_var("TEMPS_TELEMETRY");
+        let svc = {
+            // Force opt-out for this construction only; the env lock must not
+            // be held across the await below.
+            let _env = lock_telemetry_env();
+            std::env::set_var("TEMPS_TELEMETRY", "0");
+            let svc = TelemetryService::new(&dir, "0.0.0-test").unwrap();
+            std::env::remove_var("TEMPS_TELEMETRY");
+            svc
+        };
 
         assert!(!svc.is_enabled());
         // Must not panic and must not spawn a request.
         svc.report(TelemetryEvent::new(TelemetryEventKind::ProjectCreated));
+        // The synchronous path honours the opt-out too: it returns without
+        // building a request, so it cannot wait on the network.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            svc.send_now(TelemetryEvent::new(TelemetryEventKind::UpgradeFailed)),
+        )
+        .await
+        .expect("opted-out send_now must return immediately");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn report_once_records_milestone_in_process_guard() {
+        let _env = lock_telemetry_env();
         let dir = temp_dir();
         std::env::remove_var("TEMPS_TELEMETRY");
         let svc = TelemetryService::new(&dir, "0.0.0-test").unwrap();
@@ -439,6 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn report_once_is_noop_when_disabled() {
+        let _env = lock_telemetry_env();
         let dir = temp_dir();
         std::env::set_var("TEMPS_TELEMETRY", "0");
         let svc = TelemetryService::new(&dir, "0.0.0-test").unwrap();
@@ -459,6 +585,7 @@ mod tests {
 
     #[test]
     fn enabled_from_env_defaults_on_and_honors_opt_out() {
+        let _env = lock_telemetry_env();
         std::env::remove_var("TEMPS_TELEMETRY");
         assert!(TelemetryService::enabled_from_env());
 

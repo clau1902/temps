@@ -132,6 +132,39 @@ pub fn read_cross_node_blockers(config: &serde_json::Value) -> Vec<CrossNodeServ
         .unwrap_or_default()
 }
 
+/// Key under which the planner records, on every job it creates, whether the
+/// principal that asked for this deployment was allowed to deploy a project
+/// holding host Docker access (ADR 045).
+///
+/// Underscore-prefixed like `_required_for_completion`: planner-injected
+/// metadata, not part of any job's own schema. Never derived from request
+/// input — only [`WorkflowPlanner::create_deployment_jobs`] writes it, from
+/// the `DeployCaller` its caller had to supply.
+pub const DOCKER_SOCKET_AUTHORIZED_KEY: &str = "_docker_socket_authorized";
+
+/// Recover the deploy authority recorded at planning time.
+///
+/// The executor runs from the queue, long after the request that asked for the
+/// deployment is gone, so it cannot re-derive the caller from an `AuthContext`.
+/// It reads the planner's recorded answer instead, and **fails closed**: a job
+/// config that does not say it was authorized is treated as an ordinary
+/// project writer, which `DeployImageJobBuilder::build` then refuses for a
+/// declared project. A future writer of job rows that forgets this key
+/// therefore cannot start a host-root container by omission.
+pub fn planned_deploy_caller(
+    config: &serde_json::Value,
+) -> temps_core::docker_socket_grant::DeployCaller {
+    if config
+        .get(DOCKER_SOCKET_AUTHORIZED_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        temps_core::docker_socket_grant::DeployCaller::InstanceAdmin
+    } else {
+        temps_core::docker_socket_grant::DeployCaller::ProjectWriter
+    }
+}
+
 /// Swap every occurrence of a linked service's Docker container name for the
 /// address a container on another node must use, in place.
 ///
@@ -912,7 +945,7 @@ impl WorkflowPlanner {
     ///
     /// Returns an empty plan (no variables, no blockers) in single-node mode
     /// or when the project has no cross-node exposure at all.
-    async fn build_remote_environment_variables(
+    pub(crate) async fn build_remote_environment_variables(
         &self,
         project: &projects::Model,
         local_env_vars: &std::collections::HashMap<String, String>,
@@ -1101,10 +1134,20 @@ impl WorkflowPlanner {
         Some(host.to_string())
     }
 
-    /// Create all jobs for a deployment based on project configuration
+    /// Create all jobs for a deployment based on project configuration.
+    ///
+    /// `caller` is required, and is the ADR-045 gate for every deployment that
+    /// goes through the queue — which is every one except rollback and
+    /// promotion, which build their deploy job directly and are gated in
+    /// `DeployImageJobBuilder` instead. It is a constructor-style argument for
+    /// the same reason `project_slug` is one on that builder: three
+    /// remote-deployment handlers reach a running container through this
+    /// function and nothing else, so a new one must be unable to compile
+    /// without saying on whose authority it is deploying.
     pub async fn create_deployment_jobs(
         &self,
         deployment_id: i32,
+        caller: temps_core::docker_socket_grant::DeployCaller,
     ) -> anyhow::Result<Vec<deployment_jobs::Model>> {
         // Get deployment, project, and environment info
         let deployment = deployments::Entity::find_by_id(deployment_id)
@@ -1121,6 +1164,32 @@ impl WorkflowPlanner {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| anyhow::anyhow!("Environment not found"))?;
+
+        // ADR 045, before a single job row exists: this project's containers
+        // receive `/var/run/docker.sock` and run the planned image and command
+        // as host root, so planning the deployment at all is admin-only.
+        // Refused here rather than only in the handlers because the handlers
+        // are exactly what was missed the first time.
+        if temps_core::docker_socket_grant::deploy_requires_instance_admin(
+            temps_core::docker_socket_grant::process_grant(),
+            &project.slug,
+            caller,
+        ) {
+            warn!(
+                deployment_id,
+                project_id = project.id,
+                slug = %project.slug,
+                caller = ?caller,
+                env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+                "Refused to plan a deployment for a project that holds host Docker access \
+                 (ADR 045)"
+            );
+            return Err(anyhow::anyhow!(
+                "{}",
+                temps_core::docker_socket_grant::granted_project_deploy_reason(&project.slug)
+            ));
+        }
+        let docker_socket_authorized = caller.may_deploy_granted_project();
 
         info!(
             "Planning workflow for deployment {} (project: {}, env: {})",
@@ -1164,6 +1233,12 @@ impl WorkflowPlanner {
                 config_obj.insert(
                     "_required_for_completion".to_string(),
                     serde_json::Value::Bool(job_def.required_for_completion),
+                );
+                // ADR 045: carried to the executor, which has no request to
+                // re-derive it from. See `planned_deploy_caller`.
+                config_obj.insert(
+                    DOCKER_SOCKET_AUTHORIZED_KEY.to_string(),
+                    serde_json::Value::Bool(docker_socket_authorized),
                 );
             }
 
@@ -1318,6 +1393,13 @@ impl WorkflowPlanner {
 
         // Determine the effective source type for this deployment
         // For Manual projects, this inspects the deployment metadata
+        if project.source_type == SourceType::External {
+            return Err(crate::services::DeploymentError::InvalidInput(format!(
+                "Project {} is for monitoring only. Configure hosting before deploying.",
+                project.id
+            ))
+            .into());
+        }
         let effective_source_type = self.determine_deployment_source_type(project, deployment);
 
         debug!(
@@ -1416,6 +1498,11 @@ impl WorkflowPlanner {
 
         // Route to appropriate job planning based on effective source type
         match effective_source_type {
+            SourceType::External => Err(crate::services::DeploymentError::InvalidInput(format!(
+                "Project {} is for monitoring only. Configure hosting before deploying.",
+                project.id
+            ))
+            .into()),
             SourceType::DockerImage => {
                 self.plan_docker_image_deployment(
                     project,
@@ -1578,7 +1665,8 @@ impl WorkflowPlanner {
                     "git_provider_connection_id": project.git_provider_connection_id,
                     "git_url": project.git_url,
                     "is_public_repo": project.is_public_repo,
-                    "directory": project.directory
+                    "directory": project.directory,
+                    "pull_only_root_directory": project.pull_only_root_directory
                 })),
                 required_for_completion: true, // Core deployment job
             });
@@ -2249,7 +2337,8 @@ impl WorkflowPlanner {
                     "git_provider_connection_id": project.git_provider_connection_id,
                     "git_url": project.git_url,
                     "is_public_repo": project.is_public_repo,
-                    "directory": project.directory
+                    "directory": project.directory,
+                    "pull_only_root_directory": project.pull_only_root_directory
                 })),
                 required_for_completion: true,
             });
@@ -2492,12 +2581,22 @@ impl WorkflowPlanner {
             .or_else(|| project.deployment_config.as_ref().map(|c| c.replicas))
             .unwrap_or(1);
 
+        // `use_external_image` only means "deploy this tag, there is no build
+        // job". Whether a remote worker can pull it is a separate question: an
+        // uploaded image exists only in this control plane's Docker and must be
+        // streamed to the worker, never pulled (see `DeployImageSource`).
+        let image_source = if is_uploaded_locally {
+            crate::jobs::DeployImageSource::ControlPlaneLocal
+        } else {
+            crate::jobs::DeployImageSource::Registry
+        };
         let mut job_config = serde_json::json!({
             "port": exposed_port,
             "configured_port": configured_port,
             "replicas": replicas,
             "image_name": external_image_ref,
             "use_external_image": true,
+            (crate::jobs::IMAGE_SOURCE_CONFIG_KEY): image_source.as_str(),
         });
         if let Some(obj) = job_config.as_object_mut() {
             self.seal_sensitive_field(obj, deployment, "environment_variables", &deploy_env_vars)?;
@@ -3059,7 +3158,12 @@ mod tests {
         let (_project, _environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
 
         // Should create 5 jobs: download_repo, build_image, deploy_container, mark_deployment_complete, configure_crons
         // Screenshots may or may not be included depending on config
@@ -3151,7 +3255,12 @@ mod tests {
 
         // Should succeed and create only build_image, deploy_container, and mark_deployment_complete jobs
         // (no download_repo or configure_crons since git info is missing)
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
         assert!(
             jobs.len() >= 3,
             "Expected at least 3 jobs, got {}",
@@ -3189,7 +3298,12 @@ mod tests {
         let (_project, _environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
 
         // Verify execution order is set correctly
         for (index, job) in jobs.iter().enumerate() {
@@ -3236,7 +3350,12 @@ mod tests {
         let (_project, _environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
 
         // Find specific jobs and check their dependencies
         let build_job = jobs.iter().find(|j| j.job_id == "build_image").unwrap();
@@ -3280,7 +3399,12 @@ mod tests {
         let (project, environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
 
         // Check that jobs have proper configuration
         let build_job = jobs.iter().find(|j| j.job_id == "build_image").unwrap();
@@ -3392,7 +3516,12 @@ mod tests {
 
         let (project, environment, deployment) =
             create_test_project(db.as_ref(), Preset::Static).await?;
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
         let build_job = jobs
             .iter()
             .find(|job| job.job_id == "build_image")
@@ -3493,7 +3622,12 @@ mod tests {
         }));
         let deployment = deployment_update.update(db.as_ref()).await?;
 
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
         let prepare = jobs
             .iter()
             .find(|job| job.job_id == "prepare_source_bundle")
@@ -3593,7 +3727,12 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
         let compose_job = jobs
             .iter()
             .find(|job| job.job_id == "deploy_compose")
@@ -3660,7 +3799,12 @@ mod tests {
         let (project, environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
 
         // Verify log_id format - should be hierarchical: {project_slug}/{env_slug}/{year}/{month}/{day}/{hour}/{minute}/deployment-{id}-job-{job_id}.log
         for job in &jobs {
@@ -3760,7 +3904,12 @@ mod tests {
         };
         let deployment = deployment.insert(db.as_ref()).await?;
 
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
 
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
 
@@ -3787,6 +3936,129 @@ mod tests {
         assert!(
             !job_ids.contains(&"build_image".to_string()),
             "Should NOT contain build_image for Docker image deployment"
+        );
+
+        // A registry image is pulled by whichever worker runs the replica.
+        let deploy_job = jobs
+            .iter()
+            .find(|j| j.job_id == "deploy_container")
+            .expect("deploy_container job");
+        let deploy_config = deploy_job
+            .job_config
+            .as_ref()
+            .expect("deploy_container job config");
+        assert_eq!(
+            crate::jobs::DeployImageSource::from_job_config(deploy_config),
+            Some(crate::jobs::DeployImageSource::Registry),
+            "external image deploy must be registry-sourced: {deploy_config}"
+        );
+
+        Ok(())
+    }
+
+    /// Regression: an uploaded image (`temps deploy:local-image`) exists only in
+    /// the control plane's Docker. Its deploy job must say so, or a replica
+    /// scheduled on a worker asks that worker to pull `temps.internal/...` from
+    /// a registry that doesn't exist.
+    #[tokio::test]
+    async fn test_uploaded_image_deployment_is_control_plane_local(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Docker/Postgres not available, skipping: {e}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+
+        let project = projects::ActiveModel {
+            name: Set("Uploaded Image Project".to_string()),
+            slug: Set("uploaded-image-project".to_string()),
+            repo_owner: Set(String::new()),
+            repo_name: Set(String::new()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            source_type: Set(temps_entities::source_type::SourceType::DockerImage),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("uploaded.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("uploaded.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await?;
+
+        let image_ref = format!(
+            "temps.internal/project-{}/environment-{}/upload-0f3c9a:immutable",
+            project.id, environment.id
+        );
+        // Same metadata the upload handler writes.
+        let deployment_metadata = temps_entities::deployments::DeploymentMetadata {
+            external_image_ref: Some(image_ref.clone()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::DockerImage),
+            image_uploaded_locally: true,
+            uploaded_image_id: Some("sha256:0f3c9a".to_string()),
+            ..Default::default()
+        };
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("uploaded-image-project-1".to_string()),
+            state: Set("pending".to_string()),
+            metadata: Set(Some(deployment_metadata)),
+            image_name: Set(Some(image_ref.clone())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let deployment = deployment.insert(db.as_ref()).await?;
+
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
+
+        let job_ids: Vec<&str> = jobs.iter().map(|j| j.job_id.as_str()).collect();
+        assert!(
+            job_ids.contains(&"verify_local_image") && !job_ids.contains(&"pull_external_image"),
+            "uploaded image must be verified locally, not pulled: {job_ids:?}"
+        );
+
+        let deploy_config = jobs
+            .iter()
+            .find(|j| j.job_id == "deploy_container")
+            .and_then(|j| j.job_config.as_ref())
+            .expect("deploy_container job config");
+        assert_eq!(
+            deploy_config.get("image_name").and_then(|v| v.as_str()),
+            Some(image_ref.as_str())
+        );
+        assert_eq!(
+            crate::jobs::DeployImageSource::from_job_config(deploy_config),
+            Some(crate::jobs::DeployImageSource::ControlPlaneLocal),
+            "uploaded image deploy must be control-plane-local: {deploy_config}"
         );
 
         Ok(())
@@ -3997,7 +4269,12 @@ mod tests {
         let (_project, _environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
-        let result = planner.create_deployment_jobs(deployment.id).await;
+        let result = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await;
 
         assert!(
             result.is_err(),
@@ -4048,7 +4325,12 @@ mod tests {
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         // Deployment planning must succeed when the resolver returns Ok.
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
         assert!(
             !jobs.is_empty(),
             "create_deployment_jobs must succeed when the secrets resolver returns Ok"
@@ -4088,7 +4370,12 @@ mod tests {
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         // Deployment planning must succeed exactly as it did before ADR 0009.
-        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let jobs = planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await?;
         assert!(
             !jobs.is_empty(),
             "create_deployment_jobs must succeed when no secrets resolver is registered"
@@ -4110,5 +4397,36 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// ADR 045: the executor recovers the deploy authority from the job row
+    /// the planner wrote, because there is no request left to re-derive it
+    /// from. Everything that is not an explicit `true` must come back as an
+    /// ordinary project writer — a job queued by an older build, a config
+    /// whose key was dropped, or a future writer of job rows that never
+    /// learned about the key — so that omission cannot start a host-root
+    /// container.
+    #[test]
+    fn a_job_config_that_does_not_claim_authorization_plans_as_a_project_writer() {
+        use temps_core::docker_socket_grant::DeployCaller;
+
+        assert_eq!(
+            planned_deploy_caller(&serde_json::json!({ DOCKER_SOCKET_AUTHORIZED_KEY: true })),
+            DeployCaller::InstanceAdmin
+        );
+        for config in [
+            serde_json::json!({ DOCKER_SOCKET_AUTHORIZED_KEY: false }),
+            serde_json::json!({}),
+            serde_json::json!({ DOCKER_SOCKET_AUTHORIZED_KEY: "true" }),
+            serde_json::json!({ DOCKER_SOCKET_AUTHORIZED_KEY: 1 }),
+            serde_json::json!({ DOCKER_SOCKET_AUTHORIZED_KEY: null }),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                planned_deploy_caller(&config),
+                DeployCaller::ProjectWriter,
+                "must fail closed for {config}"
+            );
+        }
     }
 }

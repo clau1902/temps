@@ -39,8 +39,7 @@ pub struct Model {
     /// rather than exposed generally; (2) the `PUT`/`DELETE
     /// /admin/oidc/providers/{id}` handlers refuse to edit or delete this
     /// row manually — its credentials are rotated by Cloud's own
-    /// provisioning path (`ConsoleOidcConfig`/`ConsoleOidcRevoke`), mirroring
-    /// `s3_sources.managed_by_cloud`.
+    /// provisioning path, mirroring `s3_sources.managed_by_cloud`.
     pub managed_by_cloud: bool,
     /// ADR-045 §4 role gate, layer 2: when true, `resolve_user` hard-rejects
     /// with `OidcError::InsufficientRole` unless the role resolved from

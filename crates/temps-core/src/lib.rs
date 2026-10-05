@@ -11,6 +11,7 @@ pub mod client_ip;
 /// (ADR-042 P3).
 pub mod cloud_telemetry_activation;
 pub mod config;
+pub mod console_startup;
 pub mod deployment;
 pub mod dns_automation;
 pub mod env_vars_provider;
@@ -22,6 +23,7 @@ pub mod feature_maturity;
 pub mod jobs;
 pub mod log_storage_config;
 pub mod managed_backup_schedule;
+pub mod node_address;
 pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;
@@ -42,6 +44,10 @@ pub mod release_images {
     include!(concat!(env!("OUT_DIR"), "/release_images.rs"));
 }
 pub mod docker_handle;
+/// Idempotent, race-safe creation of a named Docker bridge network.
+pub mod docker_network;
+/// Host-level grant of `/var/run/docker.sock` to named projects (ADR 045).
+pub mod docker_socket_grant;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
@@ -57,7 +63,12 @@ pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;
-pub use docker_handle::{DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON};
+pub use docker_handle::{
+    worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
+    WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,
+    WORKER_NODE_REQUIRED_TYPE, WORKER_NODE_SETUP_PATH,
+};
+pub use docker_socket_grant::{DockerSocketGrant, DOCKER_SOCKET_PROJECTS_ENV};
 pub use problemdetails::ProblemDetails;
 pub use self_update::{
     ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability,
@@ -129,6 +140,7 @@ pub use request_policy_gate::{
 };
 pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
+    SettingsRetentionResolver,
 };
 pub use runtime::{
     initialize_process_runtime_context, ExecutionEnvironment, ExecutionEnvironmentSource,
@@ -160,9 +172,9 @@ pub use app_settings::{
     DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
     ImageRetentionSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
     MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
-    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
-    TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    ObservabilityRetentionSettings, OnDemandTlsSettings, PreviewGatewaySettings, ProviderConfig,
+    RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    SelfUpdateSettings, TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
     DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
     DEFAULT_GEO_STALE_LOOKUP_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
     GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,

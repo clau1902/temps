@@ -42,6 +42,7 @@ Manage projects
 - `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 - `list` (`ls`) - List all projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
+- `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
 - `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
@@ -148,7 +149,18 @@ Create a new project (git-based or manual deployment)
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | Yes |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | Yes |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | Yes |
+| `--delivery-provider <provider>` | Delivery provider for the new project: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | Yes |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
+
+### `projects cloudflare-capability` (alias: `delivery-capability`)
+
+Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `projects show` (alias: `get`)
 
@@ -802,6 +814,7 @@ Set an environment variable
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | Yes |
+| `--preview` | Also include in current and future preview environments | - | No |
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
@@ -848,10 +861,10 @@ View or set CPU/memory resources for an environment
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--cpu <millicores>` | CPU limit in millicores (e.g., 500 = 0.5 CPU) | - | Yes |
+| `--cpu <millicores>` | CPU limit in millicores (1000 = 1 core, e.g., 500 = 0.5 CPU) | - | Yes |
 | `--memory <mb>` | Memory limit in MB (e.g., 512) | - | Yes |
-| `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | Yes |
-| `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | Yes |
+| `--cpu-request <millicores>` | CPU request in millicores (recorded; not currently enforced) | - | Yes |
+| `--memory-request <mb>` | Memory request in MB (recorded; not currently enforced) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments timeouts`
@@ -1093,7 +1106,7 @@ List available repositories
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--id <id>` | Provider ID (optional, lists all if not provided) | - | Yes |
+| `--id <id>` | Connection ID (lists every synced repository if omitted) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 | `--search <term>` | Search repositories by name | - | Yes |
 | `--page <n>` | Page number | - | Yes |
@@ -1110,6 +1123,7 @@ Manage Git provider connections
 **Subcommands:**
 
 - `list` (`ls`) - List all Git connections
+- `get` - Show one Git connection: account, health and sync state
 - `show` - Show connection details for a provider
 - `delete` (`rm`) - Delete a Git connection
 - `activate` - Activate a Git connection
@@ -1131,6 +1145,17 @@ List all Git connections
 | `--per-page <n>` | Items per page (default: 30, max: 100) | - | Yes |
 | `--sort <field>` | Sort by field (created_at, updated_at, account_name) | - | Yes |
 | `--direction <dir>` | Sort direction: asc or desc (default: desc) | - | Yes |
+
+#### `providers connections get`
+
+Show one Git connection: account, health and sync state
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 #### `providers connections show`
 
@@ -1688,7 +1713,7 @@ Remove a notification route
 
 ## `dns`
 
-Manage DNS providers for automated domain verification
+Manage DNS providers and Temps-managed DNS records
 
 **Subcommands:**
 
@@ -1698,6 +1723,7 @@ Manage DNS providers for automated domain verification
 - `remove` (`rm`) - Remove a DNS provider
 - `test` - Test DNS provider connection
 - `zones` - List available zones in a DNS provider
+- `records` (`record`) - Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
 
 ### `dns list` (alias: `ls`)
 
@@ -1717,25 +1743,30 @@ Add a new DNS provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual) | - | Yes |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual) | - | Yes |
 | `-n, --name <name>` | Provider name | - | Yes |
 | `-d, --description <description>` | Provider description | - | Yes |
-| `--api-token <token>` | Cloudflare API token | - | Yes |
+| `--api-token <token>` | API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history) | - | Yes |
+| `--api-token-stdin` | Read the API token from stdin | - | No |
 | `--account-id <id>` | Cloudflare account ID (optional) | - | Yes |
 | `--access-key-id <key>` | AWS access key ID | - | Yes |
-| `--secret-access-key <secret>` | AWS secret access key | - | Yes |
+| `--secret-access-key <secret>` | AWS secret access key (prefer --secret-access-key-stdin to keep it out of shell history) | - | Yes |
+| `--secret-access-key-stdin` | Read the AWS secret access key from stdin | - | No |
 | `--region <region>` | AWS region | - | Yes |
 | `--api-user <user>` | Namecheap API user | - | Yes |
-| `--api-key <key>` | Namecheap API key | - | Yes |
+| `--api-key <key>` | API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history) | - | Yes |
+| `--api-key-stdin` | Read the Bunny or Namecheap API key from stdin | - | No |
 | `--username <username>` | Namecheap username | - | Yes |
 | `--client-ip <ip>` | Namecheap whitelisted client IP | - | Yes |
 | `--project-id <id>` | GCP project ID | - | Yes |
 | `--service-account-email <email>` | GCP service account email | - | Yes |
 | `--private-key-id <id>` | GCP private key ID | - | Yes |
-| `--private-key <key>` | GCP private key | - | Yes |
+| `--private-key <key>` | GCP private key (prefer --private-key-stdin to keep it out of shell history) | - | Yes |
+| `--private-key-stdin` | Read the GCP private key from stdin | - | No |
 | `--tenant-id <id>` | Azure tenant ID | - | Yes |
 | `--client-id <id>` | Azure client ID | - | Yes |
-| `--client-secret <secret>` | Azure client secret | - | Yes |
+| `--client-secret <secret>` | Azure client secret (prefer --client-secret-stdin to keep it out of shell history) | - | Yes |
+| `--client-secret-stdin` | Read the Azure client secret from stdin | - | No |
 | `--subscription-id <id>` | Azure subscription ID | - | Yes |
 | `--resource-group <name>` | Azure resource group | - | Yes |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
@@ -1783,6 +1814,78 @@ List available zones in a DNS provider
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+
+### `dns records` (alias: `record`)
+
+Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
+
+**Subcommands:**
+
+- `ownership` (`owner`) - Show whether Temps owns a DNS record and may change it
+- `set` (`create`) - Create or update a Temps-owned DNS record
+- `import` (`adopt`) - Adopt an existing DNS record into Temps management
+- `remove` (`rm`, `delete`) - Delete a Temps-owned DNS record
+
+#### `dns records ownership` (alias: `owner`)
+
+Show whether Temps owns a DNS record and may change it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records set` (alias: `create`)
+
+Create or update a Temps-owned DNS record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `--value <value>` | Record value: IPv4 address (A), IPv6 address (AAAA) or target hostname (CNAME) | - | Yes |
+| `--ttl <seconds>` | TTL in seconds, 60-86400; omit (or use 1) for the provider default | - | Yes |
+| `--proxied` | Proxy through the provider CDN (Cloudflare orange cloud) | - | No |
+| `--no-proxied` | Do not proxy (DNS only) | - | No |
+| `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | Yes |
+| `--environment-id <id>` | Environment ID to stamp as the record owner | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records import` (alias: `adopt`)
+
+Adopt an existing DNS record into Temps management
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | Yes |
+| `--environment-id <id>` | Environment ID to stamp as the record owner | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records remove` (alias: `rm`, `delete`)
+
+Delete a Temps-owned DNS record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ## `services` (alias: `svc`)
 
@@ -2526,6 +2629,7 @@ Manage platform users
 - `me` - Show current user info
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
+- `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)
@@ -2583,6 +2687,18 @@ Restore a deleted user
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | User ID | - | Yes |
+
+### `users reset-password`
+
+Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompt (for automation) | - | No |
 
 ### `users role`
 
@@ -3283,6 +3399,7 @@ View project analytics
 - `api-path` - Show client IPs calling one path with latency and error analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+- `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
 
 ### `analytics keys`
 
@@ -3590,6 +3707,20 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 | `-p, --project <project>` | Project slug or ID | - | Yes |
 | `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics enrich`
+
+Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --data <json>` | JSON object to merge, e.g. '{"user_id":"user_123"}' | - | Yes |
+| `-f, --file <path>` | Read the JSON object to merge from a file | - | Yes |
+| `--set <key=value>` | Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values) | `` | Yes |
+| `--unset <key>` | Remove one top-level key (repeatable; sends null) | `` | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ## `plugin`

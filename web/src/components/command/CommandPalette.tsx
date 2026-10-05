@@ -42,6 +42,7 @@ import {
   settingsPageNavigationItems,
 } from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
+import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import {
   mergeSettingsNavigationGroups,
   type SettingsNavigationIcon,
@@ -80,6 +81,7 @@ import {
   Monitor,
   Network,
   Puzzle,
+  Rocket,
   ScrollText,
   Search,
   Server,
@@ -228,10 +230,10 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['apps', 'applications', 'sites'],
   },
   {
-    title: 'All platform tools',
+    title: 'All tools',
     url: '/tools',
     icon: Boxes,
-    keywords: ['tools', 'features', 'capabilities', 'everything'],
+    keywords: ['tools', 'platform', 'features', 'capabilities', 'everything'],
   },
   {
     title: 'Sandboxes',
@@ -253,6 +255,20 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['workspace', 'context', 'persistent'],
   },
   {
+    title: 'Deploy your first app',
+    url: '/get-started',
+    icon: Rocket,
+    keywords: [
+      'get started',
+      'getting started',
+      'sample',
+      'demo',
+      'first deploy',
+      'onboarding',
+      'hello',
+    ],
+  },
+  {
     title: 'Create New Project',
     url: '/projects/new',
     icon: FolderPlus,
@@ -271,7 +287,7 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['import', 'migrate', 'workload', 'platform', 'external'],
   },
   {
-    title: 'Server',
+    title: 'Server metrics',
     url: '/monitoring/server',
     icon: Cpu,
     keywords: ['cpu', 'memory', 'disk', 'docker', 'network', 'host', 'server'],
@@ -293,6 +309,24 @@ const mainNavItems: NavigationItem[] = [
       'stats',
       'traffic',
       'health',
+    ],
+  },
+  // Main navigation, not Settings: worker nodes are what builds and
+  // deployments run on. The URL stays /settings/nodes (see lib/worker-nodes),
+  // so this entry is filtered back out of the main category unless the page
+  // is absent from the settings registry — which it now is, by design.
+  {
+    title: 'Worker nodes',
+    url: WORKER_NODES_URL,
+    icon: Network,
+    keywords: [
+      'worker',
+      'nodes',
+      'cluster',
+      'multinode',
+      'infrastructure',
+      'build',
+      'deploy',
     ],
   },
 ]
@@ -531,10 +565,16 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Git Providers',
+    title: 'Git connections',
     url: '/git-providers',
     icon: GitBranch,
-    keywords: ['github', 'gitlab', 'version control', 'repositories'],
+    keywords: [
+      'github',
+      'gitlab',
+      'providers',
+      'version control',
+      'repositories',
+    ],
   },
   {
     title: 'Add Git Provider',
@@ -564,6 +604,12 @@ const settingsNavItems: NavigationItem[] = [
       'digitalocean',
       'namecheap',
     ],
+  },
+  {
+    title: 'Delivery Profiles',
+    url: '/delivery-profiles',
+    icon: Cloud,
+    keywords: ['delivery', 'cdn', 'cloudflare', 'direct', 'domains'],
   },
   {
     title: 'Add DNS Provider',
@@ -612,12 +658,6 @@ const settingsNavItems: NavigationItem[] = [
       'latest',
       'recent',
     ],
-  },
-  {
-    title: 'Worker Nodes',
-    url: '/settings/nodes',
-    icon: Network,
-    keywords: ['worker', 'nodes', 'cluster', 'multinode', 'infrastructure'],
   },
   {
     title: 'Plugins',

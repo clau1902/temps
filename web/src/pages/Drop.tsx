@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import {
   createProject,
   deleteProject,
@@ -18,6 +19,7 @@ import { DropEnvironmentVariables } from '@/components/drop/DropEnvironmentVaria
 import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
 import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
 import { PageContainer } from '@/components/layout/PageContainer'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -30,6 +32,7 @@ import {
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import {
   htmlRootCandidates,
   isDropArchive,
@@ -37,6 +40,7 @@ import {
 } from '@/lib/drop-archive'
 import { dropErrorMessage, inferredProjectName } from '@/lib/drop-files'
 import { consumeDropFilesHandoff } from '@/lib/drop-handoff'
+import { sourceArchiveUploadsSupported } from '@/lib/platform-capabilities'
 import {
   serializeDropEnvironmentVariables,
   validateDropEnvironmentVariables,
@@ -94,9 +98,18 @@ function stageLabel(
 
 export function Drop({ embedded = false }: { embedded?: boolean }) {
   const navigate = useNavigate()
+  const platformFeatures = usePlatformFeatures()
+  const sourceUploadsSupported = sourceArchiveUploadsSupported(
+    platformFeatures.data
+  )
+  const sourceUploadsUnavailable =
+    platformFeatures.data !== undefined && !sourceUploadsSupported
   const { setBreadcrumbs } = useBreadcrumbs()
   const [files, setFiles] = useState<DropFile[]>([])
   const [projectName, setProjectName] = useState('')
+  const [deliveryProvider, setDeliveryProvider] = useState<
+    'none' | 'cloudflare' | 'bunny' | undefined
+  >(undefined)
   const [nameWasEdited, setNameWasEdited] = useState(false)
   const [rootPage, setRootPage] = useState('')
   const [stage, setStage] = useState<DropStage>('idle')
@@ -222,7 +235,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   }
 
   useEffect(() => {
-    if (!handedOffFiles?.length) return
+    if (!sourceUploadsSupported || !handedOffFiles?.length) return
     const startHandoff = window.setTimeout(
       () => setSelection(handedOffFiles),
       0
@@ -230,7 +243,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     return () => window.clearTimeout(startHandoff)
     // The handoff is deliberately consumed only on the first `/drop` mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handedOffFiles])
+  }, [handedOffFiles, sourceUploadsSupported])
 
   const reset = () => {
     detectionRunRef.current += 1
@@ -238,6 +251,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     detectionAbortRef.current = null
     setFiles([])
     setProjectName('')
+    setDeliveryProvider(undefined)
     setNameWasEdited(false)
     setRootPage('')
     setStage('idle')
@@ -251,6 +265,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   }
 
   const deploy = async () => {
+    if (!sourceUploadsSupported) return
     if (files.length === 0 || isBusy) return
 
     let createdProject: ProjectResponse | null = null
@@ -281,6 +296,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
       const projectResult = await createProject({
         throwOnError: true,
         body: {
+          delivery_provider: deliveryProvider,
           name: normalizedProjectName,
           directory: candidate.directory,
           main_branch: 'main',
@@ -418,6 +434,16 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
 
   const content = (
     <>
+      {sourceUploadsUnavailable && (
+        <Alert>
+          <AlertTitle>File uploads need persistent storage</AlertTitle>
+          <AlertDescription>
+            This stateless control plane accepts prebuilt images from a
+            registry. Push an image from CI or the Temps CLI, then deploy it by
+            image reference.
+          </AlertDescription>
+        </Alert>
+      )}
       {!embedded && (
         <header className="grid gap-6 border-b pb-8 lg:grid-cols-[1fr_auto] lg:items-end">
           <div>
@@ -449,7 +475,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
                 files={files}
                 onSelect={setSelection}
                 onError={setError}
-                disabled={isBusy}
+                disabled={isBusy || !sourceUploadsSupported}
               />
             </div>
           ) : (
@@ -481,6 +507,10 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
               </div>
 
               <div className="flex-1 space-y-6 py-6">
+                <DeliveryProjectOption
+                  value={deliveryProvider}
+                  onChange={setDeliveryProvider}
+                />
                 <div className="space-y-2">
                   <Label htmlFor="drop-name">Project name</Label>
                   <Input

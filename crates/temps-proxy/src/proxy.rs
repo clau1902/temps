@@ -43,10 +43,10 @@ use crate::service::proxy_log_batch_writer::{
 };
 use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::static_file_serving::{
-    bounded_cas_etag, bounded_log_value, cap_static_chunk, if_none_match_matches, metadata_etag,
-    object_etag, open_static_file, opened_cas_size_matches, read_static_chunk,
-    resolve_static_object_request, static_not_found_contract, static_object_key,
-    unavailable_outcome, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
+    bounded_cas_etag, bounded_log_value, canonical_redirect_location, cap_static_chunk,
+    if_none_match_matches, metadata_etag, object_etag, open_static_file, opened_cas_size_matches,
+    read_static_chunk, resolve_static_object_request, static_not_found_contract, static_object_key,
+    unavailable_outcome, StaticFileMatch, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
 };
 use crate::tls_fingerprint;
 use crate::traits::*;
@@ -56,6 +56,7 @@ use bytes::Bytes;
 use cookie::Cookie;
 use pingora::http::StatusCode;
 use pingora::Error;
+use pingora_core::protocols::http::compression::ResponseCompressionCtx;
 use pingora_core::{
     upstreams::peer::{HttpPeer, Peer},
     Result,
@@ -292,6 +293,28 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
     let is_html = upstream_ct.contains("text/html");
     let has_ct = !upstream_ct.is_empty();
 
+    // The converter reads the body as UTF-8 HTML. We ask the upstream for an
+    // identity body (see `request_identity_encoding_for_markdown`), but an
+    // upstream is free to compress anyway; converting those bytes produces
+    // mojibake under a text/markdown header. Pass such responses through
+    // untouched instead — the client gets valid (compressed) HTML.
+    // Every Content-Encoding field and every coding in each: a response can
+    // carry `identity` in one field and `gzip` in another, or `gzip, br` in one.
+    // Checked in place, no allocation: this runs for every Markdown response.
+    // A header value that isn't visible ASCII can't be verified as identity,
+    // so it counts as encoded.
+    let is_encoded = upstream_response
+        .headers
+        .get_all("content-encoding")
+        .iter()
+        .any(|value| match value.to_str() {
+            Ok(codings) => codings
+                .split(',')
+                .map(str::trim)
+                .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")),
+            Err(_) => true,
+        });
+
     // Reject bodies we already know are too large from Content-Length, before
     // we commit to a text/markdown Content-Type in response_filter. Pingora
     // sends response headers to the client before response_body_filter runs,
@@ -305,7 +328,8 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
         .and_then(|v| v.parse::<usize>().ok())
         .is_some_and(|len| len > MAX_MARKDOWN_BODY_BYTES);
 
-    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html || declared_too_large {
+    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html || declared_too_large || is_encoded
+    {
         // Cannot or should not convert — reset the flag so response_body_filter
         // will pass the body through normally.
         ctx.wants_markdown = false;
@@ -318,6 +342,17 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
             debug!(
                 "Markdown conversion cancelled: non-2xx status={}, content-type={:?}",
                 status, upstream_ct
+            );
+        } else if is_encoded {
+            debug!(
+                "Markdown conversion cancelled: upstream sent Content-Encoding {:?} \
+                 (content-type={:?})",
+                upstream_response
+                    .headers
+                    .get_all("content-encoding")
+                    .iter()
+                    .collect::<Vec<_>>(),
+                upstream_ct
             );
         } else if declared_too_large {
             debug!(
@@ -343,6 +378,72 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
     }
 }
 
+/// Ask the upstream for an uncompressed body when the client wants Markdown.
+///
+/// `upstream_compression.adjust_level(0)` only stops Pingora from compressing
+/// the response itself; the client's own `Accept-Encoding` (browsers and most
+/// HTTP clients send `gzip, br`) is still forwarded, so a compressing upstream
+/// (Next.js, nginx) answers with a gzip body the HTML-to-Markdown converter
+/// cannot read.
+fn request_identity_encoding_for_markdown(upstream_request: &mut RequestHeader) {
+    if let Err(e) = upstream_request.insert_header("Accept-Encoding", "identity") {
+        warn!("Failed to set Accept-Encoding for markdown request: {}", e);
+    }
+}
+
+/// Compression level for responses Pingora compresses on the client's behalf.
+const RESPONSE_COMPRESSION_LEVEL: u32 = 6;
+
+/// Re-enable response compression for a Markdown request whose response is
+/// being passed through unconverted (JSON, an error, oversized or already
+/// encoded HTML).
+///
+/// For Markdown requests compression is turned off and the upstream is asked
+/// for `identity`, so without this a large pass-through response would reach
+/// a client that accepts gzip uncompressed. Pingora records the accepted
+/// encodings from the *upstream* request, which by then says `identity`, so
+/// the client's original header (saved before the rewrite) is fed back in.
+/// HTTP version the proxy must answer an HTTP/1.x client with.
+///
+/// An intermediary sends its own HTTP version on each hop (RFC 9110 §6.2), so
+/// an HTTP/1.1 client gets `HTTP/1.1` even when the backend answered
+/// `HTTP/1.0` (Python's `http.server`, many embedded and devtools servers).
+/// Forwarding the backend's `1.0` is not just cosmetic: when the proxy gzips
+/// the body, Pingora switches it to `Transfer-Encoding: chunked`, which
+/// HTTP/1.0 does not define. Browsers then read the chunk framing as body bytes
+/// and fail with `ERR_CONTENT_DECODING_FAILED`.
+///
+/// Returns `None` when the upstream version can be forwarded unchanged
+/// (HTTP/2 downstreams, where the header version is not written to the wire,
+/// and HTTP/1.0 clients, whose responses are never compressed).
+fn downstream_response_version(
+    client: pingora_http::Version,
+    upstream: pingora_http::Version,
+) -> Option<pingora_http::Version> {
+    (client == pingora_http::Version::HTTP_11
+        && matches!(
+            upstream,
+            pingora_http::Version::HTTP_09 | pingora_http::Version::HTTP_10
+        ))
+    .then_some(pingora_http::Version::HTTP_11)
+}
+
+fn restore_client_compression(compression: &mut ResponseCompressionCtx, accept_encoding: &str) {
+    compression.adjust_level(RESPONSE_COMPRESSION_LEVEL);
+    let mut req = match RequestHeader::build("GET", b"/", None) {
+        Ok(req) => req,
+        Err(e) => {
+            warn!("Failed to build header for restoring compression: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = req.insert_header("Accept-Encoding", accept_encoding) {
+        warn!("Failed to restore Accept-Encoding for compression: {}", e);
+        return;
+    }
+    compression.request_filter(&req);
+}
+
 /// Rewrite outbound response headers for Markdown delivery.
 /// Must be called from `response_filter` (before the body is sent to the client).
 ///
@@ -358,8 +459,8 @@ fn apply_markdown_response_headers(upstream_response: &mut ResponseHeader, ctx: 
     // Remove Content-Length — the Markdown body will differ in size from the HTML.
     // Pingora will handle framing via chunked transfer encoding.
     upstream_response.remove_header("Content-Length");
-    // Remove Content-Encoding — we disabled upstream compression for markdown
-    // requests, but be defensive in case it was set anyway.
+    // The gate only lets identity-encoded bodies through, so this is at most
+    // `Content-Encoding: identity`; drop it since the body is rewritten.
     upstream_response.remove_header("Content-Encoding");
     // Set x-markdown-tokens to 0 as a placeholder.  The actual token count is
     // computed in response_body_filter once the full body is available, but
@@ -397,6 +498,13 @@ pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
 /// before any TLS material exists, so these calls must never be answered with
 /// a redirect to a certificate that has not been issued yet.
 pub const INTERNAL_CLUSTER_PREFIX: &str = "/api/internal/";
+
+fn should_lookup_sleeping_environment(
+    route_table: Option<&temps_routes::CachedPeerTable>,
+    host: &str,
+) -> bool {
+    !route_table.is_some_and(|routes| routes.owns_hostname(host))
+}
 
 /// Decide whether a request on the plain-HTTP listener should be answered with
 /// a 301 to the HTTPS URL.
@@ -444,6 +552,23 @@ fn should_redirect_to_https(
     }
 
     env_force_https.unwrap_or_else(host_has_cert)
+}
+
+fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<ResponseHeader> {
+    let mut response = ResponseHeader::build(301, None)?;
+    response.insert_header("Location", redirect_url)?;
+    response.insert_header("Content-Length", "0")?;
+    response.insert_header("X-Request-ID", request_id)?;
+    response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
+    response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    Ok(response)
+}
+
+fn strip_proxy_owned_response_headers(response: &mut ResponseHeader) {
+    // Applications must not be able to impersonate the pre-upstream redirect
+    // used by managed monitors to decide whether a local TLS follow-up is safe.
+    response.remove_header("X-Temps-Proxy-Https-Redirect");
+    response.remove_header("X-Temps-Proxy-Probe-Capable");
 }
 
 fn deployment_asset_scope(
@@ -785,6 +910,11 @@ pub struct ProxyContext {
     pub wants_markdown: bool,
     /// Accumulated body bytes for HTML-to-Markdown conversion
     pub markdown_buffer: Vec<u8>,
+    /// The client's `Accept-Encoding`, saved before a Markdown request rewrites
+    /// it to `identity`, so compression can be restored if the response is
+    /// passed through unconverted. `None` when compression was off anyway
+    /// (streaming requests) or the client sent none.
+    pub markdown_fallback_accept_encoding: Option<String>,
     /// Number of upstream connection attempts (for retry logic)
     pub upstream_connect_tries: usize,
     /// Time upstream took to accept the request body (upload diagnostics, Pingora 0.8.0)
@@ -892,6 +1022,53 @@ pub struct LoadBalancer {
     /// histogram). Updated on every completed/failed request; drained by the
     /// background `ProxyMetricsSampler`, never read on the request path.
     proxy_metrics: Arc<crate::metrics::ProxyMetrics>,
+    /// Startup state of the in-process console (`temps serve`). When set and
+    /// the console failed to start, console-bound requests get a status page
+    /// naming the cause instead of the generic 503 — see
+    /// `crate::console_unavailable`. `None` in split topology (`temps proxy`),
+    /// where the console is another process this one cannot observe.
+    console_unavailable: Option<Arc<crate::console_unavailable::ConsoleUnavailableResponder>>,
+}
+
+/// Status recorded in proxy logs when the client disconnected before a
+/// response could be sent (the nginx convention).
+const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// Who caused a proxy failure, which decides how loudly it is logged.
+///
+/// Only a failure inside Temps is an ERROR. A client that disconnected
+/// mid-request is routine (a browser cancelling a fetch), and an upstream
+/// that refuses or drops the connection is the deployed application being
+/// down, which is the operator's to see at WARN, not a Temps fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyFailureKind {
+    ClientGone,
+    Upstream,
+    Internal,
+}
+
+impl ProxyFailureKind {
+    fn of(error: &Error) -> Self {
+        use pingora::{ErrorSource, ErrorType};
+        match error.esource() {
+            ErrorSource::Downstream => match error.etype() {
+                ErrorType::ConnectionClosed | ErrorType::ReadError | ErrorType::WriteError => {
+                    Self::ClientGone
+                }
+                _ => Self::Internal,
+            },
+            ErrorSource::Upstream => Self::Upstream,
+            ErrorSource::Internal | ErrorSource::Unset => Self::Internal,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientGone => "client disconnected",
+            Self::Upstream => "upstream unavailable",
+            Self::Internal => "internal",
+        }
+    }
 }
 
 impl LoadBalancer {
@@ -939,7 +1116,22 @@ impl LoadBalancer {
             connection_limiter: Arc::new(crate::connection_limiter::ConnectionLimiter::new()),
             admin_gate: None,
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
+            console_unavailable: None,
         }
+    }
+
+    /// Wire the in-process console's startup state so console-bound requests
+    /// explain a failed (or still running) console startup. `console_address`
+    /// must be the address the upstream resolver forwards console traffic to.
+    pub fn with_console_startup_state(
+        mut self,
+        state: Arc<temps_core::console_startup::ConsoleStartupState>,
+        console_address: &str,
+    ) -> Self {
+        self.console_unavailable = Some(Arc::new(
+            crate::console_unavailable::ConsoleUnavailableResponder::new(state, console_address),
+        ));
+        self
     }
 
     pub fn with_request_policy_gate(
@@ -1050,6 +1242,110 @@ impl LoadBalancer {
         Some(trace_id.to_ascii_lowercase())
     }
 
+    /// Answer a failed console-bound request with the console's startup
+    /// status instead of the generic 503, when the console in this process
+    /// failed to start or is still starting. Returns `None` to fall through
+    /// to the generic failure handling (application upstreams, a running
+    /// console that errored, split topology, a client that already left).
+    async fn serve_console_status_page(
+        &self,
+        session: &mut PingoraSession,
+        e: &Error,
+        ctx: &mut ProxyContext,
+    ) -> Option<FailToProxy> {
+        use temps_core::console_startup::ConsolePhase;
+
+        let responder = self.console_unavailable.as_ref()?;
+        if !ctx
+            .upstream_host
+            .as_deref()
+            .is_some_and(|host| responder.is_console_address(host))
+        {
+            return None;
+        }
+        if ProxyFailureKind::of(e) == ProxyFailureKind::ClientGone {
+            return None;
+        }
+
+        let req = session.req_header();
+        let format = crate::console_unavailable::ResponseFormat::for_request(
+            req.uri.path(),
+            req.headers.get("accept").and_then(|v| v.to_str().ok()),
+        );
+        let (body, routing_status, retry_after) = match responder.phase() {
+            ConsolePhase::Failed => {
+                let client_ip = ctx
+                    .ip_address
+                    .as_deref()
+                    .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
+                let gate = self.admin_gate.as_ref().map(|gate| gate.current());
+                let detailed = crate::console_unavailable::client_may_see_details(
+                    client_ip,
+                    &ctx.host,
+                    gate.as_deref(),
+                );
+                (
+                    responder.failure_body(detailed, format)?,
+                    "console_startup_failed",
+                    None,
+                )
+            }
+            ConsolePhase::Starting if is_connect_failure(e) => (
+                crate::console_unavailable::ConsoleUnavailableResponder::starting_body(format),
+                "console_starting",
+                Some(crate::console_unavailable::CONSOLE_STARTING_RETRY_AFTER_SECS),
+            ),
+            ConsolePhase::Starting | ConsolePhase::Running => return None,
+        };
+
+        // The cause was logged once, at ERROR, when startup failed; one line
+        // per request here would only repeat it.
+        debug!(
+            request_id = %ctx.request_id,
+            host = %ctx.host,
+            path = %ctx.path,
+            routing_status,
+            "serving console status page"
+        );
+        ctx.error_message = Some(e.to_string());
+        ctx.routing_status = routing_status.to_string();
+
+        let error_code = 503;
+        let written = async {
+            let mut header = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+            header.insert_header(header::SERVER, &SERVER_NAME[..])?;
+            header.insert_header(header::CACHE_CONTROL, "no-store")?;
+            header.insert_header(header::CONTENT_TYPE, format.content_type())?;
+            header.insert_header(header::CONTENT_LENGTH, body.len().to_string())?;
+            header.insert_header("X-Content-Type-Options", "nosniff")?;
+            header.insert_header("X-Request-ID", &ctx.request_id)?;
+            if let Some(seconds) = retry_after {
+                header.insert_header(header::RETRY_AFTER, seconds.to_string())?;
+            }
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
+            session
+                .write_response_body(Some(body.clone()), true)
+                .await?;
+            Ok::<(), Box<Error>>(())
+        }
+        .await;
+        if let Err(write_error) = written {
+            debug!(
+                request_id = %ctx.request_id,
+                "Failed to write console status page: {:?}",
+                write_error
+            );
+        }
+        self.log_failed_request(ctx, error_code, Some(body.len() as i64));
+
+        Some(FailToProxy {
+            error_code,
+            can_reuse_downstream: false,
+        })
+    }
+
     /// Decide whether the admin gate should be consulted for this request.
     ///
     /// The gate is only meaningful when it's non-noop, the request isn't a
@@ -1064,6 +1360,79 @@ impl LoadBalancer {
         is_preview: bool,
     ) -> bool {
         !config.is_noop() && !is_preview && !path.starts_with(ROUTE_PREFIX_TEMPS)
+    }
+
+    /// Record a request that failed before an upstream response was sent
+    /// (skipping static assets, like successful requests).
+    fn log_failed_request(
+        &self,
+        ctx: &ProxyContext,
+        status_code: u16,
+        response_size_bytes: Option<i64>,
+    ) {
+        if Self::should_log_request(&ctx.path) {
+            // Prefer bytes actually received from the client (see log_request);
+            // fall back to Content-Length if the body never reached the filter.
+            let request_size = if ctx.client_body_bytes_received > 0 {
+                Some(ctx.client_body_bytes_received as i64)
+            } else {
+                ctx.request_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
+
+            let (request_source, is_system_request) =
+                Self::traffic_classification(&ctx.path, &ctx.user_agent);
+            let proxy_log_request = CreateProxyLogRequest {
+                method: ctx.method.clone(),
+                path: ctx.path.clone(),
+                query_string: None,
+                host: ctx.host.clone(),
+                status_code: status_code as i16,
+                response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
+                request_source: request_source.to_string(),
+                is_system_request,
+                routing_status: ctx.routing_status.clone(),
+                project_id: ctx.project.as_ref().map(|p| p.id),
+                environment_id: ctx.environment.as_ref().map(|e| e.id),
+                deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+                session_id: None,
+                visitor_id: None,
+                visitor_uuid: ctx.visitor_id.clone(),
+                session_uuid: ctx.session_id.clone(),
+                container_id: None,
+                upstream_host: None,
+                error_message: ctx.error_message.clone(),
+                client_ip: ctx.ip_address.clone(),
+                user_agent: Some(ctx.user_agent.clone()),
+                referrer: ctx.referrer.clone(),
+                request_id: ctx.request_id.clone(),
+                ip_geolocation_id: None,
+                browser: None,
+                browser_version: None,
+                operating_system: None,
+                device_type: None,
+                is_bot: None,
+                bot_name: None,
+                request_size_bytes: request_size,
+                response_size_bytes,
+                cache_status: None,
+                request_headers: ctx
+                    .request_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
+                response_headers: ctx
+                    .response_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
+                trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
+                error_group_id: None,
+            };
+
+            // Non-blocking enqueue; shed with rate-limited accounting when full.
+            self.proxy_log_handle.send_or_drop(proxy_log_request);
+        }
     }
 
     /// Check if a request should be logged to proxy_logs based on path
@@ -2111,14 +2480,11 @@ impl LoadBalancer {
         if let Some(visitor_id) = &ctx.visitor_id {
             let cookie_name = get_visitor_cookie_name(project_id);
 
-            let has_valid_visitor_cookie = session
-                .req_header()
-                .headers
-                .get_all("Cookie")
-                .iter()
-                .filter_map(|h| h.to_str().ok())
-                .flat_map(|s| Cookie::split_parse(s).filter_map(|c| c.ok()))
-                .any(|c| c.name() == cookie_name && self.crypto.decrypt(c.value()).is_ok());
+            let has_valid_visitor_cookie =
+                find_request_cookie(session.req_header(), &cookie_name, |value| {
+                    self.crypto.decrypt(value).ok().map(|_| ())
+                })
+                .is_some();
 
             if !has_valid_visitor_cookie {
                 let encrypted = match self.crypto.encrypt(visitor_id) {
@@ -2238,19 +2604,27 @@ impl LoadBalancer {
             .to_str()
             .map(Self::infer_content_type)
             .unwrap_or("application/octet-stream");
+        if opened.matched == StaticFileMatch::CanonicalRedirect {
+            return self
+                .write_static_canonical_redirect(session, ctx, content_type)
+                .await;
+        }
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
         // Metadata + immutable deployment identity produce the validator before
         // body IO. Conditional requests therefore never read the file body.
         let etag = metadata_etag(&opened.canonical_path, &opened.metadata);
+        let is_not_found_page = opened.matched == StaticFileMatch::NotFoundPage;
 
-        // Check If-None-Match header for 304 Not Modified response
+        // Check If-None-Match header for 304 Not Modified response. A 404 has
+        // no validator, so the deployment's 404 page is always sent in full.
         if let Some(if_none_match) = session
             .req_header()
             .headers
             .get("if-none-match")
             .and_then(|v| v.to_str().ok())
+            .filter(|_| !is_not_found_page)
         {
             if if_none_match_matches(if_none_match, &etag) {
                 debug!("ETag match - returning 304 Not Modified for: {}", ctx.path);
@@ -2258,18 +2632,10 @@ impl LoadBalancer {
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
-                // Add cache headers
-                if Self::is_cacheable_static_asset(&ctx.path) {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    )?;
-                } else {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=0, must-revalidate",
-                    )?;
-                }
+                resp.insert_header(
+                    header::CACHE_CONTROL,
+                    Self::static_cache_control(&ctx.path, opened.matched),
+                )?;
 
                 // CRITICAL: Set tracking cookies even for 304 responses to keep sessions alive
                 // Without this, visitors won't get cookies on cached root URLs (/) and events will fail
@@ -2282,27 +2648,21 @@ impl LoadBalancer {
         }
 
         // Build response
-        let mut resp = ResponseHeader::build(200, None)?;
+        let mut resp = ResponseHeader::build(opened.matched.status(), None)?;
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.metadata.len().to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        resp.insert_header("ETag", &etag)?;
-
-        // Add cache headers for static assets
-        if Self::is_cacheable_static_asset(&ctx.path) {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
-        } else {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
-        }
+        Self::insert_static_validators(&mut resp, &ctx.path, &etag, opened.matched)?;
 
         // Set visitor and session tracking cookies for static file responses
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
         // HEAD has the same metadata as GET and intentionally never reads a body.
+        let outcome = Self::static_served_outcome(opened.matched);
         session.write_response_header(Box::new(resp), false).await?;
         if ctx.method == "HEAD" {
             session.write_response_body(None, true).await?;
-            return Ok(StaticFileServeOutcome::Served);
+            return Ok(outcome);
         }
 
         let mut remaining = opened.metadata.len();
@@ -2337,7 +2697,93 @@ impl LoadBalancer {
         }
         session.write_response_body(None, true).await?;
 
-        Ok(StaticFileServeOutcome::Served)
+        Ok(outcome)
+    }
+
+    /// `Cache-Control` for a static-site response. The deployment's 404 page
+    /// gets no cache lifetime: it answers a path that may exist in the next
+    /// deployment, and a hashed-asset path (`/assets/app-1a2b.js`) must never
+    /// pin a 404 page as `immutable`.
+    fn static_cache_control(request_path: &str, matched: StaticFileMatch) -> &'static str {
+        match matched {
+            StaticFileMatch::NotFoundPage => "no-store",
+            // The next deployment may add `<path>/index.html`, which must win.
+            StaticFileMatch::CanonicalRedirect => "public, max-age=0, must-revalidate",
+            StaticFileMatch::Requested | StaticFileMatch::SpaShell => {
+                if Self::is_cacheable_static_asset(request_path) {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "public, max-age=0, must-revalidate"
+                }
+            }
+        }
+    }
+
+    /// `ETag` and `Cache-Control` for a full static response. The 404 page has
+    /// no validator, so a conditional request can never turn it into a 304.
+    fn insert_static_validators(
+        resp: &mut ResponseHeader,
+        request_path: &str,
+        etag: &str,
+        matched: StaticFileMatch,
+    ) -> Result<()> {
+        if matched != StaticFileMatch::NotFoundPage {
+            resp.insert_header("ETag", etag)?;
+        }
+        resp.insert_header(
+            header::CACHE_CONTROL,
+            Self::static_cache_control(request_path, matched),
+        )?;
+        Ok(())
+    }
+
+    fn static_served_outcome(matched: StaticFileMatch) -> StaticFileServeOutcome {
+        match matched {
+            StaticFileMatch::Requested | StaticFileMatch::SpaShell => {
+                StaticFileServeOutcome::Served
+            }
+            StaticFileMatch::NotFoundPage => StaticFileServeOutcome::ServedNotFoundPage,
+            StaticFileMatch::CanonicalRedirect => StaticFileServeOutcome::Redirected,
+        }
+    }
+
+    /// Answer a trailing-slash request whose page is `<path>.html` with a 308
+    /// to the slashless URL, keeping the query string.
+    ///
+    /// `page_content_type` is the MIME of the page being redirected to. The
+    /// redirect is attributed like that page: it is often a visitor's first
+    /// request, and the one that still carries the original `Referer` and UTM
+    /// query, so the visitor and session are created here and their cookies
+    /// set on the 308. The followed request then reuses them instead of
+    /// starting a second, referrer-less visit.
+    async fn write_static_canonical_redirect(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        page_content_type: &str,
+    ) -> Result<StaticFileServeOutcome> {
+        let Some(location) = canonical_redirect_location(&ctx.path, ctx.query_string.as_deref())
+        else {
+            warn!(
+                request_path = %bounded_log_value(&ctx.path),
+                "Static canonical redirect rejected an unsafe location"
+            );
+            return Ok(StaticFileServeOutcome::NotFound);
+        };
+        let matched = StaticFileMatch::CanonicalRedirect;
+        let mut resp = ResponseHeader::build(matched.status(), None)?;
+        resp.insert_header(header::LOCATION, &location)?;
+        resp.insert_header(header::CONTENT_LENGTH, "0")?;
+        resp.insert_header(
+            header::CACHE_CONTROL,
+            Self::static_cache_control(&ctx.path, matched),
+        )?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        self.ensure_static_visitor_session(session, ctx, page_content_type)
+            .await;
+        self.set_tracking_cookies(session, &mut resp, ctx).await?;
+        session.write_response_header(Box::new(resp), true).await?;
+        Ok(Self::static_served_outcome(matched))
     }
 
     /// Serve a static file from an object-store-backed deployment
@@ -2383,10 +2829,12 @@ impl LoadBalancer {
         // for an already-cached key and a metadata-only backend call
         // (e.g. S3 `HeadObject`) otherwise.
         let is_head = ctx.method == "HEAD";
-        let mut resolved: Option<(String, temps_file_store::OpenedBlob)> = None;
+        let mut resolved: Option<(String, StaticFileMatch, temps_file_store::OpenedBlob)> = None;
         for candidate in &request.candidates {
-            let key = static_object_key(&request.relative_static_dir, candidate);
-            let lookup = if is_head {
+            let key = static_object_key(&request.relative_static_dir, &candidate.path);
+            // A redirect never sends the page body, so it only needs to know
+            // the key exists.
+            let lookup = if is_head || candidate.matched == StaticFileMatch::CanonicalRedirect {
                 store
                     .stat_raw(&key)
                     .await
@@ -2399,7 +2847,7 @@ impl LoadBalancer {
             };
             match lookup {
                 Ok(opened) => {
-                    resolved = Some((key, opened));
+                    resolved = Some((key, candidate.matched, opened));
                     break;
                 }
                 Err(temps_file_store::FileStoreError::NotFound { .. }) => continue,
@@ -2419,7 +2867,7 @@ impl LoadBalancer {
                 }
             }
         }
-        let Some((resolved_key, mut opened)) = resolved else {
+        let Some((resolved_key, matched, mut opened)) = resolved else {
             debug!(
                 request_path = %bounded_log_value(&ctx.path),
                 stored_static_dir = %bounded_log_value(static_dir),
@@ -2432,6 +2880,11 @@ impl LoadBalancer {
         // from the resolved key (e.g. an SPA fallback's `index.html`) rather
         // than the original request path — identical to the disk-backed path.
         let content_type = Self::infer_content_type(&resolved_key);
+        if matched == StaticFileMatch::CanonicalRedirect {
+            return self
+                .write_static_canonical_redirect(session, ctx, content_type)
+                .await;
+        }
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
@@ -2442,22 +2895,16 @@ impl LoadBalancer {
             .headers
             .get("if-none-match")
             .and_then(|v| v.to_str().ok())
+            .filter(|_| matched != StaticFileMatch::NotFoundPage)
         {
             if if_none_match_matches(if_none_match, &etag) {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                if Self::is_cacheable_static_asset(&ctx.path) {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    )?;
-                } else {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=0, must-revalidate",
-                    )?;
-                }
+                resp.insert_header(
+                    header::CACHE_CONTROL,
+                    Self::static_cache_control(&ctx.path, matched),
+                )?;
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
@@ -2465,22 +2912,18 @@ impl LoadBalancer {
             }
         }
 
-        let mut resp = ResponseHeader::build(200, None)?;
+        let mut resp = ResponseHeader::build(matched.status(), None)?;
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.size_bytes.to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        resp.insert_header("ETag", &etag)?;
-        if Self::is_cacheable_static_asset(&ctx.path) {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
-        } else {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
-        }
+        Self::insert_static_validators(&mut resp, &ctx.path, &etag, matched)?;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
+        let outcome = Self::static_served_outcome(matched);
         session.write_response_header(Box::new(resp), false).await?;
         if ctx.method == "HEAD" {
             session.write_response_body(None, true).await?;
-            return Ok(StaticFileServeOutcome::Served);
+            return Ok(outcome);
         }
 
         let mut remaining = opened.size_bytes;
@@ -2517,7 +2960,7 @@ impl LoadBalancer {
         }
         session.write_response_body(None, true).await?;
 
-        Ok(StaticFileServeOutcome::Served)
+        Ok(outcome)
     }
 
     /// Serve embedded WASM files for CAPTCHA solver
@@ -3185,6 +3628,97 @@ fn strip_untrusted_client_ip_headers(request: &mut RequestHeader) {
     request.remove_header("cf-connecting-ip");
 }
 
+/// Collapse every `Cookie` field on the request into a single field before it
+/// is forwarded upstream.
+///
+/// HTTP/2 clients may split cookies into separate `cookie` fields for better
+/// header compression ("cookie crumbs", RFC 9113 §8.2.3), and browsers do so
+/// in practice. Pingora forwards the header map as-is, so an HTTP/1.1
+/// upstream would receive several `Cookie:` lines, which RFC 6265 §5.4
+/// forbids. Common app servers (PHP, and so WordPress/WooCommerce) then read
+/// only the first line and silently lose every other cookie. RFC 9113
+/// requires an intermediary to join the crumbs with `"; "` before forwarding
+/// to a non-HTTP/2 context; the joined form is equally valid over HTTP/2.
+///
+/// Values are joined as raw bytes so a crumb that is not valid UTF-8 is kept
+/// rather than dropped, and empty crumbs are skipped so the result never
+/// contains an empty `; ;` segment.
+///
+/// Never fails the request: every crumb is already a valid header value and
+/// `"; "` is too, so rebuilding the joined value cannot fail in practice. If it
+/// ever did, the crumbs are forwarded unchanged (the previous behaviour) and
+/// the failure is logged, rather than turning a cookie quirk into a 502.
+fn coalesce_cookie_headers(request: &mut RequestHeader) {
+    if request
+        .headers
+        .get_all(header::COOKIE)
+        .iter()
+        .nth(1)
+        .is_none()
+    {
+        return;
+    }
+
+    let crumbs = || {
+        request
+            .headers
+            .get_all(header::COOKIE)
+            .iter()
+            .map(|value| value.as_bytes().trim_ascii())
+            .filter(|crumb| !crumb.is_empty())
+    };
+    // One exactly-sized buffer that becomes the header value without a copy.
+    let mut joined = Vec::with_capacity(crumbs().map(|crumb| crumb.len() + 2).sum());
+    for crumb in crumbs() {
+        if !joined.is_empty() {
+            joined.extend_from_slice(b"; ");
+        }
+        joined.extend_from_slice(crumb);
+    }
+
+    if joined.is_empty() {
+        request.remove_header(&header::COOKIE);
+        return;
+    }
+    let result = header::HeaderValue::from_maybe_shared(Bytes::from(joined))
+        .map_err(|e| e.to_string())
+        .and_then(|value| {
+            request
+                .insert_header(header::COOKIE, value)
+                .map_err(|e| e.to_string())
+        });
+    if let Err(error) = result {
+        warn!(%error, "Could not combine Cookie header fields; forwarding them unchanged");
+    }
+}
+
+/// Look up a request cookie by name across every `Cookie` field, returning
+/// the first value for which `accept` yields `Some`.
+///
+/// Fields are decoded with `String::from_utf8_lossy`, not `to_str()`: one
+/// cookie carrying non-UTF-8 (obs-text) bytes must only garble itself, not
+/// hide every other cookie in the same field. That matters because
+/// `coalesce_cookie_headers` joins all HTTP/2 crumbs into a single field, and
+/// a single-field HTTP/1.1 request can carry such a cookie too. Valid UTF-8
+/// (the normal case) is borrowed without allocating.
+fn find_request_cookie<T>(
+    request: &RequestHeader,
+    name: &str,
+    mut accept: impl FnMut(&str) -> Option<T>,
+) -> Option<T> {
+    request
+        .headers
+        .get_all(header::COOKIE)
+        .iter()
+        .find_map(|field| {
+            let field = String::from_utf8_lossy(field.as_bytes());
+            Cookie::split_parse(field.as_ref())
+                .filter_map(Result::ok)
+                .filter(|cookie| cookie.name() == name)
+                .find_map(|cookie| accept(cookie.value()))
+        })
+}
+
 /// Whether a `Content-Type` value's media type — its "essence", the part
 /// before any `;` parameters — is exactly `text/event-stream`.
 ///
@@ -3271,6 +3805,20 @@ fn is_browser_document_request(
         // which Fetch Metadata alone can't fix either.
         None => upgrade_insecure_requests.is_some_and(|value| value.trim() == "1"),
     }
+}
+
+/// Whether `error` means the upstream could not be connected to at all
+/// (nothing listening yet), as opposed to failing mid-request.
+fn is_connect_failure(error: &Error) -> bool {
+    use pingora::ErrorType;
+    matches!(
+        error.etype(),
+        ErrorType::ConnectRefused
+            | ErrorType::ConnectTimedout
+            | ErrorType::ConnectError
+            | ErrorType::ConnectNoRoute
+            | ErrorType::SocketError
+    )
 }
 
 /// Console/control-plane traffic always gets a fixed timeout, regardless of
@@ -3638,6 +4186,56 @@ mod https_redirect_tests {
     }
 
     #[test]
+    fn proxy_https_redirect_response_has_monitor_marker() {
+        let response = https_redirect_response("https://app.example.test/health", "request-1")
+            .expect("build HTTPS redirect response");
+        assert_eq!(response.status.as_u16(), 301);
+        assert_eq!(
+            response
+                .headers
+                .get("x-temps-proxy-https-redirect")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("x-temps-proxy-probe-capable")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://app.example.test/health")
+        );
+    }
+
+    #[test]
+    fn application_cannot_spoof_proxy_https_redirect_marker() {
+        let mut response = ResponseHeader::build(302, None).expect("build application response");
+        response
+            .insert_header("X-Temps-Proxy-Https-Redirect", "1")
+            .expect("insert spoofed marker");
+        response
+            .insert_header("X-Temps-Proxy-Probe-Capable", "1")
+            .expect("insert spoofed capability");
+
+        strip_proxy_owned_response_headers(&mut response);
+
+        assert!(response
+            .headers
+            .get("x-temps-proxy-https-redirect")
+            .is_none());
+        assert!(response
+            .headers
+            .get("x-temps-proxy-probe-capable")
+            .is_none());
+    }
+
+    #[test]
     fn default_behaviour_follows_certificate_presence() {
         // No per-environment override → the pre-existing heuristic is unchanged:
         // hosts with a provisioned certificate are redirected, HTTP-only installs
@@ -3837,6 +4435,7 @@ impl ProxyHttp for LoadBalancer {
             pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
+            markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
@@ -3947,7 +4546,18 @@ impl ProxyHttp for LoadBalancer {
             || req_path.contains("/logs")
             || req_path.contains("/webhook");
 
-        if accepts_sse || is_websocket_upgrade || is_chunked || is_streaming_path {
+        // Compressed bodies are streamed with chunked transfer encoding, which
+        // an HTTP/1.0 client cannot parse.
+        let is_http10_client = matches!(
+            session.req_header().version,
+            pingora_http::Version::HTTP_09 | pingora_http::Version::HTTP_10
+        );
+        let compression_disabled = accepts_sse
+            || is_websocket_upgrade
+            || is_chunked
+            || is_streaming_path
+            || is_http10_client;
+        if compression_disabled {
             // Disable compression for SSE/WebSocket/streaming paths
             // compression requires buffering which breaks streaming responses
             session.upstream_compression.adjust_level(0);
@@ -3974,7 +4584,9 @@ impl ProxyHttp for LoadBalancer {
             }
         } else {
             // Enable compression for normal requests
-            session.upstream_compression.adjust_level(6);
+            session
+                .upstream_compression
+                .adjust_level(RESPONSE_COMPRESSION_LEVEL);
         }
 
         // Detect whether the client prefers a Markdown response.
@@ -3999,8 +4611,18 @@ impl ProxyHttp for LoadBalancer {
             // SSE or WebSocket we must not buffer.
             if !ctx.is_sse && !ctx.is_websocket {
                 ctx.wants_markdown = true;
-                // Disable upstream compression so we receive raw HTML bytes to convert.
+                if !compression_disabled {
+                    ctx.markdown_fallback_accept_encoding = session
+                        .req_header()
+                        .headers
+                        .get("accept-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                }
+                // Don't compress the response ourselves, and ask the upstream
+                // not to either, so the body filter receives raw HTML.
                 session.upstream_compression.adjust_level(0);
+                request_identity_encoding_for_markdown(session.req_header_mut());
                 debug!("Client requested text/markdown — enabling HTML-to-Markdown conversion");
             } else {
                 debug!(
@@ -4562,7 +5184,15 @@ impl ProxyHttp for LoadBalancer {
         // and hold the request until the container is ready and routes are reloaded.
         if let Some(ref on_demand) = self.on_demand_manager {
             let host_without_port = ctx.host.split(':').next().unwrap_or(&ctx.host);
-            if let Some(sleeping_info) = on_demand.get_sleeping_environment(host_without_port) {
+            // An awake route always wins over a sleeping wildcard. Without
+            // this check, `api.example.com` could wake an environment behind
+            // `*.example.com` even when the exact host belongs to another
+            // active project. Both lookups are in-memory.
+            if let Some(sleeping_info) =
+                should_lookup_sleeping_environment(self.route_table.as_deref(), host_without_port)
+                    .then(|| on_demand.get_sleeping_environment(host_without_port))
+                    .flatten()
+            {
                 info!(
                     environment_id = sleeping_info.environment_id,
                     host = %ctx.host,
@@ -5168,22 +5798,19 @@ impl ProxyHttp for LoadBalancer {
                 }
 
                 // Check for valid password cookie
-                let has_valid_cookie = session
-                    .req_header()
-                    .headers
-                    .get_all("Cookie")
-                    .iter()
-                    .filter_map(|h| h.to_str().ok())
-                    .flat_map(|s| Cookie::split_parse(s).filter_map(Result::ok))
-                    .find(|c| c.name() == crate::handler::password_wall::PASSWORD_COOKIE_NAME)
-                    .map(|c| {
-                        crate::handler::password_wall::validate_cookie(
-                            c.value(),
+                // The first cookie with this name decides, as before.
+                let has_valid_cookie = find_request_cookie(
+                    session.req_header(),
+                    crate::handler::password_wall::PASSWORD_COOKIE_NAME,
+                    |value| {
+                        Some(crate::handler::password_wall::validate_cookie(
+                            value,
                             env_id,
                             &password_hash,
-                        )
-                    })
-                    .unwrap_or(false);
+                        ))
+                    },
+                )
+                .unwrap_or(false);
 
                 if !has_valid_cookie {
                     // No valid cookie — show password form
@@ -5415,11 +6042,12 @@ impl ProxyHttp for LoadBalancer {
             );
 
             // Use 301 Permanent Redirect for HTTP→HTTPS
-            let mut resp = ResponseHeader::build(301, None)?;
-            resp.insert_header("Location", &redirect_url)?;
-            resp.insert_header("Content-Length", "0")?;
-            resp.insert_header("X-Request-ID", &ctx.request_id)?;
-
+            let resp = https_redirect_response(&redirect_url, &ctx.request_id)?;
+            // Managed monitors use this marker to distinguish the proxy's
+            // pre-upstream protocol upgrade from an application's own 3xx.
+            // It carries no trust decision by itself: monitors still require
+            // a same-host HTTPS target and pin the follow-up to the configured
+            // local TLS listener.
             ctx.routing_status = "http_to_https_redirect".to_string();
 
             session.write_response_header(Box::new(resp), true).await?;
@@ -5444,6 +6072,7 @@ impl ProxyHttp for LoadBalancer {
             let mut resp = ResponseHeader::build(status_code, None)?;
             resp.insert_header("Location", &redirect_url)?;
             resp.insert_header("Content-Length", "0")?;
+            resp.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
 
             // Add CORS headers for redirect responses
             resp.insert_header("Access-Control-Allow-Origin", "*")?;
@@ -5462,6 +6091,11 @@ impl ProxyHttp for LoadBalancer {
         // resolved `ctx.ip_address`, so do not let a tenant app read a raw,
         // possibly-spoofed client-supplied header instead.
         strip_untrusted_client_ip_headers(session.req_header_mut());
+
+        // Browsers split cookies across several fields over HTTP/2; the
+        // upstream must receive them as one `Cookie` header or it keeps only
+        // the first (see `coalesce_cookie_headers`).
+        coalesce_cookie_headers(session.req_header_mut());
 
         // Capture request headers
         let request_headers: HashMap<String, String> = session
@@ -5487,25 +6121,15 @@ impl ProxyHttp for LoadBalancer {
         let visitor_cookie_name = get_visitor_cookie_name(project_id);
         let session_cookie_name = get_session_cookie_name(project_id);
 
-        ctx.request_visitor_cookie = session
-            .req_header()
-            .headers
-            .get_all("Cookie")
-            .iter()
-            .filter_map(|cookie_header| cookie_header.to_str().ok())
-            .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-            .find(|cookie| cookie.name() == visitor_cookie_name)
-            .map(|cookie| cookie.value().to_string());
+        ctx.request_visitor_cookie =
+            find_request_cookie(session.req_header(), &visitor_cookie_name, |value| {
+                Some(value.to_string())
+            });
 
-        ctx.request_session_cookie = session
-            .req_header()
-            .headers
-            .get_all("Cookie")
-            .iter()
-            .filter_map(|cookie_header| cookie_header.to_str().ok())
-            .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-            .find(|cookie| cookie.name() == session_cookie_name)
-            .map(|cookie| cookie.value().to_string());
+        ctx.request_session_cookie =
+            find_request_cookie(session.req_header(), &session_cookie_name, |value| {
+                Some(value.to_string())
+            });
 
         // Get IP from the connection
         // Add X-Forwarded-For header with client IP (already extracted in request_filter)
@@ -5617,6 +6241,39 @@ impl ProxyHttp for LoadBalancer {
                         debug!("Served static file: {}", ctx.path);
                         ctx.routing_status = "static_file".to_string();
                         self.log_static_request(ctx, 200, "static_file", &static_dir, None, None);
+                        return Ok(true);
+                    }
+                    Ok(StaticFileServeOutcome::ServedNotFoundPage) => {
+                        debug!(
+                            request_path = %bounded_log_value(&ctx.path),
+                            stored_static_dir = %bounded_log_value(&static_dir),
+                            "Static file request answered with the deployment's 404 page"
+                        );
+                        ctx.routing_status = "static_file_not_found_page".to_string();
+                        self.log_static_request(
+                            ctx,
+                            404,
+                            "static_file_not_found_page",
+                            &static_dir,
+                            Some("Static file not found".to_string()),
+                            None,
+                        );
+                        return Ok(true);
+                    }
+                    Ok(StaticFileServeOutcome::Redirected) => {
+                        debug!(
+                            request_path = %bounded_log_value(&ctx.path),
+                            "Static file request redirected to its slashless page"
+                        );
+                        ctx.routing_status = "static_file_redirect".to_string();
+                        self.log_static_request(
+                            ctx,
+                            308,
+                            "static_file_redirect",
+                            &static_dir,
+                            None,
+                            None,
+                        );
                         return Ok(true);
                     }
                     Ok(StaticFileServeOutcome::NotFound) => {
@@ -5806,6 +6463,9 @@ impl ProxyHttp for LoadBalancer {
     {
         debug!("Upstream response filter headers: {:?}", upstream_response);
 
+        strip_proxy_owned_response_headers(upstream_response);
+        upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+
         // First upstream header = backend latency (connect + upstream time).
         if ctx.upstream_response_time_ms.is_none() {
             if let Some(start) = ctx.upstream_start_time {
@@ -5864,6 +6524,11 @@ impl ProxyHttp for LoadBalancer {
         // content type.  We only convert successful (2xx) text/html responses; everything
         // else passes through unchanged so the client receives the original response as-is.
         apply_markdown_upstream_gate(upstream_response, ctx);
+        if !ctx.wants_markdown {
+            if let Some(accept_encoding) = ctx.markdown_fallback_accept_encoding.take() {
+                restore_client_compression(&mut session.upstream_compression, &accept_encoding);
+            }
+        }
 
         Ok(())
     }
@@ -5918,6 +6583,12 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        if let Some(version) =
+            downstream_response_version(session.req_header().version, upstream_response.version)
+        {
+            upstream_response.set_version(version);
+        }
+
         // Capture upstream write pending time for upload diagnostics (Pingora 0.8.0)
         let pending_time = session.upstream_write_pending_time();
         if !pending_time.is_zero() {
@@ -6119,10 +6790,30 @@ impl ProxyHttp for LoadBalancer {
         // Pass SNI hostname for TLS-based routing
         let selection = self
             .upstream_resolver
-            .resolve_peer(&domain, &path, ctx.sni_hostname.as_deref())
+            .resolve_peer_for_request(
+                &domain,
+                &path,
+                session.req_header().method.as_str(),
+                ctx.sni_hostname.as_deref(),
+            )
             .await?;
 
         let mut peer = selection.peer;
+
+        // The console failed to start: nothing is listening on its address
+        // (or something unrelated is). Don't connect; `fail_to_proxy` serves
+        // the startup-failure page. One atomic load on the healthy path.
+        if let Some(responder) = self.console_unavailable.as_ref() {
+            if responder.phase() == temps_core::console_startup::ConsolePhase::Failed
+                && responder.is_console_peer(&peer)
+            {
+                ctx.upstream_host = Some(peer.address().to_string());
+                return Err(Error::explain(
+                    pingora::ErrorType::ConnectRefused,
+                    "console failed to start; serving its startup status page",
+                ));
+            }
+        }
 
         // Resolve the effective per-request/idle timeout for customer app
         // traffic: project config as the base layer, environment config
@@ -6215,14 +6906,29 @@ impl ProxyHttp for LoadBalancer {
         // Retry once on connection failure — handles stale pooled connections
         // where the upstream closed the keep-alive connection before we sent
         // the request (TCP RST / "Connection reset by peer").
+        //
+        // Neither branch logs above debug: a final failure reaches
+        // `fail_to_proxy`, which logs it once with the request context.
         if ctx.upstream_connect_tries == 0 {
             ctx.upstream_connect_tries += 1;
-            warn!("Upstream connection failed (try 1), retrying: {:?}", e);
+            debug!("Upstream connection failed (try 1), retrying: {:?}", e);
             e.set_retry(true);
         } else {
-            error!("Upstream connection failed after retry: {:?}", e);
+            debug!("Upstream connection failed after retry: {:?}", e);
         }
         e
+    }
+
+    /// `fail_to_proxy` already logs every failure once, with the request
+    /// context and a level that matches the cause. Pingora's own
+    /// "Fail to proxy" ERROR line would log each of them a second time.
+    fn suppress_error_log(
+        &self,
+        _session: &PingoraSession,
+        _ctx: &Self::CTX,
+        _error: &Error,
+    ) -> bool {
+        true
     }
 
     async fn fail_to_proxy(
@@ -6234,15 +6940,30 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
-        error!(
-            "Failed to proxy: {:?} | request_id={} client_ip={} host={} method={} path={}",
-            e,
-            ctx.request_id,
-            ctx.ip_address.as_deref().unwrap_or("unknown"),
-            ctx.host,
-            ctx.method,
-            ctx.path
-        );
+        if let Some(result) = self.serve_console_status_page(session, e, ctx).await {
+            return result;
+        }
+
+        let failure = ProxyFailureKind::of(e);
+        macro_rules! log_failure {
+            ($level:ident) => {
+                $level!(
+                    "Failed to proxy ({}): {:?} | request_id={} client_ip={} host={} method={} path={}",
+                    failure.as_str(),
+                    e,
+                    ctx.request_id,
+                    ctx.ip_address.as_deref().unwrap_or("unknown"),
+                    ctx.host,
+                    ctx.method,
+                    ctx.path
+                )
+            };
+        }
+        match failure {
+            ProxyFailureKind::ClientGone => log_failure!(debug),
+            ProxyFailureKind::Upstream => log_failure!(warn),
+            ProxyFailureKind::Internal => log_failure!(error),
+        }
 
         let mut error_code = 500;
         let can_reuse_downstream = false;
@@ -6250,6 +6971,17 @@ impl ProxyHttp for LoadBalancer {
         // Update context with error
         ctx.error_message = Some(e.to_string());
         ctx.routing_status = "error".to_string();
+
+        // The client already went away: there is nobody to send a 503 page
+        // to, and trying only produces a second write error. Record it as
+        // 499 (client closed request) and report that no response was sent.
+        if failure == ProxyFailureKind::ClientGone {
+            self.log_failed_request(ctx, CLIENT_CLOSED_REQUEST, None);
+            return FailToProxy {
+                error_code: 0,
+                can_reuse_downstream,
+            };
+        }
 
         let mut header = match ResponseHeader::build(503, None) {
             Ok(header) => header,
@@ -6303,74 +7035,7 @@ impl ProxyHttp for LoadBalancer {
         }
 
         error_code = 503;
-
-        // Asynchronously log failed proxy request (skip static assets)
-        if Self::should_log_request(&ctx.path) {
-            // Prefer bytes actually received from the client (see log_request);
-            // fall back to Content-Length if the body never reached the filter.
-            let request_size = if ctx.client_body_bytes_received > 0 {
-                Some(ctx.client_body_bytes_received as i64)
-            } else {
-                ctx.request_headers
-                    .as_ref()
-                    .and_then(|h| h.get("content-length"))
-                    .and_then(|v| v.parse::<i64>().ok())
-            };
-
-            // For failed requests, response size is the error message size
-            let response_size = Some(SERVICE_UNAVAILABLE_BODY.len() as i64);
-
-            let (request_source, is_system_request) =
-                Self::traffic_classification(&ctx.path, &ctx.user_agent);
-            let proxy_log_request = CreateProxyLogRequest {
-                method: ctx.method.clone(),
-                path: ctx.path.clone(),
-                query_string: None,
-                host: ctx.host.clone(),
-                status_code: error_code as i16,
-                response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                request_source: request_source.to_string(),
-                is_system_request,
-                routing_status: ctx.routing_status.clone(),
-                project_id: ctx.project.as_ref().map(|p| p.id),
-                environment_id: ctx.environment.as_ref().map(|e| e.id),
-                deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                session_id: None,
-                visitor_id: None,
-                visitor_uuid: ctx.visitor_id.clone(),
-                session_uuid: ctx.session_id.clone(),
-                container_id: None,
-                upstream_host: None,
-                error_message: ctx.error_message.clone(),
-                client_ip: ctx.ip_address.clone(),
-                user_agent: Some(ctx.user_agent.clone()),
-                referrer: ctx.referrer.clone(),
-                request_id: ctx.request_id.clone(),
-                ip_geolocation_id: None,
-                browser: None,
-                browser_version: None,
-                operating_system: None,
-                device_type: None,
-                is_bot: None,
-                bot_name: None,
-                request_size_bytes: request_size,
-                response_size_bytes: response_size,
-                cache_status: None,
-                request_headers: ctx
-                    .request_headers
-                    .as_ref()
-                    .and_then(|h| serde_json::to_value(h).ok()),
-                response_headers: ctx
-                    .response_headers
-                    .as_ref()
-                    .and_then(|h| serde_json::to_value(h).ok()),
-                trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
-                error_group_id: None,
-            };
-
-            // Non-blocking enqueue; shed with rate-limited accounting when full.
-            self.proxy_log_handle.send_or_drop(proxy_log_request);
-        }
+        self.log_failed_request(ctx, error_code, Some(SERVICE_UNAVAILABLE_BODY.len() as i64));
 
         FailToProxy {
             error_code,
@@ -6547,8 +7212,58 @@ mod on_demand_http_tests {
     //! The session-writing wrapper (`handle_on_demand_http`) is exercised in
     //! integration; here we pin the two pure helpers it delegates to so the
     //! 503 contract and the `redirect_to_env` target derivation are locked.
-    use super::{ephemeral_redirect_location, on_demand_cert_state_response};
+    use super::{
+        ephemeral_redirect_location, on_demand_cert_state_response,
+        should_lookup_sleeping_environment,
+    };
     use crate::on_demand_cert::OnDemandCertState;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use temps_routes::{BackendEntry, BackendType, CachedPeerTable, RouteInfo};
+
+    fn test_route() -> RouteInfo {
+        RouteInfo {
+            backend: BackendType::Upstream {
+                backends: vec![BackendEntry {
+                    address: "127.0.0.1:8080".to_string(),
+                    container_id: None,
+                    container_name: None,
+                }],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+            cert_eligible: false,
+        }
+    }
+
+    #[test]
+    fn active_or_reserved_host_suppresses_sleeping_wildcard_lookup() {
+        let table = CachedPeerTable::new(Arc::new(sea_orm::DatabaseConnection::Disconnected));
+        table.insert_route_for_test("api.apps.example.com", test_route());
+        table.insert_tls_route_for_test("tcp.apps.example.com", test_route());
+        table.reserve_hostname_for_test("console.apps.example.com");
+
+        assert!(!should_lookup_sleeping_environment(
+            Some(&table),
+            "api.apps.example.com"
+        ));
+        assert!(!should_lookup_sleeping_environment(
+            Some(&table),
+            "tcp.apps.example.com"
+        ));
+        assert!(!should_lookup_sleeping_environment(
+            Some(&table),
+            "console.apps.example.com"
+        ));
+        assert!(should_lookup_sleeping_environment(
+            Some(&table),
+            "preview.apps.example.com"
+        ));
+    }
 
     #[test]
     fn pending_and_issuing_map_to_provisioning_503() {
@@ -6719,6 +7434,7 @@ mod markdown_tests {
             pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
+            markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
@@ -7252,6 +7968,7 @@ mod markdown_pipeline_tests {
             pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
+            markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
@@ -7360,6 +8077,174 @@ mod markdown_pipeline_tests {
         assert!(
             !ctx.wants_markdown,
             "missing Content-Type must cancel conversion"
+        );
+    }
+
+    #[test]
+    fn gate_cancels_compressed_upstream_body() {
+        for encoding in &["gzip", "br", "deflate", "zstd", "GZIP"] {
+            let mut ctx = make_ctx();
+            ctx.wants_markdown = true;
+            let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+            resp.insert_header("Content-Encoding", *encoding).unwrap();
+            apply_markdown_upstream_gate(&mut resp, &mut ctx);
+            assert!(
+                !ctx.wants_markdown,
+                "Content-Encoding {} must cancel conversion",
+                encoding
+            );
+            apply_markdown_response_headers(&mut resp, &ctx);
+            assert_eq!(
+                resp.headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok()),
+                Some(*encoding),
+                "a passed-through compressed body keeps its Content-Encoding"
+            );
+            assert!(
+                resp.headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|ct| ct.starts_with("text/html")),
+                "a passed-through body keeps its text/html Content-Type"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_allows_identity_content_encoding() {
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html"));
+        resp.insert_header("Content-Encoding", "identity").unwrap();
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        assert!(ctx.wants_markdown);
+    }
+
+    #[test]
+    fn http10_upstream_response_is_answered_as_http11_when_compressed() {
+        // Regression: a Compose service built on Python's http.server answers
+        // HTTP/1.0. Pingora gzips any compressible body of 20+ bytes and
+        // switches it to chunked, but left the upstream's HTTP/1.0 status line,
+        // so browsers failed with ERR_CONTENT_DECODING_FAILED.
+        let mut compression = ResponseCompressionCtx::new(RESPONSE_COMPRESSION_LEVEL, false, false);
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Accept-Encoding", "gzip").unwrap();
+        compression.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.set_version(pingora_http::Version::HTTP_10);
+        resp.insert_header("Content-Type", "text/html").unwrap();
+        resp.insert_header("Content-Length", "23").unwrap();
+        compression.response_header_filter(&mut resp, false);
+        assert_eq!(
+            resp.headers
+                .get("transfer-encoding")
+                .map(|value| value.as_bytes()),
+            Some(&b"chunked"[..]),
+            "Pingora streams the compressed body as chunked"
+        );
+        assert_eq!(resp.version, pingora_http::Version::HTTP_10);
+
+        let version = downstream_response_version(pingora_http::Version::HTTP_11, resp.version);
+        assert_eq!(version, Some(pingora_http::Version::HTTP_11));
+    }
+
+    #[test]
+    fn downstream_response_version_leaves_http11_http2_and_http10_clients_alone() {
+        use pingora_http::Version;
+        assert_eq!(
+            downstream_response_version(Version::HTTP_11, Version::HTTP_11),
+            None
+        );
+        assert_eq!(
+            downstream_response_version(Version::HTTP_2, Version::HTTP_10),
+            None
+        );
+        assert_eq!(
+            downstream_response_version(Version::HTTP_10, Version::HTTP_10),
+            None
+        );
+        assert_eq!(
+            downstream_response_version(Version::HTTP_11, Version::HTTP_09),
+            Some(Version::HTTP_11)
+        );
+    }
+
+    #[test]
+    fn gzip_html_is_passed_through_byte_for_byte() {
+        // Regression: temps.sh served gzip bytes decoded as UTF-8 (every 0x8b
+        // became U+FFFD) under Content-Type: text/markdown.
+        let gzip_magic_and_payload: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef];
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+        resp.insert_header("Content-Encoding", "gzip").unwrap();
+        let (ctx, _resp, body) = run_pipeline(ctx, resp, gzip_magic_and_payload);
+        assert!(!ctx.wants_markdown);
+        assert_eq!(body.as_deref(), Some(gzip_magic_and_payload));
+    }
+
+    #[test]
+    fn gate_cancels_when_any_encoding_field_is_not_identity() {
+        // `identity` first and `gzip` in a second field, and a combined list.
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html"));
+        resp.append_header("Content-Encoding", "identity").unwrap();
+        resp.append_header("Content-Encoding", "gzip").unwrap();
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        assert!(
+            !ctx.wants_markdown,
+            "a second gzip field must cancel conversion"
+        );
+
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html"));
+        resp.insert_header("Content-Encoding", "identity, br")
+            .unwrap();
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        assert!(!ctx.wants_markdown, "`identity, br` must cancel conversion");
+    }
+
+    #[test]
+    fn pass_through_response_is_compressed_for_the_client_again() {
+        // What Pingora does for a Markdown request: compression off, and the
+        // upstream request (already rewritten) says identity.
+        let mut compression = ResponseCompressionCtx::new(0, false, false);
+        let mut upstream_req = RequestHeader::build("GET", b"/api/data", None).unwrap();
+        request_identity_encoding_for_markdown(&mut upstream_req);
+        compression.request_filter(&upstream_req);
+
+        // The gate passed a JSON response through; restore the client's gzip.
+        restore_client_compression(&mut compression, "gzip, br");
+
+        let mut resp = make_response(200, Some("application/json"));
+        compression.response_header_filter(&mut resp, false);
+        let encoding = resp
+            .headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        assert!(
+            matches!(encoding.as_deref(), Some("gzip") | Some("br")),
+            "pass-through response must be compressed for a client that accepts it, got {:?}",
+            encoding
+        );
+    }
+
+    #[test]
+    fn markdown_request_asks_upstream_for_identity_encoding() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Accept-Encoding", "gzip, deflate, br")
+            .unwrap();
+        request_identity_encoding_for_markdown(&mut req);
+        assert_eq!(
+            req.headers
+                .get("accept-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("identity")
         );
     }
 
@@ -8251,7 +9136,10 @@ mod traffic_classification_tests {
 
 #[cfg(test)]
 mod forwarded_authority_tests {
-    use super::{parse_public_authority, strip_untrusted_client_ip_headers, PublicAuthority};
+    use super::{
+        coalesce_cookie_headers, find_request_cookie, parse_public_authority,
+        strip_untrusted_client_ip_headers, PublicAuthority,
+    };
     use axum::http::HeaderValue;
     use pingora_http::RequestHeader;
 
@@ -8359,6 +9247,144 @@ mod forwarded_authority_tests {
             Some(&HeaderValue::from_static("preserved"))
         );
     }
+
+    fn request_with_cookies(crumbs: &[&'static [u8]]) -> RequestHeader {
+        let mut request =
+            RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
+        for crumb in crumbs {
+            request
+                .append_header(
+                    "cookie",
+                    HeaderValue::from_bytes(crumb).expect("cookie crumb must be a valid value"),
+                )
+                .expect("Cookie test header must be valid");
+        }
+        request
+    }
+
+    fn cookie_values(request: &RequestHeader) -> Vec<&[u8]> {
+        request
+            .headers
+            .get_all("cookie")
+            .iter()
+            .map(|value| value.as_bytes())
+            .collect()
+    }
+
+    /// Regression: an HTTP/2 browser sends each cookie as its own `cookie`
+    /// field (RFC 9113 §8.2.3). The upstream must get one joined header,
+    /// otherwise PHP-style servers keep only the first cookie
+    /// (`_temps_visitor_id`) and drop the app's session cookie.
+    #[test]
+    fn joins_http2_cookie_crumbs_into_one_header() {
+        let mut request = request_with_cookies(&[
+            b"_temps_visitor_id=abc",
+            b"woocommerce_items_in_cart=1",
+            b"zzz=3",
+        ]);
+
+        coalesce_cookie_headers(&mut request);
+
+        assert_eq!(
+            cookie_values(&request),
+            vec![&b"_temps_visitor_id=abc; woocommerce_items_in_cart=1; zzz=3"[..]]
+        );
+    }
+
+    #[test]
+    fn leaves_single_cookie_header_untouched() {
+        let mut request = request_with_cookies(&[b"a=1; b=2"]);
+
+        coalesce_cookie_headers(&mut request);
+
+        assert_eq!(cookie_values(&request), vec![&b"a=1; b=2"[..]]);
+    }
+
+    #[test]
+    fn no_cookie_header_stays_absent() {
+        let mut request = request_with_cookies(&[]);
+
+        coalesce_cookie_headers(&mut request);
+
+        assert!(!request.headers.contains_key("cookie"));
+    }
+
+    #[test]
+    fn joins_multi_cookie_crumbs_and_skips_empty_ones() {
+        let mut request = request_with_cookies(&[b"a=1; b=2", b"", b"  c=3  ", b"   "]);
+
+        coalesce_cookie_headers(&mut request);
+
+        assert_eq!(cookie_values(&request), vec![&b"a=1; b=2; c=3"[..]]);
+    }
+
+    #[test]
+    fn removes_cookie_header_when_every_crumb_is_empty() {
+        let mut request = request_with_cookies(&[b"", b" "]);
+
+        coalesce_cookie_headers(&mut request);
+
+        assert!(!request.headers.contains_key("cookie"));
+    }
+
+    /// Cookie values may carry obs-text bytes that are not valid UTF-8; they
+    /// must be forwarded byte-for-byte, never dropped.
+    #[test]
+    fn preserves_non_utf8_cookie_bytes() {
+        let mut request = request_with_cookies(&[b"a=v\xe9\xff", b"b=2"]);
+
+        coalesce_cookie_headers(&mut request);
+
+        assert_eq!(cookie_values(&request), vec![&b"a=v\xe9\xff; b=2"[..]]);
+    }
+
+    /// Regression (review of #1149): once crumbs are joined, a non-UTF-8
+    /// crumb shares a field with Temps' tracking cookies. They must stay
+    /// readable, otherwise returning visitors get fresh identities.
+    #[test]
+    fn tracking_cookies_stay_readable_next_to_a_non_utf8_crumb() {
+        let mut request = request_with_cookies(&[
+            b"_temps_visitor_id=visitor",
+            b"legacy=v\xe9\xff",
+            b"_temps_sid=session",
+        ]);
+
+        coalesce_cookie_headers(&mut request);
+
+        let value = |name: &str| find_request_cookie(&request, name, |v| Some(v.to_string()));
+        assert_eq!(value("_temps_visitor_id").as_deref(), Some("visitor"));
+        assert_eq!(value("_temps_sid").as_deref(), Some("session"));
+    }
+
+    #[test]
+    fn find_request_cookie_searches_every_field_and_filters_by_accept() {
+        let request = request_with_cookies(&[b"a=1; token=bad", b"token=good"]);
+
+        let accepted = find_request_cookie(&request, "token", |v| (v == "good").then_some(v.len()));
+        assert_eq!(accepted, Some(4));
+        assert_eq!(
+            find_request_cookie(&request, "token", |v| Some(v.to_string())).as_deref(),
+            Some("bad"),
+            "first cookie with the name comes first"
+        );
+        assert_eq!(find_request_cookie(&request, "missing", |_| Some(())), None);
+    }
+
+    #[test]
+    fn keeps_unrelated_headers_when_coalescing() {
+        let mut request = request_with_cookies(&[b"a=1", b"b=2"]);
+        request
+            .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
+            .expect("unrelated test header must be valid");
+
+        coalesce_cookie_headers(&mut request);
+
+        assert_eq!(cookie_values(&request), vec![&b"a=1; b=2"[..]]);
+        assert_eq!(
+            request.headers.get("x-unrelated"),
+            Some(&HeaderValue::from_static("preserved"))
+        );
+    }
 }
 
 /// Tests for the CDN client-IP resolution chain in `resolve_session_client_ip`.
@@ -8441,6 +9467,189 @@ mod cdn_client_ip_tests {
         assert_eq!(
             t.resolve_client_ip(cf_edge, Some("198.51.100.7")),
             real_client
+        );
+    }
+}
+
+#[cfg(test)]
+mod static_response_policy_tests {
+    use super::*;
+
+    fn header_value<'a>(resp: &'a ResponseHeader, name: &str) -> Option<&'a str> {
+        resp.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn not_found_page_has_no_etag_and_is_never_cached() {
+        for path in ["/does-not-exist", "/assets/app-1a2b.js"] {
+            let mut resp = ResponseHeader::build(StaticFileMatch::NotFoundPage.status(), None)
+                .expect("build response");
+
+            LoadBalancer::insert_static_validators(
+                &mut resp,
+                path,
+                "W/\"etag\"",
+                StaticFileMatch::NotFoundPage,
+            )
+            .expect("insert validators");
+
+            assert_eq!(resp.status.as_u16(), 404, "{path}");
+            assert_eq!(header_value(&resp, "etag"), None, "{path}");
+            assert_eq!(
+                header_value(&resp, "cache-control"),
+                Some("no-store"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn served_files_keep_their_etag_and_path_based_caching() {
+        for (path, matched, cache_control) in [
+            (
+                "/assets/app.js",
+                StaticFileMatch::Requested,
+                "public, max-age=31536000, immutable",
+            ),
+            (
+                "/about",
+                StaticFileMatch::Requested,
+                "public, max-age=0, must-revalidate",
+            ),
+            (
+                "/dashboard",
+                StaticFileMatch::SpaShell,
+                "public, max-age=0, must-revalidate",
+            ),
+        ] {
+            let mut resp = ResponseHeader::build(matched.status(), None).expect("build response");
+
+            LoadBalancer::insert_static_validators(&mut resp, path, "W/\"etag\"", matched)
+                .expect("insert validators");
+
+            assert_eq!(resp.status.as_u16(), 200, "{path}");
+            assert_eq!(header_value(&resp, "etag"), Some("W/\"etag\""), "{path}");
+            assert_eq!(
+                header_value(&resp, "cache-control"),
+                Some(cache_control),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_not_found_page_reports_a_not_found_outcome() {
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::Requested),
+            StaticFileServeOutcome::Served
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::SpaShell),
+            StaticFileServeOutcome::Served
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::NotFoundPage),
+            StaticFileServeOutcome::ServedNotFoundPage
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::CanonicalRedirect),
+            StaticFileServeOutcome::Redirected
+        );
+    }
+
+    #[test]
+    fn canonical_redirect_is_tracked_like_the_page_it_redirects_to() {
+        // The 308 for `/about/` is attributed with the MIME of `about.html`,
+        // so a browser's first navigation creates the visit on the redirect.
+        let page_content_type = LoadBalancer::infer_content_type("about.html");
+        let browser_navigation = LoadBalancer::should_track_page(
+            "/about/",
+            Some(page_content_type),
+            "GET",
+            Some("text/html,application/xhtml+xml"),
+            Some("document"),
+            Some("1"),
+        );
+        assert!(browser_navigation);
+
+        let plain_http_client = LoadBalancer::should_track_page(
+            "/about/",
+            Some(page_content_type),
+            "GET",
+            Some("*/*"),
+            None,
+            None,
+        );
+        assert!(!plain_http_client);
+    }
+
+    #[test]
+    fn canonical_redirect_is_revalidated_even_on_an_asset_like_path() {
+        assert_eq!(
+            LoadBalancer::static_cache_control(
+                "/assets/guide/",
+                StaticFileMatch::CanonicalRedirect
+            ),
+            "public, max-age=0, must-revalidate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proxy_failure_kind_tests {
+    use super::ProxyFailureKind;
+    use pingora::{Error, ErrorSource, ErrorType};
+
+    fn error(etype: ErrorType, source: ErrorSource) -> Box<Error> {
+        let mut e = Error::new(etype);
+        e.esource = source;
+        e
+    }
+
+    #[test]
+    fn client_disconnects_are_not_errors() {
+        for etype in [
+            ErrorType::ConnectionClosed,
+            ErrorType::ReadError,
+            ErrorType::WriteError,
+        ] {
+            assert_eq!(
+                ProxyFailureKind::of(&error(etype, ErrorSource::Downstream)),
+                ProxyFailureKind::ClientGone
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_failures_are_classified_as_upstream() {
+        for etype in [
+            ErrorType::ConnectRefused,
+            ErrorType::ConnectTimedout,
+            ErrorType::ConnectionClosed,
+        ] {
+            assert_eq!(
+                ProxyFailureKind::of(&error(etype, ErrorSource::Upstream)),
+                ProxyFailureKind::Upstream
+            );
+        }
+    }
+
+    #[test]
+    fn everything_else_is_internal() {
+        assert_eq!(
+            ProxyFailureKind::of(&error(
+                ErrorType::InvalidHTTPHeader,
+                ErrorSource::Downstream
+            )),
+            ProxyFailureKind::Internal
+        );
+        assert_eq!(
+            ProxyFailureKind::of(&error(ErrorType::InternalError, ErrorSource::Internal)),
+            ProxyFailureKind::Internal
+        );
+        assert_eq!(
+            ProxyFailureKind::of(&error(ErrorType::InternalError, ErrorSource::Unset)),
+            ProxyFailureKind::Internal
         );
     }
 }

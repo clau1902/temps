@@ -3,6 +3,14 @@
 
 mod m20260916_000001_visitor_activity_reports;
 mod m20260918_000001_visitor_activity_run_history;
+mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
+mod m20260921_000001_add_worker_public_ingress;
+
+pub mod m20260921_000001_http_checks;
+pub mod m20260921_000002_env_check_history;
+pub mod m20260921_000003_detection_retry;
+pub mod m20260921_000004_credential_catalog;
+pub mod m20261002_000001_secret_checks_and_history;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -157,6 +165,8 @@ mod m20260711_000002_add_ip_geolocations_hosting_provider;
 mod m20260711_000002_create_suppressed_recipients;
 mod m20260711_000003_add_visitor_non_crawler_partial_index;
 mod m20260713_000001_add_mfa_pending_to_sessions;
+mod m20260713_000002_add_dns_ownership;
+mod m20260714_000001_create_domain_delivery;
 mod m20260714_000001_fix_otel_spans_compression_segmentby;
 mod m20260714_000001_secure_sns_email_events;
 mod m20260716_000001_observability_compression_24h;
@@ -217,6 +227,7 @@ mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
 mod m20260830_000001_add_external_service_creator;
 mod m20260830_000001_add_managed_by_cloud_to_s3_sources;
 mod m20260830_000001_create_traefik_discovered_routes;
+mod m20260929_000001_add_bunny_delivery;
 // Module declarations are kept lexically sorted by rustfmt. Migration execution
 // order is defined by Migrator::migrations below, where all mainline migrations
 // remain ahead of this branch's AI workspace chain.
@@ -275,7 +286,29 @@ pub mod m20260916_000001_reconcile_otel_trace_summaries;
 pub mod m20260917_000001_add_next_check_at_to_status_monitors;
 pub mod m20260917_000002_add_breach_started_at_to_alert_rules;
 pub mod m20260917_000003_add_cron_next_run_at_to_project_agents;
-mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
+mod m20260918_000001_add_pull_only_root_directory_to_projects;
+pub mod m20260919_000001_add_failover_at_to_nodes;
+pub mod m20260919_000001_log_chunks_v2;
+pub mod m20260920_000001_log_chunks_indexed_at;
+pub mod m20260920_000002_log_collector_positions;
+pub mod m20260921_000001_log_lines_index;
+pub mod m20260921_000002_log_line_index_state;
+pub mod m20260921_000003_log_line_forget_backlog;
+pub mod m20260922_000001_stateless_control_plane_jobs;
+pub mod m20260926_000001_stateless_telemetry_anonymous_id;
+pub mod m20260928_000001_host_git_imports;
+
+mod m20260920_000001_compose_security_policies;
+mod m20260921_000005_add_docker_socket_mounted_to_deployments;
+mod m20260924_000001_add_sync_error_to_git_provider_connections;
+mod m20260927_000001_add_port_bindings_to_deployment_containers;
+mod m20260928_000001_add_node_id_to_sandboxes;
+mod m20260928_000001_wireguard_mesh;
+mod m20260929_000001_node_pairings;
+mod m20260929_000002_node_pairing_rejection;
+mod m20260929_000003_node_ssh_enrollments;
+mod m20260929_000004_mesh_hub;
+mod m20261002_000001_add_bunny_hostname_owned;
 
 pub struct Migrator;
 
@@ -596,6 +629,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260912_000001_expand_managed_daemon_workspace_images::Migration),
             Box::new(m20260912_000002_managed_daemon_workspace_images_v031::Migration),
             Box::new(m20260912_000003_managed_daemon_workspace_images_v032::Migration),
+            Box::new(m20260713_000002_add_dns_ownership::Migration),
+            Box::new(m20260714_000001_create_domain_delivery::Migration),
+
             Box::new(m20260913_000001_managed_daemon_workspace_images_v033::Migration),
             Box::new(m20260913_000002_managed_daemon_workspace_images_v034::Migration),
             Box::new(m20260914_000001_managed_daemon_digest_images::Migration),
@@ -604,11 +640,55 @@ impl MigratorTrait for Migrator {
             Box::new(m20260916_000001_external_plugin_actors::Migration),
             Box::new(m20260916_000001_reconcile_otel_trace_summaries::Migration),
             Box::new(m20260917_000001_add_next_check_at_to_status_monitors::Migration),
+            Box::new(m20260929_000001_add_bunny_delivery::Migration),
             Box::new(m20260917_000002_add_breach_started_at_to_alert_rules::Migration),
             Box::new(m20260917_000003_add_cron_next_run_at_to_project_agents::Migration),
             Box::new(m20260916_000001_visitor_activity_reports::Migration),
             Box::new(m20260918_000001_visitor_activity_run_history::Migration),
+            Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
             Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
+            Box::new(m20260919_000001_log_chunks_v2::Migration),
+            Box::new(m20260920_000001_compose_security_policies::Migration),
+            Box::new(m20260920_000001_log_chunks_indexed_at::Migration),
+            Box::new(m20260920_000002_log_collector_positions::Migration),
+            // This branch and main each shipped migrations stamped
+            // m20260921_0000{1,2,3}, independently and for unrelated
+            // features (line-index stores here vs. monitoring credential
+            // checks on main). This branch's landed first (07:22 UTC vs
+            // main's 17:31 UTC); DeriveMigrationName keys on the full
+            // module name, so the shared stamps are not a collision in
+            // seaql_migrations.
+            Box::new(m20260921_000001_log_lines_index::Migration),
+            Box::new(m20260921_000002_log_line_index_state::Migration),
+            Box::new(m20260921_000003_log_line_forget_backlog::Migration),
+            Box::new(m20260921_000001_http_checks::Migration),
+            Box::new(m20260921_000002_env_check_history::Migration),
+            Box::new(m20260921_000003_detection_retry::Migration),
+            Box::new(m20260921_000004_credential_catalog::Migration),
+            Box::new(m20260921_000001_add_worker_public_ingress::Migration),
+            Box::new(m20260921_000005_add_docker_socket_mounted_to_deployments::Migration),
+            Box::new(m20260922_000001_stateless_control_plane_jobs::Migration),
+            Box::new(m20260918_000001_add_pull_only_root_directory_to_projects::Migration),
+            Box::new(m20260924_000001_add_sync_error_to_git_provider_connections::Migration),
+            Box::new(m20260926_000001_stateless_telemetry_anonymous_id::Migration),
+            Box::new(m20260927_000001_add_port_bindings_to_deployment_containers::Migration),
+            // main and the worker-sandboxes branch each shipped a migration
+            // stamped m20260928_000001, for unrelated tables (host git
+            // credential imports vs. sandbox node placement). main's landed
+            // first, so it runs first; DeriveMigrationName keys on the full
+            // module name, so the shared stamp is not a collision.
+            Box::new(m20260928_000001_host_git_imports::Migration),
+            Box::new(m20260928_000001_add_node_id_to_sandboxes::Migration),
+            Box::new(m20261002_000001_add_bunny_hostname_owned::Migration),
+            // Shares main's m20261002_000001 stamp for unrelated tables (secret
+            // checks and history vs. Bunny hostname ownership); main's landed
+            // first, so it runs first.
+            Box::new(m20261002_000001_secret_checks_and_history::Migration),
+            Box::new(m20260928_000001_wireguard_mesh::Migration),
+            Box::new(m20260929_000001_node_pairings::Migration),
+            Box::new(m20260929_000002_node_pairing_rejection::Migration),
+            Box::new(m20260929_000003_node_ssh_enrollments::Migration),
+            Box::new(m20260929_000004_mesh_hub::Migration),
         ]
     }
 }
@@ -632,6 +712,14 @@ mod registry_tests {
         );
 
         for (shipped, added) in [
+            (
+                "m20260912_000003_managed_daemon_workspace_images_v032",
+                "m20260713_000002_add_dns_ownership",
+            ),
+            (
+                "m20260713_000002_add_dns_ownership",
+                "m20260714_000001_create_domain_delivery",
+            ),
             (
                 "m20260810_000001_create_sandbox_snapshots",
                 "m20260810_000001_add_cli_session_id_to_ai_conversations",
@@ -663,6 +751,14 @@ mod registry_tests {
             (
                 "m20260903_000004_repair_application_primary_projects",
                 "m20260908_000001_reconcile_legacy_status_monitors",
+            ),
+            (
+                "m20260928_000001_host_git_imports",
+                "m20260928_000001_add_node_id_to_sandboxes",
+            ),
+            (
+                "m20261002_000001_add_bunny_hostname_owned",
+                "m20261002_000001_secret_checks_and_history",
             ),
         ] {
             let shipped_position = names

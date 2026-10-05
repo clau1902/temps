@@ -30,6 +30,46 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Documentation-only pull requests skip the build and test jobs.
+  #
+  # `code` is "false" only when every changed file is documentation (see
+  # .github/scripts/classify-ci-changes.py for what counts, including the docs
+  # pages CI itself reads). Pushes to `main` always run everything, since
+  # they seed the caches and nightly-release decisions read their results.
+  #
+  # Gated jobs test `code != 'false'` under `!cancelled()`, so if this job
+  # fails the output is empty and everything runs: a broken classifier costs
+  # runner time, never coverage. Jobs skipped through `if:` report success, so
+  # required checks still pass on a docs-only PR. Matrix jobs are the
+  # exception -- a skipped matrix is never expanded, so `Unit Tests (unit-a)`
+  # would never report -- which is why unit-tests skips its steps instead.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - name: Checkout code
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7.0.1
+        with:
+          # The pull_request checkout is the merge commit; its first parent is
+          # the base branch tip, so HEAD^1..HEAD is exactly what the PR changes.
+          fetch-depth: 2
+
+      - name: Classify changed files
+        id: classify
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+            echo "Not a pull request ($GITHUB_EVENT_NAME); running every job."
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 .github/scripts/classify-ci-changes.py --base HEAD^1 --head HEAD
+
   workflow-contracts:
     name: Release Workflow Contracts
     runs-on: ubuntu-latest
@@ -40,6 +80,9 @@ jobs:
       - name: Verify nightly release wiring
         run: .github/scripts/test-nightly-release-workflows.sh
 
+      - name: Verify release image runtime contract
+        run: scripts/test-release-dockerfile.sh
+
       - name: Verify workflow caches are save-if guarded
         # An unguarded Swatinem/rust-cache step in a pull_request-triggered
         # workflow duplicates that cache once per open PR ref, evicting the
@@ -47,6 +90,9 @@ jobs:
         # turning every musl build into a ~80min cold compile. Has bitten us
         # twice already (dependency-scan.yml, network-kernel-tests.yml).
         run: python3 .github/scripts/check-cache-save-guards.py
+
+      - name: Test musl build cache pruning
+        run: python3 .github/scripts/test-prune-cargo-build-cache.py
 
       - name: Verify nextest target seed contracts
         run: python3 .github/scripts/test-nextest-cache-seed.py
@@ -62,11 +108,19 @@ jobs:
           python3 scripts/test_source_attribution.py
           python3 scripts/test_release_attribution.py
 
+      - name: Test stateless file migration safety
+        run: python3 scripts/test_migrate_stateless_files.py
+
+      - name: Test docs-only CI classification
+        run: python3 .github/scripts/test-classify-ci-changes.py
+
       - name: Verify source attribution headers
         run: python3 scripts/source_attribution.py check
 
   otel-protobuf-compat:
     name: OTEL protobuf compatibility (Ubuntu 22.04)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # The release workflow uses Ubuntu 22.04, whose protobuf compiler requires
     # an explicit proto3-optional flag for the OpenTelemetry metrics schema.
     # Keep this check on the same runner so newer `protoc` versions cannot mask
@@ -106,12 +160,26 @@ jobs:
   # ---------------------------------------------------------------------------
   build-binary:
     name: Build temps Binary (musl)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     # Warm this is ~5 minutes. The ceiling is sized for a fully cold cache,
     # which took 81 minutes the last time the cargo cache was evicted — a
     # tighter bound would turn a slow run into a failed one.
     timeout-minutes: 100
     steps:
+      # The runner starts with ~27GiB free. The restored cache archive, its
+      # extracted target dir, the build and the archive written on save all
+      # need room at once: with the 21GB entry, restores aborted partway and a
+      # save died with "No space left on device", which left its key reserved
+      # so later runs could not save either. Same cleanup as the test jobs.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get clean
+          df -h /
+
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
@@ -188,7 +256,9 @@ jobs:
       # inside the toolchain container, with target/ and the cargo registry
       # mounted from the persistent cache so rebuilds are incremental. Uses
       # the `fast` profile (release semantics, parallel codegen, no LTO);
-      # production images keep the default `release` profile.
+      # production images keep the default `release` profile. The JSON
+      # messages list every unit of the build, fresh or not, which is what
+      # the prune step below keys on.
       - name: Build temps binary in toolchain container
         run: |
           mkdir -p ci-build-cache/target ci-build-cache/cargo-registry ci-prebuilt
@@ -202,13 +272,57 @@ jobs:
               cd /build/web && bun install && \
                 RSBUILD_OUTPUT_PATH=/build/crates/temps-cli/dist bun run build
               cd /build
-              cargo build --profile fast --bin temps --package temps-cli
+              cargo build --profile fast --bin temps --package temps-cli \
+                --message-format=json-render-diagnostics > cargo-build-messages.json
               cp target/fast/temps ci-prebuilt/temps
               chown -R '"$(id -u):$(id -g)"' /build/target /usr/local/cargo/registry \
-                ci-prebuilt crates/temps-cli/dist
+                ci-prebuilt crates/temps-cli/dist cargo-build-messages.json
             '
           chmod +x ci-prebuilt/temps
           file ci-prebuilt/temps
+
+      # Restoring from the newest older entry and saving under a new key
+      # carries every earlier generation of build output forward: each
+      # dependency bump left a full second copy of the workspace's rlibs and
+      # incremental sessions behind, and the entry reached 21GB. Drop what
+      # this build did not use before saving. Runs that don't save only
+      # report what would go, so the numbers stay visible on every PR.
+      - name: Prune stale build output from cargo cache
+        env:
+          PRUNE_MODE: ${{ github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true' && '--apply' || '' }}
+        run: |
+          python3 .github/scripts/prune-cargo-build-cache.py $PRUNE_MODE \
+            --messages cargo-build-messages.json \
+            --target-dir ci-build-cache/target \
+            --registry ci-build-cache/cargo-registry \
+            --lockfile Cargo.lock
+
+      # Pruning decides "stale" from cargo's hashes. If a cargo release ever
+      # changes how those map to file names, this rebuild puts back whatever
+      # was wrongly removed before the save, so the cache stays complete, and
+      # the warning says the prune script needs updating.
+      - name: Verify pruned cache is still fresh
+        if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm \
+            --volume "$PWD":/build --workdir /build \
+            --volume "$PWD/ci-build-cache/target":/build/target \
+            --volume "$PWD/ci-build-cache/cargo-registry":/usr/local/cargo/registry \
+            temps-toolchain:ci \
+            sh -ec '
+              git config --global --add safe.directory /build
+              cargo build --profile fast --bin temps --package temps-cli \
+                --message-format=json-render-diagnostics > cargo-verify-messages.json
+              chown -R '"$(id -u):$(id -g)"' /build/target /usr/local/cargo/registry \
+                cargo-verify-messages.json
+            '
+          rebuilt=$(jq -r 'select(.reason == "compiler-artifact" and .fresh == false) | .target.name' \
+            cargo-verify-messages.json)
+          if [ -n "$rebuilt" ]; then
+            echo "::warning::Pruning removed build output that was still in use (rebuilt before saving): $(echo $rebuilt)"
+          else
+            echo "All units fresh after pruning."
+          fi
 
       - name: Save cargo target dir (musl, fast profile)
         if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
@@ -296,6 +410,8 @@ jobs:
 
   check:
     name: Cargo Check
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -311,6 +427,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -331,8 +448,11 @@ jobs:
           shared-key: test-build
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache wasm-pack binary
-        uses: actions/cache@v6
+      # Restore always, save only from `main`: the combined actions/cache
+      # step saves from whichever ref misses, into a scope only that ref reads.
+      - name: Restore wasm-pack binary
+        id: wasm-pack-cache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -347,6 +467,13 @@ jobs:
           fi
           cd crates/temps-captcha-wasm
           bun run build
+
+      - name: Save wasm-pack binary
+        if: github.ref == 'refs/heads/main' && steps.wasm-pack-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
 
       - name: Check workspace
         run: cargo check --workspace --all-targets
@@ -368,6 +495,8 @@ jobs:
 
   web-typecheck:
     name: Web TypeScript Check
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -377,6 +506,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       # Restore always, save only from `main` — see the cache-scoping note on
       # the toolchain export above.
@@ -421,6 +551,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       # No `bun install`: the check reads the committed file and needs nothing
       # but Bun itself, so it reports in seconds on every pull request.
@@ -434,6 +565,8 @@ jobs:
 
   clippy:
     name: Clippy (advisory)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     # Non-blocking: clippy warnings are reported but do not fail the build
     continue-on-error: true
@@ -450,6 +583,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -459,8 +593,9 @@ jobs:
           shared-key: test-build
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache wasm-pack binary
-        uses: actions/cache@v6
+      - name: Restore wasm-pack binary
+        id: wasm-pack-cache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -475,6 +610,13 @@ jobs:
           fi
           cd crates/temps-captcha-wasm
           bun run build
+
+      - name: Save wasm-pack binary
+        if: github.ref == 'refs/heads/main' && steps.wasm-pack-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -503,6 +645,8 @@ jobs:
   # provision Docker/DB services, keeps that boundary intact.
   build-test-binaries:
     name: Build Test Binaries
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -542,7 +686,7 @@ jobs:
         id: nextest-seed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 .github/scripts/nextest-cache-seed.py temps-nextest-target-seed-v1
+        run: python3 .github/scripts/nextest-cache-seed.py temps-nextest-target-seed-v2
 
       - name: Download inherited nextest target seed
         id: nextest-seed-download
@@ -598,7 +742,7 @@ jobs:
         if: github.ref == 'refs/heads/main' && steps.nextest-seed.outputs.publish-current == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: temps-nextest-target-seed-v1
+          name: temps-nextest-target-seed-v2
           path: nextest-target-seed.tar.zst
           compression-level: 0
           retention-days: 7
@@ -624,10 +768,18 @@ jobs:
   # ---------------------------------------------------------------------------
   # Runs all workspace tests WITHOUT the docker-tests feature. Both groups
   # only download the archive and run it -- no compilation happens here.
+  #
+  # These three checks are required by branch protection, and a matrix job
+  # skipped through `if:` is never expanded, so `Unit Tests (unit-a)` would
+  # never report and a docs-only PR could not merge. On a docs-only PR
+  # (`code == 'false'`) the job therefore still runs once per group, but every
+  # step is skipped. Otherwise it runs exactly as before: only after
+  # build-test-binaries succeeds.
   unit-tests:
     name: "Unit Tests (${{ matrix.group }})"
     runs-on: ubuntu-latest
-    needs: build-test-binaries
+    needs: [changes, build-test-binaries]
+    if: ${{ !cancelled() && (needs.build-test-binaries.result == 'success' || needs.changes.outputs.code == 'false') }}
     strategy:
       fail-fast: false
       matrix:
@@ -697,7 +849,12 @@ jobs:
               and kind(=test)
 
     steps:
+      - name: Skip on a documentation-only change
+        if: needs.changes.outputs.code == 'false'
+        run: echo "Every changed file is documentation; nothing for ${{ matrix.group }} to test."
+
       - name: Free up disk space
+        if: needs.changes.outputs.code != 'false'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
@@ -722,6 +879,7 @@ jobs:
       # separate processes hitting one shared instance (see
       # run_migrations_with_retry's deadlock-retry logic in test_utils.rs).
       - name: Start TimescaleDB (background workers disabled)
+        if: needs.changes.outputs.code != 'false'
         run: |
           docker run -d --name timescaledb \
             -e POSTGRES_DB=test_db \
@@ -733,25 +891,31 @@ jobs:
             postgres -c timescaledb.max_background_workers=0
 
       - name: Checkout code
+        if: needs.changes.outputs.code != 'false'
         uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain
+        if: needs.changes.outputs.code != 'false'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-nextest
+        if: needs.changes.outputs.code != 'false'
         uses: taiki-e/install-action@nextest
 
       - name: Download test binaries
+        if: needs.changes.outputs.code != 'false'
         uses: actions/download-artifact@v8
         with:
           name: test-binaries-default
 
       - name: Verify TimescaleDB is ready
+        if: needs.changes.outputs.code != 'false'
         run: |
           timeout 60 bash -c 'until docker exec timescaledb pg_isready -U test_user -d test_db; do sleep 1; done'
           echo "TimescaleDB is ready"
 
       - name: Run unit tests
+        if: needs.changes.outputs.code != 'false'
         env:
           RUST_BACKTRACE: 1
           TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
@@ -807,7 +971,7 @@ jobs:
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
             # (test_{mongodb,postgres,redis,s3}_backup_and_restore_to_s3). Each
-            # spins up a MinIO container plus a service container and streams a
+            # spins up an S3-compatible container plus a service container and streams a
             # real wal-g/mongodump backup, so running them in parallel saturates
             # Docker and races for host ports (`port is already allocated`),
             # causing 300s hangs. --test-threads=1 guarantees serial execution.
@@ -1039,12 +1203,12 @@ jobs:
 
       - name: Pull E2E images
         run: |
-          timeout 10m docker pull quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+          timeout 10m docker pull rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
           timeout 10m docker build --pull \
             --build-arg MARIADB_VERSION=11.4 \
             --tag ghcr.io/gotempsh/mariadb-walg:11.4 \
             images/mariadb-walg
-          docker image ls | grep -E '^(quay.io/minio/minio|ghcr.io/gotempsh/mariadb-walg)\s' || true
+          docker image ls | grep -E '^(rustfs/rustfs|ghcr.io/gotempsh/mariadb-walg)\s' || true
 
       - name: Run MariaDB PITR E2E
         env:

@@ -37,6 +37,10 @@ import { useMemo, useState, useEffect } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { branchCommitSha } from '@/lib/project-header-actions'
+import {
+  defaultDeployEnvironment,
+  projectDeploysImage,
+} from '@/lib/project-deploy-action'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   AlertTriangle,
@@ -48,6 +52,7 @@ import {
   Tag as TagIcon,
 } from 'lucide-react'
 import { BranchSelector, type ResolvedBranch } from './BranchSelector'
+import { gitProviderSetupPath, problemDetail } from '@/lib/api-problem'
 
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{7,40}$/i
 
@@ -174,7 +179,12 @@ export function RedeploymentModal({
     mode === 'redeploy'
       ? (deploymentSourceType ?? project.source_type)
       : project.source_type
-  const isImageDeploy = sourceType === 'docker_image'
+  // A new deployment of a Flexible project with no repository pulls an image:
+  // the git pipeline would have nothing to build.
+  const isImageDeploy =
+    mode === 'redeploy'
+      ? sourceType === 'docker_image'
+      : projectDeploysImage(project)
   const isStaticRedeploy = mode === 'redeploy' && sourceType === 'static_files'
   const isUnsupportedRedeploy =
     mode === 'redeploy' &&
@@ -204,8 +214,7 @@ export function RedeploymentModal({
   // Compute initial environment value from query data or defaults using useMemo
   const initialEnvironment = useMemo(() => {
     if (defaultEnvironment) return defaultEnvironment
-    if (environmentsQuery.data?.length) return environmentsQuery.data[0].id
-    return null
+    return defaultDeployEnvironment(environmentsQuery.data)?.id ?? null
   }, [defaultEnvironment, environmentsQuery.data])
 
   // State variables that use the computed initial values
@@ -228,6 +237,29 @@ export function RedeploymentModal({
   // previous deployment's image but the user can change it (e.g. deploy a
   // new tag) instead of always re-pulling the same one.
   const [imageRefInput, setImageRefInput] = useState(imageRef || '')
+  const [submissionError, setSubmissionError] = useState<{
+    message: string
+    setupPath?: string
+  } | null>(null)
+
+  const closeDialog = () => {
+    setSubmissionError(null)
+    onClose()
+  }
+
+  const submit = async (
+    reference: Parameters<RedeploymentModalProps['onConfirm']>[0]
+  ) => {
+    setSubmissionError(null)
+    try {
+      await onConfirm(reference)
+    } catch (error) {
+      setSubmissionError({
+        message: problemDetail(error, 'Could not start the deployment.'),
+        setupPath: gitProviderSetupPath(error),
+      })
+    }
+  }
 
   // Derive effective values (either user-selected or initial/default)
   const effectiveBranch = selectedBranch !== '' ? selectedBranch : initialBranch
@@ -459,7 +491,7 @@ export function RedeploymentModal({
         toast.error('Enter an image reference')
         return
       }
-      await onConfirm({ environmentId: envId, imageRef: ref })
+      await submit({ environmentId: envId, imageRef: ref })
       return
     }
 
@@ -472,7 +504,7 @@ export function RedeploymentModal({
         toast.error('The stored static bundle is no longer available')
         return
       }
-      await onConfirm({
+      await submit({
         environmentId: defaultEnvironment,
         staticBundleId,
       })
@@ -486,7 +518,7 @@ export function RedeploymentModal({
         return
       }
 
-      await onConfirm({
+      await submit({
         branch: defaultType === 'branch' ? defaultBranch : undefined,
         commit:
           defaultType === 'commit' || defaultType === 'tag'
@@ -537,7 +569,7 @@ export function RedeploymentModal({
       return
     }
 
-    await onConfirm({
+    await submit({
       branch: deploymentType === 'branch' ? effectiveBranch : undefined,
       commit:
         deploymentType === 'commit'
@@ -560,13 +592,31 @@ export function RedeploymentModal({
     )?.slug
 
   return (
-    <Dialog open={isOpen} onOpenChange={onClose}>
+    <Dialog open={isOpen} onOpenChange={(open) => !open && closeDialog()}>
       <DialogContent className="sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>
             {mode === 'redeploy' ? 'Redeploy' : 'Deploy Project'}
           </DialogTitle>
         </DialogHeader>
+
+        {submissionError && (
+          <Alert variant="destructive">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription className="space-y-2">
+              <p>{submissionError.message}</p>
+              {submissionError.setupPath && (
+                <Link
+                  to={submissionError.setupPath}
+                  onClick={closeDialog}
+                  className="inline-block font-medium underline underline-offset-4"
+                >
+                  Connect repository
+                </Link>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
 
         {isImageDeploy ? (
           <div className="space-y-4">
@@ -620,7 +670,11 @@ export function RedeploymentModal({
               </div>
             )}
             <DialogFooter>
-              <Button variant="outline" onClick={onClose} disabled={isLoading}>
+              <Button
+                variant="outline"
+                onClick={closeDialog}
+                disabled={isLoading}
+              >
                 Cancel
               </Button>
               <Button
@@ -664,7 +718,11 @@ export function RedeploymentModal({
               </Alert>
             )}
             <DialogFooter>
-              <Button variant="outline" onClick={onClose} disabled={isLoading}>
+              <Button
+                variant="outline"
+                onClick={closeDialog}
+                disabled={isLoading}
+              >
                 Cancel
               </Button>
               <Button
@@ -686,12 +744,12 @@ export function RedeploymentModal({
               </AlertDescription>
             </Alert>
             <DialogFooter>
-              <Button variant="outline" onClick={onClose}>
+              <Button variant="outline" onClick={closeDialog}>
                 Close
               </Button>
               <Button asChild>
                 <Link
-                  onClick={onClose}
+                  onClick={closeDialog}
                   to={
                     sourceType === 'uploaded_source'
                       ? `/projects/${project.slug}/drop`
@@ -743,7 +801,11 @@ export function RedeploymentModal({
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={onClose} disabled={isLoading}>
+              <Button
+                variant="outline"
+                onClick={closeDialog}
+                disabled={isLoading}
+              >
                 Cancel
               </Button>
               <Button
@@ -1113,7 +1175,7 @@ export function RedeploymentModal({
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={onClose}>
+              <Button variant="outline" onClick={closeDialog}>
                 Cancel
               </Button>
               <Button

@@ -954,6 +954,7 @@ mod tests {
             repo_name: "test-repo".to_string(),
             repo_owner: "test-owner".to_string(),
             directory: String::new(),
+            pull_only_root_directory: false,
             main_branch: "main".to_string(),
             preset: temps_entities::preset::Preset::NextJs,
             preset_config: None,
@@ -1057,6 +1058,7 @@ mod tests {
             deployment_config: None,
             promoted_from_deployment_id: None,
             upload_request_id: None,
+            docker_socket_mounted: false,
         }
     }
 

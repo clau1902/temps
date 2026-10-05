@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! ADR-045 §4: mark an `oidc_providers` row as provisioned by Temps Cloud for
-//! console access, and gate it behind a hard admin-only role check.
+//! Mark an `oidc_providers` row as provisioned by Temps Cloud, and gate it
+//! behind a hard admin-only role check.
 //!
-//! Cloud-managed rows are auto-created when console access is enabled and
-//! hold a credential the instance never chose and cannot rotate locally, so
-//! they must be excluded from the operator-initiated
+//! Cloud-managed rows hold a credential the instance never chose and cannot
+//! rotate locally, so they must be excluded from the operator-initiated
 //! `PUT`/`DELETE /admin/oidc/providers/{id}` paths that ordinary OIDC
 //! providers go through — the same reasoning as
 //! `m20260830_000001_add_managed_by_cloud_to_s3_sources`.

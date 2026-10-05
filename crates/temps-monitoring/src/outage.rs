@@ -1370,6 +1370,7 @@ mod tests {
             repo_name: "repo".to_string(),
             repo_owner: "owner".to_string(),
             directory: "/".to_string(),
+            pull_only_root_directory: false,
             main_branch: "main".to_string(),
             preset: temps_entities::preset::Preset::Astro,
             preset_config: None,
@@ -1436,6 +1437,7 @@ mod tests {
             deployment_config: None,
             promoted_from_deployment_id: None,
             upload_request_id: None,
+            docker_socket_mounted: false,
         }
     }
 

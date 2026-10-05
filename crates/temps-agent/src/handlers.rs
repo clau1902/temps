@@ -94,7 +94,7 @@ impl ContainerOperationRegistry {
 pub struct AgentResourceLimits {
     output_capture_slots: Arc<tokio::sync::Semaphore>,
     exec_operation_slots: Arc<tokio::sync::Semaphore>,
-    image_import_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) image_import_slots: Arc<tokio::sync::Semaphore>,
     container_operations: ContainerOperationRegistry,
 }
 
@@ -278,9 +278,21 @@ pub struct AgentState {
     /// directly through this agent's HTTP API (managed databases, Redis,
     /// etc. — see `service_handlers::create_service`), mirroring
     /// `DockerRuntime::host_bind_address` used for app-container deploys.
-    /// Resolved once at startup from `AgentConfig::private_address`; never
-    /// `"0.0.0.0"` — see `crate::server::build_router`.
-    pub host_bind_address: String,
+    /// Starts from `AgentConfig::private_address` (loopback if that is
+    /// public) and moves to the mesh address once a publicly-joined node is
+    /// on the WireGuard mesh; never `"0.0.0.0"` — see
+    /// `crate::network_sync::initial_bind_address`.
+    pub host_bind_address: crate::network_sync::SharedBindAddress,
+}
+
+impl AgentState {
+    /// The address to publish a service's ports on right now.
+    pub fn host_bind_address(&self) -> String {
+        self.host_bind_address
+            .read()
+            .map(|address| address.clone())
+            .unwrap_or_else(|_| "127.0.0.1".to_string())
+    }
 }
 
 /// Response wrapper for consistent agent API responses.
@@ -303,7 +315,7 @@ impl<T: Serialize> AgentResponse<T> {
     }
 }
 
-fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
+pub(crate) fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
     (
         status,
         Json(AgentResponse::<()> {
@@ -389,6 +401,9 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         image_exists,
         import_image,
         pull_image,
+        crate::build_handler::build_image,
+        crate::build_handler::export_image,
+        crate::build_handler::inspect_image,
         health_check,
         crate::service_handlers::create_service,
         crate::service_handlers::stop_service,
@@ -401,6 +416,19 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::service_handlers::list_services,
         crate::service_handlers::backup_service,
         crate::service_handlers::restore_service,
+        crate::sandbox_handlers::create_sandbox,
+        crate::sandbox_handlers::exec_sandbox,
+        crate::sandbox_handlers::exec_sandbox_stream,
+        crate::sandbox_handlers::sandbox_alive,
+        crate::sandbox_handlers::read_sandbox_file,
+        crate::sandbox_handlers::write_sandbox_file,
+        crate::sandbox_handlers::write_sandbox_directory,
+        crate::sandbox_handlers::kill_sandbox_processes,
+        crate::sandbox_handlers::destroy_sandbox,
+        crate::sandbox_handlers::stop_sandbox,
+        crate::sandbox_handlers::start_sandbox,
+        crate::sandbox_handlers::recover_sandbox,
+        crate::sandbox_handlers::sandbox_status,
     ),
     components(schemas(
         AgentResponse<temps_deployer::DeployResult>,
@@ -446,6 +474,26 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::ServiceRestoreRequest,
         crate::S3CredentialsPayload,
         crate::ServiceStatus,
+        temps_agents::sandbox::SandboxHandle,
+        temps_agents::sandbox::SandboxBackend,
+        temps_agents::sandbox::KillSignal,
+        temps_agents::sandbox::remote::RemoteCreateRequest,
+        temps_agents::sandbox::remote::RemoteHandleRequest,
+        temps_agents::sandbox::remote::RemoteDestroyRequest,
+        temps_agents::sandbox::remote::RemoteExecRequest,
+        temps_agents::sandbox::remote::RemoteExecResponse,
+        temps_agents::sandbox::remote::RemoteExecFrame,
+        temps_agents::sandbox::remote::RemoteReadFileRequest,
+        temps_agents::sandbox::remote::RemoteFileContents,
+        temps_agents::sandbox::remote::RemoteWriteFileRequest,
+        temps_agents::sandbox::remote::RemoteWriteDirectoryRequest,
+        temps_agents::sandbox::remote::RemoteKillRequest,
+        temps_agents::sandbox::remote::RemoteRecoverRequest,
+        temps_agents::sandbox::remote::RemoteStatusRequest,
+        temps_agents::sandbox::remote::RemoteAliveResponse,
+        temps_agents::sandbox::remote::RemoteStatusResponse,
+        temps_agents::sandbox::remote::RemoteOkResponse,
+        temps_agents::sandbox::remote::RemoteErrorBody,
     )),
     info(
         title = "Temps Agent API",
@@ -2548,6 +2596,45 @@ mod openapi_response_tests {
             "/paths/~1agent~1services~1restore/post/responses/409",
             "/paths/~1agent~1services~1restore/post/responses/429",
             "/paths/~1agent~1services~1restore/post/responses/504",
+        ] {
+            assert!(spec.pointer(pointer).is_some(), "missing OpenAPI {pointer}");
+        }
+    }
+
+    #[test]
+    fn every_sandbox_host_route_is_documented() {
+        let spec = serde_json::to_value(AgentApiDoc::openapi())
+            .expect("agent OpenAPI document serializes");
+        for route in [
+            "sandboxes",
+            "sandboxes~1exec",
+            "sandboxes~1alive",
+            "sandboxes~1read-file",
+            "sandboxes~1write-file",
+            "sandboxes~1write-directory",
+            "sandboxes~1kill-processes",
+            "sandboxes~1destroy",
+            "sandboxes~1stop",
+            "sandboxes~1start",
+            "sandboxes~1recover",
+            "sandboxes~1status",
+        ] {
+            for status in ["200", "401"] {
+                let pointer = format!("/paths/~1agent~1{route}/post/responses/{status}");
+                assert!(
+                    spec.pointer(&pointer).is_some(),
+                    "missing OpenAPI {pointer}"
+                );
+            }
+        }
+        for pointer in [
+            "/paths/~1agent~1sandboxes/post/responses/409",
+            "/paths/~1agent~1sandboxes~1write-directory/post/responses/400",
+            "/paths/~1agent~1sandboxes~1write-directory/post/responses/413",
+            "/paths/~1agent~1sandboxes~1write-file/post/responses/503",
+            "/paths/~1agent~1sandboxes~1exec/post/responses/404",
+            "/components/schemas/RemoteErrorBody",
+            "/components/schemas/SandboxHandle",
         ] {
             assert!(spec.pointer(pointer).is_some(), "missing OpenAPI {pointer}");
         }

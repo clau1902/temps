@@ -105,6 +105,7 @@ Set an environment variable
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | No |
+| `--preview` | Also include in current and future preview environments | - | No |
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
@@ -151,10 +152,10 @@ View or set CPU/memory resources for an environment
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
-| `--cpu <millicores>` | CPU limit in millicores (e.g., 500 = 0.5 CPU) | - | No |
+| `--cpu <millicores>` | CPU limit in millicores (1000 = 1 core, e.g., 500 = 0.5 CPU) | - | No |
 | `--memory <mb>` | Memory limit in MB (e.g., 512) | - | No |
-| `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | No |
-| `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | No |
+| `--cpu-request <millicores>` | CPU request in millicores (recorded; not currently enforced) | - | No |
+| `--memory-request <mb>` | Memory request in MB (recorded; not currently enforced) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments timeouts`

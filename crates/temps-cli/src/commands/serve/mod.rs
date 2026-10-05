@@ -5,10 +5,14 @@ pub(crate) mod admin_gate;
 mod admin_gate_handler;
 pub(crate) mod admin_gate_service;
 pub mod console;
+mod node_api;
 pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
 pub(crate) mod self_update;
 mod shutdown;
+pub(crate) mod startup_failure;
+pub(crate) mod stateless;
+pub(crate) mod upgrade_telemetry;
 
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
@@ -21,17 +25,86 @@ pub use proxy::start_proxy_server;
 const POST_MIGRATION_INDEX_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 const POST_MIGRATION_INDEX_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Bound on how long single-binary proxy startup waits for console plugin
-/// initialization (specifically, for a licensed plugin to claim
-/// `project_ip_gate_slot`) before starting to serve traffic anyway. See the
-/// comment at the call site for why this exists and why it is bounded
-/// rather than an unconditional wait.
+/// Compatibility bound for extra-plugin callers that have not migrated to
+/// independent proxy gate builders. Pending slots deny traffic after this
+/// interval rather than delaying the proxy indefinitely or becoming open.
 const PROJECT_IP_GATE_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+type ResolvedProxyGates = (
+    Option<Arc<dyn temps_core::ProjectIpGate>>,
+    Option<Arc<dyn temps_core::RequestPolicyGate>>,
+);
+
+fn independent_proxy_gate_mode(
+    has_extra_plugins: bool,
+    has_ip_gate_builder: bool,
+    has_request_policy_gate_builder: bool,
+) -> anyhow::Result<bool> {
+    if has_extra_plugins && has_ip_gate_builder != has_request_policy_gate_builder {
+        anyhow::bail!(
+            "Combined serve startup with extra plugins requires both proxy security gate \
+             builders or neither; provide an explicit open builder for an unsupported gate"
+        );
+    }
+    Ok(!has_extra_plugins || (has_ip_gate_builder && has_request_policy_gate_builder))
+}
+
+fn resolve_independent_proxy_gates(
+    db: Arc<temps_database::DbConnection>,
+    runtime: &tokio::runtime::Handle,
+    use_independent_proxy_gates: bool,
+    ip_gate_builder: Option<crate::commands::proxy::FallibleProjectIpGateBuilder>,
+    request_policy_gate_builder: Option<crate::commands::proxy::RequestPolicyGateBuilder>,
+) -> anyhow::Result<ResolvedProxyGates> {
+    let project_ip_gate = match ip_gate_builder {
+        Some(build) => Some(build(db.clone(), runtime).map_err(|error| {
+            anyhow::anyhow!("Failed to initialize the proxy project IP gate: {error}")
+        })?),
+        None if use_independent_proxy_gates => {
+            Some(Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>)
+        }
+        None => None,
+    };
+    let request_policy_gate = match request_policy_gate_builder {
+        Some(build) => Some(build(db, runtime).map_err(|error| {
+            anyhow::anyhow!("Failed to initialize the proxy request policy gate: {error}")
+        })?),
+        None if use_independent_proxy_gates => {
+            Some(Arc::new(temps_core::OpenRequestPolicyGate)
+                as Arc<dyn temps_core::RequestPolicyGate>)
+        }
+        None => None,
+    };
+    Ok((project_ip_gate, request_policy_gate))
+}
 
 fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::Duration {
     current
         .saturating_mul(2)
         .min(POST_MIGRATION_INDEX_MAX_RETRY)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum LocalStartupMigrationError {
+    #[error(transparent)]
+    InstallationMode(#[from] stateless::StatelessStartupError),
+    #[error(
+        "Local startup database migration failed after installation-mode validation: {source}"
+    )]
+    Migration {
+        #[source]
+        source: temps_core::ServiceError,
+    },
+}
+
+async fn run_local_mode_migrations(
+    db: &sea_orm::DatabaseConnection,
+    data_dir: &std::path::Path,
+) -> Result<Option<upgrade_telemetry::UpgradeProbe>, LocalStartupMigrationError> {
+    stateless::reject_local_mode_for_managed_database(db).await?;
+    upgrade_telemetry::run_migrations_reporting_upgrade(db, data_dir)
+        .await
+        .map_err(|source| LocalStartupMigrationError::Migration { source })
 }
 
 /// Which halves of the control plane this `temps serve` process runs.
@@ -55,6 +128,32 @@ pub enum ServeRole {
     /// bind :80/:443 and do NOT start the on-demand wake manager (those belong
     /// to the proxy process). Pair with a separate `temps proxy`.
     Console,
+}
+
+fn effective_proxy_listeners(
+    role: ServeRole,
+    address: &str,
+    tls_address: Option<&str>,
+    proxy_address: Option<&str>,
+    proxy_tls_address: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
+    match role {
+        ServeRole::All => Ok((address.to_string(), tls_address.map(str::to_string))),
+        ServeRole::Console => {
+            let proxy_address = proxy_address.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`temps serve --role=console` requires the sibling proxy address.\n\n\
+                     Set --proxy-address (or TEMPS_PROXY_ADDRESS), e.g. \
+                     `--proxy-address 127.0.0.1:8080`. Managed uptime checks and \
+                     plugin callback URLs need a proxy endpoint reachable from the console."
+                )
+            })?;
+            Ok((
+                proxy_address.to_string(),
+                proxy_tls_address.map(str::to_string),
+            ))
+        }
+    }
 }
 
 /// How much of the platform this `temps serve` process runs itself.
@@ -107,6 +206,18 @@ pub struct ServeCommand {
     /// TLS address to bind the server to
     #[arg(long, env = "TEMPS_TLS_ADDRESS")]
     pub tls_address: Option<String>,
+
+    /// Reachable address of the sibling proxy in split console mode.
+    ///
+    /// Required with `--role=console` so console-side services such as managed
+    /// uptime monitors do not mistake the console's unused `--address` value
+    /// for the application proxy listener.
+    #[arg(long, env = "TEMPS_PROXY_ADDRESS")]
+    pub proxy_address: Option<String>,
+
+    /// Reachable TLS address of the sibling proxy in split console mode.
+    #[arg(long, env = "TEMPS_PROXY_TLS_ADDRESS")]
+    pub proxy_tls_address: Option<String>,
 
     /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
@@ -196,7 +307,7 @@ pub struct ServeCommand {
 impl ServeCommand {
     /// Run `temps serve` with the OSS-only plugin set.
     pub fn execute(self) -> anyhow::Result<()> {
-        self.execute_with_extra_plugins(Vec::new())
+        self.execute_with_gates(Vec::new(), None, None)
     }
 
     /// Run `temps serve` with additional plugins registered alongside the
@@ -209,6 +320,32 @@ impl ServeCommand {
         self,
         extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
     ) -> anyhow::Result<()> {
+        self.execute_with_gates(extra_plugins, None, None)
+    }
+
+    /// Run `temps serve` with proxy security gates constructed independently
+    /// of console plugin initialization.
+    ///
+    /// A bundled binary should pass builders for every gate supplied by its
+    /// extra plugins. The builders run on the proxy's long-lived runtime before
+    /// the console task is spawned, so a slow or failed console cannot delay
+    /// deployed application traffic or leave a protected application open.
+    /// Existing extra-plugin callers that do not yet pass builders retain the
+    /// legacy, fail-closed console handoff until they migrate.
+    pub fn execute_with_gates(
+        self,
+        extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
+        ip_gate_builder: Option<crate::commands::proxy::FallibleProjectIpGateBuilder>,
+        request_policy_gate_builder: Option<crate::commands::proxy::RequestPolicyGateBuilder>,
+    ) -> anyhow::Result<()> {
+        let has_extra_plugins = !extra_plugins.is_empty();
+        let has_ip_gate_builder = ip_gate_builder.is_some();
+        let has_request_policy_gate_builder = request_policy_gate_builder.is_some();
+        let use_independent_proxy_gates = independent_proxy_gate_mode(
+            has_extra_plugins,
+            has_ip_gate_builder,
+            has_request_policy_gate_builder,
+        )?;
         let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
         if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
             warn!(
@@ -265,12 +402,20 @@ impl ServeCommand {
             );
         }
 
+        let (effective_proxy_address, effective_proxy_tls_address) = effective_proxy_listeners(
+            self.role,
+            &self.address,
+            self.tls_address.as_deref(),
+            self.proxy_address.as_deref(),
+            self.proxy_tls_address.as_deref(),
+        )?;
+
         let external_plugin_registry = temps_external_plugins::catalog::RegistryConfig::default();
 
         let serve_config = Arc::new(temps_config::ServerConfig::new(
-            self.address.clone(),
+            effective_proxy_address,
             self.database_url.clone(),
-            self.tls_address.clone(),
+            effective_proxy_tls_address,
             self.console_address.clone(),
         )?);
         let encryption_service = Arc::new(temps_core::EncryptionService::new(
@@ -296,8 +441,77 @@ impl ServeCommand {
         // leave both stranded -- the maintenance task unpolled and the pooled
         // sockets bound to a driver nothing runs -- and the first query issued
         // from the main runtime would hang forever.
+        // Declare the owner before the runtime so the runtime (including all
+        // detached plugin tasks) shuts down before the ownership guard drops.
+        let _control_plane_owner;
         let rt = tokio::runtime::Runtime::new()?;
-        let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
+        let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
+        _control_plane_owner = if bootstrap_stateless {
+            stateless::validate_profile(self.profile, self.role)?;
+            stateless::validate_scratch_directory(&serve_config.data_dir)?;
+            Some(rt.block_on(stateless::ControlPlaneOwner::acquire(&self.database_url))?)
+        } else {
+            None
+        };
+        let db = rt.block_on(temps_database::connect_without_migrations(
+            &self.database_url,
+        ))?;
+        let persisted_mode = rt.block_on(temps_config::installation_mode(db.as_ref()))?;
+        if persisted_mode.is_stateless() && !bootstrap_stateless {
+            rt.block_on(stateless::reject_local_mode_for_managed_database(
+                db.as_ref(),
+            ))?;
+        }
+        let stateless_mode = bootstrap_stateless || persisted_mode.is_stateless();
+        let storage_identity = if stateless_mode {
+            Some(stateless::storage_identity()?)
+        } else {
+            None
+        };
+        let upgrade_probe = if stateless_mode {
+            rt.block_on(stateless::preflight_identity(
+                db.as_ref(),
+                serve_config.as_ref(),
+                encryption_service.as_ref(),
+                storage_identity
+                    .as_ref()
+                    .map(|(instance, storage)| (instance.as_str(), storage.as_str())),
+            ))?;
+            rt.block_on(stateless::prepare_storage())?;
+            rt.block_on(upgrade_telemetry::run_migrations_reporting_upgrade(
+                db.as_ref(),
+                &serve_config.data_dir,
+            ))?
+        } else {
+            // This guard must remain before every migration and startup write.
+            // A local process pointed at a stateless-bound database must leave
+            // even pending schema/data migrations untouched when it refuses to
+            // start.
+            rt.block_on(run_local_mode_migrations(
+                db.as_ref(),
+                &serve_config.data_dir,
+            ))?
+        };
+        if let Some((instance_id, storage_identity)) = storage_identity {
+            rt.block_on(stateless::verify_identity(
+                db.clone(),
+                serve_config.clone(),
+                encryption_service.as_ref(),
+                &instance_id,
+                &storage_identity,
+            ))?;
+        }
+        // From this point onward runtime behavior follows only the durable
+        // database binding. The environment value above was consumed solely
+        // to bootstrap or authenticate adoption/replacement.
+        let stateless_mode = rt
+            .block_on(temps_config::installation_mode(db.as_ref()))?
+            .is_stateless();
+        if bootstrap_stateless && !stateless_mode {
+            anyhow::bail!(
+                "Stateless bootstrap completed without a persisted installation identity"
+            );
+        }
 
         // Update private address setting from CLI flag
         if let Some(ref private_address) = self.private_address {
@@ -355,8 +569,16 @@ impl ServeCommand {
 
         // Create the shared job queue FIRST — it is used by route table listeners
         // (to publish RouteTableUpdated) and by the console API (for all other jobs).
-        let (queue, _keep_alive_receiver): (Arc<dyn temps_core::JobQueue>, _) =
-            temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(1000);
+        let (queue, _keep_alive_receiver): (Arc<dyn temps_core::JobQueue>, _) = if stateless_mode {
+            (
+                rt.block_on(temps_queue::DurableBroadcastQueue::create(db.clone(), 1000))?,
+                None,
+            )
+        } else {
+            let (queue, receiver) =
+                temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(1000);
+            (queue, Some(receiver))
+        };
 
         // Create shared route table instance (used by both console API and proxy)
         let route_table = Arc::new(temps_proxy::CachedPeerTable::new_with_runtime_context(
@@ -599,18 +821,17 @@ impl ServeCommand {
         if let Some(ref on_demand_manager) = on_demand_manager {
             let on_demand_for_callback = Arc::clone(on_demand_manager);
             route_table.set_on_sleeping_callback(Arc::new(move |entries, on_demand_configs| {
-                on_demand_for_callback.clear_sleeping_domains();
-                for entry in entries {
-                    on_demand_for_callback.register_sleeping_domain(
-                        entry.domain.clone(),
+                on_demand_for_callback.replace_sleeping_domains(entries.into_iter().map(|entry| {
+                    (
+                        entry.domain,
                         temps_proxy::on_demand::SleepingEnvironmentInfo {
                             environment_id: entry.environment_id,
                             project_id: entry.project_id,
                             deployment_id: entry.deployment_id,
                             wake_timeout_seconds: entry.wake_timeout_seconds,
                         },
-                    );
-                }
+                    )
+                }));
                 // Register on-demand configs so the idle sweep can track awake environments
                 for config in on_demand_configs {
                     on_demand_for_callback.register_on_demand_environment(
@@ -791,7 +1012,16 @@ impl ServeCommand {
         // review: any object that influences auth, TLS/cert issuance, IP
         // blocklists, or rate limiting MUST NOT be shared across plugin
         // contexts this way.
-        let retention_resolver_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
+        //
+        // Default: stamp proxy-log rows from `observability_retention.
+        // proxy_logs_days`, refreshed in the background on this long-lived
+        // runtime, so the setting governs ClickHouse as it does TimescaleDB.
+        let settings_retention = rt.block_on(temps_config::settings_retention_resolver(Arc::new(
+            temps_config::ConfigService::new(serve_config.clone(), db.clone()),
+        )));
+        let retention_resolver_slot = Arc::new(temps_core::RetentionResolverSlot::with_default(
+            settings_retention,
+        ));
 
         // See the field doc on `ConsoleApiParams::project_ip_gate_slot` —
         // same shared-slot mechanism and construction site as
@@ -799,10 +1029,47 @@ impl ServeCommand {
         // review as an explicit exception rather than a second precedent.
         let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
         let request_policy_gate_slot = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
+        let overlay_dns_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
+
+        // Resolve proxy enforcement before console startup. These builders are
+        // the same extension boundary used by standalone `temps proxy`; they
+        // may hydrate caches and start refresh loops on this long-lived
+        // runtime. Any hydration failure aborts startup instead of serving a
+        // protected application with an open/default gate.
+        let (independent_project_ip_gate, independent_request_policy_gate) =
+            resolve_independent_proxy_gates(
+                db.clone(),
+                rt.handle(),
+                use_independent_proxy_gates,
+                ip_gate_builder,
+                request_policy_gate_builder,
+            )?;
+        if use_independent_proxy_gates {
+            if has_ip_gate_builder {
+                if let Some(gate) = independent_project_ip_gate.as_ref() {
+                    let _ = project_ip_gate_slot.set(Arc::clone(gate));
+                }
+            } else {
+                project_ip_gate_slot.finish_registration();
+            }
+            if has_request_policy_gate_builder {
+                if let Some(gate) = independent_request_policy_gate.as_ref() {
+                    let _ = request_policy_gate_slot.set(Arc::clone(gate));
+                }
+            } else {
+                request_policy_gate_slot.finish_registration();
+            }
+        }
+
+        // Startup outcome of the console, shared with the proxy so a failed
+        // start is explained on the console URL instead of a generic 503.
+        let console_startup_state =
+            Arc::new(temps_core::console_startup::ConsoleStartupState::new());
 
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
+            upgrade_probe,
             db: db.clone(),
             config: serve_config.clone(),
             cookie_crypto: cookie_crypto.clone(),
@@ -820,11 +1087,13 @@ impl ServeCommand {
             retention_resolver_slot: retention_resolver_slot.clone(),
             project_ip_gate_slot: project_ip_gate_slot.clone(),
             request_policy_gate_slot: request_policy_gate_slot.clone(),
+            overlay_dns_slot: overlay_dns_slot.clone(),
             update_status,
             self_updater,
             traefik_discovery: traefik_discovery_handle,
             external_plugin_registry,
             profile: self.profile,
+            startup_state: console_startup_state.clone(),
         };
 
         if self.role == ServeRole::Console {
@@ -862,88 +1131,66 @@ impl ServeCommand {
         // fails (e.g. Docker check, GeoIP validation, plugin init). Console API
         // requests will get connection-refused until the console finishes starting,
         // but that is far better than all proxied traffic being down.
+        let failure_state = console_startup_state.clone();
+        let console_url = serve_config.console_address.clone();
         rt.spawn(async move {
             match start_console_api(params).await {
                 Ok(()) => {
                     info!("Console API server exited normally");
                 }
                 Err(e) => {
+                    let failure = startup_failure::summarize(&e);
                     tracing::error!("❌ Console API failed to start: {}", e);
                     tracing::error!("Error details: {:?}", e);
                     tracing::error!(
+                        check = failure.check.code(),
+                        summary = %failure.summary,
+                        console_address = %console_url,
                         "The console management UI will not be available. \
-                         Proxied traffic to deployed applications is NOT affected."
+                         Proxied traffic to deployed applications is NOT affected. Requests \
+                         routed to the console get a status page with this cause (details \
+                         only for loopback and admin-allowed clients)."
                     );
+                    failure_state.record_failure(failure);
                 }
             }
         });
 
-        // Wait for the console's plugin two-phase init to finish before the
-        // proxy starts serving traffic — this is deliberately NOT the same
-        // thing as waiting for the console to be fully healthy (routers,
-        // middleware, admin gate, listener bind), which could take much
-        // longer or hang on something unrelated (Docker check, GeoIP
-        // validation, etc.) — exactly the "proxied traffic goes down because
-        // of a console problem" failure mode the comment above exists to
-        // avoid.
-        //
-        // The reason this wait exists at all: `project_ip_gate_slot` (see
-        // the security guardrail comment above) starts as `OpenIpGate`
-        // (allow everything) and is only claimed once plugin two-phase init
-        // completes — `ProxyPlugin::initialize` claims it from whatever
-        // `Arc<dyn ProjectIpGate>` an EE plugin registered, and that runs
-        // inside `initialize_plugins()`, nothing later. `console.rs` fires
-        // `ready_signal` (see its call site, right after "All plugins
-        // initialized successfully") at exactly that point — not at the end
-        // of `start_console_api` like it used to. Before that change
-        // (P1 security finding on PR #725), this wait was tied to the FULL
-        // console being ready, so every IP-restricted project was reachable
-        // by any client for however long the rest of console startup took,
-        // on every single boot. Now the wait resolves as soon as the one
-        // thing it actually depends on is done — deterministically, since
-        // plugin registration+init is in-memory service wiring with no
-        // listener bind, no HTTP router construction, and (bar a
-        // pathological plugin) no long-running I/O. The timeout below is a
-        // backstop against a genuinely hung plugin `initialize()`, not the
-        // expected path.
-        // `tokio::time::timeout(..)` must be constructed *inside* the
-        // runtime context `block_on` establishes, not as a bare argument
-        // evaluated on this plain sync thread before `block_on` starts --
-        // it eagerly builds a `Sleep` that registers with the current
-        // runtime's timer driver via `Handle::current()`, which panics
-        // ("there is no reactor running") if called with no ambient
-        // runtime. Wrapping it in an `async` block defers construction
-        // until `block_on` is already polling it.
-        match rt
-            .block_on(async { tokio::time::timeout(PROJECT_IP_GATE_STARTUP_GRACE, ready_rx).await })
-        {
-            Ok(Ok(())) => {
-                info!(
-                    "✅ Plugin init complete — any project IP gate a licensed plugin \
+        // Legacy extra-plugin callers without explicit builders still rely on
+        // console plugin discovery to fill the slots. Keep that compatibility
+        // wait bounded. Both slots remain fail-closed if discovery fails or
+        // hangs, so the timeout cannot turn a protected application public.
+        if !use_independent_proxy_gates {
+            match rt.block_on(async {
+                tokio::time::timeout(PROJECT_IP_GATE_STARTUP_GRACE, ready_rx).await
+            }) {
+                Ok(Ok(())) => {
+                    info!(
+                        "✅ Plugin init complete — any project IP gate a policy plugin \
                      installed is in place before the proxy starts serving"
-                );
-            }
-            Ok(Err(_)) => {
-                tracing::error!(
-                    "❌ Console plugin initialization failed — check error logs above. \
+                    );
+                }
+                Ok(Err(_)) => {
+                    tracing::error!(
+                        "❌ Console plugin initialization failed — check error logs above. \
                      Starting the proxy anyway (proxied traffic to deployed applications \
-                     is not held hostage by a console failure), but note: any \
-                     project-scoped IP restriction will NOT be enforced until the console \
-                     problem is resolved and the process is restarted."
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "⏳ Console plugin initialization did not complete within {:?} — this \
+                     is not held hostage by a console failure). Security policy discovery \
+                     remains pending and therefore fails closed."
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "⏳ Console plugin initialization did not complete within {:?} — this \
                      should not happen in normal operation (it means a plugin's own \
                      initialize() is hung, not merely that console startup is slow). \
-                     Starting the proxy anyway rather than blocking indefinitely. Any \
-                     project-scoped IP restriction will not be enforced until plugin \
-                     initialization finishes; this is a bounded, logged exposure window, \
-                     not the unbounded one this wait exists to close.",
-                    PROJECT_IP_GATE_STARTUP_GRACE
-                );
+                     Starting the proxy anyway rather than blocking indefinitely. Security \
+                     policy discovery remains pending and therefore fails closed.",
+                        PROJECT_IP_GATE_STARTUP_GRACE
+                    );
+                }
             }
+        } else {
+            debug!("Proxy security gates initialized independently of console plugins");
         }
 
         info!("Starting proxy server...");
@@ -964,6 +1211,10 @@ impl ServeCommand {
             retention_resolver_slot as Arc<dyn temps_core::RetentionResolver>,
             project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
             request_policy_gate_slot as Arc<dyn temps_core::RequestPolicyGate>,
+            overlay_dns_slot,
+            docker_handle,
+            self.profile.local_workloads_enabled(),
+            console_startup_state,
         )
     }
 }
@@ -972,6 +1223,7 @@ impl ServeCommand {
 mod serve_profile_tests {
     use super::*;
     use clap::Parser;
+    use sea_orm::{DatabaseBackend, MockDatabase};
 
     #[derive(Parser)]
     struct TestCli {
@@ -985,6 +1237,141 @@ mod serve_profile_tests {
         TestCli::try_parse_from(argv)
             .expect("serve arguments should parse")
             .serve
+    }
+
+    #[test]
+    fn independent_gate_builder_failure_aborts_before_console_startup() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let error = resolve_independent_proxy_gates(
+            db,
+            runtime.handle(),
+            true,
+            Some(Box::new(|_, _| {
+                Err(anyhow::anyhow!("protected policy snapshot unavailable"))
+            })),
+            None,
+        )
+        .err()
+        .expect("a failed gate hydration must abort startup");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("proxy project IP gate"), "{rendered}");
+        assert!(rendered.contains("snapshot unavailable"), "{rendered}");
+    }
+
+    #[test]
+    fn extra_plugins_reject_each_partial_gate_builder_combination() {
+        for (has_ip_gate, has_request_gate) in [(true, false), (false, true)] {
+            let error = independent_proxy_gate_mode(true, has_ip_gate, has_request_gate)
+                .expect_err("partial security gate builders must be rejected");
+            assert!(error.to_string().contains("requires both"), "{error}");
+        }
+    }
+
+    #[test]
+    fn request_policy_builder_failure_aborts_before_console_startup() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let error = resolve_independent_proxy_gates(
+            db,
+            runtime.handle(),
+            true,
+            None,
+            Some(Box::new(|_, _| {
+                Err(anyhow::anyhow!("firewall snapshot unavailable"))
+            })),
+        )
+        .err()
+        .expect("a failed request gate hydration must abort startup");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("proxy request policy gate"), "{rendered}");
+        assert!(rendered.contains("snapshot unavailable"), "{rendered}");
+    }
+
+    #[test]
+    fn oss_proxy_gates_are_ready_without_console_initialization() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let (ip_gate, request_gate) =
+            resolve_independent_proxy_gates(db, runtime.handle(), true, None, None)
+                .expect("OSS gates should resolve synchronously");
+
+        assert!(ip_gate.expect("OSS IP gate should be present").is_allowed(
+            1,
+            1,
+            "203.0.113.10".parse().expect("valid test IP")
+        ));
+        let context = temps_core::RequestPolicyContext {
+            project_id: 1,
+            environment_id: 1,
+            method: "GET",
+            path: "/",
+            host: "app.example.test",
+            client_ip: None,
+        };
+        assert!(matches!(
+            request_gate
+                .expect("OSS request gate should be present")
+                .evaluate(&context),
+            temps_core::RequestPolicyDecision::Continue
+        ));
+    }
+
+    struct DenyRequests;
+
+    impl temps_core::RequestPolicyGate for DenyRequests {
+        fn evaluate(
+            &self,
+            _context: &temps_core::RequestPolicyContext<'_>,
+        ) -> temps_core::RequestPolicyDecision {
+            temps_core::RequestPolicyDecision::Deny {
+                reason: "test policy",
+                rule_id: Some(7),
+                revision: Some(3),
+            }
+        }
+    }
+
+    #[test]
+    fn custom_request_policy_remains_enforced_without_console_initialization() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let (_, request_gate) = resolve_independent_proxy_gates(
+            db,
+            runtime.handle(),
+            true,
+            None,
+            Some(Box::new(|_, _| Ok(Arc::new(DenyRequests)))),
+        )
+        .expect("custom gate should initialize");
+        let slot = temps_core::RequestPolicyGateSlot::new_default();
+        assert!(slot.set(request_gate.expect("custom request gate should be present")));
+        let context = temps_core::RequestPolicyContext {
+            path: "/private",
+            method: "GET",
+            host: "app.example.test",
+            project_id: 1,
+            environment_id: 1,
+            client_ip: None,
+        };
+
+        assert!(matches!(
+            temps_core::RequestPolicyGate::evaluate(&slot, &context),
+            temps_core::RequestPolicyDecision::Deny {
+                rule_id: Some(7),
+                ..
+            }
+        ));
+        assert!(!slot.supports_worker_ingress());
+    }
+
+    #[test]
+    fn finalized_open_policy_supports_worker_ingress() {
+        let slot = temps_core::RequestPolicyGateSlot::new_default();
+        slot.finish_registration();
+        assert!(slot.supports_worker_ingress());
     }
 
     #[test]
@@ -1033,6 +1420,47 @@ mod serve_profile_tests {
     }
 
     #[test]
+    fn monolith_uses_its_bound_proxy_listeners() {
+        assert_eq!(
+            effective_proxy_listeners(
+                ServeRole::All,
+                "0.0.0.0:8080",
+                Some("0.0.0.0:8443"),
+                None,
+                None,
+            )
+            .expect("monolith listeners are self-contained"),
+            ("0.0.0.0:8080".to_string(), Some("0.0.0.0:8443".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_console_uses_explicit_sibling_proxy_listeners() {
+        assert_eq!(
+            effective_proxy_listeners(
+                ServeRole::Console,
+                "127.0.0.1:8085",
+                None,
+                Some("127.0.0.1:8080"),
+                Some("127.0.0.1:8443"),
+            )
+            .expect("split proxy listeners are explicit"),
+            (
+                "127.0.0.1:8080".to_string(),
+                Some("127.0.0.1:8443".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn split_console_rejects_missing_sibling_proxy_address() {
+        let error =
+            effective_proxy_listeners(ServeRole::Console, "127.0.0.1:8085", None, None, None)
+                .expect_err("split console must not use its parked address for probes");
+        assert!(error.to_string().contains("--proxy-address"));
+    }
+
+    #[test]
     fn only_the_full_profile_runs_local_workloads() {
         assert!(ServeProfile::Full.local_workloads_enabled());
         assert!(!ServeProfile::ControlPlane.local_workloads_enabled());
@@ -1053,6 +1481,7 @@ mod serve_profile_tests {
 #[cfg(test)]
 mod post_migration_tests {
     use super::*;
+    use sea_orm::ConnectionTrait;
 
     #[test]
     fn index_retry_backoff_grows_and_caps() {
@@ -1061,5 +1490,82 @@ mod post_migration_tests {
             delay = next_post_migration_index_retry(delay);
             assert_eq!(delay, std::time::Duration::from_secs(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn local_startup_rejects_bound_database_before_pending_migration() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!(
+                    "Skipping startup identity integration test: Docker unavailable: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("startup identity test database failed: {error}"),
+        };
+        let db = database.db.as_ref();
+        const STATELESS_MIGRATION: &str = "m20260922_000001_stateless_control_plane_jobs";
+
+        db.execute_unprepared(
+            "INSERT INTO stateless_control_plane \
+             (id, instance_id, management_url, storage_identity, secret_verifier) \
+             VALUES (1, 'bound-instance', 'https://console.example.test', \
+             'bound-storage', 'bound-verifier')",
+        )
+        .await
+        .expect("persist stateless installation binding");
+        db.execute_unprepared(&format!(
+            "DELETE FROM seaql_migrations WHERE version = '{STATELESS_MIGRATION}'"
+        ))
+        .await
+        .expect("mark the stateless migration pending without removing its binding");
+
+        let error = run_local_mode_migrations(db, &std::env::temp_dir())
+            .await
+            .expect_err("local startup must reject a stateless-bound database");
+        assert!(matches!(
+            error,
+            LocalStartupMigrationError::InstallationMode(
+                stateless::StatelessStartupError::Configuration { ref detail }
+            ) if detail.contains("TEMPS_STATELESS=true")
+        ));
+        assert!(
+            temps_database::get_pending_migration_names(db)
+                .await
+                .expect("read pending migrations after rejection")
+                .iter()
+                .any(|name| name == STATELESS_MIGRATION),
+            "the rejected startup must not apply its pending migration"
+        );
+
+        // Model a legitimate database from before the stateless identity
+        // migration existed. The same guarded local startup must accept the
+        // absent table and apply the pending migration normally.
+        db.execute_unprepared(
+            "DROP TABLE durable_job_deliveries; \
+             DROP TABLE durable_jobs; \
+             DROP TABLE stateless_cloud_backfill_checkpoints; \
+             DROP TABLE stateless_cloud_link_state; \
+             DROP TABLE stateless_control_plane;",
+        )
+        .await
+        .expect("restore the pre-identity schema");
+
+        run_local_mode_migrations(db, &std::env::temp_dir())
+            .await
+            .expect("fresh local startup should apply migrations");
+        assert!(
+            !temps_database::get_pending_migration_names(db)
+                .await
+                .expect("read pending migrations after startup")
+                .iter()
+                .any(|name| name == STATELESS_MIGRATION),
+            "legitimate local startup should apply the pending identity migration"
+        );
     }
 }

@@ -12,6 +12,7 @@ use bollard::Docker;
 use futures::{StreamExt, TryStreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_yaml::value::{Tag, TaggedValue};
 use serde_yaml::Value as YamlValue;
 use serde_yaml::{Mapping, Value};
 use std::collections::{HashMap, HashSet};
@@ -19,11 +20,41 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Weak};
 use temps_core::{DockerHandle, DockerUnavailable};
+use temps_entities::compose_security::{
+    ComposeSecurityCheck as PolicyCheck, ComposeSecurityPolicy,
+};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, info, warn};
+
+/// Owns the inspected local inputs until `compose config` finishes. Remote
+/// archives are retained only after validation, because effective runtime paths
+/// can refer to their assets throughout the deployment.
+struct ComposeReferenceSnapshots {
+    cache: tempfile::TempDir,
+    files: Vec<tempfile::NamedTempFile>,
+    remote: HashMap<String, (PathBuf, PathBuf)>,
+    resolved: HashMap<(PathBuf, PathBuf), PathBuf>,
+    active: HashSet<PathBuf>,
+    bytes: usize,
+}
+
+impl ComposeReferenceSnapshots {
+    fn new(root: &Path) -> Result<Self, ComposeError> {
+        Ok(Self {
+            cache: tempfile::Builder::new()
+                .prefix(".temps-compose-sources-")
+                .tempdir_in(root)?,
+            files: Vec::new(),
+            remote: HashMap::new(),
+            resolved: HashMap::new(),
+            active: HashSet::new(),
+            bytes: 0,
+        })
+    }
+}
 
 /// How long `deploy()` waits for every Compose service to report `running`
 /// (and `healthy`, if it defines a healthcheck) before failing the
@@ -47,6 +78,7 @@ const COMPOSE_UP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// quickly. Keep it bounded independently from image pulls so a wedged Compose
 /// plugin cannot stall a deployment after all images have already downloaded.
 const COMPOSE_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const COMPOSE_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A merged Compose model expands anchors and interpolation, so its output can
 /// be much larger than the source. Bound both memory and subsequent Docker API
@@ -95,7 +127,8 @@ const MAX_COMPOSE_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 /// in [`ComposeExecutor::capability_denial_remediation`]. A UI reshuffle that
 /// updated only one of them would send half of users to a page that no longer
 /// exists.
-pub const ELEVATED_PERMISSIONS_SETTINGS_PATH: &str = "Project Settings → Git → Compose services";
+pub const ELEVATED_PERMISSIONS_SETTINGS_PATH: &str =
+    "Project Settings → Build & deploy → Build → Docker Compose → Compose services";
 
 /// Keys an inline override may not set because [`ComposeExecutor`]'s
 /// deploy-time security policy rejects them outright, wherever they appear.
@@ -148,7 +181,6 @@ const REPO_ONLY_OVERRIDE_KEYS: &[&str] = &[
     "shm_size",
     "labels",
     "build",
-    "image",
     "env_file",
 ];
 const SAFE_DOCKER_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin";
@@ -168,7 +200,11 @@ const DOCKER_BINARY_CANDIDATES: &[&str] = &[
 /// clear the inherited environment, and restore the small set of non-secret
 /// Docker connection/configuration paths needed by legitimate installations.
 fn isolated_docker_command() -> tokio::process::Command {
-    let docker_binary = DOCKER_BINARY_CANDIDATES
+    isolated_docker_command_with_candidates(DOCKER_BINARY_CANDIDATES)
+}
+
+fn isolated_docker_command_with_candidates(candidates: &[&str]) -> tokio::process::Command {
+    let docker_binary = candidates
         .iter()
         .find(|candidate| std::path::Path::new(candidate).is_file())
         .copied()
@@ -207,7 +243,12 @@ pub enum ComposeError {
     #[error("Docker API error: {0}")]
     Docker(String),
 
-    #[error("Compose security policy rejected {field} for service '{service}': {reason}")]
+    #[error(
+        "Docker Compose v2 is unavailable: {reason}. Install the Docker Compose CLI plugin and verify it with `docker compose version`, then restart Temps"
+    )]
+    ComposeUnavailable { reason: String },
+
+    #[error("Compose security policy rejected {field} for service '{service}': {reason}. Review Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings; only instance administrators can change security checks. Invalid Compose values must be corrected in the Compose file")]
     SecurityPolicyViolation {
         service: String,
         field: String,
@@ -537,6 +578,69 @@ fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> St
     sanitized
 }
 
+/// Compose can echo values from repository and included env files in stderr.
+/// Classify its diagnostic instead of copying untrusted text into a deployment
+/// error, where readers may not have permission to view those values.
+fn safe_compose_config_failure(stderr: &[u8]) -> String {
+    let diagnostic = String::from_utf8_lossy(stderr);
+    let lower = diagnostic.to_ascii_lowercase();
+    let cause = if lower.contains("required variable") && lower.contains("missing a value") {
+        let variable =
+            Regex::new(r"(?i)\brequired variable ([a-z_][a-z0-9_]{0,63}) is missing a value")
+                .ok()
+                .and_then(|pattern| pattern.captures(&diagnostic))
+                .and_then(|captures| captures.get(1).map(|name| name.as_str().to_string()));
+        match variable {
+            Some(variable) => format!("Required Compose variable {variable} has no value. Set it in the project environment or .env file."),
+            None => "A required Compose variable has no value. Set it in the project environment or .env file.".to_string(),
+        }
+    } else if lower.contains("cannot extend service") && lower.contains("not found") {
+        "An extends reference names a service missing from its referenced Compose file. Check the extends.file and extends.service settings.".to_string()
+    } else if lower.contains("depends on undefined service") {
+        "A service depends on another service that is not defined in the combined Compose project. Check inherited depends_on entries and excluded services.".to_string()
+    } else if (lower.contains("env_file") || lower.contains("env file"))
+        && (lower.contains("not found") || lower.contains("no such file"))
+    {
+        "A required env_file is missing. Check its path relative to the Compose project directory."
+            .to_string()
+    } else if lower.contains("no such file") || lower.contains("file not found") {
+        "A referenced file is missing. Check Compose file, include, and extends paths.".to_string()
+    } else if lower.contains("validating ")
+        || lower.contains("additional properties are not allowed")
+        || lower.contains("must be a ")
+    {
+        let field = Regex::new(r"(?i)\bservices\.([a-z0-9_-]{1,64})\.([a-z_]+) must be a[n]? (array|object|boolean|string|integer|number)\b")
+            .ok()
+            .and_then(|pattern| pattern.captures(&diagnostic))
+            .and_then(|captures| {
+                let service = captures.get(1)?.as_str();
+                let field = captures.get(2)?.as_str();
+                let expected = captures.get(3)?.as_str();
+                matches!(field, "ports" | "environment" | "env_file" | "volumes" | "networks" | "depends_on" | "healthcheck" | "build" | "image" | "secrets" | "configs" | "labels" | "command" | "entrypoint")
+                    .then(|| format!("services.{service}.{field} expects a value of type {expected}."))
+            });
+        field.unwrap_or_else(|| "The Compose model has an invalid field or value type. Check the source file and project override.".to_string())
+    } else if lower.contains("yaml:")
+        || lower.contains("did not find expected key")
+        || lower.contains("mapping values are not allowed")
+    {
+        "A Compose file contains invalid YAML. Check its syntax and indentation.".to_string()
+    } else {
+        "Compose rejected the source files or project override.".to_string()
+    };
+
+    // Only numeric locations are copied from stderr. File names, field values,
+    // and quoted YAML can contain secrets from sources outside Temps' redaction set.
+    let line = Regex::new(r"(?i)\bline\s+([1-9][0-9]{0,5})\b")
+        .ok()
+        .and_then(|pattern| pattern.captures(&diagnostic))
+        .and_then(|captures| captures.get(1).map(|line| line.as_str().to_string()));
+    match line {
+        Some(line) => format!("{cause} Compose reported line {line}."),
+        None => cause.to_string(),
+    }
+}
+
 /// Request to deploy a Docker Compose stack.
 #[derive(Debug, Clone)]
 pub struct ComposeDeployRequest {
@@ -632,6 +736,8 @@ pub struct PreparedComposeDeploy {
 /// Docker Compose deployment executor.
 #[derive(Debug)]
 pub struct ComposeExecutor {
+    policy: temps_entities::compose_security::ComposeSecurityPolicy,
+    policy_authoritative: bool,
     /// The process-wide Docker client, which may be unavailable on a
     /// control-plane node that runs no local workloads. Every method that
     /// eventually needs the daemon calls [`Self::require_docker`] as late as
@@ -643,6 +749,60 @@ pub struct ComposeExecutor {
 }
 
 impl ComposeExecutor {
+    /// Immutable deployment-scoped grants, loaded by the workflow from administrator settings.
+    pub fn with_security_policy(
+        mut self,
+        policy: temps_entities::compose_security::ComposeSecurityPolicy,
+    ) -> Self {
+        self.policy = policy;
+        self.policy_authoritative = true;
+        self
+    }
+
+    fn enforced(&self, check: PolicyCheck) -> bool {
+        self.policy.enforced(check)
+    }
+
+    fn field_enforced(&self, field: &str) -> bool {
+        let check = match field {
+            "privileged" => PolicyCheck::Privileged,
+            "use_api_socket" => PolicyCheck::DockerSocket,
+            "cap_add" => PolicyCheck::Capabilities,
+            "devices" => PolicyCheck::Devices,
+            "device_cgroup_rules" => PolicyCheck::DeviceRules,
+            "security_opt" => PolicyCheck::SecurityOptions,
+            "gpus" => PolicyCheck::Gpu,
+            "extends" => PolicyCheck::Extends,
+            "volumes_from" => PolicyCheck::VolumesFrom,
+            "external_links" => PolicyCheck::ExternalLinks,
+            "label_file" => PolicyCheck::LabelFiles,
+            "post_start" | "pre_stop" => PolicyCheck::LifecycleHooks,
+            "provider" => PolicyCheck::Provider,
+            "container_name" => PolicyCheck::ContainerName,
+            "blkio_config" => PolicyCheck::Blkio,
+            "storage_opt" => PolicyCheck::StorageOptions,
+            "memswap_limit" => PolicyCheck::Swap,
+            "sysctls" => PolicyCheck::Sysctls,
+            "group_add" => PolicyCheck::Groups,
+            "cgroup_parent" => PolicyCheck::CgroupParent,
+            "runtime" => PolicyCheck::Runtime,
+            "oom_kill_disable" => PolicyCheck::OomKiller,
+            "tmpfs" => PolicyCheck::Tmpfs,
+            "ulimits" => PolicyCheck::Ulimits,
+            "build.privileged" => PolicyCheck::BuildPrivileged,
+            "build.entitlements" => PolicyCheck::BuildEntitlements,
+            "build.additional_contexts" => PolicyCheck::BuildAdditionalContexts,
+            "build.cache_from" => PolicyCheck::BuildCacheFrom,
+            "build.cache_to" => PolicyCheck::BuildCacheTo,
+            "build.tags" => PolicyCheck::BuildTags,
+            "build.ssh" => PolicyCheck::BuildSsh,
+            "build.shm_size" => PolicyCheck::BuildShm,
+            "build.ulimits" => PolicyCheck::BuildUlimits,
+            _ => return true,
+        };
+        self.enforced(check)
+    }
+
     /// Construct from a concrete Docker client.
     ///
     /// Existing callers pass an `Arc<Docker>` directly; this wraps it into a
@@ -661,7 +821,12 @@ impl ComposeExecutor {
     /// surfaced the first time an operation actually needs one, via
     /// [`Self::require_docker`].
     pub fn new_with_handle(docker: Arc<DockerHandle>, data_dir: PathBuf) -> Self {
-        Self { docker, data_dir }
+        Self {
+            docker,
+            data_dir,
+            policy: Default::default(),
+            policy_authoritative: false,
+        }
     }
 
     /// Resolve the Docker client for an operation that cannot proceed
@@ -672,6 +837,78 @@ impl ComposeExecutor {
     /// failure part-way through.
     fn require_docker(&self) -> Result<Arc<Docker>, ComposeError> {
         self.docker.require().map_err(ComposeError::from)
+    }
+
+    async fn require_compose_v2(&self) -> Result<(), ComposeError> {
+        let mut command = isolated_docker_command();
+        command.args(["compose", "version"]);
+        Self::check_compose_v2(command, COMPOSE_VERSION_TIMEOUT).await
+    }
+
+    async fn check_compose_v2(
+        mut command: tokio::process::Command,
+        timeout: std::time::Duration,
+    ) -> Result<(), ComposeError> {
+        command
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| ComposeError::ComposeUnavailable {
+                reason: format!("failed to run `docker compose version`: {error}"),
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ComposeError::ComposeUnavailable {
+                reason: "`docker compose version` did not expose stdout".to_string(),
+            })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ComposeError::ComposeUnavailable {
+                reason: "`docker compose version` did not expose stderr".to_string(),
+            })?;
+        let run = async {
+            let (stdout, stderr, status) = tokio::try_join!(
+                Self::read_bounded_stream(stdout),
+                Self::read_bounded_stream(stderr),
+                child.wait()
+            )?;
+            Ok::<_, std::io::Error>(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        };
+        let output = tokio::time::timeout(timeout, run)
+            .await
+            .map_err(|_| ComposeError::ComposeUnavailable {
+                reason: format!(
+                    "`docker compose version` did not finish within {} seconds",
+                    timeout.as_secs_f64()
+                ),
+            })?
+            .map_err(|error| ComposeError::ComposeUnavailable {
+                reason: format!("failed while running `docker compose version`: {error}"),
+            })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let reason = if stderr.is_empty() {
+            format!(
+                "`docker compose version` exited with status {}",
+                output.status
+            )
+        } else {
+            format!("`docker compose version` failed: {stderr}")
+        };
+        Err(ComposeError::ComposeUnavailable { reason })
     }
 
     /// Whether this executor was constructed with an available Docker
@@ -1295,6 +1532,38 @@ impl ComposeExecutor {
         // the actionable `DockerUnavailable` instead of a raw CLI failure
         // after files are already written to disk.
         self.require_docker()?;
+        // Docker Engine and the Compose CLI plugin are separate packages on
+        // Linux. Probe the exact isolated CLI environment used by every later
+        // command before writing files, building images, or allowing the
+        // workflow to stop the currently-serving stack.
+        self.require_compose_v2().await?;
+        let resolved_request;
+        let request = if self.needs_resolution(
+            &request.compose_content,
+            request.compose_override.as_deref(),
+        ) {
+            let (content, overrides) = self
+                .resolve_security_configuration(
+                    &request.project_name,
+                    request.repo_dir.as_deref(),
+                    request
+                        .compose_path
+                        .as_deref()
+                        .unwrap_or("docker-compose.yml"),
+                    &request.compose_content,
+                    request.compose_override.as_deref(),
+                    &request.environment_vars,
+                )
+                .await?;
+            resolved_request = ComposeDeployRequest {
+                compose_content: content,
+                compose_override: overrides,
+                ..request.clone()
+            };
+            &resolved_request
+        } else {
+            request
+        };
         Self::validate_service_dir_name(generation)?;
         let project_dir = self.project_dir(&request.project_name);
         let project_name = request.project_name.clone();
@@ -1318,17 +1587,22 @@ impl ComposeExecutor {
         self.validate_compose_security_policy("compose file", &request.compose_content)?;
         if let Some(ref compose_override) = request.compose_override {
             self.validate_compose_security_policy("compose override", compose_override)?;
-            Self::validate_compose_override(
+            Self::validate_compose_override_with_policy(
                 &request.project_name,
                 &request.compose_content,
                 compose_override,
+                &self.policy,
             )?;
         }
 
-        // Build/image selection is repository-owned. Inline overrides cannot
-        // alter either field, preventing a merge from assigning a daemon-global
-        // image tag to a build or changing the trusted pull/build decision.
-        let has_build = self.has_build_directives(&request.compose_content);
+        // The build definition stays in the repository. Inline image changes
+        // are allowed for image services, while BuildImage policy rejects an
+        // image tag on a built service by default.
+        let has_build = self.has_build_directives(&request.compose_content)
+            || request
+                .compose_override
+                .as_deref()
+                .is_some_and(|content| self.has_build_directives(content));
 
         // Every value that must never appear in a deployment error, including
         // the secrets this deploy is about to mount: a container that echoes
@@ -1359,18 +1633,20 @@ impl ComposeExecutor {
         // checkout and compose files exist but before build/up can touch the
         // host. This closes `./data -> /` style escapes for bind mounts,
         // configs/secrets, local-driver binds, and build paths.
-        Self::validate_compose_filesystem_confinement(
+        Self::validate_compose_filesystem_confinement_with_policy(
             &effective_dir,
             &compose_file,
             "compose file",
             &request.compose_content,
+            &self.policy,
         )?;
         if let Some(ref compose_override) = request.compose_override {
-            Self::validate_compose_filesystem_confinement(
+            Self::validate_compose_filesystem_confinement_with_policy(
                 &effective_dir,
                 &compose_file,
                 "compose override",
                 compose_override,
+                &self.policy,
             )?;
         }
 
@@ -1977,6 +2253,10 @@ impl ComposeExecutor {
                     ),
                 });
             }
+            if !self.enforced(PolicyCheck::EnvFiles) && Self::is_dangerous_host_path(&plan.path) {
+                // Docker reads this existing administrator-authorized file. Never synthesize or overwrite it.
+                continue;
+            }
             let destination =
                 Self::confined_write_path(project_dir, Path::new(&plan.path), "env_file")?;
             let contents = match &plan.source {
@@ -2148,10 +2428,11 @@ impl ComposeExecutor {
         // host Docker daemon — defense-in-depth alongside the value-level policy above.
         if let Some(ref user_override) = request.compose_override {
             if !user_override.trim().is_empty() {
-                Self::validate_compose_override(
+                Self::validate_compose_override_with_policy(
                     &request.project_name,
                     &request.compose_content,
                     user_override,
+                    &self.policy,
                 )?;
 
                 let override_path = Self::confined_write_path(
@@ -2411,6 +2692,578 @@ impl ComposeExecutor {
         })
     }
 
+    fn needs_resolution(&self, content: &str, override_content: Option<&str>) -> bool {
+        if override_content.is_some() {
+            return true;
+        }
+        if !self.enforced(PolicyCheck::Interpolation) && Self::contains_interpolation(content) {
+            return true;
+        }
+        let Ok(mut root) = serde_yaml::from_str::<Value>(content) else {
+            return false;
+        };
+        if root.apply_merge().is_err() {
+            return true;
+        }
+        Self::contains_compose_tag(&root)
+            || root.get("include").is_some()
+            || root
+                .get("services")
+                .and_then(Value::as_mapping)
+                .is_some_and(|services| {
+                    services
+                        .values()
+                        .any(|service| service.get("extends").is_some())
+                })
+    }
+
+    /// Resolve the user-owned model before discovery, exclusions, or generated overrides.
+    /// The Docker CLI supplies Compose's merge/path semantics; no build/pull/up runs here.
+    pub async fn resolve_security_configuration(
+        &self,
+        project_name: &str,
+        project_dir: Option<&Path>,
+        compose_file: &str,
+        content: &str,
+        override_content: Option<&str>,
+        environment: &HashMap<String, String>,
+    ) -> Result<(String, Option<String>), ComposeError> {
+        if !self.needs_resolution(content, override_content) {
+            return Ok((content.to_string(), override_content.map(str::to_string)));
+        }
+        let inline_root;
+        let root = match project_dir {
+            Some(root) => root,
+            None => {
+                Self::validate_service_dir_name(project_name)?;
+                inline_root = self.project_dir(project_name);
+                std::fs::create_dir_all(&inline_root)?;
+                &inline_root
+            }
+        };
+        Self::validate_relative_path(compose_file, "compose_path")?;
+        let canonical_root = std::fs::canonicalize(root)?;
+        let base = canonical_root
+            .join(compose_file)
+            .parent()
+            .ok_or_else(|| ComposeError::InvalidComposePath {
+                field: "compose_path".to_string(),
+                path: compose_file.to_string(),
+                reason: "missing parent directory".to_string(),
+            })?
+            .to_path_buf();
+        // File preparation still uses the non-bypassable confined-write guard.
+        Self::confined_write_path(&canonical_root, Path::new(compose_file), "compose_path")?;
+        let base = std::fs::canonicalize(&base)?;
+        let mut snapshots = ComposeReferenceSnapshots::new(&canonical_root)?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        let input = tokio::time::timeout_at(
+            deadline,
+            self.snapshot_compose_document(&canonical_root, &base, content, &mut snapshots),
+        )
+        .await
+        .map_err(|_| ComposeError::CommandFailed {
+            project: project_name.to_string(),
+            reason: "Compose reference resolution exceeded 120 seconds".to_string(),
+        })??;
+        let inline = if let Some(override_content) = override_content {
+            Self::validate_compose_override_with_policy(
+                project_name,
+                content,
+                override_content,
+                &self.policy,
+            )?;
+            let override_content =
+                Self::without_duplicate_extends(project_name, content, override_content)?;
+            Some(
+                tokio::time::timeout_at(
+                    deadline,
+                    self.snapshot_compose_document(
+                        &canonical_root,
+                        &base,
+                        &override_content,
+                        &mut snapshots,
+                    ),
+                )
+                .await
+                .map_err(|_| ComposeError::CommandFailed {
+                    project: project_name.to_string(),
+                    reason: "Compose reference resolution exceeded 120 seconds".to_string(),
+                })??,
+            )
+        } else {
+            None
+        };
+        // Inline port changes replace the repository and inherited ports.
+        // Compose normally appends port lists, and after this resolution the
+        // inline file is flattened away, so the later write-time strip cannot
+        // remove ports that came through `extends`. Reset them between the
+        // source and inline files while Compose still knows their provenance.
+        let port_reset = if let (Some(override_content), Some(_)) = (override_content, &inline) {
+            if let Some(content) = Self::port_reset_override(project_name, override_content)? {
+                let file = tempfile::Builder::new()
+                    .prefix(".temps-compose-port-reset-")
+                    .suffix(".yml")
+                    .tempfile_in(&base)?;
+                std::fs::write(file.path(), content)?;
+                Some(file)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let variables = tempfile::Builder::new()
+            .prefix(".temps-compose-env-")
+            .tempfile_in(&base)?;
+        std::fs::write(variables.path(), render_env_file(environment)?)?;
+        let mut cmd = isolated_docker_command();
+        cmd.args(["compose", "-p", project_name, "--project-directory"])
+            .arg(&base)
+            .arg("-f")
+            .arg(&input);
+        if let Some(reset) = &port_reset {
+            cmd.arg("-f").arg(reset.path());
+        }
+        if let Some(inline) = inline {
+            cmd.arg("-f").arg(inline);
+        }
+        let env = canonical_root.join(".env");
+        if env.exists() {
+            let env = Self::confined_reference(&canonical_root, &canonical_root, ".env")?;
+            cmd.arg("--env-file").arg(env);
+        }
+        // Platform environment values override repository defaults, matching deployment.
+        cmd.arg("--env-file").arg(variables.path());
+        cmd.args([
+            "config",
+            "--no-normalize",
+            "--no-path-resolution",
+            "--no-env-resolution",
+        ])
+        .current_dir(&base);
+        let output = Self::bounded_command_output(
+            cmd,
+            COMPOSE_CONFIG_TIMEOUT,
+            project_name,
+            "resolve Compose security configuration",
+        )
+        .await?;
+        if !output.status.success() {
+            let cause = safe_compose_config_failure(&output.stderr);
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "Compose configuration resolution failed ({}). {cause} Run docker compose config against the same source files, override, and environment for the full diagnostic.",
+                    output.status
+                ),
+            });
+        }
+        let resolved =
+            String::from_utf8(output.stdout).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: project_name.to_string(),
+                reason: format!("resolved configuration is not UTF-8: {error}"),
+            })?;
+        self.validate_compose_security_policy("resolved Compose configuration", &resolved)?;
+        Self::validate_compose_filesystem_confinement_with_policy(
+            &canonical_root,
+            compose_file,
+            "resolved Compose configuration",
+            &resolved,
+            &self.policy,
+        )?;
+        // Effective file/build paths may point into these archives. Keep them with
+        // the deployment checkout; its lifecycle owns their cleanup.
+        if let Some(cache_name) = snapshots
+            .cache
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+        {
+            self.validate_remote_runtime_assets(&resolved, cache_name)?;
+            if resolved.contains(cache_name) {
+                if project_dir.is_none() {
+                    return Err(ComposeError::InvalidComposePath {
+                        field: "Compose reference".to_string(), path: "<remote assets>".to_string(),
+                        reason: "remote build contexts and environment files require a repository-backed deployment; vendor these assets into a repository".to_string(),
+                    });
+                }
+                let _ = snapshots.cache.keep();
+            }
+        }
+        Ok((resolved, None))
+    }
+
+    /// The workflow removes its checkout after deployment. Image builds and env
+    /// files are consumed before cleanup, but bind/config/secret mounts must live
+    /// for the entire container lifetime and cannot point into fetched archives.
+    fn validate_remote_runtime_assets(
+        &self,
+        content: &str,
+        cache_name: &str,
+    ) -> Result<(), ComposeError> {
+        let yaml: Value =
+            serde_yaml::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "resolved Compose configuration".to_string(),
+                reason: error.to_string(),
+            })?;
+        let reject = |service: &str, field: &str, value: &Value| -> Result<(), ComposeError> {
+            if value.as_str().is_some_and(|path| path.contains(cache_name)) {
+                return Err(ComposeError::InvalidComposePath {
+                    field: format!("{service}.{field}"), path: "<remote runtime asset>".to_string(),
+                    reason: "remote Compose bind mounts, config files and secret files cannot outlive the deployment checkout; vendor runtime files locally or use named volumes".to_string(),
+                });
+            }
+            Ok(())
+        };
+        for field in ["configs", "secrets"] {
+            if let Some(definitions) = yaml.get(field).and_then(Value::as_mapping) {
+                for (name, definition) in definitions {
+                    if let Some(file) = definition.get("file") {
+                        reject(name.as_str().unwrap_or("<resource>"), field, file)?;
+                    }
+                }
+            }
+        }
+        if let Some(services) = yaml.get("services").and_then(Value::as_mapping) {
+            for (name, service) in services {
+                if let Some(volumes) = service.get("volumes").and_then(Value::as_sequence) {
+                    for volume in volumes {
+                        reject(
+                            name.as_str().unwrap_or("<service>"),
+                            "volumes",
+                            volume.get("source").unwrap_or(volume),
+                        )?;
+                    }
+                }
+            }
+        }
+        if let Some(volumes) = yaml.get("volumes").and_then(Value::as_mapping) {
+            for (name, volume) in volumes {
+                if let Some(device) = volume
+                    .get("driver_opts")
+                    .and_then(|options| options.get("device"))
+                {
+                    reject(
+                        name.as_str().unwrap_or("<volume>"),
+                        "driver_opts.device",
+                        device,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn snapshot_compose_document(
+        &self,
+        scope: &Path,
+        base: &Path,
+        content: &str,
+        snapshots: &mut ComposeReferenceSnapshots,
+    ) -> Result<PathBuf, ComposeError> {
+        let canonical_scope = std::fs::canonicalize(scope)?;
+        let scope = canonical_scope.as_path();
+        let canonical_base = std::fs::canonicalize(base)?;
+        let base = canonical_base.as_path();
+        snapshots.bytes = snapshots.bytes.saturating_add(content.len());
+        if snapshots.bytes > MAX_RESOLVED_COMPOSE_CONFIG_BYTES
+            || snapshots.files.len() + snapshots.active.len() >= 128
+        {
+            return Err(ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: "<references>".to_string(),
+                reason: "Compose references exceed the resolution size/file limit".to_string(),
+            });
+        }
+        self.validate_source_security(content)?;
+        if self.enforced(PolicyCheck::EnvFiles) && base.join(".env").symlink_metadata().is_ok() {
+            Self::confined_reference(scope, base, ".env")?;
+        }
+        let mut yaml: Value =
+            serde_yaml::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "Compose reference".to_string(),
+                reason: error.to_string(),
+            })?;
+        yaml.apply_merge()
+            .map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "Compose reference".to_string(),
+                reason: error.to_string(),
+            })?;
+        if let Some(services) = yaml.get_mut("services").and_then(Value::as_mapping_mut) {
+            for (name, definition) in services.iter_mut() {
+                // Some Compose versions read inherited env_file values even
+                // with --no-env-resolution. Check every existing path prefix
+                // before config can consume a symlink and erase its origin.
+                if self.enforced(PolicyCheck::EnvFiles) {
+                    if let Some(env) = definition.get("env_file") {
+                        for file in env.as_str().into_iter().chain(
+                            env.as_sequence().into_iter().flatten().filter_map(|entry| {
+                                entry
+                                    .as_str()
+                                    .or_else(|| entry.get("path").and_then(Value::as_str))
+                            }),
+                        ) {
+                            Self::validate_confined_bind_path(
+                                scope,
+                                base,
+                                file,
+                                name.as_str().unwrap_or("<source>"),
+                                "env_file",
+                            )?;
+                        }
+                    }
+                }
+                if let Some(file) = definition
+                    .get_mut("extends")
+                    .and_then(|v| v.get_mut("file"))
+                {
+                    self.snapshot_compose_reference(scope, base, file, None, snapshots)
+                        .await?;
+                }
+            }
+        }
+        if let Some(includes) = yaml.get_mut("include").and_then(Value::as_sequence_mut) {
+            for include in includes {
+                if include.is_string() {
+                    self.snapshot_compose_reference(scope, base, include, None, snapshots)
+                        .await?;
+                } else {
+                    let project_directory = include
+                        .get("project_directory")
+                        .and_then(Value::as_str)
+                        .map(|directory| Self::confined_reference(scope, base, directory))
+                        .transpose()?;
+                    if let Some(directory) = &project_directory {
+                        if self.enforced(PolicyCheck::EnvFiles)
+                            && directory.join(".env").symlink_metadata().is_ok()
+                        {
+                            Self::confined_reference(scope, directory, ".env")?;
+                        }
+                    }
+                    if self.enforced(PolicyCheck::EnvFiles) {
+                        if let Some(env) = include.get("env_file") {
+                            for file in env.as_str().into_iter().chain(
+                                env.as_sequence()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(Value::as_str),
+                            ) {
+                                Self::confined_reference(scope, base, file)?;
+                            }
+                        }
+                    }
+                    if let Some(path) = include.get_mut("path") {
+                        if let Some(paths) = path.as_sequence_mut() {
+                            let mut working_directory = project_directory.clone();
+                            for path in paths {
+                                let snapshot = self
+                                    .snapshot_compose_reference(
+                                        scope,
+                                        base,
+                                        path,
+                                        working_directory.as_deref(),
+                                        snapshots,
+                                    )
+                                    .await?;
+                                if working_directory.is_none() {
+                                    working_directory = snapshot.parent().map(Path::to_path_buf);
+                                }
+                            }
+                        } else {
+                            self.snapshot_compose_reference(
+                                scope,
+                                base,
+                                path,
+                                project_directory.as_deref(),
+                                snapshots,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
+        let file = tempfile::Builder::new()
+            .prefix(".temps-compose-resolve-")
+            .suffix(".yml")
+            .tempfile_in(base)?;
+        let path = file.path().to_path_buf();
+        let serialized =
+            serde_yaml::to_string(&yaml).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "Compose reference".to_string(),
+                reason: error.to_string(),
+            })?;
+        std::fs::write(&path, serialized)?;
+        snapshots.files.push(file);
+        Ok(path)
+    }
+
+    async fn snapshot_compose_reference(
+        &self,
+        scope: &Path,
+        base: &Path,
+        reference: &mut Value,
+        working_directory: Option<&Path>,
+        snapshots: &mut ComposeReferenceSnapshots,
+    ) -> Result<PathBuf, ComposeError> {
+        let file = reference
+            .as_str()
+            .ok_or_else(|| ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: "<reference>".to_string(),
+                reason: "Compose reference must be a literal file path or supported HTTPS Git URL"
+                    .to_string(),
+            })?;
+        if Self::contains_interpolation(file) {
+            return Err(ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: "<reference>".to_string(),
+                reason: "Compose reference paths must not contain interpolation".to_string(),
+            });
+        }
+        let (path, scope) = if file.contains("://") || file.starts_with("git@") {
+            if let Some(paths) = snapshots.remote.get(file) {
+                paths.clone()
+            } else {
+                if snapshots.remote.len() >= 4 {
+                    return Err(ComposeError::InvalidComposePath {
+                        field: "Compose reference".to_string(), path: "<remote sources>".to_string(),
+                        reason: "at most four remote Compose sources may be resolved per deployment; vendor additional sources into the checkout".to_string(),
+                    });
+                }
+                let paths =
+                    crate::compose_remote::materialize(file, snapshots.cache.path()).await?;
+                snapshots.remote.insert(file.to_string(), paths.clone());
+                paths
+            }
+        } else {
+            (
+                Self::confined_reference(scope, base, file)?,
+                scope.to_path_buf(),
+            )
+        };
+        let scope = std::fs::canonicalize(scope)?;
+        let directory = working_directory.or_else(|| path.parent()).ok_or_else(|| {
+            ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: file.to_string(),
+                reason: "Compose reference has no working directory".to_string(),
+            }
+        })?;
+        let directory = Self::confined_reference(&scope, &scope, &directory.to_string_lossy())?;
+        let key = (path.clone(), directory.clone());
+        let snapshot = if let Some(snapshot) = snapshots.resolved.get(&key) {
+            snapshot.clone()
+        } else {
+            if !snapshots.active.insert(path.clone()) {
+                return Err(ComposeError::InvalidComposePath {
+                    field: "Compose reference".to_string(),
+                    path: file.to_string(),
+                    reason: "cyclic Compose reference".to_string(),
+                });
+            }
+            let metadata = std::fs::metadata(&path)?;
+            if !metadata.is_file() {
+                return Err(ComposeError::InvalidComposePath {
+                    field: "Compose reference".to_string(),
+                    path: file.to_string(),
+                    reason: "Compose references must be regular files".to_string(),
+                });
+            }
+            if metadata.len() > MAX_RESOLVED_COMPOSE_CONFIG_BYTES as u64 {
+                return Err(ComposeError::InvalidComposePath {
+                    field: "Compose reference".to_string(),
+                    path: file.to_string(),
+                    reason: "Compose reference exceeds the file size limit".to_string(),
+                });
+            }
+            let content = std::fs::read_to_string(&path)?;
+            let snapshot =
+                Box::pin(self.snapshot_compose_document(&scope, &directory, &content, snapshots))
+                    .await?;
+            snapshots.active.remove(&path);
+            snapshots.resolved.insert(key, snapshot.clone());
+            snapshot
+        };
+        *reference = Value::String(snapshot.to_string_lossy().into_owned());
+        Ok(snapshot)
+    }
+
+    fn confined_reference(root: &Path, base: &Path, file: &str) -> Result<PathBuf, ComposeError> {
+        if Self::contains_interpolation(file) {
+            return Err(ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: file.to_string(),
+                reason: "Compose reference paths must be literal project files".to_string(),
+            });
+        }
+        let path = std::fs::canonicalize(base.join(file)).map_err(|error| {
+            ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: file.to_string(),
+                reason: format!("cannot resolve referenced file: {error}"),
+            }
+        })?;
+        if !path.starts_with(root) {
+            return Err(ComposeError::InvalidComposePath {
+                field: "Compose reference".to_string(),
+                path: file.to_string(),
+                reason: "Compose references must remain inside the project checkout".to_string(),
+            });
+        }
+        Ok(path)
+    }
+
+    fn validate_source_security(&self, content: &str) -> Result<(), ComposeError> {
+        let mut source: Value =
+            serde_yaml::from_str(content).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "Compose source".to_string(),
+                reason: error.to_string(),
+            })?;
+        source
+            .apply_merge()
+            .map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "Compose source".to_string(),
+                reason: error.to_string(),
+            })?;
+        if let Some(services) = source.get_mut("services").and_then(Value::as_mapping_mut) {
+            for (name, definition) in services.iter_mut() {
+                if let Some(service) = definition.as_mapping_mut() {
+                    self.reject_interpolation_in_guarded_fields(
+                        service,
+                        name.as_str().unwrap_or("<source>"),
+                    )?;
+                    // Only read-sensitive fields are consumed by `config` itself.
+                    // Runtime values (including inherited shm_size) must be checked
+                    // after Compose applies extends, overrides and !reset tags.
+                    service.retain(|key, _| {
+                        matches!(key.as_str(), Some("extends" | "label_file" | "env_file"))
+                    });
+                }
+            }
+        }
+        if let Some(root) = source.as_mapping_mut() {
+            root.remove("volumes");
+            root.remove("networks");
+        }
+        let source =
+            serde_yaml::to_string(&source).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: "Compose source".to_string(),
+                reason: error.to_string(),
+            })?;
+        self.validate_compose_security_policy("Compose source", &source)
+    }
+
+    fn contains_compose_tag(value: &Value) -> bool {
+        match value {
+            Value::Tagged(_) => true,
+            Value::Sequence(values) => values.iter().any(Self::contains_compose_tag),
+            Value::Mapping(values) => values.values().any(Self::contains_compose_tag),
+            _ => false,
+        }
+    }
+
     /// Preflight security validation. Run this BEFORE tearing down the existing
     /// stack so a policy rejection does not cause downtime on the running deployment.
     pub fn preflight_validate(
@@ -2421,10 +3274,11 @@ impl ComposeExecutor {
         self.validate_compose_security_policy("compose file", compose_content)?;
         if let Some(override_content) = compose_override {
             self.validate_compose_security_policy("compose override", override_content)?;
-            Self::validate_compose_override(
+            Self::validate_compose_override_with_policy(
                 "compose-preflight",
                 compose_content,
                 override_content,
+                &self.policy,
             )?;
         }
         Ok(())
@@ -2440,18 +3294,20 @@ impl ComposeExecutor {
         compose_content: &str,
         compose_override: Option<&str>,
     ) -> Result<(), ComposeError> {
-        Self::validate_compose_filesystem_confinement(
+        Self::validate_compose_filesystem_confinement_with_policy(
             project_dir,
             compose_file,
             "compose file",
             compose_content,
+            &self.policy,
         )?;
         if let Some(override_content) = compose_override {
-            Self::validate_compose_filesystem_confinement(
+            Self::validate_compose_filesystem_confinement_with_policy(
                 project_dir,
                 compose_file,
                 "compose override",
                 override_content,
+                &self.policy,
             )?;
         }
 
@@ -2522,7 +3378,9 @@ impl ComposeExecutor {
         // reintroduce privileged services, host mounts, etc. Inline the
         // referenced services into the reviewed compose file instead.
         if let Some(root_map) = root.as_mapping() {
-            if root_map.contains_key(YamlValue::String("include".to_string())) {
+            if self.enforced(PolicyCheck::Include)
+                && root_map.contains_key(YamlValue::String("include".to_string()))
+            {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: "<top-level>".to_string(),
                     field: "include".to_string(),
@@ -2744,12 +3602,12 @@ impl ComposeExecutor {
                         reason: "shared-memory size must be a positive byte count or a value such as '128m', '256mb', or '512MiB'".to_string(),
                     }
                 })?;
-                if bytes > MAX_SERVICE_SHM_BYTES {
+                if self.enforced(PolicyCheck::ServiceShm) && bytes > MAX_SERVICE_SHM_BYTES {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: service_name.to_string(),
                         field: "shm_size".to_string(),
                         reason: format!(
-                            "shared-memory size is limited to {} MiB per service",
+                            "'Limit service shared memory' (Resources) limits shared-memory size to {} MiB per service; lower shm_size or disable that check for a trusted stack",
                             MAX_SERVICE_SHM_BYTES / 1024 / 1024
                         ),
                     });
@@ -2762,12 +3620,14 @@ impl ComposeExecutor {
                             .to_string(),
                     }
                 })?;
-                if total_shm_bytes > MAX_COMPOSE_SHM_BYTES {
+                if self.enforced(PolicyCheck::AggregateShm)
+                    && total_shm_bytes > MAX_COMPOSE_SHM_BYTES
+                {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: service_name.to_string(),
                         field: "shm_size".to_string(),
                         reason: format!(
-                            "aggregate shared-memory sizing is limited to {} MiB per Compose deployment",
+                            "'Limit aggregate shared memory' (Resources) limits total shared-memory size to {} MiB per Compose deployment; lower the stack total or disable that check for a trusted stack",
                             MAX_COMPOSE_SHM_BYTES / 1024 / 1024
                         ),
                     });
@@ -2834,7 +3694,9 @@ impl ComposeExecutor {
                 });
             };
 
-            if options.contains_key(YamlValue::String("name".to_string())) {
+            if self.enforced(PolicyCheck::NetworkNames)
+                && options.contains_key(YamlValue::String("name".to_string()))
+            {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: "<top-level>".to_string(),
                     field: format!("networks.{name}.name"),
@@ -2843,7 +3705,10 @@ impl ComposeExecutor {
                 });
             }
             if let Some(external) = options.get(YamlValue::String("external".to_string())) {
-                if !external.is_null() && external.as_bool() != Some(false) {
+                if self.enforced(PolicyCheck::ExternalNetworks)
+                    && !external.is_null()
+                    && external.as_bool() != Some(false)
+                {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: "<top-level>".to_string(),
                         field: format!("networks.{name}.external"),
@@ -2861,7 +3726,7 @@ impl ComposeExecutor {
                         reason: "network driver must be the literal value 'bridge'".to_string(),
                     });
                 };
-                if driver != "bridge" {
+                if self.enforced(PolicyCheck::NetworkDrivers) && driver != "bridge" {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: "<top-level>".to_string(),
                         field: format!("networks.{name}.driver"),
@@ -2873,7 +3738,12 @@ impl ComposeExecutor {
                 }
             }
             for field in ["driver_opts", "ipam"] {
-                if options.contains_key(YamlValue::String(field.to_string())) {
+                if self.enforced(if field == "ipam" {
+                    PolicyCheck::NetworkIpam
+                } else {
+                    PolicyCheck::NetworkOptions
+                }) && options.contains_key(YamlValue::String(field.to_string()))
+                {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: "<top-level>".to_string(),
                         field: format!("networks.{name}.{field}"),
@@ -2926,7 +3796,9 @@ impl ComposeExecutor {
                 });
             };
 
-            if def_map.contains_key(YamlValue::String("name".to_string())) {
+            if self.enforced(PolicyCheck::VolumeNames)
+                && def_map.contains_key(YamlValue::String("name".to_string()))
+            {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: format!("volumes.{name}"),
                     field: format!("volumes.{name}.name"),
@@ -2935,7 +3807,10 @@ impl ComposeExecutor {
                 });
             }
             if let Some(external) = def_map.get(YamlValue::String("external".to_string())) {
-                if !external.is_null() && external.as_bool() != Some(false) {
+                if self.enforced(PolicyCheck::ExternalVolumes)
+                    && !external.is_null()
+                    && external.as_bool() != Some(false)
+                {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: format!("volumes.{name}"),
                         field: format!("volumes.{name}.external"),
@@ -2957,7 +3832,7 @@ impl ComposeExecutor {
                         reason: "volume driver must be the literal value 'local'".to_string(),
                     });
                 };
-                if driver != "local" {
+                if self.enforced(PolicyCheck::VolumeDrivers) && driver != "local" {
                     forbidden.insert(name.to_string());
                     continue;
                 }
@@ -2967,7 +3842,34 @@ impl ComposeExecutor {
             else {
                 continue;
             };
-            let _ = driver_opts_value;
+            let options =
+                driver_opts_value
+                    .as_mapping()
+                    .ok_or_else(|| ComposeError::InvalidComposeYaml {
+                        compose_source: format!("volume '{name}'"),
+                        reason: "driver_opts must be a mapping".to_string(),
+                    })?;
+            let fs_type = options
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let network_fs = ["nfs", "nfs4", "cifs", "smb", "smbfs", "glusterfs", "ceph"]
+                .contains(&fs_type.to_ascii_lowercase().as_str());
+            let bind = fs_type == "none"
+                || options
+                    .get("o")
+                    .and_then(Value::as_str)
+                    .is_some_and(|o| o.split(',').any(|v| v == "bind"));
+            let check = if network_fs {
+                PolicyCheck::VolumeNetworkFilesystems
+            } else if bind {
+                PolicyCheck::VolumeHostPaths
+            } else {
+                PolicyCheck::VolumeOptions
+            };
+            if !self.enforced(check) {
+                continue;
+            }
             return Err(ComposeError::SecurityPolicyViolation {
                 service: format!("volumes.{name}"),
                 field: format!("volumes.{name}.driver_opts"),
@@ -2991,6 +3893,16 @@ impl ComposeExecutor {
                 reason: format!("top-level {key} must be a mapping"),
             });
         };
+        let paths = if key == "configs" {
+            PolicyCheck::ConfigPaths
+        } else {
+            PolicyCheck::SecretPaths
+        };
+        let external_check = if key == "configs" {
+            PolicyCheck::ExternalConfigs
+        } else {
+            PolicyCheck::ExternalSecrets
+        };
         for (name, def) in map {
             let name = name.as_str().unwrap_or("<unknown>");
             if def.is_null() {
@@ -3003,7 +3915,9 @@ impl ComposeExecutor {
                     reason: format!("{key} configuration must be a mapping"),
                 });
             };
-            if def_map.contains_key(YamlValue::String("name".to_string())) {
+            if self.enforced(external_check)
+                && def_map.contains_key(YamlValue::String("name".to_string()))
+            {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: format!("{key}.{name}"),
                     field: format!("{key}.{name}.name"),
@@ -3013,7 +3927,10 @@ impl ComposeExecutor {
                 });
             }
             if let Some(external) = def_map.get(YamlValue::String("external".to_string())) {
-                if !external.is_null() && external.as_bool() != Some(false) {
+                if self.enforced(external_check)
+                    && !external.is_null()
+                    && external.as_bool() != Some(false)
+                {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: format!("{key}.{name}"),
                         field: format!("{key}.{name}.external"),
@@ -3031,7 +3948,7 @@ impl ComposeExecutor {
                         reason: format!("{key} file must be a confined literal path"),
                     });
                 };
-                if Self::is_dangerous_host_path(file) {
+                if self.enforced(paths) && Self::is_dangerous_host_path(file) {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: format!("{key}.{name}"),
                         field: format!("{key}.file"),
@@ -3055,14 +3972,17 @@ impl ComposeExecutor {
         // Short form (`build: .`) is itself a context path. It needs the same
         // lexical and canonical checks as long-form `build.context`.
         if let Some(context) = build.as_str() {
-            if Self::is_remote_build_context(context) {
+            if self.enforced(PolicyCheck::RemoteBuild) && Self::is_remote_build_context(context) {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "build.context".to_string(),
                     reason: "remote build contexts are not allowed because Docker would fetch them from the host network".to_string(),
                 });
             }
-            if Self::is_dangerous_host_path(context) {
+            if self.enforced(PolicyCheck::BuildContext)
+                && !Self::is_remote_build_context(context)
+                && Self::is_dangerous_host_path(context)
+            {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "build.context".to_string(),
@@ -3084,6 +4004,7 @@ impl ComposeExecutor {
         if let Some(privileged) = build_map.get(YamlValue::String("privileged".to_string())) {
             match privileged.as_bool() {
                 Some(false) => {}
+                Some(true) if !self.enforced(PolicyCheck::BuildPrivileged) => {}
                 Some(true) => {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: service_name.to_string(),
@@ -3101,7 +4022,9 @@ impl ComposeExecutor {
                 }
             }
         }
-        if build_map.contains_key(YamlValue::String("entitlements".to_string())) {
+        if self.enforced(PolicyCheck::BuildEntitlements)
+            && build_map.contains_key(YamlValue::String("entitlements".to_string()))
+        {
             return Err(ComposeError::SecurityPolicyViolation {
                 service: service_name.to_string(),
                 field: "build.entitlements".to_string(),
@@ -3109,7 +4032,9 @@ impl ComposeExecutor {
             });
         }
         for field in ["additional_contexts", "cache_from", "cache_to", "tags"] {
-            if build_map.contains_key(YamlValue::String(field.to_string())) {
+            if self.field_enforced(&format!("build.{field}"))
+                && build_map.contains_key(YamlValue::String(field.to_string()))
+            {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: format!("build.{field}"),
@@ -3136,7 +4061,9 @@ impl ComposeExecutor {
                         .to_string(),
                 });
             }
-            if !matches!(network.trim(), "default" | "none") {
+            if self.enforced(PolicyCheck::BuildNetwork)
+                && !matches!(network.trim(), "default" | "none")
+            {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "build.network".to_string(),
@@ -3145,7 +4072,9 @@ impl ComposeExecutor {
                 });
             }
         }
-        if build_map.contains_key(YamlValue::String("ssh".to_string())) {
+        if self.enforced(PolicyCheck::BuildSsh)
+            && build_map.contains_key(YamlValue::String("ssh".to_string()))
+        {
             return Err(ComposeError::SecurityPolicyViolation {
                 service: service_name.to_string(),
                 field: "build.ssh".to_string(),
@@ -3155,7 +4084,9 @@ impl ComposeExecutor {
             });
         }
         for field in ["shm_size", "ulimits"] {
-            if build_map.contains_key(YamlValue::String(field.to_string())) {
+            if self.field_enforced(&format!("build.{field}"))
+                && build_map.contains_key(YamlValue::String(field.to_string()))
+            {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: format!("build.{field}"),
@@ -3178,14 +4109,23 @@ impl ComposeExecutor {
                         reason: format!("build.{field} must be a literal relative path"),
                     });
                 };
-                if field == "context" && Self::is_remote_build_context(value) {
+                if self.enforced(PolicyCheck::RemoteBuild)
+                    && field == "context"
+                    && Self::is_remote_build_context(value)
+                {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: service_name.to_string(),
                         field: "build.context".to_string(),
                         reason: "remote build contexts are not allowed because Docker would fetch them from the host network".to_string(),
                     });
                 }
-                if Self::is_dangerous_host_path(value) {
+                if self.enforced(if field == "context" {
+                    PolicyCheck::BuildContext
+                } else {
+                    PolicyCheck::Dockerfile
+                }) && !(field == "context" && Self::is_remote_build_context(value))
+                    && Self::is_dangerous_host_path(value)
+                {
                     return Err(ComposeError::SecurityPolicyViolation {
                         service: service_name.to_string(),
                         field: format!("build.{field}"),
@@ -3209,6 +4149,9 @@ impl ComposeExecutor {
         service: &serde_yaml::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
+        if !self.enforced(PolicyCheck::Gpu) {
+            return Ok(());
+        }
         let has_devices = service
             .get(YamlValue::String("deploy".to_string()))
             .and_then(YamlValue::as_mapping)
@@ -3234,6 +4177,9 @@ impl ComposeExecutor {
         service: &serde_yaml::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
+        if !self.enforced(PolicyCheck::Replicas) {
+            return Ok(());
+        }
         if let Some(scale) = service.get(YamlValue::String("scale".to_string())) {
             if scale.as_u64() != Some(1) {
                 return Err(ComposeError::SecurityPolicyViolation {
@@ -3296,9 +4242,10 @@ impl ComposeExecutor {
                 || (normalized.len() == 64
                     && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()));
             if Self::contains_interpolation(image)
-                || normalized == "temps.internal"
-                || normalized.starts_with("temps.internal/")
-                || is_raw_image_id
+                || (self.enforced(PolicyCheck::ImageReferences)
+                    && (normalized == "temps.internal"
+                        || normalized.starts_with("temps.internal/")
+                        || is_raw_image_id))
             {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
@@ -3307,7 +4254,7 @@ impl ComposeExecutor {
                         .to_string(),
                 });
             }
-            if has_build {
+            if self.enforced(PolicyCheck::BuildImage) && has_build {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "image".to_string(),
@@ -3318,7 +4265,9 @@ impl ComposeExecutor {
         }
 
         if let Some(pull_policy) = service.get(YamlValue::String("pull_policy".to_string())) {
-            if has_build || pull_policy.as_str() != Some("always") {
+            if self.enforced(PolicyCheck::PullPolicy)
+                && (has_build || pull_policy.as_str() != Some("always"))
+            {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "pull_policy".to_string(),
@@ -3340,8 +4289,9 @@ impl ComposeExecutor {
             return Ok(());
         };
         let validate_path = |path: &str| -> Result<(), ComposeError> {
-            if Self::contains_interpolation(path)
-                || Self::validate_relative_path(path, "env_file").is_err()
+            if self.enforced(PolicyCheck::EnvFiles)
+                && (Self::contains_interpolation(path)
+                    || Self::validate_relative_path(path, "env_file").is_err())
             {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
@@ -3398,6 +4348,9 @@ impl ComposeExecutor {
         service: &serde_yaml::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
+        if !self.enforced(PolicyCheck::PublishedPorts) {
+            return Ok(());
+        }
         let Some(ports) = service.get(YamlValue::String("ports".to_string())) else {
             return Ok(());
         };
@@ -3512,6 +4465,9 @@ impl ComposeExecutor {
         service: &serde_yaml::Mapping,
         service_name: &str,
     ) -> Result<(), ComposeError> {
+        if !self.enforced(PolicyCheck::Interpolation) {
+            return Ok(());
+        }
         for field in Self::INTERPOLATION_GUARDED_FIELDS {
             let Some(value) = service.get(YamlValue::String((*field).to_string())) else {
                 continue;
@@ -3521,7 +4477,8 @@ impl ComposeExecutor {
                     service: service_name.to_string(),
                     field: (*field).to_string(),
                     reason: format!(
-                        "'${{...}}' interpolation in guarded field '{field}' is not allowed; \
+                        "the 'Block variables in guarded fields' security check rejects \
+                         '${{...}}' interpolation in guarded field '{field}'; \
                          it can smuggle host/privileged access past static validation"
                     ),
                 });
@@ -3537,6 +4494,7 @@ impl ComposeExecutor {
             YamlValue::String(s) => Self::contains_interpolation(s),
             YamlValue::Sequence(seq) => seq.iter().any(Self::value_contains_interpolation),
             YamlValue::Mapping(map) => map.values().any(Self::value_contains_interpolation),
+            YamlValue::Tagged(value) => Self::value_contains_interpolation(&value.value),
             _ => false,
         }
     }
@@ -3553,7 +4511,7 @@ impl ComposeExecutor {
             return Ok(());
         };
         match value.as_bool() {
-            Some(value) if value == rejected => {
+            Some(value) if value == rejected && self.field_enforced(field) => {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: field.to_string(),
@@ -3581,6 +4539,9 @@ impl ComposeExecutor {
         field: &str,
         reason: &str,
     ) -> Result<(), ComposeError> {
+        if !self.field_enforced(field) {
+            return Ok(());
+        }
         if service.contains_key(YamlValue::String(field.to_string())) {
             return Err(ComposeError::SecurityPolicyViolation {
                 service: service_name.to_string(),
@@ -3608,6 +4569,15 @@ impl ComposeExecutor {
                     .to_string(),
             });
         };
+        if (mode == "host" && !self.enforced(PolicyCheck::HostNetwork))
+            || (mode.starts_with("container:") && !self.enforced(PolicyCheck::ContainerNamespace))
+            || (!matches!(mode, "host")
+                && !mode.starts_with("container:")
+                && !mode.starts_with("service:")
+                && !self.enforced(PolicyCheck::NetworkMode))
+        {
+            return Ok(());
+        }
         if mode == "none" {
             return Ok(());
         }
@@ -3643,7 +4613,15 @@ impl ComposeExecutor {
                 reason: format!("{field} must be a literal namespace mode"),
             });
         };
-        if mode == "host" {
+        let check = match field {
+            "pid" => PolicyCheck::HostPid,
+            "ipc" => PolicyCheck::HostIpc,
+            "uts" => PolicyCheck::HostUts,
+            "cgroup" => PolicyCheck::HostCgroup,
+            "userns_mode" => PolicyCheck::HostUser,
+            _ => PolicyCheck::HostNetwork,
+        };
+        if mode == "host" && self.enforced(check) {
             return Err(ComposeError::SecurityPolicyViolation {
                 service: service_name.to_string(),
                 field: field.to_string(),
@@ -3653,7 +4631,7 @@ impl ComposeExecutor {
         // `container:<name|id>` joins the namespace of an arbitrary container on
         // the host — including other tenants' and Temps' own infrastructure
         // containers. Only intra-project `service:<name>` sharing is acceptable.
-        if mode.starts_with("container:") {
+        if mode.starts_with("container:") && self.enforced(PolicyCheck::ContainerNamespace) {
             return Err(ComposeError::SecurityPolicyViolation {
                 service: service_name.to_string(),
                 field: field.to_string(),
@@ -3663,6 +4641,64 @@ impl ComposeExecutor {
             });
         }
         Ok(())
+    }
+
+    fn socket_source(source: &str) -> bool {
+        Path::new(source)
+            .file_name()
+            .is_some_and(|name| name == "docker.sock")
+    }
+
+    /// Bind exceptions do not grant access to the Docker API, including symlinks
+    /// or parent directories exposing a known local daemon socket.
+    fn validate_socket_mount(
+        base: &Path,
+        source: &str,
+        service: &str,
+        policy: &ComposeSecurityPolicy,
+    ) -> Result<(), ComposeError> {
+        if !policy.enforced(PolicyCheck::DockerSocket) {
+            return Ok(());
+        }
+        let original = base.join(source);
+        let candidate = std::fs::canonicalize(&original).unwrap_or_else(|_| original.clone());
+        let mut sockets = vec![
+            PathBuf::from("/var/run/docker.sock"),
+            PathBuf::from("/run/docker.sock"),
+        ];
+        if let Ok(host) = std::env::var("DOCKER_HOST") {
+            if let Some(socket) = host.strip_prefix("unix://") {
+                sockets.push(PathBuf::from(socket));
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            sockets.push(PathBuf::from(&home).join(".docker/run/docker.sock"));
+            sockets.push(PathBuf::from(home).join(".colima/default/docker.sock"));
+        }
+        let exposes_socket = Self::socket_source(source)
+            || candidate
+                .file_name()
+                .is_some_and(|name| name == "docker.sock")
+            || sockets.into_iter().any(|socket| {
+                let lexical_match = socket.starts_with(&original);
+                let socket = std::fs::canonicalize(&socket).unwrap_or(socket);
+                lexical_match || socket.starts_with(&candidate)
+            });
+        if exposes_socket {
+            return Err(ComposeError::SecurityPolicyViolation {
+                service: service.to_string(), field: "volumes".to_string(),
+                reason: "this mount exposes a Docker daemon socket; the Docker socket policy must also be disabled".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn bind_path_enforced(&self, source: &str) -> bool {
+        self.enforced(if Self::socket_source(source) {
+            PolicyCheck::DockerSocket
+        } else {
+            PolicyCheck::BindMounts
+        })
     }
 
     fn validate_service_volumes(
@@ -3695,6 +4731,9 @@ impl ComposeExecutor {
                             .to_string(),
                     });
                 };
+                if mount_type == "tmpfs" && !self.enforced(PolicyCheck::Tmpfs) {
+                    continue;
+                }
                 if Self::contains_interpolation(mount_type)
                     || !matches!(mount_type, "bind" | "volume")
                 {
@@ -3724,12 +4763,13 @@ impl ComposeExecutor {
 
             // Reject interpolation in bind sources. `${HOST_ROOT:-/}` cannot be
             // statically validated, so a `/`-style check is trivially bypassed.
-            if Self::contains_interpolation(&source) {
+            if self.enforced(PolicyCheck::Interpolation) && Self::contains_interpolation(&source) {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "volumes".to_string(),
                     reason: format!(
-                        "interpolation in bind mount source '{source}' is not allowed; \
+                        "the 'Block variables in guarded fields' security check rejects \
+                         interpolation in bind mount source '{source}'; \
                          it cannot be statically validated"
                     ),
                 });
@@ -3775,7 +4815,7 @@ impl ComposeExecutor {
 
             // Host bind mount: normalize `..`/`.` and reject absolute host paths
             // outside the sandbox or relative paths that escape the project dir.
-            if Self::is_dangerous_host_path(&source) {
+            if self.bind_path_enforced(&source) && Self::is_dangerous_host_path(&source) {
                 return Err(ComposeError::SecurityPolicyViolation {
                     service: service_name.to_string(),
                     field: "volumes".to_string(),
@@ -3917,11 +4957,28 @@ impl ComposeExecutor {
     /// canonical target remains inside the checked-out project. Relative-path
     /// string checks alone cannot detect a committed symlink such as
     /// `data -> /`, which Docker follows when it opens a bind source.
+    #[cfg(test)]
     fn validate_compose_filesystem_confinement(
         project_dir: &Path,
         compose_file: &str,
         source: &str,
         compose_content: &str,
+    ) -> Result<(), ComposeError> {
+        Self::validate_compose_filesystem_confinement_with_policy(
+            project_dir,
+            compose_file,
+            source,
+            compose_content,
+            &ComposeSecurityPolicy::default(),
+        )
+    }
+
+    fn validate_compose_filesystem_confinement_with_policy(
+        project_dir: &Path,
+        compose_file: &str,
+        source: &str,
+        compose_content: &str,
+        policy: &ComposeSecurityPolicy,
     ) -> Result<(), ComposeError> {
         if compose_content.trim().is_empty() {
             return Ok(());
@@ -3970,6 +5027,13 @@ impl ComposeExecutor {
             })?;
 
         for key in ["configs", "secrets"] {
+            if !policy.enforced(if key == "configs" {
+                PolicyCheck::ConfigPaths
+            } else {
+                PolicyCheck::SecretPaths
+            }) {
+                continue;
+            }
             let Some(files) = root.get(key).and_then(YamlValue::as_mapping) else {
                 continue;
             };
@@ -4020,6 +5084,15 @@ impl ComposeExecutor {
                     .get(YamlValue::String("device".to_string()))
                     .and_then(YamlValue::as_str)
                 {
+                    Self::validate_socket_mount(
+                        &compose_base,
+                        device,
+                        &format!("volumes.{name}"),
+                        policy,
+                    )?;
+                    if !policy.enforced(PolicyCheck::VolumeHostPaths) {
+                        continue;
+                    }
                     Self::canonicalize_confined_existing_path(
                         &canonical_root,
                         &compose_base,
@@ -4053,6 +5126,14 @@ impl ComposeExecutor {
                     {
                         continue;
                     }
+                    Self::validate_socket_mount(&compose_base, &bind_source, service_name, policy)?;
+                    if !policy.enforced(if Self::socket_source(&bind_source) {
+                        PolicyCheck::DockerSocket
+                    } else {
+                        PolicyCheck::BindMounts
+                    }) {
+                        continue;
+                    }
                     Self::validate_confined_bind_path(
                         &canonical_root,
                         &compose_base,
@@ -4063,11 +5144,12 @@ impl ComposeExecutor {
                 }
             }
 
-            Self::validate_build_filesystem_paths(
+            Self::validate_build_filesystem_paths_with_policy(
                 &canonical_root,
                 &compose_base,
                 service,
                 service_name,
+                policy,
             )?;
         }
 
@@ -4196,11 +5278,12 @@ impl ComposeExecutor {
         Ok(cursor)
     }
 
-    fn validate_build_filesystem_paths(
+    fn validate_build_filesystem_paths_with_policy(
         canonical_root: &Path,
         compose_base: &Path,
         service: &Mapping,
         service_name: &str,
+        policy: &ComposeSecurityPolicy,
     ) -> Result<(), ComposeError> {
         let Some(build) = service.get(YamlValue::String("build".to_string())) else {
             return Ok(());
@@ -4229,13 +5312,20 @@ impl ComposeExecutor {
             return Ok(());
         }
 
-        let canonical_context = Self::canonicalize_confined_existing_path(
-            canonical_root,
-            compose_base,
-            context,
-            service_name,
-            "build.context",
-        )?;
+        let canonical_context = if !policy.enforced(PolicyCheck::BuildContext) {
+            compose_base.join(context)
+        } else {
+            Self::canonicalize_confined_existing_path(
+                canonical_root,
+                compose_base,
+                context,
+                service_name,
+                "build.context",
+            )?
+        };
+        if !policy.enforced(PolicyCheck::Dockerfile) {
+            return Ok(());
+        }
         if let Some(dockerfile) = dockerfile {
             Self::canonicalize_confined_existing_path(
                 canonical_root,
@@ -4430,19 +5520,39 @@ impl ComposeExecutor {
     /// only modify services that already exist in the base compose file, may not
     /// introduce top-level keys other than `services`, and may not use
     /// host-affecting service keys (privileged, network_mode, volumes, ...).
+    #[cfg(test)]
     fn validate_compose_override(
         project_name: &str,
         compose_content: &str,
         override_content: &str,
     ) -> Result<(), ComposeError> {
+        Self::validate_compose_override_with_policy(
+            project_name,
+            compose_content,
+            override_content,
+            &ComposeSecurityPolicy::default(),
+        )
+    }
+
+    fn validate_compose_override_with_policy(
+        project_name: &str,
+        compose_content: &str,
+        override_content: &str,
+        policy: &ComposeSecurityPolicy,
+    ) -> Result<(), ComposeError> {
         let base = Self::parse_compose_yaml(project_name, compose_content, "compose file")?;
         let override_yaml =
             Self::parse_compose_yaml(project_name, override_content, "compose override")?;
 
-        let base_services = Self::compose_services(&base).ok_or_else(|| ComposeError::InvalidOverride {
-            project: project_name.to_string(),
-            reason: "base compose file must define a services mapping before an inline override can be applied".to_string(),
-        })?;
+        let empty_services = Mapping::new();
+        let base_services = match Self::compose_services(&base) {
+            Some(services) => services,
+            None if !policy.enforced(PolicyCheck::InlineServices) && base.get("services").is_none() => &empty_services,
+            None => return Err(ComposeError::InvalidOverride {
+                project: project_name.to_string(),
+                reason: "base compose file must define a services mapping before an inline override can be applied".to_string(),
+            }),
+        };
 
         let Some(override_root) = override_yaml.as_mapping() else {
             return Err(ComposeError::InvalidOverride {
@@ -4451,17 +5561,28 @@ impl ComposeExecutor {
             });
         };
         for key in override_root.keys().filter_map(Self::yaml_key) {
-            if key != "services" {
+            if policy.enforced(PolicyCheck::InlineSections)
+                && key != "services"
+                && !(key == "include" && !policy.enforced(PolicyCheck::Include))
+            {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
-                        "inline compose override cannot set top-level key '{key}'; only service-level changes are allowed"
+                        "inline compose override cannot set top-level key '{key}'; an instance administrator can disable the Inline Sections check in Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings for a trusted stack"
                     ),
                 });
             }
         }
 
         let Some(override_services) = Self::compose_services(&override_yaml) else {
+            if override_yaml.get("include").is_some() && !policy.enforced(PolicyCheck::Include) {
+                return Ok(());
+            }
+            if !policy.enforced(PolicyCheck::InlineSections)
+                && override_yaml.get("services").is_none()
+            {
+                return Ok(());
+            }
             return Err(ComposeError::InvalidOverride {
                 project: project_name.to_string(),
                 reason:
@@ -4480,19 +5601,106 @@ impl ComposeExecutor {
                 }
             })?;
 
-            if !base_service_names.contains(&service_name) {
+            if policy.enforced(PolicyCheck::InlineServices)
+                && !base_service_names.contains(&service_name)
+            {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
-                        "inline compose override cannot add service '{service_name}'; add new services to the repository compose file for review"
+                        "inline compose override cannot add service '{service_name}'; add it to the repository compose file, or an instance administrator can disable the Inline Services check in Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings for a trusted stack"
                     ),
                 });
             }
 
-            Self::validate_override_service(project_name, &service_name, service_config)?;
+            Self::validate_override_service(project_name, &service_name, service_config, policy)?;
         }
 
         Ok(())
+    }
+
+    /// Compose re-applies an inherited service when the same `extends` appears
+    /// in both input files. That can restore fields the repository file removed
+    /// with `!override`, such as an inherited `depends_on`. The repeated
+    /// reference adds no intended setting, so omit it from the inline file.
+    fn without_duplicate_extends(
+        project_name: &str,
+        compose_content: &str,
+        override_content: &str,
+    ) -> Result<String, ComposeError> {
+        let base = Self::parse_compose_yaml(project_name, compose_content, "compose file")?;
+        let mut override_yaml =
+            Self::parse_compose_yaml(project_name, override_content, "compose override")?;
+        let Some(base_services) = Self::compose_services(&base) else {
+            return Ok(override_content.to_string());
+        };
+        let Some(override_services) = override_yaml
+            .get_mut("services")
+            .and_then(Value::as_mapping_mut)
+        else {
+            return Ok(override_content.to_string());
+        };
+        let mut changed = false;
+        for (name, service) in override_services {
+            let Some(base_extends) = base_services.get(name).and_then(|base| base.get("extends"))
+            else {
+                continue;
+            };
+            let Some(fields) = service.as_mapping_mut() else {
+                continue;
+            };
+            let extends = Value::String("extends".to_string());
+            if fields.get(&extends) == Some(base_extends) {
+                fields.remove(&extends);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(override_content.to_string());
+        }
+        serde_yaml::to_string(&override_yaml).map_err(|error| ComposeError::InvalidOverride {
+            project: project_name.to_string(),
+            reason: format!("failed to serialize inline override after merging extends: {error}"),
+        })
+    }
+
+    fn port_reset_override(
+        project_name: &str,
+        override_content: &str,
+    ) -> Result<Option<String>, ComposeError> {
+        let override_yaml =
+            Self::parse_compose_yaml(project_name, override_content, "compose override")?;
+        let Some(services) = Self::compose_services(&override_yaml) else {
+            return Ok(None);
+        };
+        let mut reset_services = Mapping::new();
+        for (name, service) in services {
+            if service.get("ports").is_none() {
+                continue;
+            }
+            let mut reset = Mapping::new();
+            reset.insert(
+                Value::String("ports".to_string()),
+                Value::Tagged(Box::new(TaggedValue {
+                    tag: Tag::new("!reset"),
+                    value: Value::Sequence(Vec::new()),
+                })),
+            );
+            reset_services.insert(name.clone(), Value::Mapping(reset));
+        }
+        if reset_services.is_empty() {
+            return Ok(None);
+        }
+        let mut root = Mapping::new();
+        root.insert(
+            Value::String("services".to_string()),
+            Value::Mapping(reset_services),
+        );
+        serde_yaml::to_string(&Value::Mapping(root))
+            .map(Some)
+            .map_err(|error| ComposeError::InvalidOverride {
+                project: project_name.to_string(),
+                reason: format!("failed to serialize port reset layer: {error}"),
+            })
     }
 
     fn parse_compose_yaml(
@@ -4529,6 +5737,7 @@ impl ComposeExecutor {
         project_name: &str,
         service_name: &str,
         service_config: &Value,
+        policy: &ComposeSecurityPolicy,
     ) -> Result<(), ComposeError> {
         let Some(service) = service_config.as_mapping() else {
             return Err(ComposeError::InvalidOverride {
@@ -4539,24 +5748,25 @@ impl ComposeExecutor {
 
         for key in service.keys().filter_map(Self::yaml_key) {
             if NEVER_ALLOWED_OVERRIDE_KEYS.contains(&key.as_str()) {
-                return Err(ComposeError::InvalidOverride {
-                    project: project_name.to_string(),
-                    reason: format!(
-                        "service '{service_name}' uses forbidden key '{key}', which Compose \
-                         deployments do not permit anywhere — the deploy-time security policy \
-                         rejects it in the repository compose file too, so moving it there \
-                         will not help"
-                    ),
-                });
+                let check = PolicyCheck::for_restricted_service_field(&key)
+                    .unwrap_or(PolicyCheck::InlineFields);
+                if policy.enforced(check) {
+                    return Err(ComposeError::InvalidOverride {
+                        project: project_name.to_string(),
+                        reason: format!("service '{service_name}' uses '{key}', which the {check:?} check rejects; an instance administrator can disable that check in Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings for a trusted stack"),
+                    });
+                }
             }
-            if REPO_ONLY_OVERRIDE_KEYS.contains(&key.as_str()) {
+            if policy.enforced(PolicyCheck::InlineFields)
+                && REPO_ONLY_OVERRIDE_KEYS.contains(&key.as_str())
+            {
                 return Err(ComposeError::InvalidOverride {
                     project: project_name.to_string(),
                     reason: format!(
                         "service '{service_name}' cannot set '{key}' as an inline override; \
-                         declare it in the repository compose file instead, where it is \
-                         checked against the deployment security policy (host paths, host \
-                         namespaces and resource limits are still rejected there)"
+                         declare it in the repository compose file, or an instance administrator \
+                         can disable the Inline Fields check in Project Settings → Build & deploy → \
+                         Build → Docker Compose → Advanced security settings for a trusted stack"
                     ),
                 });
             }
@@ -4953,30 +6163,13 @@ impl ComposeExecutor {
 
     /// Idempotently create the shared Docker network every Temps-managed
     /// external service and single-container app deployment joins
-    /// (`temps_core::NETWORK_NAME`). Mirrors
-    /// `temps-providers::utils::ensure_network_exists` /
-    /// `DockerDeployer::ensure_network_exists` — compose deployments have no
-    /// shared code path with either, so this is a small, deliberate
-    /// duplication rather than a new cross-crate dependency for one function.
+    /// (`temps_core::NETWORK_NAME`). Same implementation as the other
+    /// deployers ([`temps_core::docker_network::ensure_bridge_network`]), so a
+    /// concurrent deploy that creates it first is not a failure here either.
     async fn ensure_temps_network_exists(&self) -> Result<(), ComposeError> {
         let docker = self.require_docker()?;
         let network_name = temps_core::NETWORK_NAME.as_str();
-        let networks = docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
-            .map_err(|e| ComposeError::Docker(format!("Failed to list networks: {e}")))?;
-        if networks
-            .iter()
-            .any(|n| n.name.as_deref() == Some(network_name))
-        {
-            return Ok(());
-        }
-        docker
-            .create_network(bollard::models::NetworkCreateRequest {
-                name: network_name.to_string(),
-                driver: Some("bridge".to_string()),
-                ..Default::default()
-            })
+        temps_core::docker_network::ensure_bridge_network(&docker, network_name)
             .await
             .map(|_| ())
             .map_err(|e| {
@@ -5955,8 +7148,19 @@ impl ComposeExecutor {
             Value::Mapping(external),
         );
 
+        let mut parsed: Value = serde_yaml::from_str(compose_content).unwrap_or(Value::Null);
+        // Security validation has already rejected malformed merge keys.
+        let _ = parsed.apply_merge();
         let mut services_map = Mapping::new();
         for service in &services {
+            if parsed
+                .get("services")
+                .and_then(|services| services.get(service))
+                .and_then(|service| service.get("network_mode"))
+                .is_some()
+            {
+                continue;
+            }
             let mut service_map = Mapping::new();
             service_map.insert(
                 Value::String("networks".to_string()),
@@ -6059,47 +7263,65 @@ impl ComposeExecutor {
         let mut override_yaml = String::from("services:\n");
         for service in affected_services {
             override_yaml.push_str(&format!("  {}:\n", service));
-            override_yaml.push_str(&format!("    mem_limit: {COMPOSE_SERVICE_MEMORY_LIMIT}\n"));
-            override_yaml.push_str("    logging:\n");
-            override_yaml.push_str("      driver: json-file\n");
-            override_yaml.push_str("      options:\n");
-            override_yaml.push_str("        max-size: 50m\n");
-            override_yaml.push_str("        max-file: \"3\"\n");
-            override_yaml.push_str("    pids_limit: 512\n");
-            if !built_services.contains(service.as_str()) {
+            if self.enforced(PolicyCheck::Memory) {
+                override_yaml.push_str(&format!("    mem_limit: {COMPOSE_SERVICE_MEMORY_LIMIT}\n"));
+            }
+            if self.enforced(PolicyCheck::Logging) {
+                override_yaml.push_str("    logging:\n");
+                override_yaml.push_str("      driver: json-file\n");
+                override_yaml.push_str("      options:\n");
+                override_yaml.push_str("        max-size: 50m\n");
+                override_yaml.push_str("        max-file: \"3\"\n");
+            }
+            if self.enforced(PolicyCheck::Pids) {
+                override_yaml.push_str("    pids_limit: 512\n");
+            }
+            if self.enforced(PolicyCheck::PullPolicy) && !built_services.contains(service.as_str())
+            {
                 override_yaml.push_str("    pull_policy: always\n");
             }
-            let sandboxed = !unsandboxed_services.contains(service);
+            let sandboxed = self.policy_authoritative || !unsandboxed_services.contains(service);
             // Applied last in the `-f` order, so `privileged: false` here wins
             // over anything that smuggled `privileged: true` past validation
             // (e.g. via runtime interpolation) as a last line of defense.
             if sandboxed {
-                override_yaml.push_str("    privileged: false\n");
-                override_yaml.push_str("    cap_drop:\n");
-                override_yaml.push_str("      - ALL\n");
-                override_yaml.push_str("    cap_add:\n");
-                for cap in Self::RELAXED_CAPABILITIES {
-                    override_yaml.push_str(&format!("      - {}\n", cap));
+                if self.enforced(PolicyCheck::Privileged) {
+                    override_yaml.push_str("    privileged: false\n");
                 }
-                override_yaml.push_str("    security_opt:\n");
-                // Prevents exec-based privilege re-escalation (SUID binaries,
-                // capability gains on exec) after the entrypoint drops to the
-                // service user. Does NOT suppress a relaxed service's entrypoint
-                // from using capabilities it was already granted above (e.g.
-                // `gosu` calling `setuid()` directly) — that's the intended
-                // behavior, not a gap.
-                override_yaml.push_str("      - no-new-privileges:true\n");
+                if self.enforced(PolicyCheck::DropCapabilities) {
+                    override_yaml.push_str("    cap_drop:\n");
+                    override_yaml.push_str("      - ALL\n");
+                    override_yaml.push_str("    cap_add:\n");
+                    for cap in Self::RELAXED_CAPABILITIES {
+                        override_yaml.push_str(&format!("      - {}\n", cap));
+                    }
+                }
+                if self.enforced(PolicyCheck::NoNewPrivileges) {
+                    override_yaml.push_str("    security_opt:\n");
+                    // Prevents exec-based privilege re-escalation (SUID binaries,
+                    // capability gains on exec) after the entrypoint drops to the
+                    // service user. Does NOT suppress a relaxed service's entrypoint
+                    // from using capabilities it was already granted above (e.g.
+                    // `gosu` calling `setuid()` directly) — that's the intended
+                    // behavior, not a gap.
+                    override_yaml.push_str("      - no-new-privileges:true\n");
+                }
             }
             // An explicit `init: false` is a compatibility contract: the
             // image owns PID 1 (commonly s6-overlay) and Docker's init wrapper
             // would make that entrypoint fail. Keep every other sandbox guard
             // instead of forcing the user to disable the entire sandbox.
-            if detected_image_owned_init_services.contains(service.as_str()) {
+            if self.enforced(PolicyCheck::Init)
+                && detected_image_owned_init_services.contains(service.as_str())
+            {
                 // This must be explicit rather than merely omitting `init`:
                 // the user's base/override may contain `init: true`, and this
                 // trusted final override has to win that scalar merge.
                 override_yaml.push_str("    init: false\n");
-            } else if sandboxed && !explicitly_disabled_init_services.contains(service.as_str()) {
+            } else if self.enforced(PolicyCheck::Init)
+                && sandboxed
+                && !explicitly_disabled_init_services.contains(service.as_str())
+            {
                 override_yaml.push_str("    init: true\n");
             }
             if let Some(test) = healthcheck_loopback_overrides.get(service.as_str()) {
@@ -6841,6 +8063,116 @@ mod tests {
         assert!(entry.publishers.is_empty());
     }
 
+    #[tokio::test]
+    async fn compose_v2_preflight_returns_actionable_error_when_plugin_is_missing() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf \"unknown shorthand flag: 'p' in -p\\n\" >&2; exit 125",
+        ]);
+
+        let error = ComposeExecutor::check_compose_v2(command, COMPOSE_VERSION_TIMEOUT)
+            .await
+            .expect_err("a Docker CLI without Compose must fail preflight");
+
+        assert!(matches!(error, ComposeError::ComposeUnavailable { .. }));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("Docker Compose v2 is unavailable"));
+        assert!(diagnostic.contains("Install the Docker Compose CLI plugin"));
+        assert!(diagnostic.contains("docker compose version"));
+        assert!(diagnostic.contains("restart Temps"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compose_v2_preflight_checks_the_same_first_docker_candidate_used_for_deploys() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let first = directory.path().join("first-docker");
+        let second = directory.path().join("second-docker");
+        std::fs::write(
+            &first,
+            "#!/bin/sh\nprintf \"compose is unavailable\\n\" >&2\nexit 125\n",
+        )
+        .expect("first fake Docker CLI should be written");
+        std::fs::write(&second, "#!/bin/sh\nexit 0\n")
+            .expect("second fake Docker CLI should be written");
+        for path in [&first, &second] {
+            let mut permissions = std::fs::metadata(path)
+                .expect("fake Docker CLI metadata should be readable")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions)
+                .expect("fake Docker CLI should be executable");
+        }
+        let first = first.to_str().expect("temporary path should be UTF-8");
+        let second = second.to_str().expect("temporary path should be UTF-8");
+        let mut command = isolated_docker_command_with_candidates(&[first, second]);
+        command.args(["compose", "version"]);
+
+        let error = ComposeExecutor::check_compose_v2(command, COMPOSE_VERSION_TIMEOUT)
+            .await
+            .expect_err("preflight must check the same first candidate used by deployment");
+
+        assert!(matches!(error, ComposeError::ComposeUnavailable { .. }));
+        assert!(error.to_string().contains("compose is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn compose_v2_preflight_bounds_diagnostic_output() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "head -c 2097152 /dev/zero | tr '\\0' x >&2; exit 125"]);
+
+        let error = ComposeExecutor::check_compose_v2(command, COMPOSE_VERSION_TIMEOUT)
+            .await
+            .expect_err("a noisy failing Compose probe must fail preflight");
+        let diagnostic = error.to_string();
+
+        assert!(matches!(error, ComposeError::ComposeUnavailable { .. }));
+        assert!(
+            diagnostic.len() <= MAX_COMPOSE_COMMAND_OUTPUT_BYTES + 512,
+            "diagnostic must remain bounded, got {} bytes",
+            diagnostic.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compose_v2_preflight_kills_child_when_probe_times_out() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let pid_file = directory.path().join("compose-probe.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "echo $$ > \"$PID_FILE\"; exec sleep 30"])
+            .env("PID_FILE", &pid_file);
+
+        let error =
+            ComposeExecutor::check_compose_v2(command, std::time::Duration::from_millis(100))
+                .await
+                .expect_err("a hanging Compose probe must time out");
+        assert!(matches!(error, ComposeError::ComposeUnavailable { .. }));
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("probe should record its pid before timing out");
+        let pid = pid.trim();
+        let mut still_running = true;
+        for _ in 0..50 {
+            still_running = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !still_running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !still_running,
+            "timed-out Compose probe {pid} is still running"
+        );
+    }
+
     #[test]
     fn compose_build_forces_platform_build_args_over_tenant_values() {
         let project_dir = Path::new("/tmp/temps-compose-command-test");
@@ -7098,6 +8430,16 @@ services:
     }
 
     #[test]
+    fn test_validate_compose_override_allows_image_change_for_existing_service() {
+        let compose = "services:\n  web:\n    image: example/web:1\n";
+        let override_content =
+            "services:\n  web:\n    image: example/web:2\n    ports: ['8080:80']\n";
+
+        ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
+            .unwrap();
+    }
+
+    #[test]
     fn test_validate_compose_override_rejects_new_services() {
         let compose = r#"
 services:
@@ -7114,6 +8456,7 @@ services:
             ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
                 .unwrap_err();
         assert!(error.to_string().contains("cannot add service 'attacker'"));
+        assert!(error.to_string().contains("Inline Services check"));
     }
 
     #[test]
@@ -7134,7 +8477,6 @@ services:
             "volumes: ['/:/host:rw']",
             "volumes_from: ['container:temps-db']",
             "labels: {sh.temps.managed: 'false'}",
-            "image: attacker-controlled:latest",
             "build: ./attacker",
             "env_file: ./override.env",
         ];
@@ -7234,6 +8576,10 @@ services:
                 !REPO_ONLY_OVERRIDE_KEYS.contains(key),
                 "'{key}' is classified both as never-allowed and as repo-only"
             );
+            assert!(
+                PolicyCheck::for_restricted_service_field(key).is_some(),
+                "'{key}' needs a specific policy check"
+            );
         }
     }
 
@@ -7250,14 +8596,8 @@ services:
         )
         .unwrap_err();
         let message = error.to_string();
-        assert!(
-            message.contains("do not permit anywhere"),
-            "expected an anywhere-forbidden message, got {message}"
-        );
-        assert!(
-            message.contains("will not help"),
-            "expected the message to rule out moving it to the repository, got {message}"
-        );
+        assert!(message.contains("disable that check"), "{message}");
+        assert!(!message.contains("repository compose file"), "{message}");
     }
 
     /// A key the repository compose file legitimately accepts must point there,
@@ -7276,10 +8616,67 @@ services:
             message.contains("declare it in the repository compose file"),
             "expected the message to point at the repository compose file, got {message}"
         );
-        assert!(
-            !message.contains("do not permit anywhere"),
-            "'volumes' is accepted in the repository compose file, got {message}"
-        );
+        assert!(message.contains("Inline Fields check"), "{message}");
+    }
+
+    #[test]
+    fn test_include_exception_allows_inline_include_without_inline_sections_exception() {
+        let compose = "services:\n  web:\n    image: nginx\n";
+        let override_content = "include:\n  - common.yml\n";
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: std::collections::BTreeSet::from([PolicyCheck::Include]),
+        };
+        ComposeExecutor::validate_compose_override_with_policy(
+            "temps-test",
+            compose,
+            override_content,
+            &policy,
+        )
+        .unwrap();
+
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let error = executor
+            .preflight_validate(compose, Some(override_content))
+            .unwrap_err();
+        assert_eq!(violation_field(error), "include");
+        executor
+            .with_security_policy(policy)
+            .preflight_validate(compose, Some(override_content))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_inline_field_exception_does_not_disable_privileged_check() {
+        let compose = "services:\n  web:\n    image: nginx\n";
+        let override_content =
+            "services:\n  web:\n    privileged: true\n    volumes: ['data:/data']\n";
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: std::collections::BTreeSet::from([PolicyCheck::InlineFields]),
+        };
+        let error = ComposeExecutor::validate_compose_override_with_policy(
+            "temps-test",
+            compose,
+            override_content,
+            &policy,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Privileged check"));
+
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: std::collections::BTreeSet::from([
+                PolicyCheck::InlineFields,
+                PolicyCheck::Privileged,
+            ]),
+        };
+        ComposeExecutor::validate_compose_override_with_policy(
+            "temps-test",
+            compose,
+            override_content,
+            &policy,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -7303,6 +8700,7 @@ networks:
             ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
                 .unwrap_err();
         assert!(error.to_string().contains("top-level key 'networks'"));
+        assert!(error.to_string().contains("Inline Sections check"));
     }
 
     #[test]
@@ -9797,6 +11195,7 @@ services:
         let err = executor
             .validate_compose_security_policy("compose file", compose)
             .unwrap_err();
+        assert!(err.to_string().contains("Advanced security settings"));
         assert_eq!(violation_field(err), "extends");
     }
 
@@ -10350,6 +11749,33 @@ services:
             .validate_compose_security_policy("compose file", userns)
             .unwrap_err();
         assert_eq!(violation_field(err), "userns_mode");
+    }
+
+    #[test]
+    fn interpolation_in_volumes_names_the_security_check() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+
+        let compose = "services:\n  trawl:\n    image: alpine\n    volumes:\n      - ${HOST_PATH:-/tmp}:/data\n";
+        let error = executor
+            .validate_compose_security_policy("compose file", compose)
+            .expect_err("interpolated volume must be rejected");
+        let message = error.to_string();
+        let interpolation_label = PolicyCheck::catalog()
+            .into_iter()
+            .find(|definition| definition.id == PolicyCheck::Interpolation)
+            .expect("interpolation check is in the settings catalog")
+            .label;
+        assert!(
+            message.contains("rejected volumes for service 'trawl'"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("'{interpolation_label}' security check")),
+            "{message}"
+        );
+        assert!(message.contains("Advanced security settings"), "{message}");
     }
 
     #[test]
@@ -11021,26 +12447,43 @@ services:
 
     #[test]
     fn test_validate_compose_security_policy_rejects_oversized_or_invalid_shm_sizes() {
-        let Some(executor) = test_executor() else {
-            return;
-        };
-        for yaml in [
-            "services:\n  app:\n    image: alpine\n    shm_size: 513m\n",
-            "services:\n  app:\n    image: alpine\n    shm_size: unlimited\n",
-            "services:\n  app:\n    image: alpine\n    shm_size: 0\n",
+        let executor = disabled_executor(PathBuf::from("/tmp/test"));
+        for (yaml, expected_check) in [
+            (
+                "services:\n  app:\n    image: alpine\n    shm_size: 513m\n",
+                Some("Limit service shared memory"),
+            ),
+            (
+                "services:\n  app:\n    image: alpine\n    shm_size: unlimited\n",
+                None,
+            ),
+            (
+                "services:\n  app:\n    image: alpine\n    shm_size: 0\n",
+                None,
+            ),
         ] {
             let err = executor
                 .validate_compose_security_policy("compose file", yaml)
                 .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings"),
+                "{message}"
+            );
+            match expected_check {
+                Some(check) => assert!(message.contains(check), "{message}"),
+                None => assert!(
+                    !message.contains("Limit service shared memory"),
+                    "{message}"
+                ),
+            }
             assert_eq!(violation_field(err), "shm_size");
         }
     }
 
     #[test]
     fn test_validate_compose_security_policy_caps_aggregate_shm_size() {
-        let Some(executor) = test_executor() else {
-            return;
-        };
+        let executor = disabled_executor(PathBuf::from("/tmp/test"));
         let yaml = "services:\n  first:\n    image: alpine\n    shm_size: 400m\n  second:\n    image: alpine\n    shm_size: 400m\n  third:\n    image: alpine\n    shm_size: 400m\n";
 
         let err = executor
@@ -11049,7 +12492,8 @@ services:
         let message = err.to_string();
 
         assert_eq!(violation_field(err), "shm_size");
-        assert!(message.contains("aggregate"));
+        assert!(message.contains("'Limit aggregate shared memory' (Resources)"));
+        assert!(message.contains("lower the stack total or disable that check"));
     }
 
     #[test]
@@ -11065,7 +12509,8 @@ services:
         let error =
             ComposeExecutor::validate_compose_override("temps-test", compose, override_content)
                 .unwrap_err();
-        assert!(error.to_string().contains("forbidden key 'runtime'"));
+        assert!(error.to_string().contains("'runtime'"), "{error}");
+        assert!(error.to_string().contains("Advanced security settings"));
     }
 
     #[test]
@@ -11261,6 +12706,79 @@ services:
 
         assert!(sanitized.len() < diagnostic.len());
         assert!(sanitized.contains("diagnostic truncated"));
+    }
+
+    #[test]
+    fn compose_config_failures_keep_actionable_cause_without_echoing_secrets() {
+        let cases = [
+            (
+                "validating /checkout/secret.env: services.web.ports must be a array; token=repo-only-secret",
+                "services.web.ports expects a value of type array",
+            ),
+            (
+                "cannot extend service \"web\": service \"repo-only-secret\" not found in private.yaml",
+                "extends reference names a service missing",
+            ),
+            (
+                "service \"web\" depends on undefined service \"repo-only-secret\": invalid compose project",
+                "depends on another service that is not defined",
+            ),
+            (
+                "error while interpolating services.web.image: required variable TOKEN is missing a value: repo-only-secret",
+                "Required Compose variable TOKEN has no value",
+            ),
+            (
+                "yaml: line 12: mapping values are not allowed here: repo-only-secret",
+                "invalid YAML",
+            ),
+            (
+                "failed to load env_file /checkout/repo-only-secret.env: no such file or directory",
+                "required env_file is missing",
+            ),
+            (
+                "unexpected Compose error: repo-only-secret",
+                "Compose rejected the source files",
+            ),
+        ];
+        for (diagnostic, expected) in cases {
+            let safe = safe_compose_config_failure(diagnostic.as_bytes());
+            assert!(safe.contains(expected), "{safe}");
+            assert!(!safe.contains("repo-only-secret"), "{safe}");
+            assert!(!safe.contains("/checkout/"), "{safe}");
+        }
+        assert!(safe_compose_config_failure(b"yaml: line 12: bad secret")
+            .contains("Compose reported line 12"));
+    }
+
+    #[tokio::test]
+    async fn compose_config_failure_reports_safe_validation_cause() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let executor = executor_with_checks_disabled(&[]);
+        let error = executor
+            .resolve_security_configuration(
+                "temps-config-diagnostic-test",
+                Some(root.path()),
+                "compose.yml",
+                "services: {web: {image: nginx, ports: not-a-list}}",
+                Some("services: {web: {environment: {TOKEN: repo-only-secret}}}"),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("services.web.ports expects a value of type array"),
+            "{error}"
+        );
+        assert!(error.contains("docker compose config"), "{error}");
+        assert!(!error.contains("repo-only-secret"), "{error}");
     }
 
     #[test]
@@ -11504,5 +13022,1072 @@ services:
             logs.contains("Docker daemon unavailable"),
             "logs were: {logs}"
         );
+    }
+    fn executor_with_checks_disabled(checks: &[PolicyCheck]) -> ComposeExecutor {
+        disabled_executor(PathBuf::from("/tmp/temps-policy-unit")).with_security_policy(
+            ComposeSecurityPolicy {
+                disabled_checks: checks.iter().copied().collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn policy_exceptions_are_independent_for_service_fields() {
+        let cases = [
+            (PolicyCheck::Privileged, "privileged: true"),
+            (PolicyCheck::DockerSocket, "use_api_socket: true"),
+            (PolicyCheck::Capabilities, "cap_add: [NET_ADMIN]"),
+            (PolicyCheck::Devices, "devices: [/dev/fuse:/dev/fuse]"),
+            (
+                PolicyCheck::DeviceRules,
+                "device_cgroup_rules: ['c 1:3 rwm']",
+            ),
+            (
+                PolicyCheck::SecurityOptions,
+                "security_opt: [seccomp:unconfined]",
+            ),
+            (PolicyCheck::Gpu, "gpus: all"),
+            (PolicyCheck::Sysctls, "sysctls: {net.ipv4.ip_forward: '1'}"),
+            (PolicyCheck::Groups, "group_add: ['44']"),
+            (PolicyCheck::CgroupParent, "cgroup_parent: custom.slice"),
+            (PolicyCheck::Runtime, "runtime: nvidia"),
+            (
+                PolicyCheck::LifecycleHooks,
+                "post_start: [{command: echo ready}]",
+            ),
+            (PolicyCheck::Provider, "provider: {type: custom}"),
+            (PolicyCheck::ContainerName, "container_name: custom-name"),
+            (PolicyCheck::HostNetwork, "network_mode: host"),
+            (PolicyCheck::HostPid, "pid: host"),
+            (PolicyCheck::HostIpc, "ipc: host"),
+            (PolicyCheck::HostUts, "uts: host"),
+            (PolicyCheck::HostCgroup, "cgroup: host"),
+            (PolicyCheck::HostUser, "userns_mode: host"),
+            (
+                PolicyCheck::ContainerNamespace,
+                "network_mode: container:other",
+            ),
+            (PolicyCheck::NetworkMode, "network_mode: bridge"),
+            (PolicyCheck::ExternalLinks, "external_links: [other]"),
+            (PolicyCheck::PublishedPorts, "ports: ['8080:80']"),
+            (PolicyCheck::BindMounts, "volumes: ['/srv/app:/data']"),
+            (
+                PolicyCheck::DockerSocket,
+                "volumes: ['/var/run/docker.sock:/var/run/docker.sock']",
+            ),
+            (PolicyCheck::VolumesFrom, "volumes_from: [other]"),
+            (PolicyCheck::EnvFiles, "env_file: /srv/app.env"),
+            (PolicyCheck::LabelFiles, "label_file: labels.txt"),
+            (PolicyCheck::StorageOptions, "storage_opt: {size: 20G}"),
+            (PolicyCheck::OomKiller, "oom_kill_disable: true"),
+            (PolicyCheck::ServiceShm, "shm_size: 768m"),
+            (PolicyCheck::Tmpfs, "tmpfs: [/tmp]"),
+            (PolicyCheck::Tmpfs, "volumes: [{type: tmpfs, target: /tmp}]"),
+            (PolicyCheck::Ulimits, "ulimits: {nofile: 65536}"),
+            (PolicyCheck::Blkio, "blkio_config: {weight: 500}"),
+            (PolicyCheck::Swap, "memswap_limit: 2g"),
+            (PolicyCheck::Replicas, "scale: 2"),
+            (PolicyCheck::PullPolicy, "pull_policy: never"),
+        ];
+        for (check, field) in cases {
+            let compose = format!("services:\n  app:\n    image: nginx:alpine\n    {field}\n");
+            assert!(
+                executor_with_checks_disabled(&[])
+                    .validate_compose_security_policy("test", &compose)
+                    .is_err(),
+                "default must reject {field}"
+            );
+            let executor = executor_with_checks_disabled(&[check]);
+            assert!(
+                executor
+                    .validate_compose_security_policy("test", &compose)
+                    .is_ok(),
+                "exception {check:?} did not permit {field}"
+            );
+            let other = if check == PolicyCheck::Privileged {
+                "    network_mode: host\n"
+            } else {
+                "    privileged: true\n"
+            };
+            assert!(
+                executor
+                    .validate_compose_security_policy("test", &(compose + other))
+                    .is_err(),
+                "{check:?} waived an unrelated check"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_exceptions_apply_to_build_and_top_level_checks() {
+        let cases = [
+            (PolicyCheck::BuildPrivileged, "privileged: true"),
+            (
+                PolicyCheck::BuildEntitlements,
+                "entitlements: [security.insecure]",
+            ),
+            (PolicyCheck::BuildNetwork, "network: host"),
+            (PolicyCheck::BuildSsh, "ssh: [default]"),
+            (PolicyCheck::BuildShm, "shm_size: 2g"),
+            (PolicyCheck::BuildUlimits, "ulimits: {nofile: 65536}"),
+            (
+                PolicyCheck::BuildAdditionalContexts,
+                "additional_contexts: {assets: /srv/assets}",
+            ),
+            (
+                PolicyCheck::BuildCacheFrom,
+                "cache_from: [type=local,src=/tmp/cache]",
+            ),
+            (
+                PolicyCheck::BuildCacheTo,
+                "cache_to: [type=local,dest=/tmp/cache]",
+            ),
+            (PolicyCheck::BuildTags, "tags: [custom:latest]"),
+            (PolicyCheck::BuildContext, "context: /srv/app"),
+            (PolicyCheck::Dockerfile, "dockerfile: /srv/Dockerfile"),
+        ];
+        for (check, field) in cases {
+            let compose = format!("services:\n  app:\n    build:\n      {field}\n");
+            assert!(
+                executor_with_checks_disabled(&[])
+                    .validate_compose_security_policy("test", &compose)
+                    .is_err(),
+                "default accepted {field}"
+            );
+            assert!(
+                executor_with_checks_disabled(&[check])
+                    .validate_compose_security_policy("test", &compose)
+                    .is_ok(),
+                "exception {check:?} did not permit {field}"
+            );
+        }
+        for (check, definition) in [
+            (
+                PolicyCheck::ExternalNetworks,
+                "networks: {shared: {external: true}}",
+            ),
+            (
+                PolicyCheck::NetworkNames,
+                "networks: {shared: {name: shared}}",
+            ),
+            (
+                PolicyCheck::NetworkDrivers,
+                "networks: {shared: {driver: macvlan}}",
+            ),
+            (
+                PolicyCheck::NetworkOptions,
+                "networks: {shared: {driver_opts: {parent: eth0}}}",
+            ),
+            (
+                PolicyCheck::NetworkIpam,
+                "networks: {shared: {ipam: {driver: default}}}",
+            ),
+            (
+                PolicyCheck::ExternalVolumes,
+                "volumes: {data: {external: true}}",
+            ),
+            (
+                PolicyCheck::VolumeNames,
+                "volumes: {data: {name: shared-data}}",
+            ),
+            (
+                PolicyCheck::VolumeHostPaths,
+                "volumes: {data: {driver_opts: {type: none, o: bind, device: /srv/data}}}",
+            ),
+            (
+                PolicyCheck::VolumeNetworkFilesystems,
+                "volumes: {data: {driver_opts: {type: nfs, device: 'server:/data'}}}",
+            ),
+            (
+                PolicyCheck::VolumeOptions,
+                "volumes: {data: {driver_opts: {custom: value}}}",
+            ),
+            (
+                PolicyCheck::ConfigPaths,
+                "configs: {config: {file: /etc/config}}",
+            ),
+            (
+                PolicyCheck::SecretPaths,
+                "secrets: {secret: {file: /etc/secret}}",
+            ),
+            (
+                PolicyCheck::ExternalConfigs,
+                "configs: {config: {external: true}}",
+            ),
+            (
+                PolicyCheck::ExternalSecrets,
+                "secrets: {secret: {external: true}}",
+            ),
+        ] {
+            let compose = format!("services: {{app: {{image: 'nginx:alpine'}}}}\n{definition}\n");
+            assert!(
+                executor_with_checks_disabled(&[])
+                    .validate_compose_security_policy("test", &compose)
+                    .is_err(),
+                "default accepted {definition}"
+            );
+            assert!(
+                executor_with_checks_disabled(&[check])
+                    .validate_compose_security_policy("test", &compose)
+                    .is_ok(),
+                "exception {check:?} did not permit {definition}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_exceptions_remove_only_the_selected_injected_setting() {
+        let compose = "services: {app: {image: nginx:alpine}}";
+        for (check, field) in [
+            (PolicyCheck::Privileged, "privileged"),
+            (PolicyCheck::DropCapabilities, "cap_drop"),
+            (PolicyCheck::NoNewPrivileges, "security_opt"),
+            (PolicyCheck::Pids, "pids_limit"),
+            (PolicyCheck::Memory, "mem_limit"),
+            (PolicyCheck::Logging, "logging"),
+            (PolicyCheck::Init, "init"),
+            (PolicyCheck::PullPolicy, "pull_policy"),
+        ] {
+            let strict: Value = serde_yaml::from_str(
+                &executor_with_checks_disabled(&[]).generate_security_override(compose, &[]),
+            )
+            .unwrap();
+            assert!(strict["services"]["app"].get(field).is_some());
+            let relaxed: Value = serde_yaml::from_str(
+                &executor_with_checks_disabled(&[check]).generate_security_override(compose, &[]),
+            )
+            .unwrap();
+            assert!(
+                relaxed["services"]["app"].get(field).is_none(),
+                "{check:?} was re-injected"
+            );
+            let other = if field == "privileged" {
+                "pids_limit"
+            } else {
+                "privileged"
+            };
+            assert!(relaxed["services"]["app"].get(other).is_some());
+        }
+    }
+
+    #[test]
+    fn allowed_host_network_does_not_receive_a_conflicting_network_override() {
+        let executor = executor_with_checks_disabled(&[PolicyCheck::HostNetwork]);
+        let yaml: Value = serde_yaml::from_str(&executor.generate_network_override(
+            "services: {host: {image: nginx, network_mode: host}, web: {image: nginx}}",
+        ))
+        .unwrap();
+        assert!(yaml["services"].get("host").is_none());
+        assert!(yaml["services"].get("web").is_some());
+    }
+
+    #[test]
+    fn filesystem_exceptions_do_not_authorize_generated_file_writes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("compose.yml"), "services: {}").unwrap();
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: [PolicyCheck::BindMounts].into(),
+        };
+        let content = "services: {app: {image: nginx, volumes: ['/srv/app:/data']}}";
+        assert!(
+            ComposeExecutor::validate_compose_filesystem_confinement_with_policy(
+                root.path(),
+                "compose.yml",
+                "test",
+                content,
+                &policy
+            )
+            .is_ok()
+        );
+        assert!(
+            ComposeExecutor::confined_write_path(root.path(), Path::new("../outside"), "test")
+                .is_err()
+        );
+        assert!(
+            ComposeExecutor::validate_compose_filesystem_confinement_with_policy(
+                root.path(),
+                "compose.yml",
+                "test",
+                content,
+                &ComposeSecurityPolicy::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_runtime_files_are_rejected_but_build_and_env_assets_are_allowed() {
+        let executor = executor_with_checks_disabled(&[]);
+        let cache = ".temps-compose-sources-example";
+        for content in [
+            "services: {app: {volumes: [{type: bind, source: .temps-compose-sources-example/repo/data, target: /data}]}}",
+            "services: {app: {volumes: ['.temps-compose-sources-example/repo/data:/data']}}",
+            "configs: {cfg: {file: .temps-compose-sources-example/repo/config.txt}}",
+            "secrets: {key: {file: .temps-compose-sources-example/repo/key.txt}}",
+            "volumes: {data: {driver_opts: {type: none, device: .temps-compose-sources-example/repo/data}}}",
+        ] {
+            assert!(matches!(executor.validate_remote_runtime_assets(content, cache), Err(ComposeError::InvalidComposePath { reason, .. }) if reason.contains("outlive")), "{content}");
+        }
+        assert!(executor.validate_remote_runtime_assets("services: {app: {build: {context: .temps-compose-sources-example/repo}, env_file: .temps-compose-sources-example/repo/vars.env, volumes: [data:/data]} }", cache).is_ok());
+    }
+
+    #[test]
+    fn reset_tags_require_resolution_without_policy_exceptions() {
+        let executor = executor_with_checks_disabled(&[]);
+        assert!(executor.needs_resolution(
+            "services: {app: {image: alpine, shm_size: !reset null}}",
+            None
+        ));
+        assert!(
+            !executor.needs_resolution("services: {app: {image: alpine, shm_size: 128m}}", None)
+        );
+    }
+
+    #[test]
+    fn source_policy_defers_runtime_values_but_keeps_read_guards() {
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        for value in ["1gb", "!reset null"] {
+            assert!(executor
+                .validate_source_security(&format!(
+                    "services: {{app: {{image: alpine, shm_size: {value}}}}}"
+                ))
+                .is_ok());
+        }
+        assert!(executor
+            .validate_source_security("services: {app: {label_file: /etc/secret}}")
+            .is_err());
+        assert!(executor
+            .validate_source_security("services: {app: {shm_size: !override '${SIZE}'}}")
+            .is_err());
+        assert!(executor
+            .validate_source_security("include: [other.yml]")
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn compose_snapshots_reject_cycles_and_do_not_rewrite_repository_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let first = "services: {app: {extends: {file: second.yml, service: base}}}";
+        std::fs::write(root.path().join("first.yml"), first).unwrap();
+        std::fs::write(
+            root.path().join("second.yml"),
+            "services: {base: {extends: {file: first.yml, service: app}}}",
+        )
+        .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        let error = executor
+            .snapshot_compose_document(root.path(), root.path(), first, &mut snapshots)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::InvalidComposePath { reason, .. } if reason.contains("cyclic"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("first.yml")).unwrap(),
+            first
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_snapshots_reject_remote_urls_before_fetch_when_extends_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = executor_with_checks_disabled(&[]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        let error = executor.snapshot_compose_document(root.path(), root.path(), "services: {app: {extends: {file: 'https://example.invalid/repo.git', service: base}}}", &mut snapshots).await.unwrap_err();
+        assert!(
+            matches!(error, ComposeError::SecurityPolicyViolation { field, .. } if field == "extends")
+        );
+        assert!(snapshots.remote.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compose_snapshots_confine_inherited_env_files_before_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.env"), "SECRET=private\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.env"),
+            root.path().join("vars.env"),
+        )
+        .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let source = "services: {app: {extends: {file: common.yml, service: base}}}";
+        for env_file in [
+            "vars.env",
+            "[vars.env]",
+            "[{path: vars.env, required: false}]",
+        ] {
+            std::fs::write(
+                root.path().join("common.yml"),
+                format!("services: {{base: {{image: alpine, env_file: {env_file}}}}}"),
+            )
+            .unwrap();
+            let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+            let error = executor
+                .snapshot_compose_document(root.path(), root.path(), source, &mut snapshots)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ComposeError::SecurityPolicyViolation { field, reason, .. } if field == "env_file" && reason.contains("outside")),
+                "{env_file}"
+            );
+        }
+        std::fs::write(root.path().join("common.yml"), "services: {base: {image: alpine, env_file: [{path: optional/missing.env, required: false}]}}").unwrap();
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        assert!(executor
+            .snapshot_compose_document(root.path(), root.path(), source, &mut snapshots)
+            .await
+            .is_ok());
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: alpine, env_file: vars.env}}",
+        )
+        .unwrap();
+        let permitted =
+            executor_with_checks_disabled(&[PolicyCheck::Extends, PolicyCheck::EnvFiles]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        assert!(permitted
+            .snapshot_compose_document(root.path(), root.path(), source, &mut snapshots)
+            .await
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compose_include_uses_effective_project_directory_for_nested_env_guards() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(
+            source.join("child.yml"),
+            "include: [{path: grandchild.yml, env_file: vars.env}]",
+        )
+        .unwrap();
+        std::fs::write(source.join("vars.env"), "VALUE=safe\n").unwrap();
+        std::fs::write(
+            runtime.join("grandchild.yml"),
+            "services: {app: {image: alpine}}",
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("secret.env"), "VALUE=private\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.env"), runtime.join("vars.env"))
+            .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Include]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        let error = executor
+            .snapshot_compose_document(
+                root.path(),
+                root.path(),
+                "include: [{path: source/child.yml, project_directory: runtime}]",
+                &mut snapshots,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::InvalidComposePath { reason, .. } if reason.contains("inside the project"))
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_compose_snapshots_rebase_assets_and_confine_nested_files() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends, PolicyCheck::Include]);
+        let mut snapshots = ComposeReferenceSnapshots::new(root.path()).unwrap();
+        let remote = snapshots.cache.path().join("repository");
+        std::fs::create_dir(&remote).unwrap();
+        std::fs::write(remote.join("vars.env"), "SETTING=value\n").unwrap();
+        std::fs::write(
+            remote.join("compose.yml"),
+            "services: {base: {image: alpine, env_file: vars.env}}",
+        )
+        .unwrap();
+        let reference = "https://github.com/example/stack.git";
+        snapshots.remote.insert(
+            reference.to_string(),
+            (remote.join("compose.yml"), remote.clone()),
+        );
+        let source =
+            format!("services: {{app: {{extends: {{file: '{reference}', service: base}}}}}}");
+        let input = executor
+            .snapshot_compose_document(root.path(), root.path(), &source, &mut snapshots)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.remote.len(), 1);
+        let original = std::fs::read_to_string(remote.join("compose.yml")).unwrap();
+        assert_eq!(
+            original,
+            "services: {base: {image: alpine, env_file: vars.env}}"
+        );
+        if std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            let compose_base = std::fs::canonicalize(root.path()).unwrap();
+            // Match the resolver's working directory: Compose versions that
+            // check relative env files during config resolve them against cwd.
+            let output = std::process::Command::new("docker")
+                .args([
+                    "compose",
+                    "-p",
+                    "temps-remote-snapshot-test",
+                    "--project-directory",
+                ])
+                .arg(&compose_base)
+                .arg("-f")
+                .arg(&input)
+                .current_dir(&compose_base)
+                .args([
+                    "config",
+                    "--no-normalize",
+                    "--no-path-resolution",
+                    "--no-env-resolution",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let yaml: Value = serde_yaml::from_slice(&output.stdout).unwrap();
+            if let Some(env_path) = yaml["services"]["app"]["env_file"][0]["path"].as_str() {
+                assert_eq!(
+                    std::fs::canonicalize(compose_base.join(env_path)).unwrap(),
+                    std::fs::canonicalize(remote.join("vars.env")).unwrap()
+                );
+            } else {
+                // Older Compose versions eagerly resolve inherited env files
+                // even with --no-env-resolution; assert the same effective data.
+                assert_eq!(yaml["services"]["app"]["environment"]["SETTING"], "value");
+            }
+        }
+        std::fs::write(
+            root.path().join("private.yml"),
+            "services: {private: {image: alpine}}",
+        )
+        .unwrap();
+        let escape = format!("include: ['{}']", root.path().join("private.yml").display());
+        let error = executor
+            .snapshot_compose_document(&remote, &remote, &escape, &mut snapshots)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::InvalidComposePath { reason, .. } if reason.contains("inside the project"))
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_reset_removes_inherited_shm_and_keeps_effective_policy_checks() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("common.yml"), "services: {base: {image: alpine, shm_size: 1gb, mem_limit: 3g}, unused: {image: alpine, privileged: true}}").unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let content = "services: {app: {extends: {file: common.yml, service: base}, shm_size: !reset null, mem_limit: !reset null}}";
+        let (resolved, _) = executor
+            .resolve_security_configuration(
+                "temps-reset-test",
+                Some(root.path()),
+                "compose.yml",
+                content,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let yaml: Value = serde_yaml::from_str(&resolved).unwrap();
+        assert!(yaml["services"]["app"].get("shm_size").is_none());
+        assert!(yaml["services"]["app"].get("mem_limit").is_none());
+        assert!(yaml["services"].get("unused").is_none());
+        let inherited = "services: {app: {extends: {file: common.yml, service: base}}}";
+        let error = executor
+            .resolve_security_configuration(
+                "temps-reset-test",
+                Some(root.path()),
+                "compose.yml",
+                inherited,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::SecurityPolicyViolation { field, .. } if field == "shm_size")
+        );
+        let default_executor = executor_with_checks_disabled(&[]);
+        assert!(default_executor
+            .resolve_security_configuration(
+                "temps-reset-test",
+                Some(root.path()),
+                "compose.yml",
+                "services: {app: {image: alpine, shm_size: !reset null}}",
+                None,
+                &HashMap::new()
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn extends_exception_resolves_inherited_services_and_still_rejects_privileged() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: nginx:alpine, environment: {MODE: shared}}}",
+        )
+        .unwrap();
+        let content = "services: {web: {extends: {file: common.yml, service: base}}}";
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let (resolved, overrides) = executor
+            .resolve_security_configuration(
+                "temps-policy-test",
+                Some(root.path()),
+                "compose.yml",
+                content,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_yaml::from_str(&resolved).unwrap();
+        assert_eq!(
+            value["services"]["web"]["image"].as_str(),
+            Some("nginx:alpine")
+        );
+        assert!(value["services"]["web"].get("extends").is_none());
+        assert!(overrides.is_none());
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: nginx:alpine, privileged: true}}",
+        )
+        .unwrap();
+        assert!(
+            matches!(executor.resolve_security_configuration("temps-policy-test", Some(root.path()), "compose.yml", content, None, &HashMap::new()).await, Err(ComposeError::SecurityPolicyViolation { field, .. }) if field == "privileged")
+        );
+    }
+
+    #[test]
+    fn identical_extends_is_removed_from_inline_override_only() {
+        let source = "services: {app: {extends: {file: common.yml, service: base}}}";
+        let same = "services: {app: {extends: {file: common.yml, service: base}, ports: ['127.0.0.1:8191:8191']}}";
+        let normalized = ComposeExecutor::without_duplicate_extends("test", source, same).unwrap();
+        let yaml: Value = serde_yaml::from_str(&normalized).unwrap();
+        assert!(yaml["services"]["app"].get("extends").is_none());
+        assert_eq!(
+            yaml["services"]["app"]["ports"][0].as_str(),
+            Some("127.0.0.1:8191:8191")
+        );
+
+        let different = "services: {app: {extends: {file: other.yml, service: base}}}";
+        assert_eq!(
+            ComposeExecutor::without_duplicate_extends("test", source, different).unwrap(),
+            different
+        );
+    }
+
+    #[test]
+    fn port_reset_layer_targets_only_services_with_inline_ports() {
+        let inline = "services: {app: {ports: ['127.0.0.1:8194:8191']}, worker: {environment: {MODE: safe}}}";
+        let reset = ComposeExecutor::port_reset_override("test", inline)
+            .unwrap()
+            .unwrap();
+        assert!(reset.contains("!reset []"));
+        let yaml: Value = serde_yaml::from_str(&reset).unwrap();
+        assert!(yaml["services"]["app"].get("ports").is_some());
+        assert!(yaml["services"].get("worker").is_none());
+        assert!(ComposeExecutor::port_reset_override(
+            "test",
+            "services: {worker: {image: alpine}}"
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_ports_replace_inherited_and_source_ports_during_resolution() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: alpine, ports: ['8191:8191']}}",
+        )
+        .unwrap();
+        let inline = "services: {app: {ports: ['127.0.0.1:8194:8191']}}";
+        for (source, disabled_checks) in [
+            (
+                "services: {app: {image: alpine, ports: ['127.0.0.1:8191:8191']}}",
+                Vec::new(),
+            ),
+            (
+                "services: {app: {extends: {file: common.yml, service: base}, ports: ['127.0.0.1:8192:8191']}}",
+                vec![PolicyCheck::Extends],
+            ),
+        ] {
+            let executor = executor_with_checks_disabled(&disabled_checks);
+            let (resolved, override_content) = executor
+                .resolve_security_configuration(
+                    "temps-port-override-test",
+                    Some(root.path()),
+                    "compose.yml",
+                    source,
+                    Some(inline),
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            assert!(override_content.is_none());
+            let yaml: Value = serde_yaml::from_str(&resolved).unwrap();
+            let ports = yaml["services"]["app"]["ports"].as_sequence().unwrap();
+            assert_eq!(ports.len(), 1, "{resolved}");
+            assert_eq!(ports[0]["published"].as_str(), Some("8194"));
+            assert_eq!(ports[0]["host_ip"].as_str(), Some("127.0.0.1"));
+
+            let clear_inline = "services: {app: {ports: !reset []}}";
+            let (cleared, _) = executor
+                .resolve_security_configuration(
+                    "temps-port-override-test",
+                    Some(root.path()),
+                    "compose.yml",
+                    source,
+                    Some(clear_inline),
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let cleared: Value = serde_yaml::from_str(&cleared).unwrap();
+            assert!(cleared["services"]["app"].get("ports").is_none());
+
+            let public_inline = "services: {app: {ports: ['0.0.0.0:8194:8191']}}";
+            assert!(matches!(
+                executor
+                    .resolve_security_configuration(
+                        "temps-port-override-test",
+                        Some(root.path()),
+                        "compose.yml",
+                        source,
+                        Some(public_inline),
+                        &HashMap::new(),
+                    )
+                    .await,
+                Err(ComposeError::SecurityPolicyViolation { field, .. }) if field == "ports"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_extends_in_inline_override_keeps_repository_dependency_override() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: alpine, depends_on: [redis]}}",
+        )
+        .unwrap();
+        let source = "services: {app: {extends: {file: common.yml, service: base}, depends_on: !override {warp: {condition: service_started}}}, warp: {image: alpine}}";
+        let inline = "services: {app: {extends: {file: common.yml, service: base}, ports: ['127.0.0.1:8191:8191']}}";
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Extends]);
+        let (resolved, override_content) = executor
+            .resolve_security_configuration(
+                "temps-duplicate-extends-test",
+                Some(root.path()),
+                "compose.yml",
+                source,
+                Some(inline),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(override_content.is_none());
+        let yaml: Value = serde_yaml::from_str(&resolved).unwrap();
+        assert!(yaml["services"]["app"]["depends_on"].get("redis").is_none());
+        assert!(yaml["services"]["app"]["depends_on"].get("warp").is_some());
+        assert_eq!(
+            yaml["services"]["app"]["ports"][0]["published"].as_str(),
+            Some("8191")
+        );
+
+        std::fs::write(
+            root.path().join("common.yml"),
+            "services: {base: {image: alpine, depends_on: [redis], privileged: true}}",
+        )
+        .unwrap();
+        let error = executor
+            .resolve_security_configuration(
+                "temps-duplicate-extends-test",
+                Some(root.path()),
+                "compose.yml",
+                source,
+                Some(inline),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposeError::SecurityPolicyViolation { field, .. } if field == "privileged")
+        );
+    }
+
+    #[tokio::test]
+    async fn interpolation_exception_validates_the_resolved_value() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Interpolation]);
+        let content = "services: {app: {image: nginx:alpine, privileged: '${PRIVILEGED:-true}'}}";
+        assert!(executor
+            .resolve_security_configuration(
+                "temps-policy-test",
+                Some(root.path()),
+                "compose.yml",
+                content,
+                None,
+                &HashMap::new()
+            )
+            .await
+            .is_err());
+        std::fs::write(root.path().join(".env"), "PRIVILEGED=true\n").unwrap();
+        let env = HashMap::from([("PRIVILEGED".to_string(), "false".to_string())]);
+        assert!(executor
+            .resolve_security_configuration(
+                "temps-policy-test",
+                Some(root.path()),
+                "compose.yml",
+                content,
+                None,
+                &env
+            )
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn acknowledged_policy_overrides_legacy_sandbox_grants() {
+        let executor = executor_with_checks_disabled(&[]);
+        let yaml: Value =
+            serde_yaml::from_str(&executor.generate_security_override(
+                "services: {app: {image: nginx}}",
+                &["app".to_string()],
+            ))
+            .unwrap();
+        let app = &yaml["services"]["app"];
+        assert_eq!(app["privileged"], Value::Bool(false));
+        assert!(app.get("cap_drop").is_some());
+        assert!(app.get("security_opt").is_some());
+        assert_eq!(app["init"], Value::Bool(true));
+    }
+
+    #[test]
+    fn inline_exceptions_allow_sections_and_new_services_independently() {
+        let base = "services: {app: {image: nginx}}";
+        let sections = "volumes: {data: {}}";
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: [PolicyCheck::InlineSections].into(),
+        };
+        assert!(ComposeExecutor::validate_compose_override_with_policy(
+            "test", base, sections, &policy
+        )
+        .is_ok());
+        assert!(ComposeExecutor::validate_compose_override_with_policy(
+            "test",
+            base,
+            "services: []",
+            &policy
+        )
+        .is_err());
+        assert!(ComposeExecutor::validate_compose_override_with_policy(
+            "test",
+            base,
+            "services: {extra: {image: nginx}}",
+            &policy
+        )
+        .is_err());
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: [PolicyCheck::InlineServices, PolicyCheck::InlineFields].into(),
+        };
+        assert!(ComposeExecutor::validate_compose_override_with_policy(
+            "test",
+            "include: [base.yml]",
+            "services: {extra: {image: nginx}}",
+            &policy
+        )
+        .is_ok());
+        assert!(ComposeExecutor::validate_compose_override_with_policy(
+            "test", base, sections, &policy
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_exceptions_still_reject_docker_socket_aliases_and_parent_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("docker.sock");
+        std::fs::write(&socket, "test socket placeholder").unwrap();
+        std::os::unix::fs::symlink(&socket, root.path().join("engine")).unwrap();
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: [PolicyCheck::BindMounts, PolicyCheck::VolumeHostPaths].into(),
+        };
+        for content in [
+            "services: {app: {image: nginx, volumes: ['./engine:/socket']}}",
+            "services: {app: {image: nginx, volumes: ['/var/run:/host-run']}}",
+            "services: {app: {image: nginx}}\nvolumes: {data: {driver_opts: {type: none, o: bind, device: ./engine}}}",
+        ] {
+            assert!(matches!(ComposeExecutor::validate_compose_filesystem_confinement_with_policy(root.path(), "compose.yml", "test", content, &policy), Err(ComposeError::SecurityPolicyViolation { .. })), "socket reachable through {content}");
+        }
+        let policy = ComposeSecurityPolicy {
+            disabled_checks: [PolicyCheck::BindMounts, PolicyCheck::DockerSocket].into(),
+        };
+        assert!(
+            ComposeExecutor::validate_compose_filesystem_confinement_with_policy(
+                root.path(),
+                "compose.yml",
+                "test",
+                "services: {app: {image: nginx, volumes: ['./engine:/socket']}}",
+                &policy
+            )
+            .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn include_env_symlinks_cannot_escape_the_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        std::fs::write(
+            root.path().join("sub/compose.yml"),
+            "services: {app: {image: nginx}}",
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("secret.env"), "SECRET=hidden").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.env"),
+            root.path().join("sub/.env"),
+        )
+        .unwrap();
+        let result = executor_with_checks_disabled(&[PolicyCheck::Include])
+            .resolve_security_configuration(
+                "test",
+                Some(root.path()),
+                "compose.yml",
+                "include: [sub/compose.yml]",
+                None,
+                &HashMap::new(),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+    #[test]
+    fn shared_external_certificate_volume_requires_both_explicit_grants() {
+        let compose = "services:\n  proxy:\n    image: nginx:alpine\n    volumes: [certificates:/etc/certificates:ro]\nvolumes:\n  certificates:\n    external: true\n    name: shared-certificates\n";
+        for checks in [
+            vec![],
+            vec![PolicyCheck::ExternalVolumes],
+            vec![PolicyCheck::VolumeNames],
+        ] {
+            assert!(executor_with_checks_disabled(&checks)
+                .validate_compose_security_policy("certificates", compose)
+                .is_err());
+        }
+        assert!(executor_with_checks_disabled(&[
+            PolicyCheck::ExternalVolumes,
+            PolicyCheck::VolumeNames
+        ])
+        .validate_compose_security_policy("certificates", compose)
+        .is_ok());
+        let ordinary =
+            "services: {app: {image: nginx, volumes: ['data:/data']}}\nvolumes: {data: {}}";
+        assert!(executor_with_checks_disabled(&[])
+            .validate_compose_security_policy("ordinary", ordinary)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn include_exception_resolves_shared_stack_without_waiving_host_network() {
+        if !std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|result| result.status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("shared.yml"),
+            "services: {proxy: {image: nginx:alpine}}",
+        )
+        .unwrap();
+        let executor = executor_with_checks_disabled(&[PolicyCheck::Include]);
+        let content = "include: [shared.yml]";
+        let (resolved, _) = executor
+            .resolve_security_configuration(
+                "include-test",
+                Some(root.path()),
+                "compose.yml",
+                content,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_yaml::from_str(&resolved).unwrap();
+        assert_eq!(
+            value["services"]["proxy"]["image"].as_str(),
+            Some("nginx:alpine")
+        );
+        std::fs::write(
+            root.path().join("shared.yml"),
+            "services: {proxy: {image: nginx:alpine, network_mode: host}}",
+        )
+        .unwrap();
+        assert!(matches!(
+            executor
+                .resolve_security_configuration(
+                    "include-test",
+                    Some(root.path()),
+                    "compose.yml",
+                    content,
+                    None,
+                    &HashMap::new()
+                )
+                .await,
+            Err(ComposeError::SecurityPolicyViolation { .. })
+        ));
     }
 }
