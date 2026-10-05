@@ -3548,6 +3548,7 @@
             "default": {
               "backend_url": "https://app.temps.sh",
               "backups_enabled": false,
+              "console_access_enabled": false,
               "notifications_enabled": false,
               "telemetry_bulk_anomaly_factor": null,
               "telemetry_bulk_rate_limit_spans_per_sec": null,
@@ -7813,20 +7814,31 @@
       "CloudFeatureSwitchesRequest": {
         "properties": {
           "backups_enabled": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "console_access_enabled": {
+            "description": "Omitted switches retain their current value under the settings row lock.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "notifications_enabled": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "telemetry_enabled": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
-        "required": [
-          "telemetry_enabled",
-          "backups_enabled",
-          "notifications_enabled"
-        ],
         "type": "object"
       },
       "CloudProvider": {
@@ -7852,6 +7864,11 @@
           "backups_enabled": {
             "default": false,
             "description": "Explicit consent to export completed backup objects.",
+            "type": "boolean"
+          },
+          "console_access_enabled": {
+            "default": false,
+            "description": "Explicit operator consent to let Temps Cloud open this instance's\nconsole over the outbound relay, using managed OIDC authentication.\nDefault off for every enrollment path. Linking, including unattended\nbootstrap, never enables console access; enable it explicitly in\nSettings > Temps Cloud or with `temps cloud console-access enable`.",
             "type": "boolean"
           },
           "notifications_enabled": {
@@ -7912,6 +7929,10 @@
           "backups_enabled": {
             "type": "boolean"
           },
+          "console_access_enabled": {
+            "description": "ADR-045 §5: whether this instance currently permits Temps Cloud to\nopen its console over the console-proxy tunnel.",
+            "type": "boolean"
+          },
           "health": {
             "type": "string"
           },
@@ -7954,6 +7975,7 @@
           "telemetry_enabled",
           "backups_enabled",
           "notifications_enabled",
+          "console_access_enabled",
           "managed_backup_setup"
         ],
         "type": "object"

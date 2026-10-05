@@ -11456,6 +11456,7 @@ name = "temps-cloud"
 version = "0.1.0-beta.56"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aws-sdk-s3",
  "axum",
  "chrono",
@@ -11488,11 +11489,14 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "clickhouse",
  "futures",
  "futures-util",
  "hmac 0.13.0",
+ "hyper",
+ "hyper-util",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",
@@ -11508,6 +11512,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
+ "tower",
  "tracing",
  "url",
  "uuid",
@@ -11517,6 +11522,7 @@ dependencies = [
 name = "temps-cloud-protocol"
 version = "0.1.0-beta.56"
 dependencies = [
+ "bytes",
  "chrono",
  "serde",
  "serde_json",

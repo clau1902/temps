@@ -271,6 +271,14 @@ pub struct CloudSettings {
     /// Explicit consent to send notifications through managed providers.
     pub notifications_enabled: bool,
 
+    /// Explicit operator consent to let Temps Cloud open this instance's
+    /// console over the outbound relay, using managed OIDC authentication.
+    /// Default off for every enrollment path. Linking, including unattended
+    /// bootstrap, never enables console access; enable it explicitly in
+    /// Settings > Temps Cloud or with `temps cloud console-access enable`.
+    #[serde(default)]
+    pub console_access_enabled: bool,
+
     /// ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
     /// backs Cloud-primary telemetry writes.
     ///
@@ -435,6 +443,8 @@ impl Default for CloudSettings {
             telemetry_enabled: false,
             backups_enabled: false,
             notifications_enabled: false,
+            // Linking never changes this explicit operator consent.
+            console_access_enabled: false,
             telemetry_outbox_max_bytes: DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
             // ADR-042 §3: unthrottled by default. "Activate now" is what the
             // customer paid for, and a throttle nobody asked for makes a long
@@ -3082,6 +3092,10 @@ mod tests {
         assert!(!defaults.telemetry_enabled);
         assert!(!defaults.backups_enabled);
         assert!(!defaults.notifications_enabled);
+        // ADR-045 §5: console access defaults off just like the other three
+        // consent flags -- an instance never gets it merely by loading
+        // settings. Every enrollment path preserves explicit operator consent.
+        assert!(!defaults.console_access_enabled);
 
         let parsed = AppSettings::from_json(serde_json::json!({
             "cloud": {"backend_url": "https://cloud.example.com"}
@@ -3089,6 +3103,21 @@ mod tests {
         assert!(!parsed.cloud.telemetry_enabled);
         assert!(!parsed.cloud.backups_enabled);
         assert!(!parsed.cloud.notifications_enabled);
+        assert!(!parsed.cloud.console_access_enabled);
+
+        // A settings row written before this field existed (no `cloud.
+        // console_access_enabled` key at all) must deserialize as off
+        // rather than failing the whole settings read.
+        let legacy = AppSettings::from_json(serde_json::json!({
+            "cloud": {
+                "backend_url": "https://cloud.example.com",
+                "telemetry_enabled": true,
+                "backups_enabled": false,
+                "notifications_enabled": false
+            }
+        }));
+        assert!(!legacy.cloud.console_access_enabled);
+        assert!(legacy.cloud.telemetry_enabled);
     }
 
     #[test]

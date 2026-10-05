@@ -1832,9 +1832,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// the whole document would lose concurrent unrelated changes.
     pub async fn update_cloud_features(
         &self,
-        telemetry_enabled: bool,
-        backups_enabled: bool,
-        notifications_enabled: bool,
+        telemetry_enabled: Option<bool>,
+        backups_enabled: Option<bool>,
+        notifications_enabled: Option<bool>,
+        console_access_enabled: Option<bool>,
     ) -> Result<AppSettings, ConfigServiceError> {
         let transaction = self.db.begin().await?;
         let query = settings::Entity::find_by_id(1);
@@ -1848,9 +1849,18 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .as_ref()
             .map(|model| AppSettings::from_json(model.data.clone()))
             .unwrap_or_default();
-        current.cloud.telemetry_enabled = telemetry_enabled;
-        current.cloud.backups_enabled = backups_enabled;
-        current.cloud.notifications_enabled = notifications_enabled;
+        if let Some(value) = telemetry_enabled {
+            current.cloud.telemetry_enabled = value;
+        }
+        if let Some(value) = backups_enabled {
+            current.cloud.backups_enabled = value;
+        }
+        if let Some(value) = notifications_enabled {
+            current.cloud.notifications_enabled = value;
+        }
+        if let Some(value) = console_access_enabled {
+            current.cloud.console_access_enabled = value;
+        }
         let now = Utc::now();
         if let Some(model) = existing {
             let merged = current.to_json_merged(&model.data);
@@ -1872,6 +1882,47 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // Invalidate instead of publishing this transaction's clone: another
         // writer may commit later but update the cache earlier, and publishing
         // here would then regress the cache out of commit order.
+        self.invalidate_settings_cache().await;
+        Ok(current)
+    }
+
+    /// Persist only the console-access switch under the shared settings lock.
+    /// Used when an operator explicitly configures remote console access.
+    pub async fn set_console_access_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<AppSettings, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        current.cloud.console_access_enabled = enabled;
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
         self.invalidate_settings_cache().await;
         Ok(current)
     }
@@ -4803,5 +4854,113 @@ mod tests {
             .await
             .expect("query")
             .is_some());
+    }
+
+    fn settings_row_with_document(document: serde_json::Value) -> settings::Model {
+        settings::Model {
+            id: 1,
+            data: document,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_console_access_enabled_persists_true_without_touching_other_cloud_fields() {
+        let mut document = AppSettings::default().to_json();
+        if let Some(cloud) = document
+            .get_mut("cloud")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            cloud.insert("telemetry_enabled".to_string(), serde_json::json!(true));
+        }
+        let row = settings_row_with_document(document);
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                // Locked read, then the row Sea-ORM re-selects after UPDATE
+                // (same shape as `update_geo_settings`'s own test above).
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db);
+
+        let updated = svc
+            .set_console_access_enabled(true)
+            .await
+            .expect("setting console access must succeed");
+
+        assert!(updated.cloud.console_access_enabled);
+        // Confirms this is a narrow, single-field update: an unrelated
+        // consent flag already `true` in the stored document must survive
+        // untouched, the same guarantee `update_cloud_features` gives the
+        // fields it does not own.
+        assert!(updated.cloud.telemetry_enabled);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_instance_defaults_console_access_to_off() {
+        // The unattended first-boot bootstrap is the *only* path that turns
+        // this on -- calling it is a distinct, explicit step
+        // (`CloudService::enable_console_access_for_unattended_bootstrap`)
+        // never reached merely by loading settings. An instance that has
+        // never taken that step (including one enrolled by an operator
+        // pasting a code) must read back `false`.
+        assert!(!AppSettings::default().cloud.console_access_enabled);
+    }
+
+    #[tokio::test]
+    async fn partial_cloud_update_preserves_unrelated_consent() {
+        let mut settings = AppSettings::default();
+        settings.cloud.telemetry_enabled = true;
+        settings.cloud.console_access_enabled = true;
+        let row = settings_row_with_document(settings.to_json());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db);
+        let updated = service
+            .update_cloud_features(None, Some(true), None, None)
+            .await
+            .unwrap();
+        assert!(updated.cloud.backups_enabled);
+        assert!(updated.cloud.console_access_enabled);
+        assert!(updated.cloud.telemetry_enabled);
+    }
+
+    #[tokio::test]
+    async fn update_cloud_features_sets_console_access_enabled_explicitly() {
+        let row = settings_row_with_document(AppSettings::default().to_json());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                // Locked read, then the row Sea-ORM re-selects after UPDATE
+                // (same shape as `update_geo_settings`'s own test above).
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db);
+
+        let updated = svc
+            .update_cloud_features(Some(false), Some(false), Some(false), Some(true))
+            .await
+            .expect("update_cloud_features must succeed");
+        assert!(
+            updated.cloud.console_access_enabled,
+            "the 4th positional argument must map to console_access_enabled"
+        );
     }
 }

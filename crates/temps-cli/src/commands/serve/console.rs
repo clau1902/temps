@@ -1066,7 +1066,7 @@ fn bootstrap_cloud_enrollment_from_env(
         let already_linked_service = cloud_service.clone();
         let apply_backend_url_service = cloud_service.clone();
         let enroll_service = cloud_service.clone();
-        let provision_service = cloud_service;
+        let provision_service = cloud_service.clone();
         let backend_url_audit = audit_logger.clone();
         let link_audit = audit_logger.clone();
         let backup_audit = audit_logger;
@@ -1111,6 +1111,8 @@ fn bootstrap_cloud_enrollment_from_env(
                          registered; the CLOUD_LINK_CONNECTED audit record was not written"
                     ),
                 }
+                // Enrollment preserves console consent. Enable remote console
+                // access explicitly from Settings > Temps Cloud or the CLI.
             },
             move || async move {
                 provision_service
@@ -4550,6 +4552,19 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let plugin_api_router =
         Router::new().nest("/api", public_router.clone().merge(admin_router.clone()));
 
+    // ADR-045 §3: a second clone of `admin_router`, shaped exactly like
+    // `admin_app` below (`nest("/api", ..)` + the static-file fallback) but
+    // taken *before* that router is wrapped in the admin IP-allowlist gate —
+    // for the same reason `plugin_api_router` above omits it: authorization
+    // for a console-proxied request comes from Cloud's own auth plus the
+    // browser's session cookie, not from network topology. Installed into
+    // the shared `ConsoleDispatchSlot` near the `RouterHostApi` wiring below,
+    // for `temps-cloud-client::console_proxy::ConsoleProxyWorker` (started
+    // elsewhere, once the `cloud.console_access_enabled` setting exists) to
+    // drive in-process.
+    let console_router = Router::new()
+        .nest("/api", admin_router.clone())
+        .fallback(serve_static_file);
     // Nodes paired from the control plane reach it over the WireGuard mesh
     // (ADR 048 D3); that listener serves only the routes nodes call.
     super::node_api::spawn(
@@ -4635,6 +4650,33 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     }
 
     info!("Plugin system initialized successfully with static file serving");
+
+    // ADR-045 §3: install the just-assembled `console_router` into a shared
+    // slot for the console-proxy dispatcher — the same "shared slot, filled
+    // post-construction" shape `RouterHostApi`'s bridge uses just below, and
+    // for the same reason: the router does not exist until this point in
+    // startup. The Cloud plugin registers the slot (and starts
+    // `ConsoleProxyWorker` reading from it) during service registration;
+    // this fills it. The fallback only exists for builds without that
+    // plugin, so the console still starts — nothing reads the slot then.
+    let console_dispatch_slot = match plugin_manager
+        .service_context()
+        .get_service::<temps_cloud_client::ConsoleDispatchSlot>()
+    {
+        Some(slot) => slot.as_ref().clone(),
+        None => {
+            let slot = temps_cloud_client::ConsoleDispatchSlot::new();
+            plugin_manager
+                .service_context()
+                .register_service(Arc::new(slot.clone()));
+            slot
+        }
+    };
+    console_dispatch_slot
+        .set(Arc::new(temps_cloud_client::ConsoleRouterHandle::new(
+            console_router,
+        )))
+        .await;
 
     let external_plugins_service = plugin_manager
         .service_context()

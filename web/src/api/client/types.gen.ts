@@ -3600,9 +3600,13 @@ export type CloudDeliveryGapResponse = {
 };
 
 export type CloudFeatureSwitchesRequest = {
-    backups_enabled: boolean;
-    notifications_enabled: boolean;
-    telemetry_enabled: boolean;
+    backups_enabled?: boolean | null;
+    /**
+     * Omitted switches retain their current value under the settings row lock.
+     */
+    console_access_enabled?: boolean | null;
+    notifications_enabled?: boolean | null;
+    telemetry_enabled?: boolean | null;
 };
 
 /**
@@ -3627,6 +3631,14 @@ export type CloudSettings = {
      * Explicit consent to export completed backup objects.
      */
     backups_enabled?: boolean;
+    /**
+     * Explicit operator consent to let Temps Cloud open this instance's
+     * console over the outbound relay, using managed OIDC authentication.
+     * Default off for every enrollment path. Linking, including unattended
+     * bootstrap, never enables console access; enable it explicitly in
+     * Settings > Temps Cloud or with `temps cloud console-access enable`.
+     */
+    console_access_enabled?: boolean;
     /**
      * Explicit consent to send notifications through managed providers.
      */
@@ -3711,6 +3723,11 @@ export type CloudStatus = {
     account_email?: string | null;
     backend_url: string;
     backups_enabled: boolean;
+    /**
+     * ADR-045 §5: whether this instance currently permits Temps Cloud to
+     * open its console over the console-proxy tunnel.
+     */
+    console_access_enabled: boolean;
     health: string;
     health_message: string;
     instance_id?: string | null;
