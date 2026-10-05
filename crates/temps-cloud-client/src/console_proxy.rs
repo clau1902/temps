@@ -86,6 +86,18 @@ type WsRead = SplitStream<WsStream>;
 /// Bound on connect + handshake, matching [`crate::heartbeat::HANDSHAKE_TIMEOUT`].
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Total budget for best-effort stream-end notices during teardown.
+const STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Spawned connection drivers must not outlive a cancelled stream or worker.
+struct TaskAbortGuard(AbortHandle);
+
+impl Drop for TaskAbortGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Base reconnect delay. Console access is an interactive operator feature —
 /// unlike heartbeat, a lost connection should be retried promptly rather than
 /// waiting out a 30s cadence built for a liveness signal — but it still backs
@@ -383,6 +395,7 @@ async fn connection_cycle(
 
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
     let writer_handle = tokio::spawn(writer_task(write, outbound_rx));
+    let _writer_guard = TaskAbortGuard(writer_handle.abort_handle());
 
     let shared = Arc::new(ConnectionShared {
         console_host: StdRwLock::new(None),
@@ -448,10 +461,13 @@ async fn connect(
     let config = WebSocketConfig::default()
         .max_message_size(Some(WS_TRANSPORT_MAX_MESSAGE_BYTES))
         .max_frame_size(Some(WS_TRANSPORT_MAX_MESSAGE_BYTES));
-    let (stream, _response) =
-        tokio_tungstenite::connect_async_with_config(request, Some(config), false)
-            .await
-            .map_err(|source| ConsoleProxyError::Connect { source })?;
+    let (stream, _response) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+    )
+    .await
+    .map_err(|_| ConsoleProxyError::ConnectTimeout)?
+    .map_err(|source| ConsoleProxyError::Connect { source })?;
     let (write, read) = stream.split();
     Ok((write, read))
 }
@@ -695,16 +711,32 @@ async fn end_stream(shared: &ConnectionShared, stream_id: Uuid, reason: ConsoleS
 
 /// ADR-045 §1: announce every currently open stream before the socket closes.
 async fn close_all_streams(shared: &ConnectionShared, reason: ConsoleStreamEndReason) {
-    let entries: Vec<(Uuid, AbortHandle)> = {
-        let table = shared.streams.lock().unwrap_or_else(|p| p.into_inner());
-        table
-            .iter()
-            .map(|(id, entry)| (*id, entry.abort.clone()))
-            .collect()
+    let entries: Vec<(Uuid, StreamEntry)> = shared
+        .streams
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain()
+        .collect();
+    // Abort all tasks before attempting any potentially blocked writes.
+    for (_, entry) in &entries {
+        entry.abort.abort();
+    }
+    let notices = async {
+        for (stream_id, _) in entries {
+            let end = ConsoleStreamEnd {
+                stream_id,
+                reason: reason.clone(),
+            };
+            let _ = shared.send_envelope(ConsoleStreamEnd::KIND, &end).await;
+        }
     };
-    for (stream_id, abort) in entries {
-        abort.abort();
-        end_stream(shared, stream_id, reason.clone()).await;
+    if tokio::time::timeout(STREAM_SHUTDOWN_TIMEOUT, notices)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "console-proxy stream-end notices timed out; all streams are already aborted"
+        );
     }
 }
 
@@ -748,7 +780,27 @@ async fn read_loop(
                     }
                     Some(Ok(message)) => {
                         let is_enabled = *enabled.borrow();
-                        handle_message(shared, message, oidc_sink, is_enabled).await;
+                        let handling = handle_message(shared, message, oidc_sink, is_enabled);
+                        tokio::pin!(handling);
+                        // Body backpressure or provisioning must never prevent an
+                        // operator from closing this connection. Keep the same
+                        // future across unrelated watch notifications.
+                        loop {
+                            tokio::select! {
+                                biased;
+                                changed = cancel.changed() => {
+                                    if changed.is_err() || *cancel.borrow() {
+                                        return CycleOutcome::Cancelled;
+                                    }
+                                }
+                                changed = enabled.changed() => {
+                                    if changed.is_err() || !*enabled.borrow() {
+                                        return CycleOutcome::Disconnected;
+                                    }
+                                }
+                                _ = &mut handling => break,
+                            }
+                        }
                     }
                     Some(Err(error)) => {
                         tracing::debug!(%error, "Cloud console-proxy connection error; will reconnect");
@@ -947,21 +999,6 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
         refuse_stream(&shared, stream_id, ConsoleRefusalReason::HostMismatch).await;
         return;
     }
-    let header_bytes: usize = open.headers.iter().map(|(k, v)| k.len() + v.len()).sum();
-    if header_bytes > CONSOLE_MAX_HEADER_BYTES {
-        end_stream(
-            &shared,
-            stream_id,
-            ConsoleStreamEndReason::Error {
-                detail: format!(
-                    "request headers total {header_bytes} bytes, over the \
-                     {CONSOLE_MAX_HEADER_BYTES}-byte limit"
-                ),
-            },
-        )
-        .await;
-        return;
-    }
     // A reused `stream_id` must never overwrite the existing table entry —
     // that would desync this connection's bookkeeping from Cloud's and
     // silently drop whatever the original stream was doing. Checked before
@@ -974,6 +1011,18 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
         .contains_key(&stream_id);
     if is_duplicate {
         refuse_stream(&shared, stream_id, ConsoleRefusalReason::DuplicateStream).await;
+        return;
+    }
+    let header_bytes: usize = open.headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if header_bytes > CONSOLE_MAX_HEADER_BYTES {
+        let end = ConsoleStreamEnd {
+            stream_id,
+            reason: ConsoleStreamEndReason::Error {
+                detail: format!("request headers total {header_bytes} bytes, over the {CONSOLE_MAX_HEADER_BYTES}-byte limit"),
+            },
+        };
+        // No table entry exists yet, so end_stream would silently do nothing.
+        let _ = shared.send_envelope(ConsoleStreamEnd::KIND, &end).await;
         return;
     }
     let too_many_streams = shared
@@ -1169,7 +1218,17 @@ fn build_request(
     }
     let mut builder = Request::builder().method(method).uri(uri);
     for (name, value) in &open.headers {
-        if name.eq_ignore_ascii_case("host") {
+        // Forwarding metadata comes only from the relay's validated client IP
+        // and pinned host, never from headers supplied by a browser.
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("forwarded")
+            || name.eq_ignore_ascii_case("x-real-ip")
+            || name.to_ascii_lowercase().starts_with("x-forwarded-")
+            || (is_hop_by_hop_header(name, &open.headers)
+                && !(open.upgrade_requested
+                    && (name.eq_ignore_ascii_case("connection")
+                        || name.eq_ignore_ascii_case("upgrade"))))
+        {
             continue;
         }
         let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
@@ -1207,6 +1266,27 @@ fn build_request(
     // console-proxied request's audited IP to "unknown".
     request.extensions_mut().insert(ConnectInfo(SYNTHETIC_PEER));
     Ok(request)
+}
+
+fn is_hop_by_hop_header(name: &str, headers: &[(String, String)]) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    ) || headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("connection"))
+        .any(|(_, value)| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(name))
+        })
 }
 
 fn max_data_payload_bytes() -> usize {
@@ -1259,15 +1339,26 @@ async fn stream_response(
     upgraded: bool,
 ) -> Result<(), ConsoleProxyError> {
     let status = response.status();
-    let headers = response
+    // Check the original header map before copying any unbounded values.
+    validate_response_headers(stream_id, response.headers())?;
+    let connection_headers: Vec<(String, String)> = response
+        .headers()
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| ("connection".into(), value.into()))
+        })
+        .collect();
+    let headers: Vec<(String, String)> = response
         .headers()
         .iter()
         .filter_map(|(name, value)| {
             // Hop-by-hop framing headers are meaningless once re-framed as
             // console-proxy data frames.
-            if name.as_str().eq_ignore_ascii_case("transfer-encoding")
-                || name.as_str().eq_ignore_ascii_case("connection")
-            {
+            if is_hop_by_hop_header(name.as_str(), &connection_headers) {
                 return None;
             }
             value
@@ -1296,6 +1387,23 @@ async fn stream_response(
             continue;
         }
         send_credited(shared, stream_id, kind, credit, activity, chunk).await?;
+    }
+    Ok(())
+}
+
+fn validate_response_headers(
+    stream_id: Uuid,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), ConsoleProxyError> {
+    let bytes: usize = headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
+        .sum();
+    if bytes > CONSOLE_MAX_HEADER_BYTES {
+        return Err(ConsoleProxyError::InvalidStreamResponse {
+            stream_id,
+            reason: format!("response headers total {bytes} bytes, over the {CONSOLE_MAX_HEADER_BYTES}-byte limit"),
+        });
     }
     Ok(())
 }
@@ -1380,6 +1488,7 @@ async fn run_upgrade_stream(
             .await;
     });
 
+    let _server_guard = TaskAbortGuard(server_task.abort_handle());
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(client_half))
             .await
@@ -1391,6 +1500,7 @@ async fn run_upgrade_stream(
         let _ = connection.with_upgrades().await;
     });
 
+    let _connection_guard = TaskAbortGuard(connection_task.abort_handle());
     let response = sender.send_request(request).await.map_err(|error| {
         ConsoleProxyError::UpgradeHandshake {
             stream_id,
@@ -1417,6 +1527,7 @@ async fn run_upgrade_stream(
         return outcome;
     }
 
+    validate_response_headers(stream_id, response.headers())?;
     let head = ConsoleResponseHead {
         stream_id,
         status: response.status().as_u16(),
@@ -1514,6 +1625,10 @@ enum ConsoleProxyError {
         #[source]
         source: tokio_tungstenite::tungstenite::Error,
     },
+    #[error("timed out connecting to the Cloud console-proxy endpoint")]
+    ConnectTimeout,
+    #[error("stream {stream_id} response is invalid: {reason}")]
+    InvalidStreamResponse { stream_id: Uuid, reason: String },
     #[error("the server hello was unreadable: {reason}")]
     InvalidServerHello { reason: String },
     #[error("timed out waiting for the server hello")]
@@ -2169,6 +2284,644 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), harness.join).await;
     }
 
+    #[test]
+    fn browser_proxy_headers_cannot_override_trusted_metadata() {
+        let mut open = open_request(Uuid::new_v4(), "GET", "/whoami");
+        open.headers.extend([
+            ("x-forwarded-for".into(), "198.51.100.99".into()),
+            ("x-forwarded-for".into(), "127.0.0.1".into()),
+            ("x-real-ip".into(), "127.0.0.1".into()),
+            ("x-forwarded-proto".into(), "http".into()),
+            ("x-forwarded-host".into(), "spoof.example.invalid".into()),
+            ("forwarded".into(), "for=127.0.0.1;proto=http".into()),
+        ]);
+        let request = build_request(&open, PINNED_HOST, Body::empty()).unwrap();
+        assert_eq!(
+            temps_core::resolve_client_ip(request.headers(), Some(SYNTHETIC_PEER)),
+            "203.0.113.5"
+        );
+        assert_eq!(
+            request.headers().get_all("x-forwarded-for").iter().count(),
+            1
+        );
+        assert_eq!(request.headers()["x-forwarded-proto"], "https");
+        assert!(!request.headers().contains_key("forwarded"));
+        assert!(!request.headers().contains_key("x-forwarded-host"));
+        assert!(!request.headers().contains_key("x-real-ip"));
+    }
+
+    #[tokio::test]
+    async fn oversized_request_headers_end_without_dispatch_and_allow_next_request() {
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        harness
+            .set_router(Router::new().route("/fast", get(|| async { "ok" })))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        let mut open = open_request(Uuid::new_v4(), "GET", "/fast");
+        open.headers
+            .push(("x-oversized".into(), "x".repeat(CONSOLE_MAX_HEADER_BYTES)));
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+        let envelope = tokio::time::timeout(Duration::from_secs(1), recv_control(&mut cloud))
+            .await
+            .expect("invalid request must get a terminal response");
+        let end: ConsoleStreamEnd = envelope.decode(ConsoleStreamEnd::KIND).unwrap();
+        assert_eq!(end.stream_id, open.stream_id);
+        assert!(matches!(end.reason, ConsoleStreamEndReason::Error { .. }));
+        let next = open_request(Uuid::new_v4(), "GET", "/fast");
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &next).await;
+        assert_eq!(expect_response(&mut cloud, next.stream_id).await.1, b"ok");
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
+    #[test]
+    fn connection_scoped_request_headers_do_not_reach_the_router() {
+        let mut open = open_request(Uuid::new_v4(), "GET", "/");
+        open.headers.extend([
+            ("connection".into(), "keep-alive, X-Private-Hop".into()),
+            ("x-private-hop".into(), "private".into()),
+            ("keep-alive".into(), "timeout=30".into()),
+            ("proxy-authorization".into(), "private-credential".into()),
+            ("cookie".into(), "session=browser-session".into()),
+        ]);
+        let request = build_request(&open, PINNED_HOST, Body::empty()).unwrap();
+        for name in [
+            "connection",
+            "x-private-hop",
+            "keep-alive",
+            "proxy-authorization",
+        ] {
+            assert!(
+                !request.headers().contains_key(name),
+                "{name} is connection-scoped"
+            );
+        }
+        assert_eq!(request.headers()["cookie"], "session=browser-session");
+    }
+
+    #[tokio::test]
+    async fn console_html_redirect_and_session_cookies_round_trip_over_the_wire() {
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        harness.set_router(Router::new()
+            .route("/", get(|| async { axum::response::Html("<html><body>Console</body></html>") }))
+            .route("/signin", get(|| async {
+                let mut response = Response::builder().status(StatusCode::SEE_OTHER)
+                    .header("location", "/")
+                    .header("connection", "keep-alive, x-private-hop")
+                    .header("x-private-hop", "private")
+                    .body(Body::empty()).unwrap();
+                response.headers_mut().append("set-cookie", HeaderValue::from_static("session=browser-session; Path=/; Secure; HttpOnly; SameSite=Strict"));
+                response.headers_mut().append("set-cookie", HeaderValue::from_static("oidc_state=; Path=/; Max-Age=0; Secure; HttpOnly"));
+                response
+            }))
+            .route("/api/user/me", get(|headers: axum::http::HeaderMap| async move {
+                if headers.get("cookie").and_then(|value| value.to_str().ok()) == Some("session=browser-session") {
+                    (StatusCode::OK, "authenticated")
+                } else {
+                    (StatusCode::UNAUTHORIZED, "sign in")
+                }
+            }))).await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        let page = open_request(Uuid::new_v4(), "GET", "/");
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &page).await;
+        let (head, body) = expect_response(&mut cloud, page.stream_id).await;
+        assert_eq!(head.status, 200);
+        assert!(String::from_utf8(body).unwrap().contains("Console"));
+        let login = open_request(Uuid::new_v4(), "GET", "/signin");
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &login).await;
+        let (head, _) = expect_response(&mut cloud, login.stream_id).await;
+        assert_eq!(head.status, 303);
+        assert_eq!(header_value(&head.headers, "location"), Some("/"));
+        let cookies: Vec<_> = head
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "set-cookie")
+            .collect();
+        assert_eq!(
+            cookies.len(),
+            2,
+            "session creation and state cleanup must remain separate cookies"
+        );
+        assert!(cookies
+            .iter()
+            .any(|(_, value)| value.contains("Secure; HttpOnly; SameSite=Strict")));
+        assert!(cookies.iter().any(|(_, value)| value.contains("Max-Age=0")));
+        assert!(header_value(&head.headers, "x-private-hop").is_none());
+        assert!(header_value(&head.headers, "connection").is_none());
+        for authenticated in [false, true] {
+            let mut open = open_request(Uuid::new_v4(), "GET", "/api/user/me");
+            if authenticated {
+                open.headers
+                    .push(("cookie".into(), "session=browser-session".into()));
+            }
+            send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+            let (head, _) = expect_response(&mut cloud, open.stream_id).await;
+            assert_eq!(head.status, if authenticated { 200 } else { 401 });
+        }
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
+    /// Browser dependencies are optional in Rust-only CI jobs. Where available,
+    /// drive Chromium through a local Cloud HTTP stub and the real relay worker.
+    /// The sign-in route tests cookie transport, not the external Cloud IdP.
+    #[tokio::test]
+    async fn chromium_loads_relayed_html_keeps_cookies_and_receives_sse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let playwright = root.join("web/node_modules/@playwright/test/index.mjs");
+        if !playwright.exists() {
+            eprintln!(
+                "skipping browser relay test: install web dependencies and Playwright Chromium"
+            );
+            return;
+        }
+        let module = serde_json::to_string(&playwright.to_string_lossy()).unwrap();
+        let probe = format!(
+            "const {{chromium}} = await import({module}); console.log(chromium.executablePath());"
+        );
+        let available = tokio::process::Command::new("bun")
+            .args(["-e", &probe])
+            .output()
+            .await;
+        let Ok(available) = available else {
+            eprintln!("skipping browser relay test: Bun is unavailable");
+            return;
+        };
+        let executable = String::from_utf8_lossy(&available.stdout);
+        if !available.status.success() || !std::path::Path::new(executable.trim()).exists() {
+            eprintln!("skipping browser relay test: Playwright Chromium is unavailable");
+            return;
+        }
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        harness
+            .set_router(
+                Router::new()
+                    .route(
+                        "/",
+                        get(|| async {
+                            axum::response::Html("<html><body><h1>Relay console</h1></body></html>")
+                        }),
+                    )
+                    .route(
+                        "/signin",
+                        get(|| async {
+                            Response::builder()
+                                .status(303)
+                                .header("location", "/")
+                                .header(
+                                    "set-cookie",
+                                    "session=browser-session; Path=/; HttpOnly; SameSite=Strict",
+                                )
+                                .body(Body::empty())
+                                .unwrap()
+                        }),
+                    )
+                    .route(
+                        "/api/user/me",
+                        get(|headers: axum::http::HeaderMap| async move {
+                            if headers.get("cookie").and_then(|value| value.to_str().ok())
+                                == Some("session=browser-session")
+                            {
+                                (StatusCode::OK, "authenticated")
+                            } else {
+                                (StatusCode::UNAUTHORIZED, "sign in")
+                            }
+                        }),
+                    )
+                    .route(
+                        "/events",
+                        get(|| async {
+                            use axum::response::sse::{Event, Sse};
+                            Sse::new(
+                                futures_util::stream::once(async {
+                                    Ok::<_, std::convert::Infallible>(
+                                        Event::default().data("live event"),
+                                    )
+                                })
+                                .chain(futures_util::stream::pending()),
+                            )
+                        }),
+                    ),
+            )
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+
+        type BrowserReply = tokio::sync::oneshot::Sender<Response<Body>>;
+        let (requests_tx, mut requests_rx) = mpsc::channel::<(ConsoleStreamOpen, BrowserReply)>(16);
+        let front = Router::new().fallback(move |request: Request<Body>| {
+            let tx = requests_tx.clone();
+            async move {
+                let mut open = open_request(
+                    Uuid::new_v4(),
+                    request.method().as_str(),
+                    request.uri().path(),
+                );
+                open.query = request.uri().query().map(str::to_owned);
+                open.headers.extend(
+                    request
+                        .headers()
+                        .iter()
+                        .filter(|(name, _)| name.as_str() != "host")
+                        .map(|(name, value)| {
+                            (name.to_string(), value.to_str().unwrap().to_owned())
+                        }),
+                );
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.send((open, reply_tx)).await.unwrap();
+                reply_rx.await.unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let browser_url = format!("http://{}", listener.local_addr().unwrap());
+        let front_task = tokio::spawn(async move {
+            axum::serve(listener, front).await.unwrap();
+        });
+        let _front_guard = TaskAbortGuard(front_task.abort_handle());
+        let pump = tokio::spawn(async move {
+            type PendingReply = (
+                Option<(BrowserReply, mpsc::Receiver<Bytes>)>,
+                mpsc::Sender<Bytes>,
+            );
+            let mut pending: HashMap<Uuid, PendingReply> = HashMap::new();
+            loop {
+                tokio::select! {
+                    request = requests_rx.recv() => {
+                        let Some((open, reply)) = request else { break; };
+                        let (body_tx, body_rx) = mpsc::channel(8);
+                        pending.insert(open.stream_id, (Some((reply, body_rx)), body_tx));
+                        send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+                    }
+                    frame = recv_wire_frame(&mut cloud) => {
+                        match frame {
+                            Some(WireFrame::Control(envelope)) if envelope.kind == ConsoleResponseHead::KIND => {
+                                let head: ConsoleResponseHead = envelope.decode(ConsoleResponseHead::KIND).unwrap();
+                                let entry = pending.get_mut(&head.stream_id).unwrap();
+                                let (reply, rx) = entry.0.take().unwrap();
+                                let mut response = Response::builder().status(head.status);
+                                for (name, value) in head.headers { response = response.header(name, value); }
+                                let _ = reply.send(response.body(Body::from_stream(receiver_stream(rx))).unwrap());
+                            }
+                            Some(WireFrame::Data(frame)) => {
+                                if let Some(entry) = pending.get(&frame.stream_id) {
+                                    let _ = entry.1.send(frame.payload().clone()).await;
+                                    send_control(&mut cloud, ConsoleWindowUpdate::KIND, &ConsoleWindowUpdate {
+                                        stream_id: frame.stream_id, additional_bytes: frame.payload().len() as u32,
+                                    }).await;
+                                }
+                            }
+                            Some(WireFrame::Control(envelope)) if envelope.kind == ConsoleStreamEnd::KIND => {
+                                let end: ConsoleStreamEnd = envelope.decode(ConsoleStreamEnd::KIND).unwrap();
+                                pending.remove(&end.stream_id);
+                            }
+                            None => break,
+                            Some(_) => {}
+                        }
+                    }
+                }
+            }
+        });
+        let _pump_guard = TaskAbortGuard(pump.abort_handle());
+        let url = serde_json::to_string(&browser_url).unwrap();
+        let script = format!(
+            r#"
+            const {{ chromium }} = await import({module});
+            const browser = await chromium.launch({{headless: true}});
+            try {{
+                const page = await browser.newPage();
+                await page.goto({url});
+                if (await page.locator('h1').textContent() !== 'Relay console') throw Error('HTML did not load');
+                const result = await page.evaluate(async () => {{
+                    const before = (await fetch('/api/user/me')).status;
+                    await fetch('/signin');
+                    const after = await (await fetch('/api/user/me')).text();
+                    const event = await new Promise((resolve, reject) => {{
+                        const events = new EventSource('/events');
+                        events.onmessage = value => {{ events.close(); resolve(value.data); }};
+                        events.onerror = () => {{ events.close(); reject(Error('SSE failed')); }};
+                    }});
+                    return {{before, after, event, cookie: document.cookie}};
+                }});
+                if (result.before !== 401 || result.after !== 'authenticated' || result.event !== 'live event' || result.cookie.includes('session=')) {{
+                    throw Error(JSON.stringify(result));
+                }}
+                console.log('browser relay passed');
+            }} finally {{ await browser.close(); }}
+        "#
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new("bun")
+                .args(["-e", &script])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("browser flow must finish promptly")
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "browser flow failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("browser relay passed"));
+        harness.cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(6), harness.join)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_response_headers_end_the_stream_without_sending_an_oversized_head() {
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        harness
+            .set_router(Router::new().route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .header("x-oversized", "x".repeat(CONSOLE_MAX_HEADER_BYTES))
+                        .body(Body::empty())
+                        .unwrap()
+                }),
+            ))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        let open = open_request(Uuid::new_v4(), "GET", "/");
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+        let end: ConsoleStreamEnd = recv_control(&mut cloud)
+            .await
+            .decode(ConsoleStreamEnd::KIND)
+            .unwrap();
+        assert_eq!(end.stream_id, open.stream_id);
+        assert!(matches!(end.reason, ConsoleStreamEndReason::Error { .. }));
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabling_under_request_body_backpressure_still_closes_the_relay_promptly() {
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        harness
+            .set_router(Router::new().route(
+                "/blocked",
+                axum::routing::post(|request: Request<Body>| async move {
+                    std::future::pending::<()>().await;
+                    drop(request);
+                    StatusCode::OK
+                }),
+            ))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        let mut open = open_request(Uuid::new_v4(), "POST", "/blocked");
+        open.headers
+            .push(("content-length".into(), "1048576".into()));
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+        for _ in 0..=STREAM_BODY_CHANNEL_CAPACITY {
+            send_data(
+                &mut cloud,
+                ConsoleFrameKind::RequestBodyChunk,
+                open.stream_id,
+                Bytes::from_static(b"pending body"),
+            )
+            .await;
+        }
+        for _ in 0..STREAM_BODY_CHANNEL_CAPACITY {
+            assert_eq!(
+                recv_control(&mut cloud).await.kind,
+                ConsoleWindowUpdate::KIND
+            );
+        }
+        harness.enabled_tx.send(false).unwrap();
+        let envelope = tokio::time::timeout(Duration::from_secs(2), recv_control(&mut cloud))
+            .await
+            .expect("disable must interrupt a blocked body delivery");
+        let end: ConsoleStreamEnd = envelope.decode(ConsoleStreamEnd::KIND).unwrap();
+        assert_eq!(end.stream_id, open.stream_id);
+        assert_eq!(end.reason, ConsoleStreamEndReason::GoingAway);
+        harness.cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), harness.join)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_never_upgrades_hits_the_connect_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend =
+            BackendUrl::loopback_development(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+        let task = tokio::spawn(async move { connect(&backend, "test-token").await });
+        let (socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(ConsoleProxyError::ConnectTimeout)
+        ));
+        drop(socket);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn teardown_aborts_every_stream_even_when_the_writer_queue_is_full() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(Message::Text("blocked".into())).await.unwrap();
+        let shared = ConnectionShared {
+            console_host: StdRwLock::new(Some(PINNED_HOST.into())),
+            streams: StdMutex::new(HashMap::new()),
+            outbound: tx,
+            dispatch: ConsoleDispatchSlot::new(),
+        };
+        let mut tasks = Vec::new();
+        for _ in 0..CONSOLE_MAX_CONCURRENT_STREAMS {
+            let task = tokio::spawn(std::future::pending::<()>());
+            shared.streams.lock().unwrap().insert(
+                Uuid::new_v4(),
+                StreamEntry {
+                    inbound: Arc::new(StdMutex::new(None)),
+                    remaining_inbound_bytes: Arc::new(AtomicI64::new(-1)),
+                    outbound_credit: Arc::new(tokio::sync::Semaphore::new(0)),
+                    activity: Arc::new(ActivityClock::new()),
+                    abort: task.abort_handle(),
+                },
+            );
+            tasks.push(task);
+        }
+        tokio::time::timeout(
+            STREAM_SHUTDOWN_TIMEOUT + Duration::from_secs(1),
+            close_all_streams(&shared, ConsoleStreamEndReason::GoingAway),
+        )
+        .await
+        .expect("shutdown must be bounded even if Cloud stops consuming data");
+        assert!(shared.streams.lock().unwrap().is_empty());
+        for task in tasks {
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_upgrade_releases_its_router_dispatch() {
+        struct DispatchDrop(Arc<tokio::sync::Notify>);
+        impl Drop for DispatchDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let handler_started = started.clone();
+        let handler_dropped = dropped.clone();
+        harness
+            .set_router(Router::new().route(
+                "/ws",
+                get(move |request: Request<Body>| {
+                    let started = handler_started.clone();
+                    let dropped = handler_dropped.clone();
+                    async move {
+                        let _drop = DispatchDrop(dropped);
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                        drop(request);
+                        StatusCode::OK
+                    }
+                }),
+            ))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        let mut open = open_request(Uuid::new_v4(), "GET", "/ws");
+        open.upgrade_requested = true;
+        open.headers.extend([
+            ("origin".into(), format!("https://{PINNED_HOST}")),
+            ("connection".into(), "Upgrade".into()),
+            ("upgrade".into(), "websocket".into()),
+        ]);
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        send_control(
+            &mut cloud,
+            ConsoleStreamCancel::KIND,
+            &ConsoleStreamCancel {
+                stream_id: open.stream_id,
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("a cancelled upgrade must release its in-process router task");
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sse_streams_before_completion_and_does_not_block_other_requests() {
+        use axum::response::sse::{Event, Sse};
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        let (event_tx, event_rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(2);
+        let event_rx = Arc::new(tokio::sync::Mutex::new(Some(event_rx)));
+        harness
+            .set_router(
+                Router::new()
+                    .route(
+                        "/events",
+                        get(move || {
+                            let event_rx = event_rx.clone();
+                            async move {
+                                let rx = event_rx.lock().await.take().unwrap();
+                                Sse::new(futures_util::stream::unfold(rx, |mut rx| async move {
+                                    rx.recv().await.map(|item| (item, rx))
+                                }))
+                            }
+                        }),
+                    )
+                    .route("/fast", get(|| async { "ok" })),
+            )
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        let open = open_request(Uuid::new_v4(), "GET", "/events");
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+        let head: ConsoleResponseHead = recv_control(&mut cloud)
+            .await
+            .decode(ConsoleResponseHead::KIND)
+            .unwrap();
+        assert_eq!(head.status, 200);
+        assert_eq!(
+            header_value(&head.headers, "content-type"),
+            Some("text/event-stream")
+        );
+        for value in ["first", "second"] {
+            event_tx
+                .send(Ok(Event::default().data(value)))
+                .await
+                .unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(1), recv_wire_frame(&mut cloud))
+                .await
+                .unwrap()
+                .unwrap();
+            match frame {
+                WireFrame::Data(frame) => {
+                    assert_eq!(frame.stream_id, open.stream_id);
+                    assert!(std::str::from_utf8(frame.payload())
+                        .unwrap()
+                        .contains(value));
+                }
+                _ => panic!("event must arrive while its source remains open"),
+            }
+        }
+        let next = open_request(Uuid::new_v4(), "GET", "/fast");
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &next).await;
+        assert_eq!(expect_response(&mut cloud, next.stream_id).await.1, b"ok");
+        drop(event_tx);
+        let end: ConsoleStreamEnd = recv_control(&mut cloud)
+            .await
+            .decode(ConsoleStreamEnd::KIND)
+            .unwrap();
+        assert_eq!(end.stream_id, open.stream_id);
+        assert_eq!(end.reason, ConsoleStreamEndReason::Complete);
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_chunked_post_body_arrives_whole_with_window_updates() {
         let Some((backend_url, mut server_rx)) = fake_cloud_server().await else {
@@ -2321,21 +3074,22 @@ mod tests {
         .await;
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Reuse the same id for an unrelated request.
-        send_control(
-            &mut cloud,
-            ConsoleStreamOpen::KIND,
-            &open_request(stream_id, "GET", "/hello"),
-        )
-        .await;
-
-        let envelope = recv_control(&mut cloud).await;
-        assert_eq!(envelope.kind, ConsoleStreamRefused::KIND);
-        let refused: ConsoleStreamRefused = envelope
-            .decode(ConsoleStreamRefused::KIND)
-            .expect("refusal must decode");
-        assert_eq!(refused.stream_id, stream_id);
-        assert_eq!(refused.reason, ConsoleRefusalReason::DuplicateStream);
+        // A malformed duplicate must not emit an end for the original stream.
+        for oversized in [false, true] {
+            let mut duplicate = open_request(stream_id, "GET", "/hello");
+            if oversized {
+                duplicate
+                    .headers
+                    .push(("x-oversized".into(), "x".repeat(CONSOLE_MAX_HEADER_BYTES)));
+            }
+            send_control(&mut cloud, ConsoleStreamOpen::KIND, &duplicate).await;
+            let envelope = recv_control(&mut cloud).await;
+            assert_eq!(envelope.kind, ConsoleStreamRefused::KIND);
+            let refused: ConsoleStreamRefused =
+                envelope.decode(ConsoleStreamRefused::KIND).unwrap();
+            assert_eq!(refused.stream_id, stream_id);
+            assert_eq!(refused.reason, ConsoleRefusalReason::DuplicateStream);
+        }
 
         // The original hanging stream must still be the one occupying that
         // id — cancel it and confirm the slot only frees up now, proving the
