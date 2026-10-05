@@ -217,6 +217,23 @@ pub struct AppSettings {
     #[serde(default)]
     pub plugin_installation_reporting_enabled: bool,
 
+    /// Admin preference for anonymous product telemetry (the events sent to
+    /// the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+    /// mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
+    ///
+    /// - `None` (default) — the operator has not chosen; the built-in default
+    ///   applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+    /// - `Some(true)` / `Some(false)` — an admin turned it on/off from
+    ///   Settings › Telemetry. Applied at runtime without a restart.
+    ///
+    /// The `TEMPS_TELEMETRY=0` environment variable is a host-level kill
+    /// switch that wins over this value unconditionally. The dedicated
+    /// `PATCH /settings/telemetry` endpoint is the only write path: the
+    /// generic settings save restores the stored value under the row lock, so
+    /// an older client round-tripping the whole document cannot flip it.
+    #[serde(default)]
+    pub anonymous_telemetry_enabled: Option<bool>,
+
     /// One-click "Update now" from the console. Enabled by default; an admin
     /// can turn it off here to keep upgrades on the CLI/config-management path.
     ///
@@ -2011,6 +2028,7 @@ impl Default for AppSettings {
             setup_complete: false,
             require_mfa_for_admins: false,
             plugin_installation_reporting_enabled: false,
+            anonymous_telemetry_enabled: None,
             self_update: None,
             console_version: None,
         }
@@ -2213,7 +2231,19 @@ impl SecurityHeadersSettings {
 impl AppSettings {
     /// Create settings from JSON value, using defaults for missing fields
     pub fn from_json(value: serde_json::Value) -> Self {
-        serde_json::from_value(value).unwrap_or_default()
+        serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+            // Unrelated malformed sections must never turn a saved opt-out
+            // into the opt-in default during an unrelated settings write.
+            let anonymous_telemetry_enabled = match value.get("anonymous_telemetry_enabled") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
+                Some(_) => Some(false),
+            };
+            Self {
+                anonymous_telemetry_enabled,
+                ..Self::default()
+            }
+        })
     }
 
     /// Convert settings to JSON value
