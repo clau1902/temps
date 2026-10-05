@@ -72,16 +72,18 @@ const MAX_RESTORED_BREACH_AGE_MULTIPLIER: i64 = 3;
 /// discard a window that is genuinely current.
 const MIN_RESTORED_BREACH_AGE_SECS: i64 = 15 * 60;
 
-// FIXME(metrics-scale): Issue 7 (Security Review) — No per-project alert rule limit.
+// FIXME(metrics-scale): Issue 7 (Security Review) — alert rule volume.
 //
-// A user may create an unlimited number of alert rules.  At 50,000 rules, the
-// evaluation loop would issue 50,000 individual `query_latest` calls per 30s
-// cycle, exhausting the DB connection pool and causing the server to fall
-// behind indefinitely.
+// The evaluation loop issues one `query_latest` call per enabled rule per 30s
+// cycle, so the rule count must stay bounded or the DB connection pool is
+// exhausted and the server falls behind indefinitely.
 //
-// Required fixes before GA:
-//   1. Enforce a hard per-project limit (suggested: 100 rules per project) in
-//      the alert rule creation handler via a COUNT(*) guard before INSERT.
+//   1. DONE: user-created rules are capped per external service
+//      (`MAX_ALERT_RULES_PER_SERVICE` in temps-providers' metrics handlers,
+//      enforced under a row lock at creation; over-limit requests get 409).
+//      Deployment and node rules are only seeded from fixed default sets.
+//
+// Remaining hardening:
 //   2. Add a per-cycle timeout: if `run_cycle` takes more than 25 seconds,
 //      log a warning and return early rather than letting cycles stack.
 //   3. Add a `alert_evaluator_cycle_duration_ms` metric so an admin can detect
@@ -1136,7 +1138,7 @@ fn alarm_type_for_rule(rule: &monitoring_alert_rules::Model) -> AlarmType {
 /// Error type for seeding operations — re-exported from `temps_metrics`.
 pub use temps_metrics::MetricsError;
 
-/// Insert a default set of alert rules for `service_id` if none exist yet.
+/// Install all missing built-in alert rules atomically within the service budget.
 ///
 /// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
 /// `(service_id, metric_name)` so concurrent calls are safe — no TOCTOU race.
@@ -1157,11 +1159,27 @@ pub use temps_metrics::MetricsError;
 ///   which is informational, not actionable. Self-hosted deployments use the
 ///   `"rustfs"` service_type and get real alerts via the Prometheus scrape.
 /// - Anything else — no rules inserted.
+pub const MAX_ALERT_RULES_PER_SERVICE: u64 = 100;
+
+/// Failure to install a complete set of built-in service alerts.
+#[derive(Debug, thiserror::Error)]
+pub enum DefaultRuleSeedError {
+    #[error("Database error: {0}")]
+    Database(#[from] sea_orm::DbErr),
+    #[error("Service {service_id} has {existing} alert rules and needs {missing} additional built-in rules; the limit is {limit}. Remove enough custom rules before enabling metrics.")]
+    Capacity {
+        service_id: i32,
+        existing: u64,
+        missing: u64,
+        limit: u64,
+    },
+}
+
 pub async fn seed_default_rules(
     db: &DatabaseConnection,
     service_id: i32,
     engine: &str,
-) -> Result<(), MetricsError> {
+) -> Result<(), DefaultRuleSeedError> {
     let seeds: Vec<RuleSeed> = match engine.to_lowercase().as_str() {
         "postgres" => postgres_default_seeds(),
         "redis" => redis_default_seeds(),
@@ -1175,6 +1193,53 @@ pub async fn seed_default_rules(
             return Ok(());
         }
     };
+
+    use sea_orm::{
+        ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, TransactionTrait,
+    };
+    let transaction = db.begin().await.map_err(DefaultRuleSeedError::Database)?;
+    if temps_entities::external_services::Entity::find_by_id(service_id)
+        .lock_exclusive()
+        .one(&transaction)
+        .await
+        .map_err(DefaultRuleSeedError::Database)?
+        .is_none()
+    {
+        transaction
+            .rollback()
+            .await
+            .map_err(DefaultRuleSeedError::Database)?;
+        return Ok(());
+    }
+    let count = temps_entities::monitoring_alert_rules::Entity::find()
+        .filter(temps_entities::monitoring_alert_rules::Column::ServiceId.eq(service_id))
+        .count(&transaction)
+        .await
+        .map_err(DefaultRuleSeedError::Database)?;
+
+    let existing_metrics = temps_entities::monitoring_alert_rules::Entity::find()
+        .filter(temps_entities::monitoring_alert_rules::Column::ServiceId.eq(service_id))
+        .all(&transaction)
+        .await?;
+    let missing = seeds
+        .iter()
+        .filter(|seed| {
+            !existing_metrics
+                .iter()
+                .any(|rule| rule.metric_name == seed.metric_name)
+        })
+        .map(|seed| seed.metric_name)
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u64;
+    if count.saturating_add(missing) > MAX_ALERT_RULES_PER_SERVICE {
+        transaction.rollback().await?;
+        return Err(DefaultRuleSeedError::Capacity {
+            service_id,
+            existing: count,
+            missing,
+            limit: MAX_ALERT_RULES_PER_SERVICE,
+        });
+    }
 
     // Insert each rule individually with ON CONFLICT DO NOTHING so concurrent
     // invocations (e.g. rapid retries or parallel API calls) are safely handled
@@ -1195,13 +1260,18 @@ pub async fn seed_default_rules(
             for_duration = seed.for_duration_secs,
         );
 
-        db.execute(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-        ))
-        .await
-        .map_err(MetricsError::DatabaseError)?;
+        transaction
+            .execute(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+            ))
+            .await
+            .map_err(DefaultRuleSeedError::Database)?;
     }
+    transaction
+        .commit()
+        .await
+        .map_err(DefaultRuleSeedError::Database)?;
 
     info!(
         service_id,
