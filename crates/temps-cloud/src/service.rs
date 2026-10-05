@@ -225,6 +225,7 @@ pub struct CloudService {
     /// console-proxy connection task needs to `.changed()` on it to open or
     /// close the tunnel without polling.
     console_access_tx: watch::Sender<bool>,
+    feature_update_lock: AsyncMutex<()>,
 }
 
 impl CloudService {
@@ -258,6 +259,7 @@ impl CloudService {
             managed_backup_retention_days: RwLock::new(None),
             oidc_provisioner: OnceLock::new(),
             console_access_tx,
+            feature_update_lock: AsyncMutex::new(()),
         }
     }
 
@@ -884,15 +886,34 @@ impl CloudService {
         &self,
         switches: CloudFeatureSwitches,
     ) -> Result<CloudStatus, CloudServiceError> {
+        self.patch_feature_switches(
+            Some(switches.telemetry),
+            Some(switches.backups),
+            Some(switches.notifications),
+            Some(switches.console_access),
+        )
+        .await
+    }
+
+    pub async fn patch_feature_switches(
+        &self,
+        telemetry: Option<bool>,
+        backups: Option<bool>,
+        notifications: Option<bool>,
+        console_access: Option<bool>,
+    ) -> Result<CloudStatus, CloudServiceError> {
+        let _update = self.feature_update_lock.lock().await;
         let was_console_access_enabled = self.link.feature_switches().console_access;
-        self.config
-            .update_cloud_features(
-                switches.telemetry,
-                switches.backups,
-                switches.notifications,
-                switches.console_access,
-            )
+        let updated = self
+            .config
+            .update_cloud_features(telemetry, backups, notifications, console_access)
             .await?;
+        let switches = CloudFeatureSwitches {
+            telemetry: updated.cloud.telemetry_enabled,
+            backups: updated.cloud.backups_enabled,
+            notifications: updated.cloud.notifications_enabled,
+            console_access: updated.cloud.console_access_enabled,
+        };
         if let Err(error) = self.link.set_feature_switches(switches) {
             self.link.block_outbound(
                 "telemetry consent state could not be persisted; repair the Cloud link state",

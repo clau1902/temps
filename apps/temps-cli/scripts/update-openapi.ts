@@ -19,7 +19,7 @@
  *   bun run generate:api
  */
 
-import { SPEC_PATH, pathCount, serialize } from './openapi-canonical'
+import { SPEC_PATH, cliSpec, pathCount, serialize } from './openapi-canonical'
 
 const DEFAULT_URL = 'http://localhost:8080/api/api-docs/openapi.json'
 
@@ -64,7 +64,7 @@ if (!response.ok) {
   process.exit(1)
 }
 
-const spec = await response.json()
+const spec = cliSpec(await response.json())
 const paths = pathCount(spec)
 if (paths === 0) {
   // A spec with no paths means the server answered but the doc was not

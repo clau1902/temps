@@ -175,7 +175,7 @@ pub struct ConsoleStreamOpen {
     pub path: String,
     pub query: Option<String>,
     pub headers: Vec<(String, String)>,   // bounded, see limits
-    pub client_ip: Option<String>,        // the browser's real IP, as Cloud saw it
+    pub client_ip: Option<String>,        // required bare IP at dispatch; absent/invalid is refused
     pub upgrade_requested: bool,
 }
 pub struct ConsoleResponseHead { pub stream_id: Uuid, pub status: u16, pub headers: Vec<(String, String)>, pub upgraded: bool }
@@ -236,10 +236,14 @@ must not exceed the last-advertised credit. This is deliberately not the
 hot-path "bounded channel + drop" rule — dropping HTTP body bytes corrupts
 the response, unlike dropping a metrics sample.
 
-**Compatibility.** `Capability::ConsoleProxy` negotiates like any other
-capability; an old Cloud or old instance on either end simply never opens
-the connection, matching the `telemetry_query` independence precedent
-(`lib.rs:225–237`).
+**Compatibility.** Attempting `/v1/console-proxy` is the compatibility
+probe. The instance attempts it only while local console access is enabled
+and the Cloud link is enrolled. A missing endpoint or a Hello without
+`Capability::ConsoleProxy` means unsupported; it retries with bounded
+backoff without dispatching requests. Console-proxy Hello negotiation does
+not decide whether that initial probe occurs. The settings UI must not infer
+support from management-channel capabilities; until a successful probe,
+support is unknown.
 
 ### 3. In-process dispatch: a streaming router handle
 
@@ -486,33 +490,20 @@ does not forge an `AuthContext` — §3 inserts none), run code outside the
 console's own API surface, or reach Docker/the host filesystem except
 through APIs an authenticated admin could already reach directly.
 
-**The precise mechanism a compromised Hub gains, named rather than left
-implicit.** The Hub (Cloud's relay component terminating the per-instance
-hostname) sees two things a browser normally never exposes to a third
-party: the OIDC `client_secret` (delivered to the instance via
-`ConsoleOidcConfig`, §4, but visible to whatever forwarded it), and every
-tunneled `/oidc/callback` request in full — the authorization code and the
-PKCE-verifier cookie together. Holding both, a compromised Hub does not
-need to wait for a browser to complete a login; it can perform the
-code→token exchange itself. This is a materially more specific claim than
-"compromised Cloud = instance admin" above, and the mitigations are
-correspondingly specific rather than generic:
+**The compromised-Hub boundary.** The relay sees the OIDC client secret
+and callback authorization code and state. It does not see the PKCE verifier:
+Temps stores it server-side in `oidc_login_states`, retrieves it only for the
+single-use callback state, and sends it directly to the token endpoint.
+There is no PKCE-verifier cookie, and this design must not introduce one.
+The client secret and tunneled callback alone therefore cannot redeem the
+code independently. A compromised relay can still forward the callback to
+the instance and observe the resulting session response, and can modify
+proxied browser content. Console access trusts Cloud with that relay authority.
 
-- **Cloud-side**: authorization codes are single-use and expire in 60s,
-  with reuse detection — a code the Hub replays after the legitimate
-  exchange already happened is rejected, and a double-redemption is a
-  detectable signal on Cloud's side.
-- **OSS-side (this ADR's scope)**: (a) the callback is bound to the
-  PKCE-verifier cookie with `SameSite=Strict` (already the cookie floor,
-  `auth_service.rs`), so a code intercepted in transit cannot be redeemed
-  from a context that doesn't also hold that cookie; (b) the RP rejects any
-  callback whose `state` was not minted by this instance within the last
-  60s, matching the code's own lifetime rather than the RP's normal,
-  longer `LOGIN_STATE_TTL_MINUTES` (`oidc_service.rs:39`) — tightened
-  specifically for the Cloud-managed provider, since its authorization
-  codes are known to expire that fast; (c) every callback failure is
-  audited (§4), so a pattern of rejected/expired/reused callbacks is
-  visible rather than silent.
+- **Cloud-side**: codes are single-use, expire in 60s, and reject reuse.
+- **OSS-side**: retain the server-held verifier and consume login state once;
+  managed-provider callback state expires in 60s. Audit rejected callbacks.
+
 - **Token lifetimes the RP must tolerate**: Cloud issues ID/access tokens
   with a 120s lifetime and **no refresh tokens** — openidconnect 4.x's
   token exchange must not assume a longer-lived token or attempt a refresh
@@ -543,8 +534,8 @@ did this silently.
 | Open redirect on OIDC callback | Reuses the existing `sanitize_return_to_rejects_open_redirect` validation unchanged; no new callback endpoint. |
 | Cookie scope leaking across instances | No `Domain` attribute is ever set (confirmed: only `.same_site(...)` calls) — a host-only cookie can't leak to a different hostname. |
 | WS Origin on upgrade | **Decided, not deferred**: for every tunneled Upgrade request the dispatcher validates `Origin == https://<console_host>` (the connection's pinned hostname, §3) *before* the request reaches the router; a mismatch is a 403 plus an audit row (§4), never a silent drop. `SameSite=Strict` remains as defense in depth underneath this, not as the sole control — the gap this closes is a request that never carries the session cookie's `SameSite` context at all (a raw non-browser WS client), which Origin-checking catches and cookie policy alone does not. |
-| Compromised Hub completing an OIDC exchange itself | See the dedicated mechanism above: short-lived single-use codes (Cloud), PKCE-cookie binding + tightened `state` TTL + failure audit (OSS). |
-| Audit/rate-limit IP spoofing | §3's `ConnectInfo(loopback)` + `X-Forwarded-For` reuses `resolve_client_ip`'s existing trust gate rather than a new mechanism; verified against `crates/temps-auth/src/rate_limit.rs:112–128`. |
+| Compromised Hub completing an OIDC exchange itself | See the dedicated mechanism above: short-lived single-use codes (Cloud), server-held PKCE verifier + single-use `state` + tightened TTL + failure audit (OSS). |
+| Audit/rate-limit IP spoofing | Dispatch requires `client_ip` to parse as a bare IPv4/IPv6 address and refuses missing/malformed values before router dispatch. §3's `ConnectInfo(loopback)` + `X-Forwarded-For` reuses `resolve_client_ip`'s existing trust gate rather than a new mechanism; verified against `crates/temps-auth/src/rate_limit.rs:112–128`. |
 | Resource exhaustion | §2's stream/frame/idle-timeout caps, instance-enforced. |
 | OIDC provider over-granting | §4's two-layer role gate, not Cloud's screen alone; both the reject and an Origin mismatch are audited (§4), not just successful logins. |
 

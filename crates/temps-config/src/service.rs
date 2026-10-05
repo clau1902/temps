@@ -1439,10 +1439,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// the whole document would lose concurrent unrelated changes.
     pub async fn update_cloud_features(
         &self,
-        telemetry_enabled: bool,
-        backups_enabled: bool,
-        notifications_enabled: bool,
-        console_access_enabled: bool,
+        telemetry_enabled: Option<bool>,
+        backups_enabled: Option<bool>,
+        notifications_enabled: Option<bool>,
+        console_access_enabled: Option<bool>,
     ) -> Result<AppSettings, ConfigServiceError> {
         let transaction = self.db.begin().await?;
         let query = settings::Entity::find_by_id(1);
@@ -1456,10 +1456,18 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .as_ref()
             .map(|model| AppSettings::from_json(model.data.clone()))
             .unwrap_or_default();
-        current.cloud.telemetry_enabled = telemetry_enabled;
-        current.cloud.backups_enabled = backups_enabled;
-        current.cloud.notifications_enabled = notifications_enabled;
-        current.cloud.console_access_enabled = console_access_enabled;
+        if let Some(value) = telemetry_enabled {
+            current.cloud.telemetry_enabled = value;
+        }
+        if let Some(value) = backups_enabled {
+            current.cloud.backups_enabled = value;
+        }
+        if let Some(value) = notifications_enabled {
+            current.cloud.notifications_enabled = value;
+        }
+        if let Some(value) = console_access_enabled {
+            current.cloud.console_access_enabled = value;
+        }
         let now = Utc::now();
         if let Some(model) = existing {
             let merged = current.to_json_merged(&model.data);
@@ -3679,6 +3687,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_cloud_update_preserves_unrelated_consent() {
+        let mut settings = AppSettings::default();
+        settings.cloud.telemetry_enabled = true;
+        settings.cloud.console_access_enabled = true;
+        let row = settings_row_with_document(settings.to_json());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db);
+        let updated = service
+            .update_cloud_features(None, Some(true), None, None)
+            .await
+            .unwrap();
+        assert!(updated.cloud.backups_enabled);
+        assert!(updated.cloud.console_access_enabled);
+        assert!(updated.cloud.telemetry_enabled);
+    }
+
+    #[tokio::test]
     async fn update_cloud_features_sets_console_access_enabled_explicitly() {
         let row = settings_row_with_document(AppSettings::default().to_json());
         let db = Arc::new(
@@ -3695,7 +3728,7 @@ mod tests {
         let svc = ConfigService::new(test_config(), db);
 
         let updated = svc
-            .update_cloud_features(false, false, false, true)
+            .update_cloud_features(Some(false), Some(false), Some(false), Some(true))
             .await
             .expect("update_cloud_features must succeed");
         assert!(

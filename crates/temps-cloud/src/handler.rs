@@ -46,19 +46,11 @@ pub struct EnrollCloudRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CloudFeatureSwitchesRequest {
-    pub telemetry_enabled: bool,
-    pub backups_enabled: bool,
-    pub notifications_enabled: bool,
-    /// ADR-045 §5: console access through Temps Cloud's console-proxy
-    /// tunnel. Deliberately **not** `#[serde(default)]`, matching the other
-    /// three fields on this request: `PATCH /cloud/features` is a small,
-    /// dedicated endpoint whose only callers send the whole switch set every
-    /// time (the console's "Temps Cloud" settings page renders all four
-    /// together from one status response), so a request that omits it is
-    /// rejected outright rather than silently interpreted as "turn console
-    /// access off" -- the same trap `preserve_cloud_settings_not_sent_by_every_client`
-    /// exists to avoid on the general `PUT /settings` endpoint.
-    pub console_access_enabled: bool,
+    pub telemetry_enabled: Option<bool>,
+    pub backups_enabled: Option<bool>,
+    pub notifications_enabled: Option<bool>,
+    /// Omitted switches retain their current value under the settings row lock.
+    pub console_access_enabled: Option<bool>,
 }
 
 /// Who performed a Cloud enrollment, for the audit trail.
@@ -295,25 +287,25 @@ async fn update_cloud_features(
     Json(request): Json<CloudFeatureSwitchesRequest>,
 ) -> Result<Json<CloudStatus>, Problem> {
     permission_guard!(auth, SettingsWrite);
-    if request.backups_enabled {
+    if request.backups_enabled == Some(true) {
         permission_guard!(auth, BackupsWrite);
     }
-    if request.notifications_enabled {
+    if request.notifications_enabled == Some(true) {
         permission_guard!(auth, NotificationProvidersWrite);
         permission_guard!(auth, NotificationProvidersCreate);
     }
     let previous = state.service.feature_switches();
-    let switches = CloudFeatureSwitches {
-        telemetry: request.telemetry_enabled,
-        backups: request.backups_enabled,
-        notifications: request.notifications_enabled,
-        console_access: request.console_access_enabled,
-    };
     let result = state
         .service
-        .update_feature_switches(switches)
+        .patch_feature_switches(
+            request.telemetry_enabled,
+            request.backups_enabled,
+            request.notifications_enabled,
+            request.console_access_enabled,
+        )
         .await
         .map_err(problem)?;
+    let switches = state.service.feature_switches();
     audit(
         &state,
         &auth,

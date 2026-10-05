@@ -3318,21 +3318,13 @@ export type CloudCapability = {
 };
 
 export type CloudFeatureSwitchesRequest = {
-    backups_enabled: boolean;
+    backups_enabled?: boolean | null;
     /**
-     * ADR-045 §5: console access through Temps Cloud's console-proxy
-     * tunnel. Deliberately **not** `#[serde(default)]`, matching the other
-     * three fields on this request: `PATCH /cloud/features` is a small,
-     * dedicated endpoint whose only callers send the whole switch set every
-     * time (the console's "Temps Cloud" settings page renders all four
-     * together from one status response), so a request that omits it is
-     * rejected outright rather than silently interpreted as "turn console
-     * access off" -- the same trap `preserve_cloud_settings_not_sent_by_every_client`
-     * exists to avoid on the general `PUT /settings` endpoint.
+     * Omitted switches retain their current value under the settings row lock.
      */
-    console_access_enabled: boolean;
-    notifications_enabled: boolean;
-    telemetry_enabled: boolean;
+    console_access_enabled?: boolean | null;
+    notifications_enabled?: boolean | null;
+    telemetry_enabled?: boolean | null;
 };
 
 /**

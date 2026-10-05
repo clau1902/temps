@@ -57,16 +57,12 @@ async function fetchStatus(): Promise<CloudStatus> {
 async function setConsoleAccess(enabled: boolean): Promise<CloudStatus> {
   await requireAuth()
   await setupClient()
-  const current = await fetchStatus()
   const result = await withSpinner(
     enabled ? 'Enabling console access...' : 'Disabling console access...',
     async () => {
       const { data, error } = await updateCloudFeatures({
         client,
         body: {
-          telemetry_enabled: current.telemetry_enabled,
-          backups_enabled: current.backups_enabled,
-          notifications_enabled: current.notifications_enabled,
           console_access_enabled: enabled,
         },
       })

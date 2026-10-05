@@ -218,21 +218,23 @@ impl ConsoleDispatchSlot {
 pub trait ConsoleOidcSink: Send + Sync {
     /// A [`ConsoleOidcConfig`] arrived (once per connection, and again on
     /// every reconnect). The sink is responsible for upserting the managed
-    /// provider row idempotently.
-    async fn on_config(&self, config: ConsoleOidcConfig);
+    /// provider row idempotently. Routing remains disabled on failure.
+    async fn on_config(&self, config: ConsoleOidcConfig) -> Result<(), String>;
     /// Console access was disabled or the link was disconnected from Cloud's
     /// side; run the same teardown the local disable path runs.
     async fn on_revoke(&self);
 }
 
-/// Does nothing with either notification. Used by every test in this file,
-/// and by any caller that has not wired the OIDC provisioning side up yet.
+/// Refuses configuration when no OIDC provisioning adapter is installed.
+/// An unwired caller must never enable authenticated console routing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopConsoleOidcSink;
 
 #[async_trait::async_trait]
 impl ConsoleOidcSink for NoopConsoleOidcSink {
-    async fn on_config(&self, _config: ConsoleOidcConfig) {}
+    async fn on_config(&self, _config: ConsoleOidcConfig) -> Result<(), String> {
+        Err("OIDC provisioning is not configured".into())
+    }
     async fn on_revoke(&self) {}
 }
 
@@ -769,12 +771,25 @@ async fn handle_envelope(
     enabled: bool,
 ) {
     if let Some(config) = envelope.decode::<ConsoleOidcConfig>(ConsoleOidcConfig::KIND) {
-        tracing::info!(console_host = %config.console_host, "console-proxy OIDC config received; pinning console host");
+        // Provisioning must succeed before routing browser requests. A
+        // conflicting issuer or failed database write must fail closed.
         *shared
             .console_host
             .write()
-            .unwrap_or_else(|p| p.into_inner()) = Some(config.console_host.clone());
-        oidc_sink.on_config(config).await;
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        close_all_streams(shared, ConsoleStreamEndReason::GoingAway).await;
+        let host = config.console_host.clone();
+        match oidc_sink.on_config(config).await {
+            Ok(()) => {
+                *shared
+                    .console_host
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(host);
+            }
+            Err(error) => {
+                tracing::error!(%error, "console-proxy OIDC provisioning failed; routing remains disabled")
+            }
+        }
         return;
     }
     if envelope
@@ -782,6 +797,11 @@ async fn handle_envelope(
         .is_some()
     {
         tracing::info!("console-proxy OIDC revoke received");
+        *shared
+            .console_host
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        close_all_streams(shared, ConsoleStreamEndReason::GoingAway).await;
         oidc_sink.on_revoke().await;
         return;
     }
@@ -838,7 +858,7 @@ async fn route_data_frame(shared: &Arc<ConnectionShared>, frame: ConsoleDataFram
         // Frame for a stream that was refused, cancelled, or already ended.
         return;
     };
-    let payload_len = frame.payload.len();
+    let payload_len = frame.payload().len();
     let current_sender = { inbound.lock().unwrap_or_else(|p| p.into_inner()).clone() };
     let Some(current_sender) = current_sender else {
         tracing::debug!(
@@ -847,7 +867,7 @@ async fn route_data_frame(shared: &Arc<ConnectionShared>, frame: ConsoleDataFram
         );
         return;
     };
-    if current_sender.send(frame.payload).await.is_err() {
+    if current_sender.send(frame.payload().clone()).await.is_err() {
         return;
     }
     activity.touch();
@@ -890,6 +910,15 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
         refuse_stream(&shared, stream_id, ConsoleRefusalReason::NotConfigured).await;
         return;
     };
+    if open
+        .client_ip
+        .as_deref()
+        .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+        .is_none()
+    {
+        refuse_stream(&shared, stream_id, ConsoleRefusalReason::NotConfigured).await;
+        return;
+    }
     let declared_host = header_value(&open.headers, "host");
     if declared_host != Some(pinned_host.as_str()) {
         refuse_stream(&shared, stream_id, ConsoleRefusalReason::HostMismatch).await;
@@ -976,7 +1005,11 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
     let remaining_for_task = remaining_inbound_bytes.clone();
     let credit_for_task = outbound_credit.clone();
     let activity_for_task = activity.clone();
+    let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
     let join = tokio::spawn(async move {
+        if registered_rx.await.is_err() {
+            return;
+        }
         run_stream(
             stream_shared,
             open,
@@ -1005,6 +1038,7 @@ async fn handle_stream_open(shared: Arc<ConnectionShared>, open: ConsoleStreamOp
                 abort: join.abort_handle(),
             },
         );
+    let _ = registered_tx.send(());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1385,7 +1419,7 @@ async fn run_upgrade_stream(
             reason: error.to_string(),
         }
     })?;
-    let mut io = TokioIo::new(upgraded);
+    let io = TokioIo::new(upgraded);
 
     // From here on, inbound `WsRelay` frames are routed to this stream's
     // write half instead of a request body — the one point where a stream's
@@ -1400,43 +1434,42 @@ async fn run_upgrade_stream(
     }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut read_buf = vec![0u8; 16 * 1024];
-    loop {
-        tokio::select! {
-            biased;
-            relayed = relay_rx.recv() => {
-                match relayed {
-                    Some(bytes) => {
-                        if io.write_all(&bytes).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
+    let (mut read_half, mut write_half) = tokio::io::split(io);
+    let inbound_work = async {
+        while let Some(bytes) = relay_rx.recv().await {
+            if write_half.write_all(&bytes).await.is_err() {
+                break;
             }
-            read_result = io.read(&mut read_buf) => {
-                match read_result {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let chunk = Bytes::copy_from_slice(&read_buf[..n]);
-                        send_credited(
-                            shared,
-                            stream_id,
-                            ConsoleFrameKind::WsRelay,
-                            outbound_credit,
-                            activity,
-                            chunk,
-                        )
-                        .await?;
-                    }
+        }
+    };
+    let outbound_work = async {
+        let mut read_buf = vec![0u8; 16 * 1024];
+        loop {
+            match read_half.read(&mut read_buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    send_credited(
+                        shared,
+                        stream_id,
+                        ConsoleFrameKind::WsRelay,
+                        outbound_credit,
+                        activity,
+                        Bytes::copy_from_slice(&read_buf[..n]),
+                    )
+                    .await?;
                 }
             }
         }
-    }
+        Ok::<(), ConsoleProxyError>(())
+    };
+    let relay_result = tokio::select! {
+        _ = inbound_work => Ok(()),
+        result = outbound_work => result,
+    };
 
     server_task.abort();
     connection_task.abort();
-    Ok(())
+    relay_result
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1763,6 +1796,15 @@ mod tests {
         }
     }
 
+    struct TestOidcSink;
+    #[async_trait::async_trait]
+    impl ConsoleOidcSink for TestOidcSink {
+        async fn on_config(&self, _: ConsoleOidcConfig) -> Result<(), String> {
+            Ok(())
+        }
+        async fn on_revoke(&self) {}
+    }
+
     struct Harness {
         _dir: tempfile::TempDir,
         dispatch: ConsoleDispatchSlot,
@@ -1773,15 +1815,14 @@ mod tests {
 
     impl Harness {
         async fn start(backend_url: &str) -> Self {
+            Self::start_with_sink(backend_url, Arc::new(TestOidcSink)).await
+        }
+        async fn start_with_sink(backend_url: &str, sink: Arc<dyn ConsoleOidcSink>) -> Self {
             let (link, dir) = linked_test_link(backend_url).await;
             let dispatch = ConsoleDispatchSlot::new();
             let (enabled_tx, enabled_rx) = watch::channel(true);
-            let (join, cancel_tx) = ConsoleProxyWorker::spawn(
-                link,
-                enabled_rx,
-                dispatch.clone(),
-                Arc::new(NoopConsoleOidcSink),
-            );
+            let (join, cancel_tx) =
+                ConsoleProxyWorker::spawn(link, enabled_rx, dispatch.clone(), sink);
             Self {
                 _dir: dir,
                 dispatch,
@@ -1815,7 +1856,7 @@ mod tests {
                 WireFrame::Data(frame) => {
                     assert_eq!(frame.frame_kind, ConsoleFrameKind::ResponseBodyChunk);
                     assert_eq!(frame.stream_id, stream_id);
-                    body.extend_from_slice(&frame.payload);
+                    body.extend_from_slice(frame.payload());
                 }
                 WireFrame::Control(envelope) if envelope.kind == ConsoleStreamEnd::KIND => {
                     let end: ConsoleStreamEnd = envelope
@@ -1839,6 +1880,133 @@ mod tests {
     // -----------------------------------------------------------------
     // Scenarios
     // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_streams_release_slots_after_every_response() {
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        harness
+            .set_router(Router::new().route("/fast", get(|| async { "ok" })))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        for _ in 0..100 {
+            let id = Uuid::new_v4();
+            send_control(
+                &mut cloud,
+                ConsoleStreamOpen::KIND,
+                &open_request(id, "GET", "/fast"),
+            )
+            .await;
+            let (_, body) =
+                tokio::time::timeout(Duration::from_secs(3), expect_response(&mut cloud, id))
+                    .await
+                    .unwrap();
+            assert_eq!(body, b"ok");
+        }
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_oidc_provisioning_leaves_console_routing_disabled() {
+        let Some((backend_url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start_with_sink(&backend_url, Arc::new(NoopConsoleOidcSink)).await;
+        harness
+            .set_router(axum::Router::new().route("/", get(|| async { "unexpected dispatch" })))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        let open = open_request(test_uuid(90), "GET", "/");
+        send_control(&mut cloud, ConsoleStreamOpen::KIND, &open).await;
+        assert_eq!(
+            recv_control(&mut cloud).await.kind,
+            ConsoleStreamRefused::KIND
+        );
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_or_malformed_client_ip_is_refused() {
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        harness
+            .set_router(Router::new().route("/fast", get(|| async { "unexpected dispatch" })))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        for ip in [
+            None,
+            Some("not-an-ip".into()),
+            Some("203.0.113.7, 127.0.0.1".into()),
+        ] {
+            let mut request = open_request(Uuid::new_v4(), "GET", "/fast");
+            request.client_ip = ip;
+            send_control(&mut cloud, ConsoleStreamOpen::KIND, &request).await;
+            assert_eq!(
+                recv_control(&mut cloud).await.kind,
+                ConsoleStreamRefused::KIND
+            );
+        }
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_revoke_closes_active_streams_and_refuses_new_requests() {
+        let Some((url, mut server_rx)) = fake_cloud_server().await else {
+            return;
+        };
+        let harness = Harness::start(&url).await;
+        harness
+            .set_router(Router::new().route(
+                "/hang",
+                get(|| async {
+                    std::future::pending::<()>().await;
+                    "never"
+                }),
+            ))
+            .await;
+        let mut cloud = server_rx.recv().await.unwrap();
+        cloud_handshake(&mut cloud).await;
+        send_oidc_config(&mut cloud).await;
+        let id = Uuid::new_v4();
+        send_control(
+            &mut cloud,
+            ConsoleStreamOpen::KIND,
+            &open_request(id, "GET", "/hang"),
+        )
+        .await;
+        send_control(&mut cloud, ConsoleOidcRevoke::KIND, &ConsoleOidcRevoke).await;
+        let end: ConsoleStreamEnd = recv_control(&mut cloud)
+            .await
+            .decode(ConsoleStreamEnd::KIND)
+            .unwrap();
+        assert_eq!(end.stream_id, id);
+        assert_eq!(end.reason, ConsoleStreamEndReason::GoingAway);
+        send_control(
+            &mut cloud,
+            ConsoleStreamOpen::KIND,
+            &open_request(Uuid::new_v4(), "GET", "/hang"),
+        )
+        .await;
+        assert_eq!(
+            recv_control(&mut cloud).await.kind,
+            ConsoleStreamRefused::KIND
+        );
+        harness.cancel_tx.send(true).unwrap();
+        harness.join.await.unwrap();
+    }
 
     #[tokio::test]
     async fn a_plain_get_is_dispatched_and_streamed_back() {
@@ -2356,8 +2524,12 @@ mod tests {
             cx: &mut TaskContext<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            match self.outgoing.try_send(bytes::Bytes::copy_from_slice(buf)) {
-                Ok(()) => Poll::Ready(Ok(buf.len())),
+            let len = buf.len().min(16 * 1024);
+            match self
+                .outgoing
+                .try_send(bytes::Bytes::copy_from_slice(&buf[..len]))
+            {
+                Ok(()) => Poll::Ready(Ok(len)),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -2377,6 +2549,12 @@ mod tests {
 
     async fn echo_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
         ws.on_upgrade(|mut socket| async move {
+            // Write more than the in-process duplex capacity before reading.
+            // Both peers writing first must not deadlock the relay.
+            socket
+                .send(AxumMessage::Binary(Bytes::from(vec![7; 128 * 1024])))
+                .await
+                .expect("server banner sends");
             while let Some(Ok(message)) = socket.recv().await {
                 if matches!(message, AxumMessage::Close(_)) {
                     break;
@@ -2446,9 +2624,10 @@ mod tests {
                     frame = recv_wire_frame(&mut cloud) => {
                         match frame {
                             Some(WireFrame::Data(frame)) if frame.frame_kind == ConsoleFrameKind::WsRelay => {
-                                if from_instance_tx.send(frame.payload).await.is_err() {
+                                if from_instance_tx.send(frame.payload().clone()).await.is_err() {
                                     break;
                                 }
+                                send_control(&mut cloud, ConsoleWindowUpdate::KIND, &ConsoleWindowUpdate { stream_id, additional_bytes: frame.payload().len() as u32 }).await;
                             }
                             Some(_) => continue,
                             None => break,
@@ -2464,6 +2643,27 @@ mod tests {
             leftover: bytes::Bytes::new(),
         };
         let mut ws = WebSocketStream::from_raw_socket(relay_io, Role::Client, None).await;
+
+        let large_message = Bytes::from(vec![9; 128 * 1024]);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ws.send(Message::Binary(large_message.clone())),
+        )
+        .await
+        .expect("large client write must not deadlock")
+        .expect("client binary sends");
+        let banner = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("server write must progress independently")
+            .expect("banner arrives")
+            .expect("banner readable");
+        assert_eq!(banner.into_data(), Bytes::from(vec![7; 128 * 1024]));
+        let large_echo = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("large echo must arrive")
+            .expect("echo arrives")
+            .expect("echo readable");
+        assert_eq!(large_echo.into_data(), large_message);
 
         ws.send(Message::Text("hello over the tunnel".into()))
             .await

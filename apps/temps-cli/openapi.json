@@ -7434,25 +7434,31 @@
       "CloudFeatureSwitchesRequest": {
         "properties": {
           "backups_enabled": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "console_access_enabled": {
-            "description": "ADR-045 §5: console access through Temps Cloud's console-proxy\ntunnel. Deliberately **not** `#[serde(default)]`, matching the other\nthree fields on this request: `PATCH /cloud/features` is a small,\ndedicated endpoint whose only callers send the whole switch set every\ntime (the console's \"Temps Cloud\" settings page renders all four\ntogether from one status response), so a request that omits it is\nrejected outright rather than silently interpreted as \"turn console\naccess off\" -- the same trap `preserve_cloud_settings_not_sent_by_every_client`\nexists to avoid on the general `PUT /settings` endpoint.",
-            "type": "boolean"
+            "description": "Omitted switches retain their current value under the settings row lock.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "notifications_enabled": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "telemetry_enabled": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
-        "required": [
-          "telemetry_enabled",
-          "backups_enabled",
-          "notifications_enabled",
-          "console_access_enabled"
-        ],
         "type": "object"
       },
       "CloudProvider": {
@@ -34721,67 +34727,6 @@
           "extensions"
         ],
         "type": "object"
-      },
-      "ProgressSnapshot": {
-        "properties": {
-          "elapsed_ms": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "id": {
-            "type": "string"
-          },
-          "stages": {
-            "items": {
-              "$ref": "#/components/schemas/ProgressStage"
-            },
-            "type": "array"
-          },
-          "status": {
-            "$ref": "#/components/schemas/ProgressStatus"
-          }
-        },
-        "required": [
-          "id",
-          "status",
-          "elapsed_ms",
-          "stages"
-        ],
-        "type": "object"
-      },
-      "ProgressStage": {
-        "properties": {
-          "elapsed_ms": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "message": {
-            "type": "string"
-          },
-          "stage": {
-            "type": "string"
-          },
-          "status": {
-            "$ref": "#/components/schemas/ProgressStatus"
-          }
-        },
-        "required": [
-          "stage",
-          "message",
-          "status",
-          "elapsed_ms"
-        ],
-        "type": "object"
-      },
-      "ProgressStatus": {
-        "enum": [
-          "running",
-          "completed",
-          "failed"
-        ],
-        "type": "string"
       },
       "ProjectAccessResponse": {
         "properties": {
@@ -117145,52 +117090,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryCatalogResponse"
-                }
-              }
-            },
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "External Plugins"
-        ]
-      }
-    },
-    "/x/plugins/install/progress/{id}": {
-      "get": {
-        "operationId": "getRepositoryInstallProgress",
-        "parameters": [
-          {
-            "description": "Client-generated installation UUID",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProgressSnapshot"
-                }
-              }
-            },
-            "description": ""
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },

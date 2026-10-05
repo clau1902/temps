@@ -3318,21 +3318,13 @@ export type CloudCapability = {
 };
 
 export type CloudFeatureSwitchesRequest = {
-    backups_enabled: boolean;
+    backups_enabled?: boolean | null;
     /**
-     * ADR-045 §5: console access through Temps Cloud's console-proxy
-     * tunnel. Deliberately **not** `#[serde(default)]`, matching the other
-     * three fields on this request: `PATCH /cloud/features` is a small,
-     * dedicated endpoint whose only callers send the whole switch set every
-     * time (the console's "Temps Cloud" settings page renders all four
-     * together from one status response), so a request that omits it is
-     * rejected outright rather than silently interpreted as "turn console
-     * access off" -- the same trap `preserve_cloud_settings_not_sent_by_every_client`
-     * exists to avoid on the general `PUT /settings` endpoint.
+     * Omitted switches retain their current value under the settings row lock.
      */
-    console_access_enabled: boolean;
-    notifications_enabled: boolean;
-    telemetry_enabled: boolean;
+    console_access_enabled?: boolean | null;
+    notifications_enabled?: boolean | null;
+    telemetry_enabled?: boolean | null;
 };
 
 /**
@@ -15864,22 +15856,6 @@ export type ProblemDetails = {
      */
     type?: string | null;
 };
-
-export type ProgressSnapshot = {
-    elapsed_ms: number;
-    id: string;
-    stages: Array<ProgressStage>;
-    status: ProgressStatus;
-};
-
-export type ProgressStage = {
-    elapsed_ms: number;
-    message: string;
-    stage: string;
-    status: ProgressStatus;
-};
-
-export type ProgressStatus = 'running' | 'completed' | 'failed';
 
 export type ProjectAccessResponse = {
     created_at: string;
@@ -62859,30 +62835,6 @@ export type ListRepositoryPluginCatalogResponses = {
 };
 
 export type ListRepositoryPluginCatalogResponse = ListRepositoryPluginCatalogResponses[keyof ListRepositoryPluginCatalogResponses];
-
-export type GetRepositoryInstallProgressData = {
-    body?: never;
-    path: {
-        /**
-         * Client-generated installation UUID
-         */
-        id: string;
-    };
-    query?: never;
-    url: '/x/plugins/install/progress/{id}';
-};
-
-export type GetRepositoryInstallProgressErrors = {
-    404: ProblemDetails;
-};
-
-export type GetRepositoryInstallProgressError = GetRepositoryInstallProgressErrors[keyof GetRepositoryInstallProgressErrors];
-
-export type GetRepositoryInstallProgressResponses = {
-    200: ProgressSnapshot;
-};
-
-export type GetRepositoryInstallProgressResponse = GetRepositoryInstallProgressResponses[keyof GetRepositoryInstallProgressResponses];
 
 export type InstallRepositoryData = {
     body: InstallRepositoryRequest;

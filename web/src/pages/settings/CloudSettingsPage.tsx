@@ -181,13 +181,7 @@ export function CloudSettingsPage() {
     if (!status.data) return
     try {
       const updatedStatus = await updateFeatures.mutateAsync({
-        body: {
-          telemetry_enabled: status.data.telemetry_enabled,
-          backups_enabled: status.data.backups_enabled,
-          notifications_enabled: status.data.notifications_enabled,
-          console_access_enabled: status.data.console_access_enabled,
-          [feature]: enabled,
-        },
+        body: { [feature]: enabled },
       })
       queryClient.setQueryData(getCloudStatusOptions().queryKey, updatedStatus)
       toast.success(`${label} ${enabled ? 'enabled' : 'disabled'}`)

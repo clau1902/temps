@@ -369,7 +369,7 @@ impl ConsoleFrameKind {
 pub struct ConsoleDataFrame {
     pub frame_kind: ConsoleFrameKind,
     pub stream_id: Uuid,
-    pub payload: bytes::Bytes,
+    payload: bytes::Bytes,
 }
 
 impl ConsoleDataFrame {
@@ -393,6 +393,11 @@ impl ConsoleDataFrame {
             stream_id,
             payload,
         })
+    }
+
+    /// Immutable validated payload; callers cannot widen a frame after construction.
+    pub fn payload(&self) -> &bytes::Bytes {
+        &self.payload
     }
 
     /// Encode this frame as the exact bytes to send in one `Message::Binary`.
