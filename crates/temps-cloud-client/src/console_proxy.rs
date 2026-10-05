@@ -97,6 +97,10 @@ const BASE_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 /// [`crate::heartbeat::MAX_RECONNECT_INTERVAL`].
 const MAX_RECONNECT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// A handshake alone does not demonstrate backend recovery: repeatedly short
+/// connections retain outage backoff until the relay has stayed up this long.
+const STABLE_CONNECTION_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Depth of the queue feeding the single writer task. Bounded so a wedged
 /// socket applies backpressure to callers rather than growing without limit;
 /// sized well above [`CONSOLE_MAX_CONCURRENT_STREAMS`] so ordinary control
@@ -387,7 +391,9 @@ async fn connection_cycle(
         dispatch: dispatch.clone(),
     });
 
+    let connected_at = Instant::now();
     let outcome = read_loop(&shared, &mut read, oidc_sink, enabled, cancel).await;
+    let outcome = connection_outcome(outcome, connected_at.elapsed());
 
     // ADR-045 §1: announce every open stream before the socket closes, so
     // Cloud can offer the browser a retry instead of a silent hard cut. Best
@@ -407,7 +413,11 @@ async fn connection_cycle(
     drop(shared);
     let _ = tokio::time::timeout(Duration::from_secs(5), writer_handle).await;
 
-    if outcome == CycleOutcome::Disconnected {
+    outcome
+}
+
+fn connection_outcome(outcome: CycleOutcome, connected_for: Duration) -> CycleOutcome {
+    if outcome == CycleOutcome::Disconnected && connected_for >= STABLE_CONNECTION_INTERVAL {
         CycleOutcome::Connected
     } else {
         outcome
@@ -1848,6 +1858,26 @@ mod tests {
             .await
             .expect("worker must stop")
             .unwrap();
+    }
+
+    #[test]
+    fn short_console_connections_preserve_outage_backoff() {
+        let mut retry = Duration::ZERO;
+        for _ in 0..20 {
+            let outcome = connection_outcome(CycleOutcome::Disconnected, Duration::from_secs(1));
+            assert_eq!(outcome, CycleOutcome::Disconnected);
+            retry = next_reconnect_interval(retry, outcome);
+        }
+        assert_eq!(retry, MAX_RECONNECT_INTERVAL);
+        let recovered = connection_outcome(CycleOutcome::Disconnected, STABLE_CONNECTION_INTERVAL);
+        assert_eq!(
+            next_reconnect_interval(retry, recovered),
+            BASE_RECONNECT_INTERVAL
+        );
+        assert_eq!(
+            connection_outcome(CycleOutcome::Cancelled, STABLE_CONNECTION_INTERVAL),
+            CycleOutcome::Cancelled,
+        );
     }
 
     #[test]
