@@ -61,6 +61,7 @@ import { registerGlobalLogsCommands } from './commands/global-logs/index.js'
 import { registerEmailDomainsCommands } from './commands/email-domains/index.js'
 import { registerEmailProvidersCommands } from './commands/email-providers/index.js'
 import { registerIncidentsCommands } from './commands/incidents/index.js'
+import { registerStatusPagesCommands } from './commands/status-pages/index.js'
 import { registerAlarmsCommands } from './commands/alarms/index.js'
 import { registerEmailsCommands } from './commands/emails/index.js'
 import { registerLoadBalancerCommands } from './commands/load-balancer/index.js'
@@ -220,6 +221,7 @@ export function createProgram(): Command {
   registerEmailDomainsCommands(program)
   registerEmailProvidersCommands(program)
   registerIncidentsCommands(program)
+  registerStatusPagesCommands(program)
   registerAlarmsCommands(program)
   registerEmailsCommands(program)
   registerLoadBalancerCommands(program)
