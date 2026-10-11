@@ -131,6 +131,24 @@ fn blocked(error: UrlValidationError) -> AiGatewayError {
     AiGatewayError::InvalidProviderUrl { reason }
 }
 
+/// Map a blocked address. Any address that is private by allocation can be
+/// trusted, so it always gets both hints -- including CGNAT/overlay addresses
+/// (`100.64.0.0/10`, e.g. Tailscale), which the core reports as "reserved".
+fn blocked_address(ip: IpAddr, error: UrlValidationError) -> AiGatewayError {
+    if matches!(
+        error,
+        UrlValidationError::PrivateIp | UrlValidationError::LoopbackIp
+    ) || validate_trustable_private_host(ip).is_err()
+    {
+        return blocked(error);
+    }
+    AiGatewayError::InvalidProviderUrl {
+        reason: format!(
+            "Private or overlay-network addresses are not allowed{TRUSTED_NETWORKS_HINT}.{PER_KEY_TRUST_HINT}"
+        ),
+    }
+}
+
 fn parse(url: &str) -> Result<Url, AiGatewayError> {
     let parsed = Url::parse(url.trim())
         .map_err(|error| invalid(&format!("the base URL is not a valid URL: {error}")))?;
@@ -151,7 +169,7 @@ fn check_address(
         // `KeyTrust` is only ever built from a trustable private address.
         return Ok(());
     }
-    validate_outbound_ip(ip).map_err(blocked)?;
+    validate_outbound_ip(ip).map_err(|error| blocked_address(ip, error))?;
     if plaintext && !is_trusted_private_destination(ip) {
         return Err(invalid(PLAINTEXT_PUBLIC_MESSAGE));
     }
@@ -302,6 +320,19 @@ mod tests {
         assert!(!message.contains(":9"), "{message}");
         let message = resolved_reason("models.example.test", &["8.8.8.8", "10.1.2.3"], false);
         assert!(message.contains("Private IP"), "{message}");
+    }
+
+    #[test]
+    fn untrusted_cgnat_overlay_address_gets_the_trust_hints() {
+        // Tailscale-style 100.64.0.0/10 is trustable, so say how.
+        let message = resolved_reason("models.tailnet.example", &["100.101.102.103"], true);
+        assert!(message.contains("Trusted private networks"), "{message}");
+        assert!(message.contains("Trust this private address"), "{message}");
+        let message = reason(check_provider_url("http://100.101.102.103:52415/v1", None));
+        assert!(message.contains("Trusted private networks"), "{message}");
+        // Metadata inside that range never gets a hint.
+        let message = reason(check_provider_url("http://100.100.100.200/", None));
+        assert!(!message.contains("Trust this private address"), "{message}");
     }
 
     #[test]
