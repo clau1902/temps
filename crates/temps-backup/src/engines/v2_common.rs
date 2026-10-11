@@ -454,8 +454,6 @@ pub fn build_s3_client(
     encryption_service: &Arc<EncryptionService>,
     user_agent: &'static str,
 ) -> Result<S3Client, BackupError> {
-    use aws_sdk_s3::Config;
-
     let access_key = encryption_service
         .decrypt_string(&s3_source.access_key_id)
         .map_err(|e| BackupError::PermanentFailure {
@@ -479,23 +477,48 @@ pub fn build_s3_client(
         user_agent,
     );
 
-    let mut builder = Config::builder()
-        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-        .region(aws_sdk_s3::config::Region::new(s3_source.region.clone()))
-        .force_path_style(s3_source.force_path_style.unwrap_or(true))
-        .credentials_provider(creds)
-        .http_client(bundled_roots_http_client());
+    let builder = s3_config_builder(
+        &s3_source.region,
+        s3_source.force_path_style.unwrap_or(true),
+        creds,
+        s3_source.endpoint.as_deref(),
+    );
+    Ok(S3Client::from_conf(builder.build()))
+}
 
-    if let Some(endpoint) = &s3_source.endpoint {
-        let url = if endpoint.starts_with("http") {
-            endpoint.clone()
-        } else {
-            format!("http://{}", endpoint)
-        };
-        builder = builder.endpoint_url(url);
+/// Base configuration for every S3 client that talks to an operator's
+/// backup destination. Callers add per-use settings (timeouts) on top.
+///
+/// Request checksums are computed only when an operation requires one.
+/// The SDK's default (`WhenSupported`) adds a CRC32 to every
+/// `PutObject`/`UploadPart`, and for a streaming body (a backup file read
+/// from disk) sends it as an `aws-chunked` trailer with
+/// `x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER`. Many
+/// S3-compatible stores don't implement that encoding: they compare the
+/// sentinel against the body's real SHA-256 and reject the upload with
+/// `XAmzContentSHA256Mismatch`, on every retry. With `WhenRequired` the
+/// upload is a plain SigV4 PUT, which AWS and every compatible store
+/// accept; operations that do require a checksum (`DeleteObjects`,
+/// `PutBucketLifecycleConfiguration`) still get one.
+pub(crate) fn s3_config_builder(
+    region: &str,
+    force_path_style: bool,
+    credentials: aws_sdk_s3::config::Credentials,
+    endpoint: Option<&str>,
+) -> aws_sdk_s3::config::Builder {
+    let mut builder = aws_sdk_s3::Config::builder()
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(region.to_string()))
+        .force_path_style(force_path_style)
+        .credentials_provider(credentials)
+        .http_client(bundled_roots_http_client())
+        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired);
+
+    if let Some(endpoint) = endpoint {
+        builder = builder.endpoint_url(crate::services::s3_probe::endpoint_url(endpoint));
     }
 
-    Ok(S3Client::from_conf(builder.build()))
+    builder
 }
 
 /// Convenience wrapper: load the row + build the client in one call. Most
@@ -1441,5 +1464,184 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(state.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    /// What a stub store saw for one upload request: the headers the SDK
+    /// signed and the bytes that arrived on the wire.
+    struct RecordedPut {
+        headers: axum::http::HeaderMap,
+        body: Vec<u8>,
+    }
+
+    type RecordedPuts = Arc<std::sync::Mutex<Vec<RecordedPut>>>;
+
+    /// Accepts every upload and records each `PUT`, so a test can check
+    /// how the request was encoded rather than only that it succeeded.
+    async fn recording_stub_handler(
+        axum::extract::State(puts): axum::extract::State<RecordedPuts>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let xml = |body: &'static str| {
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                body,
+            )
+                .into_response()
+        };
+        let query = uri.query().unwrap_or_default();
+        match method {
+            axum::http::Method::PUT => {
+                puts.lock().expect("puts lock").push(RecordedPut {
+                    headers,
+                    body: body.to_vec(),
+                });
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::ETAG, "\"etag\"")],
+                    "",
+                )
+                    .into_response()
+            }
+            axum::http::Method::POST if query.contains("uploads") => xml(
+                "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
+                 <UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ),
+            axum::http::Method::POST => xml(
+                "<CompleteMultipartUploadResult><Location>l</Location><Bucket>b</Bucket>\
+                 <Key>k</Key><ETag>\"done\"</ETag></CompleteMultipartUploadResult>",
+            ),
+            _ => axum::http::StatusCode::NO_CONTENT.into_response(),
+        }
+    }
+
+    /// A client built by the production [`super::s3_config_builder`],
+    /// pointed at a recording stub store.
+    async fn spawn_recording_stub() -> Option<(aws_sdk_s3::Client, RecordedPuts)> {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping recording stub test");
+                return None;
+            }
+            Err(error) => panic!("bind recording stub: {error}"),
+        };
+        let address = listener.local_addr().expect("stub address");
+        let puts: RecordedPuts = Default::default();
+        let app = axum::Router::new()
+            .route(
+                "/{bucket}/{*key}",
+                axum::routing::any(recording_stub_handler),
+            )
+            // Parts are 5 MiB; Axum's default body limit is 2 MiB.
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+            .with_state(puts.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve recording stub");
+        });
+        // A bare `host:port`, the way an operator enters a private endpoint.
+        let endpoint = address.to_string();
+        let config = super::s3_config_builder(
+            "us-east-1",
+            true,
+            aws_sdk_s3::config::Credentials::new("test", "test", None, None, "test"),
+            Some(&endpoint),
+        )
+        .build();
+        Some((aws_sdk_s3::Client::from_conf(config), puts))
+    }
+
+    /// The upload must be a plain SigV4 request: no `aws-chunked` body, no
+    /// streaming payload sentinel, and no optional flexible checksum.
+    /// S3-compatible stores that don't implement the aws-chunked trailer
+    /// format reject anything else with `XAmzContentSHA256Mismatch`.
+    fn assert_plain_sigv4_put(put: &RecordedPut, what: &str) {
+        let header = |name: &str| {
+            put.headers
+                .get(name)
+                .map(|value| value.to_str().expect("ascii header").to_string())
+        };
+        let content_encoding = header("content-encoding").unwrap_or_default();
+        assert!(
+            !content_encoding.contains("aws-chunked"),
+            "{what} was sent aws-chunked (content-encoding: {content_encoding})"
+        );
+        let content_sha256 = header("x-amz-content-sha256").expect("signed payload hash");
+        assert!(
+            !content_sha256.starts_with("STREAMING-"),
+            "{what} used a streaming payload: x-amz-content-sha256 = {content_sha256}"
+        );
+        assert_eq!(header("x-amz-trailer"), None, "{what} declared a trailer");
+        assert_eq!(
+            header("x-amz-sdk-checksum-algorithm"),
+            None,
+            "{what} requested an optional flexible checksum"
+        );
+        let checksums: Vec<_> = put
+            .headers
+            .keys()
+            .filter(|name| name.as_str().starts_with("x-amz-checksum-"))
+            .collect();
+        assert!(
+            checksums.is_empty(),
+            "{what} carried optional checksum headers {checksums:?}"
+        );
+    }
+
+    /// A backup file below the multipart threshold is uploaded as a plain
+    /// SigV4 PUT whose body is the file itself, not an aws-chunked stream.
+    #[tokio::test]
+    async fn a_single_part_upload_is_a_plain_sigv4_put() {
+        let Some((client, puts)) = spawn_recording_stub().await else {
+            return;
+        };
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        super::upload_single_part(&client, "b", "k", &path, "application/gzip", None)
+            .await
+            .expect("single-part upload succeeds");
+
+        let puts = puts.lock().expect("puts lock");
+        assert_eq!(puts.len(), 1, "one PUT for a single-part upload");
+        assert_plain_sigv4_put(&puts[0], "single-part upload");
+        assert!(
+            puts[0].body == std::fs::read(&path).expect("file"),
+            "the store received the file bytes unframed"
+        );
+    }
+
+    /// Every part of a multipart upload goes out without optional
+    /// checksums, the same as a single-part upload.
+    #[tokio::test]
+    async fn multipart_upload_parts_are_plain_sigv4_puts() {
+        let Some((client, puts)) = spawn_recording_stub().await else {
+            return;
+        };
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        super::upload_multipart(
+            &client,
+            "b",
+            "k",
+            &path,
+            "application/octet-stream",
+            None,
+            &cancel,
+        )
+        .await
+        .expect("multipart upload succeeds");
+
+        let puts = puts.lock().expect("puts lock");
+        assert_eq!(puts.len(), 3, "three parts for a 12 MiB file");
+        for (index, put) in puts.iter().enumerate() {
+            assert_plain_sigv4_put(put, &format!("part {}", index + 1));
+        }
     }
 }

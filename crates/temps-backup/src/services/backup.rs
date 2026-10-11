@@ -6,7 +6,7 @@ use crate::handlers::backup_handler::{
 };
 use anyhow::Result;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::{Client as S3Client, Config};
+use aws_sdk_s3::Client as S3Client;
 use chrono::{DateTime, Duration, Timelike, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -3322,32 +3322,14 @@ SELECT cp.id
             "backup-service",
         );
 
-        let mut config_builder = Config::builder()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(s3_source.region.clone()))
-            .force_path_style(s3_source.force_path_style.unwrap_or(true)) // Default to true for Minio
-            .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client())
-            // aws-sdk-s3 defaults to computing a flexible checksum and sending it via
-            // aws-chunked trailers on every PutObject/UploadPart. Most third-party
-            // S3-compatible providers (Cloudflare R2, OVH, MinIO, Backblaze) don't
-            // implement that trailer format and reject or corrupt the upload, so only
-            // compute checksums when a caller explicitly asks for one.
-            .request_checksum_calculation(
-                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-            );
-
-        // Only set endpoint URL if endpoint is specified (for Minio/custom S3)
-        if let Some(endpoint) = &s3_source.endpoint {
-            let endpoint_url = if endpoint.starts_with("http") {
-                endpoint.clone()
-            } else {
-                format!("http://{}", endpoint)
-            };
-            config_builder = config_builder.endpoint_url(endpoint_url);
-        }
-
-        let config = config_builder.build();
+        // Default to path style for MinIO and other S3-compatible stores.
+        let config = crate::engines::v2_common::s3_config_builder(
+            &s3_source.region,
+            s3_source.force_path_style.unwrap_or(true),
+            creds,
+            s3_source.endpoint.as_deref(),
+        )
+        .build();
 
         Ok(S3Client::from_conf(config))
     }
@@ -3365,32 +3347,21 @@ SELECT cp.id
             "backup-service",
         );
 
-        let mut config_builder = Config::builder()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(request.region.clone()))
-            .force_path_style(request.force_path_style.unwrap_or(true))
-            .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client())
-            // See create_s3_client() above for why this is forced to WhenRequired.
-            .request_checksum_calculation(
-                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-            )
-            // This client only verifies a destination while an operator
-            // waits; bound it so an endpoint that never answers cannot hold
-            // the request open.
-            .timeout_config(
-                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                    .operation_timeout(crate::services::s3_probe::S3_PROBE_OPERATION_TIMEOUT)
-                    .build(),
-            );
-
-        // Only set endpoint URL if endpoint is specified (for MinIO)
-        if let Some(endpoint) = &request.endpoint {
-            config_builder =
-                config_builder.endpoint_url(crate::services::s3_probe::endpoint_url(endpoint));
-        }
-
-        let config = config_builder.build();
+        let config = crate::engines::v2_common::s3_config_builder(
+            &request.region,
+            request.force_path_style.unwrap_or(true),
+            creds,
+            request.endpoint.as_deref(),
+        )
+        // This client only verifies a destination while an operator
+        // waits; bound it so an endpoint that never answers cannot hold
+        // the request open.
+        .timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .operation_timeout(crate::services::s3_probe::S3_PROBE_OPERATION_TIMEOUT)
+                .build(),
+        )
+        .build();
         Ok(S3Client::from_conf(config))
     }
 
