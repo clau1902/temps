@@ -17,6 +17,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 import {
+  BUNDLED_SKILL,
   DB_CONTAINER,
   DB_IMAGE,
   DB_NAME,
@@ -881,17 +882,18 @@ export async function deleteLocalData(paths: LocalPaths): Promise<void> {
   }
 }
 
-// ── Skills ───────────────────────────────────────────────────────────────
+// ── Skill ────────────────────────────────────────────────────────────────
 
 /**
- * The Temps skills ship inside the npm package (`dist/skills`); from a
- * source checkout they are the repo's `skills/` directory.
+ * The folder of the Temps skill. It ships inside the npm package
+ * (`dist/skills/temps`); from a source checkout it is the repo's
+ * `skills/temps`. Null when this build has neither.
  */
-export function findBundledSkills(from: string = fileURLToPath(import.meta.url)): string | null {
+export function findBundledSkill(from: string = fileURLToPath(import.meta.url)): string | null {
   let dir = dirname(from)
   for (let i = 0; i < 7; i++) {
-    const candidate = join(dir, 'skills')
-    if (existsSync(join(candidate, 'temps-cli', 'SKILL.md'))) return candidate
+    const candidate = join(dir, 'skills', BUNDLED_SKILL)
+    if (existsSync(join(candidate, 'SKILL.md'))) return candidate
     const parent = dirname(dir)
     if (parent === dir) break
     dir = parent
@@ -899,20 +901,18 @@ export function findBundledSkills(from: string = fileURLToPath(import.meta.url))
   return null
 }
 
-/** Copy every bundled skill into each agent's skills directory under `base`. */
-export async function installSkills(source: string, base: string): Promise<{ skills: string[]; targets: string[] }> {
-  const entries = await readdir(source, { withFileTypes: true })
-  const skills = entries
-    .filter((entry) => entry.isDirectory() && existsSync(join(source, entry.name, 'SKILL.md')))
-    .map((entry) => entry.name)
-    .sort()
+/**
+ * Copy the Temps skill into each agent's skills directory under `base`,
+ * replacing an older copy of it. Other skills already there are left alone.
+ * Returns the directories it was installed into.
+ */
+export async function installSkill(source: string, base: string): Promise<string[]> {
   const targets = skillTargets(base)
   for (const target of targets) {
+    const destination = join(target, BUNDLED_SKILL)
     await mkdir(target, { recursive: true })
-    for (const skill of skills) {
-      await rm(join(target, skill), { recursive: true, force: true })
-      await cp(join(source, skill), join(target, skill), { recursive: true })
-    }
+    await rm(destination, { recursive: true, force: true })
+    await cp(source, destination, { recursive: true })
   }
-  return { skills, targets }
+  return targets
 }

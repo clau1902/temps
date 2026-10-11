@@ -405,6 +405,13 @@ export function resolveSkillsScope(
   return entries.some((entry) => PROJECT_MARKERS.includes(entry)) ? 'project' : 'global'
 }
 
+/**
+ * The one skill `temps start` installs. It covers the whole product; the
+ * other folders under `skills/` are older, narrower skills it replaces, so
+ * they are neither bundled nor installed.
+ */
+export const BUNDLED_SKILL = 'temps'
+
 /** Agent skill directories: Claude Code reads `.claude/skills`; Codex and OpenCode read `.agents/skills`. */
 export function skillTargets(base: string): string[] {
   return [join(base, '.claude', 'skills'), join(base, '.agents', 'skills')]

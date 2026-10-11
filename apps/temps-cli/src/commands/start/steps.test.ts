@@ -13,8 +13,8 @@ import { localPaths, type LocalState } from './runtime.js'
 import {
   acquireLock,
   destroySandboxes,
-  findBundledSkills,
-  installSkills,
+  findBundledSkill,
+  installSkill,
   isLocalServer,
   isPortFree,
   pickPort,
@@ -66,33 +66,46 @@ describe('state file', () => {
   })
 })
 
-describe('skills', () => {
-  test('the repo skills are found from the source tree', () => {
-    const found = findBundledSkills()
+describe('the Temps skill', () => {
+  test('is found from the source tree', () => {
+    const found = findBundledSkill()
     expect(found).not.toBeNull()
-    expect(existsSync(join(found as string, 'temps-cli', 'SKILL.md'))).toBe(true)
+    expect((found as string).endsWith(join('skills', 'temps'))).toBe(true)
+    expect(existsSync(join(found as string, 'SKILL.md'))).toBe(true)
   })
 
-  test('copies every skill into each agent folder and replaces old copies', async () => {
-    const source = tempDir()
-    await mkdir(join(source, 'deploy-to-temps', 'references'), { recursive: true })
-    await writeFile(join(source, 'deploy-to-temps', 'SKILL.md'), '# new')
-    await writeFile(join(source, 'deploy-to-temps', 'references', 'a.md'), 'ref')
-    await mkdir(join(source, 'not-a-skill'))
+  test('is not found where there is no skills/temps folder', async () => {
+    const dir = tempDir()
+    // A neighbouring skill is not a substitute for it.
+    await mkdir(join(dir, 'skills', 'deploy-to-temps'), { recursive: true })
+    await writeFile(join(dir, 'skills', 'deploy-to-temps', 'SKILL.md'), '# other')
+    expect(findBundledSkill(join(dir, 'index.js'))).toBeNull()
+  })
+
+  test('is copied into each agent folder, replaces its old copy and touches no other skill', async () => {
+    const source = join(tempDir(), 'skills', 'temps')
+    await mkdir(join(source, 'references'), { recursive: true })
+    await writeFile(join(source, 'SKILL.md'), '# new')
+    await writeFile(join(source, 'references', 'a.md'), 'ref')
 
     const base = tempDir()
-    const stale = join(base, '.claude', 'skills', 'deploy-to-temps')
+    const stale = join(base, '.claude', 'skills', 'temps')
+    const neighbour = join(base, '.claude', 'skills', 'my-own-skill')
     await mkdir(stale, { recursive: true })
+    await mkdir(neighbour, { recursive: true })
     await writeFile(join(stale, 'old.md'), 'stale')
+    await writeFile(join(neighbour, 'SKILL.md'), '# mine')
 
-    const result = await installSkills(source, base)
-    expect(result.skills).toEqual(['deploy-to-temps'])
-    for (const target of result.targets) {
-      expect(readFileSync(join(target, 'deploy-to-temps', 'SKILL.md'), 'utf-8')).toBe('# new')
-      expect(existsSync(join(target, 'deploy-to-temps', 'references', 'a.md'))).toBe(true)
-      expect(existsSync(join(target, 'not-a-skill'))).toBe(false)
+    const targets = await installSkill(source, base)
+    expect(targets).toEqual([join(base, '.claude', 'skills'), join(base, '.agents', 'skills')])
+    for (const target of targets) {
+      expect(readFileSync(join(target, 'temps', 'SKILL.md'), 'utf-8')).toBe('# new')
+      expect(existsSync(join(target, 'temps', 'references', 'a.md'))).toBe(true)
     }
     expect(existsSync(join(stale, 'old.md'))).toBe(false)
+    expect(readFileSync(join(neighbour, 'SKILL.md'), 'utf-8')).toBe('# mine')
+    // Exactly one skill was installed.
+    expect(await readdir(join(base, '.agents', 'skills'))).toEqual(['temps'])
   })
 })
 

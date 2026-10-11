@@ -127,7 +127,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`cloud`](#cloud) - Temps Cloud
 - [`plugin`](#plugin) - Create, install, update and build TypeScript plugins
 - [`setup`](#setup) - PoC: install Temps on an existing Linux VPS over SSH and save a client context
-- [`start`](#start) - Run Temps on this computer, sign in the CLI and add the skills for your coding agent
+- [`start`](#start) - Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
 - [`stop`](#stop) - Stop the Temps server and database started by `temps start`
 
 ## Commands
@@ -8702,7 +8702,7 @@ PoC: install Temps on an existing Linux VPS over SSH and save a client context
 
 ## `start`
 
-Run Temps on this computer, sign in the CLI and add the skills for your coding agent
+Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
 
 **Options:**
 
@@ -8710,7 +8710,7 @@ Run Temps on this computer, sign in the CLI and add the skills for your coding a
 |------|-------------|---------|----------|
 | `--channel <channel>` | Release channel for a fresh install: stable, beta or nightly | `beta` | No |
 | `--runtime-version <tag>` | Run this exact Temps release | - | No |
-| `--skills <scope>` | Where to add the agent skills: project, global or none (default: project inside a project, otherwise global) | - | No |
+| `--skills <scope>` | Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global) | - | No |
 | `--port <port>` | Port for your apps and the console on a fresh install (default: 8080 or the next free port) | - | No |
 | `--make-default` | Make "local" the default CLI context even if another one is active | - | No |
 | `--json` | Print the result as JSON, for scripts and agents | - | No |

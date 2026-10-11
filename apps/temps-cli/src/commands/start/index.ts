@@ -5,7 +5,7 @@
  * `temps start` runs Temps on this computer: it downloads the server binary,
  * starts a database in Docker, sets the platform up on first run, starts the
  * server in the background, mints an API key for the CLI (which every
- * coding agent using the Temps skills goes through), and copies the skills
+ * coding agent using the Temps skill goes through), and copies that skill
  * in. Running it again only starts what is stopped. `temps stop` stops it.
  */
 
@@ -25,6 +25,7 @@ import { colors, icons } from '../../ui/output.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import { isQuietMode, startSpinner } from '../../ui/spinner.js'
 import {
+  BUNDLED_SKILL,
   DB_CONTAINER,
   DB_VOLUME,
   DOCKER_NETWORK,
@@ -55,8 +56,8 @@ import {
   dockerVersion,
   ensureBinary,
   ensureDatabase,
-  findBundledSkills,
-  installSkills,
+  findBundledSkill,
+  installSkill,
   isLocalServer,
   isPortFree,
   mintApiKey,
@@ -309,7 +310,7 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
     }
 
     const current = state
-    const bundled = scope === 'none' ? null : findBundledSkills()
+    const bundled = scope === 'none' ? null : findBundledSkill()
     const skillsBase = scope === 'global' ? homedir() : cwd
     const [binary, , skills] = await Promise.all([
       steps.time(
@@ -326,9 +327,9 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
           ),
       bundled
         ? steps.time(
-            'Adding skills',
-            () => installSkills(bundled, skillsBase),
-            (s) => `Added ${s.skills.length} skills for Claude Code, Codex and OpenCode`,
+            'Adding the Temps skill',
+            () => installSkill(bundled, skillsBase),
+            () => 'Added the Temps skill for Claude Code, Codex and OpenCode',
           )
         : Promise.resolve(null),
     ])
@@ -388,7 +389,7 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
             api_key_created: cli.minted,
             admin_email: current.adminEmail,
             credentials_file: paths.state,
-            skills: skills ? { scope, count: skills.skills.length, directories: skills.targets } : { scope, count: 0 },
+            skill: skills ? { scope, name: BUNDLED_SKILL, directories: skills } : { scope, name: null, directories: [] },
             elapsed_ms: elapsed,
           },
           null,
@@ -408,7 +409,8 @@ function printSummary(input: {
   paths: LocalPaths
   urls: ReturnType<typeof localUrls>
   cli: { active: boolean; previous: string | null }
-  skills: { skills: string[]; targets: string[] } | null
+  /** Directories the Temps skill was installed into, or null if it was not. */
+  skills: string[] | null
   scope: SkillsScope
   bundled: boolean
   elapsed: number
@@ -428,9 +430,9 @@ function printSummary(input: {
       : `context "${LOCAL_CONTEXT}" saved; "${cli.previous}" is still your default. Switch with \`temps context use ${LOCAL_CONTEXT}\`, or prefix one command (or your agent) with TEMPS_CONTEXT=${LOCAL_CONTEXT}`,
   )
   if (skills) {
-    row('Agents', `${skills.skills.length} skills in ${skills.targets.map((t) => t.replace(homedir(), '~')).join(' and ')}`)
+    row('Agents', `the Temps skill, in ${skills.map((t) => t.replace(homedir(), '~')).join(' and ')}`)
   } else if (scope !== 'none' && !input.bundled) {
-    row('Agents', 'Skills are not bundled in this build. Add them with `bunx skills add gotempsh/temps`')
+    row('Agents', `The Temps skill is not bundled in this build. Add it with \`bunx skills add gotempsh/temps --skill ${BUNDLED_SKILL}\``)
   }
   row('Apps', urls.app('<project>'))
   console.log()
@@ -539,10 +541,10 @@ async function removeSandboxes(state: LocalState | null): Promise<{ destroyed: s
 export function registerStartCommands(program: Command): void {
   program
     .command('start')
-    .description('Run Temps on this computer, sign in the CLI and add the skills for your coding agent')
+    .description('Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent')
     .option('--channel <channel>', 'Release channel for a fresh install: stable, beta or nightly', 'beta')
     .option('--runtime-version <tag>', 'Run this exact Temps release')
-    .option('--skills <scope>', 'Where to add the agent skills: project, global or none (default: project inside a project, otherwise global)')
+    .option('--skills <scope>', 'Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global)')
     .option('--port <port>', 'Port for your apps and the console on a fresh install (default: 8080 or the next free port)')
     .option('--make-default', 'Make "local" the default CLI context even if another one is active')
     .option('--json', 'Print the result as JSON, for scripts and agents')
