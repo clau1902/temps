@@ -469,7 +469,8 @@ impl NativeApiService {
                 &format!("batches/{}", record.upstream_id),
                 None,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !reply.is_success() {
             return Err(AiGatewayError::Validation {
                 message: "Provider could not retrieve tracked batch".into(),
@@ -613,7 +614,8 @@ impl NativeApiService {
                     "responses",
                     Some(body),
                 )
-                .await?;
+                .await
+                .map_err(|error| credentials.caller_facing(error))?;
             let usage = if reply.is_success() {
                 serde_json::from_slice::<ResponseObject>(&reply.body)
                     .ok()
@@ -634,7 +636,8 @@ impl NativeApiService {
                 Some(body),
                 false,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !response.status().is_success() {
             let reply = read_reply(response, "responses").await?;
             return Ok((ResponsesOutcome::Reply { reply, usage: None }, served_by));
@@ -689,7 +692,8 @@ impl NativeApiService {
                 spooled.length,
                 text_fields,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         drop(spooled);
         if !reply.is_success() {
             return Ok(reply);
@@ -745,6 +749,7 @@ impl NativeApiService {
                 None,
             )
             .await
+            .map_err(|error| credentials.caller_facing(error))
     }
 
     /// Download a file's content. Successful downloads are streamed, never
@@ -771,7 +776,8 @@ impl NativeApiService {
                 None,
                 true,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !response.status().is_success() {
             return Ok(Err(read_reply(response, &path).await?));
         }
@@ -810,7 +816,8 @@ impl NativeApiService {
                 &format!("files/{file_id}"),
                 None,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if reply.is_success() {
             if let Some(record) = record {
                 ai_gateway_objects::Entity::delete_by_id(record.id)
@@ -897,7 +904,8 @@ impl NativeApiService {
                 "batches",
                 Some(body),
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !reply.is_success() {
             return Ok(reply);
         }
@@ -976,7 +984,8 @@ impl NativeApiService {
         let reply = self
             .client
             .send_buffered(method, &base_url, &credentials.api_key, &path, None)
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if let (true, Some(record)) = (reply.is_success(), record) {
             match serde_json::from_slice::<BatchObject>(&reply.body) {
                 Ok(batch) => self.observe_batch(&record, &batch).await?,
@@ -1130,7 +1139,8 @@ impl NativeApiService {
                 None,
                 true,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
         if !response.status().is_success() {
             return Err(AiGatewayError::Validation {
                 message: "Batch output is not yet available for accounting".into(),
@@ -1189,6 +1199,7 @@ impl NativeApiService {
             .client
             .send_buffered(method, &base_url, &credentials.api_key, &path, None)
             .await
+            .map_err(|error| credentials.caller_facing(error))
         {
             Ok(reply) if reply.is_success() => {}
             Ok(reply) => error!(

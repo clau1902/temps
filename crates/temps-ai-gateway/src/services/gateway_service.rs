@@ -1665,6 +1665,42 @@ mod tests {
     }
 
     #[test]
+    fn blocked_system_key_urls_are_generic_for_callers_but_byok_keeps_details() {
+        let blocked = || AiGatewayError::InvalidProviderUrl {
+            reason: "provider hostname 'models.internal' resolved to a private address".into(),
+        };
+        let mut credentials = ResolvedCredentials {
+            provider_id: OPENAI_COMPATIBLE,
+            api_key: String::new(),
+            base_url: Some("http://models.internal:8000/v1".to_string()),
+            credential_type: CredentialType::System,
+            system_key_id: Some(4),
+            key_trust: None,
+            self_hosted_capabilities: None,
+        };
+        match credentials.caller_facing(blocked()) {
+            AiGatewayError::InvalidProviderUrl { reason } => {
+                assert!(!reason.contains("models.internal"), "{reason}");
+                assert!(reason.contains("provider key 4"), "{reason}");
+            }
+            other => panic!("expected InvalidProviderUrl, got {other:?}"),
+        }
+        credentials.credential_type = CredentialType::Byok;
+        credentials.system_key_id = None;
+        match credentials.caller_facing(blocked()) {
+            AiGatewayError::InvalidProviderUrl { reason } => {
+                assert!(reason.contains("models.internal"), "{reason}")
+            }
+            other => panic!("expected InvalidProviderUrl, got {other:?}"),
+        }
+        // Other errors pass through untouched.
+        assert!(matches!(
+            credentials.caller_facing(AiGatewayError::UploadCapacity),
+            AiGatewayError::UploadCapacity
+        ));
+    }
+
+    #[test]
     fn undeclared_capability_is_refused_only_for_self_hosted_keys() {
         let mut credentials = ResolvedCredentials {
             provider_id: OPENAI_COMPATIBLE,
