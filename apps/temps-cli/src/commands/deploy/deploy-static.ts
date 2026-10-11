@@ -23,8 +23,8 @@ import {
   box,
 } from '../../ui/output.js'
 import { existsSync, statSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
-import { basename, extname, resolve } from 'node:path'
+import { readdir, readFile } from 'node:fs/promises'
+import { basename, extname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 
 interface DeployStaticOptions {
@@ -245,6 +245,13 @@ export async function deployStatic(options: DeployStaticOptions): Promise<void> 
       fileData = result.data
       filename = result.filename
       contentType = 'application/gzip'
+      if (result.skipped.length > 0) {
+        info(
+          `Left out ${result.skipped.length} hidden ${result.skipped.length === 1 ? 'entry' : 'entries'} ` +
+            `(${result.skipped.slice(0, 5).join(', ')}${result.skipped.length > 5 ? ', …' : ''}): ` +
+            'Temps never publishes files or folders whose name starts with a dot.'
+        )
+      }
     } else {
       // Read existing archive
       fileData = await readFile(resolvedPath)
@@ -410,19 +417,64 @@ export function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
-async function createTarGzFromDirectory(
+/**
+ * Every file under `root` that Temps will publish, as paths relative to it.
+ *
+ * Mirrors the server's rule (`is_sensitive_static_path`): a path with any
+ * dot-prefixed component is private, except a top-level `.well-known`
+ * folder. Leaving those out here means a project folder with `.git`,
+ * `.temps`, `.env`, agent skill folders or macOS `.DS_Store` files deploys
+ * instead of being rejected after upload. `skipped` lists what was left out,
+ * relative to `root`, without descending into it.
+ */
+export async function collectPublishableFiles(
+  root: string
+): Promise<{ files: string[]; skipped: string[] }> {
+  const files: string[] = []
+  const skipped: string[] = []
+  const walk = async (relative: string): Promise<void> => {
+    const entries = await readdir(join(root, relative), { withFileTypes: true })
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      const path = relative ? `${relative}/${entry.name}` : entry.name
+      const hidden = entry.name.startsWith('.') && !(relative === '' && entry.name === '.well-known')
+      if (hidden) {
+        skipped.push(path)
+      } else if (entry.isDirectory()) {
+        await walk(path)
+      } else {
+        files.push(path)
+      }
+    }
+  }
+  await walk('')
+  return { files, skipped }
+}
+
+export async function createTarGzFromDirectory(
   dirPath: string
-): Promise<{ data: Buffer; filename: string }> {
+): Promise<{ data: Buffer; filename: string; skipped: string[] }> {
   const dirName = basename(dirPath)
   const filename = `${dirName}.tar.gz`
+  const { files, skipped } = await collectPublishableFiles(dirPath)
+  if (files.length === 0) {
+    throw new Error(
+      `Nothing to publish in ${dirPath}: it has no files outside hidden folders${skipped.length ? ` (left out: ${skipped.slice(0, 5).join(', ')})` : ''}.`
+    )
+  }
 
-  // Use system tar command to create the archive
+  // System tar, fed the file list on stdin (NUL-separated, so any file name
+  // is safe). GNU tar and bsdtar both accept --null -T -.
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
 
-    const tar = spawn('tar', ['-czf', '-', '-C', dirPath, '.'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+    // COPYFILE_DISABLE stops macOS tar adding `._name` copies of extended
+    // attributes, which the server would reject as hidden files.
+    const tar = spawn('tar', ['-czf', '-', '-C', dirPath, '--null', '-T', '-'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, COPYFILE_DISABLE: '1' },
     })
+    tar.stdin.end(files.map((file) => `${file}\0`).join(''))
 
     tar.stdout.on('data', (chunk: Buffer) => {
       chunks.push(chunk)
@@ -438,6 +490,7 @@ async function createTarGzFromDirectory(
         resolve({
           data: Buffer.concat(chunks),
           filename,
+          skipped,
         })
       } else {
         reject(new Error(`tar command failed with code ${code}: ${stderr}`))

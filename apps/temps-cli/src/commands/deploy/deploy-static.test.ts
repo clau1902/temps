@@ -56,3 +56,77 @@ describe('formatFileSize', () => {
     expect(formatFileSize(1024 * 1024 * 3)).toBe('3.00 MB')
   })
 })
+
+describe('static bundles leave out what Temps never publishes', () => {
+  async function project(): Promise<string> {
+    const { mkdtemp, mkdir, writeFile } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const root = await mkdtemp(join(tmpdir(), 'temps-static-'))
+    for (const dir of ['.git', '.temps', '.claude/skills/x', 'assets', '.well-known', 'docs/.cache']) {
+      await mkdir(join(root, dir), { recursive: true })
+    }
+    const files: Record<string, string> = {
+      'index.html': '<h1>hi</h1>',
+      'assets/app.js': 'console.log(1)',
+      'assets/.DS_Store': 'mac',
+      '.env': 'SECRET=1',
+      '.git/config': '[core]',
+      '.temps/config.json': '{}',
+      '.claude/skills/x/SKILL.md': '# x',
+      '.well-known/security.txt': 'Contact: x',
+      'docs/.cache/a': 'a',
+      'docs/guide.html': 'guide',
+    }
+    for (const [path, content] of Object.entries(files)) await writeFile(join(root, path), content)
+    return root
+  }
+
+  test('keeps public files and a top-level .well-known, skips every other dot path', async () => {
+    const { collectPublishableFiles } = await import('./deploy-static.js')
+    const { rm } = await import('node:fs/promises')
+    const root = await project()
+    try {
+      const { files, skipped } = await collectPublishableFiles(root)
+      expect(files).toEqual(['.well-known/security.txt', 'assets/app.js', 'docs/guide.html', 'index.html'])
+      expect(skipped).toEqual(['.claude', '.env', '.git', '.temps', 'assets/.DS_Store', 'docs/.cache'])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('the archive contains exactly the publishable files', async () => {
+    const { createTarGzFromDirectory } = await import('./deploy-static.js')
+    const { mkdtemp, rm, writeFile } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { spawnSync } = await import('node:child_process')
+    const root = await project()
+    const out = await mkdtemp(join(tmpdir(), 'temps-static-out-'))
+    try {
+      const { data, skipped } = await createTarGzFromDirectory(root)
+      expect(skipped).toContain('.temps')
+      await writeFile(join(out, 'bundle.tar.gz'), data)
+      const listing = spawnSync('tar', ['-tzf', join(out, 'bundle.tar.gz')], { encoding: 'utf-8' })
+      const entries = listing.stdout.split('\n').filter(Boolean).sort()
+      expect(entries).toEqual(['.well-known/security.txt', 'assets/app.js', 'docs/guide.html', 'index.html'])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+      await rm(out, { recursive: true, force: true })
+    }
+  })
+
+  test('a folder with nothing publishable fails with what was left out', async () => {
+    const { createTarGzFromDirectory } = await import('./deploy-static.js')
+    const { mkdtemp, mkdir, rm } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const root = await mkdtemp(join(tmpdir(), 'temps-static-empty-'))
+    await mkdir(join(root, '.git'))
+    try {
+      await expect(createTarGzFromDirectory(root)).rejects.toThrow(/Nothing to publish.*\.git/)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
