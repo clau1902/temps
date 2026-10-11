@@ -247,9 +247,9 @@ export async function deployStatic(options: DeployStaticOptions): Promise<void> 
       contentType = 'application/gzip'
       if (result.skipped.length > 0) {
         info(
-          `Left out ${result.skipped.length} hidden ${result.skipped.length === 1 ? 'entry' : 'entries'} ` +
+          `Left out ${result.skipped.length} private ${result.skipped.length === 1 ? 'entry' : 'entries'} ` +
             `(${result.skipped.slice(0, 5).join(', ')}${result.skipped.length > 5 ? ', …' : ''}): ` +
-            'Temps never publishes files or folders whose name starts with a dot.'
+            'Temps never publishes dotfiles, source maps, keys, env files, database dumps or symbolic links.'
         )
       }
     } else {
@@ -417,15 +417,75 @@ export function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
+const SENSITIVE_NAMES = new Set([
+  'id_rsa',
+  'id_dsa',
+  'id_ecdsa',
+  'id_ed25519',
+  'credentials',
+  'credentials.json',
+  'secrets.json',
+  'kubeconfig',
+  'client_secret.json',
+  'client_secrets.json',
+  'service-account.json',
+  'service-account-key.json',
+  'service_account.json',
+  'service_account_key.json',
+  'serviceaccountkey.json',
+])
+
+const SENSITIVE_SUFFIXES = [
+  '.env',
+  '.pem',
+  '.key',
+  '.ppk',
+  '.p12',
+  '.pfx',
+  '.jks',
+  '.keystore',
+  '.tfvars',
+  '.map',
+  '.sql',
+  '.sqlite',
+  '.sqlite3',
+  '.bak',
+  '.backup',
+  '.orig',
+  '.swp',
+  '.tfstate',
+]
+
+/**
+ * Whether the server refuses to publish a file or folder with this name.
+ * A line-for-line port of `is_sensitive_static_path` in
+ * `crates/temps-core/src/static_files.rs`, applied to one path component:
+ * dot-prefixed names (except a top-level `.well-known`), key and credential
+ * files, env files, source maps, database dumps, editor backups and
+ * Terraform state. Keep the two in sync: a name the server rejects and this
+ * accepts fails the whole deployment after the upload.
+ */
+export function isSensitiveStaticName(name: string, topLevel: boolean): boolean {
+  const lower = name.toLowerCase()
+  if (lower.startsWith('.') && !(topLevel && lower === '.well-known')) return true
+  return (
+    SENSITIVE_NAMES.has(lower) ||
+    SENSITIVE_SUFFIXES.some((suffix) => lower.endsWith(suffix)) ||
+    lower.includes('.tfstate.') ||
+    lower.includes('.env.')
+  )
+}
+
 /**
  * Every file under `root` that Temps will publish, as paths relative to it.
  *
- * Mirrors the server's rule (`is_sensitive_static_path`): a path with any
- * dot-prefixed component is private, except a top-level `.well-known`
- * folder. Leaving those out here means a project folder with `.git`,
- * `.temps`, `.env`, agent skill folders or macOS `.DS_Store` files deploys
- * instead of being rejected after upload. `skipped` lists what was left out,
- * relative to `root`, without descending into it.
+ * Applies the server's own policy before the upload: names it treats as
+ * sensitive (see `isSensitiveStaticName`) and symbolic links, which it
+ * rejects outright. Leaving those out here means a project folder with
+ * `.git`, `.temps`, `.env`, agent skill folders, macOS `.DS_Store` files or
+ * a build's `app.js.map` deploys instead of being rejected after upload.
+ * `skipped` lists what was left out, relative to `root`, without descending
+ * into it.
  */
 export async function collectPublishableFiles(
   root: string
@@ -437,8 +497,7 @@ export async function collectPublishableFiles(
     entries.sort((a, b) => a.name.localeCompare(b.name))
     for (const entry of entries) {
       const path = relative ? `${relative}/${entry.name}` : entry.name
-      const hidden = entry.name.startsWith('.') && !(relative === '' && entry.name === '.well-known')
-      if (hidden) {
+      if (entry.isSymbolicLink() || isSensitiveStaticName(entry.name, relative === '')) {
         skipped.push(path)
       } else if (entry.isDirectory()) {
         await walk(path)
@@ -459,7 +518,7 @@ export async function createTarGzFromDirectory(
   const { files, skipped } = await collectPublishableFiles(dirPath)
   if (files.length === 0) {
     throw new Error(
-      `Nothing to publish in ${dirPath}: it has no files outside hidden folders${skipped.length ? ` (left out: ${skipped.slice(0, 5).join(', ')})` : ''}.`
+      `Nothing to publish in ${dirPath}: every entry is private or a symbolic link${skipped.length ? ` (left out: ${skipped.slice(0, 5).join(', ')})` : ''}.`
     )
   }
 

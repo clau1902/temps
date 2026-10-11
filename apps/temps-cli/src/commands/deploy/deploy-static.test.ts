@@ -59,11 +59,11 @@ describe('formatFileSize', () => {
 
 describe('static bundles leave out what Temps never publishes', () => {
   async function project(): Promise<string> {
-    const { mkdtemp, mkdir, writeFile } = await import('node:fs/promises')
+    const { mkdtemp, mkdir, symlink, writeFile } = await import('node:fs/promises')
     const { tmpdir } = await import('node:os')
     const { join } = await import('node:path')
     const root = await mkdtemp(join(tmpdir(), 'temps-static-'))
-    for (const dir of ['.git', '.temps', '.claude/skills/x', 'assets', '.well-known', 'docs/.cache']) {
+    for (const dir of ['.git', '.temps', '.claude/skills/x', 'assets', '.well-known', 'docs/.cache', 'data']) {
       await mkdir(join(root, dir), { recursive: true })
     }
     const files: Record<string, string> = {
@@ -77,19 +77,68 @@ describe('static bundles leave out what Temps never publishes', () => {
       '.well-known/security.txt': 'Contact: x',
       'docs/.cache/a': 'a',
       'docs/guide.html': 'guide',
+      // Ordinary build output and stray files the server also refuses.
+      'assets/app.js.map': '{"version":3}',
+      'assets/tls.pem': 'cert',
+      'data/dump.sql': 'select 1',
+      'data/credentials.json': '{}',
+      'data/prod.env.local': 'SECRET=1',
+      'data/terraform.TFSTATE.backup': '{}',
+      '.well-known/.env': 'SECRET=1',
     }
     for (const [path, content] of Object.entries(files)) await writeFile(join(root, path), content)
+    await symlink(join(root, 'index.html'), join(root, 'latest.html'))
+    await symlink(join(root, 'assets'), join(root, 'static'))
     return root
   }
 
-  test('keeps public files and a top-level .well-known, skips every other dot path', async () => {
+  test('applies the server filename policy to one path component', async () => {
+    const { isSensitiveStaticName } = await import('./deploy-static.js')
+    const sensitive = [
+      '.git', '.env', '.DS_Store', '.Well-Known.bak',
+      'id_rsa', 'ID_ED25519', 'credentials', 'Credentials.JSON', 'secrets.json', 'kubeconfig',
+      'client_secret.json', 'service-account-key.json', 'serviceAccountKey.json',
+      'prod.env', 'app.env.production', 'server.pem', 'tls.KEY', 'putty.ppk', 'cert.p12', 'cert.pfx',
+      'store.jks', 'release.keystore', 'vars.tfvars', 'app.js.map', 'styles.css.MAP', 'dump.sql',
+      'app.sqlite', 'app.sqlite3', 'index.html.bak', 'db.backup', 'merge.orig', 'notes.swp',
+      'terraform.tfstate', 'terraform.tfstate.backup',
+    ]
+    for (const name of sensitive) expect([name, isSensitiveStaticName(name, false)]).toEqual([name, true])
+    const publishable = [
+      'index.html', 'app.js', 'sitemap.xml', 'roadmap.html', 'keys.html', 'environment.js',
+      'sql-tutorial.html', 'backup-guide.md', 'mapbox.css', 'env', 'pem',
+    ]
+    for (const name of publishable) expect([name, isSensitiveStaticName(name, false)]).toEqual([name, false])
+    // `.well-known` is public only as a top-level folder.
+    expect(isSensitiveStaticName('.well-known', true)).toBe(false)
+    expect(isSensitiveStaticName('.WELL-KNOWN', true)).toBe(false)
+    expect(isSensitiveStaticName('.well-known', false)).toBe(true)
+  })
+
+  test('keeps public files and a top-level .well-known, skips private names and symlinks', async () => {
     const { collectPublishableFiles } = await import('./deploy-static.js')
     const { rm } = await import('node:fs/promises')
     const root = await project()
     try {
       const { files, skipped } = await collectPublishableFiles(root)
       expect(files).toEqual(['.well-known/security.txt', 'assets/app.js', 'docs/guide.html', 'index.html'])
-      expect(skipped).toEqual(['.claude', '.env', '.git', '.temps', 'assets/.DS_Store', 'docs/.cache'])
+      expect(skipped).toEqual([
+        '.claude',
+        '.env',
+        '.git',
+        '.temps',
+        '.well-known/.env',
+        'assets/.DS_Store',
+        'assets/app.js.map',
+        'assets/tls.pem',
+        'data/credentials.json',
+        'data/dump.sql',
+        'data/prod.env.local',
+        'data/terraform.TFSTATE.backup',
+        'docs/.cache',
+        'latest.html',
+        'static',
+      ])
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -106,6 +155,7 @@ describe('static bundles leave out what Temps never publishes', () => {
     try {
       const { data, skipped } = await createTarGzFromDirectory(root)
       expect(skipped).toContain('.temps')
+      expect(skipped).toContain('assets/app.js.map')
       await writeFile(join(out, 'bundle.tar.gz'), data)
       const listing = spawnSync('tar', ['-tzf', join(out, 'bundle.tar.gz')], { encoding: 'utf-8' })
       const entries = listing.stdout.split('\n').filter(Boolean).sort()
