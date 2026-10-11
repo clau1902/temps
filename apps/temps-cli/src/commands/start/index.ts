@@ -430,7 +430,7 @@ function printSummary(input: {
   if (skills) {
     row('Agents', `${skills.skills.length} skills in ${skills.targets.map((t) => t.replace(homedir(), '~')).join(' and ')}`)
   } else if (scope !== 'none' && !input.bundled) {
-    row('Agents', 'Skills are not bundled in this build. Add them with `npx skills add gotempsh/temps`')
+    row('Agents', 'Skills are not bundled in this build. Add them with `bunx skills add gotempsh/temps`')
   }
   row('Apps', urls.app('<project>'))
   console.log()
