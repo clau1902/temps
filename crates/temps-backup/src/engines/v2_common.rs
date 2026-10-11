@@ -1836,4 +1836,211 @@ mod tests {
         assert_eq!(puts.len(), 1, "one PUT for the metadata companion");
         assert_plain_sigv4_put(&puts[0], "metadata upload");
     }
+
+    // ── Object Lock against a real S3-compatible server ─────────────────────
+    //
+    // The stub above enforces AWS's documented rule for buckets with a
+    // default Object Lock retention period (no integrity header ->
+    // InvalidRequest) and checks each `Content-MD5` against this crate's own
+    // `content_md5`. Self-hosted S3-compatible servers don't enforce that
+    // rule (RustFS and LocalStack both accept such an upload), so a real
+    // server can't reproduce the rejection itself. What one can check is
+    // everything else: that our digests pass a real server's `Content-MD5`
+    // verification, and that every backup upload lands in a locked bucket
+    // under its default retention.
+
+    const LOCKED_BUCKET: &str = "locked-backups";
+
+    struct ObjectLockFixture {
+        _container: testcontainers::ContainerAsync<testcontainers::GenericImage>,
+        /// Built by the production [`super::s3_config_builder`].
+        client: aws_sdk_s3::Client,
+    }
+
+    /// Start RustFS and create [`LOCKED_BUCKET`] with Object Lock and a
+    /// one-day GOVERNANCE default retention. `None` when Docker is not
+    /// available, so the test skips instead of failing.
+    async fn object_lock_fixture() -> Option<ObjectLockFixture> {
+        use crate::test_rustfs::{
+            rustfs_container_request, wait_for_rustfs_ready, RUSTFS_ACCESS_KEY, RUSTFS_S3_PORT,
+            RUSTFS_SECRET_KEY,
+        };
+        use testcontainers::runners::AsyncRunner;
+
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(e) => {
+                println!("Docker not available, skipping Object Lock test: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping Object Lock test: {e}");
+            return None;
+        }
+
+        let container = rustfs_container_request()
+            .start()
+            .await
+            .expect("start RustFS container");
+        let port = container
+            .get_host_port_ipv4(RUSTFS_S3_PORT)
+            .await
+            .expect("RustFS S3 port");
+        wait_for_rustfs_ready(port)
+            .await
+            .expect("RustFS did not become healthy");
+
+        let endpoint = format!("127.0.0.1:{port}");
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            RUSTFS_ACCESS_KEY,
+            RUSTFS_SECRET_KEY,
+            None,
+            None,
+            "object-lock-test",
+        );
+        let client = aws_sdk_s3::Client::from_conf(
+            super::s3_config_builder("us-east-1", true, credentials, Some(&endpoint)).build(),
+        );
+
+        client
+            .create_bucket()
+            .bucket(LOCKED_BUCKET)
+            .object_lock_enabled_for_bucket(true)
+            .send()
+            .await
+            .expect("create Object Lock bucket");
+        client
+            .put_object_lock_configuration()
+            .bucket(LOCKED_BUCKET)
+            .object_lock_configuration(
+                aws_sdk_s3::types::ObjectLockConfiguration::builder()
+                    .object_lock_enabled(aws_sdk_s3::types::ObjectLockEnabled::Enabled)
+                    .rule(
+                        aws_sdk_s3::types::ObjectLockRule::builder()
+                            .default_retention(
+                                aws_sdk_s3::types::DefaultRetention::builder()
+                                    .mode(aws_sdk_s3::types::ObjectLockRetentionMode::Governance)
+                                    .days(1)
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("set default retention");
+
+        Some(ObjectLockFixture {
+            _container: container,
+            client,
+        })
+    }
+
+    /// The retention mode the server recorded for `key`, proving the upload
+    /// landed under the bucket's default retention rather than beside it.
+    async fn retention_mode(client: &aws_sdk_s3::Client, key: &str) -> Option<String> {
+        client
+            .head_object()
+            .bucket(LOCKED_BUCKET)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("head_object {key}: {e:?}"))
+            .object_lock_mode()
+            .map(|mode| mode.as_str().to_string())
+    }
+
+    /// The server really verifies `Content-MD5`: a digest that doesn't match
+    /// the body is rejected. Without this, the test below would pass
+    /// against a server that ignores the header, proving nothing about the
+    /// digests this crate computes.
+    #[tokio::test]
+    async fn a_locked_bucket_rejects_a_wrong_content_md5() {
+        let Some(fixture) = object_lock_fixture().await else {
+            return;
+        };
+        let error = fixture
+            .client
+            .put_object()
+            .bucket(LOCKED_BUCKET)
+            .key("wrong-digest.json")
+            .body(b"{}".to_vec().into())
+            // The MD5 of an empty body, not of `{}`. The interceptor leaves
+            // a `Content-MD5` the caller already set untouched.
+            .content_md5(super::content_md5(b""))
+            .send()
+            .await
+            .expect_err("a wrong Content-MD5 is rejected");
+        assert_eq!(
+            error
+                .raw_response()
+                .map(|response| response.status().as_u16()),
+            Some(400),
+            "expected a 400 rejection: {}",
+            super::describe_sdk_error("put_object with a wrong Content-MD5", &error)
+        );
+    }
+
+    /// Every kind of backup upload succeeds on a bucket with a default
+    /// Object Lock retention period, and each object is stored under it.
+    #[tokio::test]
+    async fn backup_uploads_succeed_on_a_bucket_with_default_object_lock_retention() {
+        let Some(fixture) = object_lock_fixture().await else {
+            return;
+        };
+        let client = &fixture.client;
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        super::upload_single_part(
+            client,
+            LOCKED_BUCKET,
+            "single/backup.sql.gz",
+            &path,
+            "application/gzip",
+            None,
+        )
+        .await
+        .expect("single-part upload to a locked bucket");
+        super::upload_multipart(
+            client,
+            LOCKED_BUCKET,
+            "multi/backup.sql.gz",
+            &path,
+            "application/gzip",
+            None,
+            &cancel,
+        )
+        .await
+        .expect("multipart upload to a locked bucket");
+        super::write_metadata_companion(
+            client,
+            LOCKED_BUCKET,
+            "single/metadata.json",
+            "postgres",
+            "uuid-1",
+            "single/backup.sql.gz",
+            12 * 1024 * 1024,
+            1,
+            "gzip",
+            None,
+        )
+        .await
+        .expect("metadata upload to a locked bucket");
+
+        for key in [
+            "single/backup.sql.gz",
+            "multi/backup.sql.gz",
+            "single/metadata.json",
+        ] {
+            assert_eq!(
+                retention_mode(client, key).await.as_deref(),
+                Some("GOVERNANCE"),
+                "{key} is stored under the bucket's default retention"
+            );
+        }
+    }
 }
