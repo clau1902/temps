@@ -500,6 +500,13 @@ pub fn build_s3_client(
 /// upload is a plain SigV4 PUT, which AWS and every compatible store
 /// accept; operations that do require a checksum (`DeleteObjects`,
 /// `PutBucketLifecycleConfiguration`) still get one.
+///
+/// Uploads still carry an integrity header: `Content-MD5`, added by
+/// [`ContentMd5Interceptor`] for in-memory bodies and by
+/// [`upload_single_part`] for a file streamed from disk. A bucket with a
+/// default Object Lock retention period rejects an upload with neither
+/// `Content-MD5` nor a flexible checksum, and `Content-MD5` is the one
+/// every S3-compatible store accepts.
 pub(crate) fn s3_config_builder(
     region: &str,
     force_path_style: bool,
@@ -512,13 +519,91 @@ pub(crate) fn s3_config_builder(
         .force_path_style(force_path_style)
         .credentials_provider(credentials)
         .http_client(bundled_roots_http_client())
-        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired);
+        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+        .interceptor(ContentMd5Interceptor);
 
     if let Some(endpoint) = endpoint {
         builder = builder.endpoint_url(crate::services::s3_probe::endpoint_url(endpoint));
     }
 
     builder
+}
+
+/// Adds `Content-MD5` to every `PutObject` and `UploadPart` whose body is
+/// already in memory: metadata, backup indexes, multipart parts.
+///
+/// With checksums computed only when required (see [`s3_config_builder`]),
+/// neither operation would otherwise carry an integrity header, and a
+/// bucket with a default Object Lock retention period rejects such an
+/// upload. Living on the client rather than at each call site means a new
+/// upload can't forget it. A body streamed from disk has no bytes to hash
+/// here; [`upload_single_part`] computes its digest before sending.
+#[derive(Debug)]
+struct ContentMd5Interceptor;
+
+impl aws_sdk_s3::config::Intercept for ContentMd5Interceptor {
+    fn name(&self) -> &'static str {
+        "ContentMd5Interceptor"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &aws_sdk_s3::config::RuntimeComponents,
+        cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), aws_smithy_runtime_api::box_error::BoxError> {
+        let is_upload = cfg
+            .load::<aws_smithy_runtime_api::client::orchestrator::Metadata>()
+            .is_some_and(|metadata| matches!(metadata.name(), "PutObject" | "UploadPart"));
+        if !is_upload {
+            return Ok(());
+        }
+        let request = context.request_mut();
+        let has_integrity_header = request
+            .headers()
+            .iter_bytes()
+            .any(|(name, _)| name == "content-md5" || name.starts_with("x-amz-checksum-"));
+        if has_integrity_header {
+            return Ok(());
+        }
+        let Some(body) = request.body().bytes() else {
+            return Ok(());
+        };
+        let digest = content_md5(body);
+        request
+            .headers_mut()
+            .try_insert("content-md5", digest)
+            .map_err(|e| format!("failed to set Content-MD5 on an S3 upload: {}", e))?;
+        Ok(())
+    }
+}
+
+/// Base64 MD5 digest of `bytes`, in the form the `Content-MD5` header takes.
+fn content_md5(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(md5::compute(bytes).0)
+}
+
+/// `Content-MD5` of the file at `path`, read in fixed-size chunks so memory
+/// stays bounded whatever the file's size.
+async fn file_content_md5(path: &str) -> Result<String, BackupError> {
+    use base64::Engine as _;
+    use tokio::io::AsyncReadExt;
+
+    let read_error = |e: std::io::Error| BackupError::Failed {
+        reason: format!("failed to read {} to compute its Content-MD5: {}", path, e),
+    };
+    let mut file = tokio::fs::File::open(path).await.map_err(read_error)?;
+    let mut context = md5::Context::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await.map_err(read_error)?;
+        if read == 0 {
+            break;
+        }
+        context.consume(&buffer[..read]);
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(context.finalize().0))
 }
 
 /// Convenience wrapper: load the row + build the client in one call. Most
@@ -624,6 +709,10 @@ pub async fn upload_single_part(
     content_type: &str,
     tags: Option<&BackupTags>,
 ) -> Result<(), BackupError> {
+    // The body is streamed from disk, so `ContentMd5Interceptor` can't hash
+    // it; the digest is computed here, one pass over a file that is at most
+    // `MULTIPART_THRESHOLD` bytes.
+    let content_md5 = file_content_md5(path).await?;
     let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(path))
         .await
         .map_err(|e| BackupError::Failed {
@@ -638,6 +727,7 @@ pub async fn upload_single_part(
         .bucket(bucket)
         .key(key)
         .body(body)
+        .content_md5(content_md5)
         .content_type(content_type)
         .send()
         .await
@@ -1475,8 +1565,11 @@ mod tests {
 
     type RecordedPuts = Arc<std::sync::Mutex<Vec<RecordedPut>>>;
 
-    /// Accepts every upload and records each `PUT`, so a test can check
-    /// how the request was encoded rather than only that it succeeded.
+    /// Records each `PUT`, so a test can check how the request was encoded
+    /// rather than only that it succeeded, and enforces what a bucket with
+    /// a default Object Lock retention period enforces: an upload with
+    /// neither `Content-MD5` nor a flexible checksum is rejected, and so is
+    /// one whose `Content-MD5` doesn't match the body.
     async fn recording_stub_handler(
         axum::extract::State(puts): axum::extract::State<RecordedPuts>,
         method: axum::http::Method,
@@ -1493,19 +1586,47 @@ mod tests {
             )
                 .into_response()
         };
+        let rejected = |code: &str, message: &str| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                format!("<Error><Code>{code}</Code><Message>{message}</Message></Error>"),
+            )
+                .into_response()
+        };
         let query = uri.query().unwrap_or_default();
         match method {
             axum::http::Method::PUT => {
-                puts.lock().expect("puts lock").push(RecordedPut {
-                    headers,
-                    body: body.to_vec(),
-                });
-                (
-                    axum::http::StatusCode::OK,
-                    [(axum::http::header::ETAG, "\"etag\"")],
-                    "",
-                )
-                    .into_response()
+                let content_md5 = headers
+                    .get("content-md5")
+                    .map(|value| value.to_str().expect("ascii header").to_string());
+                let has_checksum = headers
+                    .keys()
+                    .any(|name| name.as_str().starts_with("x-amz-checksum-"));
+                let body = body.to_vec();
+                let digest_matches = content_md5
+                    .as_deref()
+                    .map(|md5| md5 == super::content_md5(&body));
+                puts.lock()
+                    .expect("puts lock")
+                    .push(RecordedPut { headers, body });
+                match (digest_matches, has_checksum) {
+                    (None, false) => rejected(
+                        "InvalidRequest",
+                        "Content-MD5 OR x-amz-checksum- HTTP header is required for Put \
+                         Object requests with Object Lock parameters",
+                    ),
+                    (Some(false), _) => rejected(
+                        "BadDigest",
+                        "The Content-MD5 you specified did not match what we received.",
+                    ),
+                    _ => (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::ETAG, "\"etag\"")],
+                        "",
+                    )
+                        .into_response(),
+                }
             }
             axum::http::Method::POST if query.contains("uploads") => xml(
                 "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
@@ -1560,7 +1681,9 @@ mod tests {
     /// The upload must be a plain SigV4 request: no `aws-chunked` body, no
     /// streaming payload sentinel, and no optional flexible checksum.
     /// S3-compatible stores that don't implement the aws-chunked trailer
-    /// format reject anything else with `XAmzContentSHA256Mismatch`.
+    /// format reject anything else with `XAmzContentSHA256Mismatch`. It
+    /// must still carry a `Content-MD5` of exactly the bytes received,
+    /// which a bucket with Object Lock retention requires.
     fn assert_plain_sigv4_put(put: &RecordedPut, what: &str) {
         let header = |name: &str| {
             put.headers
@@ -1591,6 +1714,48 @@ mod tests {
         assert!(
             checksums.is_empty(),
             "{what} carried optional checksum headers {checksums:?}"
+        );
+        // `content_md5` itself is pinned to reference vectors in
+        // `content_md5_matches_reference_digests`.
+        assert_eq!(
+            header("content-md5"),
+            Some(super::content_md5(&put.body)),
+            "{what} must carry the Content-MD5 of the bytes the store received"
+        );
+    }
+
+    #[test]
+    fn content_md5_matches_reference_digests() {
+        assert_eq!(super::content_md5(b""), "1B2M2Y8AsgTpgAmY7PhCfg==");
+        assert_eq!(
+            super::content_md5(b"The quick brown fox jumps over the lazy dog"),
+            "nhB9nTcrtoJr2B01QqQZ1g=="
+        );
+    }
+
+    /// The streamed digest of a file spanning many read chunks equals the
+    /// digest of its bytes in memory.
+    #[tokio::test]
+    async fn file_content_md5_matches_the_in_memory_digest() {
+        let file = twelve_mib_file();
+        let path = file.path().to_str().expect("utf-8 path").to_string();
+        let streamed = super::file_content_md5(&path)
+            .await
+            .expect("digest of a readable file");
+        assert_eq!(
+            streamed,
+            super::content_md5(&std::fs::read(&path).expect("file"))
+        );
+    }
+
+    #[tokio::test]
+    async fn file_content_md5_of_a_missing_file_names_the_path() {
+        let error = super::file_content_md5("/nonexistent/backup.sql.gz")
+            .await
+            .expect_err("a missing file has no digest");
+        assert!(
+            error.to_string().contains("/nonexistent/backup.sql.gz"),
+            "the reason names the file: {error}"
         );
     }
 
@@ -1643,5 +1808,32 @@ mod tests {
         for (index, put) in puts.iter().enumerate() {
             assert_plain_sigv4_put(put, &format!("part {}", index + 1));
         }
+    }
+
+    /// An in-memory upload (the metadata companion) gets its `Content-MD5`
+    /// from the client's interceptor, with no help from the call site.
+    #[tokio::test]
+    async fn an_in_memory_upload_gets_content_md5_from_the_client() {
+        let Some((client, puts)) = spawn_recording_stub().await else {
+            return;
+        };
+        super::write_metadata_companion(
+            &client,
+            "b",
+            "backups/metadata.json",
+            "postgres",
+            "uuid-1",
+            "backups/backup.sql.gz",
+            42,
+            7,
+            "gzip",
+            None,
+        )
+        .await
+        .expect("metadata upload succeeds");
+
+        let puts = puts.lock().expect("puts lock");
+        assert_eq!(puts.len(), 1, "one PUT for the metadata companion");
+        assert_plain_sigv4_put(&puts[0], "metadata upload");
     }
 }
