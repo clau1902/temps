@@ -164,6 +164,22 @@ export function pickActiveContext(contexts: CliContext[]): CliContext | null {
   return contexts.find((c) => c.isActive) ?? contexts[0] ?? null
 }
 
+/**
+ * The context saved as the default on disk, ignoring `TEMPS_CONTEXT`: what a
+ * command run without that variable will use. `pickActiveContext` answers
+ * "which context does *this* process talk to"; a command that is about to
+ * change the saved default must ask this instead, or a per-shell override
+ * hides the default it is replacing.
+ */
+export function pickSavedDefaultContext(contexts: CliContext[]): CliContext | null {
+  return contexts.find((c) => c.isActive) ?? contexts[0] ?? null
+}
+
+/** The saved default context, ignoring `TEMPS_CONTEXT`. */
+export async function getSavedDefaultContext(): Promise<CliContext | null> {
+  return pickSavedDefaultContext(await loadContexts())
+}
+
 /** Get the active context (or the only one when nothing is marked active). */
 export async function getActiveContext(): Promise<CliContext | null> {
   return pickActiveContext(await loadContexts())

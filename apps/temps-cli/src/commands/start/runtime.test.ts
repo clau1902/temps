@@ -8,11 +8,14 @@ import {
   databaseUrl,
   generateAdminPassword,
   isLocalServerCommand,
+  isLocalState,
   localPaths,
   localUrls,
   parseChannel,
   parseChecksum,
   parseJsonOutput,
+  parseLocalServerPids,
+  parsePort,
   pickRelease,
   proxyPortCandidates,
   releaseAssetUrl,
@@ -189,5 +192,60 @@ describe('isLocalServerCommand', () => {
     expect(isLocalServerCommand('/home/me/.temps/local/bin/v1.2.3/temps setup --auto', paths)).toBe(false)
     expect(isLocalServerCommand('/home/me/.temps/local/bin/v1.2.3/other/temps serve', paths)).toBe(false)
     expect(isLocalServerCommand('', paths)).toBe(false)
+  })
+})
+
+describe('parseLocalServerPids', () => {
+  test('finds the local servers in a process listing and nothing else', () => {
+    const paths = localPaths('/home/me')
+    const listing = [
+      '    1 /sbin/init',
+      '  812 /home/me/.temps/local/bin/v1.2.3/temps serve --address 127.0.0.1:8080',
+      ' 9001 /usr/local/bin/temps serve --address 0.0.0.0:80',
+      '12345 /home/me/.temps/local/bin/v1.2.4/temps serve',
+      ' 4242 /home/me/.temps/local/bin/v1.2.3/temps api-key --name x',
+      ' 5555 vim /home/me/.temps/local/bin/v1.2.3/temps serve',
+      '',
+    ].join('\n')
+    expect(parseLocalServerPids(listing, paths)).toEqual([812, 12345])
+    expect(parseLocalServerPids('', paths)).toEqual([])
+  })
+})
+
+describe('parsePort', () => {
+  test('accepts whole port numbers', () => {
+    expect(parsePort('1')).toBe(1)
+    expect(parsePort('8080')).toBe(8080)
+    expect(parsePort('65535')).toBe(65535)
+  })
+
+  test('rejects typos that parseInt would read as a port', () => {
+    for (const value of ['8080abc', '8080.5', '80 80', ' 8080', '0x50', '8e3', '+80', '-80', '', '0', '65536', '99999', '123456']) {
+      expect(() => parsePort(value)).toThrow(/--port must be a whole number/)
+    }
+  })
+})
+
+describe('isLocalState', () => {
+  const valid = {
+    version: 'v1.2.3',
+    dbPort: 55432,
+    dbPassword: 'p',
+    proxyPort: 8080,
+    consolePort: 8700,
+    adminEmail: 'admin@localhost',
+    adminPassword: 'p',
+    setupComplete: false,
+  }
+
+  test('accepts a state file with or without a pid', () => {
+    expect(isLocalState(valid)).toBe(true)
+    expect(isLocalState({ ...valid, pid: 123 })).toBe(true)
+  })
+
+  test('rejects valid JSON that is not a state file', () => {
+    for (const value of [null, [], 'x', {}, { ...valid, dbPort: '55432' }, { ...valid, pid: 'abc' }, { ...valid, pid: -1 }, { ...valid, dbPassword: '' }, { ...valid, proxyPort: 70000 }]) {
+      expect(isLocalState(value)).toBe(false)
+    }
   })
 })

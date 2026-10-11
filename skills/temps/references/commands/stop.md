@@ -12,5 +12,5 @@ Stop the Temps server and database started by `temps start`
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--delete-data` | Also delete the local database, settings and admin password (asks first) | - | No |
+| `--delete-data` | Also delete everything in your local Temps: its apps, services, sandboxes, database and admin password (asks first) | - | No |
 | `-y, --yes` | Do not ask before deleting data | - | No |

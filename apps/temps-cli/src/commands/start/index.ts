@@ -13,7 +13,7 @@ import type { Command } from 'commander'
 import type { Ora } from 'ora'
 import { readdir } from 'node:fs/promises'
 import { homedir, hostname } from 'node:os'
-import { getActiveContext, getContext, upsertContext } from '../../config/contexts.js'
+import { getContext, getSavedDefaultContext, upsertContext } from '../../config/contexts.js'
 import { config, credentials } from '../../config/store.js'
 import { colors, icons } from '../../ui/output.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -21,6 +21,7 @@ import { isQuietMode, startSpinner } from '../../ui/spinner.js'
 import {
   DB_CONTAINER,
   DB_VOLUME,
+  DOCKER_NETWORK,
   LOCAL_ADMIN_EMAIL,
   LOCAL_CONTEXT,
   StartError,
@@ -33,6 +34,7 @@ import {
   localPaths,
   localUrls,
   parseChannel,
+  parsePort,
   proxyPortCandidates,
   releaseTarget,
   resolveSkillsScope,
@@ -43,6 +45,7 @@ import {
 import {
   containerState,
   deleteLocalData,
+  destroySandboxes,
   dockerVersion,
   ensureBinary,
   ensureDatabase,
@@ -53,14 +56,18 @@ import {
   mintApiKey,
   pickPort,
   readState,
+  removeWorkloads,
   resolveVersion,
   runSetup,
+  sandboxContainers,
   serverHealthy,
   startServer,
   stopDatabase,
-  stopServer,
+  stopServers,
   waitForServer,
+  withLock,
   writeState,
+  type RemovedWorkloads,
 } from './steps.js'
 
 interface StartOptions {
@@ -140,20 +147,39 @@ async function validateKey(apiUrl: string, apiKey: string): Promise<{ id: number
 }
 
 /**
- * Decide whether `local` becomes the CLI's default context. It always does
- * when nothing else is active. Otherwise it asks (or needs --make-default),
+ * What a `temps` command run with no `TEMPS_CONTEXT` talks to today, or null
+ * when that is nothing or already this local server. Reads the default
+ * saved on disk, never the context `TEMPS_CONTEXT` selects for this one
+ * process: with production saved as the default, `TEMPS_CONTEXT=local temps
+ * start` must still see production as the default it would be replacing.
+ * A login from before contexts existed counts too, named by its URL.
+ */
+export async function savedDefaultElsewhere(apiUrl: string): Promise<string | null> {
+  const saved = await getSavedDefaultContext()
+  if (saved) return saved.name === LOCAL_CONTEXT ? null : saved.name
+  const legacyUrl = config.getAll().apiUrl
+  const legacyKey = (await credentials.getAll()).apiKey
+  return legacyKey && legacyUrl && legacyUrl !== apiUrl ? legacyUrl : null
+}
+
+/**
+ * Decide whether `local` becomes the CLI's saved default. It does when no
+ * other default is saved. Otherwise it asks (or needs --make-default),
  * because switching would silently send `temps deploy` somewhere else.
  */
-async function shouldActivate(options: StartOptions): Promise<{ activate: boolean; previous: string | null }> {
-  const active = await getActiveContext()
-  if (!active || active.name === LOCAL_CONTEXT) return { activate: true, previous: null }
-  if (options.makeDefault) return { activate: true, previous: active.name }
-  if (options.json || !process.stdin.isTTY) return { activate: false, previous: active.name }
+async function shouldActivate(
+  options: StartOptions,
+  apiUrl: string,
+): Promise<{ activate: boolean; previous: string | null }> {
+  const previous = await savedDefaultElsewhere(apiUrl)
+  if (!previous) return { activate: true, previous: null }
+  if (options.makeDefault) return { activate: true, previous }
+  if (options.json || !process.stdin.isTTY) return { activate: false, previous }
   const activate = await promptConfirm({
-    message: `Make "${LOCAL_CONTEXT}" your default CLI context? Your current default is "${active.name}".`,
+    message: `Make "${LOCAL_CONTEXT}" your default CLI context? Your current default is "${previous}".`,
     default: true,
   })
-  return { activate, previous: active.name }
+  return { activate, previous }
 }
 
 /** Reuse the saved key while it still works; otherwise mint a new one. */
@@ -183,9 +209,17 @@ async function signInCli(
     }
     minted = true
   }
-  const { activate, previous } = await shouldActivate(options)
+  const { activate, previous } = await shouldActivate(options, apiUrl)
   await upsertContext(
-    { name: LOCAL_CONTEXT, url: apiUrl, apiKey: apiKey as string, email: user.email, keyPrefix },
+    {
+      name: LOCAL_CONTEXT,
+      url: apiUrl,
+      apiKey: apiKey as string,
+      email: user.email,
+      keyPrefix,
+      // Projects only exist on the server they were created on.
+      defaultProject: existing?.url === apiUrl ? existing.defaultProject : undefined,
+    },
     { makeActive: activate },
   )
   if (activate) {
@@ -196,10 +230,7 @@ async function signInCli(
 }
 
 async function freshState(options: StartOptions, target: string): Promise<LocalState> {
-  const preferred = options.port ? Number.parseInt(options.port, 10) : undefined
-  if (options.port && (!preferred || preferred < 1 || preferred > 65535)) {
-    throw new StartError('preflight', 'bad_port', `--port must be a port number (got "${options.port}").`)
-  }
+  const preferred = options.port === undefined ? undefined : parsePort(options.port)
   const isRoot = typeof process.getuid === 'function' && process.getuid() === 0
   const proxyPort = await pickPort(proxyPortCandidates(preferred, process.platform, isRoot), [], 'apps and console')
   const consolePort = await pickPort(consolePortCandidates(), [proxyPort], 'console API')
@@ -218,12 +249,17 @@ async function freshState(options: StartOptions, target: string): Promise<LocalS
 }
 
 async function startAction(options: StartOptions): Promise<void> {
+  const paths = localPaths()
+  await withLock(paths, 'start', () => startLocked(options, paths))
+}
+
+async function startLocked(options: StartOptions, paths: LocalPaths): Promise<void> {
   const started = Date.now()
   const quiet = Boolean(options.json) || isQuietMode()
   const steps = new Steps(quiet)
-  const paths = localPaths()
   const target = releaseTarget(process.platform, process.arch)
   parseChannel(options.channel)
+  if (options.port !== undefined) parsePort(options.port)
   const cwd = process.cwd()
   const scope: SkillsScope = resolveSkillsScope(options.skills, await readdir(cwd))
 
@@ -392,15 +428,51 @@ function printSummary(input: {
 
 async function stopAction(options: StopOptions): Promise<void> {
   const paths = localPaths()
-  const state = await readState(paths)
-  const stoppedServer = await stopServer(state?.pid, paths)
+  await withLock(paths, 'stop', () => stopLocked(options, paths))
+}
+
+async function stopLocked(options: StopOptions, paths: LocalPaths): Promise<void> {
+  // A reset must work on an install whose state file is unreadable: that is
+  // what `readState` tells the user to run. Nothing below needs the saved
+  // pid, so a missing state only costs the sandbox cleanup, which says so.
+  let state: LocalState | null = null
+  try {
+    state = await readState(paths)
+  } catch (error) {
+    if (!options.deleteData) throw error
+    console.log(colors.muted(`${(error as Error).message.split('. Run ')[0]}. Deleting it with everything else.`))
+  }
+
+  if (options.deleteData) {
+    console.log(`This deletes your local Temps: the apps and services it runs (every container on the`)
+    console.log(`${DOCKER_NETWORK} Docker network, and the volumes created for them), its sandboxes, the`)
+    console.log(`${DB_CONTAINER} container, the ${DB_VOLUME} volume and the data in ${paths.root},`)
+    console.log('including the admin password.')
+    if (!options.yes) {
+      if (!process.stdin.isTTY) {
+        throw new StartError('stop', 'confirmation_required', 'Pass --yes to delete local data without a prompt.')
+      }
+      if (!(await promptConfirm({ message: 'Delete all local Temps data?', default: false }))) {
+        console.log(colors.muted('Nothing was deleted, and nothing was stopped.'))
+        return
+      }
+    }
+  }
+
+  // Sandboxes can only be attributed to this install by asking it, so that
+  // happens while the server is still up.
+  const sandboxes = options.deleteData ? await removeSandboxes(state) : null
+
+  const stoppedServer = await stopServers(paths, state?.pid)
+  let workloads: RemovedWorkloads | null = null
+  if (options.deleteData) workloads = await removeWorkloads()
   let stoppedDb = false
   try {
     stoppedDb = await stopDatabase()
   } catch (error) {
     if (!options.deleteData) throw error
   }
-  if (state?.pid !== undefined) await writeState(paths, { ...state, pid: undefined })
+  if (!options.deleteData && state?.pid !== undefined) await writeState(paths, { ...state, pid: undefined })
   console.log(stoppedServer ? `${colors.success('✔')} Temps stopped` : colors.muted('Temps was not running'))
   console.log(stoppedDb ? `${colors.success('✔')} Database stopped` : colors.muted('The database was not running'))
 
@@ -408,20 +480,41 @@ async function stopAction(options: StopOptions): Promise<void> {
     console.log(colors.muted('Start it again with `temps start`. Your apps and data are kept.'))
     return
   }
-  console.log()
-  console.log(`This deletes the ${DB_CONTAINER} container, the ${DB_VOLUME} volume and the data in ${paths.root}:`)
-  console.log('every project, deployment and setting in your local Temps, and its admin password.')
-  if (!options.yes) {
-    if (!process.stdin.isTTY) {
-      throw new StartError('stop', 'confirmation_required', 'Pass --yes to delete local data without a prompt.')
-    }
-    if (!(await promptConfirm({ message: 'Delete all local Temps data?', default: false }))) {
-      console.log(colors.muted('Nothing was deleted.'))
-      return
-    }
-  }
   await deleteLocalData(paths)
+  if (workloads && (workloads.containers.length > 0 || workloads.volumes.length > 0)) {
+    console.log(
+      `${colors.success('✔')} Removed ${workloads.containers.length} app and service container(s) and ${workloads.volumes.length} volume(s)`,
+    )
+  }
+  if (sandboxes?.destroyed.length) console.log(`${colors.success('✔')} Destroyed ${sandboxes.destroyed.length} sandbox(es)`)
   console.log(`${colors.success('✔')} Local Temps data deleted. The "${LOCAL_CONTEXT}" CLI context remains; \`temps start\` replaces its key.`)
+  for (const kept of [...(workloads?.kept ?? []), ...(sandboxes?.notes ?? [])]) {
+    console.log(colors.warning(`  Left in place: ${kept}`))
+  }
+}
+
+/**
+ * Destroy this install's sandboxes before its database goes. Needs the
+ * running server and the `local` context's key; when either is missing it
+ * cannot tell this install's sandbox containers from another Temps', so it
+ * removes none and reports any sandbox containers present on the engine.
+ */
+async function removeSandboxes(state: LocalState | null): Promise<{ destroyed: string[]; notes: string[] }> {
+  const context = await getContext(LOCAL_CONTEXT)
+  const apiUrl = state ? consoleApiUrl(state.consolePort) : null
+  if (state && apiUrl && context?.url === apiUrl && (await serverHealthy(state.consolePort))) {
+    const result = await destroySandboxes(apiUrl, context.apiKey)
+    return { destroyed: result.destroyed, notes: result.failed.map((entry) => `sandbox ${entry}`) }
+  }
+  const present = await sandboxContainers()
+  if (present.length === 0) return { destroyed: [], notes: [] }
+  return {
+    destroyed: [],
+    notes: [
+      `${present.length} sandbox container(s) on this Docker engine (${present.slice(0, 5).join(', ')}${present.length > 5 ? ', …' : ''}). ` +
+        'Temps was not running, so they could not be matched to this install. Remove the ones you created here with `docker rm -f`.',
+    ],
+  }
 }
 
 export function registerStartCommands(program: Command): void {
@@ -444,7 +537,7 @@ export function registerStartCommands(program: Command): void {
   program
     .command('stop')
     .description('Stop the Temps server and database started by `temps start`')
-    .option('--delete-data', 'Also delete the local database, settings and admin password (asks first)')
+    .option('--delete-data', 'Also delete everything in your local Temps: its apps, services, sandboxes, database and admin password (asks first)')
     .option('-y, --yes', 'Do not ask before deleting data')
     .action(stopAction)
 }

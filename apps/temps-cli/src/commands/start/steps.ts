@@ -8,11 +8,11 @@
  */
 
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { createReadStream, createWriteStream, existsSync, openSync, closeSync, readFileSync, statSync } from 'node:fs'
-import { chmod, cp, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { createHash, randomBytes } from 'node:crypto'
+import { createReadStream, createWriteStream, existsSync, fstatSync, openSync, closeSync, readSync, statSync } from 'node:fs'
+import { chmod, cp, link, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
@@ -22,15 +22,18 @@ import {
   DB_NAME,
   DB_USER,
   DB_VOLUME,
+  DOCKER_NETWORK,
   LOCAL_DOMAIN,
   RELEASE_REPO,
   StartError,
   binaryPath,
   databaseUrl,
   isLocalServerCommand,
+  isLocalState,
   localUrls,
   parseChecksum,
   parseJsonOutput,
+  parseLocalServerPids,
   pickRelease,
   releaseAssetUrl,
   skillTargets,
@@ -46,7 +49,18 @@ export interface RunResult {
   stderr: string
 }
 
-/** Run a command to completion. Secrets go in `env`, never in `args`. */
+/** Most output kept from a child process: enough for any result, bounded for a runaway one. */
+const MAX_CAPTURED_OUTPUT = 1024 * 1024
+
+function appendCapped(text: string, chunk: Buffer): string {
+  const next = text + chunk.toString()
+  return next.length > MAX_CAPTURED_OUTPUT ? next.slice(-MAX_CAPTURED_OUTPUT) : next
+}
+
+/**
+ * Run a command to completion. Secrets go in `env`, never in `args`. Keeps
+ * at most the last `MAX_CAPTURED_OUTPUT` characters of each stream.
+ */
 export function run(
   command: string,
   args: readonly string[],
@@ -59,8 +73,8 @@ export function run(
     })
     let stdout = ''
     let stderr = ''
-    child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()))
-    child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
+    child.stdout.on('data', (chunk: Buffer) => (stdout = appendCapped(stdout, chunk)))
+    child.stderr.on('data', (chunk: Buffer) => (stderr = appendCapped(stderr, chunk)))
     const timer = options.timeoutMs
       ? setTimeout(() => child.kill('SIGTERM'), options.timeoutMs)
       : undefined
@@ -83,8 +97,9 @@ function lastLines(text: string, count = 8): string {
 
 export async function readState(paths: LocalPaths): Promise<LocalState | null> {
   if (!existsSync(paths.state)) return null
+  let parsed: unknown
   try {
-    return JSON.parse(await readFile(paths.state, 'utf-8')) as LocalState
+    parsed = JSON.parse(await readFile(paths.state, 'utf-8'))
   } catch (error) {
     throw new StartError(
       'state',
@@ -92,6 +107,14 @@ export async function readState(paths: LocalPaths): Promise<LocalState | null> {
       `Could not read ${paths.state}: ${(error as Error).message}. Run \`temps stop --delete-data\` to start fresh.`,
     )
   }
+  if (!isLocalState(parsed)) {
+    throw new StartError(
+      'state',
+      'bad_state',
+      `${paths.state} is not a valid state file. Run \`temps stop --delete-data\` to start fresh.`,
+    )
+  }
+  return parsed
 }
 
 /** The state file holds the database and admin passwords: owner-only. */
@@ -100,6 +123,105 @@ export async function writeState(paths: LocalPaths, state: LocalState): Promise<
   const tmp = `${paths.state}.tmp`
   await writeFile(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
   await rename(tmp, paths.state)
+}
+
+// ── Lock ─────────────────────────────────────────────────────────────────
+
+/** A lock this old is abandoned even if its pid is alive (reused by another program). */
+const LOCK_STALE_MS = 60 * 60_000
+
+interface LockToken {
+  pid: number
+  command: string
+  startedAt: number
+  nonce: string
+}
+
+function parseLock(raw: string): LockToken | null {
+  try {
+    const token = JSON.parse(raw) as Partial<LockToken>
+    return typeof token.pid === 'number' && typeof token.startedAt === 'number' && typeof token.command === 'string'
+      ? (token as LockToken)
+      : null
+  } catch {
+    return null
+  }
+}
+
+function lockBusy(paths: LocalPaths, holder: LockToken | null): StartError {
+  const who = holder ? `\`temps ${holder.command}\` (pid ${holder.pid})` : 'Another temps start or stop'
+  return new StartError(
+    'lock',
+    'busy',
+    `${who} is already working on your local Temps. Wait for it to finish, then run this again. ` +
+      `If nothing is running, delete ${paths.lock}.`,
+  )
+}
+
+/**
+ * Take the lock that serializes `temps start` and `temps stop`. Two of them
+ * at once would each generate credentials, write `state.json` and unpack the
+ * binary, and the loser's password would not match the database the winner
+ * created. Fails at once when the lock is held: the caller should not queue
+ * behind a command that may be waiting on a prompt.
+ *
+ * The lock is a hard link to a private token file, so taking it is atomic.
+ * A lock whose process is gone (Ctrl-C, crash) or that is older than
+ * `LOCK_STALE_MS` is taken over by renaming it aside first and checking that
+ * what was renamed is the lock that was judged stale, so a live lock that
+ * replaced it in between is put back instead of stolen. Returns the release
+ * function.
+ */
+export async function acquireLock(paths: LocalPaths, command: string): Promise<() => Promise<void>> {
+  await mkdir(paths.root, { recursive: true, mode: 0o700 })
+  const nonce = randomBytes(8).toString('hex')
+  const token = JSON.stringify({ pid: process.pid, command, startedAt: Date.now(), nonce } satisfies LockToken)
+  const mine = `${paths.lock}.${process.pid}.${nonce}`
+  await writeFile(mine, token, { mode: 0o600 })
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await link(mine, paths.lock)
+        return async () => {
+          const held = await readFile(paths.lock, 'utf-8').catch(() => null)
+          if (held === token) await rm(paths.lock, { force: true })
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+      const held = await readFile(paths.lock, 'utf-8').catch(() => null)
+      if (held === null) continue // released between the link and the read
+      const holder = parseLock(held)
+      if (holder && processAlive(holder.pid) && Date.now() - holder.startedAt < LOCK_STALE_MS) {
+        throw lockBusy(paths, holder)
+      }
+      const aside = `${mine}.stale`
+      try {
+        await rename(paths.lock, aside)
+      } catch {
+        continue // someone else took the stale lock away first
+      }
+      const taken = await readFile(aside, 'utf-8').catch(() => null)
+      if (taken !== held) {
+        await link(aside, paths.lock).catch(() => undefined)
+        await rm(aside, { force: true })
+        throw lockBusy(paths, taken ? parseLock(taken) : null)
+      }
+      await rm(aside, { force: true })
+    }
+    throw lockBusy(paths, null)
+  } finally {
+    await rm(mine, { force: true })
+  }
+}
+
+export async function withLock<T>(paths: LocalPaths, command: string, work: () => Promise<T>): Promise<T> {
+  const release = await acquireLock(paths, command)
+  try {
+    return await work()
+  } finally {
+    await release()
+  }
 }
 
 // ── Preflight ────────────────────────────────────────────────────────────
@@ -324,8 +446,16 @@ export async function ensureDatabase(state: LocalState): Promise<{ created: bool
 
 // ── Platform setup and API key ───────────────────────────────────────────
 
+/**
+ * Environment for every invocation of the server binary. The network name
+ * scopes this install's containers (see `DOCKER_NETWORK`).
+ */
 function serverEnv(state: LocalState, paths: LocalPaths): NodeJS.ProcessEnv {
-  return { TEMPS_DATABASE_URL: databaseUrl(state), TEMPS_DATA_DIR: paths.data }
+  return {
+    TEMPS_DATABASE_URL: databaseUrl(state),
+    TEMPS_DATA_DIR: paths.data,
+    TEMPS_NETWORK_NAME: DOCKER_NETWORK,
+  }
 }
 
 /**
@@ -425,11 +555,30 @@ export async function startServer(bin: string, state: LocalState, paths: LocalPa
   }
 }
 
-function tailFile(path: string, count = 15): string {
+/** How much of the end of a log is read to show its last lines. */
+const TAIL_BYTES = 64 * 1024
+
+/**
+ * The last `count` lines of a log, reading at most `TAIL_BYTES` from its
+ * end: `server.log` grows across restarts and must never be loaded whole
+ * just to report an error.
+ */
+export function tailFile(path: string, count = 15): string {
+  let fd: number | undefined
   try {
-    return lastLines(readFileSync(path, 'utf-8').replace(/\x1b\[[0-9;]*m/g, ''), count)
+    fd = openSync(path, 'r')
+    const size = fstatSync(fd).size
+    const length = Math.min(size, TAIL_BYTES)
+    const buffer = Buffer.alloc(length)
+    const read = readSync(fd, buffer, 0, length, size - length)
+    let text = buffer.subarray(0, read).toString('utf-8')
+    // A window that starts mid-file starts mid-line: drop the partial line.
+    if (size > length) text = text.slice(text.indexOf('\n') + 1)
+    return lastLines(text.replace(/\x1b\[[0-9;]*m/g, ''), count) || '(log is empty)'
   } catch {
     return '(no log yet)'
+  } finally {
+    if (fd !== undefined) closeSync(fd)
   }
 }
 
@@ -489,6 +638,31 @@ export async function stopServer(pid: number | undefined, paths: LocalPaths): Pr
   return true
 }
 
+/**
+ * Pids of every running local server, from the process table. `null` when
+ * `ps` cannot list processes here (the caller falls back to the saved pid).
+ */
+export async function localServerPids(paths: LocalPaths): Promise<number[] | null> {
+  try {
+    const ps = await run('ps', ['-axo', 'pid=,command='], { timeoutMs: 10_000 })
+    return ps.code === 0 ? parseLocalServerPids(ps.stdout, paths) : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Stop every local server process. Works from the process table, so it does
+ * not need a readable state file; `savedPid` is only a fallback where `ps`
+ * is unavailable, and is verified before it is signalled either way.
+ */
+export async function stopServers(paths: LocalPaths, savedPid: number | undefined): Promise<boolean> {
+  const pids = (await localServerPids(paths)) ?? (savedPid === undefined ? [] : [savedPid])
+  let stopped = false
+  for (const pid of pids) stopped = (await stopServer(pid, paths)) || stopped
+  return stopped
+}
+
 export async function stopDatabase(): Promise<boolean> {
   if ((await containerState(DB_CONTAINER)) !== 'running') return false
   const result = await docker(['stop', DB_CONTAINER])
@@ -498,10 +672,138 @@ export async function stopDatabase(): Promise<boolean> {
   return true
 }
 
+export interface RemovedWorkloads {
+  containers: string[]
+  volumes: string[]
+  /** Volumes or the network Docker refused to remove, with its reason. */
+  kept: string[]
+}
+
+/**
+ * Remove what this install deployed: every container on `DOCKER_NETWORK`
+ * (apps, Compose stacks, managed services), the volumes Temps created for
+ * them, and the network. Once the platform database is gone nothing else
+ * can manage them, so they must go with it.
+ *
+ * Scoped by network membership, which no other Temps on this Docker engine
+ * shares. A volume those containers mounted is removed only if it was
+ * created after this install's database volume, so a volume that already
+ * existed and was merely attached to a deployed app is kept. Docker itself
+ * refuses to remove a volume another container still uses. Everything kept
+ * is reported with its reason, never forced.
+ */
+export async function removeWorkloads(
+  network: string = DOCKER_NETWORK,
+  installVolume: string = DB_VOLUME,
+): Promise<RemovedWorkloads> {
+  const removed: RemovedWorkloads = { containers: [], volumes: [], kept: [] }
+  const listed = await docker(['ps', '-aq', '--no-trunc', '--filter', `network=${network}`])
+  if (listed.code !== 0) {
+    throw new StartError('workloads', 'list_failed', `Could not list containers on ${network}: ${lastLines(listed.stderr, 3)}`)
+  }
+  const ids = listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean)
+  const volumes = new Set<string>()
+  if (ids.length > 0) {
+    const format = '{{.Name}}\t{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}'
+    const inspected = await docker(['inspect', '--format', format, ...ids])
+    for (const line of inspected.stdout.split('\n')) {
+      const [name, mounts = ''] = line.split('\t')
+      if (!name) continue
+      removed.containers.push(name.replace(/^\//, ''))
+      for (const volume of mounts.split(' ').filter(Boolean)) volumes.add(volume)
+    }
+    // -v also removes the containers' anonymous volumes.
+    const rmContainers = await docker(['rm', '-f', '-v', ...ids], { timeoutMs: 5 * 60_000 })
+    if (rmContainers.code !== 0) {
+      throw new StartError('workloads', 'rm_failed', `Could not remove this install's containers: ${lastLines(rmContainers.stderr, 3)}`)
+    }
+  }
+  const installedAt = await volumeCreatedAt(installVolume)
+  for (const volume of [...volumes].sort()) {
+    const createdAt = await volumeCreatedAt(volume)
+    if (createdAt === null) continue // an anonymous volume `rm -v` already removed
+    if (installedAt === null || createdAt < installedAt) {
+      removed.kept.push(
+        installedAt === null
+          ? `volume ${volume}: cannot tell whether this install created it (${installVolume} is missing)`
+          : `volume ${volume}: it existed before this install`,
+      )
+      continue
+    }
+    const rmVolume = await docker(['volume', 'rm', volume])
+    if (rmVolume.code === 0) removed.volumes.push(volume)
+    else if (!/no such volume/i.test(rmVolume.stderr)) removed.kept.push(`volume ${volume}: ${lastLines(rmVolume.stderr, 1)}`)
+  }
+  const rmNetwork = await docker(['network', 'rm', network])
+  if (rmNetwork.code !== 0 && !/not found|no such network/i.test(rmNetwork.stderr)) {
+    removed.kept.push(`network ${network}: ${lastLines(rmNetwork.stderr, 1)}`)
+  }
+  return removed
+}
+
+/** When a volume was created (ms since the epoch), or null if it does not exist. */
+async function volumeCreatedAt(name: string): Promise<number | null> {
+  const inspected = await docker(['volume', 'inspect', '--format', '{{.CreatedAt}}', name], { timeoutMs: 15_000 })
+  const createdAt = inspected.code === 0 ? Date.parse(inspected.stdout.trim()) : Number.NaN
+  return Number.isNaN(createdAt) ? null : createdAt
+}
+
+/**
+ * Destroy this install's sandboxes through its own API, the only place
+ * that knows which sandbox containers are its own (they are not on
+ * `DOCKER_NETWORK`). Returns the ids destroyed and the ones the server
+ * refused, with its reason.
+ */
+export async function destroySandboxes(apiUrl: string, apiKey: string): Promise<{ destroyed: string[]; failed: string[] }> {
+  const headers = { Authorization: `Bearer ${apiKey}` }
+  const destroyed: string[] = []
+  const failed: string[] = []
+  // Each sandbox is tried once. A destroyed sandbox leaves the listing, so
+  // after a page that destroyed something the same page is read again; a
+  // page that destroyed nothing (all refused) is stepped past. The round
+  // limit bounds both the requests and the ids remembered.
+  const attempted = new Set<string>()
+  let page = 1
+  for (let round = 0; round < 200; round++) {
+    const response = await fetch(`${apiUrl}/v1/sandboxes?page=${page}&page_size=100`, { headers, signal: AbortSignal.timeout(15_000) })
+    if (!response.ok) {
+      // Older releases have no sandbox API: nothing to destroy.
+      if (response.status === 404) break
+      throw new StartError('workloads', 'sandbox_list_failed', `GET ${apiUrl}/v1/sandboxes returned HTTP ${response.status}.`)
+    }
+    const listed = ((await response.json()) as { sandboxes?: { id: string }[] }).sandboxes ?? []
+    if (listed.length === 0) break
+    let destroyedHere = 0
+    for (const sandbox of listed) {
+      if (attempted.has(sandbox.id)) continue
+      attempted.add(sandbox.id)
+      const result = await fetch(`${apiUrl}/v1/sandboxes/${encodeURIComponent(sandbox.id)}/destroy`, {
+        method: 'POST',
+        headers,
+        signal: AbortSignal.timeout(120_000),
+      })
+      if (result.ok || result.status === 404) {
+        destroyed.push(sandbox.id)
+        destroyedHere += 1
+      } else {
+        failed.push(`${sandbox.id}: HTTP ${result.status}`)
+      }
+    }
+    if (destroyedHere === 0) page += 1
+  }
+  return { destroyed, failed }
+}
+
+/** Names of every sandbox container on this Docker engine, whichever Temps made it. */
+export async function sandboxContainers(): Promise<string[]> {
+  const listed = await docker(['ps', '-a', '--filter', 'label=sh.temps.sandbox=true', '--format', '{{.Names}}'])
+  return listed.code === 0 ? listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean) : []
+}
+
 /**
  * Remove the database container, its volume and everything in
- * `~/.temps/local` except the downloaded binaries, so starting fresh does
- * not download Temps again.
+ * `~/.temps/local` except the downloaded binaries (so starting fresh does
+ * not download Temps again) and the lock the caller holds.
  */
 export async function deleteLocalData(paths: LocalPaths): Promise<void> {
   await docker(['rm', '-f', DB_CONTAINER])
@@ -511,7 +813,7 @@ export async function deleteLocalData(paths: LocalPaths): Promise<void> {
   }
   if (!existsSync(paths.root)) return
   for (const entry of await readdir(paths.root)) {
-    if (join(paths.root, entry) === paths.bin) continue
+    if (join(paths.root, entry) === paths.bin || entry.startsWith(basename(paths.lock))) continue
     await rm(join(paths.root, entry), { recursive: true, force: true })
   }
 }

@@ -24,6 +24,15 @@ export const DB_IMAGE = 'timescale/timescaledb:2.30.2-pg18'
 export const DB_CONTAINER = 'temps-local-db'
 export const DB_VOLUME = 'temps-local-db-data'
 export const DB_USER = 'temps'
+
+/**
+ * Docker network the local server puts every app, Compose stack and managed
+ * service on (`TEMPS_NETWORK_NAME`). A name of its own is what lets
+ * `temps stop --delete-data` find exactly this install's containers: labels
+ * such as `sh.temps.managed` are shared by every Temps on the same Docker
+ * engine, membership of this network is not.
+ */
+export const DOCKER_NETWORK = 'temps-local'
 export const DB_NAME = 'temps'
 
 /** Context name the CLI (and every agent using the skills) talks to. */
@@ -58,6 +67,7 @@ export interface LocalPaths {
   data: string
   bin: string
   log: string
+  lock: string
 }
 
 export function localPaths(home: string = homedir()): LocalPaths {
@@ -68,6 +78,7 @@ export function localPaths(home: string = homedir()): LocalPaths {
     data: join(root, 'data'),
     bin: join(root, 'bin'),
     log: join(root, 'server.log'),
+    lock: join(root, 'run.lock'),
   }
 }
 
@@ -86,6 +97,20 @@ export function isLocalServerCommand(command: string, paths: LocalPaths): boolea
   const prefix = `${paths.bin}/`
   // `<bin>/<version>/temps serve …`; the home folder may contain spaces.
   return line.startsWith(prefix) && /^[^/\s]+\/temps serve(\s|$)/.test(line.slice(prefix.length))
+}
+
+/**
+ * Pids of every local server in `ps -axo pid=,command=` output. Finds the
+ * server from the process table alone, so `temps stop` works when the state
+ * file is unreadable and never has to trust a saved pid.
+ */
+export function parseLocalServerPids(psOutput: string, paths: LocalPaths): number[] {
+  const pids: number[] = []
+  for (const line of psOutput.split('\n')) {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line)
+    if (match && isLocalServerCommand(match[2] as string, paths)) pids.push(Number(match[1]))
+  }
+  return pids
 }
 
 /** A failed step of `temps start` / `temps stop`, with what to do next. */
@@ -204,6 +229,34 @@ export function generateAdminPassword(bytes?: (n: number) => Buffer): string {
 
 export function generateDbPassword(bytes: (n: number) => Buffer = randomBytes): string {
   return bytes(24).toString('hex')
+}
+
+/** A `--port` value: digits only, 1–65535. `8080abc` and `8080.5` are typos, not port 8080. */
+export function parsePort(value: string): number {
+  const port = /^\d{1,5}$/.test(value) ? Number(value) : Number.NaN
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new StartError('preflight', 'bad_port', `--port must be a whole number from 1 to 65535 (got "${value}").`)
+  }
+  return port
+}
+
+/** Whether parsed JSON has the shape of a state file this version wrote. */
+export function isLocalState(value: unknown): value is LocalState {
+  if (typeof value !== 'object' || value === null) return false
+  const state = value as Record<string, unknown>
+  const port = (v: unknown) => Number.isInteger(v) && (v as number) > 0 && (v as number) < 65536
+  const text = (v: unknown) => typeof v === 'string' && v.length > 0
+  return (
+    text(state.version) &&
+    text(state.dbPassword) &&
+    text(state.adminEmail) &&
+    text(state.adminPassword) &&
+    port(state.dbPort) &&
+    port(state.proxyPort) &&
+    port(state.consolePort) &&
+    typeof state.setupComplete === 'boolean' &&
+    (state.pid === undefined || (Number.isInteger(state.pid) && (state.pid as number) > 0))
+  )
 }
 
 /** Where apps and the console are reached in the browser. */
