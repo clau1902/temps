@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **proxy:** Serve third-party callbacks on a public-only ingress surface
 - **email:** Resend captured emails
 
 ### Documentation
 
 - **security:** Use david@temps.sh as the vulnerability report address ([#1382](https://github.com/gotempsh/temps/issues/1382))
+- **adr:** Add ADR-051 public ingress surface for third-party callbacks
 
 ### Fixed
 
@@ -34,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deployments:** Pass build-argument values to worker builds for every preset
 - **deployments:** Record only platform-set values as public build arguments
 - **deployer:** Join continued Dockerfile lines the way Docker does
+- **proxy:** Keep gate-denied requests off the MCP endpoint in dual-listener mode
+- **config:** Refuse a public ingress hostname that any application uses
+- **web:** Never show the console origin as a callback URL
+- **config:** Keep the public ingress hostname out of the preview namespace
 - **agents:** Skip the microsandbox SDK on Intel macOS so the release binary builds
 
 ### Miscellaneous
