@@ -90,3 +90,5 @@ syntax may have changed.
 - [`cloud`](cloud.md)
 - [`plugin`](plugin.md)
 - [`setup`](setup.md)
+- [`start`](start.md)
+- [`stop`](stop.md)

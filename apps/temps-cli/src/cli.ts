@@ -16,6 +16,7 @@ import { registerAuthCommands } from './commands/auth/index.js'
 import { registerContextCommands } from './commands/context/index.js'
 import { registerConfigureCommand } from './commands/configure.js'
 import { registerSetupCommand } from './commands/setup/index.js'
+import { registerStartCommands } from './commands/start/index.js'
 import { registerProjectsCommands } from './commands/projects/index.js'
 import { registerDeployCommands } from './commands/deploy/index.js'
 import { registerDomainsCommands } from './commands/domains/index.js'
@@ -257,6 +258,7 @@ export function createProgram(): Command {
 
   registerDocsCommand(program)
   registerSetupCommand(program)
+  registerStartCommands(program)
 
   // Custom help
   program.addHelpText('beforeAll', LOGO)
