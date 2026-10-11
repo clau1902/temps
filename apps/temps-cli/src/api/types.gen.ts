@@ -6269,14 +6269,35 @@ export type CreateProjectSecretRequest = {
 };
 
 export type CreateProviderKeyRequest = {
-    api_key: string;
-    base_url?: string | null;
     /**
-     * Optional model id to pin for this provider (e.g. "gpt-4o-mini").
+     * Provider API key. Optional only for self-hosted providers that run
+     * without authentication.
+     */
+    api_key?: string;
+    /**
+     * Required for "openai_compatible", e.g. "http://10.0.0.5:8000/v1".
+     */
+    base_url?: string | null;
+    capabilities?: SelfHostedCapabilities | null;
+    /**
+     * Model id to pin for this provider (e.g. "gpt-4o-mini"). Required for
+     * "openai_compatible": it must be one of the models the server lists
+     * (see `POST /ai/providers/discover`), and is used to verify the key.
      */
     default_model?: string | null;
     display_name: string;
+    /**
+     * "openai", "anthropic", "xai", "gemini", "openrouter", or
+     * "openai_compatible" for a self-hosted OpenAI-compatible server.
+     */
     provider: string;
+    /**
+     * Trust the exact private `ip:port` of `base_url` for this key only,
+     * without adding it to the instance-wide trusted private networks.
+     * Requires the `settings:write` permission; the base URL must use an IP
+     * address. Cloud metadata and link-local addresses can never be trusted.
+     */
+    trust_private_address?: boolean;
 };
 
 export type CreateProviderRequest = {
@@ -7860,6 +7881,34 @@ export type DisableMfaRequest = {
     code: string;
 };
 
+export type DiscoverProviderModelsRequest = {
+    /**
+     * API key, if the server requires one
+     */
+    api_key?: string;
+    /**
+     * Base URL of the server (required for "openai_compatible")
+     */
+    base_url?: string | null;
+    /**
+     * Provider ID, e.g. "openai_compatible"
+     */
+    provider: string;
+    /**
+     * Discover as if the base URL's exact private address were trusted on
+     * the key. Requires `settings:write`.
+     */
+    trust_private_address?: boolean;
+};
+
+export type DiscoverProviderModelsResponse = {
+    /**
+     * Models the provider lists, sorted by id
+     */
+    models: Array<DiscoveredModelResponse>;
+    provider: string;
+};
+
 /**
  * Request to discover workloads
  */
@@ -7886,6 +7935,11 @@ export type DiscoverResponse = {
      * Discovered workloads
      */
     workloads: Array<WorkloadDescriptor>;
+};
+
+export type DiscoveredModelResponse = {
+    id: string;
+    owned_by: string;
 };
 
 /**
@@ -19069,6 +19123,7 @@ export type ProviderKeyResponse = {
      */
     api_key_masked: string;
     base_url?: string | null;
+    capabilities?: SelfHostedCapabilities | null;
     created_at: string;
     /**
      * Model id this provider serves (NULL → per-provider default).
@@ -19078,6 +19133,19 @@ export type ProviderKeyResponse = {
     id: number;
     is_active: boolean;
     provider: string;
+    /**
+     * Exact private `ip:port` this key may reach without that address being
+     * in the instance-wide trusted private networks. `None` when not set.
+     */
+    trusted_private_address?: string | null;
+    /**
+     * When the per-key trust was set (ISO 8601).
+     */
+    trusted_private_address_set_at?: string | null;
+    /**
+     * User who set the per-key trust.
+     */
+    trusted_private_address_set_by?: number | null;
     updated_at: string;
 };
 
@@ -21749,6 +21817,29 @@ export type SelectOption = {
     description?: string | null;
     id: string;
     name: string;
+};
+
+/**
+ * Capabilities an administrator declared for a self-hosted key. Requests
+ * needing an undeclared capability are refused before anything is sent.
+ */
+export type SelfHostedCapabilities = {
+    /**
+     * The `/embeddings` endpoint.
+     */
+    embeddings?: boolean;
+    /**
+     * The OpenAI Responses API (`/responses`).
+     */
+    responses_api?: boolean;
+    /**
+     * Streaming chat completions (`"stream": true`). Required by AI chat.
+     */
+    streaming?: boolean;
+    /**
+     * Function/tool calling in chat completions.
+     */
+    tools?: boolean;
 };
 
 /**
@@ -24703,17 +24794,28 @@ export type TestEmailResponse = {
 
 export type TestProviderKeyRequest = {
     /**
-     * The raw API key to test
+     * The raw API key to test (may be empty for a self-hosted provider)
      */
-    api_key: string;
+    api_key?: string;
     /**
-     * Optional custom base URL
+     * Optional custom base URL (required for "openai_compatible")
      */
     base_url?: string | null;
     /**
-     * Provider ID: "openai", "anthropic", "xai", "gemini", "openrouter"
+     * Model to send the test completion to. Required for
+     * "openai_compatible"; defaults to a small vendor model otherwise.
+     */
+    default_model?: string | null;
+    /**
+     * Provider ID: "openai", "anthropic", "xai", "gemini", "openrouter",
+     * "openai_compatible"
      */
     provider: string;
+    /**
+     * Test as if the base URL's exact private address were trusted on the
+     * key. Requires `settings:write`.
+     */
+    trust_private_address?: boolean;
 };
 
 export type TestProviderKeyResponse = {
@@ -26544,12 +26646,17 @@ export type UpdateProviderCredentialsRequest = {
 };
 
 export type UpdateProviderKeyRequest = {
+    /**
+     * New API key. An empty string removes it, for self-hosted keys only.
+     */
     api_key?: string | null;
     /**
      * Double-Option: absent = leave unchanged, present-null = clear (revert to
-     * the provider's default endpoint), present-value = set.
+     * the provider's default endpoint), present-value = set. Moving the base
+     * URL to another address drops the per-key private-address trust.
      */
     base_url?: string | null;
+    capabilities?: SelfHostedCapabilities | null;
     /**
      * Double-Option: absent = leave unchanged, present-null = clear the pinned
      * model (revert to the per-provider default), present-value = set.
@@ -26557,6 +26664,11 @@ export type UpdateProviderKeyRequest = {
     default_model?: string | null;
     display_name?: string | null;
     is_active?: boolean | null;
+    /**
+     * `true` trusts the exact private `ip:port` of the (new) base URL for
+     * this key only (requires `settings:write`); `false` removes the trust.
+     */
+    trust_private_address?: boolean | null;
 };
 
 export type UpdateProviderModelRequest = {
@@ -30237,6 +30349,39 @@ export type CreateProviderKeyResponses = {
 };
 
 export type CreateProviderKeyResponse = CreateProviderKeyResponses[keyof CreateProviderKeyResponses];
+
+export type DiscoverProviderModelsData = {
+    body: DiscoverProviderModelsRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/providers/discover';
+};
+
+export type DiscoverProviderModelsErrors = {
+    /**
+     * Invalid or blocked base URL, or the provider could not be listed
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type DiscoverProviderModelsError = DiscoverProviderModelsErrors[keyof DiscoverProviderModelsErrors];
+
+export type DiscoverProviderModelsResponses = {
+    /**
+     * Models the provider lists
+     */
+    200: DiscoverProviderModelsResponse;
+};
+
+export type DiscoverProviderModelsResponse2 = DiscoverProviderModelsResponses[keyof DiscoverProviderModelsResponses];
 
 export type TestProviderKeyInlineData = {
     body: TestProviderKeyRequest;

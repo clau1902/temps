@@ -166,7 +166,20 @@ import {
   aiProviderName,
   aiProviderModels,
   getAiProvider,
+  isSelfHostedProvider,
 } from '@/lib/ai-providers'
+import {
+  SelfHostedProviderFields,
+  type SelfHostedDiscovery,
+} from '@/components/ai/SelfHostedProviderFields'
+import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
+import {
+  DEFAULT_SELF_HOSTED_CAPABILITIES,
+  selfHostedDiscoverySignature,
+  selfHostedSubmitBlocker,
+  type SelfHostedCapabilitiesInput,
+} from '@/components/ai/self-hosted-provider'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
@@ -3905,6 +3918,15 @@ export function AiGatewayPage() {
   const [newDisplayName, setNewDisplayName] = useState('')
   const [newApiKey, setNewApiKey] = useState('')
   const [newBaseUrl, setNewBaseUrl] = useState('')
+  // Self-hosted (OpenAI-compatible) only
+  const [newDefaultModel, setNewDefaultModel] = useState('')
+  const [newTrustPrivateAddress, setNewTrustPrivateAddress] = useState(false)
+  const [newCapabilities, setNewCapabilities] =
+    useState<SelfHostedCapabilitiesInput>(DEFAULT_SELF_HOSTED_CAPABILITIES)
+  const [selfHostedDiscovery, setSelfHostedDiscovery] =
+    useState<SelfHostedDiscovery | null>(null)
+  const canTrustPrivateAddress = useIsInstanceAdmin()
+  const newProviderIsSelfHosted = isSelfHostedProvider(newProvider)
 
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
@@ -3965,6 +3987,9 @@ export function AiGatewayPage() {
       display_name: string
       api_key: string
       base_url?: string
+      default_model?: string
+      trust_private_address?: boolean
+      capabilities?: SelfHostedCapabilitiesInput
     }) => createProviderKey({ body: data, throwOnError: true }),
     meta: { errorTitle: 'Failed to create provider key' },
     onSuccess: () => {
@@ -4039,7 +4064,29 @@ export function AiGatewayPage() {
     setNewDisplayName('')
     setNewApiKey('')
     setNewBaseUrl('')
+    setNewDefaultModel('')
+    setNewTrustPrivateAddress(false)
+    setNewCapabilities(DEFAULT_SELF_HOSTED_CAPABILITIES)
+    setSelfHostedDiscovery(null)
   }
+
+  const currentSelfHostedModels =
+    selfHostedDiscovery &&
+    selfHostedDiscovery.signature ===
+      selfHostedDiscoverySignature({
+        baseUrl: newBaseUrl,
+        apiKey: newApiKey,
+        trustPrivateAddress: newTrustPrivateAddress,
+      })
+      ? selfHostedDiscovery.models
+      : null
+  const selfHostedBlocker = newProviderIsSelfHosted
+    ? selfHostedSubmitBlocker({
+        baseUrl: newBaseUrl,
+        discoveredModels: currentSelfHostedModels,
+        defaultModel: newDefaultModel,
+      })
+    : null
 
   const handleCreate = () => {
     if (createMutation.isPending) return
@@ -4047,7 +4094,8 @@ export function AiGatewayPage() {
       toast.error('Please select a provider')
       return
     }
-    if (!newApiKey.trim()) {
+    // Self-hosted servers often run without authentication.
+    if (!newProviderIsSelfHosted && !newApiKey.trim()) {
       toast.error('Please enter an API key')
       return
     }
@@ -4055,12 +4103,23 @@ export function AiGatewayPage() {
       toast.error('Please enter a display name')
       return
     }
+    if (selfHostedBlocker) {
+      toast.error(selfHostedBlocker)
+      return
+    }
 
     createMutation.mutate({
       provider: newProvider,
       display_name: newDisplayName,
       api_key: newApiKey,
-      base_url: newBaseUrl || undefined,
+      base_url: newBaseUrl.trim() || undefined,
+      ...(newProviderIsSelfHosted
+        ? {
+            default_model: newDefaultModel,
+            trust_private_address: newTrustPrivateAddress,
+            capabilities: newCapabilities,
+          }
+        : {}),
     })
   }
 
@@ -4080,9 +4139,20 @@ export function AiGatewayPage() {
 
   const effectiveSnippetProvider =
     snippetProvider || firstConfiguredProvider?.id || SUPPORTED_PROVIDERS[0].id
+  // A self-hosted server has no vendor default; show the model its key pins.
+  const selfHostedSnippetModel = isSelfHostedProvider(effectiveSnippetProvider)
+    ? keys.find(
+        (k) =>
+          k.provider === effectiveSnippetProvider &&
+          k.is_active &&
+          k.default_model
+      )?.default_model
+    : undefined
   const snippetModel =
+    selfHostedSnippetModel ??
     SUPPORTED_PROVIDERS.find((p) => p.id === effectiveSnippetProvider)
-      ?.defaultModel ?? SUPPORTED_PROVIDERS[0].defaultModel
+      ?.defaultModel ??
+    SUPPORTED_PROVIDERS[0].defaultModel
 
   const codeSnippets = {
     bash: `curl ${gatewayEndpoint}/chat/completions \\
@@ -4498,6 +4568,12 @@ console.log(response.choices[0].message.content);`,
                             <TableRow className="bg-muted/20 hover:bg-muted/20">
                               <TableCell />
                               <TableCell colSpan={4} className="pb-4 pt-1">
+                                <SelfHostedKeySettings
+                                  providerKey={key}
+                                  canTrustPrivateAddress={
+                                    canTrustPrivateAddress
+                                  }
+                                />
                                 <ProviderKeyModelDetail providerKey={key} />
                               </TableCell>
                             </TableRow>
@@ -4583,11 +4659,25 @@ console.log(response.choices[0].message.content);`,
                 />
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="apiKey">API Key</Label>
+                <Label htmlFor="apiKey">
+                  API Key
+                  {newProviderIsSelfHosted && (
+                    <>
+                      {' '}
+                      <span className="text-muted-foreground font-normal">
+                        (optional)
+                      </span>
+                    </>
+                  )}
+                </Label>
                 <Input
                   id="apiKey"
                   type="password"
-                  placeholder="sk-..."
+                  placeholder={
+                    newProviderIsSelfHosted
+                      ? 'Leave empty if your server has no authentication'
+                      : 'sk-...'
+                  }
                   value={newApiKey}
                   disabled={createMutation.isPending}
                   onChange={(e) => setNewApiKey(e.target.value)}
@@ -4599,26 +4689,49 @@ console.log(response.choices[0].message.content);`,
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="baseUrl">
-                  Custom Base URL{' '}
+                  {newProviderIsSelfHosted ? 'Base URL' : 'Custom Base URL'}{' '}
                   <span className="text-muted-foreground font-normal">
-                    (optional)
+                    {newProviderIsSelfHosted ? '(required)' : '(optional)'}
                   </span>
                 </Label>
                 <Input
                   id="baseUrl"
-                  placeholder="https://api.openai.com/v1"
+                  placeholder={
+                    newProviderIsSelfHosted
+                      ? 'http://10.0.0.5:8000/v1'
+                      : 'https://api.openai.com/v1'
+                  }
                   value={newBaseUrl}
                   disabled={createMutation.isPending}
                   onChange={(e) => setNewBaseUrl(e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
-                  Override the default API endpoint for this provider.
+                  {newProviderIsSelfHosted
+                    ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
+                    : 'Override the default API endpoint for this provider.'}
                 </p>
               </div>
+              {newProviderIsSelfHosted && (
+                <SelfHostedProviderFields
+                  baseUrl={newBaseUrl}
+                  apiKey={newApiKey}
+                  trustPrivateAddress={newTrustPrivateAddress}
+                  onTrustPrivateAddressChange={setNewTrustPrivateAddress}
+                  canTrustPrivateAddress={canTrustPrivateAddress}
+                  discovery={selfHostedDiscovery}
+                  onDiscovered={setSelfHostedDiscovery}
+                  defaultModel={newDefaultModel}
+                  onDefaultModelChange={setNewDefaultModel}
+                  capabilities={newCapabilities}
+                  onCapabilitiesChange={setNewCapabilities}
+                  disabled={createMutation.isPending}
+                />
+              )}
             </div>
             <p className="text-xs text-muted-foreground">
-              We&apos;ll verify the key works before saving — this usually takes
-              1–2 seconds.
+              {newProviderIsSelfHosted
+                ? 'We’ll send a short test completion to the default model before saving.'
+                : 'We’ll verify the key works before saving — this usually takes 1–2 seconds.'}
             </p>
             {createMutation.isError && (
               <p role="alert" className="text-sm text-destructive">
@@ -4631,7 +4744,8 @@ console.log(response.choices[0].message.content);`,
             <DialogFooter>
               <Button
                 onClick={handleCreate}
-                disabled={createMutation.isPending}
+                disabled={createMutation.isPending || !!selfHostedBlocker}
+                title={selfHostedBlocker ?? undefined}
                 className="w-full sm:w-auto"
               >
                 {createMutation.isPending ? (

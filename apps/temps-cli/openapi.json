@@ -13162,16 +13162,29 @@
       "CreateProviderKeyRequest": {
         "properties": {
           "api_key": {
+            "description": "Provider API key. Optional only for self-hosted providers that run\nwithout authentication.",
             "type": "string"
           },
           "base_url": {
+            "description": "Required for \"openai_compatible\", e.g. \"http://10.0.0.5:8000/v1\".",
             "type": [
               "string",
               "null"
             ]
           },
+          "capabilities": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SelfHostedCapabilities",
+                "description": "Declared capabilities of a self-hosted key (defaults: streaming and\ntools on, embeddings and Responses API off)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "default_model": {
-            "description": "Optional model id to pin for this provider (e.g. \"gpt-4o-mini\").",
+            "description": "Model id to pin for this provider (e.g. \"gpt-4o-mini\"). Required for\n\"openai_compatible\": it must be one of the models the server lists\n(see `POST /ai/providers/discover`), and is used to verify the key.",
             "type": [
               "string",
               "null"
@@ -13181,13 +13194,17 @@
             "type": "string"
           },
           "provider": {
+            "description": "\"openai\", \"anthropic\", \"xai\", \"gemini\", \"openrouter\", or\n\"openai_compatible\" for a self-hosted OpenAI-compatible server.",
             "type": "string"
+          },
+          "trust_private_address": {
+            "description": "Trust the exact private `ip:port` of `base_url` for this key only,\nwithout adding it to the instance-wide trusted private networks.\nRequires the `settings:write` permission; the base URL must use an IP\naddress. Cloud metadata and link-local addresses can never be trusted.",
+            "type": "boolean"
           }
         },
         "required": [
           "provider",
-          "display_name",
-          "api_key"
+          "display_name"
         ],
         "type": "object"
       },
@@ -16601,6 +16618,52 @@
         ],
         "type": "object"
       },
+      "DiscoverProviderModelsRequest": {
+        "properties": {
+          "api_key": {
+            "description": "API key, if the server requires one",
+            "type": "string"
+          },
+          "base_url": {
+            "description": "Base URL of the server (required for \"openai_compatible\")",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "description": "Provider ID, e.g. \"openai_compatible\"",
+            "type": "string"
+          },
+          "trust_private_address": {
+            "description": "Discover as if the base URL's exact private address were trusted on\nthe key. Requires `settings:write`.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider"
+        ],
+        "type": "object"
+      },
+      "DiscoverProviderModelsResponse": {
+        "properties": {
+          "models": {
+            "description": "Models the provider lists, sorted by id",
+            "items": {
+              "$ref": "#/components/schemas/DiscoveredModelResponse"
+            },
+            "type": "array"
+          },
+          "provider": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "models"
+        ],
+        "type": "object"
+      },
       "DiscoverRequest": {
         "description": "Request to discover workloads",
         "properties": {
@@ -16635,6 +16698,21 @@
         },
         "required": [
           "workloads"
+        ],
+        "type": "object"
+      },
+      "DiscoveredModelResponse": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "owned_by": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "owned_by"
         ],
         "type": "object"
       },
@@ -40934,6 +41012,17 @@
               "null"
             ]
           },
+          "capabilities": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SelfHostedCapabilities",
+                "description": "Declared capabilities of a self-hosted key; `None` for vendor keys."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "created_at": {
             "type": "string"
           },
@@ -40956,6 +41045,28 @@
           },
           "provider": {
             "type": "string"
+          },
+          "trusted_private_address": {
+            "description": "Exact private `ip:port` this key may reach without that address being\nin the instance-wide trusted private networks. `None` when not set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trusted_private_address_set_at": {
+            "description": "When the per-key trust was set (ISO 8601).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trusted_private_address_set_by": {
+            "description": "User who set the per-key trust.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "updated_at": {
             "type": "string"
@@ -46705,6 +46816,28 @@
           "id",
           "name"
         ],
+        "type": "object"
+      },
+      "SelfHostedCapabilities": {
+        "description": "Capabilities an administrator declared for a self-hosted key. Requests\nneeding an undeclared capability are refused before anything is sent.",
+        "properties": {
+          "embeddings": {
+            "description": "The `/embeddings` endpoint.",
+            "type": "boolean"
+          },
+          "responses_api": {
+            "description": "The OpenAI Responses API (`/responses`).",
+            "type": "boolean"
+          },
+          "streaming": {
+            "description": "Streaming chat completions (`\"stream\": true`). Required by AI chat.",
+            "type": "boolean"
+          },
+          "tools": {
+            "description": "Function/tool calling in chat completions.",
+            "type": "boolean"
+          }
+        },
         "type": "object"
       },
       "SelfUpdateAttempt": {
@@ -53013,24 +53146,34 @@
       "TestProviderKeyRequest": {
         "properties": {
           "api_key": {
-            "description": "The raw API key to test",
+            "description": "The raw API key to test (may be empty for a self-hosted provider)",
             "type": "string"
           },
           "base_url": {
-            "description": "Optional custom base URL",
+            "description": "Optional custom base URL (required for \"openai_compatible\")",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_model": {
+            "description": "Model to send the test completion to. Required for\n\"openai_compatible\"; defaults to a small vendor model otherwise.",
             "type": [
               "string",
               "null"
             ]
           },
           "provider": {
-            "description": "Provider ID: \"openai\", \"anthropic\", \"xai\", \"gemini\", \"openrouter\"",
+            "description": "Provider ID: \"openai\", \"anthropic\", \"xai\", \"gemini\", \"openrouter\",\n\"openai_compatible\"",
             "type": "string"
+          },
+          "trust_private_address": {
+            "description": "Test as if the base URL's exact private address were trusted on the\nkey. Requires `settings:write`.",
+            "type": "boolean"
           }
         },
         "required": [
-          "provider",
-          "api_key"
+          "provider"
         ],
         "type": "object"
       },
@@ -57031,16 +57174,28 @@
       "UpdateProviderKeyRequest": {
         "properties": {
           "api_key": {
+            "description": "New API key. An empty string removes it, for self-hosted keys only.",
             "type": [
               "string",
               "null"
             ]
           },
           "base_url": {
-            "description": "Double-Option: absent = leave unchanged, present-null = clear (revert to\nthe provider's default endpoint), present-value = set.",
+            "description": "Double-Option: absent = leave unchanged, present-null = clear (revert to\nthe provider's default endpoint), present-value = set. Moving the base\nURL to another address drops the per-key private-address trust.",
             "type": [
               "string",
               "null"
+            ]
+          },
+          "capabilities": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SelfHostedCapabilities",
+                "description": "Declared capabilities; self-hosted keys only."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "default_model": {
@@ -57057,6 +57212,13 @@
             ]
           },
           "is_active": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "trust_private_address": {
+            "description": "`true` trusts the exact private `ip:port` of the (new) base URL for\nthis key only (requires `settings:write`); `false` removes the trust.",
             "type": [
               "boolean",
               "null"
@@ -64822,6 +64984,72 @@
               }
             },
             "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Admin"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/providers/discover": {
+      "post": {
+        "operationId": "discover_provider_models",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoverProviderModelsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoverProviderModelsResponse"
+                }
+              }
+            },
+            "description": "Models the provider lists"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid or blocked base URL, or the provider could not be listed"
           },
           "401": {
             "content": {

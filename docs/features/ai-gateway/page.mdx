@@ -136,7 +136,7 @@ curl https://your-temps-instance.com/ai/v1/chat/completions \
 
 ## Supported Providers {{ anchor: true, id: 'providers' }}
 
-The gateway routes requests to the correct provider based on the model name:
+The gateway routes each request by its exact model ID: it looks the ID up in the model catalogs of your active provider keys (the models listed under each key in **AI Gateway → AI providers**) and sends the request to the key that serves it. Only when no catalog lists the model does it fall back to the model-name prefixes of the built-in providers:
 
 | Model Prefix | Provider | Examples |
 |---|---|---|
@@ -149,6 +149,25 @@ The gateway routes requests to the correct provider based on the model name:
 
 <Note>
   All providers use the same OpenAI-compatible API format. The gateway handles protocol translation automatically for Anthropic and Gemini.
+</Note>
+
+If two keys that reach different upstreams both serve the same model ID, the request is refused with `409 ambiguous_model` rather than sent to either. Pick one with the `X-Temps-Provider-Key-Id: <key id>` header, or disable the model on all but one key. Two keys of the same provider on the same endpoint are interchangeable and are not ambiguous.
+
+---
+
+## Self-hosted Providers {{ anchor: true, id: 'self-hosted' }}
+
+Add a **Self-hosted (OpenAI-compatible)** provider to use a model server on your own network, such as MLX, vLLM, llama.cpp, LM Studio or Ollama's OpenAI API:
+
+1. Enter the server's base URL including `/v1`, for example `http://10.0.0.5:8000/v1`. The API key is optional, since many local servers run without authentication.
+2. Allow Temps to reach the address. Private and loopback addresses are blocked by default. Either an administrator enables **Trust this private address for this key only**, which lets this one key reach that exact IP address and port, or the address is added under **Settings → Security → Trusted private networks**, which every outbound feature honours. Trusting on the key requires the base URL to use an IP address, and cloud metadata and link-local addresses can never be trusted.
+3. Click **Load models**. Temps lists every model the server reports at `/models`, with no name filter, and you pick the default model. Temps verifies the connection with that model before saving.
+4. Declare what the server supports: streaming, tool calling, embeddings and the Responses API. Requests that need an undeclared capability are refused before anything is sent.
+
+Every model the server lists is routed only to that server. A request for a model it hosts is never sent to OpenRouter or another vendor, even when the ID looks like `vendor/model`, and if the model is disabled there or the server stops listing it, the request fails instead of falling back.
+
+<Note>
+  Plain `http://` is accepted only for trusted private addresses, so an API key or a prompt is never sent unencrypted over the internet. Use `https://` for any provider on a public address. Keys created before this rule that point at a public `http://` URL are refused at request time with that reason; change their base URL to `https://`.
 </Note>
 
 ---
