@@ -293,6 +293,22 @@ export function getActiveDefaultProjectSync(): string | undefined {
 }
 
 /**
+ * Clear the default project of the context called `name`, whichever context
+ * is active. For when the server behind a context is wiped: its projects are
+ * gone, and a default that outlives them makes every project command fail
+ * with "not found" instead of asking which project to use. Returns whether
+ * a default was cleared.
+ */
+export async function clearContextDefaultProject(name: string): Promise<boolean> {
+  const contexts = await loadContexts()
+  const target = contexts.find((c) => c.name === name)
+  if (!target || target.defaultProject === undefined) return false
+  delete target.defaultProject
+  await saveContexts(contexts)
+  return true
+}
+
+/**
  * Set (or clear, with `undefined`) the default project on the active context.
  * No-op returning false when there's no active context to attach it to.
  * Does not change which context is active.

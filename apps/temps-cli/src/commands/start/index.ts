@@ -13,7 +13,13 @@ import type { Command } from 'commander'
 import type { Ora } from 'ora'
 import { readdir } from 'node:fs/promises'
 import { homedir, hostname } from 'node:os'
-import { getContext, getSavedDefaultContext, upsertContext } from '../../config/contexts.js'
+import {
+  clearContextDefaultProject,
+  getContext,
+  getSavedDefaultContext,
+  upsertContext,
+  type CliContext,
+} from '../../config/contexts.js'
 import { config, credentials } from '../../config/store.js'
 import { colors, icons } from '../../ui/output.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -182,6 +188,17 @@ async function shouldActivate(
   return { activate, previous }
 }
 
+/**
+ * The default project to carry over when the `local` context is rewritten.
+ * A project only exists in the install it was created in, and the one proof
+ * that the saved context is for this install is that this server still
+ * accepts its key: a reset or a fresh install has a new database, which
+ * rejects every old key. So the default survives a restart and nothing else.
+ */
+export function carriedDefaultProject(existing: CliContext | null, keyStillValid: boolean): string | undefined {
+  return keyStillValid ? existing?.defaultProject : undefined
+}
+
 /** Reuse the saved key while it still works; otherwise mint a new one. */
 async function signInCli(
   bin: string,
@@ -217,8 +234,7 @@ async function signInCli(
       apiKey: apiKey as string,
       email: user.email,
       keyPrefix,
-      // Projects only exist on the server they were created on.
-      defaultProject: existing?.url === apiUrl ? existing.defaultProject : undefined,
+      defaultProject: carriedDefaultProject(existing, !minted),
     },
     { makeActive: activate },
   )
@@ -481,6 +497,9 @@ async function stopLocked(options: StopOptions, paths: LocalPaths): Promise<void
     return
   }
   await deleteLocalData(paths)
+  // The context stays so `temps start` can reuse its name, but the projects
+  // its default pointed at are gone.
+  await clearContextDefaultProject(LOCAL_CONTEXT)
   if (workloads && (workloads.containers.length > 0 || workloads.volumes.length > 0)) {
     console.log(
       `${colors.success('✔')} Removed ${workloads.containers.length} app and service container(s) and ${workloads.volumes.length} volume(s)`,

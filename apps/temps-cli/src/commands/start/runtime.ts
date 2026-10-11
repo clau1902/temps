@@ -99,6 +99,75 @@ export function isLocalServerCommand(command: string, paths: LocalPaths): boolea
   return line.startsWith(prefix) && /^[^/\s]+\/temps serve(\s|$)/.test(line.slice(prefix.length))
 }
 
+/** A container on the install's network, as far as a reset needs to know it. */
+export interface WorkloadContainer {
+  name: string
+  labels: Record<string, string>
+  /** Names of the Docker volumes it mounts. */
+  volumes: string[]
+}
+
+export interface WorkloadVolume {
+  name: string
+  /** Milliseconds since the epoch. */
+  createdAt: number
+  labels: Record<string, string>
+}
+
+const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project'
+/** Labels Temps puts on every managed service container (one per service generation). */
+const SERVICE_LABELS = ['temps.service_type', 'temps.service', 'sh.temps.service.type']
+/** Labels Temps puts on every app container; a managed service never has them. */
+const APP_LABELS = ['sh.temps.project_id', 'sh.temps.deploy_id', COMPOSE_PROJECT_LABEL]
+
+/**
+ * A managed service (Postgres, Redis, …): Temps creates the container and
+ * chooses its volumes, the user never does. An app container cannot pass
+ * for one by shipping a service label in its image, because Temps always
+ * adds the app labels on top.
+ */
+function isManagedService(container: WorkloadContainer): boolean {
+  return (
+    SERVICE_LABELS.some((label) => label in container.labels) &&
+    !APP_LABELS.some((label) => label in container.labels)
+  )
+}
+
+/**
+ * Whether a reset may delete a volume: only with positive proof that this
+ * install created it. Being mounted by one of the install's containers is
+ * not proof (an app can be pointed at a volume that belongs to something
+ * else), and neither is being newer than the install. A volume is owned
+ * when it is not older than the install AND either
+ *
+ * - every container that mounted it is a managed service, or
+ * - Docker Compose created it for the stack that mounted it: it carries
+ *   the same `com.docker.compose.project` label as every container using
+ *   it. A volume declared `external` in a Compose file is not created by
+ *   Compose and never has that label.
+ *
+ * Anything else is kept, with the reason returned for the user.
+ */
+export function volumeOwnership(
+  volume: WorkloadVolume,
+  mountedBy: readonly WorkloadContainer[],
+  installedAt: number | null,
+): { owned: true } | { owned: false; reason: string } {
+  if (installedAt === null) {
+    return { owned: false, reason: 'the install date is unknown, so it cannot be shown to belong to this install' }
+  }
+  if (!Number.isFinite(volume.createdAt)) return { owned: false, reason: 'its creation date could not be read' }
+  if (volume.createdAt < installedAt) return { owned: false, reason: 'it existed before this install' }
+  if (mountedBy.length === 0) return { owned: false, reason: 'no container of this install mounted it' }
+  if (mountedBy.every(isManagedService)) return { owned: true }
+  const project = volume.labels[COMPOSE_PROJECT_LABEL]
+  if (project && mountedBy.every((container) => container.labels[COMPOSE_PROJECT_LABEL] === project)) {
+    return { owned: true }
+  }
+  const users = mountedBy.map((container) => container.name).join(', ')
+  return { owned: false, reason: `Temps did not create it (it was attached to ${users})` }
+}
+
 /**
  * Pids of every local server in `ps -axo pid=,command=` output. Finds the
  * server from the process table alone, so `temps stop` works when the state

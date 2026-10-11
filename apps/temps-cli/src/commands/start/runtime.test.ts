@@ -21,6 +21,8 @@ import {
   releaseAssetUrl,
   releaseTarget,
   resolveSkillsScope,
+  volumeOwnership,
+  type WorkloadContainer,
   skillTargets,
 } from './runtime.js'
 
@@ -247,5 +249,53 @@ describe('isLocalState', () => {
     for (const value of [null, [], 'x', {}, { ...valid, dbPort: '55432' }, { ...valid, pid: 'abc' }, { ...valid, pid: -1 }, { ...valid, dbPassword: '' }, { ...valid, proxyPort: 70000 }]) {
       expect(isLocalState(value)).toBe(false)
     }
+  })
+})
+
+describe('volumeOwnership', () => {
+  const INSTALLED = 1_000_000
+  const volume = (labels: Record<string, string> = {}, createdAt = INSTALLED + 5_000) => ({ name: 'v', createdAt, labels })
+  const container = (name: string, labels: Record<string, string>): WorkloadContainer => ({ name, labels, volumes: ['v'] })
+  const service = container('redis-cache', { 'temps.service_type': 'redis', 'temps.service_name': 'cache' })
+  const app = container('web-1', { 'sh.temps.managed': 'true', 'sh.temps.project_id': '1', 'sh.temps.deploy_id': '7' })
+  const stack = container('shop-api-1', { 'sh.temps.managed': 'true', 'com.docker.compose.project': 'shop' })
+
+  test('owns the volume of a managed service, whichever label generation it carries', () => {
+    expect(volumeOwnership(volume(), [service], INSTALLED)).toEqual({ owned: true })
+    expect(volumeOwnership(volume(), [container('mongo', { 'temps.service': 'mongodb' })], INSTALLED)).toEqual({ owned: true })
+    expect(volumeOwnership(volume(), [container('pg', { 'sh.temps.service.type': 'postgres' })], INSTALLED)).toEqual({ owned: true })
+    // Created in the same second as the install's own volume.
+    expect(volumeOwnership(volume({}, INSTALLED), [service], INSTALLED)).toEqual({ owned: true })
+  })
+
+  test('owns a volume Compose created for the stack that mounts it', () => {
+    expect(volumeOwnership(volume({ 'com.docker.compose.project': 'shop' }), [stack], INSTALLED)).toEqual({ owned: true })
+  })
+
+  test('being newer than the install is not proof: an app with an unlabelled volume keeps it', () => {
+    const verdict = volumeOwnership(volume(), [app], INSTALLED)
+    expect(verdict).toEqual({ owned: false, reason: 'Temps did not create it (it was attached to web-1)' })
+    // An `external` Compose volume has no Compose label, or another stack's.
+    expect(volumeOwnership(volume(), [stack], INSTALLED).owned).toBe(false)
+    expect(volumeOwnership(volume({ 'com.docker.compose.project': 'other' }), [stack], INSTALLED).owned).toBe(false)
+  })
+
+  test('one non-owning user is enough to keep a volume', () => {
+    expect(volumeOwnership(volume(), [service, app], INSTALLED).owned).toBe(false)
+    expect(volumeOwnership(volume({ 'com.docker.compose.project': 'shop' }), [stack, app], INSTALLED).owned).toBe(false)
+  })
+
+  test('an app cannot pass for a managed service with a label from its image', () => {
+    for (const marker of ['sh.temps.project_id', 'sh.temps.deploy_id', 'com.docker.compose.project']) {
+      const spoof = container('spoof', { 'temps.service_type': 'redis', [marker]: '1' })
+      expect(volumeOwnership(volume(), [spoof], INSTALLED).owned).toBe(false)
+    }
+  })
+
+  test('keeps anything it cannot date against the install', () => {
+    expect(volumeOwnership(volume({}, INSTALLED - 1), [service], INSTALLED)).toEqual({ owned: false, reason: 'it existed before this install' })
+    expect(volumeOwnership(volume({}, Number.NaN), [service], INSTALLED).owned).toBe(false)
+    expect(volumeOwnership(volume(), [service], null).owned).toBe(false)
+    expect(volumeOwnership(volume(), [], INSTALLED).owned).toBe(false)
   })
 })

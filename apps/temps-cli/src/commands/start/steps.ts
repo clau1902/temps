@@ -10,7 +10,7 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { createReadStream, createWriteStream, existsSync, fstatSync, openSync, closeSync, readSync, statSync } from 'node:fs'
-import { chmod, cp, link, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { basename, dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -41,6 +41,9 @@ import {
   type LocalPaths,
   type LocalState,
   type ReleaseSummary,
+  type WorkloadContainer,
+  type WorkloadVolume,
+  volumeOwnership,
 } from './runtime.js'
 
 export interface RunResult {
@@ -127,91 +130,138 @@ export async function writeState(paths: LocalPaths, state: LocalState): Promise<
 
 // ── Lock ─────────────────────────────────────────────────────────────────
 
-/** A lock this old is abandoned even if its pid is alive (reused by another program). */
-const LOCK_STALE_MS = 60 * 60_000
-
-interface LockToken {
+interface LockEntry {
   pid: number
   command: string
   startedAt: number
-  nonce: string
+  /** `ps -o lstart=` for `pid` when it took the lock; null where `ps` cannot say. */
+  processStart: string | null
 }
 
-function parseLock(raw: string): LockToken | null {
+const LOCK_ATTEMPTS = 4
+
+/** When a process started, as `ps` prints it. Null if it is not running or `ps` cannot say. */
+async function processStartTime(pid: number): Promise<string | null> {
   try {
-    const token = JSON.parse(raw) as Partial<LockToken>
-    return typeof token.pid === 'number' && typeof token.startedAt === 'number' && typeof token.command === 'string'
-      ? (token as LockToken)
+    const ps = await run('ps', ['-o', 'lstart=', '-p', String(pid)], { timeoutMs: 5_000 })
+    return ps.code === 0 && ps.stdout.trim() ? ps.stdout.trim() : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether the process that wrote a lock entry is still running. A pid alone
+ * is not enough: it can be reused by another program after a crash, so the
+ * start time recorded with the entry must still be that pid's start time.
+ * Every doubt (no recorded start time, `ps` unavailable) counts as running:
+ * a lock is only ever disregarded when its writer is certainly gone.
+ */
+async function writerAlive(entry: LockEntry): Promise<boolean> {
+  if (!processAlive(entry.pid)) return false
+  if (entry.processStart === null) return true
+  const current = await processStartTime(entry.pid)
+  return current === null || current === entry.processStart
+}
+
+function parseLockEntry(raw: string): LockEntry | null {
+  try {
+    const entry = JSON.parse(raw) as Partial<LockEntry>
+    return typeof entry.pid === 'number' && typeof entry.command === 'string' && typeof entry.startedAt === 'number'
+      ? { pid: entry.pid, command: entry.command, startedAt: entry.startedAt, processStart: entry.processStart ?? null }
       : null
   } catch {
     return null
   }
 }
 
-function lockBusy(paths: LocalPaths, holder: LockToken | null): StartError {
-  const who = holder ? `\`temps ${holder.command}\` (pid ${holder.pid})` : 'Another temps start or stop'
-  return new StartError(
-    'lock',
-    'busy',
-    `${who} is already working on your local Temps. Wait for it to finish, then run this again. ` +
-      `If nothing is running, delete ${paths.lock}.`,
-  )
+/**
+ * Entries in the lock directory, other than `own`, whose writer is still
+ * running. Removes the ones left by a process that is certainly gone, which
+ * is safe for exactly that reason; a live entry is never touched.
+ */
+async function liveLockEntries(paths: LocalPaths, own: string): Promise<LockEntry[]> {
+  const live: LockEntry[] = []
+  for (const name of await readdir(paths.lock)) {
+    if (name === own) continue
+    const path = join(paths.lock, name)
+    if (!name.endsWith('.json')) {
+      // A half-written entry (`<pid>-<nonce>.tmp`) is not a claim yet; it is
+      // only litter once its writer is gone.
+      const pid = Number.parseInt(name, 10)
+      if (!processAlive(Number.isNaN(pid) ? undefined : pid)) await rm(path, { force: true })
+      continue
+    }
+    const raw = await readFile(path, 'utf-8').catch(() => null)
+    if (raw === null) continue // released while we were listing
+    const entry = parseLockEntry(raw)
+    // Entries appear by rename, complete; one that does not parse was not written by this code.
+    if (entry && (await writerAlive(entry))) live.push(entry)
+    else await rm(path, { force: true })
+  }
+  return live
 }
 
 /**
  * Take the lock that serializes `temps start` and `temps stop`. Two of them
  * at once would each generate credentials, write `state.json` and unpack the
  * binary, and the loser's password would not match the database the winner
- * created. Fails at once when the lock is held: the caller should not queue
- * behind a command that may be waiting on a prompt.
+ * created.
  *
- * The lock is a hard link to a private token file, so taking it is atomic.
- * A lock whose process is gone (Ctrl-C, crash) or that is older than
- * `LOCK_STALE_MS` is taken over by renaming it aside first and checking that
- * what was renamed is the lock that was judged stale, so a live lock that
- * replaced it in between is put back instead of stolen. Returns the release
- * function.
+ * The lock is a directory of claims, one file per process, and the protocol
+ * never removes another live process's claim, so there is no takeover step
+ * to race on:
+ *
+ * 1. Publish a claim: write it under a temporary name, then rename it into
+ *    place, so it appears whole and at one instant.
+ * 2. List the directory. If no other live claim exists, the lock is held.
+ * 3. Otherwise withdraw the claim and retry after a random pause; give up
+ *    after a few rounds with an error naming the holder.
+ *
+ * Why two commands cannot both hold it: each lists only after its own claim
+ * is published, so whichever published second must see the first one's
+ * claim, unless the first has already withdrawn or released it. Two that
+ * publish together may both withdraw; the random pause separates them on the
+ * next round. A claim left by a crash or Ctrl-C is skipped and removed once
+ * its writer is certainly gone (see `writerAlive`), and that is the only
+ * time anything but a command's own claim is deleted.
+ *
+ * Fails rather than queues behind a running command, which may be waiting
+ * on a prompt. Returns the release function.
  */
 export async function acquireLock(paths: LocalPaths, command: string): Promise<() => Promise<void>> {
-  await mkdir(paths.root, { recursive: true, mode: 0o700 })
-  const nonce = randomBytes(8).toString('hex')
-  const token = JSON.stringify({ pid: process.pid, command, startedAt: Date.now(), nonce } satisfies LockToken)
-  const mine = `${paths.lock}.${process.pid}.${nonce}`
-  await writeFile(mine, token, { mode: 0o600 })
-  try {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        await link(mine, paths.lock)
-        return async () => {
-          const held = await readFile(paths.lock, 'utf-8').catch(() => null)
-          if (held === token) await rm(paths.lock, { force: true })
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      }
-      const held = await readFile(paths.lock, 'utf-8').catch(() => null)
-      if (held === null) continue // released between the link and the read
-      const holder = parseLock(held)
-      if (holder && processAlive(holder.pid) && Date.now() - holder.startedAt < LOCK_STALE_MS) {
-        throw lockBusy(paths, holder)
-      }
-      const aside = `${mine}.stale`
-      try {
-        await rename(paths.lock, aside)
-      } catch {
-        continue // someone else took the stale lock away first
-      }
-      const taken = await readFile(aside, 'utf-8').catch(() => null)
-      if (taken !== held) {
-        await link(aside, paths.lock).catch(() => undefined)
-        await rm(aside, { force: true })
-        throw lockBusy(paths, taken ? parseLock(taken) : null)
-      }
-      await rm(aside, { force: true })
+  await mkdir(paths.lock, { recursive: true, mode: 0o700 })
+  const id = `${process.pid}-${randomBytes(8).toString('hex')}`
+  const claim = join(paths.lock, `${id}.json`)
+  const draft = join(paths.lock, `${id}.tmp`)
+  const entry: LockEntry = {
+    pid: process.pid,
+    command,
+    startedAt: Date.now(),
+    processStart: await processStartTime(process.pid),
+  }
+  for (let attempt = 1; ; attempt++) {
+    await writeFile(draft, JSON.stringify(entry), { mode: 0o600 })
+    await rename(draft, claim)
+    let others: LockEntry[]
+    try {
+      others = await liveLockEntries(paths, `${id}.json`)
+    } catch (error) {
+      await rm(claim, { force: true })
+      throw error
     }
-    throw lockBusy(paths, null)
-  } finally {
-    await rm(mine, { force: true })
+    if (others.length === 0) return () => rm(claim, { force: true })
+    await rm(claim, { force: true })
+    if (attempt >= LOCK_ATTEMPTS) {
+      const holder = others[0] as LockEntry
+      throw new StartError(
+        'lock',
+        'busy',
+        `\`temps ${holder.command}\` (pid ${holder.pid}) is already working on your local Temps. ` +
+          'Wait for it to finish, then run this again.',
+      )
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50 + Math.random() * 200))
   }
 }
 
@@ -675,22 +725,30 @@ export async function stopDatabase(): Promise<boolean> {
 export interface RemovedWorkloads {
   containers: string[]
   volumes: string[]
-  /** Volumes or the network Docker refused to remove, with its reason. */
+  /** Volumes or the network left in place, each with its reason. */
   kept: string[]
 }
 
+function parseLabels(json: string | undefined): Record<string, string> {
+  try {
+    return (JSON.parse(json ?? 'null') as Record<string, string> | null) ?? {}
+  } catch {
+    return {}
+  }
+}
+
 /**
- * Remove what this install deployed: every container on `DOCKER_NETWORK`
- * (apps, Compose stacks, managed services), the volumes Temps created for
+ * Remove what this install deployed: every container on `network` (apps,
+ * Compose stacks, managed services), the volumes this install created for
  * them, and the network. Once the platform database is gone nothing else
  * can manage them, so they must go with it.
  *
- * Scoped by network membership, which no other Temps on this Docker engine
- * shares. A volume those containers mounted is removed only if it was
- * created after this install's database volume, so a volume that already
- * existed and was merely attached to a deployed app is kept. Docker itself
- * refuses to remove a volume another container still uses. Everything kept
- * is reported with its reason, never forced.
+ * Containers are scoped by network membership, which no other Temps on
+ * this Docker engine shares. Volumes need more than that: a container can
+ * mount a volume that belongs to something else, so a volume is deleted
+ * only with proof that this install created it (`volumeOwnership`), and
+ * Docker itself refuses one another container still uses. Every volume
+ * kept is reported with its reason; nothing is forced.
  */
 export async function removeWorkloads(
   network: string = DOCKER_NETWORK,
@@ -702,37 +760,40 @@ export async function removeWorkloads(
     throw new StartError('workloads', 'list_failed', `Could not list containers on ${network}: ${lastLines(listed.stderr, 3)}`)
   }
   const ids = listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean)
-  const volumes = new Set<string>()
+  const containers: WorkloadContainer[] = []
   if (ids.length > 0) {
-    const format = '{{.Name}}\t{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}'
+    const format = '{{.Name}}\t{{json .Config.Labels}}\t{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}'
     const inspected = await docker(['inspect', '--format', format, ...ids])
+    if (inspected.code !== 0) {
+      throw new StartError('workloads', 'inspect_failed', `Could not inspect the containers on ${network}: ${lastLines(inspected.stderr, 3)}`)
+    }
     for (const line of inspected.stdout.split('\n')) {
-      const [name, mounts = ''] = line.split('\t')
+      const [name, labels, mounts = ''] = line.split('\t')
       if (!name) continue
-      removed.containers.push(name.replace(/^\//, ''))
-      for (const volume of mounts.split(' ').filter(Boolean)) volumes.add(volume)
+      containers.push({ name: name.replace(/^\//, ''), labels: parseLabels(labels), volumes: mounts.split(' ').filter(Boolean) })
     }
     // -v also removes the containers' anonymous volumes.
     const rmContainers = await docker(['rm', '-f', '-v', ...ids], { timeoutMs: 5 * 60_000 })
     if (rmContainers.code !== 0) {
       throw new StartError('workloads', 'rm_failed', `Could not remove this install's containers: ${lastLines(rmContainers.stderr, 3)}`)
     }
+    removed.containers = containers.map((container) => container.name)
   }
-  const installedAt = await volumeCreatedAt(installVolume)
-  for (const volume of [...volumes].sort()) {
-    const createdAt = await volumeCreatedAt(volume)
-    if (createdAt === null) continue // an anonymous volume `rm -v` already removed
-    if (installedAt === null || createdAt < installedAt) {
-      removed.kept.push(
-        installedAt === null
-          ? `volume ${volume}: cannot tell whether this install created it (${installVolume} is missing)`
-          : `volume ${volume}: it existed before this install`,
-      )
+  const installed = (await inspectVolume(installVolume))?.createdAt
+  const installedAt = installed !== undefined && Number.isFinite(installed) ? installed : null
+  const volumes = [...new Set(containers.flatMap((container) => container.volumes))].sort()
+  for (const name of volumes) {
+    const volume = await inspectVolume(name)
+    if (volume === null) continue // an anonymous volume `rm -v` already removed
+    const mountedBy = containers.filter((container) => container.volumes.includes(name))
+    const verdict = volumeOwnership(volume, mountedBy, installedAt)
+    if (!verdict.owned) {
+      removed.kept.push(`volume ${name}: ${verdict.reason}`)
       continue
     }
-    const rmVolume = await docker(['volume', 'rm', volume])
-    if (rmVolume.code === 0) removed.volumes.push(volume)
-    else if (!/no such volume/i.test(rmVolume.stderr)) removed.kept.push(`volume ${volume}: ${lastLines(rmVolume.stderr, 1)}`)
+    const rmVolume = await docker(['volume', 'rm', name])
+    if (rmVolume.code === 0) removed.volumes.push(name)
+    else if (!/no such volume/i.test(rmVolume.stderr)) removed.kept.push(`volume ${name}: ${lastLines(rmVolume.stderr, 1)}`)
   }
   const rmNetwork = await docker(['network', 'rm', network])
   if (rmNetwork.code !== 0 && !/not found|no such network/i.test(rmNetwork.stderr)) {
@@ -741,11 +802,13 @@ export async function removeWorkloads(
   return removed
 }
 
-/** When a volume was created (ms since the epoch), or null if it does not exist. */
-async function volumeCreatedAt(name: string): Promise<number | null> {
-  const inspected = await docker(['volume', 'inspect', '--format', '{{.CreatedAt}}', name], { timeoutMs: 15_000 })
-  const createdAt = inspected.code === 0 ? Date.parse(inspected.stdout.trim()) : Number.NaN
-  return Number.isNaN(createdAt) ? null : createdAt
+/** A volume's creation time and labels, or null if it does not exist. */
+async function inspectVolume(name: string): Promise<WorkloadVolume | null> {
+  const inspected = await docker(['volume', 'inspect', '--format', '{{.CreatedAt}}\t{{json .Labels}}', name], { timeoutMs: 15_000 })
+  if (inspected.code !== 0) return null
+  const [created, labels] = inspected.stdout.trim().split('\t')
+  // An unreadable date stays NaN, which `volumeOwnership` treats as "not ours".
+  return { name, createdAt: Date.parse(created ?? ''), labels: parseLabels(labels) }
 }
 
 /**

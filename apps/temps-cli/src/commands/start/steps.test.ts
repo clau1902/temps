@@ -142,68 +142,92 @@ describe('state file validation', () => {
 })
 
 describe('start/stop lock', () => {
+  const claims = async (paths: ReturnType<typeof localPaths>) => (await readdir(paths.lock)).sort()
+  const writeClaim = async (paths: ReturnType<typeof localPaths>, name: string, entry: unknown) => {
+    await mkdir(paths.lock, { recursive: true })
+    await writeFile(join(paths.lock, name), typeof entry === 'string' ? entry : JSON.stringify(entry))
+  }
+  const DEAD_PID = 2 ** 22 + 12345
+
   test('a second command fails while the first holds the lock, and succeeds after release', async () => {
     const paths = localPaths(tempDir())
     const release = await acquireLock(paths, 'start')
+    expect(await claims(paths)).toHaveLength(1)
     await expect(acquireLock(paths, 'stop')).rejects.toThrow(new RegExp(`temps start.*pid ${process.pid}.*already working`))
+    // The loser withdrew its claim and left the holder's alone.
+    expect(await claims(paths)).toHaveLength(1)
     await release()
-    expect(existsSync(paths.lock)).toBe(false)
+    expect(await claims(paths)).toEqual([])
     await (await acquireLock(paths, 'stop'))()
-    // No token or stale files are left behind.
-    expect(await readdir(paths.root)).toEqual([])
+    expect(await claims(paths)).toEqual([])
   })
 
-  test('overlapping callers: exactly one runs at a time', async () => {
+  test('overlapping callers never run together', async () => {
     const paths = localPaths(tempDir())
     let inside = 0
+    let peak = 0
     let ran = 0
     const attempt = () =>
       withLock(paths, 'start', async () => {
         inside += 1
-        expect(inside).toBe(1)
-        await new Promise((resolve) => setTimeout(resolve, 30))
+        peak = Math.max(peak, inside)
+        await new Promise((resolve) => setTimeout(resolve, 40))
         inside -= 1
         ran += 1
       })
-    const results = await Promise.allSettled([attempt(), attempt(), attempt(), attempt()])
-    expect(ran).toBe(1)
-    expect(results.filter((r) => r.status === 'rejected')).toHaveLength(3)
-    expect(existsSync(paths.lock)).toBe(false)
-  })
+    for (let round = 0; round < 5; round++) {
+      await Promise.allSettled(Array.from({ length: 8 }, attempt))
+    }
+    expect(peak).toBe(1)
+    expect(ran).toBeGreaterThanOrEqual(5)
+    expect(await claims(paths)).toEqual([])
+  }, 30_000)
 
   test('releases the lock when the work throws', async () => {
     const paths = localPaths(tempDir())
     await expect(withLock(paths, 'start', async () => Promise.reject(new Error('boom')))).rejects.toThrow('boom')
-    expect(existsSync(paths.lock)).toBe(false)
+    expect(await claims(paths)).toEqual([])
   })
 
-  test('takes over a lock whose process is gone', async () => {
+  test('skips and removes a claim whose process is gone', async () => {
     const paths = localPaths(tempDir())
-    await mkdir(paths.root, { recursive: true })
-    await writeFile(paths.lock, JSON.stringify({ pid: 2 ** 22 + 12345, command: 'start', startedAt: Date.now(), nonce: 'x' }))
+    await writeClaim(paths, `${DEAD_PID}-aaaa.json`, { pid: DEAD_PID, command: 'start', startedAt: Date.now(), processStart: 'x' })
     const release = await acquireLock(paths, 'stop')
-    expect(JSON.parse(readFileSync(paths.lock, 'utf-8')).pid).toBe(process.pid)
+    expect(await claims(paths)).toHaveLength(1)
+    expect((await claims(paths))[0]).toMatch(new RegExp(`^${process.pid}-`))
     await release()
   })
 
-  test('takes over an abandoned lock even if its pid was reused, and an unreadable one', async () => {
+  test('a claim whose pid now belongs to another process is not a holder', async () => {
     const paths = localPaths(tempDir())
-    await mkdir(paths.root, { recursive: true })
-    const twoHoursAgo = Date.now() - 2 * 60 * 60_000
-    await writeFile(paths.lock, JSON.stringify({ pid: process.pid, command: 'start', startedAt: twoHoursAgo, nonce: 'x' }))
+    // This pid is alive, but it did not start at the recorded time: the
+    // writer died and the pid was reused.
+    await writeClaim(paths, `${process.pid}-bbbb.json`, {
+      pid: process.pid,
+      command: 'start',
+      startedAt: Date.now() - 86_400_000,
+      processStart: 'Thu Jan  1 00:00:00 1970',
+    })
     await (await acquireLock(paths, 'stop'))()
-    await writeFile(paths.lock, 'garbage')
-    await (await acquireLock(paths, 'stop'))()
-    expect(existsSync(paths.lock)).toBe(false)
+    expect(await claims(paths)).toEqual([])
   })
 
-  test('release leaves a lock that is no longer ours', async () => {
+  test('when a live writer cannot be ruled out, the lock stays held', async () => {
     const paths = localPaths(tempDir())
+    // Alive pid, no recorded start time to compare: assume it is the writer.
+    await writeClaim(paths, `${process.pid}-cccc.json`, { pid: process.pid, command: 'start', startedAt: Date.now(), processStart: null })
+    await expect(acquireLock(paths, 'stop')).rejects.toThrow(/already working/)
+    expect(await claims(paths)).toEqual([`${process.pid}-cccc.json`])
+  })
+
+  test('clears litter: unparseable claims and drafts of dead writers, but not a live draft', async () => {
+    const paths = localPaths(tempDir())
+    await writeClaim(paths, 'garbage.json', '{ not json')
+    await writeClaim(paths, `${DEAD_PID}-dddd.tmp`, 'half')
+    await writeClaim(paths, `${process.pid}-eeee.tmp`, 'half')
     const release = await acquireLock(paths, 'start')
-    const other = JSON.stringify({ pid: process.pid, command: 'stop', startedAt: Date.now(), nonce: 'other' })
-    await writeFile(paths.lock, other)
     await release()
-    expect(readFileSync(paths.lock, 'utf-8')).toBe(other)
+    expect(await claims(paths)).toEqual([`${process.pid}-eeee.tmp`])
   })
 })
 
@@ -316,7 +340,7 @@ describe('removeWorkloads', () => {
   const docker = (...args: string[]) => spawnSync('docker', args, { encoding: 'utf-8', timeout: 120_000 })
   const IMAGE = 'busybox:stable'
 
-  test('removes only the containers on the install network and the volumes created for them', async () => {
+  test('removes the install network\'s containers, and only the volumes Temps created for them', async () => {
     if (docker('info', '--format', '{{.ServerVersion}}').status !== 0) {
       console.log('Docker not available, skipping')
       return
@@ -326,52 +350,70 @@ describe('removeWorkloads', () => {
       return
     }
     const id = `temps-cli-test-${process.pid}-${Date.now()}`
-    const names = {
-      network: `${id}-net`,
-      otherNetwork: `${id}-other-net`,
-      older: `${id}-older`,
-      install: `${id}-install`,
-      data: `${id}-data`,
-      shared: `${id}-shared`,
-      app: `${id}-app`,
-      service: `${id}-service`,
-      bystander: `${id}-bystander`,
-    }
+    const n = (suffix: string) => `${id}-${suffix}`
+    const stack = n('stack')
+    const containers = ['service', 'app', 'compose', 'spoof', 'bystander'].map(n)
+    const volumes = ['older', 'install', 'service-data', 'external', 'stack-data', 'other-stack-data', 'spoof-data', 'shared'].map(n)
     const cleanup = () => {
-      docker('rm', '-f', '-v', names.app, names.service, names.bystander)
-      docker('volume', 'rm', names.older, names.install, names.data, names.shared)
-      docker('network', 'rm', names.network, names.otherNetwork)
+      docker('rm', '-f', '-v', ...containers)
+      docker('volume', 'rm', ...volumes)
+      docker('network', 'rm', n('net'), n('other-net'))
     }
+    const ok = (...args: string[]) => {
+      const result = docker(...args)
+      expect([args.slice(0, 3).join(' '), result.status, result.stderr]).toEqual([args.slice(0, 3).join(' '), 0, ''])
+    }
+    const create = (name: string, network: string, labels: Record<string, string>, mounts: string[]) =>
+      ok(
+        'create', '--name', n(name), '--network', n(network),
+        ...Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
+        ...mounts.flatMap((volume) => ['-v', `${n(volume)}:/mnt/${volume}`]),
+        '-v', '/anonymous', IMAGE, 'true',
+      )
     try {
       // A volume from before the install, then (a second later, the
       // resolution of Docker's CreatedAt) the install's own marker volume.
-      expect(docker('volume', 'create', names.older).status).toBe(0)
+      ok('volume', 'create', n('older'))
       await new Promise((resolve) => setTimeout(resolve, 1100))
-      for (const volume of [names.install, names.data, names.shared]) expect(docker('volume', 'create', volume).status).toBe(0)
-      for (const network of [names.network, names.otherNetwork]) expect(docker('network', 'create', network).status).toBe(0)
-      const create = (name: string, network: string, ...volumes: string[]) =>
-        docker('create', '--name', name, '--network', network, ...volumes.flatMap((v) => ['-v', `${v}:/mnt/${v}`]), '-v', '/anonymous', IMAGE, 'true')
-      expect(create(names.app, names.network, names.data, names.older).status).toBe(0)
-      expect(create(names.service, names.network, names.shared).status).toBe(0)
-      // Another Temps' container: same engine, different network, sharing one volume.
-      expect(create(names.bystander, names.otherNetwork, names.shared).status).toBe(0)
+      for (const volume of ['install', 'service-data', 'external', 'spoof-data', 'shared']) ok('volume', 'create', n(volume))
+      ok('volume', 'create', '--label', `com.docker.compose.project=${stack}`, n('stack-data'))
+      ok('volume', 'create', '--label', 'com.docker.compose.project=someone-elses-stack', n('other-stack-data'))
+      ok('network', 'create', n('net'))
+      ok('network', 'create', n('other-net'))
 
-      const removed = await removeWorkloads(names.network, names.install)
+      // A managed service: its own data volume, a volume older than the
+      // install, and one a container outside the install also uses.
+      create('service', 'net', { 'temps.service_type': 'redis', 'temps.service_name': 'cache' }, ['service-data', 'older', 'shared'])
+      // An app pointed at a volume Temps did not create.
+      create('app', 'net', { 'sh.temps.managed': 'true', 'sh.temps.project_id': '1' }, ['external'])
+      // A Compose stack: the volume Compose made for it, and another stack's.
+      create('compose', 'net', { 'sh.temps.managed': 'true', 'com.docker.compose.project': stack }, ['stack-data', 'other-stack-data'])
+      // An app whose image ships a service label to pass for a managed service.
+      create('spoof', 'net', { 'temps.service_type': 'redis', 'sh.temps.project_id': '2' }, ['spoof-data'])
+      // Another Temps' container: same engine, different network.
+      create('bystander', 'other-net', { 'temps.service_type': 'redis' }, ['shared'])
 
-      expect(removed.containers.sort()).toEqual([names.app, names.service])
-      expect(removed.volumes).toEqual([names.data])
-      expect(removed.kept).toHaveLength(2)
-      expect(removed.kept.join('\n')).toMatch(new RegExp(`volume ${names.older}: it existed before this install`))
-      expect(removed.kept.join('\n')).toMatch(new RegExp(`volume ${names.shared}: .*in use`))
+      const removed = await removeWorkloads(n('net'), n('install'))
+
+      expect(removed.containers.sort()).toEqual(['app', 'compose', 'service', 'spoof'].map(n).sort())
+      expect(removed.volumes.sort()).toEqual(['service-data', 'stack-data'].map(n).sort())
+      const kept = removed.kept.join('\n')
+      expect(removed.kept).toHaveLength(5)
+      expect(kept).toMatch(new RegExp(`volume ${n('older')}: it existed before this install`))
+      expect(kept).toMatch(new RegExp(`volume ${n('external')}: Temps did not create it \\(it was attached to ${n('app')}\\)`))
+      expect(kept).toMatch(new RegExp(`volume ${n('other-stack-data')}: Temps did not create it`))
+      expect(kept).toMatch(new RegExp(`volume ${n('spoof-data')}: Temps did not create it`))
+      expect(kept).toMatch(new RegExp(`volume ${n('shared')}: .*in use`))
+
       const left = docker('ps', '-a', '--filter', `name=${id}`, '--format', '{{.Names}}').stdout.trim()
-      expect(left).toBe(names.bystander)
+      expect(left).toBe(n('bystander'))
       const volumesLeft = docker('volume', 'ls', '--filter', `name=${id}`, '--format', '{{.Name}}').stdout.trim().split('\n').sort()
-      expect(volumesLeft).toEqual([names.install, names.older, names.shared])
-      expect(docker('network', 'inspect', names.network).status).not.toBe(0)
-      expect(docker('network', 'inspect', names.otherNetwork).status).toBe(0)
+      expect(volumesLeft).toEqual(['external', 'install', 'older', 'other-stack-data', 'shared', 'spoof-data'].map(n).sort())
+      expect(docker('network', 'inspect', n('net')).status).not.toBe(0)
+      expect(docker('network', 'inspect', n('other-net')).status).toBe(0)
 
       // Nothing on the network: a no-op that reports nothing.
-      expect(await removeWorkloads(names.network, names.install)).toEqual({ containers: [], volumes: [], kept: [] })
+      expect(await removeWorkloads(n('net'), n('install'))).toEqual({ containers: [], volumes: [], kept: [] })
     } finally {
       cleanup()
     }
