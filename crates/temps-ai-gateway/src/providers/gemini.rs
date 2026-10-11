@@ -9,12 +9,12 @@ use std::time::Duration;
 use tokio_stream::Stream;
 
 use crate::error::AiGatewayError;
-use crate::providers::{external_http_client, AiProvider, ProviderCapability, ProviderInfo};
+use crate::providers::{AiProvider, ProviderCapability, ProviderHttpClient, ProviderInfo};
 use crate::types::*;
 
 pub struct GeminiProvider {
     info: ProviderInfo,
-    client: reqwest::Client,
+    client: ProviderHttpClient,
 }
 
 impl Default for GeminiProvider {
@@ -25,7 +25,7 @@ impl Default for GeminiProvider {
 
 impl GeminiProvider {
     pub fn new() -> Self {
-        let client = external_http_client(Duration::from_secs(300));
+        let client = ProviderHttpClient::new(Duration::from_secs(300));
 
         Self {
             info: ProviderInfo {

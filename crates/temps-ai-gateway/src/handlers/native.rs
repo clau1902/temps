@@ -427,7 +427,7 @@ async fn create_response(
     let user_id = auth.user_id_opt();
     let model = request.model.clone();
 
-    let (outcome, credential_type) = match app_state
+    let (outcome, served_by) = match app_state
         .native_api_service
         .create_response(&request, &byok)
         .await
@@ -438,6 +438,8 @@ async fn create_response(
             return Ok(error_to_response(call_error).into_response());
         }
     };
+    let credential_type = served_by.credential_type;
+    let provider_id = served_by.provider_id;
     let is_byok = credential_type == CredentialType::Byok;
 
     app_state.telemetry.report_once(
@@ -445,7 +447,7 @@ async fn create_response(
         temps_core::telemetry::TelemetryEvent::new(
             temps_core::telemetry::TelemetryEventKind::AiGatewayFirstRequest,
         )
-        .with("provider", "openai"),
+        .with("provider", provider_id),
     );
 
     match outcome {
@@ -458,7 +460,7 @@ async fn create_response(
                     if let Err(log_error) = usage_service
                         .log_usage_with_context(
                             user_id,
-                            "openai",
+                            provider_id,
                             &model,
                             usage.input_tokens,
                             usage.output_tokens,
@@ -497,7 +499,7 @@ async fn create_response(
                 stream,
                 app_state.usage_service.clone(),
                 user_id,
-                "openai".to_string(),
+                provider_id.to_string(),
                 model,
                 start,
                 is_byok,
@@ -509,7 +511,7 @@ async fn create_response(
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-store")
                 .header("x-content-type-options", "nosniff")
-                .header("x-temps-provider", "openai")
+                .header("x-temps-provider", provider_id)
                 .header(
                     "x-temps-credential-type",
                     credential_type_str(credential_type),
