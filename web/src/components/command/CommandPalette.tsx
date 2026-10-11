@@ -904,6 +904,12 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['monitoring', 'uptime', 'health', 'monitors'],
   },
   {
+    title: 'Status Pages',
+    url: 'status-pages',
+    icon: Globe,
+    keywords: ['status page', 'public status', 'uptime', 'outage', 'publish'],
+  },
+  {
     title: 'Traces',
     url: 'traces',
     icon: Workflow,

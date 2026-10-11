@@ -45,6 +45,8 @@ import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
+import { ProjectStatusPages } from '@/components/project/status-pages/ProjectStatusPages'
+import { StatusPageDetail } from '@/components/project/status-pages/StatusPageDetail'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
 import { ErrorTrackingSetup } from '@/components/project/setup/ErrorTrackingSetup'
@@ -561,6 +563,14 @@ export function ProjectDetail() {
                 element={<MonitorDetail project={project} />}
               />
               <Route
+                path="status-pages"
+                element={<ProjectStatusPages project={project} />}
+              />
+              <Route
+                path="status-pages/:statusPageId"
+                element={<StatusPageDetail project={project} />}
+              />
+              <Route
                 path="settings/telemetry"
                 element={<TelemetrySettings project={project} />}
               />
@@ -822,6 +832,14 @@ export function ProjectDetail() {
               <Route
                 path="monitors/:monitorId"
                 element={<MonitorDetail project={project} />}
+              />
+              <Route
+                path="status-pages"
+                element={<ProjectStatusPages project={project} />}
+              />
+              <Route
+                path="status-pages/:statusPageId"
+                element={<StatusPageDetail project={project} />}
               />
               <Route path="traces/*" element={<Traces project={project} />} />
               <Route
