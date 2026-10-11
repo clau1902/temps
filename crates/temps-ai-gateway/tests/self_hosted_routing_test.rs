@@ -257,6 +257,21 @@ async fn vendor_model_hosted_only_by_self_hosted_key_never_reaches_openrouter() 
         Some("Bearer sk-or-fake")
     );
 
+    // A different capitalisation of a self-hosted ID never falls through to
+    // the name heuristic (which would pick OpenRouter).
+    let error = harness
+        .gateway
+        .chat_completion(
+            &chat(&SELF_HOSTED_MODEL.to_uppercase(), false),
+            &ByokOverride::default(),
+        )
+        .await
+        .expect_err("case variant of a self-hosted model must be refused");
+    assert!(
+        matches!(&error, AiGatewayError::SelfHostedModelUnavailable { key_id, .. } if *key_id == self_hosted_key.id),
+        "{error:?}"
+    );
+
     // An ID served by two upstreams is refused, naming both keys ...
     harness
         .models
@@ -289,6 +304,40 @@ async fn vendor_model_hosted_only_by_self_hosted_key_never_reaches_openrouter() 
         .await
         .expect("explicitly selected key");
     assert_eq!(served.system_key_id, Some(self_hosted_key.id));
+
+    // With OpenRouter also listing the ID, deactivating the self-hosted key
+    // must not hand the model to OpenRouter.
+    harness
+        .keys
+        .update(
+            self_hosted_key.id,
+            temps_ai_gateway::services::ProviderKeyUpdate {
+                is_active: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("deactivate self-hosted key");
+    let error = harness
+        .gateway
+        .chat_completion(&chat(SELF_HOSTED_MODEL, false), &ByokOverride::default())
+        .await
+        .expect_err("inactive self-hosted key must not fall back to OpenRouter");
+    assert!(
+        matches!(&error, AiGatewayError::SelfHostedModelUnavailable { key_id, .. } if *key_id == self_hosted_key.id),
+        "{error:?}"
+    );
+    harness
+        .keys
+        .update(
+            self_hosted_key.id,
+            temps_ai_gateway::services::ProviderKeyUpdate {
+                is_active: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("reactivate self-hosted key");
 
     // Remove the OpenRouter listing again and disable the model on the
     // self-hosted key: the request is refused, never sent to OpenRouter.

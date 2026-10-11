@@ -328,6 +328,15 @@ mod tests {
     }
 
     #[test]
+    fn lenient_http_spellings_are_treated_as_plain_http() {
+        // WHATWG parsing (what reqwest uses) turns these into http://8.8.8.8.
+        for url in ["http:8.8.8.8/v1", "http:/8.8.8.8/v1", " HTTP://8.8.8.8/v1"] {
+            let message = reason(check_provider_url(url, None));
+            assert!(message.contains("plain http://"), "{url}: {message}");
+        }
+    }
+
+    #[test]
     fn untrusted_private_ip_literal_includes_both_hints() {
         let message = reason(check_provider_url("http://127.0.0.1:9/v1", None));
         assert!(message.contains("Loopback"), "{message}");

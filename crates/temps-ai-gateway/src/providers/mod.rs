@@ -286,14 +286,16 @@ impl ProviderHttpClient {
         }
     }
 
+    /// Pick the client from the scheme reqwest itself will use. The URL is
+    /// parsed (WHATWG rules, like reqwest) rather than prefix-matched, because
+    /// forms such as `http:host/v1`, ` http://host` or `HTTP:\\host` all
+    /// parse to plain `http://host`; a string check would hand them to the
+    /// TLS client, whose resolver accepts public addresses. Anything that is
+    /// not unambiguously `https` gets the stricter plaintext client.
     fn for_url(&self, url: &str) -> &reqwest::Client {
-        let plaintext = url
-            .get(..7)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
-        if plaintext {
-            &self.plaintext
-        } else {
-            &self.tls
+        match reqwest::Url::parse(url) {
+            Ok(parsed) if parsed.scheme() == "https" => &self.tls,
+            _ => &self.plaintext,
         }
     }
 
@@ -327,6 +329,40 @@ pub(crate) fn with_bearer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_is_chosen_from_the_parsed_scheme_not_a_prefix() {
+        let client = ProviderHttpClient::new(Duration::from_secs(1));
+        let plaintext = &client.plaintext as *const reqwest::Client;
+        let tls = &client.tls as *const reqwest::Client;
+        for url in [
+            "http://models.example.com/v1",
+            "HTTP://models.example.com/v1",
+            "http:models.example.com/v1",
+            "http:/models.example.com/v1",
+            "http:\\\\models.example.com\\v1",
+            " http://models.example.com/v1",
+            "ht\ttp://models.example.com/v1",
+            "not a url",
+        ] {
+            assert_eq!(
+                client.for_url(url) as *const reqwest::Client,
+                plaintext,
+                "{url:?} must use the trusted-private-only client"
+            );
+        }
+        for url in [
+            "https://api.openai.com/v1",
+            "HTTPS://api.openai.com/v1",
+            "https:api.openai.com/v1",
+        ] {
+            assert_eq!(
+                client.for_url(url) as *const reqwest::Client,
+                tls,
+                "{url:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_route_openai_models() {

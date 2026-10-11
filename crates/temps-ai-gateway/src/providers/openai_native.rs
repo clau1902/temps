@@ -71,6 +71,9 @@ pub struct OpenAiNativeClient {
     /// File uploads and downloads, which can move up to 200 MB and so need a
     /// longer overall deadline than a single model call.
     transfer_client: ProviderHttpClient,
+    /// Whether callers must re-check base URLs against the outbound policy
+    /// before sending. Only the loopback test client turns this off.
+    enforce_url_policy: bool,
 }
 
 impl Default for OpenAiNativeClient {
@@ -84,6 +87,7 @@ impl OpenAiNativeClient {
         Self {
             client: ProviderHttpClient::new(NATIVE_REQUEST_TIMEOUT),
             transfer_client: ProviderHttpClient::new(FILE_TRANSFER_TIMEOUT),
+            enforce_url_policy: true,
         }
     }
 
@@ -92,7 +96,13 @@ impl OpenAiNativeClient {
         Self {
             client: ProviderHttpClient::unrestricted_for_tests(),
             transfer_client: ProviderHttpClient::unrestricted_for_tests(),
+            enforce_url_policy: false,
         }
+    }
+
+    /// Whether base URLs must pass the outbound policy before use.
+    pub(crate) fn enforces_url_policy(&self) -> bool {
+        self.enforce_url_policy
     }
 
     fn url(base_url: &str, path: &str) -> String {
@@ -243,6 +253,7 @@ mod tests {
         let client = OpenAiNativeClient {
             client: ProviderHttpClient::unrestricted_for_tests(),
             transfer_client: ProviderHttpClient::unrestricted_for_tests(),
+            enforce_url_policy: false,
         };
         let reply = client
             .send_buffered(

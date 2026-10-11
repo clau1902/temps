@@ -18,6 +18,10 @@ use crate::handlers::types::AiGatewayAppState;
 pub(crate) const PROVIDER_KEY_CREATED: &str = "AI_PROVIDER_KEY_CREATED";
 pub(crate) const PROVIDER_KEY_UPDATED: &str = "AI_PROVIDER_KEY_UPDATED";
 pub(crate) const PROVIDER_KEY_DELETED: &str = "AI_PROVIDER_KEY_DELETED";
+pub(crate) const PROVIDER_MODELS_REFRESHED: &str = "AI_PROVIDER_MODELS_REFRESHED";
+pub(crate) const PROVIDER_MODEL_ADDED: &str = "AI_PROVIDER_MODEL_ADDED";
+pub(crate) const PROVIDER_MODEL_UPDATED: &str = "AI_PROVIDER_MODEL_UPDATED";
+pub(crate) const PROVIDER_MODEL_DELETED: &str = "AI_PROVIDER_MODEL_DELETED";
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProviderKeyAudit {
@@ -62,6 +66,82 @@ impl AuditOperation for ProviderKeyAudit {
     fn serialize(&self) -> AnyhowResult<String> {
         serde_json::to_string(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize AI provider key audit: {e}"))
+    }
+}
+
+/// A change to a provider key's model catalog. Enabling or disabling a model
+/// decides which key -- self-hosted or vendor -- may serve it, so these
+/// changes are security-relevant and audited like key changes.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProviderModelAudit {
+    #[serde(skip)]
+    operation: &'static str,
+    user_id: Option<i32>,
+    #[serde(skip)]
+    ip_address: Option<String>,
+    #[serde(skip)]
+    user_agent: String,
+    provider_key_id: i32,
+    /// Affected model ID; `None` for a whole-catalog refresh.
+    model_id: Option<String>,
+    /// New enabled state, for enable/disable.
+    is_enabled: Option<bool>,
+    /// Number of catalog rows after a refresh.
+    model_count: Option<usize>,
+}
+
+impl AuditOperation for ProviderModelAudit {
+    fn operation_type(&self) -> String {
+        self.operation.to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> AnyhowResult<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize AI provider model audit: {e}"))
+    }
+}
+
+/// Record a model catalog change. Failures are logged, never surfaced.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn audit_provider_model(
+    app_state: &AiGatewayAppState,
+    auth: &AuthContext,
+    metadata: &RequestMetadata,
+    operation: &'static str,
+    provider_key_id: i32,
+    model_id: Option<String>,
+    is_enabled: Option<bool>,
+    model_count: Option<usize>,
+) {
+    let audit = ProviderModelAudit {
+        operation,
+        user_id: auth.user_id_opt(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+        provider_key_id,
+        model_id,
+        is_enabled,
+        model_count,
+    };
+    if let Err(audit_error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            operation,
+            provider_key_id,
+            error = %audit_error,
+            "Failed to create audit log for AI provider model"
+        );
     }
 }
 

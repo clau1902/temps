@@ -63,9 +63,39 @@ impl ResolvedCredentials {
     /// decided here; hostnames are checked again by the client's resolver.
     pub(crate) fn check_base_url(&self) -> Result<(), AiGatewayError> {
         if let Some(base_url) = self.base_url.as_deref() {
-            check_provider_url(base_url, self.key_trust)?;
+            check_provider_url(base_url, self.key_trust)
+                .map_err(|error| self.caller_facing(error))?;
         }
         Ok(())
+    }
+
+    /// A blocked base URL on an administrator-configured key is an operator
+    /// problem: gateway callers (including deployment tokens) get a generic
+    /// message without the configured host or network details, which are
+    /// logged instead. Admins see the full reason via "Test key". BYOK
+    /// callers supplied the URL themselves and get the full reason.
+    pub(crate) fn caller_facing(&self, error: AiGatewayError) -> AiGatewayError {
+        match (self.credential_type, self.system_key_id, error) {
+            (
+                CredentialType::System,
+                Some(key_id),
+                AiGatewayError::InvalidProviderUrl { reason },
+            ) => {
+                warn!(
+                    provider_key_id = key_id,
+                    reason = %reason,
+                    "Configured AI provider base URL blocked by the outbound policy"
+                );
+                AiGatewayError::InvalidProviderUrl {
+                    reason: format!(
+                        "the base URL configured on provider key {key_id} is not allowed by this \
+                         instance's outbound policy; an administrator can see why by testing the \
+                         key under AI Gateway"
+                    ),
+                }
+            }
+            (_, _, error) => error,
+        }
     }
 
     /// Refuse a request that needs a capability the self-hosted key did not
@@ -124,62 +154,88 @@ pub(crate) enum CatalogRoute {
 
 /// Decide which key serves `model` from its catalog entries (#1408).
 ///
-/// Entries are served when the row is enabled and available and the key is
-/// active. Two serving keys are only interchangeable when they reach the same
-/// upstream destination (same provider type and effective base URL) -- e.g.
-/// two OpenAI keys on the default endpoint -- in which case the lowest key id
-/// is used, as before. Anything else is ambiguous and refused.
+/// `entries` are every catalog row whose model ID matches `model` ignoring
+/// case, in any state. A row serves when it matches exactly, is enabled and
+/// available, and its key is active. Two serving keys are only
+/// interchangeable when they reach the same upstream destination (same
+/// provider type and effective base URL) -- e.g. two OpenAI keys on the
+/// default endpoint -- in which case the lowest key id is used, as before.
+/// Anything else is ambiguous and refused.
+///
+/// A self-hosted key that lists the model but cannot serve it right now (key
+/// inactive, model disabled or no longer listed, or listed with different
+/// capitalisation) still "hosts" it: no other destination may serve it, and
+/// the name heuristic is never consulted. Only an explicitly pinned key can
+/// override that.
 pub(crate) fn route_by_catalog(
+    model: &str,
     entries: &[(ai_provider_models::Model, ai_provider_keys::Model)],
     default_base_url: impl Fn(&str) -> Option<&'static str>,
 ) -> CatalogRoute {
+    let destination = |key: &ai_provider_keys::Model| {
+        let base = key
+            .base_url
+            .clone()
+            .or_else(|| default_base_url(&key.provider).map(str::to_string))
+            .unwrap_or_default();
+        (
+            key.provider.clone(),
+            base.trim().trim_end_matches('/').to_ascii_lowercase(),
+        )
+    };
+    let is_serving = |(row, key): &&(ai_provider_models::Model, ai_provider_keys::Model)| {
+        row.model_id == model && key.is_active && row.is_enabled && row.is_available
+    };
     let serving: Vec<&ai_provider_keys::Model> = entries
         .iter()
-        .filter(|(model, key)| key.is_active && model.is_enabled && model.is_available)
+        .filter(is_serving)
         .map(|(_, key)| key)
         .collect();
-    if let Some(first) = serving.iter().min_by_key(|key| key.id) {
-        let destination = |key: &ai_provider_keys::Model| {
-            let base = key
-                .base_url
-                .clone()
-                .or_else(|| default_base_url(&key.provider).map(str::to_string))
-                .unwrap_or_default();
-            (
-                key.provider.clone(),
-                base.trim().trim_end_matches('/').to_ascii_lowercase(),
-            )
+    let hosted_elsewhere = |served: Option<&(String, String)>| {
+        entries.iter().find(|entry| {
+            let (_, key) = entry;
+            is_self_hosted(&key.provider)
+                && !is_serving(entry)
+                && served.is_none_or(|served| destination(key) != *served)
+        })
+    };
+    let unavailable = |(row, key): &(ai_provider_models::Model, ai_provider_keys::Model)| {
+        let reason = if row.model_id != model {
+            format!("it lists the model as '{}'", row.model_id)
+        } else if !key.is_active {
+            "the key is inactive".to_string()
+        } else if !row.is_enabled {
+            "the model is disabled on that key".to_string()
+        } else {
+            "the server no longer lists the model".to_string()
         };
+        CatalogRoute::SelfHostedUnavailable {
+            key_id: key.id,
+            reason,
+        }
+    };
+
+    if let Some(first) = serving.iter().min_by_key(|key| key.id) {
         let first_destination = destination(first);
-        if serving
+        if !serving
             .iter()
             .all(|key| destination(key) == first_destination)
         {
-            return CatalogRoute::Key(first.id);
+            let mut candidates: Vec<(i32, String)> = serving
+                .iter()
+                .map(|key| (key.id, key.provider.clone()))
+                .collect();
+            candidates.sort();
+            candidates.dedup();
+            return CatalogRoute::Ambiguous(candidates);
         }
-        let mut candidates: Vec<(i32, String)> = serving
-            .iter()
-            .map(|key| (key.id, key.provider.clone()))
-            .collect();
-        candidates.sort();
-        candidates.dedup();
-        return CatalogRoute::Ambiguous(candidates);
+        if let Some(entry) = hosted_elsewhere(Some(&first_destination)) {
+            return unavailable(entry);
+        }
+        return CatalogRoute::Key(first.id);
     }
-    if let Some((model, key)) = entries
-        .iter()
-        .find(|(_, key)| is_self_hosted(&key.provider))
-    {
-        let reason = if !key.is_active {
-            "the key is inactive"
-        } else if !model.is_enabled {
-            "the model is disabled on that key"
-        } else {
-            "the server no longer lists the model"
-        };
-        return CatalogRoute::SelfHostedUnavailable {
-            key_id: key.id,
-            reason: reason.to_string(),
-        };
+    if let Some(entry) = hosted_elsewhere(None) {
+        return unavailable(entry);
     }
     CatalogRoute::NotInCatalog
 }
@@ -514,7 +570,7 @@ impl GatewayService {
             return Ok(key);
         }
 
-        let route = route_by_catalog(&entries, |provider| {
+        let route = route_by_catalog(model, &entries, |provider| {
             self.providers
                 .get(provider)
                 .map(|adapter| adapter.info().default_base_url)
@@ -648,7 +704,8 @@ impl GatewayService {
                 credentials.base_url.as_deref(),
                 request,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
 
         Ok((response, ServedBy::from_credentials(&credentials)))
     }
@@ -708,7 +765,8 @@ impl GatewayService {
                 credentials.base_url.as_deref(),
                 request,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
 
         Ok((stream, ServedBy::from_credentials(&credentials)))
     }
@@ -774,7 +832,8 @@ impl GatewayService {
                 credentials.base_url.as_deref(),
                 request,
             )
-            .await?;
+            .await
+            .map_err(|error| credentials.caller_facing(error))?;
 
         Ok((response, ServedBy::from_credentials(&credentials)))
     }
@@ -1370,7 +1429,7 @@ mod tests {
             key(2, OPENAI_COMPATIBLE, Some("http://10.0.0.5:8000/v1"), true),
         )];
         assert_eq!(
-            route_by_catalog(&entries, default_url),
+            route_by_catalog(HOSTED, &entries, default_url),
             CatalogRoute::Key(2)
         );
     }
@@ -1385,7 +1444,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            route_by_catalog(&entries, default_url),
+            route_by_catalog(HOSTED, &entries, default_url),
             CatalogRoute::Ambiguous(vec![
                 (1, "openrouter".to_string()),
                 (2, OPENAI_COMPATIBLE.to_string())
@@ -1403,7 +1462,7 @@ mod tests {
             ),
         ];
         assert!(matches!(
-            route_by_catalog(&entries, default_url),
+            route_by_catalog(HOSTED, &entries, default_url),
             CatalogRoute::Ambiguous(_)
         ));
     }
@@ -1420,7 +1479,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            route_by_catalog(&entries, default_url),
+            route_by_catalog("gpt-4o", &entries, default_url),
             CatalogRoute::Key(5)
         );
     }
@@ -1450,7 +1509,7 @@ mod tests {
                 "inactive",
             ),
         ] {
-            match route_by_catalog(&[entry], default_url) {
+            match route_by_catalog(HOSTED, &[entry], default_url) {
                 CatalogRoute::SelfHostedUnavailable { key_id, reason } => {
                     assert_eq!(key_id, 2);
                     assert!(reason.contains(expected_reason), "{reason}");
@@ -1461,16 +1520,88 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_self_hosted_model_blocks_a_vendor_listing_the_same_id() {
+        // LM Studio-style IDs can equal OpenRouter's exactly. Once the
+        // self-hosted key cannot serve the model, the vendor that also lists
+        // it must not silently take over.
+        let shared = "qwen/qwen3-8b";
+        for self_hosted in [
+            (
+                row(2, shared, true, true),
+                key(2, OPENAI_COMPATIBLE, Some("http://10.0.0.5/v1"), false),
+            ),
+            (
+                row(2, shared, true, false),
+                key(2, OPENAI_COMPATIBLE, Some("http://10.0.0.5/v1"), true),
+            ),
+            (
+                row(2, shared, false, true),
+                key(2, OPENAI_COMPATIBLE, Some("http://10.0.0.5/v1"), true),
+            ),
+        ] {
+            let entries = vec![
+                (row(1, shared, true, true), key(1, "openrouter", None, true)),
+                self_hosted,
+            ];
+            assert!(
+                matches!(
+                    route_by_catalog(shared, &entries, default_url),
+                    CatalogRoute::SelfHostedUnavailable { key_id: 2, .. }
+                ),
+                "{entries:?}"
+            );
+        }
+        // Two self-hosted keys on the same server stay interchangeable even
+        // when one of them is inactive.
+        let entries = vec![
+            (
+                row(3, shared, true, true),
+                key(3, OPENAI_COMPATIBLE, Some("http://10.0.0.5/v1"), true),
+            ),
+            (
+                row(4, shared, true, true),
+                key(4, OPENAI_COMPATIBLE, Some("http://10.0.0.5/v1/"), false),
+            ),
+        ];
+        assert_eq!(
+            route_by_catalog(shared, &entries, default_url),
+            CatalogRoute::Key(3)
+        );
+    }
+
+    #[test]
+    fn self_hosted_case_variant_blocks_the_name_heuristic() {
+        // The server lists `Org/Model-8B`; a client asks for `org/model-8b`.
+        // The heuristic would say OpenRouter -- the request must be refused.
+        let entries = vec![(
+            row(2, "Org/Model-8B", true, true),
+            key(2, OPENAI_COMPATIBLE, Some("http://10.0.0.5/v1"), true),
+        )];
+        match route_by_catalog("org/model-8b", &entries, default_url) {
+            CatalogRoute::SelfHostedUnavailable { key_id, reason } => {
+                assert_eq!(key_id, 2);
+                assert!(reason.contains("Org/Model-8B"), "{reason}");
+            }
+            other => panic!("expected SelfHostedUnavailable, got {other:?}"),
+        }
+        // Exact match still routes normally.
+        assert_eq!(
+            route_by_catalog("Org/Model-8B", &entries, default_url),
+            CatalogRoute::Key(2)
+        );
+    }
+
+    #[test]
     fn vendor_rows_that_cannot_serve_fall_through_to_the_heuristic() {
         // Only vendor rows, none serving: the existing fallback (which then
         // applies that key's own catalog rules) keeps working.
         let entries = vec![(row(1, "gpt-4o", false, true), key(1, "openai", None, true))];
         assert_eq!(
-            route_by_catalog(&entries, default_url),
+            route_by_catalog("gpt-4o", &entries, default_url),
             CatalogRoute::NotInCatalog
         );
         assert_eq!(
-            route_by_catalog(&[], default_url),
+            route_by_catalog(HOSTED, &[], default_url),
             CatalogRoute::NotInCatalog
         );
     }

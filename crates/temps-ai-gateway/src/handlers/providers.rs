@@ -20,7 +20,9 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::error::AiGatewayError;
 use crate::handlers::provider_audit::{
-    audit_provider_key, PROVIDER_KEY_CREATED, PROVIDER_KEY_DELETED, PROVIDER_KEY_UPDATED,
+    audit_provider_key, audit_provider_model, PROVIDER_KEY_CREATED, PROVIDER_KEY_DELETED,
+    PROVIDER_KEY_UPDATED, PROVIDER_MODELS_REFRESHED, PROVIDER_MODEL_ADDED, PROVIDER_MODEL_DELETED,
+    PROVIDER_MODEL_UPDATED,
 };
 use crate::handlers::types::AiGatewayAppState;
 use crate::provider_url::KeyTrust;
@@ -777,11 +779,23 @@ async fn discover_provider_models(
 async fn refresh_provider_models(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AiGatewayAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayWrite);
     let models = app_state.provider_model_service.refresh(id).await?;
     app_state.provider_status_cache.invalidate().await;
+    audit_provider_model(
+        &app_state,
+        &auth,
+        &metadata,
+        PROVIDER_MODELS_REFRESHED,
+        id,
+        None,
+        None,
+        Some(models.len()),
+    )
+    .await;
     Ok(Json(
         models
             .into_iter()
@@ -802,6 +816,7 @@ async fn refresh_provider_models(
 async fn add_provider_model(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AiGatewayAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(id): Path<i32>,
     Json(request): Json<AddProviderModelRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -811,6 +826,17 @@ async fn add_provider_model(
         .add_manual(id, &request.model_id, request.display_name.as_deref())
         .await?;
     app_state.provider_status_cache.invalidate().await;
+    audit_provider_model(
+        &app_state,
+        &auth,
+        &metadata,
+        PROVIDER_MODEL_ADDED,
+        id,
+        Some(model.model_id.clone()),
+        Some(model.is_enabled),
+        None,
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(ProviderModelResponse::from(model)),
@@ -829,6 +855,7 @@ async fn add_provider_model(
 async fn update_provider_model(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AiGatewayAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path((id, model_row_id)): Path<(i32, i32)>,
     Json(request): Json<UpdateProviderModelRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -838,6 +865,17 @@ async fn update_provider_model(
         .set_enabled(id, model_row_id, request.is_enabled)
         .await?;
     app_state.provider_status_cache.invalidate().await;
+    audit_provider_model(
+        &app_state,
+        &auth,
+        &metadata,
+        PROVIDER_MODEL_UPDATED,
+        id,
+        Some(model.model_id.clone()),
+        Some(model.is_enabled),
+        None,
+    )
+    .await;
     Ok(Json(ProviderModelResponse::from(model)))
 }
 
@@ -852,6 +890,7 @@ async fn update_provider_model(
 async fn delete_provider_model(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AiGatewayAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path((id, model_row_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayWrite);
@@ -860,6 +899,17 @@ async fn delete_provider_model(
         .delete_manual(id, model_row_id)
         .await?;
     app_state.provider_status_cache.invalidate().await;
+    audit_provider_model(
+        &app_state,
+        &auth,
+        &metadata,
+        PROVIDER_MODEL_DELETED,
+        id,
+        Some(format!("row {model_row_id}")),
+        None,
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

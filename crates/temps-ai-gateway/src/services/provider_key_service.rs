@@ -121,9 +121,13 @@ impl ProviderKeyService {
             (Some(_), Some(url)) => Some(KeyTrust::for_base_url(url)?),
             (None, _) => None,
         };
-        if let Some(url) = base_url {
-            validate_provider_url(url, key_trust).await?;
-        }
+        // Store the canonical form of what was validated, so a lenient
+        // spelling (`http:host`, stray whitespace) cannot be read differently
+        // later.
+        let base_url = match base_url {
+            Some(url) => Some(validate_provider_url(url, key_trust).await?.to_string()),
+            None => None,
+        };
         if capabilities.is_some() && !self_hosted {
             return Err(AiGatewayError::Validation {
                 message: format!(
@@ -142,7 +146,7 @@ impl ProviderKeyService {
             provider: Set(provider.to_string()),
             display_name: Set(display_name.to_string()),
             api_key_encrypted: Set(encrypted_key),
-            base_url: Set(base_url.map(|s| s.to_string())),
+            base_url: Set(base_url),
             default_model: Set(default_model.map(|s| s.to_string())),
             is_active: Set(true),
             trusted_private_address: Set(key_trust.map(KeyTrust::to_stored)),
@@ -235,7 +239,7 @@ impl ProviderKeyService {
         Ok(CatalogMembership::LegacyUncataloged)
     }
 
-    /// Every catalog row listing `model_id`, in any state, with its key --
+    /// Every catalog row listing `model_id` (ignoring case), in any state, with its key --
     /// one JOIN query. Request routing decides from these which key may serve
     /// the model, so disabled rows and inactive keys are included on purpose:
     /// a model a self-hosted key hosts must not fall through to the name
@@ -244,8 +248,19 @@ impl ProviderKeyService {
         &self,
         model_id: &str,
     ) -> Result<Vec<(ai_provider_models::Model, ai_provider_keys::Model)>, AiGatewayError> {
+        // Matched ignoring case (served by `idx_ai_provider_models_model_id_lower`)
+        // so a self-hosted listing that differs only in capitalisation still
+        // blocks the name heuristic; serving requires the exact ID.
         let rows = ai_provider_models::Entity::find()
-            .filter(ai_provider_models::Column::ModelId.eq(model_id))
+            .filter(
+                sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                    sea_orm::sea_query::Expr::col((
+                        ai_provider_models::Entity,
+                        ai_provider_models::Column::ModelId,
+                    )),
+                ))
+                .eq(model_id.to_lowercase()),
+            )
             .find_also_related(ai_provider_keys::Entity)
             .order_by_asc(ai_provider_models::Column::ProviderKeyId)
             .all(self.db.as_ref())
@@ -328,11 +343,14 @@ impl ProviderKeyService {
             }),
         };
 
-        let base_url_changed = base_url != existing.base_url;
+        let mut base_url_changed = base_url != existing.base_url;
         let trust_changed = new_trust != existing_trust;
+        let mut base_url = base_url;
         if base_url_changed || (trust_changed && new_trust.is_some()) {
             if let Some(url) = base_url.as_deref() {
-                validate_provider_url(url, new_trust).await?;
+                let canonical = validate_provider_url(url, new_trust).await?.to_string();
+                base_url = Some(canonical);
+                base_url_changed = base_url != existing.base_url;
             }
         }
 

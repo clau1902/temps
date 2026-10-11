@@ -489,6 +489,12 @@ impl NativeApiService {
     }
 
     fn base_url(&self, credentials: &ResolvedCredentials) -> Result<String, AiGatewayError> {
+        // Re-check at every use, including background reconciliation of
+        // objects created with a caller's key: the trusted networks may have
+        // changed since, and a pre-existing row may predate the http rule.
+        if self.client.enforces_url_policy() {
+            credentials.check_base_url()?;
+        }
         let base_url = match credentials.base_url.as_deref() {
             Some(base_url) => base_url.to_string(),
             None => self

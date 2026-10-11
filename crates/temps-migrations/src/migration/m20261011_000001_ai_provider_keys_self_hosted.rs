@@ -10,8 +10,10 @@
 //! * `capabilities` holds the capabilities an administrator declared for a
 //!   self-hosted key (streaming, tools, embeddings, Responses API); built-in
 //!   vendor keys leave it NULL.
-//! * Requests are routed by exact model id against the catalog, so
-//!   `ai_provider_models.model_id` gets its own index.
+//! * Requests are routed by model id against the catalog (looked up ignoring
+//!   case, so a self-hosted listing that differs only in capitalisation still
+//!   blocks the name heuristic), so `LOWER(ai_provider_models.model_id)` gets
+//!   its own index.
 //!
 //! Existing rows need no backfill: every new column is nullable and NULL
 //! means "no per-key trust" / "vendor-defined capabilities".
@@ -32,7 +34,7 @@ ALTER TABLE ai_provider_keys ADD COLUMN IF NOT EXISTS trusted_private_address TE
 ALTER TABLE ai_provider_keys ADD COLUMN IF NOT EXISTS trusted_private_address_set_by INTEGER;
 ALTER TABLE ai_provider_keys ADD COLUMN IF NOT EXISTS trusted_private_address_set_at TIMESTAMPTZ;
 ALTER TABLE ai_provider_keys ADD COLUMN IF NOT EXISTS capabilities JSONB;
-CREATE INDEX IF NOT EXISTS idx_ai_provider_models_model_id ON ai_provider_models(model_id);
+CREATE INDEX IF NOT EXISTS idx_ai_provider_models_model_id_lower ON ai_provider_models(LOWER(model_id));
 "#,
             )
             .await?;
@@ -44,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_provider_models_model_id ON ai_provider_models
             .get_connection()
             .execute_unprepared(
                 r#"
-DROP INDEX IF EXISTS idx_ai_provider_models_model_id;
+DROP INDEX IF EXISTS idx_ai_provider_models_model_id_lower;
 ALTER TABLE ai_provider_keys DROP COLUMN IF EXISTS capabilities;
 ALTER TABLE ai_provider_keys DROP COLUMN IF EXISTS trusted_private_address_set_at;
 ALTER TABLE ai_provider_keys DROP COLUMN IF EXISTS trusted_private_address_set_by;
