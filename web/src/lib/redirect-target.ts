@@ -21,8 +21,11 @@ export function redirectTarget(to: string, search: string, hash: string): To {
   const query = new URLSearchParams(
     queryStart === -1 ? '' : withoutHash.slice(queryStart + 1)
   )
+  // Keys the target itself sets; every incoming value of any other key rides
+  // along, so a repeated parameter (`?attr=a&attr=b`) keeps all its values.
+  const targetKeys = new Set(query.keys())
   new URLSearchParams(search).forEach((value, key) => {
-    if (!query.has(key)) query.append(key, value)
+    if (!targetKeys.has(key)) query.append(key, value)
   })
   const merged = query.toString()
   return {

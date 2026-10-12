@@ -34,6 +34,18 @@ test('parameters on the target win over the incoming ones', () => {
   })
 })
 
+test('a repeated incoming parameter keeps every value', () => {
+  expect(redirectTarget('/logs', '?attr=a&attr=b&level=error', '').search).toBe(
+    '?attr=a&attr=b&level=error'
+  )
+})
+
+test('a target parameter replaces every incoming value of that key', () => {
+  expect(
+    redirectTarget('/logs?level=warn', '?level=a&level=b&attr=x', '').search
+  ).toBe('?level=warn&attr=x')
+})
+
 function Where() {
   const location = useLocation()
   return (

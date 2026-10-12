@@ -275,7 +275,16 @@ export function MajorUpgradeDetail() {
           'Upgrade not found.'
         }
         action={
-          <Button onClick={() => void upgradeQuery.refetch()}>Retry</Button>
+          <Button
+            onClick={() => {
+              // The logs read can have failed in the same outage, and polling
+              // stays off once the upgrade turns out to be finished.
+              void upgradeQuery.refetch()
+              void logsQuery.refetch()
+            }}
+          >
+            Retry
+          </Button>
         }
       />
     )

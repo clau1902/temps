@@ -2,4 +2,4 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 [test]
-preload = ["./src/test/setup-dom.ts"]
+preload = ["./src/test/setup-dom.ts", "./src/test/setup-hooks.ts"]

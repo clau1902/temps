@@ -30,6 +30,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRight, Loader2, Plus, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
+import { rolePriorityError } from '@/lib/oidc-role-priority'
 
 function nextDefaultPriority(existing: OidcRoleMappingResponse[]): number {
   if (existing.length === 0) return 100
@@ -105,6 +106,11 @@ export function OidcRoleMappingsCard({
   const handleAdd = () => {
     const idpGroup = draftGroup.trim()
     if (!idpGroup) return
+    const priorityError = rolePriorityError(draftPriority)
+    if (priorityError) {
+      toast.error(priorityError)
+      return
+    }
     createMapping.mutate({
       path: { provider_id: providerId },
       body: {

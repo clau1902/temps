@@ -3,6 +3,13 @@
 
 import { client } from '@/api/client/client.gen'
 import { attachHttpStatus } from '@/lib/http-error-status'
+import {
+  registerMockRestore,
+  restoreAllMockApis,
+  unregisterMockRestore,
+} from './mock-registry'
+
+export { restoreAllMockApis }
 
 type Handler = (request: Request) => Response | Promise<Response>
 
@@ -22,7 +29,8 @@ export function jsonResponse(body: unknown, status = 200): Response {
  * Replaces `globalThis.fetch` for the generated API client with a route table
  * keyed `"METHOD /path"` (path without the `/api` prefix and query string).
  * Unmatched requests answer 404 and are recorded, so a test can assert that
- * a request was *not* sent as well as that it was. Call `restore()` when done.
+ * a request was *not* sent as well as that it was. Call `restore()` when done; anything
+ * left installed is restored after each test.
  */
 export function mockApi(routes: Record<string, Handler>) {
   const calls: RecordedCall[] = []
@@ -48,12 +56,15 @@ export function mockApi(routes: Record<string, Handler>) {
     client.interceptors.error.use(attachHttpStatus)
   }
   client.setConfig({ baseUrl: 'http://localhost/api', fetch: mockedFetch })
+  const restore = () => {
+    if (!unregisterMockRestore(restore)) return
+    client.setConfig({ baseUrl: previous.baseUrl, fetch: previous.fetch })
+  }
+  registerMockRestore(restore)
   return {
     calls,
     called: (method: string, path: string) =>
       calls.some((call) => call.method === method && call.path === path),
-    restore: () => {
-      client.setConfig({ baseUrl: previous.baseUrl, fetch: previous.fetch })
-    },
+    restore,
   }
 }
