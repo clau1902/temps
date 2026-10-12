@@ -36,13 +36,13 @@ futures = { workspace = true }
 arc-swap = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 temps-migrations = { path = "../temps-migrations" }
 tower = { workspace = true, features = ["util"] }
 tokio-test = "0.4"
 wiremock = "0.6"
-async-trait = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

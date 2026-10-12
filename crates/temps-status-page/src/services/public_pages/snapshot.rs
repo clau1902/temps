@@ -54,8 +54,8 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const CURRENT_STATUS_MAX_AGE_HOURS: i64 = 24;
 /// Resolved incidents stay on the public page for this many days.
 const RESOLVED_INCIDENT_RETENTION_DAYS: i64 = 14;
-/// Most incidents considered per project per refresh.
-const MAX_INCIDENTS_PER_PROJECT: i64 = 25;
+/// Most incidents shown per page (active ones first).
+const MAX_INCIDENTS_PER_PAGE: i64 = 25;
 /// Most public updates shown per incident.
 const MAX_UPDATES_PER_INCIDENT: usize = 20;
 /// Bound on bind parameters per `IN (...)` list; Postgres allows 65535.
@@ -130,8 +130,9 @@ pub(crate) struct SelectionRow {
 
 #[derive(Debug, Clone, FromQueryResult)]
 pub(crate) struct IncidentRow {
+    /// The page this row was selected for; an incident appears once per page.
+    pub status_page_id: i32,
     pub id: i32,
-    pub project_id: i32,
     pub environment_id: Option<i32>,
     pub monitor_id: Option<i32>,
     pub severity: String,
@@ -170,7 +171,8 @@ pub(crate) struct RefreshData {
     pub latest_status: HashMap<i32, String>,
     /// Day counts per monitor, past days and today merged.
     pub days: HashMap<i32, HashMap<NaiveDate, DayCounts>>,
-    /// Incidents with at least one public update, per project.
+    /// Incidents with at least one public update that concern a page's
+    /// selection, per status page.
     pub incidents: HashMap<i32, Vec<IncidentRow>>,
     /// Public updates per incident, newest first.
     pub updates: HashMap<i32, Vec<PublicUpdateRow>>,
@@ -290,14 +292,7 @@ impl StatusSnapshotCache {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let project_ids: Vec<i32> = pages
-            .iter()
-            .map(|p| p.project_id)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        let data = load_refresh_data(db, &mut state, &monitor_ids, &project_ids, now).await?;
+        let data = load_refresh_data(db, &mut state, &monitor_ids, &page_ids, now).await?;
         if matches!(scope, Scope::All) {
             let live: HashSet<i32> = monitor_ids.iter().copied().collect();
             state
@@ -459,11 +454,11 @@ async fn load_refresh_data(
     db: &DatabaseConnection,
     state: &mut WriterState,
     monitor_ids: &[i32],
-    project_ids: &[i32],
+    page_ids: &[i32],
     now: UtcDateTime,
 ) -> Result<RefreshData, DbErr> {
     let mut data = RefreshData::default();
-    if monitor_ids.is_empty() && project_ids.is_empty() {
+    if monitor_ids.is_empty() && page_ids.is_empty() {
         return Ok(data);
     }
 
@@ -551,28 +546,59 @@ async fn load_refresh_data(
 
     let cutoff = now - chrono::Duration::days(RESOLVED_INCIDENT_RETENTION_DAYS);
     let mut incident_ids = Vec::new();
-    for chunk in project_ids.chunks(MAX_IDS_PER_QUERY) {
+    for chunk in page_ids.chunks(MAX_IDS_PER_QUERY) {
         let n = chunk.len();
+        // Select per page, after applying that page's monitor selection, and
+        // rank active incidents ahead of resolved history, so the per-page
+        // limit can never push an active incident off the page.
         let sql = format!(
             r#"
-            SELECT id, project_id, environment_id, monitor_id, severity, status,
-                   started_at, resolved_at
-            FROM (
-                SELECT i.id, i.project_id, i.environment_id, i.monitor_id, i.severity,
-                       i.status, i.started_at, i.resolved_at,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY i.project_id ORDER BY i.started_at DESC, i.id DESC
-                       ) AS rn
-                FROM status_incidents i
-                WHERE i.project_id IN ({})
-                  AND (i.status <> 'resolved' OR i.resolved_at >= ${} OR i.started_at >= ${})
+            WITH pages AS (
+                SELECT id AS status_page_id, project_id
+                FROM status_pages
+                WHERE id IN ({})
+            ),
+            sel AS (
+                SELECT spm.status_page_id, spm.monitor_id, sm.environment_id
+                FROM status_page_monitors spm
+                JOIN pages p ON p.status_page_id = spm.status_page_id
+                JOIN status_monitors sm
+                  ON sm.id = spm.monitor_id AND sm.project_id = p.project_id
+            ),
+            candidates AS (
+                SELECT p.status_page_id, i.id, i.project_id, i.environment_id,
+                       i.monitor_id, i.severity, i.status, i.started_at, i.resolved_at
+                FROM pages p
+                JOIN status_incidents i ON i.project_id = p.project_id
+                WHERE (i.status <> 'resolved' OR i.resolved_at >= ${} OR i.started_at >= ${})
+                  AND (
+                      (i.monitor_id IS NOT NULL AND EXISTS (
+                          SELECT 1 FROM sel s
+                          WHERE s.status_page_id = p.status_page_id
+                            AND s.monitor_id = i.monitor_id))
+                      OR (i.monitor_id IS NULL AND i.environment_id IS NULL)
+                      OR (i.monitor_id IS NULL AND EXISTS (
+                          SELECT 1 FROM sel s
+                          WHERE s.status_page_id = p.status_page_id
+                            AND s.environment_id = i.environment_id))
+                  )
                   AND EXISTS (
                       SELECT 1 FROM status_incident_updates u
                       WHERE u.incident_id = i.id AND u.is_public AND NOT u.is_system
                   )
+            )
+            SELECT status_page_id, id, environment_id, monitor_id, severity,
+                   status, started_at, resolved_at
+            FROM (
+                SELECT candidates.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY status_page_id
+                           ORDER BY (status = 'resolved'), started_at DESC, id DESC
+                       ) AS rn
+                FROM candidates
             ) ranked
             WHERE rn <= ${}
-            ORDER BY started_at DESC, id DESC
+            ORDER BY status_page_id, started_at DESC, id DESC
             "#,
             placeholders(1, n),
             n + 1,
@@ -582,7 +608,7 @@ async fn load_refresh_data(
         let mut values = id_values(chunk);
         values.push(cutoff.into());
         values.push(cutoff.into());
-        values.push(MAX_INCIDENTS_PER_PROJECT.into());
+        values.push(MAX_INCIDENTS_PER_PAGE.into());
         for row in IncidentRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             &sql,
@@ -592,32 +618,47 @@ async fn load_refresh_data(
         .await?
         {
             incident_ids.push(row.id);
-            data.incidents.entry(row.project_id).or_default().push(row);
+            data.incidents
+                .entry(row.status_page_id)
+                .or_default()
+                .push(row);
         }
     }
+    incident_ids.sort_unstable();
+    incident_ids.dedup();
 
     for chunk in incident_ids.chunks(MAX_IDS_PER_QUERY) {
+        let n = chunk.len();
+        // The per-incident limit is applied in SQL so a long-running incident
+        // never makes a refresh read its whole history.
         let sql = format!(
             r#"
             SELECT incident_id, status, message, created_at
-            FROM status_incident_updates
-            WHERE is_public AND NOT is_system AND incident_id IN ({})
+            FROM (
+                SELECT incident_id, status, message, created_at, id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY incident_id ORDER BY created_at DESC, id DESC
+                       ) AS rn
+                FROM status_incident_updates
+                WHERE is_public AND NOT is_system AND incident_id IN ({})
+            ) ranked
+            WHERE rn <= ${}
             ORDER BY incident_id, created_at DESC, id DESC
             "#,
-            placeholders(1, chunk.len())
+            placeholders(1, n),
+            n + 1
         );
+        let mut values = id_values(chunk);
+        values.push((MAX_UPDATES_PER_INCIDENT as i64).into());
         for row in PublicUpdateRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             &sql,
-            id_values(chunk),
+            values,
         ))
         .all(db)
         .await?
         {
-            let updates = data.updates.entry(row.incident_id).or_default();
-            if updates.len() < MAX_UPDATES_PER_INCIDENT {
-                updates.push(row);
-            }
+            data.updates.entry(row.incident_id).or_default().push(row);
         }
     }
 
@@ -693,7 +734,7 @@ pub(crate) fn assemble_public_page(
         })
         .collect();
 
-    let incidents = public_incidents(page.project_id, selections, data);
+    let incidents = public_incidents(page.id, selections, data);
 
     let mut status = components
         .iter()
@@ -725,19 +766,20 @@ pub(crate) fn assemble_public_page(
     }
 }
 
-/// Incidents of `project_id` that concern this page's selection and have at
-/// least one public update.
+/// Incidents selected for `status_page_id` that concern this page's selection
+/// and have at least one public update. The query already applies these
+/// rules; they are re-applied here so the output never depends on it alone.
 ///
 /// - linked to a monitor: shown only if that monitor is selected;
 /// - linked to an environment only: shown only if a selected monitor watches
 ///   that environment;
 /// - project-wide: shown on every page of the project.
 fn public_incidents(
-    project_id: i32,
+    status_page_id: i32,
     selections: &[SelectionRow],
     data: &RefreshData,
 ) -> Vec<PublicIncident> {
-    let Some(incidents) = data.incidents.get(&project_id) else {
+    let Some(incidents) = data.incidents.get(&status_page_id) else {
         return Vec::new();
     };
     let names_by_monitor: BTreeMap<i32, &str> = selections
@@ -833,8 +875,8 @@ mod tests {
 
     fn incident(id: i32, monitor_id: Option<i32>, environment_id: Option<i32>) -> IncidentRow {
         IncidentRow {
+            status_page_id: 7,
             id,
-            project_id: 3,
             environment_id,
             monitor_id,
             severity: "major".to_string(),
@@ -948,7 +990,7 @@ mod tests {
     fn incidents_on_unselected_monitors_or_environments_are_excluded() {
         let mut data = RefreshData::default();
         data.incidents.insert(
-            3,
+            7,
             vec![
                 incident(10, Some(1), Some(100)), // selected monitor
                 incident(11, Some(2), Some(100)), // unselected monitor
@@ -989,7 +1031,7 @@ mod tests {
         let mut resolved = incident(10, None, None);
         resolved.status = "resolved".to_string();
         resolved.resolved_at = Some(now());
-        data.incidents.insert(3, vec![resolved]);
+        data.incidents.insert(7, vec![resolved]);
         data.updates.insert(10, vec![update(10, "fixed")]);
         let out = assemble_public_page(&page(), &[], &data, now());
         assert_eq!(out.incidents[0].status, PublicIncidentStatus::Resolved);
@@ -1002,7 +1044,7 @@ mod tests {
         let mut data = RefreshData::default();
         data.latest_status.insert(4242, "operational".to_string());
         data.incidents
-            .insert(3, vec![incident(9191, Some(4242), Some(5151))]);
+            .insert(7, vec![incident(9191, Some(4242), Some(5151))]);
         data.updates.insert(9191, vec![update(9191, "all good")]);
         let out = assemble_public_page(
             &page(),

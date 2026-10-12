@@ -1588,4 +1588,129 @@ mod tests {
         .expect("missing project");
         assert_eq!(error.status_code, StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn active_incident_on_a_selected_monitor_survives_newer_unrelated_incidents() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let incidents = fx.state.status_page_service.incident_service();
+        // 30 newer incidents with public updates, all on the unselected
+        // monitor: more than the per-page limit.
+        for i in 0..30 {
+            let incident = incidents
+                .create_incident(
+                    fx.project_a,
+                    CreateIncidentRequest {
+                        title: format!("noise {i}"),
+                        description: None,
+                        severity: "minor".to_string(),
+                        environment_id: None,
+                        monitor_id: Some(fx.unselected_monitor),
+                    },
+                )
+                .await
+                .expect("noise incident");
+            incidents
+                .update_incident_status(
+                    incident.id,
+                    UpdateIncidentStatusRequest {
+                        status: "resolved".to_string(),
+                        message: format!("noise update {i}"),
+                        is_public: true,
+                    },
+                )
+                .await
+                .expect("noise update");
+        }
+        // 25 more public updates on the selected incident: above the
+        // per-incident cap.
+        for i in 0..25 {
+            incidents
+                .update_incident_status(
+                    fx.selected_incident,
+                    UpdateIncidentStatusRequest {
+                        status: "monitoring".to_string(),
+                        message: format!("progress {i:02}"),
+                        is_public: true,
+                    },
+                )
+                .await
+                .expect("progress update");
+        }
+
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let (_, _, body) = fetch(&fx.public, &format!("/status/{}/summary.json", page.slug)).await;
+        let value: serde_json::Value = serde_json::from_str(&body).expect("public json");
+        let incidents = value["incidents"].as_array().expect("incidents");
+        assert_eq!(
+            incidents.len(),
+            1,
+            "only the selected monitor's incident: {body}"
+        );
+        assert_eq!(incidents[0]["status"], "monitoring");
+        let updates = incidents[0]["updates"].as_array().expect("updates");
+        assert_eq!(updates.len(), 20, "updates are capped per incident");
+        assert_eq!(updates[0]["message"], "progress 24", "newest first");
+        assert!(!body.contains("noise"));
+        assert_eq!(
+            value["status"], "degraded",
+            "the active incident lifts the page status"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_deletion_hook_takes_pages_down_immediately() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let path = format!("/status/{}", page.slug);
+        assert_eq!(fetch(&fx.public, &path).await.0, StatusCode::OK);
+
+        temps_core::ProjectDeletionHook::project_deletion_started(
+            &fx.state.public_status_page_service,
+            fx.project_a,
+        )
+        .await;
+        assert_eq!(fetch(&fx.public, &path).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unpublish_and_rotate_use_the_current_published_state() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        // Rotating a draft does not publish it.
+        let rotated: StatusPageResponse = decode(
+            rotate_status_page_url(admin(), State(fx.state.clone()), metadata(), Path(page.id))
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("rotate draft"),
+        )
+        .await;
+        assert!(!rotated.is_published);
+        let path = format!("/status/{}", rotated.slug);
+        assert_eq!(fetch(&fx.public, &path).await.0, StatusCode::NOT_FOUND);
+
+        publish(&fx, page.id).await;
+        assert_eq!(fetch(&fx.public, &path).await.0, StatusCode::OK);
+        let unpublished: StatusPageResponse = decode(
+            unpublish_status_page(admin(), State(fx.state.clone()), metadata(), Path(page.id))
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("unpublish"),
+        )
+        .await;
+        assert!(!unpublished.is_published);
+        // A full refresh reads the persisted state and keeps it down.
+        fx.state
+            .public_status_page_service
+            .refresh_project_pages(fx.project_a)
+            .await;
+        assert_eq!(fetch(&fx.public, &path).await.0, StatusCode::NOT_FOUND);
+    }
 }

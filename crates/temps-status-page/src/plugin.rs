@@ -265,6 +265,9 @@ impl TempsPlugin for StatusPagePlugin {
                 snapshot_cache.clone(),
             ));
             context.register_service(public_status_page_service.clone());
+            let deletion_hook: Arc<dyn temps_core::ProjectDeletionHook> =
+                public_status_page_service.clone();
+            context.register_service(deletion_hook);
             tokio::spawn(snapshot_cache.run_refresh_loop());
 
             // Start the health check scheduler with job receiver for realtime monitor creation

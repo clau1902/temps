@@ -371,15 +371,21 @@ impl PublicStatusPageService {
         &self,
         status_page_id: i32,
     ) -> Result<StatusPageResponse, StatusPageError> {
-        let model = self.find(status_page_id).await?;
-        let model = if model.is_published {
+        // Same row lock as `publish`: a concurrent publish either commits
+        // before this read (and is undone here) or waits and runs after.
+        let txn = self.db.begin().await?;
+        let result = async {
+            let model = Self::find_locked(&txn, status_page_id).await?;
+            if !model.is_published {
+                return Ok(model);
+            }
             let mut active: status_pages::ActiveModel = model.into();
             active.is_published = Set(false);
             active.published_at = Set(None);
-            active.update(self.db.as_ref()).await?
-        } else {
-            model
-        };
+            Ok(active.update(&txn).await?)
+        }
+        .await;
+        let model = Self::finish(txn, result).await?;
         self.cache.remove_page(status_page_id).await;
         info!(
             status_page_id,
@@ -395,18 +401,22 @@ impl PublicStatusPageService {
         &self,
         status_page_id: i32,
     ) -> Result<StatusPageResponse, StatusPageError> {
-        let model = self.find(status_page_id).await?;
-        let slug = generate_slug(model.project_id)?;
-        let was_published = model.is_published;
-        let mut active: status_pages::ActiveModel = model.into();
-        active.slug = Set(slug);
-        let model = active.update(self.db.as_ref()).await?;
-        // Drop the old slug first so it can never be served again, then
-        // publish under the new one.
-        self.cache.remove_page(status_page_id).await;
-        if was_published {
-            self.refresh_or_take_down(status_page_id).await;
+        let project_id = self.get_project_id(status_page_id).await?;
+        let slug = generate_slug(project_id)?;
+        let txn = self.db.begin().await?;
+        let result = async {
+            let model = Self::find_locked(&txn, status_page_id).await?;
+            let mut active: status_pages::ActiveModel = model.into();
+            active.slug = Set(slug);
+            Ok(active.update(&txn).await?)
         }
+        .await;
+        let model = Self::finish(txn, result).await?;
+        // Drop the old slug so it can never be served again, then rebuild
+        // from the database: publishes under the new slug only if the page is
+        // published *now*, whatever it was when this call started.
+        self.cache.remove_page(status_page_id).await;
+        self.refresh_or_take_down(status_page_id).await;
         info!(
             status_page_id,
             project_id = model.project_id,
@@ -642,6 +652,17 @@ impl PublicStatusPageService {
                 updated_at: model.updated_at,
             })
             .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl temps_core::ProjectDeletionHook for PublicStatusPageService {
+    async fn project_deletion_started(&self, project_id: i32) {
+        self.remove_project_pages(project_id).await;
+        info!(
+            project_id,
+            "stopped serving status pages of a project being deleted"
+        );
     }
 }
 
