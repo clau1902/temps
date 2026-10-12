@@ -18,6 +18,12 @@
 //!   tombstone keeps answering 404 for the hostname (instead of letting it fall
 //!   through to the console) until the name is attached again or claimed by an
 //!   application, which always takes precedence over a tombstone.
+//! - `certificate_operation_until` is a lease: a verify or renew claims it
+//!   with one conditional UPDATE and clears it when done, so two certificate
+//!   operations on one hostname never overlap (one would replace or delete
+//!   the other's ACME order). It holds no lock or connection while the CA is
+//!   called, works across processes, and expires on its own if a process
+//!   dies mid-operation.
 //! - Route-table NOTIFY triggers make every proxy (in-process or a separate
 //!   `temps proxy`) reload when a binding, a page, or the certificate state of
 //!   a bound `domains` row changes.
@@ -41,6 +47,7 @@ CREATE TABLE IF NOT EXISTS status_page_domains (
     verification_method VARCHAR(16) NOT NULL DEFAULT 'http-01',
     domain_id INTEGER REFERENCES domains(id) ON DELETE SET NULL,
     detached_at TIMESTAMPTZ,
+    certificate_operation_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT status_page_domains_method_check
@@ -121,9 +128,12 @@ CREATE TRIGGER status_page_domains_release_certificate
     AFTER UPDATE OR DELETE ON status_page_domains
     FOR EACH ROW EXECUTE FUNCTION status_page_domain_release_certificate();
 
+-- Only changes that affect routing reload the route table; the certificate
+-- operation lease is written on every verify and renew and does not.
 DROP TRIGGER IF EXISTS status_page_domains_route_table_changes ON status_page_domains;
 CREATE TRIGGER status_page_domains_route_table_changes
-    AFTER INSERT OR UPDATE OR DELETE ON status_page_domains
+    AFTER INSERT OR DELETE OR UPDATE OF status_page_id, hostname, domain_id
+    ON status_page_domains
     FOR EACH STATEMENT EXECUTE FUNCTION notify_route_table_change();
 
 DROP TRIGGER IF EXISTS status_pages_route_table_changes ON status_pages;

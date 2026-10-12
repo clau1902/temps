@@ -28,6 +28,9 @@ pub struct Model {
     pub domain_id: Option<i32>,
     /// When the binding became a tombstone.
     pub detached_at: Option<DBDateTime>,
+    /// Lease held by a verify or renew in progress, so two certificate
+    /// operations on one hostname never overlap. Expired leases are free.
+    pub certificate_operation_until: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

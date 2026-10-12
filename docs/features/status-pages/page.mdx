@@ -113,7 +113,7 @@ A page can also be served on your own hostname, such as `status.example.com`. Th
 - **HTTP verification**: the certificate renews automatically within 30 days of expiry, like every other HTTP-01 certificate.
 - **DNS verification**: the certificate is **not** renewed automatically, because every order needs a new `TXT` value. Temps notifies you 30 days before expiry, and the console shows the expiry date. Click **Renew**: Temps starts a new order and shows the new `_acme-challenge` record. Publish it, then click **Verify**.
 
-The current certificate keeps serving while a renewal is in progress, and also when a renewal fails, until it expires. A failed renewal shows its error and a **Renew** button to try again.
+The current certificate keeps serving while a renewal is in progress, and also when a renewal fails, until it expires. A failed renewal shows its error and a **Renew** button to try again. Only one verify or renew runs per hostname at a time; a second one started meanwhile is refused until the first finishes.
 
 ```bash
 temps status-pages domains add --id 1 --hostname status.example.com          # HTTP verification

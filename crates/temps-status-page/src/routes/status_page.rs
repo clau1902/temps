@@ -1436,6 +1436,12 @@ pub(crate) fn map_error(error: StatusPageError) -> Problem {
                 .detail(error.to_string())
                 .build()
         }
+        error @ StatusPageError::CertificateOperationInProgress { .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Certificate Operation In Progress")
+                .detail(error.to_string())
+                .build()
+        }
         error @ StatusPageError::DomainNotRenewable { .. } => {
             temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
                 .title("No Certificate To Renew")

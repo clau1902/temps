@@ -91,6 +91,8 @@ pub enum StatusPageError {
         status_page_id: i32,
         hostname: String,
     },
+    #[error("a certificate operation for '{hostname}' is already in progress; try again when it finishes")]
+    CertificateOperationInProgress { hostname: String },
     #[error("'{hostname}' on status page {status_page_id} has no certificate to renew; verify it instead")]
     DomainNotRenewable {
         status_page_id: i32,

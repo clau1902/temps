@@ -67554,7 +67554,7 @@ export type RenewStatusPageDomainErrors = {
      */
     404: unknown;
     /**
-     * The page is unpublished or the domain has no certificate yet
+     * The page is unpublished, the domain has no certificate yet, or another verify or renew of this hostname is in progress
      */
     409: unknown;
     /**
@@ -67605,6 +67605,14 @@ export type VerifyStatusPageDomainErrors = {
      * Status page or domain not found
      */
     404: unknown;
+    /**
+     * The page is unpublished, or another verify or renew of this hostname is in progress
+     */
+    409: unknown;
+    /**
+     * Too many domain operations for this project
+     */
+    429: unknown;
     /**
      * Certificate order could not be started
      */

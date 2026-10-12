@@ -37,6 +37,18 @@ use crate::services::StatusPageError;
 /// Most custom hostnames per status page.
 pub const MAX_DOMAINS_PER_STATUS_PAGE: u64 = 5;
 
+/// How long a verify or renew may hold a hostname's certificate-operation
+/// lease. Longer than any ACME order takes; it only matters when a process
+/// dies mid-operation, after which the hostname is free again this soon.
+pub const CERTIFICATE_OPERATION_LEASE: chrono::Duration = chrono::Duration::minutes(15);
+
+/// A lease expiry, at the precision Postgres stores, so it can be matched
+/// exactly when the lease is released.
+fn lease_until() -> UtcDateTime {
+    use chrono::SubsecRound;
+    (chrono::Utc::now() + CERTIFICATE_OPERATION_LEASE).trunc_subsecs(6)
+}
+
 /// Attach/verify/renew operations allowed per project per hour. Each one can start
 /// an ACME order, so this bounds the load on the CA and its rate limits.
 pub const DOMAIN_OPERATIONS_PER_HOUR: usize = 30;
@@ -482,6 +494,9 @@ impl StatusPageDomainService {
                 hostname: Set(hostname.clone()),
                 verification_method: Set(request.verification_method.as_str().to_string()),
                 domain_id: Set(None),
+                // The first order starts right after this commit; hold the
+                // lease from the start so a verify cannot start a second one.
+                certificate_operation_until: Set(page.is_published.then(lease_until)),
                 ..Default::default()
             }
             .insert(&txn)
@@ -514,10 +529,13 @@ impl StatusPageDomainService {
         // No certificate is requested while the page is unpublished: the
         // order starts when the hostname is verified on a published page.
         let binding = if page.is_published {
-            match self
+            let ordered = self
                 .start_order(&binding, request.verification_method, acme_email)
-                .await
-            {
+                .await;
+            if let Some(lease) = binding.certificate_operation_until {
+                self.release_certificate_operation(binding.id, lease).await;
+            }
+            match ordered {
                 Ok(binding) => binding,
                 Err(e) => {
                     if let Err(delete) = status_page_domains::Entity::delete_by_id(binding.id)
@@ -700,7 +718,10 @@ impl StatusPageDomainService {
         let (page, binding) = self
             .prepare_order(status_page_id, domain_binding_id, acme_email)
             .await?;
-        self.verify_binding(page, binding, acme_email).await
+        let lease = self.claim_certificate_operation(&binding).await?;
+        let result = self.verify_binding(page, binding.clone(), acme_email).await;
+        self.release_certificate_operation(binding.id, lease).await;
+        result
     }
 
     /// The work of [`Self::verify`] on a binding read earlier. Every
@@ -778,7 +799,67 @@ impl StatusPageDomainService {
         let (page, binding) = self
             .prepare_order(status_page_id, domain_binding_id, acme_email)
             .await?;
-        self.renew_binding(page, binding, acme_email).await
+        let lease = self.claim_certificate_operation(&binding).await?;
+        let result = self.renew_binding(page, binding.clone(), acme_email).await;
+        self.release_certificate_operation(binding.id, lease).await;
+        result
+    }
+
+    /// Claim the binding's certificate-operation lease, so no other verify
+    /// or renew on this hostname runs at the same time: two overlapping
+    /// operations act on the same ACME order, and the one that finishes
+    /// last deletes or replaces the other's (a TXT record the operator just
+    /// published would then have no order to complete).
+    ///
+    /// One conditional UPDATE: no lock or connection is held while the CA
+    /// is called, it works across processes, and a lease left by a process
+    /// that died expires after [`CERTIFICATE_OPERATION_LEASE`].
+    async fn claim_certificate_operation(
+        &self,
+        binding: &status_page_domains::Model,
+    ) -> Result<UtcDateTime, StatusPageError> {
+        let lease = lease_until();
+        let claimed = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"UPDATE status_page_domains SET certificate_operation_until = $2
+                   WHERE id = $1 AND status_page_id IS NOT NULL
+                     AND (certificate_operation_until IS NULL OR certificate_operation_until < now())"#,
+                [binding.id.into(), lease.into()],
+            ))
+            .await?
+            .rows_affected();
+        if claimed == 1 {
+            Ok(lease)
+        } else {
+            Err(StatusPageError::CertificateOperationInProgress {
+                hostname: binding.hostname.clone(),
+            })
+        }
+    }
+
+    /// Release a lease taken by [`Self::claim_certificate_operation`] (or
+    /// at attach). Matches the exact expiry, so a lease that already
+    /// expired and was claimed by someone else is left alone. Best-effort:
+    /// on failure the lease expires on its own.
+    async fn release_certificate_operation(&self, binding_id: i32, lease: UtcDateTime) {
+        if let Err(e) = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"UPDATE status_page_domains SET certificate_operation_until = NULL
+                   WHERE id = $1 AND certificate_operation_until = $2"#,
+                [binding_id.into(), lease.into()],
+            ))
+            .await
+        {
+            warn!(
+                binding_id,
+                error = %e,
+                "failed to release a status page certificate operation lease; it expires on its own"
+            );
+        }
     }
 
     /// The work of [`Self::renew`] on a binding read earlier; see

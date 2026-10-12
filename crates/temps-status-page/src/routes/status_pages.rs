@@ -638,6 +638,8 @@ where
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Status page or domain not found"),
+        (status = 409, description = "The page is unpublished, or another verify or renew of this hostname is in progress"),
+        (status = 429, description = "Too many domain operations for this project"),
         (status = 502, description = "Certificate order could not be started"),
     ),
     tag = "Status Page",
@@ -724,7 +726,7 @@ where
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Status page or domain not found"),
-        (status = 409, description = "The page is unpublished or the domain has no certificate yet"),
+        (status = 409, description = "The page is unpublished, the domain has no certificate yet, or another verify or renew of this hostname is in progress"),
         (status = 429, description = "Too many domain operations for this project"),
     ),
     tag = "Status Page",
@@ -3311,5 +3313,99 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(60), flow)
             .await
             .expect("no operation waits on a second connection");
+    }
+
+    async fn certificate_lease(fx: &Fx, binding_id: i32) -> Option<temps_core::UtcDateTime> {
+        temps_entities::status_page_domains::Entity::find_by_id(binding_id)
+            .one(fx._db.connection_arc().as_ref())
+            .await
+            .expect("binding query")
+            .expect("binding exists")
+            .certificate_operation_until
+    }
+
+    async fn set_certificate_lease(fx: &Fx, binding_id: i32, interval: &str) {
+        use sea_orm::ConnectionTrait;
+        fx._db
+            .connection_arc()
+            .execute_unprepared(&format!(
+                "UPDATE status_page_domains SET certificate_operation_until = now() + interval '{interval}' WHERE id = {binding_id}"
+            ))
+            .await
+            .expect("set lease");
+    }
+
+    #[tokio::test]
+    async fn certificate_operations_on_one_hostname_never_overlap() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let host = "one-at-a-time.example.org";
+        let binding = attach(&fx, page.id, host)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach");
+        assert_eq!(
+            certificate_lease(&fx, binding.id).await,
+            None,
+            "attach releases the lease it took for the first order"
+        );
+        verify(&fx, page.id, binding.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("verify");
+        assert_eq!(certificate_lease(&fx, binding.id).await, None);
+
+        // Another operation is in flight: a second one is refused with 409
+        // instead of replacing or deleting its order.
+        set_certificate_lease(&fx, binding.id, "10 minutes").await;
+        let orders_before = fx.certs.orders.load(std::sync::atomic::Ordering::Relaxed);
+        for result in [
+            verify(&fx, page.id, binding.id).await,
+            renew(&fx, page.id, binding.id).await,
+        ] {
+            let error = result.expect_err("refused while another operation runs");
+            assert_eq!(error.status_code, StatusCode::CONFLICT);
+        }
+        assert_eq!(
+            fx.certs.orders.load(std::sync::atomic::Ordering::Relaxed),
+            orders_before,
+            "no order was touched"
+        );
+
+        // A lease left by a process that died expires on its own.
+        set_certificate_lease(&fx, binding.id, "-1 second").await;
+        let renewed = renew(&fx, page.id, binding.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("renew after the lease expired");
+        assert_eq!(renewed.status, StatusPageDomainStatus::Active);
+        assert_eq!(certificate_lease(&fx, binding.id).await, None);
+
+        // A failed operation releases its lease too.
+        fx.certs
+            .fail_hosts
+            .lock()
+            .expect("lock")
+            .insert(host.to_string());
+        renew(&fx, page.id, binding.id)
+            .await
+            .expect_err("renewal fails");
+        assert_eq!(certificate_lease(&fx, binding.id).await, None);
+
+        // Taking the hostname down is never blocked by an operation in flight.
+        set_certificate_lease(&fx, binding.id, "10 minutes").await;
+        remove_status_page_domain(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path((page.id, binding.id)),
+        )
+        .await
+        .map_err(|p| format!("{:?}", p.body))
+        .expect("remove while an operation holds the lease");
+        assert!(!domains_row_exists(&fx, host).await);
     }
 }

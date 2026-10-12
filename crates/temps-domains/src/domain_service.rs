@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::telemetry::{
@@ -801,7 +801,10 @@ impl DomainService {
                         ))
                     })?;
 
-                // Save certificate to tls_acme_certificates table
+                // Save the certificate copy and its domain row together. The
+                // row can be deleted while the CA is issuing (its owner was
+                // removed); then the update fails and the copy, with its
+                // encrypted private key, must not be left behind either.
                 let acme_cert = tls_acme_certificates::ActiveModel {
                     domain: Set(domain_name.to_string()),
                     certificate: Set(certificate.certificate_pem.clone()),
@@ -811,9 +814,6 @@ impl DomainService {
                     ..Default::default()
                 };
 
-                acme_cert.insert(self.db.as_ref()).await?;
-
-                // Update domain record
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set("active".to_string());
                 domain_active.certificate = Set(Some(certificate.certificate_pem));
@@ -823,7 +823,31 @@ impl DomainService {
                 domain_active.last_error = Set(None);
                 domain_active.last_error_type = Set(None);
 
-                let updated_domain = domain_active.update(self.db.as_ref()).await?;
+                let txn = self.db.begin().await?;
+                let saved = async {
+                    acme_cert.insert(&txn).await?;
+                    domain_active.update(&txn).await
+                }
+                .await;
+                let updated_domain = match saved {
+                    Ok(updated) => {
+                        txn.commit().await?;
+                        updated
+                    }
+                    Err(e) => {
+                        if let Err(rollback) = txn.rollback().await {
+                            warn!(
+                                "Failed to roll back certificate save for domain {} (id {}): {}",
+                                domain_name, domain_id, rollback
+                            );
+                        }
+                        error!(
+                            "Issued certificate for domain {} (id {}) was not stored: {}",
+                            domain_name, domain_id, e
+                        );
+                        return Err(e.into());
+                    }
+                };
 
                 // Keep orders carrying provider record receipts until the
                 // handler completes (or explicitly skips) external DNS
@@ -3775,6 +3799,118 @@ mod tests {
         println!(
             "Certificate chain verified: leaf issuer = '{}', CA subject = '{}'",
             leaf_issuer_str, ca_subject_str
+        );
+    }
+
+    /// A provider whose CA "issues" only after the domain row was deleted
+    /// (its owner removed it mid-order), as happens when a status page
+    /// hostname is removed while its certificate is being completed.
+    struct RowDeletedDuringIssuanceProvider {
+        db: Arc<DatabaseConnection>,
+    }
+
+    #[async_trait::async_trait]
+    impl CertificateProvider for RowDeletedDuringIssuanceProvider {
+        async fn provision(
+            &self,
+            domain: &str,
+            challenge: ChallengeType,
+            _email: &str,
+        ) -> Result<ProvisioningResult, crate::tls::ProviderError> {
+            Ok(ProvisioningResult::Challenge(
+                crate::tls::models::ChallengeData {
+                    challenge_type: challenge,
+                    domain: domain.to_string(),
+                    token: "token".to_string(),
+                    key_authorization: "token.key".to_string(),
+                    validation_url: Some("https://ca.example.test/chall/1".to_string()),
+                    dns_txt_records: vec![],
+                    order_url: Some("https://ca.example.test/order/1".to_string()),
+                },
+            ))
+        }
+
+        async fn complete_challenge(
+            &self,
+            domain: &str,
+            _challenge_data: &crate::tls::models::ChallengeData,
+            _email: &str,
+        ) -> Result<crate::tls::models::Certificate, crate::tls::ProviderError> {
+            domains::Entity::delete_many()
+                .filter(domains::Column::Domain.eq(domain))
+                .exec(self.db.as_ref())
+                .await
+                .map_err(|e| crate::tls::ProviderError::Acme(e.to_string()))?;
+            Ok(mock_certificate(domain))
+        }
+
+        fn supported_challenges(&self) -> Vec<ChallengeType> {
+            vec![ChallengeType::Http01]
+        }
+
+        async fn validate_prerequisites(
+            &self,
+            _domain: &str,
+            _email: &str,
+        ) -> Result<crate::tls::models::ValidationResult, crate::tls::ProviderError> {
+            Ok(crate::tls::models::ValidationResult {
+                is_valid: true,
+                errors: vec![],
+                warnings: vec![],
+            })
+        }
+
+        async fn cancel_order(&self, _domain: &str) -> Result<(), crate::tls::ProviderError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_certificate_issued_for_a_deleted_row_leaves_no_stored_copy() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping certificate storage test: {e}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("encryption service"),
+        );
+        let service = DomainService::new(
+            db.clone(),
+            Arc::new(RowDeletedDuringIssuanceProvider { db: db.clone() }),
+            Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
+                db.clone(),
+                encryption_service.clone(),
+            )),
+            encryption_service,
+        );
+        let row = service
+            .create_domain("late-copy.example.org", "http-01")
+            .await
+            .expect("create domain");
+        service
+            .request_challenge_for_id(row.id, "ops@example.com")
+            .await
+            .expect("order");
+
+        let result = service
+            .complete_challenge_for_id(row.id, "ops@example.com")
+            .await;
+        assert!(result.is_err(), "the owning row is gone: {result:?}");
+        let copies = tls_acme_certificates::Entity::find()
+            .filter(tls_acme_certificates::Column::Domain.eq("late-copy.example.org"))
+            .count(db.as_ref())
+            .await
+            .expect("count copies");
+        assert_eq!(
+            copies, 0,
+            "the certificate and its private key are not stored without their row"
         );
     }
 }

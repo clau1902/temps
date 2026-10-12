@@ -125000,7 +125000,7 @@
             "description": "Status page or domain not found"
           },
           "409": {
-            "description": "The page is unpublished or the domain has no certificate yet"
+            "description": "The page is unpublished, the domain has no certificate yet, or another verify or renew of this hostname is in progress"
           },
           "429": {
             "description": "Too many domain operations for this project"
@@ -125065,6 +125065,12 @@
           },
           "404": {
             "description": "Status page or domain not found"
+          },
+          "409": {
+            "description": "The page is unpublished, or another verify or renew of this hostname is in progress"
+          },
+          "429": {
+            "description": "Too many domain operations for this project"
           },
           "502": {
             "description": "Certificate order could not be started"
