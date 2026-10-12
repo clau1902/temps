@@ -96,6 +96,28 @@ pub enum AiGatewayError {
     },
 }
 
+impl AiGatewayError {
+    /// A short, human-friendly description. Upstream errors often carry a
+    /// raw JSON body; this pulls out just its `error.message` when present.
+    pub fn summary(&self) -> String {
+        if let AiGatewayError::UpstreamError {
+            status, message, ..
+        } = self
+        {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(message) {
+                if let Some(msg) = parsed
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    return format!("{} — {}", status, msg);
+                }
+            }
+        }
+        self.to_string()
+    }
+}
+
 impl From<reqwest::Error> for AiGatewayError {
     fn from(error: reqwest::Error) -> Self {
         // A connect-time DNS block is a policy decision, not a transport

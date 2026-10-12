@@ -460,6 +460,36 @@ impl GatewayService {
         })
     }
 
+    /// List a self-hosted server's models and check the administrator's
+    /// chosen default against that listing. A self-hosted server has no
+    /// vendor default to verify with, so this runs before a key is created;
+    /// the listing it returns seeds the new key's catalog.
+    pub async fn discover_self_hosted_with_default(
+        &self,
+        api_key: &str,
+        base_url: Option<&str>,
+        default_model: Option<&str>,
+        key_trust: Option<KeyTrust>,
+    ) -> Result<SelfHostedListing, AiGatewayError> {
+        let models = self
+            .discover_models(OPENAI_COMPATIBLE, api_key, base_url, key_trust)
+            .await
+            .map_err(|error| match error {
+                AiGatewayError::InvalidProviderUrl { .. } => error,
+                other => AiGatewayError::Validation {
+                    message: format!(
+                        "Could not list models at the self-hosted server's /models endpoint: {}",
+                        other.summary()
+                    ),
+                },
+            })?;
+        let default_model = choose_self_hosted_default(&models, default_model)?;
+        Ok(SelfHostedListing {
+            models,
+            default_model,
+        })
+    }
+
     /// Route a model name to the provider and resolve the API key.
     ///
     /// When `byok.api_key` is set, the caller-supplied key is used directly
@@ -979,6 +1009,47 @@ impl GatewayService {
             data: models,
         })
     }
+}
+
+/// A self-hosted server's model listing and the default model chosen from it.
+#[derive(Debug, Clone)]
+pub struct SelfHostedListing {
+    pub models: Vec<ModelInfo>,
+    pub default_model: String,
+}
+
+/// The default model for a new self-hosted key must be one the server lists:
+/// it is what the connection is verified with.
+pub(crate) fn choose_self_hosted_default(
+    models: &[ModelInfo],
+    default_model: Option<&str>,
+) -> Result<String, AiGatewayError> {
+    if models.is_empty() {
+        return Err(AiGatewayError::Validation {
+            message: "The self-hosted server lists no models at /models; load a model on it and \
+                      try again"
+                .to_string(),
+        });
+    }
+    let default_model = default_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| AiGatewayError::Validation {
+            message: format!(
+                "Choose a default model from the {} models the self-hosted server lists; it is \
+                 used to verify the connection",
+                models.len()
+            ),
+        })?;
+    if !models.iter().any(|model| model.id == default_model) {
+        return Err(AiGatewayError::Validation {
+            message: format!(
+                "Model '{default_model}' is not among the {} models the self-hosted server lists",
+                models.len()
+            ),
+        });
+    }
+    Ok(default_model.to_string())
 }
 
 /// Refuse tool calling on a self-hosted key that did not declare it.
@@ -1742,6 +1813,38 @@ mod tests {
         let body = serde_json::json!({"models": [{"name": "models/gemini-3.1-pro"}]});
         let models = parse_model_catalog("gemini", &body, |_| true).unwrap();
         assert_eq!(models[0].id, "gemini-3.1-pro");
+    }
+
+    #[test]
+    fn self_hosted_default_must_come_from_the_listing() {
+        let listed = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| ModelInfo {
+                    id: id.to_string(),
+                    object: "model".to_string(),
+                    owned_by: OPENAI_COMPATIBLE.to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let reason = |result: Result<String, AiGatewayError>| match result {
+            Err(AiGatewayError::Validation { message }) => message,
+            other => panic!("expected Validation, got {other:?}"),
+        };
+        assert!(reason(choose_self_hosted_default(&[], Some(HOSTED))).contains("lists no models"));
+        let models = listed(&[HOSTED, "mlx-community/embed-small"]);
+        assert!(
+            reason(choose_self_hosted_default(&models, None)).contains("Choose a default model")
+        );
+        assert!(
+            reason(choose_self_hosted_default(&models, Some("  "))).contains("Choose a default")
+        );
+        assert!(
+            reason(choose_self_hosted_default(&models, Some("gpt-5-nano"))).contains("not among")
+        );
+        assert_eq!(
+            choose_self_hosted_default(&models, Some(&format!(" {HOSTED} "))).unwrap(),
+            HOSTED
+        );
     }
 
     #[test]

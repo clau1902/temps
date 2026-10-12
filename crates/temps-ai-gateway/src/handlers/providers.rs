@@ -458,68 +458,9 @@ fn verification_error(error: AiGatewayError) -> AiGatewayError {
     match error {
         AiGatewayError::InvalidProviderUrl { .. } => error,
         other => AiGatewayError::Validation {
-            message: format!(
-                "API key verification failed: {}",
-                friendly_error_message(&other)
-            ),
+            message: format!("API key verification failed: {}", other.summary()),
         },
     }
-}
-
-/// For a self-hosted server: list its models and check that the chosen
-/// default is one of them. Returns the listing so it seeds the catalog.
-async fn discover_self_hosted_models(
-    app_state: &AiGatewayAppState,
-    api_key: &str,
-    base_url: Option<&str>,
-    default_model: Option<&str>,
-    key_trust: Option<KeyTrust>,
-) -> Result<(Vec<ModelInfo>, String), AiGatewayError> {
-    let models = app_state
-        .gateway_service
-        .discover_models(
-            crate::self_hosted::OPENAI_COMPATIBLE,
-            api_key,
-            base_url,
-            key_trust,
-        )
-        .await
-        .map_err(|error| match error {
-            AiGatewayError::InvalidProviderUrl { .. } => error,
-            other => AiGatewayError::Validation {
-                message: format!(
-                    "Could not list models at the self-hosted server's /models endpoint: {}",
-                    friendly_error_message(&other)
-                ),
-            },
-        })?;
-    if models.is_empty() {
-        return Err(AiGatewayError::Validation {
-            message: "The self-hosted server lists no models at /models; load a model on it and \
-                      try again"
-                .to_string(),
-        });
-    }
-    let default_model = default_model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| AiGatewayError::Validation {
-            message: format!(
-                "Choose a default model from the {} models the self-hosted server lists; it is \
-                 used to verify the connection",
-                models.len()
-            ),
-        })?
-        .to_string();
-    if !models.iter().any(|model| model.id == default_model) {
-        return Err(AiGatewayError::Validation {
-            message: format!(
-                "Model '{default_model}' is not among the {} models the self-hosted server lists",
-                models.len()
-            ),
-        });
-    }
-    Ok((models, default_model))
 }
 
 // ============================================================================
@@ -611,15 +552,16 @@ async fn create_provider_key(
     // A self-hosted server has no vendor default model: list its models
     // first and verify with the one the administrator picked from them.
     let (discovered, default_model) = if self_hosted {
-        let (models, default_model) = discover_self_hosted_models(
-            &app_state,
-            &request.api_key,
-            base_url,
-            request.default_model.as_deref(),
-            key_trust,
-        )
-        .await?;
-        (Some(models), Some(default_model))
+        let listing = app_state
+            .gateway_service
+            .discover_self_hosted_with_default(
+                &request.api_key,
+                base_url,
+                request.default_model.as_deref(),
+                key_trust,
+            )
+            .await?;
+        (Some(listing.models), Some(listing.default_model))
     } else {
         (None, request.default_model.clone())
     };
@@ -756,10 +698,7 @@ async fn discover_provider_models(
             AiGatewayError::InvalidProviderUrl { .. }
             | AiGatewayError::ProviderNotConfigured { .. } => error,
             other => AiGatewayError::Validation {
-                message: format!(
-                    "Could not list the provider's models: {}",
-                    friendly_error_message(&other)
-                ),
+                message: format!("Could not list the provider's models: {}", other.summary()),
             },
         })?;
     Ok(Json(DiscoverProviderModelsResponse {
@@ -1090,7 +1029,7 @@ async fn test_provider_key_inline(
         Err(e) => TestProviderKeyResponse {
             success: false,
             provider: request.provider,
-            error: Some(friendly_error_message(&e)),
+            error: Some(e.summary()),
             latency_ms,
         },
     };
@@ -1148,33 +1087,12 @@ async fn test_provider_key_by_id(
         Err(e) => TestProviderKeyResponse {
             success: false,
             provider: provider_name,
-            error: Some(friendly_error_message(&e)),
+            error: Some(e.summary()),
             latency_ms,
         },
     };
 
     Ok(Json(response))
-}
-
-/// Extract a human-friendly error message from an AiGatewayError.
-/// For upstream errors the raw body is often a JSON blob; we try to
-/// pull out just the `error.message` field for a cleaner UX.
-fn friendly_error_message(err: &AiGatewayError) -> String {
-    if let AiGatewayError::UpstreamError {
-        status, message, ..
-    } = err
-    {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(message) {
-            if let Some(msg) = parsed
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-            {
-                return format!("{} — {}", status, msg);
-            }
-        }
-    }
-    err.to_string()
 }
 
 #[cfg(test)]

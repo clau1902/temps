@@ -13,7 +13,7 @@ pub mod usage_service;
 
 pub use ai_service::GatewayAiService;
 pub use gateway_service::{
-    ByokOverride, CredentialType, GatewayService, ResolvedCredentials, ServedBy,
+    ByokOverride, CredentialType, GatewayService, ResolvedCredentials, SelfHostedListing, ServedBy,
 };
 pub use native_api_service::{NativeApiService, Owner};
 pub use provider_capabilities::gateway_provider_capabilities;
