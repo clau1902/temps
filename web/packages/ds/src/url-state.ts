@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { useLocation, useSearchParams } from 'react-router'
 
 export type UrlStateValue = string | number | boolean | undefined | null
 
@@ -18,10 +18,15 @@ export type UrlStateValue = string | number | boolean | undefined | null
  */
 export function useComposedSearchParams() {
   const [params, setParams] = useSearchParams()
+  const { key } = useLocation()
   const pending = useRef<URLSearchParams | null>(null)
+  // Cleared on any new location, not only a new query: a navigation that
+  // supersedes our update and lands on the query already rendered keeps the
+  // same `params` identity, and the cancelled snapshot would otherwise be
+  // resurrected by the next update.
   useEffect(() => {
     pending.current = null
-  }, [params])
+  }, [params, key])
 
   const update = useCallback(
     (
@@ -123,24 +128,60 @@ export type UrlState = ReturnType<typeof useUrlState>
  */
 export function useUrlBoundText(
   urlValue: string,
-  commit: (value: string) => void
+  commit: (value: string) => void,
+  { settleMs = 1000 }: { settleMs?: number } = {}
 ): [string, (value: string) => void] {
   const [text, setText] = useState(urlValue)
+  const { key } = useLocation()
   const inFlight = useRef<string[]>([])
+  const previousUrl = useRef(urlValue)
+  const latest = useRef({ text, urlValue, lastWriteAt: 0 })
+  useEffect(() => {
+    latest.current.text = text
+    latest.current.urlValue = urlValue
+  })
 
   useEffect(() => {
-    const index = inFlight.current.lastIndexOf(urlValue)
-    if (index >= 0) {
+    if (previousUrl.current !== urlValue) {
+      previousUrl.current = urlValue
+      const index = inFlight.current.lastIndexOf(urlValue)
+      if (index < 0) {
+        inFlight.current = []
+        setText(urlValue)
+        return
+      }
       inFlight.current = inFlight.current.slice(index + 1)
-      return
     }
-    inFlight.current = []
-    setText(urlValue)
-  }, [urlValue])
+
+    // A write can be cancelled by a navigation that wins the race (Back, a
+    // "clear filters" action): the URL then never shows it, and it would stay
+    // "in flight" forever while the box keeps the text. Once the URL has been
+    // quiet for `settleMs` since the last keystroke, the URL wins.
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const settle = () => {
+      const { text, urlValue, lastWriteAt } = latest.current
+      if (text === urlValue) {
+        inFlight.current = []
+        return
+      }
+      const quiet = Date.now() - lastWriteAt
+      if (quiet < settleMs) {
+        timer = setTimeout(settle, settleMs - quiet)
+        return
+      }
+      inFlight.current = []
+      setText(urlValue)
+    }
+    if (inFlight.current.length > 0 || latest.current.text !== urlValue) {
+      timer = setTimeout(settle, settleMs)
+    }
+    return () => clearTimeout(timer)
+  }, [urlValue, key, settleMs])
 
   const update = useCallback(
     (value: string) => {
       setText(value)
+      latest.current.lastWriteAt = Date.now()
       inFlight.current.push(value)
       commit(value)
     },

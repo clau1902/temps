@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { MemoryRouter, useLocation } from 'react-router'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router'
 import { useUrlBoundText, useUrlState } from './url-state'
 
 import {
@@ -116,5 +116,131 @@ test('an external URL change replaces the text in the box', async () => {
   expect((view.getByLabelText('search') as HTMLInputElement).value).toBe(
     'from-link'
   )
+  view.unmount()
+})
+
+const settle = (ms: number) =>
+  act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms))
+  })
+
+function Navigable({ settleMs }: { settleMs: number }) {
+  const { get, patch } = useUrlState<'q' | 'page'>()
+  const navigate = useNavigate()
+  const [text, setText] = useUrlBoundText(
+    get('q') ?? '',
+    (value) => patch({ q: value || undefined }),
+    { settleMs }
+  )
+  const location = useLocation()
+  return (
+    <div>
+      <input
+        aria-label="search"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+      />
+      <button onClick={() => navigate(-1)}>back</button>
+      <button
+        onClick={() => {
+          setText('abc')
+          patch({ q: undefined })
+        }}
+      >
+        type-then-clear
+      </button>
+      <button onClick={() => patch({ page: 2 })}>page</button>
+      <output data-testid="search">{location.search}</output>
+    </div>
+  )
+}
+
+test('Back that cancels in-flight typing makes the box show the URL again', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list?q=a', '/list']} initialIndex={1}>
+      <Navigable settleMs={30} />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  await act(async () => {
+    fireEvent.change(input, { target: { value: 'a' } })
+    fireEvent.change(input, { target: { value: 'ab' } })
+    fireEvent.click(view.getByText('back'))
+  })
+  await settle(120)
+  expect(view.getByTestId('search').textContent).toBe('?q=a')
+  expect(input.value).toBe('a')
+  view.unmount()
+})
+
+test('an external clear back to the original query makes the box show the URL', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list']}>
+      <Navigable settleMs={30} />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  await act(async () => {
+    fireEvent.click(view.getByText('type-then-clear'))
+  })
+  await settle(120)
+  expect(view.getByTestId('search').textContent).toBe('')
+  expect(input.value).toBe('')
+  view.unmount()
+})
+
+test('typing is not reverted while the URL is still catching up', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list']}>
+      <Navigable settleMs={500} />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  await act(async () => {
+    fireEvent.change(input, { target: { value: 'slow' } })
+  })
+  await settle(60)
+  expect(input.value).toBe('slow')
+  expect(view.getByTestId('search').textContent).toBe('?q=slow')
+  view.unmount()
+})
+
+test('a navigation that lands on the query already shown discards a cancelled patch', async () => {
+  function Racer() {
+    const { patch } = useUrlState<'q' | 'page'>()
+    const navigate = useNavigate()
+    const location = useLocation()
+    return (
+      <div>
+        <button
+          onClick={() => {
+            patch({ q: 'abcd' })
+            navigate('/list?q=abc', { replace: true })
+          }}
+        >
+          race
+        </button>
+        <button onClick={() => patch({ page: 2 })}>page</button>
+        <output data-testid="search">{location.search}</output>
+      </div>
+    )
+  }
+  const view = render(
+    <MemoryRouter initialEntries={['/list?q=abc']}>
+      <Racer />
+    </MemoryRouter>
+  )
+  await act(async () => {
+    fireEvent.click(view.getByText('race'))
+  })
+  expect(view.getByTestId('search').textContent).toBe('?q=abc')
+  await act(async () => {
+    fireEvent.click(view.getByText('page'))
+  })
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe('abc')
+  expect(params.get('page')).toBe('2')
   view.unmount()
 })
