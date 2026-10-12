@@ -72,6 +72,7 @@ import {
   fmtDate,
   fmtDateTime,
   fmtRelativeTime,
+  useUrlBoundText,
   useUrlState,
   type DetailFact,
 } from '@temps-sdk/ds'
@@ -97,7 +98,7 @@ import {
   Search,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
@@ -303,8 +304,17 @@ export function S3SourceDetail() {
   >()
   const backupSearch = getBackupsUrlState('q') ?? ''
   const backupPage = Number(getBackupsUrlState('page') ?? '1') || 1
-  const setBackupSearch = (value: string) =>
-    patchBackupsUrlState({ q: value || undefined })
+  // Search text and the page reset it implies are one URL update; the box
+  // keeps what was typed locally so a router transition can't drop keystrokes.
+  const commitBackupSearch = useCallback(
+    (value: string) =>
+      patchBackupsUrlState({ q: value || undefined, page: undefined }),
+    [patchBackupsUrlState]
+  )
+  const [backupSearchText, setBackupSearchText] = useUrlBoundText(
+    backupSearch,
+    commitBackupSearch
+  )
   const setBackupPage = (value: number | ((current: number) => number)) => {
     const next = typeof value === 'function' ? value(backupPage) : value
     patchBackupsUrlState({ page: next > 1 ? next : undefined })
@@ -693,11 +703,8 @@ export function S3SourceDetail() {
                   <Input
                     type="search"
                     placeholder="Search by service, engine, state, or UUID…"
-                    value={backupSearch}
-                    onChange={(e) => {
-                      setBackupSearch(e.target.value)
-                      setBackupPage(1)
-                    }}
+                    value={backupSearchText}
+                    onChange={(e) => setBackupSearchText(e.target.value)}
                     className="pl-9"
                   />
                 </div>
