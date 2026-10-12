@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { client } from '@/api/client/client.gen'
+import { attachHttpStatus } from '@/lib/http-error-status'
 
 type Handler = (request: Request) => Response | Promise<Response>
 
@@ -41,6 +42,11 @@ export function mockApi(routes: Record<string, Handler>) {
     if (!handler) return jsonResponse({ title: 'Not mocked' }, 404)
     return handler(request)
   }) as typeof fetch
+  // Same as App.tsx: pages tell a 404 from a 403/500 by the status copied onto
+  // the thrown body.
+  if (!client.interceptors.error.exists(attachHttpStatus)) {
+    client.interceptors.error.use(attachHttpStatus)
+  }
   client.setConfig({ baseUrl: 'http://localhost/api', fetch: mockedFetch })
   return {
     calls,
