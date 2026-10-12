@@ -13,6 +13,14 @@ export const MAX_TITLE_CHARS = 120
 export const MAX_DESCRIPTION_CHARS = 1000
 export const MAX_DISPLAY_NAME_CHARS = 80
 export const MAX_MONITORS_PER_PAGE = 50
+export const MAX_INCIDENT_UPDATE_CHARS = 5000
+
+export const INCIDENT_STATUSES = [
+  'investigating',
+  'identified',
+  'monitoring',
+  'resolved',
+] as const
 
 const monitorRowSchema = z
   .object({
@@ -119,4 +127,28 @@ export function formDefaults(
  */
 export function operationQueries(operationId: string) {
   return { queryKey: [{ _id: operationId }] }
+}
+
+export const incidentUpdateSchema = z.object({
+  status: z.enum(INCIDENT_STATUSES),
+  message: z
+    .string()
+    .trim()
+    .min(1, 'Write a message for the update')
+    .max(
+      MAX_INCIDENT_UPDATE_CHARS,
+      `At most ${MAX_INCIDENT_UPDATE_CHARS.toLocaleString('en-US')} characters`
+    ),
+  is_public: z.boolean(),
+})
+
+export type IncidentUpdateValues = z.infer<typeof incidentUpdateSchema>
+
+/** The incident's current status if it is a known one, else "investigating". */
+export function initialIncidentStatus(
+  status: string
+): IncidentUpdateValues['status'] {
+  return (INCIDENT_STATUSES as readonly string[]).includes(status)
+    ? (status as IncidentUpdateValues['status'])
+    : 'investigating'
 }

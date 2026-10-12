@@ -132,14 +132,20 @@ function StatusPageForm({
   })
   const rows = useFieldArray({ control: form.control, name: 'monitors' })
 
+  // Publishing, unpublishing or replacing the link refetches the page. Take
+  // the fresh server values for fields the operator has not touched, but
+  // never discard unsaved edits.
   useEffect(() => {
-    form.reset(formDefaults(monitors, page))
+    form.reset(formDefaults(monitors, page), { keepDirtyValues: true })
   }, [form, monitors, page])
 
   const update = useMutation({
     ...updateStatusPageMutation(),
     meta: { errorTitle: 'Failed to save status page' },
     onSuccess: async () => {
+      // What was submitted is now saved: make it the clean baseline so the
+      // refetch below replaces it with the server's normalized values.
+      form.reset(form.getValues())
       await queryClient.invalidateQueries(operationQueries('getStatusPage'))
       await queryClient.invalidateQueries(operationQueries('listStatusPages'))
       toast.success(

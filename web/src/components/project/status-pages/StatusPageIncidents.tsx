@@ -12,7 +12,15 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
-import { Label } from '@/components/ui/label'
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import {
   Select,
   SelectContent,
@@ -26,16 +34,20 @@ import { Textarea } from '@/components/ui/textarea'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
-import { useId, useState } from 'react'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
-import { operationQueries } from './status-page-form'
+import {
+  INCIDENT_STATUSES,
+  incidentUpdateSchema,
+  initialIncidentStatus,
+  operationQueries,
+  type IncidentUpdateValues,
+} from './status-page-form'
 
-const INCIDENT_STATUSES = [
-  'investigating',
-  'identified',
-  'monitoring',
-  'resolved',
-] as const
+/** Incidents per page of the incident list. */
+const INCIDENTS_PAGE_SIZE = 5
 
 function titleCase(value: string) {
   return value.charAt(0).toUpperCase() + value.slice(1)
@@ -43,79 +55,109 @@ function titleCase(value: string) {
 
 function PostUpdateForm({ incident }: { incident: IncidentResponse }) {
   const queryClient = useQueryClient()
-  const id = useId()
-  const [status, setStatus] = useState<string>(incident.status)
-  const [message, setMessage] = useState('')
-  const [isPublic, setIsPublic] = useState(true)
+  const form = useForm<IncidentUpdateValues>({
+    resolver: zodResolver(incidentUpdateSchema),
+    defaultValues: {
+      status: initialIncidentStatus(incident.status),
+      message: '',
+      is_public: true,
+    },
+  })
   const post = useMutation({
     ...updateIncidentStatusMutation(),
     meta: { errorTitle: 'Failed to post incident update' },
-    onSuccess: async () => {
+    onSuccess: async (_incident, variables) => {
       await queryClient.invalidateQueries(
         operationQueries('getIncidentUpdates')
       )
       await queryClient.invalidateQueries(operationQueries('listIncidents'))
-      setMessage('')
+      form.reset({ ...form.getValues(), message: '' })
       toast.success(
-        isPublic
+        variables.body.is_public
           ? 'Update posted and shown on published status pages.'
           : 'Private update posted.'
       )
     },
   })
   return (
-    <form
-      className="space-y-2"
-      onSubmit={(event) => {
-        event.preventDefault()
-        if (!message.trim()) {
-          toast.error('Write a message for the update.')
-          return
-        }
-        post.mutate({
-          path: { incident_id: incident.id },
-          body: { status, message, is_public: isPublic },
-        })
-      }}
-    >
-      <Textarea
-        rows={2}
-        value={message}
-        onChange={(e) => setMessage(e.target.value)}
-        placeholder="We have identified the cause and are rolling out a fix."
-        aria-label="Update message"
-      />
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-        <Select value={status} onValueChange={setStatus}>
-          <SelectTrigger className="w-full sm:w-[180px]" aria-label="Status">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {INCIDENT_STATUSES.map((s) => (
-              <SelectItem key={s} value={s}>
-                {titleCase(s)}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <div className="flex items-center gap-2">
-          <Checkbox
-            id={`${id}-public`}
-            checked={isPublic}
-            onCheckedChange={(checked) => setIsPublic(checked === true)}
+    <Form {...form}>
+      <form
+        className="space-y-2"
+        onSubmit={form.handleSubmit((values) =>
+          post.mutate({ path: { incident_id: incident.id }, body: values })
+        )}
+      >
+        <FormField
+          control={form.control}
+          name="message"
+          render={({ field }) => (
+            <FormItem>
+              <FormControl>
+                <Textarea
+                  rows={2}
+                  placeholder="We have identified the cause and are rolling out a fix."
+                  aria-label="Update message"
+                  {...field}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <FormField
+            control={form.control}
+            name="status"
+            render={({ field }) => (
+              <FormItem>
+                <Select value={field.value} onValueChange={field.onChange}>
+                  <FormControl>
+                    <SelectTrigger
+                      className="w-full sm:w-[180px]"
+                      aria-label="Status"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent>
+                    {INCIDENT_STATUSES.map((s) => (
+                      <SelectItem key={s} value={s}>
+                        {titleCase(s)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormItem>
+            )}
           />
-          <Label htmlFor={`${id}-public`}>Show on status pages</Label>
+          <FormField
+            control={form.control}
+            name="is_public"
+            render={({ field }) => (
+              <FormItem className="flex flex-row items-center gap-2 space-y-0">
+                <FormControl>
+                  <Checkbox
+                    checked={field.value}
+                    onCheckedChange={(checked) =>
+                      field.onChange(checked === true)
+                    }
+                  />
+                </FormControl>
+                <FormLabel>Show on status pages</FormLabel>
+              </FormItem>
+            )}
+          />
+          <Button
+            type="submit"
+            size="sm"
+            className="sm:ml-auto"
+            disabled={post.isPending}
+          >
+            {post.isPending ? 'Posting...' : 'Post update'}
+          </Button>
         </div>
-        <Button
-          type="submit"
-          size="sm"
-          className="sm:ml-auto"
-          disabled={post.isPending}
-        >
-          {post.isPending ? 'Posting...' : 'Post update'}
-        </Button>
-      </div>
-    </form>
+      </form>
+    </Form>
   )
 }
 
@@ -222,13 +264,17 @@ function IncidentRow({ incident }: { incident: IncidentResponse }) {
  * reaches published status pages. Incident updates are private by default.
  */
 export function StatusPageIncidents({ project }: { project: ProjectResponse }) {
-  const incidents = useQuery(
-    listIncidentsOptions({
+  const [page, setPage] = useState(1)
+  const incidents = useQuery({
+    ...listIncidentsOptions({
       path: { project_id: project.id },
-      query: { page: 1, page_size: 5 },
-    })
-  )
+      query: { page, page_size: INCIDENTS_PAGE_SIZE },
+    }),
+    placeholderData: (previous) => previous,
+  })
   const items = incidents.data?.incidents ?? []
+  const total = incidents.data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / INCIDENTS_PAGE_SIZE))
 
   return (
     <section className="space-y-3">
@@ -266,6 +312,16 @@ export function StatusPageIncidents({ project }: { project: ProjectResponse }) {
             ))}
           </CardContent>
         </Card>
+      )}
+      {totalPages > 1 && (
+        <ResponsivePagination
+          page={page}
+          pageSize={INCIDENTS_PAGE_SIZE}
+          total={total}
+          totalPages={totalPages}
+          onPageChange={setPage}
+          ariaLabel="Incident pagination"
+        />
       )}
     </section>
   )

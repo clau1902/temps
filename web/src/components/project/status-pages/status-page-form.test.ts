@@ -6,6 +6,9 @@ import { QueryClient } from '@tanstack/react-query'
 import type { MonitorResponse, StatusPageResponse } from '@/api/client'
 import {
   buildMonitorRows,
+  incidentUpdateSchema,
+  initialIncidentStatus,
+  MAX_INCIDENT_UPDATE_CHARS,
   operationQueries,
   statusPageFormSchema,
   toSelection,
@@ -145,5 +148,31 @@ describe('operationQueries', () => {
     await client.invalidateQueries(operationQueries('getStatusPage'))
     expect(client.getQueryState(detail)?.isInvalidated).toBe(true)
     expect(client.getQueryState(other)?.isInvalidated).toBe(false)
+  })
+})
+
+describe('incidentUpdateSchema', () => {
+  it('requires a message and enforces the server limit', () => {
+    const base = { status: 'identified' as const, is_public: true }
+    expect(
+      incidentUpdateSchema.safeParse({ ...base, message: '  ' }).success
+    ).toBe(false)
+    expect(
+      incidentUpdateSchema.safeParse({
+        ...base,
+        message: 'x'.repeat(MAX_INCIDENT_UPDATE_CHARS + 1),
+      }).success
+    ).toBe(false)
+    expect(
+      incidentUpdateSchema.safeParse({
+        ...base,
+        message: 'x'.repeat(MAX_INCIDENT_UPDATE_CHARS),
+      }).success
+    ).toBe(true)
+  })
+
+  it('falls back to investigating for an unknown incident status', () => {
+    expect(initialIncidentStatus('monitoring')).toBe('monitoring')
+    expect(initialIncidentStatus('something-else')).toBe('investigating')
   })
 })
