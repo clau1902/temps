@@ -4,6 +4,7 @@
 import * as z from 'zod'
 import type {
   MonitorResponse,
+  StatusPageDomainResponse,
   StatusPageMonitorInput,
   StatusPageResponse,
 } from '@/api/client'
@@ -151,4 +152,45 @@ export function initialIncidentStatus(
   return (INCIDENT_STATUSES as readonly string[]).includes(status)
     ? (status as IncidentUpdateValues['status'])
     : 'investigating'
+}
+
+/**
+ * Client-side shape check for a custom hostname. The server normalizes
+ * (case, trailing dot, IDNA) and decides; this only catches obvious mistakes
+ * such as pasting a URL.
+ */
+export const addDomainSchema = z.object({
+  hostname: z
+    .string()
+    .trim()
+    .min(1, 'Enter a hostname such as status.example.com')
+    .max(253, 'At most 253 characters')
+    .refine((value) => !value.includes('*'), 'Wildcards are not supported')
+    .refine(
+      (value) => !/[/:@\s?#]/.test(value),
+      'Enter just the hostname, without https:// or a path'
+    )
+    .refine(
+      (value) => value.replace(/\.$/, '').includes('.'),
+      'Use a fully qualified hostname such as status.example.com'
+    ),
+  verification_method: z.enum(['http-01', 'dns-01']),
+})
+
+export type AddDomainValues = z.infer<typeof addDomainSchema>
+
+/** Human label for a custom domain's state. */
+export function domainStatusLabel(
+  domain: Pick<StatusPageDomainResponse, 'status' | 'serving'>
+): string {
+  switch (domain.status) {
+    case 'active':
+      return domain.serving ? 'Serving' : 'Verified · page unpublished'
+    case 'failed':
+      return 'Verification failed'
+    case 'unverified':
+      return 'Needs verification'
+    default:
+      return 'Waiting for DNS'
+  }
 }

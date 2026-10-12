@@ -64,6 +64,7 @@ import { useFieldArray, useForm } from 'react-hook-form'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { StatusPageStateBadge } from './ProjectStatusPages'
+import { StatusPageDomains } from './StatusPageDomains'
 import { StatusPageIncidents } from './StatusPageIncidents'
 import {
   formDefaults,
@@ -471,6 +472,8 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
       </div>
 
       <PublicLinkSection page={page} />
+
+      <StatusPageDomains page={page} />
 
       <StatusPageForm
         page={page}
