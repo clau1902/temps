@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { parseMonitorSpec, parseMonitorSpecs } from './index.js'
+import { domainStateLabel, parseMonitorSpec, parseMonitorSpecs } from './index.js'
 
 describe('parseMonitorSpec', () => {
   test('parses <id>=<public name>', () => {
@@ -33,5 +33,15 @@ describe('parseMonitorSpecs', () => {
     ])
     expect(typeof parseMonitorSpecs(['2=Web', 'bad'])).toBe('string')
     expect(parseMonitorSpecs(undefined)).toEqual([])
+  })
+})
+
+describe('domainStateLabel', () => {
+  test('describes each custom domain state', () => {
+    expect(domainStateLabel({ status: 'active', serving: true })).toBe('serving')
+    expect(domainStateLabel({ status: 'active', serving: false })).toContain('unpublished')
+    expect(domainStateLabel({ status: 'pending', serving: false })).toBe('waiting for DNS')
+    expect(domainStateLabel({ status: 'unverified', serving: false })).toBe('needs verification')
+    expect(domainStateLabel({ status: 'failed', serving: false })).toBe('verification failed')
   })
 })

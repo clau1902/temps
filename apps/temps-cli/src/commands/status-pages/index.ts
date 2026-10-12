@@ -13,8 +13,13 @@ import {
   unpublishStatusPage,
   rotateStatusPageUrl,
   deleteStatusPage,
+  listStatusPageDomains,
+  addStatusPageDomain,
+  verifyStatusPageDomain,
+  removeStatusPageDomain,
 } from '../../api/sdk.gen.js'
 import type {
+  StatusPageDomainResponse,
   StatusPageMonitorInput,
   StatusPageResponse,
 } from '../../api/types.gen.js'
@@ -139,6 +144,175 @@ async function run<T>(label: string, call: () => Promise<{ data?: T; error?: unk
     }
     return data
   })
+}
+
+interface DomainOptions {
+  id: string
+  domainId?: string
+  hostname?: string
+  dns?: boolean
+  json?: boolean
+  yes?: boolean
+}
+
+export function domainStateLabel(domain: Pick<StatusPageDomainResponse, 'status' | 'serving'>): string {
+  switch (domain.status) {
+    case 'active':
+      return domain.serving ? 'serving' : 'verified (page unpublished)'
+    case 'failed':
+      return 'verification failed'
+    case 'unverified':
+      return 'needs verification'
+    default:
+      return 'waiting for DNS'
+  }
+}
+
+function printDomain(domain: StatusPageDomainResponse): void {
+  newline()
+  header(`${icons.info} ${domain.hostname}`)
+  keyValue('Domain ID', domain.id)
+  keyValue('State', domainStateLabel(domain))
+  keyValue('Verification', domain.verification_method === 'dns-01' ? 'DNS TXT record' : 'HTTP (hostname points here)')
+  if (domain.certificate_expires_at) {
+    keyValue('Certificate expires', formatDate(domain.certificate_expires_at))
+  }
+  if (domain.last_error) {
+    keyValue('Last error', domain.last_error)
+  }
+  if (domain.status !== 'active') {
+    newline()
+    info('Create these DNS records, then run: temps status-pages domains verify')
+    printTable(domain.dns_records, [
+      { header: 'Type', key: 'record_type', width: 6 },
+      { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
+      { header: 'Value', key: 'value' },
+    ], { style: 'minimal' })
+  }
+  newline()
+}
+
+function registerDomainCommands(pages: Command): void {
+  const domains = pages
+    .command('domains')
+    .alias('domain')
+    .description('Serve a status page on your own hostname')
+
+  domains
+    .command('list')
+    .alias('ls')
+    .description('List a status page\'s custom domains and the DNS records they need')
+    .requiredOption('--id <id>', 'Status page ID')
+    .option('--json', 'Output in JSON format')
+    .action(async (options: DomainOptions) => {
+      await requireAuth()
+      await setupClient()
+      const id = parseId(options.id, 'status page ID')
+      if (id === null) return
+      const result = await run('Fetching custom domains...', () =>
+        listStatusPageDomains({ client, path: { status_page_id: id } }))
+      if (options.json) {
+        json(result)
+        return
+      }
+      if (result.length === 0) {
+        newline()
+        info(`No custom domains. Add one with: temps status-pages domains add --id ${id} --hostname status.example.com`)
+        newline()
+        return
+      }
+      result.forEach(printDomain)
+    })
+
+  domains
+    .command('add')
+    .description('Attach a hostname; it serves only after ownership is verified')
+    .requiredOption('--id <id>', 'Status page ID')
+    .requiredOption('--hostname <hostname>', 'Hostname, e.g. status.example.com')
+    .option('--dns', 'Verify with a DNS TXT record instead of HTTP')
+    .option('--json', 'Output in JSON format')
+    .action(async (options: DomainOptions) => {
+      await requireAuth()
+      await setupClient()
+      const id = parseId(options.id, 'status page ID')
+      if (id === null) return
+      const domain = await run('Adding custom domain...', () =>
+        addStatusPageDomain({
+          client,
+          path: { status_page_id: id },
+          body: {
+            hostname: options.hostname ?? '',
+            verification_method: options.dns ? 'dns-01' : 'http-01',
+          },
+        }))
+      if (options.json) {
+        json(domain)
+        return
+      }
+      success(`Added ${domain.hostname}`)
+      printDomain(domain)
+    })
+
+  domains
+    .command('verify')
+    .description('Prove ownership and issue the certificate')
+    .requiredOption('--id <id>', 'Status page ID')
+    .requiredOption('--domain-id <id>', 'Custom domain ID (see `domains list`)')
+    .option('--json', 'Output in JSON format')
+    .action(async (options: DomainOptions) => {
+      await requireAuth()
+      await setupClient()
+      const id = parseId(options.id, 'status page ID')
+      const domainId = parseId(options.domainId ?? '', 'domain ID')
+      if (id === null || domainId === null) return
+      const domain = await run('Verifying...', () =>
+        verifyStatusPageDomain({ client, path: { status_page_id: id, domain_id: domainId } }))
+      if (options.json) {
+        json(domain)
+        return
+      }
+      if (domain.status === 'active') {
+        success(`${domain.hostname} is verified`)
+      } else {
+        warning(`${domain.hostname} is not verified yet`)
+      }
+      printDomain(domain)
+    })
+
+  domains
+    .command('remove')
+    .alias('rm')
+    .description('Detach a hostname; it answers 404 immediately and its certificate is deleted')
+    .requiredOption('--id <id>', 'Status page ID')
+    .requiredOption('--domain-id <id>', 'Custom domain ID (see `domains list`)')
+    .option('-y, --yes', 'Skip the confirmation prompt')
+    .action(async (options: DomainOptions) => {
+      await requireAuth()
+      await setupClient()
+      const id = parseId(options.id, 'status page ID')
+      const domainId = parseId(options.domainId ?? '', 'domain ID')
+      if (id === null || domainId === null) return
+      if (!options.yes) {
+        const confirmed = await promptConfirm({
+          message: `Remove custom domain ${domainId}? It stops serving the page immediately.`,
+          default: false,
+        })
+        if (!confirmed) {
+          info('Cancelled')
+          return
+        }
+      }
+      await withSpinner('Removing custom domain...', async () => {
+        const { error } = await removeStatusPageDomain({
+          client,
+          path: { status_page_id: id, domain_id: domainId },
+        })
+        if (error) {
+          throw new Error(getErrorMessage(error))
+        }
+      })
+      success(`Removed custom domain ${domainId}`)
+    })
 }
 
 export function registerStatusPagesCommands(program: Command): void {
@@ -330,4 +504,6 @@ export function registerStatusPagesCommands(program: Command): void {
       })
       success(`Deleted status page ${id}`)
     })
+
+  registerDomainCommands(pages)
 }
