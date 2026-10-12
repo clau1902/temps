@@ -270,7 +270,12 @@ export function StatusPageIncidents({ project }: { project: ProjectResponse }) {
       path: { project_id: project.id },
       query: { page, page_size: INCIDENTS_PAGE_SIZE },
     }),
-    placeholderData: (previous) => previous,
+    // Keep the previous page visible while the next one loads, but only
+    // for this project.
+    placeholderData: (previous, previousQuery) =>
+      previousQuery?.queryKey[0]?.path?.project_id === project.id
+        ? previous
+        : undefined,
   })
   const items = incidents.data?.incidents ?? []
   const total = incidents.data?.total ?? 0
@@ -313,12 +318,14 @@ export function StatusPageIncidents({ project }: { project: ProjectResponse }) {
           </CardContent>
         </Card>
       )}
-      {totalPages > 1 && (
+      {/* Also shown past the last page (incidents can disappear while
+          browsing), so there is always a way back. */}
+      {(totalPages > 1 || page > 1) && (
         <ResponsivePagination
           page={page}
           pageSize={INCIDENTS_PAGE_SIZE}
           total={total}
-          totalPages={totalPages}
+          totalPages={Math.max(totalPages, page)}
           onPageChange={setPage}
           ariaLabel="Incident pagination"
         />

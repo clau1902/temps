@@ -142,10 +142,10 @@ function StatusPageForm({
   const update = useMutation({
     ...updateStatusPageMutation(),
     meta: { errorTitle: 'Failed to save status page' },
-    onSuccess: async () => {
-      // What was submitted is now saved: make it the clean baseline so the
-      // refetch below replaces it with the server's normalized values.
-      form.reset(form.getValues())
+    onSuccess: async (saved) => {
+      // The saved page is the new clean baseline. The form is disabled while
+      // a save is pending, so there are no newer edits for this to discard.
+      form.reset(formDefaults(monitors, saved))
       await queryClient.invalidateQueries(operationQueries('getStatusPage'))
       await queryClient.invalidateQueries(operationQueries('listStatusPages'))
       toast.success(
@@ -156,7 +156,7 @@ function StatusPageForm({
     },
   })
 
-  const onSubmit = (values: StatusPageFormValues) =>
+  const onSubmit = (values: StatusPageFormValues) => {
     update.mutate({
       path: { status_page_id: page.id },
       body: {
@@ -165,89 +165,101 @@ function StatusPageForm({
         monitors: toSelection(values.monitors),
       },
     })
+  }
 
   return (
     <Form {...form}>
-      <form className="space-y-6" onSubmit={form.handleSubmit(onSubmit)}>
-        <section className="space-y-4">
-          <h3 className="text-lg font-semibold">Details</h3>
-          <FormField
-            control={form.control}
-            name="title"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>Public title</FormLabel>
-                <FormControl>
-                  <Input {...field} />
-                </FormControl>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
-          <FormField
-            control={form.control}
-            name="description"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>Description (optional)</FormLabel>
-                <FormControl>
-                  <Textarea
-                    rows={2}
-                    placeholder="Live status of the Acme API and dashboard."
-                    {...field}
-                  />
-                </FormControl>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
-        </section>
+      <form onSubmit={form.handleSubmit(onSubmit)}>
+        <fieldset
+          className="min-w-0 space-y-6"
+          disabled={update.isPending}
+          aria-busy={update.isPending}
+        >
+          <section className="space-y-4">
+            <h3 className="text-lg font-semibold">Details</h3>
+            <FormField
+              control={form.control}
+              name="title"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Public title</FormLabel>
+                  <FormControl>
+                    <Input {...field} />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="description"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Description (optional)</FormLabel>
+                  <FormControl>
+                    <Textarea
+                      rows={2}
+                      placeholder="Live status of the Acme API and dashboard."
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </section>
 
-        <section className="space-y-3">
-          <div>
-            <h3 className="text-lg font-semibold">Monitors</h3>
-            <p className="text-sm text-muted-foreground">
-              Tick the monitors to show and give each a public name. Only that
-              name, its current state and its daily uptime are published — never
-              the monitor&apos;s internal name, URL, host or error messages.
-            </p>
+          <section className="space-y-3">
+            <div>
+              <h3 className="text-lg font-semibold">Monitors</h3>
+              <p className="text-sm text-muted-foreground">
+                Tick the monitors to show and give each a public name. Only that
+                name, its current state and its daily uptime are published —
+                never the monitor&apos;s internal name, URL, host or error
+                messages.
+              </p>
+            </div>
+            {rows.fields.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                This project has no monitors.{' '}
+                <Link
+                  className="underline underline-offset-4"
+                  to={`/projects/${projectSlug}/monitors`}
+                >
+                  Create one
+                </Link>{' '}
+                to show it here.
+              </p>
+            ) : (
+              <Card>
+                <CardContent className="divide-y p-0">
+                  {rows.fields.map((row, index) => (
+                    <MonitorSelectionRow
+                      key={row.id}
+                      index={index}
+                      form={form}
+                    />
+                  ))}
+                </CardContent>
+              </Card>
+            )}
+            <FormField
+              control={form.control}
+              name="monitors"
+              render={() => (
+                <FormItem>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </section>
+
+          <div className="flex justify-end">
+            <Button type="submit" disabled={update.isPending}>
+              {update.isPending ? 'Saving...' : 'Save changes'}
+            </Button>
           </div>
-          {rows.fields.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              This project has no monitors.{' '}
-              <Link
-                className="underline underline-offset-4"
-                to={`/projects/${projectSlug}/monitors`}
-              >
-                Create one
-              </Link>{' '}
-              to show it here.
-            </p>
-          ) : (
-            <Card>
-              <CardContent className="divide-y p-0">
-                {rows.fields.map((row, index) => (
-                  <MonitorSelectionRow key={row.id} index={index} form={form} />
-                ))}
-              </CardContent>
-            </Card>
-          )}
-          <FormField
-            control={form.control}
-            name="monitors"
-            render={() => (
-              <FormItem>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
-        </section>
-
-        <div className="flex justify-end">
-          <Button type="submit" disabled={update.isPending}>
-            {update.isPending ? 'Saving...' : 'Save changes'}
-          </Button>
-        </div>
+        </fieldset>
       </form>
     </Form>
   )
@@ -466,7 +478,9 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
         projectSlug={project.slug}
       />
 
-      <StatusPageIncidents project={project} />
+      {/* Keyed by project: switching projects must never show (and let you
+          act on) the previous project's incidents or page number. */}
+      <StatusPageIncidents key={project.id} project={project} />
 
       <AlertDialog open={confirmRotate} onOpenChange={setConfirmRotate}>
         <AlertDialogContent>
