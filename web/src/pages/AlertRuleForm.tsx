@@ -243,13 +243,13 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
 
   const isMutating = createMutation.isPending || updateMutation.isPending
 
-  const onSubmit = async (data: AlertRuleFormData) => {
+  const onSubmit = (data: AlertRuleFormData) => {
     const triggerConfig = needsConfig(data.trigger_type)
       ? data.trigger_config
       : undefined
 
     if (isEditing) {
-      await updateMutation.mutateAsync({
+      updateMutation.mutate({
         path: { project_id: projectId, rule_id: Number(ruleId) },
         body: {
           name: data.name,
@@ -263,7 +263,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
         },
       })
     } else {
-      await createMutation.mutateAsync({
+      createMutation.mutate({
         path: { project_id: projectId },
         body: {
           name: data.name,

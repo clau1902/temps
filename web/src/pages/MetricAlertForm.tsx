@@ -490,7 +490,7 @@ function AlertFormBody({
 
   const isMutating = createMutation.isPending || updateMutation.isPending
 
-  const onSubmit = async (data: AlertFormData) => {
+  const onSubmit = (data: AlertFormData) => {
     // Build the typed `detection_config` variant the user chose. The Zod enums
     // guarantee the string fields are valid literals, so the narrowing casts are
     // sound, and the backend re-validates the final config.
@@ -515,7 +515,7 @@ function AlertFormBody({
     // backend now supports per-series anomaly detection too.)
     const dynamic_alerts = data.dynamic_alerts && data.group_by.length > 0
     if (isEditing) {
-      await updateMutation.mutateAsync({
+      updateMutation.mutate({
         path: { id },
         query: { project_id: project.id },
         body: {
@@ -535,7 +535,7 @@ function AlertFormBody({
         },
       })
     } else {
-      await createMutation.mutateAsync({
+      createMutation.mutate({
         body: {
           project_id: project.id,
           name: data.name,
