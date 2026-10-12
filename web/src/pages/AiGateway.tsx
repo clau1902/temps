@@ -4711,22 +4711,21 @@ console.log(response.choices[0].message.content);`,
                     : 'Override the default API endpoint for this provider.'}
                 </p>
               </div>
-              {newProviderIsSelfHosted && (
-                <SelfHostedProviderFields
-                  baseUrl={newBaseUrl}
-                  apiKey={newApiKey}
-                  trustPrivateAddress={newTrustPrivateAddress}
-                  onTrustPrivateAddressChange={setNewTrustPrivateAddress}
-                  canTrustPrivateAddress={canTrustPrivateAddress}
-                  discovery={selfHostedDiscovery}
-                  onDiscovered={setSelfHostedDiscovery}
-                  defaultModel={newDefaultModel}
-                  onDefaultModelChange={setNewDefaultModel}
-                  capabilities={newCapabilities}
-                  onCapabilitiesChange={setNewCapabilities}
-                  disabled={createMutation.isPending}
-                />
-              )}
+              <SelfHostedProviderFields
+                open={newProviderIsSelfHosted}
+                baseUrl={newBaseUrl}
+                apiKey={newApiKey}
+                trustPrivateAddress={newTrustPrivateAddress}
+                onTrustPrivateAddressChange={setNewTrustPrivateAddress}
+                canTrustPrivateAddress={canTrustPrivateAddress}
+                discovery={selfHostedDiscovery}
+                onDiscovered={setSelfHostedDiscovery}
+                defaultModel={newDefaultModel}
+                onDefaultModelChange={setNewDefaultModel}
+                capabilities={newCapabilities}
+                onCapabilitiesChange={setNewCapabilities}
+                disabled={createMutation.isPending}
+              />
             </div>
             <p className="text-xs text-muted-foreground">
               {newProviderIsSelfHosted

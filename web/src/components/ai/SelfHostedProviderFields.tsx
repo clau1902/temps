@@ -26,6 +26,12 @@ export interface SelfHostedDiscovery {
 }
 
 interface SelfHostedProviderFieldsProps {
+  /**
+   * Whether the fields are shown (the self-hosted provider is selected). The
+   * component stays mounted either way, so discovery request state survives
+   * switching providers back and forth.
+   */
+  open: boolean
   baseUrl: string
   apiKey: string
   trustPrivateAddress: boolean
@@ -49,6 +55,7 @@ interface SelfHostedProviderFieldsProps {
  * key only.
  */
 export function SelfHostedProviderFields({
+  open,
   baseUrl,
   apiKey,
   trustPrivateAddress,
@@ -71,7 +78,9 @@ export function SelfHostedProviderFields({
     discovery && discovery.signature === signature ? discovery.models : null
 
   const discoverMutation = useMutation({
-    mutationFn: async () => {
+    // The variable is the signature of the inputs the request was made with,
+    // so results and errors only apply while those inputs are unchanged.
+    mutationFn: async (_requestSignature: string) => {
       const response = await discoverProviderModels({
         body: {
           provider: SELF_HOSTED_PROVIDER_ID,
@@ -83,9 +92,9 @@ export function SelfHostedProviderFields({
       })
       return response.data
     },
-    onSuccess: (data) => {
+    onSuccess: (data, requestSignature) => {
       const models = data.models.map((model) => model.id)
-      onDiscovered({ signature, models })
+      onDiscovered({ signature: requestSignature, models })
       if (!models.includes(defaultModel)) {
         onDefaultModelChange(models[0] ?? '')
       }
@@ -95,6 +104,12 @@ export function SelfHostedProviderFields({
 
   const ipLiteral = hasIpLiteralHost(baseUrl)
   const plainHttp = isPlainHttpUrl(baseUrl)
+  const discoveryError =
+    discoverMutation.isError && discoverMutation.variables === signature
+      ? discoverMutation.error
+      : null
+
+  if (!open) return null
 
   return (
     <div className="grid gap-4">
@@ -156,7 +171,7 @@ export function SelfHostedProviderFields({
             variant="outline"
             size="sm"
             disabled={disabled || !baseUrl.trim() || discoverMutation.isPending}
-            onClick={() => discoverMutation.mutate()}
+            onClick={() => discoverMutation.mutate(signature)}
           >
             {discoverMutation.isPending ? (
               <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
@@ -183,10 +198,10 @@ export function SelfHostedProviderFields({
           searchMode="contains"
           disabled={disabled || !currentModels || currentModels.length === 0}
         />
-        {discoverMutation.isError ? (
+        {discoveryError ? (
           <p role="alert" className="text-xs text-destructive">
             {problemDetail(
-              discoverMutation.error,
+              discoveryError,
               'Could not list the models your server serves.'
             )}
           </p>
