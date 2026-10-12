@@ -27,10 +27,11 @@ use super::public::{__path_get_public_status_page, __path_get_public_status_page
 use super::status_pages::{
     __path_add_status_page_domain, __path_create_status_page, __path_delete_status_page,
     __path_get_status_page, __path_list_status_page_domains, __path_list_status_pages,
-    __path_publish_status_page, __path_remove_status_page_domain, __path_rotate_status_page_url,
-    __path_unpublish_status_page, __path_update_status_page, __path_verify_status_page_domain,
-    add_status_page_domain, create_status_page, delete_status_page, get_status_page,
-    list_status_page_domains, list_status_pages, publish_status_page, remove_status_page_domain,
+    __path_publish_status_page, __path_remove_status_page_domain, __path_renew_status_page_domain,
+    __path_rotate_status_page_url, __path_unpublish_status_page, __path_update_status_page,
+    __path_verify_status_page_domain, add_status_page_domain, create_status_page,
+    delete_status_page, get_status_page, list_status_page_domains, list_status_pages,
+    publish_status_page, remove_status_page_domain, renew_status_page_domain,
     rotate_status_page_url, unpublish_status_page, update_status_page, verify_status_page_domain,
 };
 use crate::services::public_pages::{
@@ -94,6 +95,7 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         list_status_page_domains,
         add_status_page_domain,
         verify_status_page_domain,
+        renew_status_page_domain,
         remove_status_page_domain,
         get_public_status_page,
         get_public_status_page_json,
@@ -1399,6 +1401,10 @@ where
             "/status-pages/{status_page_id}/domains/{domain_id}/verify",
             post(verify_status_page_domain),
         )
+        .route(
+            "/status-pages/{status_page_id}/domains/{domain_id}/renew",
+            post(renew_status_page_domain),
+        )
 }
 
 pub(crate) fn map_error(error: StatusPageError) -> Problem {
@@ -1427,6 +1433,12 @@ pub(crate) fn map_error(error: StatusPageError) -> Problem {
         | StatusPageError::DomainRequiresPublishedPage { .. }) => {
             temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
                 .title("Hostname Unavailable")
+                .detail(error.to_string())
+                .build()
+        }
+        error @ StatusPageError::DomainNotRenewable { .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("No Certificate To Renew")
                 .detail(error.to_string())
                 .build()
         }
@@ -1880,7 +1892,11 @@ mod tests {
                     db.clone(),
                 ),
             ),
-            None,
+            Arc::new(
+                crate::services::public_pages::domains::test_support::StubRouteTable {
+                    serving: Default::default(),
+                },
+            ),
         );
         let status_page_service = StatusPageService::new(db.clone(), config_service);
 

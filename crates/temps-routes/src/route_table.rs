@@ -667,11 +667,18 @@ async fn load_status_page_hosts(
         SELECT spd.hostname,
                sp.slug,
                (sp.id IS NOT NULL) AS attached,
+               -- Ownership is proven once the binding's own `domains` row
+               -- holds a certificate: the row is created empty for the
+               -- binding and only ACME issuance fills it. Its `status` is not
+               -- consulted, because a renewal order moves it to
+               -- `challenge_requested` while the current certificate is
+               -- still valid and must keep being served.
                COALESCE(
                    sp.is_published
                    AND NOT p.is_deleted
-                   AND d.status IN ('active', 'active_renewal_failed')
                    AND d.certificate IS NOT NULL
+                   AND d.private_key IS NOT NULL
+                   AND (d.expiration_time IS NULL OR d.expiration_time > now())
                    AND lower(d.domain) = spd.hostname,
                    FALSE
                ) AS serving

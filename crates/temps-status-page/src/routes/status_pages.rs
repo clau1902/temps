@@ -706,6 +706,82 @@ where
     Ok(Json(domain))
 }
 
+/// Renew the certificate of a status page's custom domain
+///
+/// Starts a new ACME order while the current certificate keeps being served.
+/// HTTP-01 completes immediately. DNS-01 returns `renewal_pending` with the
+/// new `_acme-challenge` TXT record: publish it, then call verify.
+#[utoipa::path(
+    post,
+    path = "/status-pages/{status_page_id}/domains/{domain_id}/renew",
+    params(
+        ("status_page_id" = i32, Path, description = "Status page ID"),
+        ("domain_id" = i32, Path, description = "Custom domain ID"),
+    ),
+    responses(
+        (status = 200, description = "Renewal started (DNS-01) or completed (HTTP-01)", body = StatusPageDomainResponse),
+        (status = 400, description = "The new order could not be validated"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Status page or domain not found"),
+        (status = 409, description = "The page is unpublished or the domain has no certificate yet"),
+        (status = 429, description = "Too many domain operations for this project"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn renew_status_page_domain<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((status_page_id, domain_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem>
+where
+    T: StatusPageAppState,
+{
+    permission_guard!(auth, StatusPageWrite);
+    let project_id = app_state
+        .public_status_page_service()
+        .get_project_id(status_page_id)
+        .await
+        .map_err(map_error)?;
+    project_permission_guard!(
+        auth,
+        StatusPageWrite,
+        project_id,
+        app_state.project_access_checker()
+    );
+    project_scope_guard!(auth, project_id);
+    let result = app_state
+        .status_page_domain_service()
+        .renew(status_page_id, domain_id, &acme_email(&auth))
+        .await;
+    // Audited whatever the outcome: every attempt starts an ACME order.
+    let (hostname, outcome) = match &result {
+        Ok(domain) => (
+            domain.hostname.clone(),
+            match domain.status {
+                crate::services::public_pages::StatusPageDomainStatus::Active => "renewed",
+                _ => "pending",
+            }
+            .to_string(),
+        ),
+        Err(error) => (format!("domain {domain_id}"), error.to_string()),
+    };
+    let mut audit = domain_audit(
+        &auth,
+        &metadata,
+        PublicStatusPageAction::DomainRenewalRequested,
+        project_id,
+        status_page_id,
+        hostname,
+    );
+    audit.outcome = Some(outcome);
+    record_audit(app_state.as_ref(), audit).await;
+    let domain = result.map_err(map_error)?;
+    Ok(Json(domain))
+}
+
 /// Remove a custom domain from a status page; it answers 404 immediately
 #[utoipa::path(
     delete,
@@ -777,7 +853,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
-    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
     use temps_auth::permissions::{Permission, Role};
@@ -1022,11 +1098,11 @@ mod tests {
                 config_service,
                 cache.clone(),
                 certs.clone(),
-                Some(Arc::new(
+                Arc::new(
                     crate::services::public_pages::domains::test_support::StubRouteTable {
                         serving: ["app-taken.example.com".to_string()].into_iter().collect(),
                     },
-                )),
+                ),
             );
 
         let project_a = insert_project(&db, "status-a").await;
@@ -2651,5 +2727,416 @@ mod tests {
                 .expect("query"),
             "only single-label children are covered"
         );
+    }
+
+    async fn renew(
+        fx: &Fx,
+        page_id: i32,
+        domain_id: i32,
+    ) -> Result<StatusPageDomainResponse, Problem> {
+        let response = renew_status_page_domain(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path((page_id, domain_id)),
+        )
+        .await?;
+        Ok(decode(response).await)
+    }
+
+    async fn attach_with(
+        fx: &Fx,
+        page_id: i32,
+        hostname: &str,
+        verification_method: VerificationMethod,
+    ) -> StatusPageDomainResponse {
+        let response = add_status_page_domain(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path(page_id),
+            Json(AddStatusPageDomainRequest {
+                hostname: hostname.to_string(),
+                verification_method,
+            }),
+        )
+        .await
+        .map_err(|p| format!("{:?}", p.body))
+        .expect("attach");
+        decode(response).await
+    }
+
+    /// Certificate copies `tls_acme_certificates` holds for `hostname`.
+    async fn stored_certificate_copies(fx: &Fx, hostname: &str) -> u64 {
+        temps_entities::tls_acme_certificates::Entity::find()
+            .filter(temps_entities::tls_acme_certificates::Column::Domain.eq(hostname))
+            .count(fx._db.connection_arc().as_ref())
+            .await
+            .expect("count certificate copies")
+    }
+
+    async fn binding_order(fx: &Fx, binding_id: i32) -> Option<i32> {
+        temps_entities::status_page_domains::Entity::find_by_id(binding_id)
+            .one(fx._db.connection_arc().as_ref())
+            .await
+            .expect("binding query")
+            .expect("binding exists")
+            .domain_id
+    }
+
+    async fn domain_listing(fx: &Fx, page_id: i32, binding_id: i32) -> StatusPageDomainResponse {
+        let listed: Vec<StatusPageDomainResponse> = decode(
+            list_status_page_domains(admin(), State(fx.state.clone()), Path(page_id))
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("list domains"),
+        )
+        .await;
+        listed
+            .into_iter()
+            .find(|d| d.id == binding_id)
+            .expect("domain listed")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_attaches_never_exceed_the_domain_limit() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        let limit = crate::services::public_pages::MAX_DOMAINS_PER_STATUS_PAGE;
+        for i in 0..limit - 1 {
+            attach(&fx, page.id, &format!("pre{i}.example.org"))
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("within limit");
+        }
+        // Different parent domains take different hostname locks; only the
+        // page lock can stop both from seeing room for one more.
+        let (first, second) = tokio::join!(
+            attach(&fx, page.id, "last.first-parent.example"),
+            attach(&fx, page.id, "last.second-parent.example"),
+        );
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "exactly one concurrent attach fits"
+        );
+        let refused = first.err().or(second.err()).expect("one refused");
+        assert_eq!(refused.status_code, StatusCode::CONFLICT);
+        let attached = temps_entities::status_page_domains::Entity::find()
+            .filter(temps_entities::status_page_domains::Column::StatusPageId.eq(page.id))
+            .count(fx._db.connection_arc().as_ref())
+            .await
+            .expect("count bindings");
+        assert_eq!(attached, limit);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_order_is_never_linked_to_a_page_unpublished_concurrently() {
+        use sea_orm::{ConnectionTrait, TransactionTrait};
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let db = fx._db.connection_arc();
+        let page = create_page(&fx, api_selection(&fx)).await;
+        // Attached while a draft: no order yet, so the binding has no
+        // certificate for unpublish to release.
+        let binding = attach(&fx, page.id, "race.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach");
+        publish(&fx, page.id).await;
+
+        // An unpublish in flight: it holds the page row lock, has flipped the
+        // flag and released the page's (unlinked) certificates, and has not
+        // committed yet.
+        let txn = db.begin().await.expect("begin");
+        for sql in [
+            "SELECT id FROM status_pages WHERE id = $1 FOR UPDATE",
+            "UPDATE status_pages SET is_published = FALSE, published_at = NULL WHERE id = $1",
+            "UPDATE status_page_domains SET domain_id = NULL WHERE status_page_id = $1 AND domain_id IS NOT NULL",
+        ] {
+            txn.execute(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+                [page.id.into()],
+            ))
+            .await
+            .expect("unpublish step");
+        }
+
+        // Verify reads the page as still published and starts an order.
+        let state = fx.state.clone();
+        let (page_id, binding_id) = (page.id, binding.id);
+        let verifying = tokio::spawn(async move {
+            state
+                .status_page_domain_service
+                .verify(page_id, binding_id, "ops@example.com")
+                .await
+        });
+        let started = async {
+            while !domains_row_exists(&fx, "race.example.org").await {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), started)
+            .await
+            .expect("the order was created");
+        // Give the link step time to reach (and wait on) the page lock.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        txn.commit().await.expect("unpublish commits");
+
+        let result = verifying.await.expect("verify task");
+        assert!(
+            matches!(
+                result,
+                Err(crate::services::StatusPageError::HostnameBindingChanged { .. })
+            ),
+            "the link must see the unpublish: {result:?}"
+        );
+        assert_eq!(binding_order(&fx, binding.id).await, None);
+        assert!(
+            !domains_row_exists(&fx, "race.example.org").await,
+            "the unlinked order is deleted"
+        );
+        assert_eq!(stored_certificate_copies(&fx, "race.example.org").await, 0);
+    }
+
+    #[tokio::test]
+    async fn dns_certificates_are_renewed_while_the_current_one_keeps_serving() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let host = "dns-renew.example.org";
+        let pending = attach_with(&fx, page.id, host, VerificationMethod::Dns01).await;
+        assert_eq!(pending.status, StatusPageDomainStatus::Pending);
+        assert!(pending.dns_records.iter().any(|r| r.record_type == "TXT"));
+        let active = verify(&fx, page.id, pending.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("verify");
+        assert_eq!(active.status, StatusPageDomainStatus::Active);
+        assert!(active.serving);
+        assert!(
+            active.dns_records.iter().all(|r| r.record_type != "TXT"),
+            "a stale TXT value is not shown for a current certificate"
+        );
+
+        // Renewing starts a new order with a new TXT value; the current
+        // certificate keeps serving through it, at every layer.
+        let renewing = renew(&fx, page.id, pending.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("renew");
+        assert_eq!(renewing.status, StatusPageDomainStatus::RenewalPending);
+        assert!(renewing.serving);
+        assert!(renewing.certificate_expires_at.is_some());
+        let txt = renewing
+            .dns_records
+            .iter()
+            .find(|r| r.record_type == "TXT")
+            .expect("new TXT record");
+        assert_eq!(txt.name, format!("_acme-challenge.{host}"));
+        assert_eq!(txt.value, "txt-value-1");
+        assert!(route_for(&fx, host).await.and_then(|r| r.slug).is_some());
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, host, false).await.0,
+            StatusCode::OK
+        );
+
+        // Verify completes the renewal.
+        let renewed = verify(&fx, page.id, pending.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("finish renewal");
+        assert_eq!(renewed.status, StatusPageDomainStatus::Active);
+        assert_eq!(fx.certs.completed.lock().expect("lock").len(), 2);
+        assert!(fx
+            .audit
+            .entries
+            .lock()
+            .expect("audit")
+            .iter()
+            .any(
+                |(kind, payload)| kind == "STATUS_PAGE_DOMAIN_RENEWAL_REQUESTED"
+                    && payload["hostname"] == host
+                    && payload["outcome"] == "pending"
+            ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_renewal_is_reported_and_keeps_serving() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let host = "renew-fails.example.org";
+        let binding = attach(&fx, page.id, host)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach");
+        verify(&fx, page.id, binding.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("verify");
+
+        fx.certs
+            .fail_hosts
+            .lock()
+            .expect("lock")
+            .insert(host.to_string());
+        let error = renew(&fx, page.id, binding.id)
+            .await
+            .expect_err("renewal fails");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+        let listed = domain_listing(&fx, page.id, binding.id).await;
+        assert_eq!(
+            listed.status,
+            StatusPageDomainStatus::RenewalFailed,
+            "active_renewal_failed is not reported as healthy"
+        );
+        assert!(listed.serving, "the current certificate is still served");
+        assert!(listed
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("connection refused")));
+        assert!(route_for(&fx, host).await.and_then(|r| r.slug).is_some());
+
+        fx.certs.fail_hosts.lock().expect("lock").clear();
+        let renewed = renew(&fx, page.id, binding.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("retry");
+        assert_eq!(renewed.status, StatusPageDomainStatus::Active);
+        assert!(renewed.last_error.is_none());
+
+        // Nothing to renew before the first certificate exists.
+        fx.certs
+            .fail_hosts
+            .lock()
+            .expect("lock")
+            .insert("never-issued.example.org".to_string());
+        let fresh = attach(&fx, page.id, "never-issued.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach");
+        let error = renew(&fx, page.id, fresh.id)
+            .await
+            .expect_err("no certificate yet");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn released_certificates_leave_no_stored_copy() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let mut ids = Vec::new();
+        for host in ["copy-a.example.org", "copy-b.example.org"] {
+            let binding = attach(&fx, page.id, host)
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("attach");
+            verify(&fx, page.id, binding.id)
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("verify");
+            assert_eq!(stored_certificate_copies(&fx, host).await, 1);
+            ids.push(binding.id);
+        }
+
+        remove_status_page_domain(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path((page.id, ids[0])),
+        )
+        .await
+        .map_err(|p| format!("{:?}", p.body))
+        .expect("remove");
+        assert!(!domains_row_exists(&fx, "copy-a.example.org").await);
+        assert_eq!(
+            stored_certificate_copies(&fx, "copy-a.example.org").await,
+            0
+        );
+
+        unpublish_status_page(admin(), State(fx.state.clone()), metadata(), Path(page.id))
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("unpublish");
+        assert!(!domains_row_exists(&fx, "copy-b.example.org").await);
+        assert_eq!(
+            stored_certificate_copies(&fx, "copy-b.example.org").await,
+            0
+        );
+        // The console shows the hostname needing verification again.
+        assert_eq!(
+            domain_listing(&fx, page.id, ids[1]).await.status,
+            StatusPageDomainStatus::Unverified
+        );
+    }
+
+    #[tokio::test]
+    async fn the_public_ingress_hostname_and_a_status_host_cannot_both_claim_a_name() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let db = fx._db.connection_arc();
+        let settings_writer = temps_config::ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgres://test:test@localhost/test".to_string(),
+                    None,
+                    None,
+                )
+                .expect("server config"),
+            ),
+            db.clone(),
+        );
+        let page = create_page(&fx, api_selection(&fx)).await;
+
+        // A status host claimed after the settings handler checked the name:
+        // the settings transaction re-checks under the shared lock.
+        attach(&fx, page.id, "hooks.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach");
+        let mut settings = settings_writer.get_settings().await.expect("settings");
+        settings.public_ingress_url = Some("https://hooks.example.org".to_string());
+        let refused = settings_writer.update_settings(settings).await;
+        assert!(
+            matches!(
+                refused,
+                Err(temps_config::ConfigServiceError::PublicIngressHostnameInUse { ref hostname })
+                    if hostname == "hooks.example.org"
+            ),
+            "{refused:?}"
+        );
+
+        // The other way round: the status page service may hold a settings
+        // snapshot from before the ingress hostname was saved. Warm its cache,
+        // save the hostname through another writer, then attach.
+        fx.state
+            .status_page_domain_service
+            .list(page.id)
+            .await
+            .expect("list warms the service's settings cache");
+        let mut settings = settings_writer.get_settings().await.expect("settings");
+        settings.public_ingress_url = Some("https://ingress.example.org".to_string());
+        settings_writer
+            .update_settings(settings)
+            .await
+            .expect("save ingress hostname");
+        let error = attach(&fx, page.id, "ingress.example.org")
+            .await
+            .expect_err("reserved for the public ingress");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
     }
 }

@@ -318,7 +318,10 @@ impl TempsPlugin for StatusPagePlugin {
             Arc::new(DomainServiceCertificates::new(
                 context.require_service::<temps_domains::DomainService>(),
             )),
-            context.get_service::<dyn temps_core::route_table::RouteTableRefresher>(),
+            // Every attach checks the hostname against the route table; the
+            // console registers it before any plugin runs, so a missing one
+            // is a wiring bug that must stop startup, not a 503 per attach.
+            context.require_service::<dyn temps_core::route_table::RouteTableRefresher>(),
         ));
         let telemetry = context
             .get_service::<dyn temps_core::TelemetryReporter>()

@@ -91,6 +91,11 @@ pub enum StatusPageError {
         status_page_id: i32,
         hostname: String,
     },
+    #[error("'{hostname}' on status page {status_page_id} has no certificate to renew; verify it instead")]
+    DomainNotRenewable {
+        status_page_id: i32,
+        hostname: String,
+    },
     #[error("too many custom domain operations for project {project_id}; try again in {retry_after_secs}s")]
     DomainOperationsThrottled {
         project_id: i32,

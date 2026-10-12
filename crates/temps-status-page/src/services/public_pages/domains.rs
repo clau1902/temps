@@ -20,7 +20,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use temps_config::ConfigService;
@@ -36,7 +37,7 @@ use crate::services::StatusPageError;
 /// Most custom hostnames per status page.
 pub const MAX_DOMAINS_PER_STATUS_PAGE: u64 = 5;
 
-/// Attach/verify operations allowed per project per hour. Each one can start
+/// Attach/verify/renew operations allowed per project per hour. Each one can start
 /// an ACME order, so this bounds the load on the CA and its rate limits.
 pub const DOMAIN_OPERATIONS_PER_HOUR: usize = 30;
 
@@ -85,13 +86,20 @@ pub struct AddStatusPageDomainRequest {
 pub enum StatusPageDomainStatus {
     /// Waiting for the DNS records below and a verification attempt.
     Pending,
-    /// Ownership proven; the certificate is issued and renewed automatically.
+    /// Ownership proven and the certificate is current. HTTP-01 certificates
+    /// are renewed automatically; DNS-01 ones need a renewal (see `renew`).
     Active,
     /// The last verification attempt failed; see `last_error`.
     Failed,
     /// No certificate: the page was unpublished, which releases certificates.
     /// Verify again after publishing.
     Unverified,
+    /// A renewal order is open. The current certificate is still served; for
+    /// DNS-01, publish the new TXT record below, then verify.
+    RenewalPending,
+    /// The last renewal failed (see `last_error`). The current certificate is
+    /// still served until it expires; renew again.
+    RenewalFailed,
 }
 
 /// A DNS record the operator must create.
@@ -317,9 +325,9 @@ pub struct StatusPageDomainService {
     config_service: Arc<ConfigService>,
     cache: Arc<StatusSnapshotCache>,
     certificates: Arc<dyn StatusPageCertificates>,
-    /// Knows every hostname an application serves. `None` fails closed: no
-    /// hostname can be attached without the check.
-    route_table: Option<Arc<dyn RouteTableRefresher>>,
+    /// Knows every hostname an application serves; consulted before any
+    /// hostname is attached.
+    route_table: Arc<dyn RouteTableRefresher>,
     /// Recent attach/verify operations per project, for [`Self::throttle`].
     /// Bounded by the number of projects with recent operations.
     operations: std::sync::Mutex<
@@ -333,7 +341,7 @@ impl StatusPageDomainService {
         config_service: Arc<ConfigService>,
         cache: Arc<StatusSnapshotCache>,
         certificates: Arc<dyn StatusPageCertificates>,
-        route_table: Option<Arc<dyn RouteTableRefresher>>,
+        route_table: Arc<dyn RouteTableRefresher>,
     ) -> Self {
         Self {
             db,
@@ -389,11 +397,20 @@ impl StatusPageDomainService {
         let page = self.page(status_page_id).await?;
         self.throttle(page.project_id)?;
 
-        // Check and claim under the hostname lock, in one transaction, so a
-        // concurrent claim of the same name (here or by a project,
-        // environment or custom route) cannot also pass its checks.
+        // Check and claim in one transaction, holding two locks:
+        // - the page row, so concurrent attaches to this page (which may take
+        //   different hostname locks) cannot both pass the per-page limit.
+        //   Taken first, the same order as unpublish (page, then bindings);
+        // - the hostname lock, so a concurrent claim of the same name (here,
+        //   by a project, environment or custom route, or as the public
+        //   ingress hostname) cannot also pass its checks.
         let txn = self.db.begin().await?;
         let result = async {
+            let page = status_pages::Entity::find_by_id(status_page_id)
+                .lock_exclusive()
+                .one(&txn)
+                .await?
+                .ok_or(StatusPageError::StatusPageNotFound { status_page_id })?;
             status_page_domains::lock_hostname_claim(&txn, &hostname).await?;
             let attached = status_page_domains::Entity::find()
                 .filter(status_page_domains::Column::StatusPageId.eq(status_page_id))
@@ -431,13 +448,13 @@ impl StatusPageDomainService {
                     StatusPageError::Database(e)
                 }
             })?;
-            Ok(binding)
+            Ok((page, binding))
         }
         .await;
-        let binding = match result {
-            Ok(binding) => {
+        let (page, binding) = match result {
+            Ok(claimed) => {
                 txn.commit().await?;
-                binding
+                claimed
             }
             Err(e) => {
                 if let Err(rollback) = txn.rollback().await {
@@ -497,20 +514,16 @@ impl StatusPageDomainService {
                 hostname: hostname.clone(),
                 reason,
             })?;
-        let linked = self
-            .db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                r#"UPDATE status_page_domains SET domain_id = $1, updated_at = now()
-                   WHERE id = $2 AND status_page_id = $3 AND domain_id IS NULL
-                     AND EXISTS (SELECT 1 FROM status_pages WHERE id = $3 AND is_published)"#,
-                [domain_id.into(), binding.id.into(), status_page_id.into()],
-            ))
-            .await?
-            .rows_affected();
-        if linked != 1 {
-            self.delete_certificate_row(domain_id, &hostname).await;
-            return Err(StatusPageError::HostnameBindingChanged { hostname });
+        match self.link_order(binding.id, status_page_id, domain_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.delete_certificate_row(domain_id, &hostname).await;
+                return Err(StatusPageError::HostnameBindingChanged { hostname });
+            }
+            Err(e) => {
+                self.delete_certificate_row(domain_id, &hostname).await;
+                return Err(e);
+            }
         }
         status_page_domains::Entity::find_by_id(binding.id)
             .one(self.db.as_ref())
@@ -521,28 +534,94 @@ impl StatusPageDomainService {
             })
     }
 
+    /// Link a new order to its binding, under the page row lock that
+    /// unpublish takes before it releases the page's certificates.
+    ///
+    /// Without the lock the published check could read the page as it was
+    /// before a concurrent unpublish committed, and the link could land after
+    /// unpublish had already released the page's (then still unlinked)
+    /// bindings — leaving an unpublished page holding an order. With it, the
+    /// two serialize: either the link commits first and unpublish releases
+    /// it, or unpublish commits first and the link sees the page unpublished.
+    /// Returns `false` when the binding or page changed and nothing was
+    /// linked.
+    async fn link_order(
+        &self,
+        binding_id: i32,
+        status_page_id: i32,
+        domain_id: i32,
+    ) -> Result<bool, StatusPageError> {
+        let txn = self.db.begin().await?;
+        let result = async {
+            let published = status_pages::Entity::find_by_id(status_page_id)
+                .lock_exclusive()
+                .one(&txn)
+                .await?
+                .is_some_and(|page| page.is_published);
+            if !published {
+                return Ok(false);
+            }
+            let linked = txn
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    r#"UPDATE status_page_domains SET domain_id = $1, updated_at = now()
+                       WHERE id = $2 AND status_page_id = $3 AND domain_id IS NULL"#,
+                    [domain_id.into(), binding_id.into(), status_page_id.into()],
+                ))
+                .await?
+                .rows_affected();
+            Ok(linked == 1)
+        }
+        .await;
+        match result {
+            Ok(true) => {
+                txn.commit().await?;
+                Ok(true)
+            }
+            other => {
+                if let Err(rollback) = txn.rollback().await {
+                    warn!(
+                        binding_id,
+                        status_page_id,
+                        error = %rollback,
+                        "failed to roll back status page certificate link"
+                    );
+                }
+                other
+            }
+        }
+    }
+
+    /// Delete a certificate order this service created but could not keep,
+    /// from both stores issuance writes to (see the migration's
+    /// `release_status_page_certificate`).
     async fn delete_certificate_row(&self, domain_id: i32, hostname: &str) {
-        if let Err(e) = domains::Entity::delete_by_id(domain_id)
-            .exec(self.db.as_ref())
+        if let Err(e) = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT release_status_page_certificate($1)",
+                [domain_id.into()],
+            ))
             .await
         {
             error!(
                 domain_id,
                 hostname,
                 error = %e,
-                "failed to delete an unlinked status page certificate row; it would be renewed until removed"
+                "failed to delete an unlinked status page certificate; it would be renewed until removed"
             );
         }
     }
 
-    /// Try to prove ownership now: completes the ACME order (requesting a new
-    /// one first if the certificate was released). Only for published pages.
-    pub async fn verify(
+    /// Check the preconditions shared by `verify` and `renew`, and count the
+    /// operation against the project's budget.
+    async fn prepare_order(
         &self,
         status_page_id: i32,
         domain_binding_id: i32,
         acme_email: &str,
-    ) -> Result<StatusPageDomainResponse, StatusPageError> {
+    ) -> Result<(status_pages::Model, status_page_domains::Model), StatusPageError> {
         let page = self.page(status_page_id).await?;
         let binding = self.binding(status_page_id, domain_binding_id).await?;
         let hostname = binding.hostname.clone();
@@ -556,6 +635,25 @@ impl StatusPageDomainService {
             });
         }
         self.throttle(page.project_id)?;
+        Ok((page, binding))
+    }
+
+    /// Try to prove ownership now. Depending on where the order stands:
+    /// starts one (the certificate was never issued, or was released when the
+    /// page was unpublished), completes the open one, or requests a new one
+    /// after a failure. For DNS-01, a new order returns first with the TXT
+    /// record to publish; verify again once it is in place. Only for
+    /// published pages.
+    pub async fn verify(
+        &self,
+        status_page_id: i32,
+        domain_binding_id: i32,
+        acme_email: &str,
+    ) -> Result<StatusPageDomainResponse, StatusPageError> {
+        let (page, binding) = self
+            .prepare_order(status_page_id, domain_binding_id, acme_email)
+            .await?;
+        let hostname = binding.hostname.clone();
         let method = VerificationMethod::from_stored(&binding.verification_method);
 
         let binding = match binding.domain_id {
@@ -576,12 +674,15 @@ impl StatusPageDomainService {
         let row = domains::Entity::find_by_id(domain_id)
             .one(self.db.as_ref())
             .await?;
-        let already_active = row.as_ref().is_some_and(|r| is_verified(r, &hostname));
-        if !already_active {
-            let needs_order = row
-                .as_ref()
-                .is_none_or(|r| r.status == "pending" || r.status == "failed");
-            if needs_order {
+        let state = row
+            .as_ref()
+            .map_or(OrderState::NeedsNew, |r| order_state(r, &hostname));
+        match state {
+            OrderState::Current => {}
+            OrderState::Open => {
+                self.complete_order(&binding, domain_id, acme_email).await?;
+            }
+            OrderState::NeedsNew => {
                 if let Err(reason) = self
                     .certificates
                     .request_challenge(&hostname, acme_email)
@@ -592,31 +693,98 @@ impl StatusPageDomainService {
                 if method == VerificationMethod::Dns01 {
                     return self.one(&binding, page.is_published).await;
                 }
+                self.complete_order(&binding, domain_id, acme_email).await?;
             }
-            if let Err(reason) = self.certificates.complete(&hostname, acme_email).await {
-                return Err(StatusPageError::DomainVerificationFailed { hostname, reason });
-            }
-            // The page could have been unpublished or the hostname removed
-            // while the order ran: then the certificate must not survive.
-            let still_bound = status_page_domains::Entity::find_by_id(binding.id)
-                .filter(status_page_domains::Column::StatusPageId.eq(status_page_id))
-                .filter(status_page_domains::Column::DomainId.eq(domain_id))
-                .one(self.db.as_ref())
-                .await?
-                .is_some()
-                && self.page(status_page_id).await?.is_published;
-            if !still_bound {
-                self.delete_certificate_row(domain_id, &hostname).await;
-                return Err(StatusPageError::HostnameBindingChanged { hostname });
-            }
-            info!(status_page_id, hostname = %hostname, "verified custom hostname of status page");
         }
         self.refresh_page(status_page_id).await;
         self.one(&binding, page.is_published).await
     }
 
-    /// At most [`DOMAIN_OPERATIONS_PER_HOUR`] attach/verify operations per
-    /// project per hour: each one can start an ACME order.
+    /// Start a new certificate order for a hostname that already holds a
+    /// certificate, without taking the current one out of service.
+    ///
+    /// HTTP-01 certificates are renewed by the renewal job; this renews one
+    /// early or retries a failed renewal. DNS-01 certificates are *not*
+    /// renewed automatically without a DNS provider, because the TXT value
+    /// changes with every order: this is how they are renewed. The response
+    /// is `renewal_pending` with the new TXT record; publish it and verify.
+    pub async fn renew(
+        &self,
+        status_page_id: i32,
+        domain_binding_id: i32,
+        acme_email: &str,
+    ) -> Result<StatusPageDomainResponse, StatusPageError> {
+        let (page, binding) = self
+            .prepare_order(status_page_id, domain_binding_id, acme_email)
+            .await?;
+        let hostname = binding.hostname.clone();
+        let method = VerificationMethod::from_stored(&binding.verification_method);
+        let row = match binding.domain_id {
+            Some(id) => {
+                domains::Entity::find_by_id(id)
+                    .one(self.db.as_ref())
+                    .await?
+            }
+            None => None,
+        };
+        let Some(domain_id) = row
+            .as_ref()
+            .filter(|r| holds_certificate(r, &hostname))
+            .map(|r| r.id)
+        else {
+            return Err(StatusPageError::DomainNotRenewable {
+                status_page_id,
+                hostname,
+            });
+        };
+        // A new order replaces any open one; the stored certificate is kept
+        // and served until the new one is issued.
+        if let Err(reason) = self
+            .certificates
+            .request_challenge(&hostname, acme_email)
+            .await
+        {
+            return Err(StatusPageError::DomainVerificationFailed { hostname, reason });
+        }
+        info!(status_page_id, hostname = %hostname, method = method.as_str(), "started certificate renewal for status page hostname");
+        if method == VerificationMethod::Http01 {
+            self.complete_order(&binding, domain_id, acme_email).await?;
+            self.refresh_page(status_page_id).await;
+        }
+        self.one(&binding, page.is_published).await
+    }
+
+    /// Complete the open order, then make sure the binding still owns it: the
+    /// page could have been unpublished or the hostname removed while the
+    /// order ran, and then the certificate must not survive.
+    async fn complete_order(
+        &self,
+        binding: &status_page_domains::Model,
+        domain_id: i32,
+        acme_email: &str,
+    ) -> Result<(), StatusPageError> {
+        let hostname = binding.hostname.clone();
+        let status_page_id = binding.status_page_id.unwrap_or_default();
+        if let Err(reason) = self.certificates.complete(&hostname, acme_email).await {
+            return Err(StatusPageError::DomainVerificationFailed { hostname, reason });
+        }
+        let still_bound = status_page_domains::Entity::find_by_id(binding.id)
+            .filter(status_page_domains::Column::StatusPageId.eq(status_page_id))
+            .filter(status_page_domains::Column::DomainId.eq(domain_id))
+            .one(self.db.as_ref())
+            .await?
+            .is_some()
+            && self.page(status_page_id).await?.is_published;
+        if !still_bound {
+            self.delete_certificate_row(domain_id, &hostname).await;
+            return Err(StatusPageError::HostnameBindingChanged { hostname });
+        }
+        info!(status_page_id, hostname = %hostname, "issued certificate for status page hostname");
+        Ok(())
+    }
+
+    /// At most [`DOMAIN_OPERATIONS_PER_HOUR`] attach/verify/renew operations
+    /// per project per hour: each one can start an ACME order.
     fn throttle(&self, project_id: i32) -> Result<(), StatusPageError> {
         let now = std::time::Instant::now();
         let window = std::time::Duration::from_secs(3600);
@@ -737,11 +905,15 @@ impl StatusPageDomainService {
             reason,
         };
 
-        let settings = self
-            .config_service
-            .get_settings()
-            .await
-            .map_err(|e| unverifiable(e.to_string()))?;
+        // Read from the database inside the caller's transaction, not from
+        // the settings cache: the public-ingress hostname is claimed under
+        // the same hostname lock, and a cached copy could predate a claim
+        // that committed while this request waited for the lock.
+        let settings = temps_entities::settings::Entity::find_by_id(1)
+            .one(conn)
+            .await?
+            .map(|row| temps_core::AppSettings::from_json(row.data))
+            .unwrap_or_default();
         if settings.is_reserved_hostname(hostname) {
             return Err(in_use(
                 "this Temps instance (console, public ingress or preview domain)",
@@ -785,16 +957,7 @@ impl StatusPageDomainService {
             return Err(in_use("a certificate managed under Domains"));
         }
 
-        let Some(route_table) = self.route_table.as_ref() else {
-            error!(
-                hostname,
-                "no route table is available to check status page hostname; refusing"
-            );
-            return Err(unverifiable(
-                "the route table is not available in this process".to_string(),
-            ));
-        };
-        match route_table.application_serving_host(hostname).await {
+        match self.route_table.application_serving_host(hostname).await {
             Ok(None) => Ok(()),
             Ok(Some(owner)) => Err(in_use(&owner)),
             Err(e) => Err(unverifiable(e.to_string())),
@@ -828,10 +991,51 @@ enum DnsTarget {
     Unknown,
 }
 
-fn is_verified(row: &domains::Model, hostname: &str) -> bool {
-    domains::CERT_SERVING_STATUSES.contains(&row.status.as_str())
-        && row.certificate.is_some()
+/// Whether the binding's own `domains` row holds a usable certificate for
+/// `hostname`, which is what proves ownership. Mirrors the serving condition
+/// of the route table and of [`load_verified_hosts`]. The row's `status` is
+/// deliberately not consulted: a renewal order moves it to
+/// `challenge_requested` while the current certificate is still valid.
+fn holds_certificate(row: &domains::Model, hostname: &str) -> bool {
+    row.certificate.is_some()
+        && row.private_key.is_some()
+        && row
+            .expiration_time
+            .is_none_or(|expires| expires > chrono::Utc::now())
         && row.domain.eq_ignore_ascii_case(hostname)
+}
+
+/// Where a binding's certificate order stands, for `verify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderState {
+    /// The certificate is current and no order is open: nothing to do.
+    Current,
+    /// An order is open (`challenge_requested`): complete it.
+    Open,
+    /// No usable order (never requested, failed, or the last renewal
+    /// failed): request a new one.
+    NeedsNew,
+}
+
+fn order_state(row: &domains::Model, hostname: &str) -> OrderState {
+    match row.status.as_str() {
+        "active" if holds_certificate(row, hostname) => OrderState::Current,
+        "challenge_requested" => OrderState::Open,
+        _ => OrderState::NeedsNew,
+    }
+}
+
+fn domain_status(row: Option<&domains::Model>, hostname: &str) -> StatusPageDomainStatus {
+    match row {
+        None => StatusPageDomainStatus::Unverified,
+        Some(row) if holds_certificate(row, hostname) => match row.status.as_str() {
+            "active" => StatusPageDomainStatus::Active,
+            "challenge_requested" | "pending" => StatusPageDomainStatus::RenewalPending,
+            _ => StatusPageDomainStatus::RenewalFailed,
+        },
+        Some(row) if row.status == "failed" => StatusPageDomainStatus::Failed,
+        Some(_) => StatusPageDomainStatus::Pending,
+    }
 }
 
 fn to_response(
@@ -841,12 +1045,8 @@ fn to_response(
     target: &DnsTarget,
 ) -> StatusPageDomainResponse {
     let method = VerificationMethod::from_stored(&binding.verification_method);
-    let status = match row {
-        None => StatusPageDomainStatus::Unverified,
-        Some(row) if is_verified(row, &binding.hostname) => StatusPageDomainStatus::Active,
-        Some(row) if row.status == "failed" => StatusPageDomainStatus::Failed,
-        Some(_) => StatusPageDomainStatus::Pending,
-    };
+    let status = domain_status(row, &binding.hostname);
+    let has_certificate = row.is_some_and(|r| holds_certificate(r, &binding.hostname));
     let mut dns_records = Vec::new();
     match target {
         DnsTarget::Hostname(host) if host != &binding.hostname => {
@@ -870,13 +1070,19 @@ fn to_response(
             purpose: "Points the hostname at this Temps instance.".to_string(),
         }),
     }
-    if method == VerificationMethod::Dns01 {
+    // The TXT value belongs to the open (or last failed) order. Once the
+    // certificate is current it is stale: a renewal issues a new value.
+    let order_relevant = !matches!(
+        status,
+        StatusPageDomainStatus::Active | StatusPageDomainStatus::Unverified
+    );
+    if method == VerificationMethod::Dns01 && order_relevant {
         if let Some(value) = row.and_then(|r| r.dns_challenge_value.clone()) {
             dns_records.push(DnsRecordInstruction {
                 record_type: "TXT".to_string(),
                 name: format!("_acme-challenge.{}", binding.hostname),
                 value,
-                purpose: "Proves you control the hostname (ACME DNS-01). Can be removed after verification; renewal asks for a new value.".to_string(),
+                purpose: "Proves you control the hostname (ACME DNS-01). Can be removed after verification; each renewal asks for a new value.".to_string(),
             });
         }
     }
@@ -885,13 +1091,13 @@ fn to_response(
         hostname: binding.hostname.clone(),
         verification_method: method,
         status,
-        serving: status == StatusPageDomainStatus::Active && published,
+        serving: has_certificate && published,
         dns_records,
         last_error: row
             .filter(|_| status != StatusPageDomainStatus::Active)
             .and_then(|r| r.last_error.clone()),
         certificate_expires_at: row
-            .filter(|_| status == StatusPageDomainStatus::Active)
+            .filter(|_| has_certificate)
             .and_then(|r| r.expiration_time),
         created_at: binding.created_at,
     }
@@ -902,7 +1108,8 @@ fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
     message.contains("duplicate key") || message.contains("23505")
 }
 
-/// Verified hostnames per page, for the public snapshot.
+/// Verified hostnames per page, for the public snapshot. Same condition as
+/// [`holds_certificate`] and the route table's serving check.
 pub(crate) async fn load_verified_hosts<C: ConnectionTrait>(
     db: &C,
     page_ids: &[i32],
@@ -925,8 +1132,9 @@ pub(crate) async fn load_verified_hosts<C: ConnectionTrait>(
             FROM status_page_domains spd
             JOIN domains d ON d.id = spd.domain_id
             WHERE spd.status_page_id IN ({placeholders})
-              AND d.status IN ('active', 'active_renewal_failed')
               AND d.certificate IS NOT NULL
+              AND d.private_key IS NOT NULL
+              AND (d.expiration_time IS NULL OR d.expiration_time > now())
               AND lower(d.domain) = spd.hostname
             "#
         );
@@ -962,6 +1170,8 @@ pub(crate) mod test_support {
         pub db: Arc<DatabaseConnection>,
         pub fail_hosts: Mutex<HashSet<String>>,
         pub completed: Mutex<Vec<String>>,
+        /// Orders requested so far; numbers each DNS-01 value.
+        pub orders: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeCertificates {
@@ -970,6 +1180,7 @@ pub(crate) mod test_support {
                 db,
                 fail_hosts: Mutex::new(HashSet::new()),
                 completed: Mutex::new(Vec::new()),
+                orders: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -998,36 +1209,86 @@ pub(crate) mod test_support {
             Ok(row.id)
         }
 
-        async fn request_challenge(&self, _hostname: &str, _email: &str) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn complete(&self, hostname: &str, _email: &str) -> Result<(), String> {
-            if self
-                .fail_hosts
-                .lock()
-                .map_err(|e| e.to_string())?
-                .contains(hostname)
-            {
-                return Err(format!(
-                    "HTTP-01 challenge for {hostname} failed: connection refused"
-                ));
-            }
+        /// Like `DomainService::request_challenge`: a new order moves the
+        /// row to `challenge_requested` with a fresh DNS-01 value and keeps
+        /// any certificate it already holds.
+        async fn request_challenge(&self, hostname: &str, _email: &str) -> Result<(), String> {
             let row = domains::Entity::find()
                 .filter(domains::Column::Domain.eq(hostname))
                 .one(self.db.as_ref())
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("no domains row for {hostname}"))?;
+            let order = self
+                .orders
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
             let mut active: domains::ActiveModel = row.into();
-            active.status = Set("active".to_string());
-            active.certificate = Set(Some("-----BEGIN CERTIFICATE-----\ntest\n".to_string()));
-            active.private_key = Set(Some("encrypted-test-key".to_string()));
-            active.expiration_time = Set(Some(chrono::Utc::now() + chrono::Duration::days(90)));
+            active.status = Set("challenge_requested".to_string());
+            active.dns_challenge_value = Set(Some(format!("txt-value-{order}")));
             active
                 .update(self.db.as_ref())
                 .await
                 .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// Like `DomainService::complete_challenge`: success stores the
+        /// certificate in the row *and* in `tls_acme_certificates`; failure
+        /// records the error and keeps a usable certificate serving
+        /// (`active_renewal_failed`), or marks the row `failed`.
+        async fn complete(&self, hostname: &str, _email: &str) -> Result<(), String> {
+            let row = domains::Entity::find()
+                .filter(domains::Column::Domain.eq(hostname))
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("no domains row for {hostname}"))?;
+            if self
+                .fail_hosts
+                .lock()
+                .map_err(|e| e.to_string())?
+                .contains(hostname)
+            {
+                let reason = format!("HTTP-01 challenge for {hostname} failed: connection refused");
+                let fallback = if row.certificate.is_some() {
+                    domains::STATUS_ACTIVE_RENEWAL_FAILED
+                } else {
+                    "failed"
+                };
+                let mut active: domains::ActiveModel = row.into();
+                active.status = Set(fallback.to_string());
+                active.last_error = Set(Some(reason.clone()));
+                active
+                    .update(self.db.as_ref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Err(reason);
+            }
+            let issued = self.completed.lock().map_err(|e| e.to_string())?.len() + 1;
+            let certificate = format!("-----BEGIN CERTIFICATE-----\ntest-{issued}\n");
+            let expires = chrono::Utc::now() + chrono::Duration::days(90);
+            let mut active: domains::ActiveModel = row.into();
+            active.status = Set("active".to_string());
+            active.certificate = Set(Some(certificate.clone()));
+            active.private_key = Set(Some("encrypted-test-key".to_string()));
+            active.expiration_time = Set(Some(expires));
+            active.last_error = Set(None);
+            active
+                .update(self.db.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
+            temps_entities::tls_acme_certificates::ActiveModel {
+                domain: Set(hostname.to_string()),
+                certificate: Set(certificate),
+                private_key: Set("encrypted-test-key".to_string()),
+                expires_at: Set(expires),
+                issued_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await
+            .map_err(|e| e.to_string())?;
             self.completed
                 .lock()
                 .map_err(|e| e.to_string())?
@@ -1129,7 +1390,9 @@ mod tests {
             Arc::new(ConfigService::new(Arc::new(config), db.clone())),
             Arc::new(StatusSnapshotCache::new(db.clone())),
             Arc::new(test_support::FakeCertificates::new(db)),
-            None,
+            Arc::new(test_support::StubRouteTable {
+                serving: Default::default(),
+            }),
         );
         for _ in 0..DOMAIN_OPERATIONS_PER_HOUR {
             service.throttle(7).expect("within budget");

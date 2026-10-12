@@ -90,6 +90,7 @@ pub enum PublicStatusPageAction {
     DomainAdded,
     DomainVerified,
     DomainVerificationAttempted,
+    DomainRenewalRequested,
     DomainRemoved,
 }
 
@@ -105,6 +106,7 @@ impl PublicStatusPageAction {
             Self::DomainAdded => "STATUS_PAGE_DOMAIN_ADDED",
             Self::DomainVerified => "STATUS_PAGE_DOMAIN_VERIFIED",
             Self::DomainVerificationAttempted => "STATUS_PAGE_DOMAIN_VERIFICATION_ATTEMPTED",
+            Self::DomainRenewalRequested => "STATUS_PAGE_DOMAIN_RENEWAL_REQUESTED",
             Self::DomainRemoved => "STATUS_PAGE_DOMAIN_REMOVED",
         }
     }
@@ -129,7 +131,8 @@ pub struct PublicStatusPageAudit {
     /// Custom hostname added, verified or removed (#1412).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
-    /// Result of a verification attempt: `verified`, `pending` or the error.
+    /// Result of a verification or renewal attempt: `verified`, `renewed`,
+    /// `pending` or the error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
 }
