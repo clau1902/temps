@@ -222,3 +222,76 @@ pub use workflow_memory::{
 pub use types::UtcDateTime;
 pub mod archive_security;
 pub mod drop_entries;
+
+/// Lockfile guard for the workspace's YAML parser.
+///
+/// `serde_yaml` and its `unsafe-libyaml` parser are unmaintained
+/// (RUSTSEC-2024-0449), so workspace crates use `yaml_serde` instead. The
+/// advisory stays in `dependency-scan.yml`'s ignore list only because
+/// pingora-core still depends on `serde_yaml` for a conf-file loader Temps
+/// never calls. That ignore would also hide a workspace crate adding
+/// `serde_yaml` back, so this test fails on it. `Cargo.lock` is embedded at
+/// compile time, so it also runs from prebuilt nextest archives.
+#[cfg(test)]
+mod yaml_dependency_guard_tests {
+    const CARGO_LOCK: &str = include_str!("../../../Cargo.lock");
+
+    /// The only package allowed to depend on `serde_yaml`; see the
+    /// RUSTSEC-2024-0449 note in `.github/workflows/dependency-scan.yml`.
+    const ALLOWED_SERDE_YAML_DEPENDENTS: &[&str] = &["pingora-core"];
+
+    /// Names of locked packages whose `dependencies` list includes `dependency`.
+    fn dependents_of<'a>(lock: &'a str, dependency: &str) -> Vec<&'a str> {
+        lock.split("[[package]]")
+            .skip(1)
+            .filter(|block| {
+                block.lines().map(str::trim).any(|line| {
+                    line.strip_prefix('"')
+                        .and_then(|l| l.trim_end_matches(',').strip_suffix('"'))
+                        .and_then(|entry| entry.split_whitespace().next())
+                        == Some(dependency)
+                })
+            })
+            .filter_map(|block| {
+                block.lines().map(str::trim).find_map(|line| {
+                    line.strip_prefix("name = \"")
+                        .and_then(|l| l.strip_suffix('"'))
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dependents_of_reads_lockfile_entries() {
+        let lock = "[[package]]\nname = \"a\"\nversion = \"1.0.0\"\ndependencies = [\n \
+                    \"serde_yaml\",\n \"other 2.0.0\",\n]\n\n[[package]]\nname = \"b\"\n\
+                    version = \"1.0.0\"\ndependencies = [\n \"serde_yaml_ng\",\n]\n";
+        assert_eq!(dependents_of(lock, "serde_yaml"), vec!["a"]);
+        assert_eq!(dependents_of(lock, "other"), vec!["a"]);
+        assert!(dependents_of(lock, "missing").is_empty());
+    }
+
+    #[test]
+    fn workspace_does_not_depend_on_unmaintained_serde_yaml() {
+        let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "serde_yaml")
+            .into_iter()
+            .filter(|name| !ALLOWED_SERDE_YAML_DEPENDENTS.contains(name))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "{unexpected:?} depend on serde_yaml, which is unmaintained and parses with \
+             unsafe-libyaml (RUSTSEC-2024-0449). Use the workspace `yaml_serde` dependency \
+             (same API) instead; see the note above it in the root Cargo.toml."
+        );
+    }
+
+    #[test]
+    fn unsafe_libyaml_is_only_reached_through_serde_yaml() {
+        let dependents = dependents_of(CARGO_LOCK, "unsafe-libyaml");
+        assert!(
+            dependents.iter().all(|name| *name == "serde_yaml"),
+            "unsafe-libyaml (RUSTSEC-2024-0449) is pulled in by {dependents:?}; only \
+             pingora-core's serde_yaml is covered by the dependency-scan.yml exception"
+        );
+    }
+}
