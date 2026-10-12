@@ -177,6 +177,20 @@ impl AiService for AiProviderRegistry {
         }
     }
 
+    async fn chat_unavailable_reason(&self, provider: Option<&str>) -> Option<String> {
+        self.routed(provider)
+            .await?
+            .chat_unavailable_reason(provider)
+            .await
+    }
+
+    async fn tool_calling_for(&self, provider: Option<&str>) -> bool {
+        match self.routed(provider).await {
+            Some(service) => service.tool_calling_for(provider).await,
+            None => false,
+        }
+    }
+
     async fn capabilities_for(
         &self,
         provider: Option<&str>,

@@ -543,11 +543,28 @@ async fn ai_chat_follows_self_hosted_capability_declarations() {
     .await;
     let ai = GatewayAiService::new(harness.gateway.clone(), harness._db.connection_arc());
 
-    // AI chat streams every turn: a key that cannot stream is not offered.
+    // AI chat streams every turn: a key that cannot stream is not offered,
+    // and the reason names the key and the missing declaration.
     let no_streaming_route = format!("gateway_key:{}", no_streaming.id);
     assert!(!ai.chat_capable_for(Some(&no_streaming_route)).await);
+    let reason = ai
+        .chat_unavailable_reason(Some(&no_streaming_route))
+        .await
+        .expect("a specific reason for the non-streaming key");
+    assert!(
+        reason.contains(&format!("key {}", no_streaming.id)),
+        "{reason}"
+    );
+    assert!(reason.contains("does not declare streaming"), "{reason}");
+
     let no_tools_route = format!("gateway_key:{}", no_tools.id);
     assert!(ai.chat_capable_for(Some(&no_tools_route)).await);
+    assert!(ai
+        .chat_unavailable_reason(Some(&no_tools_route))
+        .await
+        .is_none());
+    // Chat asks before adding tools, so it never sends them to this key.
+    assert!(!ai.tool_calling_for(Some(&no_tools_route)).await);
 
     // The capability report reflects the declarations, not a vendor's.
     let capabilities = ai
@@ -557,25 +574,22 @@ async fn ai_chat_follows_self_hosted_capability_declarations() {
     assert!(capabilities.realtime.text_streaming);
     assert!(!capabilities.realtime.tool_events);
 
-    // A turn offering tools still gets a reply: the tools are omitted
-    // instead of the request being refused for an undeclared capability.
-    let mut stream = ai
-        .chat_stream_turn(ChatTurnRequest {
-            purpose: "test.self_hosted_chat".to_string(),
-            provider: Some(no_tools_route),
-            model: Some(SELF_HOSTED_MODEL.to_string()),
-            messages: vec![AiChatMessage {
-                role: "user".to_string(),
-                content: "Say hello".to_string(),
-                ..Default::default()
-            }],
-            tools: vec![ChatTool {
-                name: "lookup".to_string(),
-                description: "Look something up".to_string(),
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
-            }],
+    let turn = |tools: Vec<ChatTool>| ChatTurnRequest {
+        purpose: "test.self_hosted_chat".to_string(),
+        provider: Some(no_tools_route.clone()),
+        model: Some(SELF_HOSTED_MODEL.to_string()),
+        messages: vec![AiChatMessage {
+            role: "user".to_string(),
+            content: "Say hello".to_string(),
             ..Default::default()
-        })
+        }],
+        tools,
+        ..Default::default()
+    };
+
+    // A plain turn streams a reply.
+    let mut stream = ai
+        .chat_stream_turn(turn(Vec::new()))
         .await
         .expect("chat turn on a tools-off key");
     let mut text = String::new();
@@ -585,6 +599,21 @@ async fn ai_chat_follows_self_hosted_capability_declarations() {
         }
     }
     assert!(text.contains("from self-hosted"), "{text}");
+
+    // A caller that sends tools anyway gets an explicit refusal, never a
+    // silent drop, and nothing reaches the server.
+    let refused = ai
+        .chat_stream_turn(turn(vec![ChatTool {
+            name: "lookup".to_string(),
+            description: "Look something up".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }]))
+        .await;
+    let error = match refused {
+        Ok(_) => panic!("tools must be refused on a key without tool calling"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("tool calling"), "{error}");
     assert_eq!(no_tools_server.inference_requests().len(), 1);
     assert!(no_streaming_server.inference_requests().is_empty());
 }

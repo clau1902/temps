@@ -166,7 +166,7 @@ Add a **Self-hosted (OpenAI-compatible)** provider to use a model server on your
 
 Every model the server lists is routed only to that server. A request for a model it hosts is never sent to OpenRouter or another vendor, even when the ID looks like `vendor/model`, and if the model is disabled there or the server stops listing it, the request fails with `model_unavailable` instead of falling back. To use another key for such a model on purpose, send the `X-Temps-Provider-Key-Id` header.
 
-AI chat follows the declared capabilities: a self-hosted key that does not declare streaming is not offered for chat, and chat turns on a key that does not declare tool calling are sent without tools.
+AI chat follows the declared capabilities. A self-hosted key that does not declare streaming cannot serve chat: new chats default to the first key that can, and a chat pinned to such a key explains that the key does not declare streaming. On a key that does not declare tool calling, chat runs without Temps tools, and the assistant tells you that the provider cannot look up data or take actions. Other callers that send tools to such a key get an explicit `capability_not_declared` error.
 
 <Note>
   Plain `http://` is accepted only for trusted private addresses, so an API key or a prompt is never sent unencrypted over the internet. Use `https://` for any provider on a public address. Keys created before this rule that point at a public `http://` URL are refused at request time with that reason; change their base URL to `https://`.

@@ -70,6 +70,27 @@ fn remember_provider_error(last_error: &mut Option<String>, candidate: String) {
 const ATTACHMENT_SANDBOX_PREFIX: &str = "/home/temps/workspace/.temps/chat-attachments/";
 const MAX_REPLAYED_ATTACHMENTS: usize = 10;
 
+/// Told to the model when the conversation's provider cannot call tools, so
+/// a request that needs Temps data or an action gets an explanation instead
+/// of an invented answer.
+const NO_TOOL_CALLING_NOTE: &str = "## Tools unavailable\nThe AI provider selected for this \
+     conversation does not support tool calling, so you cannot look up Temps data (logs, \
+     deployments, traces, errors, source code) or perform any action in this conversation. If \
+     the user asks for something that needs that, say clearly that the selected provider does \
+     not support tool calling and suggest switching the conversation to a provider that does. \
+     Never describe an action as done, and never write out pseudo tool calls.";
+
+/// Append `note` to the system message, creating one when there is none.
+fn append_system_note(messages: &mut Vec<ChatMessage>, note: &str) {
+    match messages.iter_mut().find(|message| message.role == "system") {
+        Some(system) => {
+            system.content.push_str("\n\n");
+            system.content.push_str(note);
+        }
+        None => messages.insert(0, ChatMessage::system(note.to_string())),
+    }
+}
+
 fn persisted_attachment_prompt_context(
     metadata: Option<&serde_json::Value>,
     conversation_public_id: &str,
@@ -2503,6 +2524,12 @@ impl ConversationService {
         self.ai.chat_capable_for(provider).await
     }
 
+    /// Why `provider` cannot serve chat, when the adapter knows more than
+    /// "not configured" (e.g. a self-hosted key without declared streaming).
+    pub async fn ai_unavailable_reason(&self, provider: Option<&str>) -> Option<String> {
+        self.ai.chat_unavailable_reason(provider).await
+    }
+
     /// Report whether the instance has an AI provider available.
     ///
     /// The project lookup intentionally remains here so callers keep receiving
@@ -3390,13 +3417,23 @@ impl ConversationService {
         // an explicit, per-thread execution decision so it cannot become an
         // ambient capability for ordinary project chat.
 
-        let key = ai_provider_keys::Entity::find()
+        // Prefer the first active key that can actually serve chat (a
+        // self-hosted key may not declare streaming), so one such key does not
+        // block chat while a working key exists. With no capable key, keep the
+        // first one: the readiness check then explains what it is missing.
+        let keys = ai_provider_keys::Entity::find()
             .filter(ai_provider_keys::Column::IsActive.eq(true))
             .order_by_asc(ai_provider_keys::Column::Id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ChatError::AiUnavailable)?;
-        Ok(format!("gateway_key:{}", key.id))
+            .all(self.db.as_ref())
+            .await?;
+        let first = keys.first().ok_or(ChatError::AiUnavailable)?;
+        for key in &keys {
+            let route = format!("gateway_key:{}", key.id);
+            if self.ai.chat_capable_for(Some(&route)).await {
+                return Ok(route);
+            }
+        }
+        Ok(format!("gateway_key:{}", first.id))
     }
 
     async fn insert_message(
@@ -3847,10 +3884,18 @@ impl ConversationService {
         // native function schemas; host adapters receive the same catalog via
         // their turn-scoped MCP bridge.
         let chat_capable = self.ai.chat_capable_for(Some(&conv.ai_provider)).await;
+        // A provider without tool calling (a self-hosted key that did not
+        // declare it) gets no tool schemas and no write-tool appendix -- the
+        // turn would otherwise be refused, or the model told to use tools it
+        // cannot call. The model is told instead, so it can explain the gap.
+        let tool_calling = chat_capable && self.ai.tool_calling_for(Some(&conv.ai_provider)).await;
         let harness_execution = harness_workspace.is_some();
         let provider = self.providers.get(conv.context_type.as_str()).cloned();
         let mut tools: Vec<ChatTool> = Vec::new();
-        if chat_capable {
+        if chat_capable && !tool_calling {
+            append_system_note(&mut messages, NO_TOOL_CALLING_NOTE);
+        }
+        if tool_calling {
             if let Some(p) = &provider {
                 tools.extend(
                     p.tools_with_auth(conv.project_id, &conv.context_id, auth)
@@ -10219,6 +10264,116 @@ mod tests {
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             harness_mcp_entries: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Chat-capable for every provider except the listed routes.
+    struct ChatCapabilityByRouteAi {
+        incapable: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl AiService for ChatCapabilityByRouteAi {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn chat_capable_for(&self, provider: Option<&str>) -> bool {
+            provider.is_none_or(|route| !self.incapable.contains(&route))
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+    }
+
+    fn active_provider_key(id: i32, provider: &str) -> temps_entities::ai_provider_keys::Model {
+        temps_entities::ai_provider_keys::Model {
+            id,
+            provider: provider.to_string(),
+            display_name: format!("{provider} {id}"),
+            api_key_encrypted: "encrypted".to_string(),
+            base_url: None,
+            default_model: None,
+            is_active: true,
+            trusted_private_address: None,
+            trusted_private_address_set_by: None,
+            trusted_private_address_set_at: None,
+            capabilities: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_provider_skips_keys_that_cannot_serve_chat() {
+        // Key 1 is a self-hosted key without declared streaming; key 2 works.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                active_provider_key(1, "openai_compatible"),
+                active_provider_key(2, "openai"),
+            ]])
+            .into_connection();
+        let service = db_service_with_ai(
+            db,
+            Arc::new(ChatCapabilityByRouteAi {
+                incapable: vec!["gateway_key:1"],
+            }),
+        );
+        assert_eq!(
+            service.resolve_default_provider().await.unwrap(),
+            "gateway_key:2"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_provider_keeps_the_first_key_when_none_can_serve_chat() {
+        // The readiness check then explains what the key is missing.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                active_provider_key(1, "openai_compatible"),
+                active_provider_key(2, "openai_compatible"),
+            ]])
+            .into_connection();
+        let service = db_service_with_ai(
+            db,
+            Arc::new(ChatCapabilityByRouteAi {
+                incapable: vec!["gateway_key:1", "gateway_key:2"],
+            }),
+        );
+        assert_eq!(
+            service.resolve_default_provider().await.unwrap(),
+            "gateway_key:1"
+        );
+    }
+
+    #[test]
+    fn no_tool_calling_note_is_added_to_the_system_message() {
+        let mut messages = vec![
+            ChatMessage::system("You are Temps."),
+            ChatMessage {
+                role: "user".to_string(),
+                content: "redeploy my app".to_string(),
+                ..Default::default()
+            },
+        ];
+        append_system_note(&mut messages, NO_TOOL_CALLING_NOTE);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].content.starts_with("You are Temps."));
+        assert!(messages[0]
+            .content
+            .contains("does not support tool calling"));
+
+        let mut without_system = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+            ..Default::default()
+        }];
+        append_system_note(&mut without_system, NO_TOOL_CALLING_NOTE);
+        assert_eq!(without_system[0].role, "system");
     }
 
     fn db_service_with_ai(db: DatabaseConnection, ai: Arc<dyn AiService>) -> ConversationService {
