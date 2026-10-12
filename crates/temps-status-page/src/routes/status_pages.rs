@@ -3139,4 +3139,149 @@ mod tests {
             .expect_err("reserved for the public ingress");
         assert_eq!(error.status_code, StatusCode::CONFLICT);
     }
+
+    #[tokio::test]
+    async fn a_stale_request_cannot_touch_the_order_of_the_hostnames_new_owner() {
+        use crate::services::public_pages::StatusPageCertificates;
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let db = fx._db.connection_arc();
+        let host = "handover.example.org";
+        let old_page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, old_page.id).await;
+        let old = attach(&fx, old_page.id, host)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach to the old page");
+        // What a renew or verify on the old page read before the handover.
+        let stale = temps_entities::status_page_domains::Entity::find_by_id(old.id)
+            .one(db.as_ref())
+            .await
+            .expect("binding query")
+            .expect("old binding");
+        let old_order = stale.domain_id.expect("old page has an order");
+
+        // The hostname changes hands: removed from the old page, attached to
+        // a new one, which gets its own order.
+        remove_status_page_domain(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path((old_page.id, old.id)),
+        )
+        .await
+        .map_err(|p| format!("{:?}", p.body))
+        .expect("remove");
+        let new_page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, new_page.id).await;
+        let new_binding = attach_with(&fx, new_page.id, host, VerificationMethod::Dns01).await;
+        let new_order = binding_order(&fx, new_binding.id)
+            .await
+            .expect("new page has an order");
+        assert_ne!(new_order, old_order);
+        let before = temps_entities::domains::Entity::find_by_id(new_order)
+            .one(db.as_ref())
+            .await
+            .expect("query")
+            .expect("new order row");
+        let orders_before = fx.certs.orders.load(std::sync::atomic::Ordering::Relaxed);
+
+        // The stale request fails under the lock instead of acting.
+        let guarded = fx
+            .state
+            .status_page_domain_service
+            .guard_binding(&stale)
+            .await;
+        assert!(
+            matches!(
+                guarded,
+                Err(crate::services::StatusPageError::HostnameBindingChanged { .. })
+            ),
+            "a binding read before the handover must be refused"
+        );
+        // And the certificate calls refuse a row that is not the expected
+        // one, even though the hostname matches.
+        assert!(fx
+            .certs
+            .request_challenge(old_order, host, "ops@example.com")
+            .await
+            .is_err());
+        assert!(fx
+            .certs
+            .complete(old_order, host, "ops@example.com")
+            .await
+            .is_err());
+        // Through the API the old page no longer has the domain at all.
+        let error = renew(&fx, old_page.id, old.id).await.expect_err("gone");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+
+        let after = temps_entities::domains::Entity::find_by_id(new_order)
+            .one(db.as_ref())
+            .await
+            .expect("query")
+            .expect("new order row survives");
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.dns_challenge_value, before.dns_challenge_value);
+        assert_eq!(
+            fx.certs.orders.load(std::sync::atomic::Ordering::Relaxed),
+            orders_before,
+            "no order was requested for the new owner's row"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_a_hostname_waits_for_a_certificate_operation_in_flight() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let db = fx._db.connection_arc();
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let attached = attach(&fx, page.id, "in-flight.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach");
+        let binding = temps_entities::status_page_domains::Entity::find_by_id(attached.id)
+            .one(db.as_ref())
+            .await
+            .expect("binding query")
+            .expect("binding");
+
+        // A verify or renew holds the guard for the length of its ACME calls.
+        let guard = fx
+            .state
+            .status_page_domain_service
+            .guard_binding(&binding)
+            .await
+            .expect("guard");
+        let state = fx.state.clone();
+        let (page_id, binding_id) = (page.id, attached.id);
+        let removing = tokio::spawn(async move {
+            remove_status_page_domain(
+                admin(),
+                State(state),
+                metadata(),
+                Path((page_id, binding_id)),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|p| format!("{:?}", p.body))
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !removing.is_finished(),
+            "removal must wait for the certificate operation"
+        );
+        assert!(binding_order(&fx, attached.id).await.is_some());
+
+        crate::services::public_pages::domains::release_guard(guard, attached.id).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), removing)
+            .await
+            .expect("removal finishes once the operation ends")
+            .expect("task")
+            .expect("removed");
+        assert_eq!(binding_order(&fx, attached.id).await, None);
+        assert!(!domains_row_exists(&fx, "in-flight.example.org").await);
+    }
 }

@@ -224,11 +224,38 @@ pub trait StatusPageCertificates: Send + Sync {
         acme_email: &str,
     ) -> Result<i32, String>;
 
-    /// Request a fresh ACME challenge for an existing row.
-    async fn request_challenge(&self, hostname: &str, acme_email: &str) -> Result<(), String>;
+    /// Request a fresh ACME challenge for the existing row `domain_id`.
+    ///
+    /// The domain service addresses rows by hostname, and a hostname can
+    /// change hands: implementations MUST refuse when the row currently
+    /// holding `hostname` is not `domain_id`, so a stale caller can never
+    /// replace another binding's order.
+    async fn request_challenge(
+        &self,
+        domain_id: i32,
+        hostname: &str,
+        acme_email: &str,
+    ) -> Result<(), String>;
 
-    /// Complete the ACME order. On success the row holds a certificate.
-    async fn complete(&self, hostname: &str, acme_email: &str) -> Result<(), String>;
+    /// Complete the ACME order of row `domain_id`. On success the row holds a
+    /// certificate. Same identity rule as [`Self::request_challenge`].
+    async fn complete(
+        &self,
+        domain_id: i32,
+        hostname: &str,
+        acme_email: &str,
+    ) -> Result<(), String>;
+}
+
+/// The error a certificate call returns when the row now holding `hostname`
+/// is not the one the caller expected.
+fn foreign_certificate_row(hostname: &str, expected: i32, found: Option<i32>) -> String {
+    match found {
+        Some(found) => format!(
+            "the certificate record for {hostname} is now {found}, not {expected}; it belongs to another binding"
+        ),
+        None => format!("the certificate record {expected} for {hostname} no longer exists"),
+    }
 }
 
 /// [`StatusPageCertificates`] over the shared domain/ACME service.
@@ -269,7 +296,13 @@ impl StatusPageCertificates for DomainServiceCertificates {
         Ok(row.id)
     }
 
-    async fn request_challenge(&self, hostname: &str, acme_email: &str) -> Result<(), String> {
+    async fn request_challenge(
+        &self,
+        domain_id: i32,
+        hostname: &str,
+        acme_email: &str,
+    ) -> Result<(), String> {
+        self.ensure_row(domain_id, hostname).await?;
         self.domain_service
             .request_challenge(hostname, acme_email)
             .await
@@ -277,12 +310,38 @@ impl StatusPageCertificates for DomainServiceCertificates {
             .map_err(|e| e.to_string())
     }
 
-    async fn complete(&self, hostname: &str, acme_email: &str) -> Result<(), String> {
+    async fn complete(
+        &self,
+        domain_id: i32,
+        hostname: &str,
+        acme_email: &str,
+    ) -> Result<(), String> {
+        self.ensure_row(domain_id, hostname).await?;
         self.domain_service
             .complete_challenge(hostname, acme_email)
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+}
+
+impl DomainServiceCertificates {
+    /// Refuse unless the row the domain service will resolve for `hostname`
+    /// is `domain_id`. The caller holds the hostname-claim lock, which every
+    /// status-page attach and removal also takes, so the answer cannot change
+    /// before the call that follows.
+    async fn ensure_row(&self, domain_id: i32, hostname: &str) -> Result<(), String> {
+        let found = self
+            .domain_service
+            .get_domain(hostname)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|row| row.id);
+        if found == Some(domain_id) {
+            Ok(())
+        } else {
+            Err(foreign_certificate_row(hostname, domain_id, found))
+        }
     }
 }
 
@@ -467,10 +526,17 @@ impl StatusPageDomainService {
         // No certificate is requested while the page is unpublished: the
         // order starts when the hostname is verified on a published page.
         let binding = if page.is_published {
-            match self
-                .start_order(&binding, request.verification_method, acme_email)
-                .await
-            {
+            let ordered = match self.guard_binding(&binding).await {
+                Ok(guard) => {
+                    let ordered = self
+                        .start_order(&binding, request.verification_method, acme_email)
+                        .await;
+                    release_guard(guard, binding.id).await;
+                    ordered
+                }
+                Err(e) => Err(e),
+            };
+            match ordered {
                 Ok(binding) => binding,
                 Err(e) => {
                     if let Err(delete) = status_page_domains::Entity::delete_by_id(binding.id)
@@ -498,6 +564,8 @@ impl StatusPageDomainService {
     /// only if the binding is still attached to this page, still has no
     /// certificate, and the page is still published. Otherwise the new row
     /// is deleted at once, so no certificate can outlive its binding.
+    ///
+    /// The caller holds [`Self::guard_binding`] for `binding`.
     async fn start_order(
         &self,
         binding: &status_page_domains::Model,
@@ -532,6 +600,62 @@ impl StatusPageDomainService {
                 status_page_id,
                 domain_id: binding.id,
             })
+    }
+
+    /// Hold the hostname-claim lock for the duration of a certificate
+    /// operation on `binding`, and confirm under it that the binding is
+    /// unchanged: still attached to the same page, under the same hostname,
+    /// with the same certificate row (which, if any, still carries that
+    /// hostname). Returns the transaction holding the lock; pass it to
+    /// [`release_guard`] when the operation is over.
+    ///
+    /// The domain service addresses certificate rows by hostname, and a
+    /// hostname can change hands: removed from this page and attached to
+    /// another, whose new row then answers to the same name. Every attach
+    /// and removal takes this lock, so while it is held the name cannot be
+    /// removed or reassigned, and a request that read the binding before a
+    /// reassignment fails here instead of acting on the new owner's order.
+    ///
+    /// Must not be nested: the advisory lock is per transaction, so a second
+    /// guard on the same hostname would wait for the first forever.
+    pub(crate) async fn guard_binding(
+        &self,
+        binding: &status_page_domains::Model,
+    ) -> Result<sea_orm::DatabaseTransaction, StatusPageError> {
+        let changed = || StatusPageError::HostnameBindingChanged {
+            hostname: binding.hostname.clone(),
+        };
+        let txn = self.db.begin().await?;
+        let checked = async {
+            status_page_domains::lock_hostname_claim(&txn, &binding.hostname).await?;
+            let current = status_page_domains::Entity::find_by_id(binding.id)
+                .one(&txn)
+                .await?;
+            let unchanged = current.is_some_and(|current| {
+                current.status_page_id.is_some()
+                    && current.status_page_id == binding.status_page_id
+                    && current.hostname == binding.hostname
+                    && current.domain_id == binding.domain_id
+            });
+            if !unchanged {
+                return Err(changed());
+            }
+            if let Some(domain_id) = binding.domain_id {
+                let row = domains::Entity::find_by_id(domain_id).one(&txn).await?;
+                if !row.is_some_and(|row| row.domain.eq_ignore_ascii_case(&binding.hostname)) {
+                    return Err(changed());
+                }
+            }
+            Ok(())
+        }
+        .await;
+        match checked {
+            Ok(()) => Ok(txn),
+            Err(e) => {
+                release_guard(txn, binding.id).await;
+                Err(e)
+            }
+        }
     }
 
     /// Link a new order to its binding, under the page row lock that
@@ -653,6 +777,19 @@ impl StatusPageDomainService {
         let (page, binding) = self
             .prepare_order(status_page_id, domain_binding_id, acme_email)
             .await?;
+        let guard = self.guard_binding(&binding).await?;
+        let result = self.verify_guarded(page, binding.clone(), acme_email).await;
+        release_guard(guard, binding.id).await;
+        result
+    }
+
+    async fn verify_guarded(
+        &self,
+        page: status_pages::Model,
+        binding: status_page_domains::Model,
+        acme_email: &str,
+    ) -> Result<StatusPageDomainResponse, StatusPageError> {
+        let status_page_id = page.id;
         let hostname = binding.hostname.clone();
         let method = VerificationMethod::from_stored(&binding.verification_method);
 
@@ -685,7 +822,7 @@ impl StatusPageDomainService {
             OrderState::NeedsNew => {
                 if let Err(reason) = self
                     .certificates
-                    .request_challenge(&hostname, acme_email)
+                    .request_challenge(domain_id, &hostname, acme_email)
                     .await
                 {
                     return Err(StatusPageError::DomainVerificationFailed { hostname, reason });
@@ -717,6 +854,19 @@ impl StatusPageDomainService {
         let (page, binding) = self
             .prepare_order(status_page_id, domain_binding_id, acme_email)
             .await?;
+        let guard = self.guard_binding(&binding).await?;
+        let result = self.renew_guarded(page, binding.clone(), acme_email).await;
+        release_guard(guard, binding.id).await;
+        result
+    }
+
+    async fn renew_guarded(
+        &self,
+        page: status_pages::Model,
+        binding: status_page_domains::Model,
+        acme_email: &str,
+    ) -> Result<StatusPageDomainResponse, StatusPageError> {
+        let status_page_id = page.id;
         let hostname = binding.hostname.clone();
         let method = VerificationMethod::from_stored(&binding.verification_method);
         let row = match binding.domain_id {
@@ -741,7 +891,7 @@ impl StatusPageDomainService {
         // and served until the new one is issued.
         if let Err(reason) = self
             .certificates
-            .request_challenge(&hostname, acme_email)
+            .request_challenge(domain_id, &hostname, acme_email)
             .await
         {
             return Err(StatusPageError::DomainVerificationFailed { hostname, reason });
@@ -765,7 +915,11 @@ impl StatusPageDomainService {
     ) -> Result<(), StatusPageError> {
         let hostname = binding.hostname.clone();
         let status_page_id = binding.status_page_id.unwrap_or_default();
-        if let Err(reason) = self.certificates.complete(&hostname, acme_email).await {
+        if let Err(reason) = self
+            .certificates
+            .complete(domain_id, &hostname, acme_email)
+            .await
+        {
             return Err(StatusPageError::DomainVerificationFailed { hostname, reason });
         }
         let still_bound = status_page_domains::Entity::find_by_id(binding.id)
@@ -820,9 +974,40 @@ impl StatusPageDomainService {
     ) -> Result<String, StatusPageError> {
         let binding = self.binding(status_page_id, domain_binding_id).await?;
         let hostname = binding.hostname.clone();
-        let mut active: status_page_domains::ActiveModel = binding.into();
-        active.status_page_id = Set(None);
-        active.update(self.db.as_ref()).await?;
+        // Under the hostname lock, so a removal waits for a verify or renew
+        // in flight on this hostname instead of handing the name to another
+        // page while that operation still addresses it.
+        let txn = self.db.begin().await?;
+        let result = async {
+            status_page_domains::lock_hostname_claim(&txn, &hostname).await?;
+            let detached = txn
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    r#"UPDATE status_page_domains SET status_page_id = NULL, updated_at = now()
+                       WHERE id = $1 AND status_page_id = $2"#,
+                    [domain_binding_id.into(), status_page_id.into()],
+                ))
+                .await?
+                .rows_affected();
+            if detached == 1 {
+                Ok(())
+            } else {
+                Err(StatusPageError::StatusPageDomainNotFound {
+                    status_page_id,
+                    domain_id: domain_binding_id,
+                })
+            }
+        }
+        .await;
+        match result {
+            Ok(()) => txn.commit().await?,
+            Err(e) => {
+                if let Err(rollback) = txn.rollback().await {
+                    warn!(error = %rollback, "failed to roll back status page hostname removal");
+                }
+                return Err(e);
+            }
+        }
         // The console stops serving the page on this hostname now, before the
         // proxy's route table has reloaded.
         self.refresh_page(status_page_id).await;
@@ -982,6 +1167,19 @@ impl StatusPageDomainService {
             Some(host) => DnsTarget::Hostname(host),
             None => DnsTarget::Unknown,
         }
+    }
+}
+
+/// End a [`StatusPageDomainService::guard_binding`] guard. It writes nothing,
+/// so rolling back only releases the hostname lock — now, rather than when
+/// the pool next reuses the connection.
+pub(crate) async fn release_guard(guard: sea_orm::DatabaseTransaction, binding_id: i32) {
+    if let Err(e) = guard.rollback().await {
+        warn!(
+            binding_id,
+            error = %e,
+            "failed to release a status page hostname lock"
+        );
     }
 }
 
@@ -1175,6 +1373,24 @@ pub(crate) mod test_support {
     }
 
     impl FakeCertificates {
+        /// The row the real domain service would resolve for `hostname`,
+        /// refused unless it is `domain_id` (as `DomainServiceCertificates`).
+        async fn row(&self, domain_id: i32, hostname: &str) -> Result<domains::Model, String> {
+            let row = domains::Entity::find()
+                .filter(domains::Column::Domain.eq(hostname))
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
+            match row {
+                Some(row) if row.id == domain_id => Ok(row),
+                other => Err(foreign_certificate_row(
+                    hostname,
+                    domain_id,
+                    other.map(|r| r.id),
+                )),
+            }
+        }
+
         pub fn new(db: Arc<DatabaseConnection>) -> Self {
             Self {
                 db,
@@ -1212,13 +1428,13 @@ pub(crate) mod test_support {
         /// Like `DomainService::request_challenge`: a new order moves the
         /// row to `challenge_requested` with a fresh DNS-01 value and keeps
         /// any certificate it already holds.
-        async fn request_challenge(&self, hostname: &str, _email: &str) -> Result<(), String> {
-            let row = domains::Entity::find()
-                .filter(domains::Column::Domain.eq(hostname))
-                .one(self.db.as_ref())
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("no domains row for {hostname}"))?;
+        async fn request_challenge(
+            &self,
+            domain_id: i32,
+            hostname: &str,
+            _email: &str,
+        ) -> Result<(), String> {
+            let row = self.row(domain_id, hostname).await?;
             let order = self
                 .orders
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1237,13 +1453,13 @@ pub(crate) mod test_support {
         /// certificate in the row *and* in `tls_acme_certificates`; failure
         /// records the error and keeps a usable certificate serving
         /// (`active_renewal_failed`), or marks the row `failed`.
-        async fn complete(&self, hostname: &str, _email: &str) -> Result<(), String> {
-            let row = domains::Entity::find()
-                .filter(domains::Column::Domain.eq(hostname))
-                .one(self.db.as_ref())
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("no domains row for {hostname}"))?;
+        async fn complete(
+            &self,
+            domain_id: i32,
+            hostname: &str,
+            _email: &str,
+        ) -> Result<(), String> {
+            let row = self.row(domain_id, hostname).await?;
             if self
                 .fail_hosts
                 .lock()
