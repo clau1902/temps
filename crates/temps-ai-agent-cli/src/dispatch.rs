@@ -184,11 +184,16 @@ impl AiService for AiProviderRegistry {
             .await
     }
 
-    async fn tool_calling_for(&self, provider: Option<&str>) -> bool {
+    async fn tool_calling_for(&self, provider: Option<&str>, model: Option<&str>) -> bool {
         match self.routed(provider).await {
-            Some(service) => service.tool_calling_for(provider).await,
+            Some(service) => service.tool_calling_for(provider, model).await,
             None => false,
         }
+    }
+
+    async fn default_chat_provider(&self) -> Option<String> {
+        // An omitted provider is always gateway-only.
+        self.gateway.default_chat_provider().await
     }
 
     async fn capabilities_for(

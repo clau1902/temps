@@ -48,6 +48,8 @@ use tokio_stream::StreamExt;
 const SELF_HOSTED_MODEL: &str = "mlx-community/Some-Model-4bit";
 const SELF_HOSTED_EMBEDDING_MODEL: &str = "mlx-community/embed-small";
 const OPENROUTER_MODEL: &str = "openai/gpt-4o-mini";
+/// Listed only by the tools-off server in the AI chat capability test.
+const TOOLS_OFF_ONLY_MODEL: &str = "mlx-community/tools-off-only";
 
 struct Harness {
     _db: TestDatabase,
@@ -514,7 +516,8 @@ async fn ai_chat_follows_self_hosted_capability_declarations() {
     };
     // One server that cannot stream, one that streams but has no tools.
     let no_streaming_server = MockRecordingServer::start(&[SELF_HOSTED_MODEL], false).await;
-    let no_tools_server = MockRecordingServer::start(&[SELF_HOSTED_MODEL], false).await;
+    let no_tools_server =
+        MockRecordingServer::start(&[SELF_HOSTED_MODEL, TOOLS_OFF_ONLY_MODEL], false).await;
     let no_streaming = add_key(
         &harness,
         OPENAI_COMPATIBLE,
@@ -564,7 +567,23 @@ async fn ai_chat_follows_self_hosted_capability_declarations() {
         .await
         .is_none());
     // Chat asks before adding tools, so it never sends them to this key.
-    assert!(!ai.tool_calling_for(Some(&no_tools_route)).await);
+    assert!(
+        !ai.tool_calling_for(Some(&no_tools_route), Some(SELF_HOSTED_MODEL))
+            .await
+    );
+    // An unpinned conversation is checked against the key serving its saved
+    // model, not the instance default model.
+    assert!(
+        !ai.tool_calling_for(Some("gateway"), Some(TOOLS_OFF_ONLY_MODEL))
+            .await
+    );
+
+    // New chats default to the first key that can stream, skipping the
+    // lower-id key that cannot -- picked with one query.
+    assert_eq!(
+        ai.default_chat_provider().await.as_deref(),
+        Some(no_tools_route.as_str())
+    );
 
     // The capability report reflects the declarations, not a vendor's.
     let capabilities = ai

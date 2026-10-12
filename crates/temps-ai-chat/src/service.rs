@@ -3417,23 +3417,20 @@ impl ConversationService {
         // an explicit, per-thread execution decision so it cannot become an
         // ambient capability for ordinary project chat.
 
-        // Prefer the first active key that can actually serve chat (a
+        // Prefer the adapter's pick of a key that can actually serve chat (a
         // self-hosted key may not declare streaming), so one such key does not
-        // block chat while a working key exists. With no capable key, keep the
-        // first one: the readiness check then explains what it is missing.
-        let keys = ai_provider_keys::Entity::find()
+        // block chat while a working key exists. With none, keep the first
+        // active key: the readiness check then explains what it is missing.
+        if let Some(route) = self.ai.default_chat_provider().await {
+            return Ok(route);
+        }
+        let key = ai_provider_keys::Entity::find()
             .filter(ai_provider_keys::Column::IsActive.eq(true))
             .order_by_asc(ai_provider_keys::Column::Id)
-            .all(self.db.as_ref())
-            .await?;
-        let first = keys.first().ok_or(ChatError::AiUnavailable)?;
-        for key in &keys {
-            let route = format!("gateway_key:{}", key.id);
-            if self.ai.chat_capable_for(Some(&route)).await {
-                return Ok(route);
-            }
-        }
-        Ok(format!("gateway_key:{}", first.id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ChatError::AiUnavailable)?;
+        Ok(format!("gateway_key:{}", key.id))
     }
 
     async fn insert_message(
@@ -3888,7 +3885,11 @@ impl ConversationService {
         // declare it) gets no tool schemas and no write-tool appendix -- the
         // turn would otherwise be refused, or the model told to use tools it
         // cannot call. The model is told instead, so it can explain the gap.
-        let tool_calling = chat_capable && self.ai.tool_calling_for(Some(&conv.ai_provider)).await;
+        let tool_calling = chat_capable
+            && self
+                .ai
+                .tool_calling_for(Some(&conv.ai_provider), Some(&conv.ai_model))
+                .await;
         let harness_execution = harness_workspace.is_some();
         let provider = self.providers.get(conv.context_type.as_str()).cloned();
         let mut tools: Vec<ChatTool> = Vec::new();
@@ -10266,19 +10267,19 @@ mod tests {
         }
     }
 
-    /// Chat-capable for every provider except the listed routes.
-    struct ChatCapabilityByRouteAi {
-        incapable: Vec<&'static str>,
+    /// Reports a fixed default chat provider pick (or none).
+    struct DefaultProviderAi {
+        pick: Option<&'static str>,
     }
 
     #[async_trait]
-    impl AiService for ChatCapabilityByRouteAi {
+    impl AiService for DefaultProviderAi {
         async fn is_available(&self) -> bool {
             true
         }
 
-        async fn chat_capable_for(&self, provider: Option<&str>) -> bool {
-            provider.is_none_or(|route| !self.incapable.contains(&route))
+        async fn default_chat_provider(&self) -> Option<String> {
+            self.pick.map(str::to_string)
         }
 
         async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
@@ -10309,18 +10310,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_provider_skips_keys_that_cannot_serve_chat() {
-        // Key 1 is a self-hosted key without declared streaming; key 2 works.
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![
-                active_provider_key(1, "openai_compatible"),
-                active_provider_key(2, "openai"),
-            ]])
-            .into_connection();
+    async fn default_provider_uses_the_adapters_chat_capable_pick() {
+        // Key 1 may be a self-hosted key without streaming; the adapter picked
+        // key 2 with one bounded query, so no key list is read here.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let service = db_service_with_ai(
             db,
-            Arc::new(ChatCapabilityByRouteAi {
-                incapable: vec!["gateway_key:1"],
+            Arc::new(DefaultProviderAi {
+                pick: Some("gateway_key:2"),
             }),
         );
         assert_eq!(
@@ -10333,17 +10330,9 @@ mod tests {
     async fn default_provider_keeps_the_first_key_when_none_can_serve_chat() {
         // The readiness check then explains what the key is missing.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results(vec![vec![
-                active_provider_key(1, "openai_compatible"),
-                active_provider_key(2, "openai_compatible"),
-            ]])
+            .append_query_results(vec![vec![active_provider_key(1, "openai_compatible")]])
             .into_connection();
-        let service = db_service_with_ai(
-            db,
-            Arc::new(ChatCapabilityByRouteAi {
-                incapable: vec!["gateway_key:1", "gateway_key:2"],
-            }),
-        );
+        let service = db_service_with_ai(db, Arc::new(DefaultProviderAi { pick: None }));
         assert_eq!(
             service.resolve_default_provider().await.unwrap(),
             "gateway_key:1"

@@ -256,11 +256,19 @@ pub trait AiService: Send + Sync {
         None
     }
 
-    /// Whether chat turns on `provider` may carry function/tool schemas.
-    /// Adapters that cannot call tools return `false`, so callers leave the
-    /// tools out (and say so) rather than having the turn refused.
-    async fn tool_calling_for(&self, _provider: Option<&str>) -> bool {
+    /// Whether chat turns on `provider` for `model` (the conversation's
+    /// saved model; `None` = the configured default) may carry function/tool
+    /// schemas. Adapters that cannot call tools return `false`, so callers
+    /// leave the tools out (and say so) rather than having the turn refused.
+    async fn tool_calling_for(&self, _provider: Option<&str>, _model: Option<&str>) -> bool {
         true
+    }
+
+    /// The provider a new chat should default to when none is chosen, if the
+    /// adapter can pick one that can actually serve chat. `None` lets the
+    /// caller fall back to its own default.
+    async fn default_chat_provider(&self) -> Option<String> {
+        None
     }
 
     /// Return the normalized controls and realtime features for one provider.
