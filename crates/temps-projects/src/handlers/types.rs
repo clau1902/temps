@@ -47,6 +47,10 @@ pub struct AppState {
     /// in the handler, so the challenge cannot drift away from the guard it
     /// protects. See [`temps_core::SensitiveActionAuthorizer`].
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    /// Optional hook run right after the deletion fence commits, so features
+    /// that serve project data publicly stop doing so before cleanup starts.
+    /// `None` when no plugin registers one.
+    pub project_deletion_hook: Option<Arc<dyn temps_core::ProjectDeletionHook>>,
 }
 
 // Domain-related types
