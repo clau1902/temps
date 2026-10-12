@@ -22,7 +22,6 @@ use temps_ai::{
     RefreshPolicy, TokenStream, ToolCall,
 };
 
-use crate::providers::route_model_to_provider;
 use crate::services::{gateway_provider_capabilities, ByokOverride, GatewayService};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, MessageContent,
@@ -181,7 +180,8 @@ impl GatewayAiService {
 }
 
 /// A safe, low-cost default chat model per provider, used when no allow-list
-/// names one. The prefix routes back to the provider via `route_model_to_provider`.
+/// names one. Self-hosted keys have none: their default is the model the
+/// administrator picked from the server's own listing.
 fn default_model_for_provider(provider: &str) -> Option<String> {
     let model = match provider {
         "openai" => "gpt-5-nano",
@@ -415,23 +415,13 @@ impl AiService for GatewayAiService {
                 model,
             });
         }
-        let provider_id = route_model_to_provider(&model)?;
-        let key = if let Some(key_id) = route.system_key_id {
-            temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
-                .one(self.db.as_ref())
-                .await
-                .ok()
-                .flatten()
-                .filter(|key| key.is_active && key.provider == provider_id)
-        } else {
-            temps_entities::ai_provider_keys::Entity::find()
-                .filter(temps_entities::ai_provider_keys::Column::Provider.eq(provider_id))
-                .filter(temps_entities::ai_provider_keys::Column::IsActive.eq(true))
-                .one(self.db.as_ref())
-                .await
-                .ok()
-                .flatten()
-        }?;
+        // Same catalog-first routing as the request itself (#1408), so the
+        // metadata names the key that will actually serve the model.
+        let key = self
+            .gateway
+            .select_system_key(&model, route.system_key_id)
+            .await
+            .ok()?;
         Some(AiRouteMetadata {
             provider: key.display_name,
             model,
@@ -1000,6 +990,10 @@ mod tests {
             base_url: None,
             default_model: None,
             is_active: true,
+            trusted_private_address: None,
+            trusted_private_address_set_by: None,
+            trusted_private_address_set_at: None,
+            capabilities: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1107,7 +1101,16 @@ mod tests {
                 "project:7",
                 Some(serde_json::json!(["claude-haiku-4-5"])),
             )]])
+            // Catalog-first routing: no catalog row lists the model ...
+            .append_query_results(vec![Vec::<temps_entities::ai_provider_models::Model>::new()])
+            // ... so the vendor name fallback picks the active Anthropic key,
             .append_query_results(vec![vec![key]])
+            // which has no catalog yet (legacy key).
+            .append_query_results(vec![Vec::<temps_entities::ai_provider_models::Model>::new()])
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "num_items",
+                sea_orm::Value::BigInt(Some(0)),
+            )])]])
             .into_connection();
         let metadata = service_over(db)
             .route_metadata(Some("gateway"), Some(7), None)

@@ -27,7 +27,12 @@ import type { DateTimeRangeValue } from '@/lib/date-time-range'
 import { Fragment, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   Card,
   CardContent,
@@ -145,7 +150,9 @@ import {
   updateProviderModel,
   updateProviderKey,
   testProviderKeyById,
+  type CreateProviderKeyRequest,
   type ProviderKeyResponse,
+  type UpdateProviderKeyRequest,
 } from '@/api/client'
 import {
   getAiProviderStatusOptions,
@@ -166,7 +173,23 @@ import {
   aiProviderName,
   aiProviderModels,
   getAiProvider,
+  isSelfHostedProvider,
 } from '@/lib/ai-providers'
+import { SelfHostedProviderFields } from '@/components/ai/SelfHostedProviderFields'
+import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
+import {
+  PROVIDER_KEY_SETTINGS_MUTATION_KEY,
+  settingsSaveKeyId,
+} from '@/components/ai/self-hosted-provider'
+import {
+  EMPTY_PROVIDER_KEY_FORM,
+  providerKeyFormSchema,
+  providerKeyFormToRequest,
+  type ProviderKeyFormValues,
+} from '@/components/ai/provider-key-form'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
@@ -3900,11 +3923,27 @@ export function AiGatewayPage() {
   >('bash')
   const [snippetProvider, setSnippetProvider] = useState<string>('')
 
-  // Form state
-  const [newProvider, setNewProvider] = useState('')
-  const [newDisplayName, setNewDisplayName] = useState('')
-  const [newApiKey, setNewApiKey] = useState('')
-  const [newBaseUrl, setNewBaseUrl] = useState('')
+  // Add-provider-key form (React Hook Form + Zod; see provider-key-form.ts)
+  const providerKeyForm = useForm<ProviderKeyFormValues>({
+    resolver: zodResolver(providerKeyFormSchema),
+    defaultValues: EMPTY_PROVIDER_KEY_FORM,
+  })
+  const formValues = useWatch({
+    control: providerKeyForm.control,
+    defaultValue: EMPTY_PROVIDER_KEY_FORM,
+  }) as ProviderKeyFormValues
+  const formErrors = providerKeyForm.formState.errors
+  const newProvider = formValues.provider
+  const canTrustPrivateAddress = useIsInstanceAdmin()
+  const newProviderIsSelfHosted = isSelfHostedProvider(newProvider)
+  const setFormValue = <K extends keyof ProviderKeyFormValues>(
+    field: K,
+    value: ProviderKeyFormValues[K]
+  ) =>
+    providerKeyForm.setValue(field as never, value as never, {
+      shouldDirty: true,
+      shouldValidate: providerKeyForm.formState.isSubmitted,
+    })
 
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
@@ -3960,12 +3999,8 @@ export function AiGatewayPage() {
 
   // Create mutation
   const createMutation = useMutation({
-    mutationFn: (data: {
-      provider: string
-      display_name: string
-      api_key: string
-      base_url?: string
-    }) => createProviderKey({ body: data, throwOnError: true }),
+    mutationFn: (body: CreateProviderKeyRequest) =>
+      createProviderKey({ body, throwOnError: true }),
     meta: { errorTitle: 'Failed to create provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4034,35 +4069,46 @@ export function AiGatewayPage() {
   // backend now verifies on create (see handlers/providers.rs) — a failed
   // test surfaces as a 400 on the create call itself.
 
-  const resetForm = () => {
-    setNewProvider('')
-    setNewDisplayName('')
-    setNewApiKey('')
-    setNewBaseUrl('')
-  }
+  const resetForm = () => providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
 
-  const handleCreate = () => {
+  const handleCreate = providerKeyForm.handleSubmit((values) => {
     if (createMutation.isPending) return
-    if (!newProvider) {
-      toast.error('Please select a provider')
-      return
-    }
-    if (!newApiKey.trim()) {
-      toast.error('Please enter an API key')
-      return
-    }
-    if (!newDisplayName.trim()) {
-      toast.error('Please enter a display name')
-      return
-    }
+    createMutation.mutate(providerKeyFormToRequest(values))
+  })
 
-    createMutation.mutate({
-      provider: newProvider,
-      display_name: newDisplayName,
-      api_key: newApiKey,
-      base_url: newBaseUrl || undefined,
-    })
-  }
+  // Per-key settings (private-address trust, declared capabilities). Owned
+  // here rather than by the collapsible key rows, so collapsing a provider
+  // never drops an in-flight update. Which keys are saving comes from the
+  // mutation cache, per key: `onSettled` returns the refetch, so a save
+  // stays pending until fresh data has arrived, and a key's controls stay
+  // disabled until then -- a second change can never send its stale
+  // capabilities (the server replaces the whole declaration).
+  const updateKeySettingsMutation = useMutation({
+    mutationKey: PROVIDER_KEY_SETTINGS_MUTATION_KEY,
+    mutationFn: ({
+      id,
+      body,
+    }: {
+      id: number
+      body: UpdateProviderKeyRequest
+    }) => updateProviderKey({ path: { id }, body, throwOnError: true }),
+    onSuccess: () => {
+      toast.success('Provider key updated')
+    },
+    onError: (error) =>
+      toast.error('Could not update the provider key', {
+        description: problemDetail(error, 'Please try again.'),
+      }),
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: ['providerKeys'] }),
+  })
+  const savingKeyIds = useMutationState({
+    filters: {
+      mutationKey: PROVIDER_KEY_SETTINGS_MUTATION_KEY,
+      status: 'pending',
+    },
+    select: (mutation) => settingsSaveKeyId(mutation.state.variables),
+  })
 
   const handleDelete = (key: ProviderKeyResponse) => {
     setSelectedKey(key)
@@ -4080,9 +4126,20 @@ export function AiGatewayPage() {
 
   const effectiveSnippetProvider =
     snippetProvider || firstConfiguredProvider?.id || SUPPORTED_PROVIDERS[0].id
+  // A self-hosted server has no vendor default; show the model its key pins.
+  const selfHostedSnippetModel = isSelfHostedProvider(effectiveSnippetProvider)
+    ? keys.find(
+        (k) =>
+          k.provider === effectiveSnippetProvider &&
+          k.is_active &&
+          k.default_model
+      )?.default_model
+    : undefined
   const snippetModel =
+    selfHostedSnippetModel ??
     SUPPORTED_PROVIDERS.find((p) => p.id === effectiveSnippetProvider)
-      ?.defaultModel ?? SUPPORTED_PROVIDERS[0].defaultModel
+      ?.defaultModel ??
+    SUPPORTED_PROVIDERS[0].defaultModel
 
   const codeSnippets = {
     bash: `curl ${gatewayEndpoint}/chat/completions \\
@@ -4407,12 +4464,13 @@ console.log(response.choices[0].message.content);`,
                             }
                             size="sm"
                             onClick={() => {
-                              setNewProvider(provider.id)
-                              setNewDisplayName(
-                                hasAnyKey
+                              providerKeyForm.reset({
+                                ...EMPTY_PROVIDER_KEY_FORM,
+                                provider: provider.id,
+                                display_name: hasAnyKey
                                   ? `${provider.name} (key ${providerKeys.length + 1})`
-                                  : provider.name
-                              )
+                                  : provider.name,
+                              })
                               setDialogOpen(true)
                             }}
                           >
@@ -4498,6 +4556,19 @@ console.log(response.choices[0].message.content);`,
                             <TableRow className="bg-muted/20 hover:bg-muted/20">
                               <TableCell />
                               <TableCell colSpan={4} className="pb-4 pt-1">
+                                <SelfHostedKeySettings
+                                  providerKey={key}
+                                  canTrustPrivateAddress={
+                                    canTrustPrivateAddress
+                                  }
+                                  pending={savingKeyIds.includes(key.id)}
+                                  onUpdate={(body) =>
+                                    updateKeySettingsMutation.mutate({
+                                      id: key.id,
+                                      body,
+                                    })
+                                  }
+                                />
                                 <ProviderKeyModelDetail providerKey={key} />
                               </TableCell>
                             </TableRow>
@@ -4577,48 +4648,109 @@ console.log(response.choices[0].message.content);`,
                 <Input
                   id="displayName"
                   placeholder="Production API Key"
-                  value={newDisplayName}
                   disabled={createMutation.isPending}
-                  onChange={(e) => setNewDisplayName(e.target.value)}
+                  aria-invalid={!!formErrors.display_name}
+                  {...providerKeyForm.register('display_name')}
                 />
+                {formErrors.display_name && (
+                  <p className="text-xs text-destructive">
+                    {formErrors.display_name.message}
+                  </p>
+                )}
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="apiKey">API Key</Label>
+                <Label htmlFor="apiKey">
+                  API Key
+                  {newProviderIsSelfHosted && (
+                    <>
+                      {' '}
+                      <span className="text-muted-foreground font-normal">
+                        (optional)
+                      </span>
+                    </>
+                  )}
+                </Label>
                 <Input
                   id="apiKey"
                   type="password"
-                  placeholder="sk-..."
-                  value={newApiKey}
+                  placeholder={
+                    newProviderIsSelfHosted
+                      ? 'Leave empty if your server has no authentication'
+                      : 'sk-...'
+                  }
                   disabled={createMutation.isPending}
-                  onChange={(e) => setNewApiKey(e.target.value)}
+                  aria-invalid={!!formErrors.api_key}
+                  {...providerKeyForm.register('api_key')}
                 />
-                <p className="text-xs text-muted-foreground">
-                  Your key is encrypted at rest and never exposed in the
-                  dashboard.
-                </p>
+                {formErrors.api_key ? (
+                  <p className="text-xs text-destructive">
+                    {formErrors.api_key.message}
+                  </p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Your key is encrypted at rest and never exposed in the
+                    dashboard.
+                  </p>
+                )}
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="baseUrl">
-                  Custom Base URL{' '}
+                  {newProviderIsSelfHosted ? 'Base URL' : 'Custom Base URL'}{' '}
                   <span className="text-muted-foreground font-normal">
-                    (optional)
+                    {newProviderIsSelfHosted ? '(required)' : '(optional)'}
                   </span>
                 </Label>
                 <Input
                   id="baseUrl"
-                  placeholder="https://api.openai.com/v1"
-                  value={newBaseUrl}
+                  placeholder={
+                    newProviderIsSelfHosted
+                      ? 'http://10.0.0.5:8000/v1'
+                      : 'https://api.openai.com/v1'
+                  }
                   disabled={createMutation.isPending}
-                  onChange={(e) => setNewBaseUrl(e.target.value)}
+                  aria-invalid={!!formErrors.base_url}
+                  {...providerKeyForm.register('base_url')}
                 />
+                {formErrors.base_url && (
+                  <p className="text-xs text-destructive">
+                    {formErrors.base_url.message}
+                  </p>
+                )}
                 <p className="text-xs text-muted-foreground">
-                  Override the default API endpoint for this provider.
+                  {newProviderIsSelfHosted
+                    ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
+                    : 'Override the default API endpoint for this provider.'}
                 </p>
               </div>
+              <SelfHostedProviderFields
+                open={newProviderIsSelfHosted}
+                baseUrl={formValues.base_url}
+                apiKey={formValues.api_key}
+                trustPrivateAddress={formValues.trust_private_address}
+                onTrustPrivateAddressChange={(trusted) =>
+                  setFormValue('trust_private_address', trusted)
+                }
+                canTrustPrivateAddress={canTrustPrivateAddress}
+                discovery={formValues.discovery}
+                onDiscovered={(discovery) =>
+                  setFormValue('discovery', discovery)
+                }
+                defaultModel={formValues.default_model}
+                onDefaultModelChange={(model) =>
+                  setFormValue('default_model', model)
+                }
+                capabilities={formValues.capabilities}
+                onCapabilitiesChange={(capabilities) =>
+                  setFormValue('capabilities', capabilities)
+                }
+                error={formErrors.default_model?.message}
+                disabled={createMutation.isPending}
+              />
             </div>
             <p className="text-xs text-muted-foreground">
-              We&apos;ll verify the key works before saving — this usually takes
-              1–2 seconds.
+              {newProviderIsSelfHosted
+                ? 'We’ll send a short test completion to the default model before saving.'
+                : 'We’ll verify the key works before saving — this usually takes 1–2 seconds.'}
             </p>
             {createMutation.isError && (
               <p role="alert" className="text-sm text-destructive">

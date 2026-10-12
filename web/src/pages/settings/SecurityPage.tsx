@@ -213,7 +213,7 @@ export function SecurityPage() {
               id="trusted-private-networks"
               rows={4}
               className="font-mono text-sm"
-              placeholder={'10.0.0.0/8\n192.168.1.20\n100.64.0.0/10'}
+              placeholder={'192.168.1.20\n10.0.0.5/32\nfd12::5/128'}
               {...register('trusted_private_networks_text')}
             />
             <p className="text-sm text-muted-foreground">
@@ -225,6 +225,15 @@ export function SecurityPage() {
               (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8,
               100.64.0.0/10, fc00::/7, ::1). Cloud metadata endpoints stay
               blocked.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              This list applies to every outbound feature at once. Prefer
+              single-address entries (a bare IP, <code>/32</code> or{' '}
+              <code>/128</code>) over whole subnets. To reach just one
+              self-hosted AI model server, trust its address on its AI provider
+              key instead (AI Gateway → Self-hosted provider → “Trust this
+              private address for this key only”); that does not widen this
+              list.
             </p>
             <Alert>
               <AlertCircle className="h-4 w-4" />
