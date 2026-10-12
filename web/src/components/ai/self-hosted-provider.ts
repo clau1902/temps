@@ -108,24 +108,23 @@ export function selfHostedSubmitBlocker(input: {
   return null
 }
 
-/** Key ids with a settings save in flight, plus `id`. */
-export function withSavingKey(
-  saving: ReadonlySet<number>,
+/**
+ * React Query mutation key of provider key settings saves (trust,
+ * capabilities). Which keys are saving is read back from the mutation cache
+ * with `useMutationState`, never kept in component state.
+ */
+export const PROVIDER_KEY_SETTINGS_MUTATION_KEY = [
+  'providerKeySettings',
+] as const
+
+/** Variables of a provider key settings save. */
+export interface ProviderKeySettingsVariables {
   id: number
-): ReadonlySet<number> {
-  return new Set(saving).add(id)
 }
 
-/**
- * Key ids with a settings save in flight, minus one finished save of `id`.
- * Counts are not needed: a key's controls stay disabled while it is saving,
- * so it never has two saves in flight.
- */
-export function withoutSavingKey(
-  saving: ReadonlySet<number>,
-  id: number
-): ReadonlySet<number> {
-  const next = new Set(saving)
-  next.delete(id)
-  return next
+/** The key id a pending settings save is for. */
+export function settingsSaveKeyId(variables: unknown): number | undefined {
+  const id = (variables as Partial<ProviderKeySettingsVariables> | undefined)
+    ?.id
+  return typeof id === 'number' ? id : undefined
 }

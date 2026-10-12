@@ -6,8 +6,7 @@ import {
   DEFAULT_SELF_HOSTED_CAPABILITIES,
   hasIpLiteralHost,
   normalizeSelfHostedCapabilities,
-  withSavingKey,
-  withoutSavingKey,
+  settingsSaveKeyId,
   isPlainHttpUrl,
   selfHostedDiscoverySignature,
   selfHostedSubmitBlocker,
@@ -101,13 +100,9 @@ describe('self-hosted provider form helpers', () => {
     })
   })
 
-  test('saving state is tracked per key, so one key finishing never frees another', () => {
-    let saving: ReadonlySet<number> = new Set()
-    saving = withSavingKey(saving, 1)
-    saving = withSavingKey(saving, 2)
-    saving = withoutSavingKey(saving, 2)
-    expect(saving.has(1)).toBe(true)
-    expect(saving.has(2)).toBe(false)
-    expect(withoutSavingKey(saving, 1).size).toBe(0)
+  test('pending settings saves are attributed to their key', () => {
+    expect(settingsSaveKeyId({ id: 7, body: {} })).toBe(7)
+    expect(settingsSaveKeyId(undefined)).toBeUndefined()
+    expect(settingsSaveKeyId({ id: '7' })).toBeUndefined()
   })
 })

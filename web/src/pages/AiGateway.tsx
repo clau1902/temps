@@ -27,7 +27,12 @@ import type { DateTimeRangeValue } from '@/lib/date-time-range'
 import { Fragment, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   Card,
   CardContent,
@@ -173,8 +178,8 @@ import {
 import { SelfHostedProviderFields } from '@/components/ai/SelfHostedProviderFields'
 import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
 import {
-  withSavingKey,
-  withoutSavingKey,
+  PROVIDER_KEY_SETTINGS_MUTATION_KEY,
+  settingsSaveKeyId,
 } from '@/components/ai/self-hosted-provider'
 import {
   EMPTY_PROVIDER_KEY_FORM,
@@ -4073,14 +4078,13 @@ export function AiGatewayPage() {
 
   // Per-key settings (private-address trust, declared capabilities). Owned
   // here rather than by the collapsible key rows, so collapsing a provider
-  // never drops an in-flight update. Saves are tracked per key: a key's
-  // controls stay disabled until its own save *and* the refetch finish, so
-  // a second change never sends the key's stale capabilities (the server
-  // replaces the whole declaration).
-  const [savingKeyIds, setSavingKeyIds] = useState<ReadonlySet<number>>(
-    () => new Set()
-  )
+  // never drops an in-flight update. Which keys are saving comes from the
+  // mutation cache, per key: `onSettled` returns the refetch, so a save
+  // stays pending until fresh data has arrived, and a key's controls stay
+  // disabled until then -- a second change can never send its stale
+  // capabilities (the server replaces the whole declaration).
   const updateKeySettingsMutation = useMutation({
+    mutationKey: PROVIDER_KEY_SETTINGS_MUTATION_KEY,
     mutationFn: ({
       id,
       body,
@@ -4088,9 +4092,6 @@ export function AiGatewayPage() {
       id: number
       body: UpdateProviderKeyRequest
     }) => updateProviderKey({ path: { id }, body, throwOnError: true }),
-    onMutate: ({ id }) => {
-      setSavingKeyIds((saving) => withSavingKey(saving, id))
-    },
     onSuccess: () => {
       toast.success('Provider key updated')
     },
@@ -4098,10 +4099,15 @@ export function AiGatewayPage() {
       toast.error('Could not update the provider key', {
         description: problemDetail(error, 'Please try again.'),
       }),
-    onSettled: async (_data, _error, { id }) => {
-      await queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
-      setSavingKeyIds((saving) => withoutSavingKey(saving, id))
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: ['providerKeys'] }),
+  })
+  const savingKeyIds = useMutationState({
+    filters: {
+      mutationKey: PROVIDER_KEY_SETTINGS_MUTATION_KEY,
+      status: 'pending',
     },
+    select: (mutation) => settingsSaveKeyId(mutation.state.variables),
   })
 
   const handleDelete = (key: ProviderKeyResponse) => {
@@ -4555,7 +4561,7 @@ console.log(response.choices[0].message.content);`,
                                   canTrustPrivateAddress={
                                     canTrustPrivateAddress
                                   }
-                                  pending={savingKeyIds.has(key.id)}
+                                  pending={savingKeyIds.includes(key.id)}
                                   onUpdate={(body) =>
                                     updateKeySettingsMutation.mutate({
                                       id: key.id,
