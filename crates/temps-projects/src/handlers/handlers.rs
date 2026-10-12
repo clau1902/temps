@@ -1672,6 +1672,12 @@ pub async fn delete_project(
 
     state.project_service.begin_project_deletion(id).await?;
 
+    // Stop serving anything public for this project now: if cleanup below
+    // fails, the project stays fenced but `ProjectDeleted` is never emitted.
+    if let Some(hook) = &state.project_deletion_hook {
+        hook.project_deletion_started(id).await;
+    }
+
     state
         .deployment_canceller
         .cancel_all_project_deployments(id)

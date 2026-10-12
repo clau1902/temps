@@ -28,6 +28,7 @@ import {
   Plus,
   Trash2,
   ExternalLink,
+  Globe,
   MoreVertical,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
@@ -419,12 +420,20 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
             Monitor your project&apos;s uptime and performance
           </p>
         </div>
-        {monitors && monitors.length > 0 && (
-          <CreateActionButton
-            onClick={() => setIsCreateDialogOpen(true)}
-            label="Create Monitor"
-          />
-        )}
+        <div className="flex items-center gap-2">
+          <Button variant="outline" asChild>
+            <Link to={`/projects/${project.slug}/status-pages`}>
+              <Globe className="size-4 sm:mr-2" />
+              <span className="hidden sm:inline">Status pages</span>
+            </Link>
+          </Button>
+          {monitors && monitors.length > 0 && (
+            <CreateActionButton
+              onClick={() => setIsCreateDialogOpen(true)}
+              label="Create Monitor"
+            />
+          )}
+        </div>
         <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
           <DialogContent>
             <DialogHeader>

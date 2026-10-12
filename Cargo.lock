@@ -14957,6 +14957,7 @@ name = "temps-status-page"
 version = "0.1.0-beta.57"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "axum-macros",
@@ -14964,6 +14965,7 @@ dependencies = [
  "futures",
  "hex",
  "http 1.5.0",
+ "rand 0.10.3",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
@@ -14983,6 +14985,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-test",
+ "tower",
  "tracing",
  "url",
  "utoipa",

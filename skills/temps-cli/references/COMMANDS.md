@@ -95,6 +95,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`email-domains`](#email-domains) - Manage email domains for transactional email
 - [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
 - [`incidents`](#incidents) - Manage incidents for status pages and monitoring
+- [`status-pages`](#status-pages) - Publish public status pages for selected monitors
 - [`alarms`](#alarms) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
 - [`emails`](#emails) - Manage and send emails
 - [`load-balancer`](#load-balancer) - Manage load balancer routes
@@ -127,6 +128,8 @@ Use this index or search for a top-level command heading to load only the releva
 - [`cloud`](#cloud) - Temps Cloud
 - [`plugin`](#plugin) - Create, install, update and build TypeScript plugins
 - [`setup`](#setup) - PoC: install Temps on an existing Linux VPS over SSH and save a client context
+- [`start`](#start) - Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
+- [`stop`](#stop) - Stop the Temps server and database started by `temps start`
 
 ## Commands
 
@@ -5955,6 +5958,7 @@ Manage incidents for status pages and monitoring
 - `create` (`add`) - Create a new incident
 - `show` - Show incident details
 - `update-status` - Update an incident status
+- `set-visibility` - Show or hide an incident update on published status pages
 - `updates` - List status updates for an incident
 - `bucketed` - Get bucketed incident data for a project
 
@@ -6009,6 +6013,20 @@ Update an incident status
 | `--id <id>` | Incident ID | - | Yes |
 | `-s, --status <status>` | New status (investigating, identified, monitoring, resolved) | - | No |
 | `-m, --message <message>` | Status update message | - | No |
+| `--public` | Show this update on published status pages (private by default) | - | No |
+
+### `incidents set-visibility`
+
+Show or hide an incident update on published status pages
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Incident ID | - | Yes |
+| `--update-id <id>` | Incident update ID (see `incidents updates`) | - | Yes |
+| `--public` | Show the update on published status pages | - | No |
+| `--private` | Hide the update from published status pages | - | No |
 
 ### `incidents updates`
 
@@ -6035,6 +6053,116 @@ Get bucketed incident data for a project
 | `--end-time <time>` | End time (ISO 8601) | - | No |
 | `--environment-id <id>` | Filter by environment ID | - | No |
 | `--json` | Output in JSON format | - | No |
+
+## `status-pages` (alias: `status-page`)
+
+Publish public status pages for selected monitors
+
+**Subcommands:**
+
+- `list` (`ls`) - List a project's status pages
+- `create` - Create a draft status page
+- `show` - Show a status page
+- `update` - Change the title, description or monitor selection
+- `publish` - Publish the page at its public URL
+- `unpublish` - Unpublish; the public URL returns 404 immediately
+- `rotate-url` - Replace the public URL; the old one stops working
+- `delete` (`rm`) - Delete a status page; its public URL returns 404 immediately
+
+### `status-pages list` (alias: `ls`)
+
+List a project's status pages
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages create`
+
+Create a draft status page
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `-t, --title <title>` | Public page title | - | Yes |
+| `-d, --description <text>` | Public description | - | No |
+| `-m, --monitor <id=name>` | Monitor to show and its public name (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages show`
+
+Show a status page
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages update`
+
+Change the title, description or monitor selection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `-t, --title <title>` | Public page title | - | No |
+| `-d, --description <text>` | Public description ("" clears it) | - | No |
+| `-m, --monitor <id=name>` | Replace the selection; repeat for each monitor | - | No |
+| `--clear-monitors` | Remove every monitor (drafts only) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages publish`
+
+Publish the page at its public URL
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages unpublish`
+
+Unpublish; the public URL returns 404 immediately
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages rotate-url`
+
+Replace the public URL; the old one stops working
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages delete` (alias: `rm`)
+
+Delete a status page; its public URL returns 404 immediately
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
 
 ## `alarms` (alias: `alarm`)
 
@@ -8697,6 +8825,32 @@ PoC: install Temps on an existing Linux VPS over SSH and save a client context
 | `--telemetry` | Opt in to coarse setup-step analytics for this attempt only | - | No |
 | `--no-telemetry` | Do not send setup analytics (default) | - | No |
 | `-y, --yes` | Approve the installation plan without prompting | - | No |
+
+## `start`
+
+Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--channel <channel>` | Release channel for a fresh install: stable, beta or nightly | `beta` | No |
+| `--runtime-version <tag>` | Run this exact Temps release | - | No |
+| `--skills <scope>` | Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global) | - | No |
+| `--port <port>` | Port for your apps and the console on a fresh install (default: 8080 or the next free port) | - | No |
+| `--make-default` | Make "local" the default CLI context even if another one is active | - | No |
+| `--json` | Print the result as JSON, for scripts and agents | - | No |
+
+## `stop`
+
+Stop the Temps server and database started by `temps start`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--delete-data` | Also delete everything in your local Temps: its apps, services, sandboxes, database and admin password (asks first) | - | No |
+| `-y, --yes` | Do not ask before deleting data | - | No |
 
 
 ---

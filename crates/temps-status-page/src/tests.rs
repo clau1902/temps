@@ -69,6 +69,7 @@ mod unit_tests {
         let request = UpdateIncidentStatusRequest {
             status: "resolved".to_string(),
             message: "Issue has been fixed".to_string(),
+            is_public: false,
         };
 
         assert_eq!(request.status, "resolved");
@@ -520,6 +521,7 @@ mod integration_tests {
         let update = UpdateIncidentStatusRequest {
             status: "resolved".to_string(),
             message: "Issue has been fixed by scaling up the servers".to_string(),
+            is_public: false,
         };
 
         let updated = incident_service
