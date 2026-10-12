@@ -4,6 +4,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { act, cleanup, fireEvent, render } from '@testing-library/react'
+import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { installBrowserWindow } from '@/test/dom'
 import { ProviderForm } from './ProviderForm'
@@ -12,10 +13,12 @@ import { providerSchema, type ProviderFormData } from './schemas'
 installBrowserWindow()
 afterEach(cleanup)
 
-let form: ReturnType<typeof useForm<ProviderFormData>> | undefined
+type Form = ReturnType<typeof useForm<ProviderFormData>>
+
+let form: Form | undefined
 
 function Harness({ type }: { type: 'email' | 'webhook' }) {
-  form = useForm<ProviderFormData>({
+  const created = useForm<ProviderFormData>({
     resolver: zodResolver(providerSchema),
     defaultValues: {
       name: 'Ops',
@@ -30,9 +33,12 @@ function Harness({ type }: { type: 'email' | 'webhook' }) {
       },
     },
   })
+  useEffect(() => {
+    form = created
+  }, [created])
   return (
     <ProviderForm
-      form={form}
+      form={created}
       onSubmit={async () => {}}
       hideProviderType
       hideSubmit
