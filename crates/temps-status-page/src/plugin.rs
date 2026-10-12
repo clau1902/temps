@@ -14,6 +14,7 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::routes::public::{create_public_router, PublicStatusState};
 use crate::routes::status_page::{create_router, StatusPageApiDoc, StatusPageAppState};
+use crate::services::public_pages::{DomainServiceCertificates, StatusPageDomainService};
 use crate::services::{
     HealthCheckService, MonitorService, PublicStatusPageService, StatusPageService,
     StatusSnapshotCache,
@@ -306,6 +307,19 @@ impl TempsPlugin for StatusPagePlugin {
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let status_page_service = context.require_service::<StatusPageService>();
         let public_status_page_service = context.require_service::<PublicStatusPageService>();
+        // Custom hostnames (#1412). Built here rather than in
+        // `register_services` because the domain/ACME service and the route
+        // table are registered by other plugins; `configure_routes` runs once
+        // all of them are in the registry.
+        let status_page_domain_service = Arc::new(StatusPageDomainService::new(
+            context.require_service::<sea_orm::DatabaseConnection>(),
+            context.require_service::<temps_config::ConfigService>(),
+            context.require_service::<StatusSnapshotCache>(),
+            Arc::new(DomainServiceCertificates::new(
+                context.require_service::<temps_domains::DomainService>(),
+            )),
+            context.get_service::<dyn temps_core::route_table::RouteTableRefresher>(),
+        ));
         let telemetry = context
             .get_service::<dyn temps_core::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
@@ -316,6 +330,7 @@ impl TempsPlugin for StatusPagePlugin {
         struct AppState {
             status_page_service: Arc<StatusPageService>,
             public_status_page_service: Arc<PublicStatusPageService>,
+            status_page_domain_service: Arc<StatusPageDomainService>,
             telemetry: Arc<dyn temps_core::TelemetryReporter>,
             audit_service: Arc<dyn temps_core::AuditLogger>,
             project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
@@ -328,6 +343,10 @@ impl TempsPlugin for StatusPagePlugin {
 
             fn public_status_page_service(&self) -> &PublicStatusPageService {
                 &self.public_status_page_service
+            }
+
+            fn status_page_domain_service(&self) -> &StatusPageDomainService {
+                &self.status_page_domain_service
             }
 
             fn telemetry(&self) -> &Arc<dyn temps_core::TelemetryReporter> {
@@ -346,6 +365,7 @@ impl TempsPlugin for StatusPagePlugin {
         let app_state = Arc::new(AppState {
             status_page_service,
             public_status_page_service,
+            status_page_domain_service,
             telemetry,
             audit_service,
             project_access_checker,

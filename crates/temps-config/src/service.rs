@@ -1215,7 +1215,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         &self,
         host: &str,
     ) -> Result<Option<&'static str>, ConfigServiceError> {
-        use temps_entities::{custom_routes, environment_domains, project_custom_domains};
+        use temps_entities::{
+            custom_routes, environment_domains, project_custom_domains, status_page_domains,
+        };
 
         let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if host.is_empty() {
@@ -1251,6 +1253,11 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .is_some()
         {
             return Ok(Some("a custom route"));
+        }
+        // A hostname attached to a status page (#1412). Tombstones (removed
+        // hostnames) do not count: any application may claim those.
+        if status_page_domains::attached_hostname_conflict(self.db.as_ref(), &host).await? {
+            return Ok(Some("a status page custom domain"));
         }
         Ok(None)
     }
@@ -5748,6 +5755,10 @@ mod tests {
             .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
             .append_query_results(vec![Vec::<environment_domains::Model>::new()])
             .append_query_results(vec![Vec::<custom_routes::Model>::new()])
+            // A hostname attached to a status page (#1412).
+            .append_query_results(vec![
+                Vec::<temps_entities::status_page_domains::Model>::new(),
+            ])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
         assert_eq!(

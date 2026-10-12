@@ -28,7 +28,8 @@ use temps_core::RequestMetadata;
 use super::audit::{PublicStatusPageAction, PublicStatusPageAudit};
 use super::status_page::{map_error, StatusPageAppState};
 use crate::services::public_pages::{
-    CreateStatusPageRequest, StatusPageListResponse, StatusPageResponse, UpdateStatusPageRequest,
+    AddStatusPageDomainRequest, CreateStatusPageRequest, StatusPageDomainResponse,
+    StatusPageListResponse, StatusPageResponse, UpdateStatusPageRequest,
 };
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -57,6 +58,8 @@ fn audit_for(
         is_published: Some(page.is_published),
         monitor_ids: include_selection
             .then(|| page.monitors.iter().map(|m| m.monitor_id).collect()),
+        hostname: None,
+        outcome: None,
     }
 }
 
@@ -480,6 +483,288 @@ where
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn domain_audit(
+    auth: &temps_auth::AuthContext,
+    metadata: &RequestMetadata,
+    action: PublicStatusPageAction,
+    project_id: i32,
+    status_page_id: i32,
+    hostname: String,
+) -> PublicStatusPageAudit {
+    PublicStatusPageAudit {
+        actor_user_id: auth.user_id_opt(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+        action,
+        project_id,
+        status_page_id,
+        title: None,
+        is_published: None,
+        monitor_ids: None,
+        hostname: Some(hostname),
+        outcome: None,
+    }
+}
+
+/// The acting user's email, used as the ACME account contact exactly like
+/// the Domains API does.
+fn acme_email(auth: &temps_auth::AuthContext) -> String {
+    auth.user
+        .as_ref()
+        .map(|user| user.email.clone())
+        .unwrap_or_default()
+}
+
+/// List a status page's custom domains
+#[utoipa::path(
+    get,
+    path = "/status-pages/{status_page_id}/domains",
+    params(("status_page_id" = i32, Path, description = "Status page ID")),
+    responses(
+        (status = 200, description = "Custom domains with their DNS records and state", body = Vec<StatusPageDomainResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Status page not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn list_status_page_domains<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+    Path(status_page_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem>
+where
+    T: StatusPageAppState,
+{
+    permission_guard!(auth, StatusPageRead);
+    let project_id = app_state
+        .public_status_page_service()
+        .get_project_id(status_page_id)
+        .await
+        .map_err(map_error)?;
+    project_permission_guard!(
+        auth,
+        StatusPageRead,
+        project_id,
+        app_state.project_access_checker()
+    );
+    project_scope_guard!(auth, project_id);
+    app_state
+        .status_page_domain_service()
+        .list(status_page_id)
+        .await
+        .map(Json)
+        .map_err(map_error)
+}
+
+/// Attach a custom domain to a status page
+///
+/// The hostname is checked against every hostname this instance already
+/// serves. It is served only after ownership is verified through ACME.
+#[utoipa::path(
+    post,
+    path = "/status-pages/{status_page_id}/domains",
+    request_body = AddStatusPageDomainRequest,
+    params(("status_page_id" = i32, Path, description = "Status page ID")),
+    responses(
+        (status = 201, description = "Domain attached; create the DNS records, then verify", body = StatusPageDomainResponse),
+        (status = 400, description = "Invalid hostname"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Status page not found"),
+        (status = 409, description = "Hostname already in use, or domain limit reached"),
+        (status = 502, description = "Certificate order could not be started"),
+        (status = 503, description = "Hostname availability could not be checked"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn add_status_page_domain<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(status_page_id): Path<i32>,
+    Json(request): Json<AddStatusPageDomainRequest>,
+) -> Result<impl IntoResponse, Problem>
+where
+    T: StatusPageAppState,
+{
+    permission_guard!(auth, StatusPageWrite);
+    let project_id = app_state
+        .public_status_page_service()
+        .get_project_id(status_page_id)
+        .await
+        .map_err(map_error)?;
+    project_permission_guard!(
+        auth,
+        StatusPageWrite,
+        project_id,
+        app_state.project_access_checker()
+    );
+    project_scope_guard!(auth, project_id);
+    let domain = app_state
+        .status_page_domain_service()
+        .attach(status_page_id, request, &acme_email(&auth))
+        .await
+        .map_err(map_error)?;
+    record_audit(
+        app_state.as_ref(),
+        domain_audit(
+            &auth,
+            &metadata,
+            PublicStatusPageAction::DomainAdded,
+            project_id,
+            status_page_id,
+            domain.hostname.clone(),
+        ),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(domain)))
+}
+
+/// Verify ownership of a status page's custom domain and issue its certificate
+#[utoipa::path(
+    post,
+    path = "/status-pages/{status_page_id}/domains/{domain_id}/verify",
+    params(
+        ("status_page_id" = i32, Path, description = "Status page ID"),
+        ("domain_id" = i32, Path, description = "Custom domain ID"),
+    ),
+    responses(
+        (status = 200, description = "Verification result; `status` is `active` once the certificate is issued", body = StatusPageDomainResponse),
+        (status = 400, description = "Ownership could not be verified yet"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Status page or domain not found"),
+        (status = 502, description = "Certificate order could not be started"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn verify_status_page_domain<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((status_page_id, domain_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem>
+where
+    T: StatusPageAppState,
+{
+    permission_guard!(auth, StatusPageWrite);
+    let project_id = app_state
+        .public_status_page_service()
+        .get_project_id(status_page_id)
+        .await
+        .map_err(map_error)?;
+    project_permission_guard!(
+        auth,
+        StatusPageWrite,
+        project_id,
+        app_state.project_access_checker()
+    );
+    project_scope_guard!(auth, project_id);
+    let result = app_state
+        .status_page_domain_service()
+        .verify(status_page_id, domain_id, &acme_email(&auth))
+        .await;
+    // Every attempt is audited, successful or not: each one can start an
+    // ACME order.
+    let (action, hostname, outcome) = match &result {
+        Ok(domain)
+            if domain.status == crate::services::public_pages::StatusPageDomainStatus::Active =>
+        {
+            (
+                PublicStatusPageAction::DomainVerified,
+                domain.hostname.clone(),
+                "verified".to_string(),
+            )
+        }
+        Ok(domain) => (
+            PublicStatusPageAction::DomainVerificationAttempted,
+            domain.hostname.clone(),
+            "pending".to_string(),
+        ),
+        Err(error) => (
+            PublicStatusPageAction::DomainVerificationAttempted,
+            format!("domain {domain_id}"),
+            error.to_string(),
+        ),
+    };
+    let mut audit = domain_audit(
+        &auth,
+        &metadata,
+        action,
+        project_id,
+        status_page_id,
+        hostname,
+    );
+    audit.outcome = Some(outcome);
+    record_audit(app_state.as_ref(), audit).await;
+    let domain = result.map_err(map_error)?;
+    Ok(Json(domain))
+}
+
+/// Remove a custom domain from a status page; it answers 404 immediately
+#[utoipa::path(
+    delete,
+    path = "/status-pages/{status_page_id}/domains/{domain_id}",
+    params(
+        ("status_page_id" = i32, Path, description = "Status page ID"),
+        ("domain_id" = i32, Path, description = "Custom domain ID"),
+    ),
+    responses(
+        (status = 204, description = "Domain removed; its certificate is deleted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Status page or domain not found"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn remove_status_page_domain<T>(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<T>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((status_page_id, domain_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem>
+where
+    T: StatusPageAppState,
+{
+    permission_guard!(auth, StatusPageWrite);
+    let project_id = app_state
+        .public_status_page_service()
+        .get_project_id(status_page_id)
+        .await
+        .map_err(map_error)?;
+    project_permission_guard!(
+        auth,
+        StatusPageWrite,
+        project_id,
+        app_state.project_access_checker()
+    );
+    project_scope_guard!(auth, project_id);
+    let hostname = app_state
+        .status_page_domain_service()
+        .remove(status_page_id, domain_id)
+        .await
+        .map_err(map_error)?;
+    record_audit(
+        app_state.as_ref(),
+        domain_audit(
+            &auth,
+            &metadata,
+            PublicStatusPageAction::DomainRemoved,
+            project_id,
+            status_page_id,
+            hostname,
+        ),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,7 +777,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
-    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
     use temps_auth::permissions::{Permission, Role};
@@ -553,6 +838,7 @@ mod tests {
     struct TestState {
         status_page_service: StatusPageService,
         public_status_page_service: PublicStatusPageService,
+        status_page_domain_service: crate::services::public_pages::StatusPageDomainService,
         telemetry: Arc<dyn TelemetryReporter>,
         audit_service: Arc<dyn AuditLogger>,
         checker: Option<Arc<dyn ProjectAccessChecker>>,
@@ -564,6 +850,11 @@ mod tests {
         }
         fn public_status_page_service(&self) -> &PublicStatusPageService {
             &self.public_status_page_service
+        }
+        fn status_page_domain_service(
+            &self,
+        ) -> &crate::services::public_pages::StatusPageDomainService {
+            &self.status_page_domain_service
         }
         fn telemetry(&self) -> &Arc<dyn TelemetryReporter> {
             &self.telemetry
@@ -580,6 +871,7 @@ mod tests {
     /// selected monitor and an unselected one whose names, check errors and
     /// incidents carry recognisable markers that must never reach the public.
     struct Fx {
+        certs: Arc<crate::services::public_pages::domains::test_support::FakeCertificates>,
         _db: TestDatabase,
         state: Arc<TestState>,
         public: axum::Router,
@@ -720,7 +1012,22 @@ mod tests {
         let cache = Arc::new(StatusSnapshotCache::new(db.clone()));
         let status_page_service = StatusPageService::new(db.clone(), config_service.clone());
         let public_status_page_service =
-            PublicStatusPageService::new(db.clone(), config_service, cache.clone());
+            PublicStatusPageService::new(db.clone(), config_service.clone(), cache.clone());
+        let certs = Arc::new(
+            crate::services::public_pages::domains::test_support::FakeCertificates::new(db.clone()),
+        );
+        let status_page_domain_service =
+            crate::services::public_pages::StatusPageDomainService::new(
+                db.clone(),
+                config_service,
+                cache.clone(),
+                certs.clone(),
+                Some(Arc::new(
+                    crate::services::public_pages::domains::test_support::StubRouteTable {
+                        serving: ["app-taken.example.com".to_string()].into_iter().collect(),
+                    },
+                )),
+            );
 
         let project_a = insert_project(&db, "status-a").await;
         let project_b = insert_project(&db, "status-b").await;
@@ -825,12 +1132,14 @@ mod tests {
         let state = Arc::new(TestState {
             status_page_service,
             public_status_page_service,
+            status_page_domain_service,
             telemetry: Arc::new(NoopTelemetryReporter),
             audit_service: audit.clone(),
             checker: checker(project_a),
         });
         let public = create_public_router(Arc::new(PublicStatusState::new(cache)));
         Some(Fx {
+            certs,
             _db: test_db,
             state,
             public,
@@ -1712,5 +2021,635 @@ mod tests {
             .refresh_project_pages(fx.project_a)
             .await;
         assert_eq!(fetch(&fx.public, &path).await.0, StatusCode::NOT_FOUND);
+    }
+
+    // ---- Custom domains (#1412) -------------------------------------------
+
+    use crate::services::public_pages::{
+        AddStatusPageDomainRequest, StatusPageDomainResponse, StatusPageDomainStatus,
+        VerificationMethod,
+    };
+
+    fn add_domain_request(hostname: &str) -> Json<AddStatusPageDomainRequest> {
+        Json(AddStatusPageDomainRequest {
+            hostname: hostname.to_string(),
+            verification_method: VerificationMethod::Http01,
+        })
+    }
+
+    async fn attach(
+        fx: &Fx,
+        page_id: i32,
+        hostname: &str,
+    ) -> Result<StatusPageDomainResponse, Problem> {
+        let response = add_status_page_domain(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path(page_id),
+            add_domain_request(hostname),
+        )
+        .await?;
+        Ok(decode(response).await)
+    }
+
+    async fn verify(
+        fx: &Fx,
+        page_id: i32,
+        domain_id: i32,
+    ) -> Result<StatusPageDomainResponse, Problem> {
+        let response = verify_status_page_domain(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path((page_id, domain_id)),
+        )
+        .await?;
+        Ok(decode(response).await)
+    }
+
+    /// A request as the proxy forwards it for a custom hostname.
+    async fn fetch_as_host(
+        router: &axum::Router,
+        slug: &str,
+        host: &str,
+        json: bool,
+    ) -> (StatusCode, String) {
+        let path = if json {
+            format!("/status/{slug}/summary.json")
+        } else {
+            format!("/status/{slug}")
+        };
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(temps_core::public_status_page::STATUS_HOST_HEADER, host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router is infallible");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    async fn route_for(fx: &Fx, host: &str) -> Option<temps_routes::StatusPageHostRoute> {
+        let table = temps_routes::CachedPeerTable::new(fx._db.connection_arc());
+        table.load_routes().await.expect("route table loads");
+        table.status_page_host(host)
+    }
+
+    async fn domains_row_exists(fx: &Fx, hostname: &str) -> bool {
+        temps_entities::domains::Entity::find()
+            .filter(temps_entities::domains::Column::Domain.eq(hostname))
+            .one(fx._db.connection_arc().as_ref())
+            .await
+            .expect("query domains")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn hostnames_used_anywhere_else_cannot_be_attached() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let db = fx._db.connection_arc();
+        let page = create_page(&fx, api_selection(&fx)).await;
+        let other = create_page(&fx, api_selection(&fx)).await;
+        attach(&fx, other.id, "taken-status.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("first attach");
+
+        // A project custom domain and an environment domain.
+        let environment_id = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(fx.project_a))
+            .one(db.as_ref())
+            .await
+            .expect("query")
+            .expect("environment")
+            .id;
+        temps_entities::project_custom_domains::ActiveModel {
+            project_id: Set(fx.project_a),
+            environment_id: Set(environment_id),
+            domain: Set("taken-project.example.org".to_string()),
+            status: Set("active".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("project custom domain");
+        temps_entities::environment_domains::ActiveModel {
+            environment_id: Set(environment_id),
+            domain: Set("taken-env.example.org".to_string()),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("environment domain");
+        // A certificate that someone else manages under Domains.
+        temps_entities::domains::ActiveModel {
+            domain: Set("taken-cert.example.org".to_string()),
+            status: Set("active".to_string()),
+            verification_method: Set("http-01".to_string()),
+            is_wildcard: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("domains row");
+
+        for (hostname, expected) in [
+            ("taken-status.example.org", StatusCode::CONFLICT),
+            ("TAKEN-STATUS.example.org.", StatusCode::CONFLICT),
+            ("taken-project.example.org", StatusCode::CONFLICT),
+            ("taken-env.example.org", StatusCode::CONFLICT),
+            ("taken-cert.example.org", StatusCode::CONFLICT),
+            ("app-taken.example.com", StatusCode::CONFLICT), // live application route
+            ("anything.localho.st", StatusCode::CONFLICT),   // generated preview zone
+            ("*.example.org", StatusCode::BAD_REQUEST),
+            ("10.0.0.5", StatusCode::BAD_REQUEST),
+            ("status.example.org:8443", StatusCode::BAD_REQUEST),
+        ] {
+            let error = attach(&fx, page.id, hostname)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{hostname} must be refused"));
+            assert_eq!(error.status_code, expected, "{hostname}: {:?}", error.body);
+        }
+
+        // The other direction: Temps' own claim check knows status hosts.
+        let config_service = temps_config::ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgres://test:test@localhost/test".to_string(),
+                    None,
+                    None,
+                )
+                .expect("server config"),
+            ),
+            db.clone(),
+        );
+        assert_eq!(
+            config_service
+                .hostname_claimed_by("Taken-Status.example.org")
+                .await
+                .expect("claim check"),
+            Some("a status page custom domain")
+        );
+
+        // Limit per page.
+        for i in 0..crate::services::public_pages::MAX_DOMAINS_PER_STATUS_PAGE {
+            attach(&fx, page.id, &format!("s{i}.example.org"))
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("within limit");
+        }
+        let error = attach(&fx, page.id, "one-too-many.example.org")
+            .await
+            .expect_err("limit");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn custom_host_serves_only_after_verification_and_only_its_own_page() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let other = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, other.id).await;
+
+        let pending = attach(&fx, page.id, "Status.Example.ORG")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach");
+        assert_eq!(pending.hostname, "status.example.org");
+        assert_eq!(pending.status, StatusPageDomainStatus::Pending);
+        assert!(!pending.serving);
+        assert!(pending
+            .dns_records
+            .iter()
+            .any(|r| r.name == "status.example.org"));
+
+        // Unverified: 404 at the console, no serving route at the proxy.
+        let (status, body) =
+            fetch_as_host(&fx.public, &page.slug, "status.example.org", false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, temps_core::public_status_page::NOT_FOUND_HTML);
+        assert_eq!(
+            route_for(&fx, "status.example.org").await,
+            Some(temps_routes::StatusPageHostRoute { slug: None }),
+            "attached but unverified: reserved, never served"
+        );
+
+        // A failed ownership check keeps it that way.
+        fx.certs
+            .fail_hosts
+            .lock()
+            .expect("lock")
+            .insert("status.example.org".to_string());
+        let error = verify(&fx, page.id, pending.id).await.expect_err("fails");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, "status.example.org", false)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        fx.certs.fail_hosts.lock().expect("lock").clear();
+
+        let active = verify(&fx, page.id, pending.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("verify");
+        assert_eq!(active.status, StatusPageDomainStatus::Active);
+        assert!(active.serving);
+        let (status, body) =
+            fetch_as_host(&fx.public, &page.slug, "status.example.org", false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("API"));
+        assert_no_leaks(&body);
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, "STATUS.example.org.", true)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let route = route_for(&fx, "status.example.org").await.expect("route");
+        assert_eq!(route.slug.as_deref(), Some(page.slug.as_str()));
+
+        // Cross-page Host spoofing: page A's hostname never serves page B, and
+        // an unrelated or garbage tag serves nothing.
+        for host in [
+            "status.example.org",
+            "other.example.org",
+            "",
+            "status.example.org.evil",
+        ] {
+            assert_eq!(
+                fetch_as_host(&fx.public, &other.slug, host, false).await.0,
+                StatusCode::NOT_FOUND,
+                "{host:?} must not serve another page"
+            );
+        }
+        // The slug URL itself (no tag) still works.
+        assert_eq!(
+            fetch(&fx.public, &format!("/status/{}", other.slug))
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        let listed: Vec<StatusPageDomainResponse> = decode(
+            list_status_page_domains(admin(), State(fx.state.clone()), Path(page.id))
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("list"),
+        )
+        .await;
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].certificate_expires_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn removing_unpublishing_or_deleting_takes_the_custom_host_down_immediately() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let a = attach(&fx, page.id, "a.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("a");
+        let b = attach(&fx, page.id, "b.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("b");
+        verify(&fx, page.id, a.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("verify a");
+        verify(&fx, page.id, b.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("verify b");
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, "a.example.org", false)
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // 1. Removing a hostname: 404 at once, certificate deleted, and the
+        // hostname stays reserved (tombstone) instead of reaching the console.
+        remove_status_page_domain(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path((page.id, a.id)),
+        )
+        .await
+        .map_err(|p| format!("{:?}", p.body))
+        .expect("remove");
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, "a.example.org", false)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            !domains_row_exists(&fx, "a.example.org").await,
+            "certificate deleted"
+        );
+        assert_eq!(
+            route_for(&fx, "a.example.org").await,
+            Some(temps_routes::StatusPageHostRoute { slug: None })
+        );
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, "b.example.org", false)
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // 2. Unpublishing: 404 at once, certificates released (no serving, no
+        // renewal), hostname kept but needs verification again.
+        unpublish_status_page(admin(), State(fx.state.clone()), metadata(), Path(page.id))
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("unpublish");
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, "b.example.org", false)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            !domains_row_exists(&fx, "b.example.org").await,
+            "certificate released"
+        );
+        let listed: Vec<StatusPageDomainResponse> = decode(
+            list_status_page_domains(admin(), State(fx.state.clone()), Path(page.id))
+                .await
+                .map_err(|p| format!("{:?}", p.body))
+                .expect("list"),
+        )
+        .await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, StatusPageDomainStatus::Unverified);
+        assert_eq!(
+            route_for(&fx, "b.example.org").await,
+            Some(temps_routes::StatusPageHostRoute { slug: None })
+        );
+
+        // Republish + verify again brings it back.
+        publish(&fx, page.id).await;
+        verify(&fx, page.id, b.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("re-verify");
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, "b.example.org", false)
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // 3. Deleting the page: 404 at once, certificate deleted, tombstone.
+        delete_status_page(admin(), State(fx.state.clone()), metadata(), Path(page.id))
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("delete");
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, "b.example.org", false)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert!(!domains_row_exists(&fx, "b.example.org").await);
+        assert_eq!(
+            route_for(&fx, "b.example.org").await,
+            Some(temps_routes::StatusPageHostRoute { slug: None })
+        );
+
+        // A tombstoned hostname can be attached again elsewhere.
+        let next = create_page(&fx, api_selection(&fx)).await;
+        attach(&fx, next.id, "b.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("re-attach a removed hostname");
+
+        let actions: Vec<String> = fx
+            .audit
+            .entries
+            .lock()
+            .expect("audit")
+            .iter()
+            .map(|(op, _)| op.clone())
+            .collect();
+        for expected in [
+            "STATUS_PAGE_DOMAIN_ADDED",
+            "STATUS_PAGE_DOMAIN_VERIFIED",
+            "STATUS_PAGE_DOMAIN_REMOVED",
+        ] {
+            assert!(
+                actions.iter().any(|a| a == expected),
+                "missing {expected}: {actions:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn project_deletion_releases_custom_host_certificates() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        publish(&fx, page.id).await;
+        let d = attach(&fx, page.id, "gone.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach");
+        verify(&fx, page.id, d.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("verify");
+        temps_core::ProjectDeletionHook::project_deletion_started(
+            &fx.state.public_status_page_service,
+            fx.project_a,
+        )
+        .await;
+        assert!(!domains_row_exists(&fx, "gone.example.org").await);
+        assert_eq!(
+            fetch_as_host(&fx.public, &page.slug, "gone.example.org", false)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_custom_domains_requires_project_admin_permissions() {
+        let viewer = |project_id: i32| -> Option<Arc<dyn ProjectAccessChecker>> {
+            Some(Arc::new(Checker {
+                allowed: vec![project_id],
+                permissions: Some(vec![Permission::StatusPageRead.to_string()]),
+            }))
+        };
+        let Some(fx) = fixture(viewer).await else {
+            return;
+        };
+        let page = create_page(&fx, api_selection(&fx)).await;
+        let d = attach(&fx, page.id, "rbac.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("admin attach");
+        assert!(
+            list_status_page_domains(member(), State(fx.state.clone()), Path(page.id))
+                .await
+                .is_ok()
+        );
+        assert_denied(
+            add_status_page_domain(
+                member(),
+                State(fx.state.clone()),
+                metadata(),
+                Path(page.id),
+                add_domain_request("x.example.org"),
+            )
+            .await
+            .err()
+            .expect("viewer add"),
+        );
+        assert_denied(
+            verify_status_page_domain(
+                member(),
+                State(fx.state.clone()),
+                metadata(),
+                Path((page.id, d.id)),
+            )
+            .await
+            .err()
+            .expect("viewer verify"),
+        );
+        assert_denied(
+            remove_status_page_domain(
+                member(),
+                State(fx.state.clone()),
+                metadata(),
+                Path((page.id, d.id)),
+            )
+            .await
+            .err()
+            .expect("viewer remove"),
+        );
+        // A domain id from another page is not reachable through this page.
+        let other = create_page(&fx, api_selection(&fx)).await;
+        let error = remove_status_page_domain(
+            admin(),
+            State(fx.state.clone()),
+            metadata(),
+            Path((other.id, d.id)),
+        )
+        .await
+        .err()
+        .expect("foreign domain id");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn no_certificate_is_ordered_for_an_unpublished_page() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let draft = create_page(&fx, api_selection(&fx)).await;
+        let attached = attach(&fx, draft.id, "draft.example.org")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach to a draft");
+        assert_eq!(attached.status, StatusPageDomainStatus::Unverified);
+        assert!(
+            !domains_row_exists(&fx, "draft.example.org").await,
+            "no ACME order for a draft"
+        );
+        let error = verify(&fx, draft.id, attached.id)
+            .await
+            .expect_err("refused");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
+        assert!(!domains_row_exists(&fx, "draft.example.org").await);
+
+        // Publishing and verifying then works.
+        publish(&fx, draft.id).await;
+        let active = verify(&fx, draft.id, attached.id)
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("verify once published");
+        assert_eq!(active.status, StatusPageDomainStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn wildcards_are_honoured_in_both_directions() {
+        let Some(fx) = fixture(|_| None).await else {
+            return;
+        };
+        let db = fx._db.connection_arc();
+        let page = create_page(&fx, api_selection(&fx)).await;
+        // A wildcard certificate managed under Domains covers its subdomains.
+        temps_entities::domains::ActiveModel {
+            domain: Set("*.wild.example.org".to_string()),
+            status: Set("active".to_string()),
+            verification_method: Set("dns-01".to_string()),
+            is_wildcard: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("wildcard domains row");
+        let error = attach(&fx, page.id, "login.wild.example.org")
+            .await
+            .expect_err("covered by an operator wildcard");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
+        assert!(
+            !format!("{:?}", error.body).contains("Domains"),
+            "the reason is not disclosed to project admins"
+        );
+
+        // A status host blocks a later wildcard that would cover it.
+        attach(&fx, page.id, "status.example.net")
+            .await
+            .map_err(|p| format!("{:?}", p.body))
+            .expect("attach");
+        assert!(
+            temps_entities::status_page_domains::attached_hostname_conflict(
+                db.as_ref(),
+                "*.example.net"
+            )
+            .await
+            .expect("query")
+        );
+        assert!(
+            !temps_entities::status_page_domains::attached_hostname_conflict(
+                db.as_ref(),
+                "*.other.example.net"
+            )
+            .await
+            .expect("query")
+        );
+        assert!(
+            !temps_entities::status_page_domains::attached_hostname_conflict(db.as_ref(), "*.net")
+                .await
+                .expect("query"),
+            "only single-label children are covered"
+        );
     }
 }

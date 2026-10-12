@@ -38,6 +38,7 @@ pub mod project_ip_gate;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
 pub mod public_ingress;
+pub mod public_status_page;
 pub mod registry_prefix;
 #[cfg(test)]
 mod release_manifest;

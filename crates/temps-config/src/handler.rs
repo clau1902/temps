@@ -3986,6 +3986,10 @@ mod tests {
             .append_query_results(vec![Vec::<project_custom_domains::Model>::new()])
             .append_query_results(vec![Vec::<environment_domains::Model>::new()])
             .append_query_results(vec![Vec::<custom_routes::Model>::new()])
+            // A hostname attached to a status page (#1412).
+            .append_query_results(vec![
+                Vec::<temps_entities::status_page_domains::Model>::new(),
+            ])
     }
 
     #[tokio::test]
