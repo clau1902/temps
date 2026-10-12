@@ -223,18 +223,28 @@ pub use types::UtcDateTime;
 pub mod archive_security;
 pub mod drop_entries;
 
-/// Lockfile guard for the workspace's YAML parser.
+/// Lockfile guards for unmaintained crates ignored by `dependency-scan.yml`.
 ///
 /// `serde_yaml` and its `unsafe-libyaml` parser are unmaintained
 /// (RUSTSEC-2024-0449), so workspace crates use `yaml_serde` instead. The
 /// advisory stays in `dependency-scan.yml`'s ignore list only because
 /// pingora-core still depends on `serde_yaml` for a conf-file loader Temps
-/// never calls. That ignore would also hide a workspace crate adding
-/// `serde_yaml` back, so this test fails on it. `Cargo.lock` is embedded at
-/// compile time, so it also runs from prebuilt nextest archives.
+/// never calls. Likewise `bincode` (RUSTSEC-2025-0141) is ignored only
+/// because the microsandbox SDK requires it. An ignore covers the whole
+/// advisory, so it would also hide anything else starting to depend on these
+/// crates; these tests fail on that instead. `Cargo.lock` is embedded at
+/// compile time, so they also run from prebuilt nextest archives.
 #[cfg(test)]
-mod yaml_dependency_guard_tests {
+mod unmaintained_dependency_guard_tests {
     const CARGO_LOCK: &str = include_str!("../../../Cargo.lock");
+
+    /// The only packages allowed to depend on `bincode`; see the
+    /// RUSTSEC-2025-0141 note in `.github/workflows/dependency-scan.yml`.
+    const ALLOWED_BINCODE_DEPENDENTS: &[&str] = &[
+        "microsandbox-filesystem",
+        "msb_krun_devices",
+        "msb_krun_vmm",
+    ];
 
     /// The only package allowed to depend on `serde_yaml`; see the
     /// RUSTSEC-2024-0449 note in `.github/workflows/dependency-scan.yml`.
@@ -292,6 +302,20 @@ mod yaml_dependency_guard_tests {
             dependents.iter().all(|name| *name == "serde_yaml"),
             "unsafe-libyaml (RUSTSEC-2024-0449) is pulled in by {dependents:?}; only \
              pingora-core's serde_yaml is covered by the dependency-scan.yml exception"
+        );
+    }
+
+    #[test]
+    fn bincode_is_only_reached_through_microsandbox() {
+        let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "bincode")
+            .into_iter()
+            .filter(|name| !ALLOWED_BINCODE_DEPENDENTS.contains(name))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "{unexpected:?} depend on bincode, which is unmaintained (RUSTSEC-2025-0141). \
+             The dependency-scan.yml exception only covers the microsandbox SDK's crates; \
+             use postcard or serde_json instead of adding a new bincode user."
         );
     }
 }
