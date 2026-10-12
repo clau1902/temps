@@ -140,6 +140,24 @@ pub struct DomainService {
     telemetry: Arc<dyn TelemetryReporter>,
 }
 
+/// How a challenge operation finds its `domains` row.
+#[derive(Debug, Clone, Copy)]
+enum DomainLookup<'a> {
+    /// By hostname: the row currently holding that name.
+    Name(&'a str),
+    /// By primary key: exactly that row, or `NotFound`.
+    Id(i32),
+}
+
+impl std::fmt::Display for DomainLookup<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(name) => f.write_str(name),
+            Self::Id(id) => write!(f, "domain id {id}"),
+        }
+    }
+}
+
 impl DomainService {
     pub fn new(
         db: Arc<DatabaseConnection>,
@@ -344,7 +362,7 @@ impl DomainService {
         domain_name: &str,
         user_email: &str,
     ) -> Result<ChallengeData, DomainServiceError> {
-        self.request_challenge_with(domain_name, user_email, true)
+        self.request_challenge_with(DomainLookup::Name(domain_name), user_email, true)
             .await
     }
 
@@ -356,19 +374,19 @@ impl DomainService {
         domain_name: &str,
         user_email: &str,
     ) -> Result<ChallengeData, DomainServiceError> {
-        self.request_challenge_with(domain_name, user_email, false)
+        self.request_challenge_with(DomainLookup::Name(domain_name), user_email, false)
             .await
     }
 
     async fn request_challenge_with(
         &self,
-        domain_name: &str,
+        target: DomainLookup<'_>,
         user_email: &str,
         report_telemetry: bool,
     ) -> Result<ChallengeData, DomainServiceError> {
         info!(
             "Requesting Let's Encrypt challenge for domain: {} with email: {}",
-            domain_name, user_email
+            target, user_email
         );
 
         // Validate email is provided
@@ -379,11 +397,9 @@ impl DomainService {
         }
 
         // Find the domain
-        let mut domain = domains::Entity::find()
-            .filter(domains::Column::Domain.eq(domain_name))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| DomainServiceError::NotFound(domain_name.to_string()))?;
+        let mut domain = self.find_domain(target).await?;
+        let domain_name_owned = domain.domain.clone();
+        let domain_name = domain_name_owned.as_str();
         let domain_id = domain.id;
 
         // Clean up any existing order for this domain (important for renewals)
@@ -611,13 +627,56 @@ impl DomainService {
         }
     }
 
+    /// [`Self::request_challenge`] for the row with id `domain_id`.
+    ///
+    /// For callers that own a specific row: a hostname can be deleted and
+    /// created again (by another owner) while a request is in flight, and a
+    /// lookup by name would then act on the new row. By id, a request for a
+    /// row that no longer exists fails with `NotFound` instead.
+    pub async fn request_challenge_for_id(
+        &self,
+        domain_id: i32,
+        user_email: &str,
+    ) -> Result<ChallengeData, DomainServiceError> {
+        self.request_challenge_with(DomainLookup::Id(domain_id), user_email, true)
+            .await
+    }
+
+    /// [`Self::complete_challenge`] for the row with id `domain_id`; see
+    /// [`Self::request_challenge_for_id`].
+    pub async fn complete_challenge_for_id(
+        &self,
+        domain_id: i32,
+        user_email: &str,
+    ) -> Result<domains::Model, DomainServiceError> {
+        self.complete_challenge_with(DomainLookup::Id(domain_id), user_email, true)
+            .await
+    }
+
+    async fn find_domain(
+        &self,
+        target: DomainLookup<'_>,
+    ) -> Result<domains::Model, DomainServiceError> {
+        match target {
+            DomainLookup::Name(name) => domains::Entity::find()
+                .filter(domains::Column::Domain.eq(name))
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| DomainServiceError::NotFound(name.to_string())),
+            DomainLookup::Id(id) => domains::Entity::find_by_id(id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| DomainServiceError::NotFound(format!("domain id {id}"))),
+        }
+    }
+
     /// Step 3: Complete the challenge (after user has added DNS record)
     pub async fn complete_challenge(
         &self,
         domain_name: &str,
         user_email: &str,
     ) -> Result<domains::Model, DomainServiceError> {
-        self.complete_challenge_with(domain_name, user_email, true)
+        self.complete_challenge_with(DomainLookup::Name(domain_name), user_email, true)
             .await
     }
 
@@ -629,19 +688,19 @@ impl DomainService {
         domain_name: &str,
         user_email: &str,
     ) -> Result<domains::Model, DomainServiceError> {
-        self.complete_challenge_with(domain_name, user_email, false)
+        self.complete_challenge_with(DomainLookup::Name(domain_name), user_email, false)
             .await
     }
 
     async fn complete_challenge_with(
         &self,
-        domain_name: &str,
+        target: DomainLookup<'_>,
         user_email: &str,
         report_telemetry: bool,
     ) -> Result<domains::Model, DomainServiceError> {
         debug!(
             "Completing challenge for domain: {} with email: {}",
-            domain_name, user_email
+            target, user_email
         );
 
         // Validate email is provided
@@ -652,11 +711,9 @@ impl DomainService {
         }
 
         // Find the domain
-        let domain = domains::Entity::find()
-            .filter(domains::Column::Domain.eq(domain_name))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| DomainServiceError::NotFound(domain_name.to_string()))?;
+        let domain = self.find_domain(target).await?;
+        let domain_name_owned = domain.domain.clone();
+        let domain_name = domain_name_owned.as_str();
         let domain_id = domain.id;
 
         // Find the ACME order for this domain

@@ -3187,21 +3187,25 @@ mod tests {
             .expect("new order row");
         let orders_before = fx.certs.orders.load(std::sync::atomic::Ordering::Relaxed);
 
-        // The stale request fails under the lock instead of acting.
-        let guarded = fx
-            .state
-            .status_page_domain_service
-            .guard_binding(&stale)
-            .await;
-        assert!(
-            matches!(
-                guarded,
-                Err(crate::services::StatusPageError::HostnameBindingChanged { .. })
-            ),
-            "a binding read before the handover must be refused"
-        );
-        // And the certificate calls refuse a row that is not the expected
-        // one, even though the hostname matches.
+        // A verify or renew that read the binding before the handover now
+        // runs: its calls address the old row by id, find it gone and fail,
+        // instead of resolving the hostname to the new owner's row.
+        let old_page_model = temps_entities::status_pages::Entity::find_by_id(old_page.id)
+            .one(db.as_ref())
+            .await
+            .expect("page query")
+            .expect("old page");
+        let service = &fx.state.status_page_domain_service;
+        assert!(service
+            .verify_binding(old_page_model.clone(), stale.clone(), "ops@example.com")
+            .await
+            .is_err());
+        assert!(service
+            .renew_binding(old_page_model, stale.clone(), "ops@example.com")
+            .await
+            .is_err());
+        // The certificate calls themselves address rows by id: the old id
+        // fails even though the hostname now has a row.
         assert!(fx
             .certs
             .request_challenge(old_order, host, "ops@example.com")
@@ -3231,57 +3235,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn removing_a_hostname_waits_for_a_certificate_operation_in_flight() {
+    async fn custom_domains_work_on_a_single_connection_pool() {
         let Some(fx) = fixture(|_| None).await else {
             return;
         };
-        let db = fx._db.connection_arc();
+        // An operator may run with one database connection. No domain
+        // operation may hold a connection while it waits for another.
+        let mut options = sea_orm::ConnectOptions::new(fx._db.database_url.clone());
+        options
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5));
+        let single = Arc::new(
+            sea_orm::Database::connect(options)
+                .await
+                .expect("single-connection pool"),
+        );
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://test:test@localhost/test".to_string(),
+            None,
+            None,
+        )
+        .expect("server config");
+        let service = crate::services::public_pages::StatusPageDomainService::new(
+            single.clone(),
+            Arc::new(temps_config::ConfigService::new(
+                Arc::new(config),
+                single.clone(),
+            )),
+            Arc::new(crate::services::StatusSnapshotCache::new(single.clone())),
+            Arc::new(
+                crate::services::public_pages::domains::test_support::FakeCertificates::new(
+                    single.clone(),
+                ),
+            ),
+            Arc::new(
+                crate::services::public_pages::domains::test_support::StubRouteTable {
+                    serving: Default::default(),
+                },
+            ),
+        );
         let page = create_page(&fx, api_selection(&fx)).await;
         publish(&fx, page.id).await;
-        let attached = attach(&fx, page.id, "in-flight.example.org")
-            .await
-            .map_err(|p| format!("{:?}", p.body))
-            .expect("attach");
-        let binding = temps_entities::status_page_domains::Entity::find_by_id(attached.id)
-            .one(db.as_ref())
-            .await
-            .expect("binding query")
-            .expect("binding");
 
-        // A verify or renew holds the guard for the length of its ACME calls.
-        let guard = fx
-            .state
-            .status_page_domain_service
-            .guard_binding(&binding)
+        let flow = async {
+            let attached = service
+                .attach(
+                    page.id,
+                    AddStatusPageDomainRequest {
+                        hostname: "single-pool.example.org".to_string(),
+                        verification_method: VerificationMethod::Http01,
+                    },
+                    "ops@example.com",
+                )
+                .await
+                .expect("attach");
+            let verified = service
+                .verify(page.id, attached.id, "ops@example.com")
+                .await
+                .expect("verify");
+            assert_eq!(verified.status, StatusPageDomainStatus::Active);
+            let again = service
+                .verify(page.id, attached.id, "ops@example.com")
+                .await
+                .expect("verify an active domain");
+            assert_eq!(again.status, StatusPageDomainStatus::Active);
+            let renewed = service
+                .renew(page.id, attached.id, "ops@example.com")
+                .await
+                .expect("renew");
+            assert_eq!(renewed.status, StatusPageDomainStatus::Active);
+            service.remove(page.id, attached.id).await.expect("remove");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), flow)
             .await
-            .expect("guard");
-        let state = fx.state.clone();
-        let (page_id, binding_id) = (page.id, attached.id);
-        let removing = tokio::spawn(async move {
-            remove_status_page_domain(
-                admin(),
-                State(state),
-                metadata(),
-                Path((page_id, binding_id)),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|p| format!("{:?}", p.body))
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        assert!(
-            !removing.is_finished(),
-            "removal must wait for the certificate operation"
-        );
-        assert!(binding_order(&fx, attached.id).await.is_some());
-
-        crate::services::public_pages::domains::release_guard(guard, attached.id).await;
-        tokio::time::timeout(std::time::Duration::from_secs(10), removing)
-            .await
-            .expect("removal finishes once the operation ends")
-            .expect("task")
-            .expect("removed");
-        assert_eq!(binding_order(&fx, attached.id).await, None);
-        assert!(!domains_row_exists(&fx, "in-flight.example.org").await);
+            .expect("no operation waits on a second connection");
     }
 }

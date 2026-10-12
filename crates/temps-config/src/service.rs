@@ -1220,6 +1220,17 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         &self,
         host: &str,
     ) -> Result<Option<&'static str>, ConfigServiceError> {
+        Self::hostname_claimed_by_on(self.db.as_ref(), host).await
+    }
+
+    /// [`Self::hostname_claimed_by`] on a caller-supplied connection, so a
+    /// caller holding a transaction (and the hostname-claim lock in it) runs
+    /// the check on that same connection instead of taking a second one from
+    /// the pool while the first is held.
+    pub async fn hostname_claimed_by_on<C: ConnectionTrait>(
+        conn: &C,
+        host: &str,
+    ) -> Result<Option<&'static str>, ConfigServiceError> {
         use temps_entities::{
             custom_routes, environment_domains, project_custom_domains, status_page_domains,
         };
@@ -1237,7 +1248,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         if project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::Domain.is_in(candidates.clone()))
-            .one(self.db.as_ref())
+            .one(conn)
             .await?
             .is_some()
         {
@@ -1245,7 +1256,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
         if environment_domains::Entity::find()
             .filter(environment_domains::Column::Domain.is_in(candidates.clone()))
-            .one(self.db.as_ref())
+            .one(conn)
             .await?
             .is_some()
         {
@@ -1253,7 +1264,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
         if custom_routes::Entity::find()
             .filter(custom_routes::Column::Domain.is_in(candidates))
-            .one(self.db.as_ref())
+            .one(conn)
             .await?
             .is_some()
         {
@@ -1261,7 +1272,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
         // A hostname attached to a status page (#1412). Tombstones (removed
         // hostnames) do not count: any application may claim those.
-        if status_page_domains::attached_hostname_conflict(self.db.as_ref(), &host).await? {
+        if status_page_domains::attached_hostname_conflict(conn, &host).await? {
             return Ok(Some("a status page custom domain"));
         }
         Ok(None)
