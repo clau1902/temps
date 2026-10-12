@@ -68,27 +68,33 @@ pub const ANALYTICS_INGEST_KEY_QUERY_PARAM: &str = "temps_key";
 /// an encoded value is by definition not one of ours and correctly fails to
 /// resolve.
 pub fn extract_analytics_key(headers: &HeaderMap, raw_query: Option<&str>) -> Option<String> {
+    analytics_key(headers, raw_query).map(str::to_string)
+}
+
+/// Borrowing form of [`extract_analytics_key`], with identical precedence and
+/// rules: the returned slice points into `headers` or `raw_query`.
+///
+/// For callers on the per-request path that only inspect the key — the CORS
+/// layer, the body extractor's "is this keyed?" check — so they do not
+/// allocate a copy of it on every request.
+pub fn analytics_key<'a>(headers: &'a HeaderMap, raw_query: Option<&'a str>) -> Option<&'a str> {
     let from_header = headers
         .get(ANALYTICS_INGEST_KEY_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    if let Some(value) = from_header {
-        return Some(value.to_string());
-    }
-
-    raw_query.and_then(key_from_query)
+    from_header.or_else(|| raw_query.and_then(key_from_query))
 }
 
-fn key_from_query(raw_query: &str) -> Option<String> {
+fn key_from_query(raw_query: &str) -> Option<&str> {
     raw_query.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
         if name != ANALYTICS_INGEST_KEY_QUERY_PARAM {
             return None;
         }
         let value = value.trim();
-        (!value.is_empty()).then(|| value.to_string())
+        (!value.is_empty()).then_some(value)
     })
 }
 
@@ -264,20 +270,24 @@ pub enum BudgetedResolveError {
 }
 
 /// Resolve `key`, charging the global unresolved-key budget for exactly the
-/// lookups that cost a database query and found nothing.
+/// database queries that did not resolve a key: misses and failures alike.
 ///
 /// This is the one place a presented key may reach the database, for the
-/// handlers and the CORS layer alike. The budget is a backstop against a flood
-/// of distinct valid-shaped garbage keys, each of which would otherwise cost a
-/// query: `resolve()`'s cache only helps on an exact repeated string. Charging
-/// per *query* rather than per *request* keeps it honest in both directions:
+/// handlers and the CORS layer alike. The budget is a backstop against
+/// unbounded query load from keys the cache cannot answer — a flood of
+/// distinct valid-shaped garbage (`resolve()`'s cache only helps on an exact
+/// repeated string), or a failing database, whose errors are never cached and
+/// so would otherwise be retried by every request. Charging per *query*
+/// rather than per *request* keeps it honest in both directions:
 ///
-/// * Every query is charged, wherever it happens. A request rejected before
-///   its handler runs (a bad body, a wrong method) still paid for the lookup
-///   the CORS layer made, so it must still count.
+/// * Every unresolving query is charged, wherever it happens. A request
+///   rejected before its handler runs (a bad body, a wrong method, a
+///   preflight) still paid for the lookup the CORS layer made, so it must
+///   still count.
 /// * A cache hit costs nothing and is never charged or gated, so the same
 ///   request resolved twice (CORS layer, then handler) counts once, and a
-///   flood of garbage cannot lock out a valid key that is already cached.
+///   flood of garbage — or a database outage — cannot lock out a valid key
+///   that is already cached.
 pub async fn resolve_within_unresolved_budget(
     key_service: &AnalyticsIngestKeyService,
     rate_limiter: &AnalyticsIngestRateLimiter,
@@ -291,14 +301,22 @@ pub async fn resolve_within_unresolved_budget(
         return Err(BudgetedResolveError::BudgetExhausted);
     }
 
-    let scope = key_service
-        .resolve(key)
-        .await
-        .map_err(BudgetedResolveError::Lookup)?;
-    if scope.is_none() {
-        rate_limiter.record_unresolved_attempt().await;
+    match key_service.resolve(key).await {
+        Ok(Some(scope)) => Ok(Some(scope)),
+        Ok(None) => {
+            rate_limiter.record_unresolved_attempt().await;
+            Ok(None)
+        }
+        Err(e) => {
+            // A failed lookup is uncached, so without a charge every request
+            // carrying an uncached key — preflights included — would retry the
+            // failing database unbounded and slow its recovery. Charged, they
+            // are capped at the same per-minute budget; past it they are
+            // refused without a query until the window rolls.
+            rate_limiter.record_unresolved_attempt().await;
+            Err(BudgetedResolveError::Lookup(e))
+        }
     }
-    Ok(scope)
 }
 
 /// Run steps 2a–2d of the ADR-040 precedence for a presented key.
@@ -603,6 +621,66 @@ mod tests {
         assert_eq!(
             extract_analytics_key(&HeaderMap::new(), Some("temps_key")),
             None
+        );
+    }
+
+    #[test]
+    fn analytics_key_borrows_from_the_request() {
+        let headers = headers_with_key("  pa_from_header  ");
+        let key = analytics_key(&headers, Some("temps_key=pa_from_query")).unwrap();
+        assert_eq!(key, "pa_from_header");
+        let header_bytes = headers[ANALYTICS_INGEST_KEY_HEADER]
+            .as_bytes()
+            .as_ptr_range();
+        assert!(
+            header_bytes.contains(&key.as_ptr()),
+            "the key must be a slice of the header, not a copy"
+        );
+
+        let query = "a=1&temps_key=pa_q";
+        let no_headers = HeaderMap::new();
+        let key = analytics_key(&no_headers, Some(query)).unwrap();
+        assert_eq!(key, "pa_q");
+        assert!(query.as_bytes().as_ptr_range().contains(&key.as_ptr()));
+    }
+
+    /// A failing database answers nothing the cache can keep, so every
+    /// request carrying an uncached key would retry it. Each failure must
+    /// spend the unresolved-key budget, and once it is spent no further query
+    /// may be made.
+    #[tokio::test]
+    async fn failed_lookups_are_charged_and_capped() {
+        use crate::ingest_keys::UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE;
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+        use std::sync::Arc;
+
+        let limit = UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE as usize;
+        // Exactly `limit` scripted failures. A query beyond them would come
+        // back as a different `Lookup` error, not `BudgetExhausted`.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_errors(
+            (0..limit).map(|_| DbErr::Custom("database unavailable".to_string())),
+        );
+        let service = AnalyticsIngestKeyService::new(Arc::new(db.into_connection()));
+        let limiter = AnalyticsIngestRateLimiter::new();
+        let key = format!("pa_{}", "f".repeat(64));
+
+        for attempt in 0..limit {
+            assert!(
+                matches!(
+                    resolve_within_unresolved_budget(&service, &limiter, &key).await,
+                    Err(BudgetedResolveError::Lookup(_))
+                ),
+                "attempt {attempt} should have reached the database and failed"
+            );
+        }
+
+        assert!(limiter.unresolved_budget_exhausted().await);
+        assert!(
+            matches!(
+                resolve_within_unresolved_budget(&service, &limiter, &key).await,
+                Err(BudgetedResolveError::BudgetExhausted)
+            ),
+            "once the budget is spent, a failing database must not be queried again"
         );
     }
 

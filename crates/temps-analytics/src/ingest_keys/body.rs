@@ -41,7 +41,7 @@ use axum::Json;
 use serde::de::DeserializeOwned;
 use temps_core::error_builder::ErrorBuilder;
 
-use super::request::extract_analytics_key;
+use super::request::analytics_key;
 
 /// [`axum::Json`], plus `text/plain` on keyed ingest requests. See the module
 /// docs.
@@ -56,7 +56,7 @@ where
     type Rejection = Response;
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let keyed = extract_analytics_key(request.headers(), request.uri().query()).is_some();
+        let keyed = analytics_key(request.headers(), request.uri().query()).is_some();
 
         if keyed && is_text_plain(request.headers()) {
             let bytes = Bytes::from_request(request, state)

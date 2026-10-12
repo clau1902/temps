@@ -65,8 +65,8 @@ use tracing::{debug, warn};
 
 use super::rate_limiter::AnalyticsIngestRateLimiter;
 use super::request::{
-    extract_analytics_key, is_origin_allowed, origin_not_allowed_problem,
-    resolve_within_unresolved_budget, BudgetedResolveError, ANALYTICS_INGEST_KEY_HEADER,
+    analytics_key, is_origin_allowed, origin_not_allowed_problem, resolve_within_unresolved_budget,
+    BudgetedResolveError, ANALYTICS_INGEST_KEY_HEADER,
 };
 use super::service::AnalyticsIngestKeyService;
 
@@ -192,25 +192,28 @@ pub async fn keyed_ingest_cors(
     request: Request,
     next: Next,
 ) -> Response {
+    // Owned because the request moves into `next.run` below; cloning a
+    // `HeaderValue` shares its bytes (a reference-count bump, not a copy).
     let Some(origin) = request.headers().get(header::ORIGIN).cloned() else {
-        return next.run(request).await;
-    };
-    let Some(key) = extract_analytics_key(request.headers(), request.uri().query()) else {
         return next.run(request).await;
     };
     // A browser origin is ASCII by construction; anything else is not one we
     // could echo, so it keeps today's behaviour.
-    let Ok(origin_str) = origin.to_str().map(str::to_owned) else {
+    let Ok(origin_str) = origin.to_str() else {
+        return next.run(request).await;
+    };
+    // Borrowed: the key is only looked up, never kept, so it is not copied.
+    let Some(key) = analytics_key(request.headers(), request.uri().query()) else {
         return next.run(request).await;
     };
 
     let preflight = is_preflight(&request);
-    let decision = cors.decide(&key, &origin_str).await;
+    let decision = cors.decide(key, origin_str).await;
 
     match (decision, preflight) {
         (KeyedCorsDecision::Unchanged, _) => next.run(request).await,
         (KeyedCorsDecision::Credentialed, true) => credentialed_preflight(origin),
-        (KeyedCorsDecision::OriginDenied, true) => denied_preflight(&origin_str),
+        (KeyedCorsDecision::OriginDenied, true) => denied_preflight(origin_str),
         (KeyedCorsDecision::Credentialed, false) => {
             let mut response = next.run(request).await;
             grant_credentialed(&mut response, origin);
@@ -677,8 +680,11 @@ mod tests {
             let keys = handler_keys.clone();
             let limiter = handler_limiter.clone();
             async move {
-                let key = extract_analytics_key(request.headers(), request.uri().query())
-                    .unwrap_or_default();
+                let key = crate::ingest_keys::extract_analytics_key(
+                    request.headers(),
+                    request.uri().query(),
+                )
+                .unwrap_or_default();
                 type Body = crate::ingest_keys::IngestJson<serde_json::Value>;
                 if let Err(rejection) =
                     <Body as axum::extract::FromRequest<()>>::from_request(request, &()).await
@@ -779,6 +785,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(rate_limiter.unresolved_budget_exhausted().await);
+    }
+
+    #[tokio::test]
+    async fn a_preflight_during_a_database_failure_is_charged() {
+        // A preflight never reaches a handler, so a failed lookup made for it
+        // has to be charged here, or an outage would be retried unbounded.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("database unavailable".to_string())]);
+        let (app, rate_limiter) = app(db);
+        prime_unresolved_budget(&rate_limiter).await;
+
+        let response = app
+            .oneshot(preflight(ALLOWED, Some(&public_key())))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            header_str(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some("*"),
+            "a failed lookup keeps the unchanged wildcard policy"
+        );
         assert!(rate_limiter.unresolved_budget_exhausted().await);
     }
 

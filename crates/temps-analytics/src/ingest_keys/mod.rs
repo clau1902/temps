@@ -42,7 +42,7 @@ pub use rate_limiter::{
     AnalyticsIngestRateLimiter, DEFAULT_RATE_LIMIT_PER_MINUTE, UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE,
 };
 pub use request::{
-    extract_analytics_key, ingest_rate_limited_problem, invalid_ingest_key_problem,
+    analytics_key, extract_analytics_key, ingest_rate_limited_problem, invalid_ingest_key_problem,
     is_origin_allowed, origin_not_allowed_problem, resolve_client_identity,
     resolve_keyed_ingest_scope, stamp_retry_after_on_rate_limited, IngestBranch,
     ANALYTICS_INGEST_KEY_HEADER, ANALYTICS_INGEST_KEY_QUERY_PARAM, INGEST_RETRY_AFTER_SECONDS,

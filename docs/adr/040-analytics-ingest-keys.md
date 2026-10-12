@@ -436,9 +436,11 @@ Three changes, all in `temps-analytics::ingest_keys`:
   anything a non-credentialed caller could not.
 
 The CORS layer resolves the key through the same cached service as the handler.
-The unresolved-key budget is charged per database *query*
-(`resolve_within_unresolved_budget`), so a lookup made by the CORS layer for a
-request that never reaches its handler is still counted. A request resolved
+The unresolved-key budget is charged per database *query* that does not
+resolve a key, misses and failures alike (`resolve_within_unresolved_budget`).
+A lookup made by the CORS layer for a request that never reaches its handler is
+still counted. A failing database, whose errors are never cached, is retried at
+most at the budget's rate rather than once per request. A request resolved
 twice costs one unit, and a cache hit is never charged or gated.
 
 #### Relationship to the visitor-id fallback
