@@ -16,6 +16,7 @@ import {
   listStatusPageDomains,
   addStatusPageDomain,
   verifyStatusPageDomain,
+  renewStatusPageDomain,
   removeStatusPageDomain,
 } from '../../api/sdk.gen.js'
 import type {
@@ -163,8 +164,32 @@ export function domainStateLabel(domain: Pick<StatusPageDomainResponse, 'status'
       return 'verification failed'
     case 'unverified':
       return 'needs verification'
+    case 'renewal_pending':
+      return 'serving, renewal in progress'
+    case 'renewal_failed':
+      return 'serving, renewal failed'
     default:
       return 'waiting for DNS'
+  }
+}
+
+/** The next command to run for a domain, or null when nothing is needed. */
+export function domainNextStep(
+  domain: Pick<StatusPageDomainResponse, 'status' | 'verification_method'>,
+): string | null {
+  switch (domain.status) {
+    case 'active':
+      return domain.verification_method === 'dns-01'
+        ? 'DNS-verified certificates are not renewed automatically. Before expiry run: temps status-pages domains renew'
+        : null
+    case 'renewal_pending':
+      return domain.verification_method === 'dns-01'
+        ? 'Publish the new TXT record below (the current certificate keeps serving), then run: temps status-pages domains verify'
+        : 'Finish the renewal with: temps status-pages domains verify'
+    case 'renewal_failed':
+      return 'The current certificate keeps serving until it expires. Retry with: temps status-pages domains renew'
+    default:
+      return 'Create these DNS records, then run: temps status-pages domains verify'
   }
 }
 
@@ -180,9 +205,12 @@ function printDomain(domain: StatusPageDomainResponse): void {
   if (domain.last_error) {
     keyValue('Last error', domain.last_error)
   }
-  if (domain.status !== 'active') {
+  const next = domainNextStep(domain)
+  if (next) {
     newline()
-    info('Create these DNS records, then run: temps status-pages domains verify')
+    info(next)
+  }
+  if (domain.status !== 'active') {
     printTable(domain.dns_records, [
       { header: 'Type', key: 'record_type', width: 6 },
       { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
@@ -275,6 +303,32 @@ function registerDomainCommands(pages: Command): void {
         success(`${domain.hostname} is verified`)
       } else {
         warning(`${domain.hostname} is not verified yet`)
+      }
+      printDomain(domain)
+    })
+
+  domains
+    .command('renew')
+    .description('Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)')
+    .requiredOption('--id <id>', 'Status page ID')
+    .requiredOption('--domain-id <id>', 'Custom domain ID (see `domains list`)')
+    .option('--json', 'Output in JSON format')
+    .action(async (options: DomainOptions) => {
+      await requireAuth()
+      await setupClient()
+      const id = parseId(options.id, 'status page ID')
+      const domainId = parseId(options.domainId ?? '', 'domain ID')
+      if (id === null || domainId === null) return
+      const domain = await run('Renewing...', () =>
+        renewStatusPageDomain({ client, path: { status_page_id: id, domain_id: domainId } }))
+      if (options.json) {
+        json(domain)
+        return
+      }
+      if (domain.status === 'active') {
+        success(`Renewed the certificate of ${domain.hostname}`)
+      } else {
+        info(`Renewal of ${domain.hostname} started`)
       }
       printDomain(domain)
     })

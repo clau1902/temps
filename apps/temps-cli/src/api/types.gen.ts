@@ -24331,7 +24331,7 @@ export type StatusPageDomainResponse = {
 /**
  * Lifecycle of a custom hostname.
  */
-export type StatusPageDomainStatus = 'pending' | 'active' | 'failed' | 'unverified';
+export type StatusPageDomainStatus = 'pending' | 'active' | 'failed' | 'unverified' | 'renewal_pending' | 'renewal_failed';
 
 export type StatusPageListResponse = {
     items: Array<StatusPageResponse>;
@@ -67198,6 +67198,58 @@ export type RemoveStatusPageDomainResponses = {
 };
 
 export type RemoveStatusPageDomainResponse = RemoveStatusPageDomainResponses[keyof RemoveStatusPageDomainResponses];
+
+export type RenewStatusPageDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/domains/{domain_id}/renew';
+};
+
+export type RenewStatusPageDomainErrors = {
+    /**
+     * The new order could not be validated
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or domain not found
+     */
+    404: unknown;
+    /**
+     * The page is unpublished or the domain has no certificate yet
+     */
+    409: unknown;
+    /**
+     * Too many domain operations for this project
+     */
+    429: unknown;
+};
+
+export type RenewStatusPageDomainResponses = {
+    /**
+     * Renewal started (DNS-01) or completed (HTTP-01)
+     */
+    200: StatusPageDomainResponse;
+};
+
+export type RenewStatusPageDomainResponse = RenewStatusPageDomainResponses[keyof RenewStatusPageDomainResponses];
 
 export type VerifyStatusPageDomainData = {
     body?: never;

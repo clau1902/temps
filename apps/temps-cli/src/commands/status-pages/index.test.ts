@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { domainStateLabel, parseMonitorSpec, parseMonitorSpecs } from './index.js'
+import { domainNextStep, domainStateLabel, parseMonitorSpec, parseMonitorSpecs } from './index.js'
 
 describe('parseMonitorSpec', () => {
   test('parses <id>=<public name>', () => {
@@ -43,5 +43,21 @@ describe('domainStateLabel', () => {
     expect(domainStateLabel({ status: 'pending', serving: false })).toBe('waiting for DNS')
     expect(domainStateLabel({ status: 'unverified', serving: false })).toBe('needs verification')
     expect(domainStateLabel({ status: 'failed', serving: false })).toBe('verification failed')
+    expect(domainStateLabel({ status: 'renewal_pending', serving: true })).toContain('renewal in progress')
+    expect(domainStateLabel({ status: 'renewal_failed', serving: true })).toContain('renewal failed')
+  })
+})
+
+describe('domainNextStep', () => {
+  test('points DNS-01 certificates at renew, since they are not renewed automatically', () => {
+    expect(domainNextStep({ status: 'active', verification_method: 'dns-01' })).toContain('domains renew')
+    expect(domainNextStep({ status: 'active', verification_method: 'http-01' })).toBeNull()
+  })
+
+  test('a pending renewal is finished with verify and a failed one retried with renew', () => {
+    expect(domainNextStep({ status: 'renewal_pending', verification_method: 'dns-01' })).toContain('TXT')
+    expect(domainNextStep({ status: 'renewal_pending', verification_method: 'dns-01' })).toContain('domains verify')
+    expect(domainNextStep({ status: 'renewal_failed', verification_method: 'http-01' })).toContain('domains renew')
+    expect(domainNextStep({ status: 'pending', verification_method: 'http-01' })).toContain('domains verify')
   })
 })

@@ -124,6 +124,7 @@ Serve a status page on your own hostname
 - `list` (`ls`) - List a status page's custom domains and the DNS records they need
 - `add` - Attach a hostname; it serves only after ownership is verified
 - `verify` - Prove ownership and issue the certificate
+- `renew` - Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
 - `remove` (`rm`) - Detach a hostname; it answers 404 immediately and its certificate is deleted
 
 #### `status-pages domains list` (alias: `ls`)
@@ -153,6 +154,18 @@ Attach a hostname; it serves only after ownership is verified
 #### `status-pages domains verify`
 
 Prove ownership and issue the certificate
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Status page ID | - | Yes |
+| `--domain-id <id>` | Custom domain ID (see `domains list`) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `status-pages domains renew`
+
+Renew the certificate; the current one keeps serving meanwhile (DNS-01: prints the new TXT record)
 
 **Options:**
 

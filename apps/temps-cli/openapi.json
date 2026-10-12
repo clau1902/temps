@@ -52293,7 +52293,9 @@
           "pending",
           "active",
           "failed",
-          "unverified"
+          "unverified",
+          "renewal_pending",
+          "renewal_failed"
         ],
         "type": "string"
       },
@@ -124942,6 +124944,74 @@
           }
         ],
         "summary": "Remove a custom domain from a status page; it answers 404 immediately",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/status-pages/{status_page_id}/domains/{domain_id}/renew": {
+      "post": {
+        "description": "Starts a new ACME order while the current certificate keeps being served.\nHTTP-01 completes immediately. DNS-01 returns `renewal_pending` with the\nnew `_acme-challenge` TXT record: publish it, then call verify.",
+        "operationId": "renew_status_page_domain",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Custom domain ID",
+            "in": "path",
+            "name": "domain_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageDomainResponse"
+                }
+              }
+            },
+            "description": "Renewal started (DNS-01) or completed (HTTP-01)"
+          },
+          "400": {
+            "description": "The new order could not be validated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or domain not found"
+          },
+          "409": {
+            "description": "The page is unpublished or the domain has no certificate yet"
+          },
+          "429": {
+            "description": "Too many domain operations for this project"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Renew the certificate of a status page's custom domain",
         "tags": [
           "Status Page"
         ],
