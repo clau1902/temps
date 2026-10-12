@@ -145,7 +145,9 @@ import {
   updateProviderModel,
   updateProviderKey,
   testProviderKeyById,
+  type CreateProviderKeyRequest,
   type ProviderKeyResponse,
+  type UpdateProviderKeyRequest,
 } from '@/api/client'
 import {
   getAiProviderStatusOptions,
@@ -168,17 +170,16 @@ import {
   getAiProvider,
   isSelfHostedProvider,
 } from '@/lib/ai-providers'
-import {
-  SelfHostedProviderFields,
-  type SelfHostedDiscovery,
-} from '@/components/ai/SelfHostedProviderFields'
+import { SelfHostedProviderFields } from '@/components/ai/SelfHostedProviderFields'
 import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
 import {
-  DEFAULT_SELF_HOSTED_CAPABILITIES,
-  selfHostedDiscoverySignature,
-  selfHostedSubmitBlocker,
-  type SelfHostedCapabilitiesInput,
-} from '@/components/ai/self-hosted-provider'
+  EMPTY_PROVIDER_KEY_FORM,
+  providerKeyFormSchema,
+  providerKeyFormToRequest,
+  type ProviderKeyFormValues,
+} from '@/components/ai/provider-key-form'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import {
   compareAiModelIdsByRelevance,
@@ -3913,20 +3914,27 @@ export function AiGatewayPage() {
   >('bash')
   const [snippetProvider, setSnippetProvider] = useState<string>('')
 
-  // Form state
-  const [newProvider, setNewProvider] = useState('')
-  const [newDisplayName, setNewDisplayName] = useState('')
-  const [newApiKey, setNewApiKey] = useState('')
-  const [newBaseUrl, setNewBaseUrl] = useState('')
-  // Self-hosted (OpenAI-compatible) only
-  const [newDefaultModel, setNewDefaultModel] = useState('')
-  const [newTrustPrivateAddress, setNewTrustPrivateAddress] = useState(false)
-  const [newCapabilities, setNewCapabilities] =
-    useState<SelfHostedCapabilitiesInput>(DEFAULT_SELF_HOSTED_CAPABILITIES)
-  const [selfHostedDiscovery, setSelfHostedDiscovery] =
-    useState<SelfHostedDiscovery | null>(null)
+  // Add-provider-key form (React Hook Form + Zod; see provider-key-form.ts)
+  const providerKeyForm = useForm<ProviderKeyFormValues>({
+    resolver: zodResolver(providerKeyFormSchema),
+    defaultValues: EMPTY_PROVIDER_KEY_FORM,
+  })
+  const formValues = useWatch({
+    control: providerKeyForm.control,
+    defaultValue: EMPTY_PROVIDER_KEY_FORM,
+  }) as ProviderKeyFormValues
+  const formErrors = providerKeyForm.formState.errors
+  const newProvider = formValues.provider
   const canTrustPrivateAddress = useIsInstanceAdmin()
   const newProviderIsSelfHosted = isSelfHostedProvider(newProvider)
+  const setFormValue = <K extends keyof ProviderKeyFormValues>(
+    field: K,
+    value: ProviderKeyFormValues[K]
+  ) =>
+    providerKeyForm.setValue(field as never, value as never, {
+      shouldDirty: true,
+      shouldValidate: providerKeyForm.formState.isSubmitted,
+    })
 
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
@@ -3982,15 +3990,8 @@ export function AiGatewayPage() {
 
   // Create mutation
   const createMutation = useMutation({
-    mutationFn: (data: {
-      provider: string
-      display_name: string
-      api_key: string
-      base_url?: string
-      default_model?: string
-      trust_private_address?: boolean
-      capabilities?: SelfHostedCapabilitiesInput
-    }) => createProviderKey({ body: data, throwOnError: true }),
+    mutationFn: (body: CreateProviderKeyRequest) =>
+      createProviderKey({ body, throwOnError: true }),
     meta: { errorTitle: 'Failed to create provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4059,69 +4060,33 @@ export function AiGatewayPage() {
   // backend now verifies on create (see handlers/providers.rs) — a failed
   // test surfaces as a 400 on the create call itself.
 
-  const resetForm = () => {
-    setNewProvider('')
-    setNewDisplayName('')
-    setNewApiKey('')
-    setNewBaseUrl('')
-    setNewDefaultModel('')
-    setNewTrustPrivateAddress(false)
-    setNewCapabilities(DEFAULT_SELF_HOSTED_CAPABILITIES)
-    setSelfHostedDiscovery(null)
-  }
+  const resetForm = () => providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
 
-  const currentSelfHostedModels =
-    selfHostedDiscovery &&
-    selfHostedDiscovery.signature ===
-      selfHostedDiscoverySignature({
-        baseUrl: newBaseUrl,
-        apiKey: newApiKey,
-        trustPrivateAddress: newTrustPrivateAddress,
-      })
-      ? selfHostedDiscovery.models
-      : null
-  const selfHostedBlocker = newProviderIsSelfHosted
-    ? selfHostedSubmitBlocker({
-        baseUrl: newBaseUrl,
-        discoveredModels: currentSelfHostedModels,
-        defaultModel: newDefaultModel,
-      })
-    : null
-
-  const handleCreate = () => {
+  const handleCreate = providerKeyForm.handleSubmit((values) => {
     if (createMutation.isPending) return
-    if (!newProvider) {
-      toast.error('Please select a provider')
-      return
-    }
-    // Self-hosted servers often run without authentication.
-    if (!newProviderIsSelfHosted && !newApiKey.trim()) {
-      toast.error('Please enter an API key')
-      return
-    }
-    if (!newDisplayName.trim()) {
-      toast.error('Please enter a display name')
-      return
-    }
-    if (selfHostedBlocker) {
-      toast.error(selfHostedBlocker)
-      return
-    }
+    createMutation.mutate(providerKeyFormToRequest(values))
+  })
 
-    createMutation.mutate({
-      provider: newProvider,
-      display_name: newDisplayName,
-      api_key: newApiKey,
-      base_url: newBaseUrl.trim() || undefined,
-      ...(newProviderIsSelfHosted
-        ? {
-            default_model: newDefaultModel,
-            trust_private_address: newTrustPrivateAddress,
-            capabilities: newCapabilities,
-          }
-        : {}),
-    })
-  }
+  // Per-key settings (private-address trust, declared capabilities). Owned
+  // here rather than by the collapsible key rows, so collapsing a provider
+  // never drops an in-flight update.
+  const updateKeySettingsMutation = useMutation({
+    mutationFn: ({
+      id,
+      body,
+    }: {
+      id: number
+      body: UpdateProviderKeyRequest
+    }) => updateProviderKey({ path: { id }, body, throwOnError: true }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
+      toast.success('Provider key updated')
+    },
+    onError: (error) =>
+      toast.error('Could not update the provider key', {
+        description: problemDetail(error, 'Please try again.'),
+      }),
+  })
 
   const handleDelete = (key: ProviderKeyResponse) => {
     setSelectedKey(key)
@@ -4477,12 +4442,13 @@ console.log(response.choices[0].message.content);`,
                             }
                             size="sm"
                             onClick={() => {
-                              setNewProvider(provider.id)
-                              setNewDisplayName(
-                                hasAnyKey
+                              providerKeyForm.reset({
+                                ...EMPTY_PROVIDER_KEY_FORM,
+                                provider: provider.id,
+                                display_name: hasAnyKey
                                   ? `${provider.name} (key ${providerKeys.length + 1})`
-                                  : provider.name
-                              )
+                                  : provider.name,
+                              })
                               setDialogOpen(true)
                             }}
                           >
@@ -4573,6 +4539,17 @@ console.log(response.choices[0].message.content);`,
                                   canTrustPrivateAddress={
                                     canTrustPrivateAddress
                                   }
+                                  pending={
+                                    updateKeySettingsMutation.isPending &&
+                                    updateKeySettingsMutation.variables?.id ===
+                                      key.id
+                                  }
+                                  onUpdate={(body) =>
+                                    updateKeySettingsMutation.mutate({
+                                      id: key.id,
+                                      body,
+                                    })
+                                  }
                                 />
                                 <ProviderKeyModelDetail providerKey={key} />
                               </TableCell>
@@ -4653,10 +4630,15 @@ console.log(response.choices[0].message.content);`,
                 <Input
                   id="displayName"
                   placeholder="Production API Key"
-                  value={newDisplayName}
                   disabled={createMutation.isPending}
-                  onChange={(e) => setNewDisplayName(e.target.value)}
+                  aria-invalid={!!formErrors.display_name}
+                  {...providerKeyForm.register('display_name')}
                 />
+                {formErrors.display_name && (
+                  <p className="text-xs text-destructive">
+                    {formErrors.display_name.message}
+                  </p>
+                )}
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="apiKey">
@@ -4678,14 +4660,20 @@ console.log(response.choices[0].message.content);`,
                       ? 'Leave empty if your server has no authentication'
                       : 'sk-...'
                   }
-                  value={newApiKey}
                   disabled={createMutation.isPending}
-                  onChange={(e) => setNewApiKey(e.target.value)}
+                  aria-invalid={!!formErrors.api_key}
+                  {...providerKeyForm.register('api_key')}
                 />
-                <p className="text-xs text-muted-foreground">
-                  Your key is encrypted at rest and never exposed in the
-                  dashboard.
-                </p>
+                {formErrors.api_key ? (
+                  <p className="text-xs text-destructive">
+                    {formErrors.api_key.message}
+                  </p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Your key is encrypted at rest and never exposed in the
+                    dashboard.
+                  </p>
+                )}
               </div>
               <div className="grid gap-2">
                 <Label htmlFor="baseUrl">
@@ -4701,10 +4689,15 @@ console.log(response.choices[0].message.content);`,
                       ? 'http://10.0.0.5:8000/v1'
                       : 'https://api.openai.com/v1'
                   }
-                  value={newBaseUrl}
                   disabled={createMutation.isPending}
-                  onChange={(e) => setNewBaseUrl(e.target.value)}
+                  aria-invalid={!!formErrors.base_url}
+                  {...providerKeyForm.register('base_url')}
                 />
+                {formErrors.base_url && (
+                  <p className="text-xs text-destructive">
+                    {formErrors.base_url.message}
+                  </p>
+                )}
                 <p className="text-xs text-muted-foreground">
                   {newProviderIsSelfHosted
                     ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
@@ -4713,17 +4706,26 @@ console.log(response.choices[0].message.content);`,
               </div>
               <SelfHostedProviderFields
                 open={newProviderIsSelfHosted}
-                baseUrl={newBaseUrl}
-                apiKey={newApiKey}
-                trustPrivateAddress={newTrustPrivateAddress}
-                onTrustPrivateAddressChange={setNewTrustPrivateAddress}
+                baseUrl={formValues.base_url}
+                apiKey={formValues.api_key}
+                trustPrivateAddress={formValues.trust_private_address}
+                onTrustPrivateAddressChange={(trusted) =>
+                  setFormValue('trust_private_address', trusted)
+                }
                 canTrustPrivateAddress={canTrustPrivateAddress}
-                discovery={selfHostedDiscovery}
-                onDiscovered={setSelfHostedDiscovery}
-                defaultModel={newDefaultModel}
-                onDefaultModelChange={setNewDefaultModel}
-                capabilities={newCapabilities}
-                onCapabilitiesChange={setNewCapabilities}
+                discovery={formValues.discovery}
+                onDiscovered={(discovery) =>
+                  setFormValue('discovery', discovery)
+                }
+                defaultModel={formValues.default_model}
+                onDefaultModelChange={(model) =>
+                  setFormValue('default_model', model)
+                }
+                capabilities={formValues.capabilities}
+                onCapabilitiesChange={(capabilities) =>
+                  setFormValue('capabilities', capabilities)
+                }
+                error={formErrors.default_model?.message}
                 disabled={createMutation.isPending}
               />
             </div>
@@ -4743,8 +4745,7 @@ console.log(response.choices[0].message.content);`,
             <DialogFooter>
               <Button
                 onClick={handleCreate}
-                disabled={createMutation.isPending || !!selfHostedBlocker}
-                title={selfHostedBlocker ?? undefined}
+                disabled={createMutation.isPending}
                 className="w-full sm:w-auto"
               >
                 {createMutation.isPending ? (

@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Loader2, ShieldCheck } from 'lucide-react'
-import { toast } from 'sonner'
 import {
-  updateProviderKey,
   type ProviderKeyResponse,
   type UpdateProviderKeyRequest,
 } from '@/api/client'
@@ -13,7 +10,6 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
-import { problemDetail } from '@/lib/api-problem'
 import { isSelfHostedProvider } from '@/lib/ai-providers'
 import {
   SELF_HOSTED_CAPABILITY_LABELS,
@@ -26,40 +22,29 @@ interface SelfHostedKeySettingsProps {
   providerKey: ProviderKeyResponse
   /** Whether the viewer may trust a private address (settings:write). */
   canTrustPrivateAddress: boolean
+  /** Apply a change to this key. The caller owns the request state. */
+  onUpdate: (body: UpdateProviderKeyRequest) => void
+  /** Whether an update to this key is in flight. */
+  pending: boolean
 }
 
 /**
  * Per-key settings shown in a provider key's detail row: where it connects,
  * the private address it trusts for itself (#1411) and, for a self-hosted
  * server, the capabilities it declares. Renders nothing for a vendor key
- * that has no per-key trust.
+ * that has no per-key trust. Presentational: the page owns the update
+ * request, so collapsing a key row never discards it.
  */
 export function SelfHostedKeySettings({
   providerKey,
   canTrustPrivateAddress,
+  onUpdate,
+  pending,
 }: SelfHostedKeySettingsProps) {
-  const queryClient = useQueryClient()
   const selfHosted = isSelfHostedProvider(providerKey.provider)
   const trusted = providerKey.trusted_private_address ?? null
   const capabilities: SelfHostedCapabilitiesInput =
     normalizeSelfHostedCapabilities(providerKey.capabilities)
-
-  const updateMutation = useMutation({
-    mutationFn: (body: UpdateProviderKeyRequest) =>
-      updateProviderKey({
-        path: { id: providerKey.id },
-        body,
-        throwOnError: true,
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
-      toast.success('Provider key updated')
-    },
-    onError: (error) =>
-      toast.error('Could not update the provider key', {
-        description: problemDetail(error, 'Please try again.'),
-      }),
-  })
 
   if (!selfHosted && !trusted) return null
 
@@ -99,10 +84,8 @@ export function SelfHostedKeySettings({
               variant="ghost"
               size="sm"
               className="h-7"
-              disabled={updateMutation.isPending}
-              onClick={() =>
-                updateMutation.mutate({ trust_private_address: false })
-              }
+              disabled={pending}
+              onClick={() => onUpdate({ trust_private_address: false })}
             >
               Remove trust
             </Button>
@@ -117,17 +100,15 @@ export function SelfHostedKeySettings({
                 variant="outline"
                 size="sm"
                 className="h-7"
-                disabled={updateMutation.isPending}
-                onClick={() =>
-                  updateMutation.mutate({ trust_private_address: true })
-                }
+                disabled={pending}
+                onClick={() => onUpdate({ trust_private_address: true })}
               >
                 Trust this address for this key
               </Button>
             )}
           </>
         )}
-        {updateMutation.isPending && (
+        {pending && (
           <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
         )}
       </div>
@@ -145,9 +126,9 @@ export function SelfHostedKeySettings({
                 <Checkbox
                   id={`key-${providerKey.id}-${capability}`}
                   checked={capabilities[capability]}
-                  disabled={updateMutation.isPending}
+                  disabled={pending}
                   onCheckedChange={(checked) =>
-                    updateMutation.mutate({
+                    onUpdate({
                       capabilities: {
                         ...capabilities,
                         [capability]: checked === true,

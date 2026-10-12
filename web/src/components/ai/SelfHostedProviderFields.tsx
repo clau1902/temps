@@ -44,6 +44,8 @@ interface SelfHostedProviderFieldsProps {
   onDefaultModelChange: (model: string) => void
   capabilities: SelfHostedCapabilitiesInput
   onCapabilitiesChange: (capabilities: SelfHostedCapabilitiesInput) => void
+  /** Form validation message for the default model, if any. */
+  error?: string
   disabled?: boolean
 }
 
@@ -67,6 +69,7 @@ export function SelfHostedProviderFields({
   onDefaultModelChange,
   capabilities,
   onCapabilitiesChange,
+  error,
   disabled = false,
 }: SelfHostedProviderFieldsProps) {
   const signature = selfHostedDiscoverySignature({
@@ -216,6 +219,9 @@ export function SelfHostedProviderFields({
             Temps asks your server for <code>/models</code> and lists every
             model it serves, with no name filter.
           </p>
+        )}
+        {error && !discoveryError && (
+          <p className="text-xs text-destructive">{error}</p>
         )}
       </div>
 
