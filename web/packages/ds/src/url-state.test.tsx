@@ -12,9 +12,9 @@ import {
   render,
   waitFor,
 } from '@testing-library/react'
-import { useBrowserWindow } from '../../../src/test/dom'
+import { installBrowserWindow } from '../../../src/test/dom'
 
-useBrowserWindow()
+installBrowserWindow()
 afterEach(cleanup)
 
 function SearchBox() {
