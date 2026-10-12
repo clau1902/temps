@@ -22,6 +22,7 @@ use temps_ai::{
     RefreshPolicy, TokenStream, ToolCall,
 };
 
+use crate::self_hosted::{is_self_hosted, SelfHostedCapabilities};
 use crate::services::{gateway_provider_capabilities, ByokOverride, GatewayService};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, MessageContent,
@@ -59,6 +60,39 @@ impl GatewayAiService {
             system_key_id: Some(key_id),
             ..Default::default()
         })
+    }
+
+    /// The self-hosted key, and its declared capabilities, that would serve
+    /// chat on `provider` (a pinned `gateway_key:N`, or the key the catalog
+    /// routes the default model to). `None` when a vendor key (or nothing)
+    /// would serve it: vendor capabilities are defined by their adapters.
+    async fn serving_self_hosted_key(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<(
+        temps_entities::ai_provider_keys::Model,
+        SelfHostedCapabilities,
+    )> {
+        let route = Self::route_override(provider, "chat.capabilities").ok()?;
+        // A pinned key always serves its conversation; otherwise the catalog
+        // decides which key serves the conversation's model (or the default).
+        let key = match route.system_key_id {
+            Some(key_id) => temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
+                .one(self.db.as_ref())
+                .await
+                .ok()
+                .flatten()?,
+            None => {
+                let model = self.resolve_model(None, model).await?;
+                self.gateway.select_system_key(&model, None).await.ok()?
+            }
+        };
+        if !is_self_hosted(&key.provider) {
+            return None;
+        }
+        let declared = SelfHostedCapabilities::from_stored(key.capabilities.as_ref());
+        Some((key, declared))
     }
 
     /// Resolve the model to use: an explicit per-call `model`, else the first
@@ -429,7 +463,66 @@ impl AiService for GatewayAiService {
     }
 
     async fn chat_capable_for(&self, provider: Option<&str>) -> bool {
-        self.is_available_for(provider).await
+        if !self.is_available_for(provider).await {
+            return false;
+        }
+        // AI chat streams every turn. A self-hosted key that did not declare
+        // streaming would refuse it, so it is not chat-capable;
+        // `chat_unavailable_reason` explains why.
+        self.serving_self_hosted_key(provider, None)
+            .await
+            .is_none_or(|(_, declared)| declared.streaming)
+    }
+
+    async fn chat_unavailable_reason(&self, provider: Option<&str>) -> Option<String> {
+        let (key, declared) = self.serving_self_hosted_key(provider, None).await?;
+        (!declared.streaming).then(|| {
+            format!(
+                "AI provider key {} ('{}') is a self-hosted server that does not declare \
+                 streaming, which AI chat needs. Enable \"Streaming\" for that key under AI \
+                 Gateway > AI providers if the server supports it, or choose another provider \
+                 for this chat.",
+                key.id, key.display_name
+            )
+        })
+    }
+
+    async fn tool_calling_for(&self, provider: Option<&str>, model: Option<&str>) -> bool {
+        self.serving_self_hosted_key(provider, model)
+            .await
+            .is_none_or(|(_, declared)| declared.tools)
+    }
+
+    async fn default_chat_provider(&self) -> Option<String> {
+        use sea_orm::sea_query::extension::postgres::PgExpr;
+        use sea_orm::sea_query::{Condition, Expr};
+        use temps_entities::ai_provider_keys;
+        // One bounded query: the lowest-id active key that can stream. Only a
+        // self-hosted key can lack streaming, and only by declaring
+        // `"streaming": false` (a missing or unreadable declaration means the
+        // default, which streams -- see `SelfHostedCapabilities::from_stored`).
+        let streaming =
+            || Expr::col(ai_provider_keys::Column::Capabilities).cast_json_field("streaming");
+        let can_stream = Condition::any()
+            .add(ai_provider_keys::Column::Provider.ne(crate::self_hosted::OPENAI_COMPATIBLE))
+            .add(Expr::expr(streaming()).is_null())
+            .add(Expr::expr(streaming()).ne("false"));
+        let key = ai_provider_keys::Entity::find()
+            .filter(ai_provider_keys::Column::IsActive.eq(true))
+            .filter(can_stream)
+            .order_by_asc(ai_provider_keys::Column::Id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    "Could not pick a chat-capable default AI provider key; chat falls back to \
+                     the first active key"
+                );
+            })
+            .ok()
+            .flatten()?;
+        Some(format!("gateway_key:{}", key.id))
     }
 
     async fn capabilities_for(
@@ -493,13 +586,22 @@ impl AiService for GatewayAiService {
                 .filter(|id| !id.starts_with("text-embedding-"))
                 .collect();
         }
-        Ok(gateway_provider_capabilities(
+        let declared = is_self_hosted(&key.provider)
+            .then(|| SelfHostedCapabilities::from_stored(key.capabilities.as_ref()));
+        let mut capabilities = gateway_provider_capabilities(
             format!("gateway_key:{}", key.id),
             key.display_name,
             &key.provider,
             key.default_model,
             model_ids,
-        ))
+        );
+        // A self-hosted key reports what its administrator declared, not
+        // what a vendor would support.
+        if let Some(declared) = declared {
+            capabilities.realtime.text_streaming = declared.streaming;
+            capabilities.realtime.tool_events = declared.tools;
+        }
+        Ok(capabilities)
     }
 
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {

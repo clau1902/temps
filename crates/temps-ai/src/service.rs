@@ -249,6 +249,28 @@ pub trait AiService: Send + Sync {
         self.chat_capable().await
     }
 
+    /// Why `provider` is not chat-capable, when the adapter can say more
+    /// than "not configured" -- e.g. a self-hosted key that does not declare
+    /// streaming. `None` lets the caller use its generic setup message.
+    async fn chat_unavailable_reason(&self, _provider: Option<&str>) -> Option<String> {
+        None
+    }
+
+    /// Whether chat turns on `provider` for `model` (the conversation's
+    /// saved model; `None` = the configured default) may carry function/tool
+    /// schemas. Adapters that cannot call tools return `false`, so callers
+    /// leave the tools out (and say so) rather than having the turn refused.
+    async fn tool_calling_for(&self, _provider: Option<&str>, _model: Option<&str>) -> bool {
+        true
+    }
+
+    /// The provider a new chat should default to when none is chosen, if the
+    /// adapter can pick one that can actually serve chat. `None` lets the
+    /// caller fall back to its own default.
+    async fn default_chat_provider(&self) -> Option<String> {
+        None
+    }
+
     /// Return the normalized controls and realtime features for one provider.
     /// UI and conversation validation consume this contract, so adding an
     /// adapter never requires provider-id branches in either layer.

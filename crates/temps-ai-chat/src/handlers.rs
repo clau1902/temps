@@ -1485,12 +1485,20 @@ fn require_application_harness(provider: Option<&str>) -> Result<String, Problem
 /// Gate for create/send: the selected AI provider must be ready to run a turn.
 async fn ensure_enabled(state: &AppState, provider: Option<&str>) -> Result<(), Problem> {
     if !state.service.ai_available_for(provider).await {
+        // Prefer the adapter's precise reason (e.g. a self-hosted key that
+        // does not declare streaming) over the generic setup advice.
+        let detail = state
+            .service
+            .ai_unavailable_reason(provider)
+            .await
+            .unwrap_or_else(|| {
+                "The selected AI provider is not ready for chat. Configure a gateway key or \
+                 authenticate the selected host harness, then try again."
+                    .to_string()
+            });
         return Err(problemdetails::new(axum::http::StatusCode::CONFLICT)
             .with_title("AI Not Configured")
-            .with_detail(
-                "The selected AI provider is not ready for chat. Configure a gateway key or \
-                 authenticate the selected host harness, then try again.",
-            ));
+            .with_detail(detail));
     }
     Ok(())
 }
