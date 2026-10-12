@@ -42,6 +42,10 @@ fn verify_worker_image_platform(
     )))
 }
 
+/// Prefix of the placeholder `image_id` an external-image deploy carries: it
+/// names no real image, so it is never an identity to verify against.
+const EXTERNAL_IMAGE_ID_PREFIX: &str = "external-";
+
 /// Typed output from BuildImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildImageOutput {
@@ -139,14 +143,24 @@ impl BuildImageOutput {
         })
     }
 
-    /// The image id recorded at build time for `tag`, when a
-    /// mixed-architecture worker build recorded one.
+    /// The image id recorded at build time for a worker-built `tag`: each
+    /// architecture's id for a mixed-architecture build, and the build's own
+    /// `image_id` for the primary tag of any worker build (single-architecture
+    /// ones record no per-platform ids). `None` for a control-plane build or
+    /// an external image, whose identity is checked elsewhere.
     pub fn expected_image_id_for_tag(&self, tag: &str) -> Option<&str> {
         self.image_tags_by_platform
             .iter()
             .find(|(_, built)| built.as_str() == tag)
             .and_then(|(platform, _)| self.image_ids_by_platform.get(platform))
             .map(String::as_str)
+            .or_else(|| {
+                (self.builder_node_id.is_some()
+                    && tag == self.image_tag
+                    && !self.image_id.trim().is_empty()
+                    && !self.image_id.starts_with(EXTERNAL_IMAGE_ID_PREFIX))
+                .then_some(self.image_id.as_str())
+            })
     }
 
     /// The worker holding `tag`: the one that built that tag's platform on a
@@ -2973,14 +2987,8 @@ impl DeployImageJob {
                     // copy failed, retry it before starting the replica.
                     if let Some(builder_id) = image_output.builder_node_for_tag(&replica_image_tag)
                     {
-                        // A mixed-architecture build records every tag's id;
-                        // otherwise the recorded id belongs to the primary tag only.
-                        let expected_image_id = image_output
-                            .expected_image_id_for_tag(&replica_image_tag)
-                            .or_else(|| {
-                                (replica_image_tag == image_output.image_tag)
-                                    .then_some(image_output.image_id.as_str())
-                            });
+                        let expected_image_id =
+                            image_output.expected_image_id_for_tag(&replica_image_tag);
                         self.ensure_node_built_image_local(
                             &replica_image_tag,
                             expected_image_id,
@@ -4013,7 +4021,10 @@ impl WorkflowTask for DeployImageJob {
                 .await?;
             let synthetic = BuildImageOutput {
                 image_tag: external_tag.clone(),
-                image_id: format!("external-{}", external_tag.replace(":", "-")),
+                image_id: format!(
+                    "{EXTERNAL_IMAGE_ID_PREFIX}{}",
+                    external_tag.replace(":", "-")
+                ),
                 size_bytes: 0, // Not applicable for external images
                 build_context: std::path::PathBuf::from("."),
                 dockerfile_path: std::path::PathBuf::from("."),
@@ -4937,6 +4948,55 @@ mod tests {
             "created": null, "working_dir": null
         })
         .to_string()
+    }
+
+    /// A single-architecture worker build records no per-platform ids, so its
+    /// primary tag is bound to the build's own `image_id` -- on a rollback
+    /// too. A control-plane build and an external image name no id to verify.
+    #[test]
+    fn a_single_worker_build_binds_its_primary_tag_to_the_built_image_id() {
+        let mut worker = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
+        worker.builder_node_id = Some(7);
+        assert_eq!(
+            worker.expected_image_id_for_tag("myapp:latest"),
+            Some("sha256:abc")
+        );
+        assert_eq!(worker.expected_image_id_for_tag("myapp:other"), None);
+
+        let control_plane = build_output_with_tags(&[]);
+        assert_eq!(
+            control_plane.expected_image_id_for_tag("myapp:latest"),
+            None
+        );
+
+        let mut external = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
+        external.builder_node_id = Some(7);
+        external.image_id = format!("{EXTERNAL_IMAGE_ID_PREFIX}myapp-latest");
+        assert_eq!(external.expected_image_id_for_tag("myapp:latest"), None);
+
+        // A rollback of a single worker build keeps that binding.
+        let reused = ReusedWorkerBuild::from_build_outputs(
+            &serde_json::json!({
+                "image_tag": "myapp:latest",
+                "image_id": "sha256:built",
+                "builder_node_id": 7,
+                "image_tags_by_platform": { "linux/arm64": "myapp:latest" }
+            }),
+            "myapp:latest",
+        )
+        .unwrap();
+        let rolled_back = BuildImageOutput {
+            image_id: reused.image_id.clone().unwrap(),
+            image_tags_by_platform: reused.image_tags_by_platform.clone(),
+            builder_node_id: reused.builder_node_id,
+            builder_node_ids_by_platform: reused.builder_node_ids_by_platform.clone(),
+            image_ids_by_platform: reused.image_ids_by_platform.clone(),
+            ..build_output_with_tags(&[])
+        };
+        assert_eq!(
+            rolled_back.expected_image_id_for_tag("myapp:latest"),
+            Some("sha256:built")
+        );
     }
 
     /// A target that already holds exactly the image recorded at build time

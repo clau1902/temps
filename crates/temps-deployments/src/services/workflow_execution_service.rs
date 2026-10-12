@@ -3198,17 +3198,20 @@ impl WorkflowExecutionService {
                 reason,
             };
 
-            let dedicated = scheduler
-                .select_builder_node(platform)
+            // Every dedicated builder of this architecture, lowest id first,
+            // before any application worker: placement below never offers a
+            // build-only node, so one that is skipped here is never tried.
+            let mut dedicated: std::collections::VecDeque<_> = scheduler
+                .select_builder_nodes(platform)
                 .await
                 .map_err(|error| {
                     WorkflowExecutionError::JobCreationFailed(format!(
                         "Deployment {deployment_id} cannot list {platform} build nodes: {error}"
                     ))
-                })?;
-            let mut candidate = dedicated;
+                })?
+                .into();
             let builder = loop {
-                let node = match candidate.take() {
+                let node = match dedicated.pop_front() {
                     Some(node) => node,
                     None => {
                         let outcome = scheduler
@@ -6874,6 +6877,16 @@ mod tests {
         address: &str,
         architecture: &str,
     ) -> Result<temps_entities::nodes::Model, Box<dyn std::error::Error>> {
+        insert_node(db, name, address, architecture, serde_json::json!({})).await
+    }
+
+    async fn insert_node(
+        db: &DbConnection,
+        name: &str,
+        address: &str,
+        architecture: &str,
+        labels: serde_json::Value,
+    ) -> Result<temps_entities::nodes::Model, Box<dyn std::error::Error>> {
         let encryption = temps_core::EncryptionService::new(TEST_MASTER_KEY)?;
         Ok(temps_entities::nodes::ActiveModel {
             name: Set(name.to_string()),
@@ -6883,7 +6896,7 @@ mod tests {
             private_address: Set("127.0.0.1".to_string()),
             role: Set("worker".to_string()),
             status: Set("active".to_string()),
-            labels: Set(serde_json::json!({})),
+            labels: Set(labels),
             capacity: Set(serde_json::json!({})),
             architecture: Set(Some(architecture.to_string())),
             last_heartbeat: Set(Some(Utc::now())),
@@ -7073,6 +7086,54 @@ mod tests {
                 other => panic!("expected NoBuilderForArchitecture, got {other}"),
             }
         }
+        Ok(())
+    }
+
+    /// Every dedicated builder of an architecture is tried before any
+    /// application worker: with the first amd64 builder and the amd64
+    /// application worker both down, the second amd64 builder still builds.
+    #[tokio::test]
+    async fn a_spare_dedicated_builder_replaces_an_unreachable_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let builder = serde_json::json!({ "temps.sh/role": "builder" });
+        insert_worker(
+            &db,
+            "w-arm",
+            &spawn_health_agent("linux/arm64").await,
+            "linux/arm64",
+        )
+        .await?;
+        insert_worker(&db, "w-amd", &unreachable_agent().await, "linux/amd64").await?;
+        let first = insert_node(
+            &db,
+            "b-amd-1",
+            &unreachable_agent().await,
+            "linux/amd64",
+            builder.clone(),
+        )
+        .await?;
+        let spare = insert_node(
+            &db,
+            "b-amd-2",
+            &spawn_health_agent("linux/amd64").await,
+            "linux/amd64",
+            builder,
+        )
+        .await?;
+        assert!(first.id < spare.id);
+        let service = control_plane_service(db).await?;
+
+        let selected = service
+            .select_node_builder(1, "app", None, None, false)
+            .await?;
+
+        let amd = selected
+            .iter()
+            .find(|selected| selected.platform == "linux/amd64")
+            .expect("an amd64 builder");
+        assert_eq!(amd.node_id, spare.id);
         Ok(())
     }
 

@@ -790,8 +790,11 @@ builds once, exactly as before.
   namespace, so native artifacts (`node_modules`, `target/`) built for one
   architecture are never reused by another.
 - **No worker for an architecture.** Before anything is built, each chosen
-  worker is checked over its agent connection. An unreachable worker is
-  replaced by another of the same architecture; if none is left, the
+  worker is checked over its agent connection (10-second limit). Candidates
+  are tried in order: every `temps.sh/role=builder` node of that
+  architecture, lowest id first, then the workers the deployment could run
+  on. An unreachable worker, or one whose agent reports another
+  architecture, is replaced by the next candidate; if none is left, the
   deployment fails naming the architecture, for example
   `Deployment 42 targets linux/amd64 nodes, but no linux/amd64 worker can
   build its image`. Bring such a worker online, or restrict target nodes or
