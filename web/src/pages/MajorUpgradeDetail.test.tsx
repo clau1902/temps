@@ -7,10 +7,10 @@ import { MemoryRouter, Route, Routes } from 'react-router'
 import { cleanup, render } from '@testing-library/react'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { shouldRetryQuery } from '@/lib/query-retry'
-import { useBrowserWindow } from '@/test/dom'
+import { installBrowserWindow } from '@/test/dom'
 import { MajorUpgradeDetail } from './MajorUpgradeDetail'
 
-useBrowserWindow()
+installBrowserWindow()
 
 const originalFetch = globalThis.fetch
 afterEach(() => {

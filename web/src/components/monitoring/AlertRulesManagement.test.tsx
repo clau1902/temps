@@ -13,7 +13,7 @@ import {
 } from '@testing-library/react'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { AlertRulesManagement } from './AlertRulesManagement'
-import { useBrowserWindow } from '@/test/dom'
+import { installBrowserWindow } from '@/test/dom'
 
 const RULE = {
   id: 11,
@@ -28,7 +28,7 @@ const RULE = {
   updated_at: '2026-10-12T00:00:00Z',
 }
 
-useBrowserWindow()
+installBrowserWindow()
 
 const unhandled: unknown[] = []
 const onUnhandled = (reason: unknown) => unhandled.push(reason)

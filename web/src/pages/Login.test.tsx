@@ -13,10 +13,10 @@ import {
 } from '@testing-library/react'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
-import { useBrowserWindow } from '@/test/dom'
+import { installBrowserWindow } from '@/test/dom'
 import { Login } from './Login'
 
-useBrowserWindow()
+installBrowserWindow()
 
 const unhandled: unknown[] = []
 process.on('unhandledRejection', (reason) => unhandled.push(reason))

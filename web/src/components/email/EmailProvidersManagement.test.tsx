@@ -12,10 +12,10 @@ import {
   waitFor,
 } from '@testing-library/react'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
-import { useBrowserWindow } from '@/test/dom'
+import { installBrowserWindow } from '@/test/dom'
 import { EmailProvidersManagement } from './EmailProvidersManagement'
 
-useBrowserWindow()
+installBrowserWindow()
 afterEach(cleanup)
 
 const PROVIDER = {

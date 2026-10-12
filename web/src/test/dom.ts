@@ -12,7 +12,7 @@ import { afterEach, beforeEach } from 'bun:test'
  * call this once at the top of the file so they never inherit a stub; the
  * previous value is put back afterwards.
  */
-export function useBrowserWindow() {
+export function installBrowserWindow() {
   let previous: PropertyDescriptor | undefined
   beforeEach(() => {
     previous = Object.getOwnPropertyDescriptor(globalThis, 'window')

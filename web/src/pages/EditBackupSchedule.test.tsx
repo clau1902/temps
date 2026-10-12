@@ -8,10 +8,10 @@ import { cleanup, render } from '@testing-library/react'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { shouldRetryQuery } from '@/lib/query-retry'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
-import { useBrowserWindow } from '@/test/dom'
+import { installBrowserWindow } from '@/test/dom'
 import { EditBackupSchedule } from './EditBackupSchedule'
 
-useBrowserWindow()
+installBrowserWindow()
 afterEach(cleanup)
 
 function renderAt(path: string) {

@@ -3,11 +3,11 @@
 
 import { afterEach, expect, mock, test } from 'bun:test'
 import { act, cleanup, fireEvent, render } from '@testing-library/react'
-import { useBrowserWindow } from '@/test/dom'
+import { installBrowserWindow } from '@/test/dom'
 import { ConfirmDialog } from './confirm-dialog'
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from './sheet'
 
-useBrowserWindow()
+installBrowserWindow()
 afterEach(cleanup)
 
 /** Largest arbitrary `z-[N]` / `z-N` utility on an element, 0 when absent. */

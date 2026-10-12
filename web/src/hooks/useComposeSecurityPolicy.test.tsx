@@ -5,10 +5,10 @@ import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, render, waitFor } from '@testing-library/react'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
-import { useBrowserWindow } from '@/test/dom'
+import { installBrowserWindow } from '@/test/dom'
 import { useComposeSecurityPolicy } from './useComposeSecurityPolicy'
 
-useBrowserWindow()
+installBrowserWindow()
 afterEach(cleanup)
 
 function Probe({ isCompose }: { isCompose: boolean }) {

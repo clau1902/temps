@@ -13,9 +13,9 @@ import {
   render,
   waitFor,
 } from '@testing-library/react'
-import { useBrowserWindow } from '@/test/dom'
+import { installBrowserWindow } from '@/test/dom'
 
-useBrowserWindow()
+installBrowserWindow()
 afterEach(cleanup)
 
 function UrlBoundToolbar() {
