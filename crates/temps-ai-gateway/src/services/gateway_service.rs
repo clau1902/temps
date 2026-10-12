@@ -152,6 +152,36 @@ pub(crate) enum CatalogRoute {
     NotInCatalog,
 }
 
+/// Identity of an upstream destination for comparing two keys' base URLs.
+///
+/// Only the case-insensitive parts are normalised: parsing lowercases the
+/// scheme and host and drops a default port, while the path keeps its case
+/// (`/Private/v1` and `/private/v1` are different endpoints) and loses only a
+/// trailing slash. A URL that does not parse is compared verbatim, so it can
+/// never be mistaken for another destination.
+fn destination_identity(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    match url::Url::parse(trimmed) {
+        Ok(parsed) => {
+            let mut identity = format!(
+                "{}://{}",
+                parsed.scheme(),
+                parsed.host_str().unwrap_or_default()
+            );
+            if let Some(port) = parsed.port() {
+                identity.push_str(&format!(":{port}"));
+            }
+            identity.push_str(parsed.path().trim_end_matches('/'));
+            if let Some(query) = parsed.query() {
+                identity.push('?');
+                identity.push_str(query);
+            }
+            identity
+        }
+        Err(_) => trimmed.to_string(),
+    }
+}
+
 /// Decide which key serves `model` from its catalog entries (#1408).
 ///
 /// `entries` are every catalog row whose model ID matches `model` ignoring
@@ -178,10 +208,7 @@ pub(crate) fn route_by_catalog(
             .clone()
             .or_else(|| default_base_url(&key.provider).map(str::to_string))
             .unwrap_or_default();
-        (
-            key.provider.clone(),
-            base.trim().trim_end_matches('/').to_ascii_lowercase(),
-        )
+        (key.provider.clone(), destination_identity(&base))
     };
     let is_serving = |(row, key): &&(ai_provider_models::Model, ai_provider_keys::Model)| {
         row.model_id == model && key.is_active && row.is_enabled && row.is_available
@@ -1000,8 +1027,19 @@ pub(crate) fn parse_model_catalog(
         })
         .filter_map(|entry| {
             let raw_id = entry.get("id").or_else(|| entry.get("name"))?.as_str()?;
-            let id = raw_id.strip_prefix("models/").unwrap_or(raw_id).trim();
-            if id.is_empty() || id.len() > 255 || id.chars().any(char::is_control) || !keep(id) {
+            // Gemini names models `models/<id>` but is called with `<id>`.
+            // Every other provider -- above all a self-hosted server -- is
+            // called with exactly the ID it lists, so that is kept verbatim.
+            let id = if provider_id == "gemini" {
+                raw_id.strip_prefix("models/").unwrap_or(raw_id)
+            } else {
+                raw_id
+            };
+            if id.trim().is_empty()
+                || id.len() > 255
+                || id.chars().any(char::is_control)
+                || !keep(id)
+            {
                 return None;
             }
             let owned_by = entry
@@ -1485,6 +1523,51 @@ mod tests {
     }
 
     #[test]
+    fn destinations_differing_only_in_path_case_are_ambiguous() {
+        let entries = vec![
+            (
+                row(1, HOSTED, true, true),
+                key(
+                    1,
+                    OPENAI_COMPATIBLE,
+                    Some("https://models.example.test/Private/v1"),
+                    true,
+                ),
+            ),
+            (
+                row(2, HOSTED, true, true),
+                key(
+                    2,
+                    OPENAI_COMPATIBLE,
+                    Some("https://models.example.test/private/v1"),
+                    true,
+                ),
+            ),
+        ];
+        assert!(matches!(
+            route_by_catalog(HOSTED, &entries, default_url),
+            CatalogRoute::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn destination_identity_normalises_only_case_insensitive_parts() {
+        assert_eq!(
+            destination_identity("HTTPS://Models.Example.TEST:443/v1/"),
+            destination_identity("https://models.example.test/v1")
+        );
+        assert_ne!(
+            destination_identity("https://models.example.test/V1"),
+            destination_identity("https://models.example.test/v1")
+        );
+        assert_ne!(
+            destination_identity("http://10.0.0.5:8000/v1"),
+            destination_identity("http://10.0.0.5:8001/v1")
+        );
+        assert_eq!(destination_identity(" not a url "), "not a url");
+    }
+
+    #[test]
     fn unavailable_self_hosted_model_never_falls_back_to_the_name_heuristic() {
         for (entry, expected_reason) in [
             (
@@ -1649,6 +1732,16 @@ mod tests {
         );
         assert_eq!(models[2].owned_by, "mlx");
         assert_eq!(models[1].owned_by, OPENAI_COMPATIBLE);
+    }
+
+    #[test]
+    fn self_hosted_discovery_keeps_a_models_prefix_but_gemini_strips_it() {
+        let body = serde_json::json!({"data": [{"id": "models/my-model"}]});
+        let models = parse_model_catalog(OPENAI_COMPATIBLE, &body, |_| true).unwrap();
+        assert_eq!(models[0].id, "models/my-model");
+        let body = serde_json::json!({"models": [{"name": "models/gemini-3.1-pro"}]});
+        let models = parse_model_catalog("gemini", &body, |_| true).unwrap();
+        assert_eq!(models[0].id, "gemini-3.1-pro");
     }
 
     #[test]
