@@ -86,6 +86,14 @@ export const notificationRouteSeveritySchema = z.enum([
   'emergency',
 ])
 
+/**
+ * A number the form may leave empty. `NumberInput` reports an emptied box as
+ * NaN (react-hook-form swaps `undefined` for the field's default, which would
+ * put the old number back), and NaN is read here as "not provided".
+ */
+const optionalNumber = (schema: z.ZodNumber) =>
+  z.union([schema, z.nan().transform(() => undefined)]).optional()
+
 const buildProviderSchema = (allowMaskedValues: boolean) =>
   z
     .object({
@@ -103,7 +111,7 @@ const buildProviderSchema = (allowMaskedValues: boolean) =>
 
         // Email config
         smtp_host: z.string().optional(),
-        smtp_port: z.number().min(1).max(65535).optional(),
+        smtp_port: optionalNumber(z.number().min(1).max(65535)),
         use_credentials: z.boolean().optional(),
         smtp_username: z.string().optional(),
         password: z.string().optional(),
@@ -118,7 +126,7 @@ const buildProviderSchema = (allowMaskedValues: boolean) =>
         url: z.string().optional(),
         method: z.enum(['POST', 'PUT', 'PATCH']).optional(),
         headers: z.record(z.string(), z.string()).optional(),
-        timeout_secs: z.number().min(1).max(300).optional(),
+        timeout_secs: optionalNumber(z.number().min(1).max(300)),
       }),
     })
     .refine(

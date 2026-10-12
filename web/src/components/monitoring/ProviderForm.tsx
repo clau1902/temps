@@ -255,7 +255,9 @@ export function ProviderForm({
                           onBlur={field.onBlur}
                           placeholder={getSuggestedPort()}
                           inputMode="numeric"
-                          onValueChange={field.onChange}
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
+                          }
                           value={field.value}
                         />
                       </FormControl>
@@ -603,7 +605,9 @@ export function ProviderForm({
                         placeholder="30"
                         min={1}
                         max={300}
-                        onValueChange={field.onChange}
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
+                        }
                         value={field.value}
                       />
                     </FormControl>
