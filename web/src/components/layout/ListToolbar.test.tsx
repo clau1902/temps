@@ -1,14 +1,22 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { expect, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
 import { MemoryRouter, useLocation } from 'react-router'
 import { useUrlState } from '@temps-sdk/ds'
-import { useDom } from '@/test/dom'
 import { ListToolbar } from './ListToolbar'
 
-useDom()
-const { render, fireEvent, act } = await import('@testing-library/react')
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
+import { useBrowserWindow } from '@/test/dom'
+
+useBrowserWindow()
+afterEach(cleanup)
 
 function UrlBoundToolbar() {
   const { get, patch } = useUrlState<'q' | 'page'>()
@@ -26,7 +34,7 @@ function UrlBoundToolbar() {
   )
 }
 
-test('typing into a URL-bound toolbar keeps every character and resets the page', () => {
+test('typing into a URL-bound toolbar keeps every character and resets the page', async () => {
   const view = render(
     <MemoryRouter initialEntries={['/projects?page=4']}>
       <UrlBoundToolbar />
@@ -39,11 +47,14 @@ test('typing into a URL-bound toolbar keeps every character and resets the page'
     fireEvent.change(input, { target: { value: typed } })
   }
   expect(input.value).toBe('qa-ui-qj14a')
-  const params = new URLSearchParams(
-    view.getByTestId('location').textContent ?? ''
-  )
-  expect(params.get('q')).toBe('qa-ui-qj14a')
-  expect(params.has('page')).toBe(false)
+  await waitFor(() => {
+    const params = new URLSearchParams(
+      view.getByTestId('location').textContent ?? ''
+    )
+    expect(params.get('q')).toBe('qa-ui-qj14a')
+    expect(params.has('page')).toBe(false)
+  })
+  expect(input.value).toBe('qa-ui-qj14a')
   view.unmount()
 })
 

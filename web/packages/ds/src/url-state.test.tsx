@@ -1,13 +1,21 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { expect, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
 import { MemoryRouter, useLocation } from 'react-router'
 import { useUrlBoundText, useUrlState } from './url-state'
-import { useDom } from '../../../src/test/dom'
 
-useDom()
-const { render, fireEvent, act } = await import('@testing-library/react')
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
+import { useBrowserWindow } from '../../../src/test/dom'
+
+useBrowserWindow()
+afterEach(cleanup)
 
 function SearchBox() {
   const { get, patch } = useUrlState<'q' | 'page' | 'tab'>()
@@ -44,13 +52,16 @@ test('typing a multi-character term into a URL-bound search keeps the full value
     fireEvent.change(input, { target: { value: typed } })
   }
   expect(input.value).toBe('qa-ui-qj14a')
-  const params = new URLSearchParams(
-    view.getByTestId('search').textContent ?? ''
-  )
   // The search and the page reset both landed, and untouched params survived.
-  expect(params.get('q')).toBe('qa-ui-qj14a')
-  expect(params.has('page')).toBe(false)
-  expect(params.get('tab')).toBe('backups')
+  await waitFor(() => {
+    const params = new URLSearchParams(
+      view.getByTestId('search').textContent ?? ''
+    )
+    expect(params.get('q')).toBe('qa-ui-qj14a')
+    expect(params.has('page')).toBe(false)
+    expect(params.get('tab')).toBe('backups')
+  })
+  expect(input.value).toBe('qa-ui-qj14a')
   view.unmount()
 })
 
