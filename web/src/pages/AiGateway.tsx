@@ -173,6 +173,10 @@ import {
 import { SelfHostedProviderFields } from '@/components/ai/SelfHostedProviderFields'
 import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
 import {
+  withSavingKey,
+  withoutSavingKey,
+} from '@/components/ai/self-hosted-provider'
+import {
   EMPTY_PROVIDER_KEY_FORM,
   providerKeyFormSchema,
   providerKeyFormToRequest,
@@ -4069,7 +4073,13 @@ export function AiGatewayPage() {
 
   // Per-key settings (private-address trust, declared capabilities). Owned
   // here rather than by the collapsible key rows, so collapsing a provider
-  // never drops an in-flight update.
+  // never drops an in-flight update. Saves are tracked per key: a key's
+  // controls stay disabled until its own save *and* the refetch finish, so
+  // a second change never sends the key's stale capabilities (the server
+  // replaces the whole declaration).
+  const [savingKeyIds, setSavingKeyIds] = useState<ReadonlySet<number>>(
+    () => new Set()
+  )
   const updateKeySettingsMutation = useMutation({
     mutationFn: ({
       id,
@@ -4078,14 +4088,20 @@ export function AiGatewayPage() {
       id: number
       body: UpdateProviderKeyRequest
     }) => updateProviderKey({ path: { id }, body, throwOnError: true }),
+    onMutate: ({ id }) => {
+      setSavingKeyIds((saving) => withSavingKey(saving, id))
+    },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
       toast.success('Provider key updated')
     },
     onError: (error) =>
       toast.error('Could not update the provider key', {
         description: problemDetail(error, 'Please try again.'),
       }),
+    onSettled: async (_data, _error, { id }) => {
+      await queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
+      setSavingKeyIds((saving) => withoutSavingKey(saving, id))
+    },
   })
 
   const handleDelete = (key: ProviderKeyResponse) => {
@@ -4539,11 +4555,7 @@ console.log(response.choices[0].message.content);`,
                                   canTrustPrivateAddress={
                                     canTrustPrivateAddress
                                   }
-                                  pending={
-                                    updateKeySettingsMutation.isPending &&
-                                    updateKeySettingsMutation.variables?.id ===
-                                      key.id
-                                  }
+                                  pending={savingKeyIds.has(key.id)}
                                   onUpdate={(body) =>
                                     updateKeySettingsMutation.mutate({
                                       id: key.id,

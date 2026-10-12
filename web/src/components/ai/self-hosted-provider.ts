@@ -107,3 +107,25 @@ export function selfHostedSubmitBlocker(input: {
   }
   return null
 }
+
+/** Key ids with a settings save in flight, plus `id`. */
+export function withSavingKey(
+  saving: ReadonlySet<number>,
+  id: number
+): ReadonlySet<number> {
+  return new Set(saving).add(id)
+}
+
+/**
+ * Key ids with a settings save in flight, minus one finished save of `id`.
+ * Counts are not needed: a key's controls stay disabled while it is saving,
+ * so it never has two saves in flight.
+ */
+export function withoutSavingKey(
+  saving: ReadonlySet<number>,
+  id: number
+): ReadonlySet<number> {
+  const next = new Set(saving)
+  next.delete(id)
+  return next
+}
