@@ -340,6 +340,11 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
   const refresh = async () => {
     await queryClient.invalidateQueries(operationQueries('getStatusPage'))
     await queryClient.invalidateQueries(operationQueries('listStatusPages'))
+    // Unpublishing releases every custom domain's certificate, so their
+    // state changes too; a stale "Serving" row would hide Verify.
+    await queryClient.invalidateQueries(
+      operationQueries('listStatusPageDomains')
+    )
   }
   const publish = useMutation({
     ...publishStatusPageMutation(),

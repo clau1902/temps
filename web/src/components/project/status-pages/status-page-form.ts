@@ -190,7 +190,47 @@ export function domainStatusLabel(
       return 'Verification failed'
     case 'unverified':
       return 'Needs verification'
+    case 'renewal_pending':
+      return 'Serving · renewal in progress'
+    case 'renewal_failed':
+      return 'Serving · renewal failed'
     default:
       return 'Waiting for DNS'
+  }
+}
+
+/** Days to renew a certificate before it expires, as the renewal job does. */
+export const CERTIFICATE_RENEWAL_WINDOW_DAYS = 30
+
+/** Whole days until `expiresAt`, or null when unknown. */
+export function daysUntil(
+  expiresAt: string | null | undefined,
+  now: Date = new Date()
+): number | null {
+  if (!expiresAt) return null
+  const expires = new Date(expiresAt).getTime()
+  if (Number.isNaN(expires)) return null
+  return Math.floor((expires - now.getTime()) / 86_400_000)
+}
+
+/** What the operator can do with a custom domain right now. */
+export function domainActions(
+  domain: Pick<StatusPageDomainResponse, 'status'>,
+  pagePublished: boolean
+): { verify: boolean; renew: boolean } {
+  const hasCertificate =
+    domain.status === 'active' ||
+    domain.status === 'renewal_pending' ||
+    domain.status === 'renewal_failed'
+  return {
+    // Completes an open order, or starts one; certificates are only issued
+    // for published pages.
+    verify:
+      pagePublished &&
+      domain.status !== 'active' &&
+      domain.status !== 'renewal_failed',
+    // A new order while the current certificate keeps serving.
+    renew:
+      pagePublished && hasCertificate && domain.status !== 'renewal_pending',
   }
 }

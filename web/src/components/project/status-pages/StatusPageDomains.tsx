@@ -5,9 +5,14 @@ import {
   addStatusPageDomainMutation,
   listStatusPageDomainsOptions,
   removeStatusPageDomainMutation,
+  renewStatusPageDomainMutation,
   verifyStatusPageDomainMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { StatusPageDomainResponse, StatusPageResponse } from '@/api/client'
+import type {
+  DnsRecordInstruction,
+  StatusPageDomainResponse,
+  StatusPageResponse,
+} from '@/api/client'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -33,15 +38,32 @@ import {
 import { Input } from '@/components/ui/input'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, Plus, ShieldCheck, Trash2 } from 'lucide-react'
+import {
+  ExternalLink,
+  Plus,
+  RefreshCw,
+  ShieldCheck,
+  Trash2,
+} from 'lucide-react'
 import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
 import {
   addDomainSchema,
+  CERTIFICATE_RENEWAL_WINDOW_DAYS,
+  daysUntil,
+  domainActions,
   domainStatusLabel,
   operationQueries,
   type AddDomainValues,
@@ -51,10 +73,109 @@ function StatusBadge({ domain }: { domain: StatusPageDomainResponse }) {
   const variant =
     domain.status === 'active'
       ? 'success-subtle'
-      : domain.status === 'failed'
+      : domain.status === 'failed' || domain.status === 'renewal_failed'
         ? 'destructive-subtle'
         : 'warning-subtle'
   return <Badge variant={variant}>{domainStatusLabel(domain)}</Badge>
+}
+
+function DnsRecordsTable({ records }: { records: DnsRecordInstruction[] }) {
+  return (
+    <div className="rounded-md border">
+      <Table className="min-w-[520px]">
+        <TableHeader>
+          <TableRow>
+            <TableHead>Type</TableHead>
+            <TableHead>Name</TableHead>
+            <TableHead>Value</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {records.map((record) => (
+            <TableRow
+              key={`${record.record_type}-${record.name}`}
+              className="align-top"
+            >
+              <TableCell className="font-mono">{record.record_type}</TableCell>
+              <TableCell>
+                <div className="flex items-center gap-1">
+                  <code className="break-all text-xs">{record.name}</code>
+                  <CopyButton
+                    value={record.name}
+                    variant="ghost"
+                    size="sm"
+                    minimal
+                    label={`Copy ${record.record_type} record name`}
+                  />
+                </div>
+              </TableCell>
+              <TableCell>
+                <div className="flex items-center gap-1">
+                  <code className="break-all text-xs">{record.value}</code>
+                  <CopyButton
+                    value={record.value}
+                    variant="ghost"
+                    size="sm"
+                    minimal
+                    label={`Copy ${record.record_type} record value`}
+                  />
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {record.purpose}
+                </p>
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  )
+}
+
+/** One line on what to do next, for every state but "serving and current". */
+function domainGuidance(
+  domain: StatusPageDomainResponse,
+  pagePublished: boolean
+): string {
+  if (!pagePublished) {
+    return 'Certificates are only issued for published pages. Publish the page, then verify.'
+  }
+  switch (domain.status) {
+    case 'unverified':
+      return 'No certificate yet. Create the DNS record below, then verify.'
+    case 'renewal_pending':
+      return domain.verification_method === 'dns-01'
+        ? 'A renewal is in progress and the current certificate is still served. Publish the new TXT record below, then verify.'
+        : 'A renewal is in progress and the current certificate is still served. Verify to finish it.'
+    case 'renewal_failed':
+      return 'The last renewal failed. The current certificate is still served until it expires; renew again.'
+    default:
+      return 'Create these DNS records at your DNS provider, wait for them to propagate, then verify. Nothing is served on this hostname until it is verified.'
+  }
+}
+
+/** Expiry note for a domain that holds a certificate. */
+function CertificateExpiry({ domain }: { domain: StatusPageDomainResponse }) {
+  const days = daysUntil(domain.certificate_expires_at)
+  if (days === null || !domain.certificate_expires_at) return null
+  const dueSoon = days <= CERTIFICATE_RENEWAL_WINDOW_DAYS
+  const expires = new Date(domain.certificate_expires_at).toLocaleDateString()
+  return (
+    <p
+      className={
+        dueSoon && domain.verification_method === 'dns-01'
+          ? 'text-sm text-warning'
+          : 'text-sm text-muted-foreground'
+      }
+    >
+      Certificate valid until {expires} ({days} days).{' '}
+      {domain.verification_method === 'dns-01'
+        ? dueSoon
+          ? 'DNS-verified certificates are not renewed automatically: renew now and publish the new TXT record.'
+          : `DNS-verified certificates are not renewed automatically: renew within ${CERTIFICATE_RENEWAL_WINDOW_DAYS} days of expiry.`
+        : `Renewed automatically within ${CERTIFICATE_RENEWAL_WINDOW_DAYS} days of expiry.`}
+    </p>
+  )
 }
 
 function DomainRow({
@@ -90,6 +211,27 @@ function DomainRow({
       await refresh()
     },
   })
+  const renew = useMutation({
+    ...renewStatusPageDomainMutation(),
+    meta: {
+      errorTitle: `Could not renew the certificate of ${domain.hostname}`,
+    },
+    onSuccess: async (result) => {
+      await refresh()
+      if (result.status === 'active') {
+        toast.success(`Renewed the certificate of ${result.hostname}.`)
+      } else {
+        toast.info(
+          `Publish the new TXT record for ${result.hostname}, then verify. The current certificate keeps serving meanwhile.`
+        )
+      }
+    },
+    onError: async () => {
+      await refresh()
+    },
+  })
+  const actions = domainActions(domain, page.is_published)
+  const busy = verify.isPending || renew.isPending
   const remove = useMutation({
     ...removeStatusPageDomainMutation(),
     meta: { errorTitle: `Failed to remove ${domain.hostname}` },
@@ -125,15 +267,30 @@ function DomainRow({
               </a>
             </Button>
           )}
-          {domain.status !== 'active' && (
+          {actions.verify && (
             <Button
               size="sm"
-              disabled={verify.isPending}
+              disabled={busy}
               onClick={() => verify.mutate(path)}
             >
               <ShieldCheck className="size-4 sm:mr-2" />
               <span className="hidden sm:inline">
                 {verify.isPending ? 'Verifying...' : 'Verify'}
+              </span>
+            </Button>
+          )}
+          {actions.renew && (
+            <Button
+              variant={
+                domain.status === 'renewal_failed' ? 'default' : 'outline'
+              }
+              size="sm"
+              disabled={busy}
+              onClick={() => renew.mutate(path)}
+            >
+              <RefreshCw className="size-4 sm:mr-2" />
+              <span className="hidden sm:inline">
+                {renew.isPending ? 'Renewing...' : 'Renew'}
               </span>
             </Button>
           )}
@@ -148,67 +305,18 @@ function DomainRow({
         </div>
       </div>
 
-      {domain.status !== 'active' && (
+      {domain.status === 'active' && page.is_published ? (
+        <CertificateExpiry domain={domain} />
+      ) : (
         <div className="space-y-2">
           <p className="text-sm text-muted-foreground">
-            {domain.status === 'unverified'
-              ? page.is_published
-                ? 'No certificate yet. Create the DNS record below, then verify.'
-                : 'Certificates are only issued for published pages. Publish the page, then verify.'
-              : 'Create these DNS records at your DNS provider, wait for them to propagate, then verify. Nothing is served on this hostname until it is verified.'}
+            {domainGuidance(domain, page.is_published)}
           </p>
-          <div className="overflow-x-auto rounded-md border">
-            <table className="w-full min-w-[520px] text-sm">
-              <thead className="bg-muted/50 text-left text-xs text-muted-foreground">
-                <tr>
-                  <th className="px-3 py-2 font-medium">Type</th>
-                  <th className="px-3 py-2 font-medium">Name</th>
-                  <th className="px-3 py-2 font-medium">Value</th>
-                </tr>
-              </thead>
-              <tbody>
-                {domain.dns_records.map((record) => (
-                  <tr
-                    key={`${record.record_type}-${record.name}`}
-                    className="border-t align-top"
-                  >
-                    <td className="px-3 py-2 font-mono">
-                      {record.record_type}
-                    </td>
-                    <td className="px-3 py-2">
-                      <div className="flex items-center gap-1">
-                        <code className="break-all text-xs">{record.name}</code>
-                        <CopyButton
-                          value={record.name}
-                          variant="ghost"
-                          size="sm"
-                          minimal
-                          label={`Copy ${record.record_type} record name`}
-                        />
-                      </div>
-                    </td>
-                    <td className="px-3 py-2">
-                      <div className="flex items-center gap-1">
-                        <code className="break-all text-xs">
-                          {record.value}
-                        </code>
-                        <CopyButton
-                          value={record.value}
-                          variant="ghost"
-                          size="sm"
-                          minimal
-                          label={`Copy ${record.record_type} record value`}
-                        />
-                      </div>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {record.purpose}
-                      </p>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          {(domain.status === 'renewal_pending' ||
+            domain.status === 'renewal_failed') && (
+            <CertificateExpiry domain={domain} />
+          )}
+          <DnsRecordsTable records={domain.dns_records} />
           {domain.last_error && (
             <p className="break-words text-sm text-destructive">
               Last attempt: {domain.last_error}
