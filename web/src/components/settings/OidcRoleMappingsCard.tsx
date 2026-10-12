@@ -17,6 +17,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -57,7 +58,8 @@ export function OidcRoleMappingsCard({
 
   const [draftGroup, setDraftGroup] = useState('')
   const [draftRole, setDraftRole] = useState<'admin' | 'user'>('user')
-  const [draftPriority, setDraftPriority] = useState(100)
+  // Empty while editing; an empty priority means "use the suggested one".
+  const [draftPriority, setDraftPriority] = useState<number | undefined>(100)
 
   const suggestedPriority = useMemo(
     () => nextDefaultPriority(mappings),
@@ -107,7 +109,7 @@ export function OidcRoleMappingsCard({
       path: { provider_id: providerId },
       body: {
         idp_group: idpGroup,
-        priority: draftPriority || suggestedPriority,
+        priority: draftPriority ?? suggestedPriority,
         role: draftRole,
       },
     })
@@ -186,15 +188,12 @@ export function OidcRoleMappingsCard({
                 <label className="text-xs text-muted-foreground">
                   Priority
                 </label>
-                <Input
-                  type="number"
+                <NumberInput
                   className="w-24"
+                  step={1}
+                  placeholder={String(suggestedPriority)}
                   value={draftPriority}
-                  onChange={(event) =>
-                    setDraftPriority(
-                      Number.parseInt(event.target.value || '100', 10)
-                    )
-                  }
+                  onValueChange={setDraftPriority}
                 />
               </div>
               <div className="space-y-1">

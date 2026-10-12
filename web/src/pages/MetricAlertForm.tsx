@@ -38,6 +38,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -913,17 +914,15 @@ function AlertFormBody({
                           <FormItem>
                             <FormLabel>Max series to track</FormLabel>
                             <FormControl>
-                              <Input
-                                type="number"
+                              <NumberInput
                                 min={1}
                                 max={100}
-                                {...field}
-                                onChange={(e) =>
-                                  field.onChange(
-                                    e.target.value === ''
-                                      ? undefined
-                                      : e.target.valueAsNumber
-                                  )
+                                name={field.name}
+                                ref={field.ref}
+                                onBlur={field.onBlur}
+                                value={field.value}
+                                onValueChange={(value) =>
+                                  field.onChange(value ?? Number.NaN)
                                 }
                               />
                             </FormControl>
@@ -945,17 +944,15 @@ function AlertFormBody({
                               Notification grouping threshold
                             </FormLabel>
                             <FormControl>
-                              <Input
-                                type="number"
+                              <NumberInput
                                 min={1}
                                 max={1000}
-                                {...field}
-                                onChange={(e) =>
-                                  field.onChange(
-                                    e.target.value === ''
-                                      ? undefined
-                                      : e.target.valueAsNumber
-                                  )
+                                name={field.name}
+                                ref={field.ref}
+                                onBlur={field.onBlur}
+                                value={field.value}
+                                onValueChange={(value) =>
+                                  field.onChange(value ?? Number.NaN)
                                 }
                               />
                             </FormControl>
@@ -1075,17 +1072,12 @@ function AlertFormBody({
                             </Select>
                             {preset === 'custom' && (
                               <FormControl>
-                                <Input
-                                  type="number"
+                                <NumberInput
                                   step="0.1"
                                   min={0}
                                   value={field.value}
-                                  onChange={(e) =>
-                                    field.onChange(
-                                      e.target.value === ''
-                                        ? undefined
-                                        : e.target.valueAsNumber
-                                    )
+                                  onValueChange={(value) =>
+                                    field.onChange(value ?? Number.NaN)
                                   }
                                 />
                               </FormControl>
@@ -1264,16 +1256,14 @@ function AlertFormBody({
                       <FormItem>
                         <FormLabel>Threshold</FormLabel>
                         <FormControl>
-                          <Input
-                            type="number"
+                          <NumberInput
                             step="any"
-                            {...field}
-                            onChange={(e) =>
-                              field.onChange(
-                                e.target.value === ''
-                                  ? undefined
-                                  : e.target.valueAsNumber
-                              )
+                            name={field.name}
+                            ref={field.ref}
+                            onBlur={field.onBlur}
+                            value={field.value}
+                            onValueChange={(value) =>
+                              field.onChange(value ?? Number.NaN)
                             }
                           />
                         </FormControl>
@@ -1300,16 +1290,14 @@ function AlertFormBody({
                     <FormItem>
                       <FormLabel>Evaluation window (seconds)</FormLabel>
                       <FormControl>
-                        <Input
-                          type="number"
+                        <NumberInput
                           min={1}
-                          {...field}
-                          onChange={(e) =>
-                            field.onChange(
-                              e.target.value === ''
-                                ? undefined
-                                : e.target.valueAsNumber
-                            )
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
+                          value={field.value}
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
                         />
                       </FormControl>
@@ -1328,16 +1316,14 @@ function AlertFormBody({
                     <FormItem>
                       <FormLabel>For duration (seconds)</FormLabel>
                       <FormControl>
-                        <Input
-                          type="number"
+                        <NumberInput
                           min={1}
-                          {...field}
-                          onChange={(e) =>
-                            field.onChange(
-                              e.target.value === ''
-                                ? undefined
-                                : e.target.valueAsNumber
-                            )
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
+                          value={field.value}
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
                         />
                       </FormControl>

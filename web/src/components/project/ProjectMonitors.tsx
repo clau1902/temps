@@ -61,6 +61,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -91,7 +92,7 @@ const createMonitorSchema = z.object({
     error: 'Environment is required',
   }),
   check_interval_seconds: z
-    .number()
+    .number({ message: 'Check interval is required' })
     .min(30, 'Check interval must be at least 30 seconds'),
 })
 
@@ -532,12 +533,14 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
                     <FormItem>
                       <FormLabel>Check Interval (seconds)</FormLabel>
                       <FormControl>
-                        <Input
-                          type="number"
-                          min="30"
-                          {...field}
-                          onChange={(e) =>
-                            field.onChange(parseInt(e.target.value) || 60)
+                        <NumberInput
+                          min={30}
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
+                          value={field.value}
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
                         />
                       </FormControl>

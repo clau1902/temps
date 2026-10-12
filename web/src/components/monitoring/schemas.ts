@@ -8,15 +8,24 @@ export const projectAlertsSchema = z.object({
   buildErrors: z.boolean(),
   runtimeErrors: z.object({
     enabled: z.boolean(),
-    errorThreshold: z.number().min(1).max(1000),
-    windowMinutes: z.number().min(1).max(60),
+    errorThreshold: z
+      .number({ message: 'Error threshold is required' })
+      .min(1)
+      .max(1000),
+    windowMinutes: z
+      .number({ message: 'Time window is required' })
+      .min(1)
+      .max(60),
   }),
 })
 
 export const domainAlertsSchema = z.object({
   sslExpirationWarning: z.object({
     enabled: z.boolean(),
-    daysBeforeExpiration: z.number().min(1).max(90),
+    daysBeforeExpiration: z
+      .number({ message: 'Days before expiration is required' })
+      .min(1)
+      .max(90),
   }),
   domainExpirationWarning: z.boolean(),
   dnsConfigurationChanges: z.boolean(),
