@@ -442,11 +442,18 @@ async fn deployment_asset_origin(
 struct ReuseImageProvenance {
     source: crate::jobs::DeployImageSource,
     expected_identity: Option<crate::jobs::ExpectedImageIdentity>,
+    /// The workers holding the reused image, when the origin built it on
+    /// workers and the control plane cannot serve it itself.
+    worker_build: Option<crate::jobs::ReusedWorkerBuild>,
 }
 
 impl ReuseImageProvenance {
     fn apply(&self, job: crate::jobs::DeployImageJob) -> crate::jobs::DeployImageJob {
         let job = job.with_image_source(self.source);
+        let job = match &self.worker_build {
+            Some(worker_build) => job.with_reused_worker_build(worker_build.clone()),
+            None => job,
+        };
         match &self.expected_identity {
             Some(expected) => job.with_expected_image_identity(expected.clone()),
             None => job,
@@ -2713,10 +2720,63 @@ impl DeploymentService {
             _ => None,
         };
 
+        let worker_build = self
+            .reused_worker_build(project.id, origin_deployment_id, image_name)
+            .await?;
+
         Ok(ReuseImageProvenance {
             source,
             expected_identity,
+            worker_build,
         })
+    }
+
+    /// What the origin deployment's build recorded about the workers holding
+    /// `image_name`, for a rollback/promotion that must reach those workers.
+    ///
+    /// Used for a mixed-architecture worker build always -- the control
+    /// plane never holds its other architectures -- and for any worker
+    /// build when this control plane runs no workloads, since it then has
+    /// no copy of the image to stream from. A full-profile control plane
+    /// keeps streaming a single-architecture image from its own copy, as
+    /// before.
+    async fn reused_worker_build(
+        &self,
+        project_id: i32,
+        origin_deployment_id: i32,
+        image_name: &str,
+    ) -> Result<Option<crate::jobs::ReusedWorkerBuild>, DeploymentError> {
+        use temps_entities::deployment_jobs;
+        // Only a build of this project's own deployment says where its image lives.
+        let origin_in_project = deployments::Entity::find_by_id(origin_deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !origin_in_project {
+            return Ok(None);
+        }
+        let build_outputs = deployment_jobs::Entity::find()
+            .filter(deployment_jobs::Column::DeploymentId.eq(origin_deployment_id))
+            .filter(deployment_jobs::Column::JobType.eq("BuildImageJob"))
+            .filter(deployment_jobs::Column::Outputs.is_not_null())
+            .order_by_desc(deployment_jobs::Column::Id)
+            .one(self.db.as_ref())
+            .await?
+            .and_then(|job| job.outputs);
+        let Some(worker_build) = build_outputs.and_then(|outputs| {
+            crate::jobs::ReusedWorkerBuild::from_build_outputs(&outputs, image_name)
+        }) else {
+            return Ok(None);
+        };
+        let control_plane_has_no_copy = self
+            .node_scheduler
+            .get()
+            .is_some_and(|scheduler| !scheduler.local_workloads_enabled());
+        Ok(
+            (worker_build.is_per_architecture() || control_plane_has_no_copy)
+                .then_some(worker_build),
+        )
     }
 
     async fn configure_reuse_deploy_builder(
@@ -11588,6 +11648,141 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(DeploymentError::NotFound(_))));
+        Ok(())
+    }
+
+    async fn insert_build_outputs(
+        db: &temps_database::DbConnection,
+        deployment_id: i32,
+        outputs: serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{deployment_jobs, types::JobStatus};
+        deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment_id),
+            job_id: Set("build_image".to_string()),
+            job_type: Set("BuildImageJob".to_string()),
+            name: Set("Build Image".to_string()),
+            status: Set(JobStatus::Success),
+            log_id: Set(format!("build-{deployment_id}.log")),
+            outputs: Set(Some(outputs)),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        Ok(())
+    }
+
+    /// A rollback or promotion of a mixed-architecture worker build reuses
+    /// each architecture's image from the worker that built it, so every
+    /// replica again runs the image of its own node's architecture. A
+    /// single-architecture worker build on a control plane that holds its own
+    /// copy keeps the existing single-tag path, and outputs of another tag are
+    /// never applied.
+    #[tokio::test]
+    async fn rollback_reuses_each_architecture_from_the_worker_that_built_it(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+        insert_build_outputs(
+            &db,
+            deployment.id,
+            serde_json::json!({
+                "image_tag": "app-1:latest",
+                "image_id": "sha256:amd",
+                "builder_node_id": 4,
+                "image_tags_by_platform": {
+                    "linux/amd64": "app-1:latest",
+                    "linux/arm64": "app-1:latest-arm64"
+                },
+                "builder_node_ids_by_platform": { "linux/amd64": 4, "linux/arm64": 5 },
+                "image_ids_by_platform": { "linux/amd64": "sha256:amd", "linux/arm64": "sha256:arm" }
+            }),
+        )
+        .await?;
+        let service = create_deployment_service_for_test(db.clone());
+
+        let reused = service
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:latest")
+            .await?
+            .expect("a per-architecture build is always reused from its workers");
+        assert_eq!(reused.builder_node_id, Some(4));
+        assert_eq!(reused.image_id.as_deref(), Some("sha256:amd"));
+        assert_eq!(
+            reused.builder_node_ids_by_platform,
+            HashMap::from([
+                ("linux/amd64".to_string(), 4),
+                ("linux/arm64".to_string(), 5)
+            ])
+        );
+        assert_eq!(
+            reused
+                .image_tags_by_platform
+                .get("linux/arm64")
+                .map(String::as_str),
+            Some("app-1:latest-arm64")
+        );
+        assert_eq!(
+            reused
+                .image_ids_by_platform
+                .get("linux/arm64")
+                .map(String::as_str),
+            Some("sha256:arm")
+        );
+        assert!(service
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:other")
+            .await?
+            .is_none());
+        // Another project's deployment never lends its build to this one.
+        assert!(service
+            .reused_worker_build(deployment.project_id + 1000, deployment.id, "app-1:latest")
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollback_of_a_single_worker_build_needs_the_workers_only_without_a_local_copy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+        insert_build_outputs(
+            &db,
+            deployment.id,
+            serde_json::json!({
+                "image_tag": "app-1:latest",
+                "image_id": "sha256:arm",
+                "builder_node_id": 5,
+                "image_tags_by_platform": { "linux/arm64": "app-1:latest" }
+            }),
+        )
+        .await?;
+
+        // Full profile: the control plane copied the image when it was built.
+        let full = create_deployment_service_for_test(db.clone());
+        full.set_node_scheduler(Arc::new(crate::services::NodeScheduler::new(Arc::new(
+            crate::services::NodeService::new(db.clone()),
+        ))));
+        assert!(full
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:latest")
+            .await?
+            .is_none());
+
+        // Control-plane profile: there is no local copy, so the worker is the source.
+        let control_plane = create_deployment_service_for_test(db.clone());
+        control_plane.set_node_scheduler(Arc::new(
+            crate::services::NodeScheduler::new(Arc::new(crate::services::NodeService::new(
+                db.clone(),
+            )))
+            .with_local_workloads_enabled(false),
+        ));
+        let reused = control_plane
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:latest")
+            .await?
+            .expect("the worker is the only source of the image");
+        assert_eq!(reused.builder_node_id, Some(5));
+        assert!(!reused.is_per_architecture());
         Ok(())
     }
 }

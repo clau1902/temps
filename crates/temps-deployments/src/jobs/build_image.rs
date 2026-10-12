@@ -158,6 +158,31 @@ const BUILD_INLINED_VARIABLE_PREFIXES: &[&str] = &[
     "EXPO_PUBLIC_",
 ];
 
+/// Build arguments for the `index`-th platform of a multi-platform build.
+///
+/// The BuildKit cache-mount namespace (#1372) is per project, environment
+/// and ref, not per architecture. Two architectures sharing one
+/// `RUN --mount=type=cache` id would share native artifacts -- an arm64
+/// `node_modules` or `target/` reused by an amd64 build -- so every platform
+/// after the first gets its own namespace. The first keeps the plain one,
+/// so a single-architecture build's cache key never changes.
+fn platform_build_args(
+    args: &HashMap<String, String>,
+    index: usize,
+    platform: Option<&str>,
+) -> HashMap<String, String> {
+    let mut args = args.clone();
+    if let (true, Some(platform)) = (index > 0, platform) {
+        if let Some(namespace) =
+            args.get_mut(temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG)
+        {
+            namespace.push('-');
+            namespace.push_str(&temps_deployer::platform::platform_tag_suffix(platform));
+        }
+    }
+    args
+}
+
 /// The variables among `names` that a framework inlines at build time,
 /// sorted and de-duplicated. Names only: values never leave the planner.
 pub(crate) fn build_inlined_variables<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -490,6 +515,27 @@ pub struct ImageOutput {
     /// matches each node.
     #[serde(default)]
     pub image_tags_by_platform: HashMap<String, String>,
+    /// For a mixed-architecture worker build, the worker that built and
+    /// holds each platform's image, keyed like `image_tags_by_platform`.
+    /// Empty for every other build, whose single builder (if any) is the
+    /// `builder_node_id` output.
+    #[serde(default)]
+    pub builder_node_ids_by_platform: HashMap<String, i32>,
+    /// For a mixed-architecture worker build, the id each worker reported
+    /// for the image it built, keyed like `image_tags_by_platform`. A
+    /// transfer or rollback of a tag only proceeds when the source still
+    /// holds exactly this image.
+    #[serde(default)]
+    pub image_ids_by_platform: HashMap<String, String>,
+}
+
+/// What [`BuildImageJob::build_on_platform_workers`] produced.
+struct PerArchitectureBuild {
+    /// The first platform's build, which owns the plain tag.
+    primary: temps_deployer::BuildResult,
+    image_tags_by_platform: HashMap<String, String>,
+    builder_node_ids_by_platform: HashMap<String, i32>,
+    image_ids_by_platform: HashMap<String, String>,
 }
 
 impl ImageOutput {
@@ -528,6 +574,12 @@ impl ImageOutput {
         let image_tags_by_platform: HashMap<String, String> = context
             .get_output(build_job_id, "image_tags_by_platform")?
             .unwrap_or_default();
+        let builder_node_ids_by_platform: HashMap<String, i32> = context
+            .get_output(build_job_id, "builder_node_ids_by_platform")?
+            .unwrap_or_default();
+        let image_ids_by_platform: HashMap<String, String> = context
+            .get_output(build_job_id, "image_ids_by_platform")?
+            .unwrap_or_default();
 
         Ok(Self {
             image_tag,
@@ -536,6 +588,8 @@ impl ImageOutput {
             build_context: PathBuf::from(build_context_str),
             dockerfile_path: PathBuf::from(dockerfile_path_str),
             image_tags_by_platform,
+            builder_node_ids_by_platform,
+            image_ids_by_platform,
         })
     }
 }
@@ -596,6 +650,28 @@ impl Default for BuildConfig {
     }
 }
 
+/// One worker of a mixed-architecture worker build: the node that builds the
+/// image for `platform`, natively, because it runs that architecture itself.
+#[derive(Clone)]
+pub struct WorkerPlatformBuilder {
+    /// Canonical platform this worker builds (`linux/arm64`).
+    pub platform: String,
+    pub node_id: i32,
+    pub node_name: String,
+    /// Authenticated agent client for `node_id`.
+    pub builder: Arc<dyn ImageBuilder>,
+}
+
+impl std::fmt::Debug for WorkerPlatformBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerPlatformBuilder")
+            .field("platform", &self.platform)
+            .field("node_id", &self.node_id)
+            .field("node_name", &self.node_name)
+            .finish()
+    }
+}
+
 /// Job for building container images from source code
 pub struct BuildImageJob {
     job_id: String,
@@ -644,6 +720,11 @@ pub struct BuildImageJob {
     /// credentials, platform tokens -- never leaves the control plane.
     /// Empty for a job planned before this existed: nothing is sent.
     worker_build_arg_keys: BTreeSet<String>,
+    /// A mixed-architecture worker build: one worker per target platform,
+    /// each building its own architecture natively, in parallel. Empty for
+    /// every other build. When set, the first entry is also
+    /// `image_builder`/`remote_builder_node_id` and owns the plain tag.
+    platform_builders: Vec<WorkerPlatformBuilder>,
 }
 
 /// What `ensure_dockerfile` produced.
@@ -728,7 +809,39 @@ impl BuildImageJob {
             build_location_notice: None,
             control_plane_copy: None,
             worker_build_arg_keys: BTreeSet::new(),
+            platform_builders: Vec::new(),
         }
+    }
+
+    /// Build each platform on its own worker. See the `platform_builders`
+    /// field doc. The first builder becomes this job's primary builder.
+    pub fn with_platform_builders(mut self, builders: Vec<WorkerPlatformBuilder>) -> Self {
+        if let Some(primary) = builders.first() {
+            self.image_builder = primary.builder.clone();
+            self.remote_builder_node_id = Some(primary.node_id);
+            self.build_config.target_platforms =
+                builders.iter().map(|b| b.platform.clone()).collect();
+        }
+        self.platform_builders = builders;
+        self
+    }
+
+    /// Whether this is a mixed-architecture build spread over several workers.
+    fn is_per_architecture_worker_build(&self) -> bool {
+        self.platform_builders.len() > 1
+    }
+
+    /// The worker(s) this build runs on, for build-log lines.
+    fn worker_nodes_phrase(&self, primary_node_id: i32) -> String {
+        if !self.is_per_architecture_worker_build() {
+            return format!("worker node {primary_node_id}");
+        }
+        let nodes: Vec<String> = self
+            .platform_builders
+            .iter()
+            .map(|b| format!("{} ({})", b.node_id, b.platform))
+            .collect();
+        format!("worker nodes {}", nodes.join(", "))
     }
 
     /// Set whether this process may build images locally. See the
@@ -1246,6 +1359,8 @@ impl BuildImageJob {
         dockerfile_path: &Path,
         split: &WorkerBuildArgs,
     ) -> Result<(), WorkflowError> {
+        let nodes = self.worker_nodes_phrase(node_id);
+        let plural = self.is_per_architecture_worker_build();
         use temps_deployer::build_protocol::{
             dockerfile_build_arg_names, dockerfile_reads_build_arg,
         };
@@ -1269,8 +1384,8 @@ impl BuildImageJob {
                     format!(
                         "Worker builds cannot pass secret values: '{shown}' declares ARG {}, \
                          but {} a secret, a platform credential or a BuildKit setting, which \
-                         never leaves the control plane, so this build on worker node \
-                         {node_id} would silently lose {}. Read {} when the container runs \
+                         never leaves the control plane, so this build on {nodes} would \
+                         silently lose {}. Read {} when the container runs \
                          instead of at build time, recreate {} as a non-secret variable if {} \
                          not sensitive, or, on a server that builds locally, set this \
                          environment's build location to the control plane.",
@@ -1315,9 +1430,11 @@ impl BuildImageJob {
             self.log(
                 context,
                 format!(
-                    "Build arguments: worker node {node_id} receives {} value(s) for the \
-                     Dockerfile's ARG instructions over its authenticated connection: {}",
+                    "Build arguments: {nodes} {} {} value(s) for the Dockerfile's ARG \
+                     instructions over {} authenticated connection: {}",
+                    if plural { "each receive" } else { "receives" },
                     received.len(),
+                    if plural { "its own" } else { "its" },
                     name_list(&received)
                 ),
             )
@@ -1334,14 +1451,18 @@ impl BuildImageJob {
         node_id: i32,
         split: &WorkerBuildArgs,
     ) -> Result<(), WorkflowError> {
+        let nodes = self.worker_nodes_phrase(node_id);
+        let plural = self.is_per_architecture_worker_build();
         let sent = split.variable_names();
         if !sent.is_empty() {
             self.log(
                 context,
                 format!(
-                    "Build arguments: this build runs on worker node {node_id}, which receives \
-                     {} variable(s) over its authenticated connection: {}",
+                    "Build arguments: this build runs on {nodes}, which {} {} variable(s) \
+                     over {} authenticated connection: {}",
+                    if plural { "each receive" } else { "receives" },
                     sent.len(),
+                    if plural { "its own" } else { "its" },
                     name_list(&sent)
                 ),
             )
@@ -1364,7 +1485,7 @@ impl BuildImageJob {
             format!(
                 "Build note: {} variable(s) are secrets or platform credentials, which never \
                  leave the control plane. They are set when the container runs, but not while \
-                 this build runs on worker node {node_id}: {}",
+                 this build runs on {nodes}: {}",
                 withheld.len(),
                 name_list(&withheld)
             ),
@@ -1627,6 +1748,31 @@ impl BuildImageJob {
                 None
             };
 
+        // A mixed-architecture worker build: every platform on its own
+        // worker, natively and in parallel. Every other build -- including
+        // every single-architecture one -- takes the loop below unchanged.
+        if self.is_per_architecture_worker_build() {
+            let built = self
+                .build_on_platform_workers(
+                    context,
+                    &build_context,
+                    &dockerfile_path,
+                    &build_args,
+                    &build_args_buildkit,
+                )
+                .await?;
+            return Ok(ImageOutput {
+                image_tag: built.primary.image_name,
+                image_id: built.primary.image_id,
+                size_bytes: built.primary.size_bytes,
+                build_context,
+                dockerfile_path,
+                image_tags_by_platform: built.image_tags_by_platform,
+                builder_node_ids_by_platform: built.builder_node_ids_by_platform,
+                image_ids_by_platform: built.image_ids_by_platform,
+            });
+        }
+
         // One build per requested platform. The empty case (`None` platform)
         // is the single-architecture path every existing deployment takes.
         let platforms: Vec<Option<String>> = if self.build_config.target_platforms.is_empty() {
@@ -1668,8 +1814,12 @@ impl BuildImageJob {
                 image_name: tag.clone(),
                 context_path: build_context.clone(),
                 dockerfile_path: Some(dockerfile_path.clone()),
-                build_args: build_args.clone(),
-                build_args_buildkit: build_args_buildkit.clone(),
+                build_args: platform_build_args(&build_args, index, platform.as_deref()),
+                build_args_buildkit: platform_build_args(
+                    &build_args_buildkit,
+                    index,
+                    platform.as_deref(),
+                ),
                 platform: platform.clone(),
                 log_path: log_path.clone(),
             };
@@ -1746,10 +1896,15 @@ impl BuildImageJob {
                 // Same rule: a mislabelled secondary image drops its platform
                 // rather than failing every deployment in the cluster.
                 match self
-                    .verify_built_platform(&build_result.image_name, platform, context)
+                    .verify_built_platform(
+                        self.image_builder.as_ref(),
+                        &build_result.image_name,
+                        platform,
+                        context,
+                    )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         image_tags_by_platform.insert(
                             temps_deployer::platform::canonicalize_platform(platform),
                             build_result.image_name.clone(),
@@ -1805,7 +1960,281 @@ impl BuildImageJob {
             build_context,
             dockerfile_path,
             image_tags_by_platform,
+            builder_node_ids_by_platform: HashMap::new(),
+            image_ids_by_platform: HashMap::new(),
         })
+    }
+
+    /// The tag `platform_builders[index]` produces: the first platform owns
+    /// the plain tag, the rest are `-<arch>` suffixed, exactly as the
+    /// control plane's own multi-platform build names them.
+    fn platform_image_tag(&self, index: usize, platform: &str) -> String {
+        if index == 0 {
+            self.image_tag.clone()
+        } else {
+            format!(
+                "{}-{}",
+                self.image_tag,
+                temps_deployer::platform::platform_tag_suffix(platform)
+            )
+        }
+    }
+
+    /// A log callback that writes each build line under a `[platform]`
+    /// prefix, so parallel builds stay readable in one job log.
+    fn prefixed_log_callback(&self, platform: &str) -> Option<temps_deployer::LogCallback> {
+        let (Some(log_service), Some(log_id)) = (self.log_service.clone(), self.log_id.clone())
+        else {
+            return None;
+        };
+        let prefix = format!("[{platform}] ");
+        Some(Arc::new(move |line: String| {
+            let log_service = log_service.clone();
+            let log_id = log_id.clone();
+            let prefix = prefix.clone();
+            Box::pin(async move {
+                let level = Self::detect_log_level(&line);
+                let _ = log_service
+                    .append_structured_log(&log_id, level, format!("{prefix}{line}"))
+                    .await;
+            })
+        }))
+    }
+
+    /// Build every platform of a mixed-architecture deployment on its own
+    /// worker, natively, in parallel.
+    ///
+    /// Unlike the control plane's own cross-build, no platform is optional
+    /// here: a failure on any architecture fails the build, and the builds
+    /// still running are stopped, so a deployment never rolls out on only
+    /// some of its architectures. Nothing is emulated: each worker builds
+    /// the architecture it runs, which [`Self::verify_built_platform`] then
+    /// confirms from the image itself.
+    async fn build_on_platform_workers(
+        &self,
+        context: &WorkflowContext,
+        build_context: &Path,
+        dockerfile_path: &Path,
+        build_args: &HashMap<String, String>,
+        build_args_buildkit: &HashMap<String, String>,
+    ) -> Result<PerArchitectureBuild, WorkflowError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let plan: Vec<String> = self
+            .platform_builders
+            .iter()
+            .map(|b| {
+                format!(
+                    "{} on worker '{}' (id={})",
+                    b.platform, b.node_name, b.node_id
+                )
+            })
+            .collect();
+        self.log(
+            context,
+            format!(
+                "Mixed-architecture deployment: building {} images in parallel, each natively on \
+                 a worker of its own architecture: {}",
+                plan.len(),
+                plan.join("; ")
+            ),
+        )
+        .await?;
+
+        let mut builds: FuturesUnordered<_> = self
+            .platform_builders
+            .iter()
+            .enumerate()
+            .map(|(index, target)| async move {
+                let result = self
+                    .build_on_platform_worker(
+                        context,
+                        index,
+                        target,
+                        build_context,
+                        dockerfile_path,
+                        build_args,
+                        build_args_buildkit,
+                    )
+                    .await;
+                (index, result)
+            })
+            .collect();
+
+        let mut results: Vec<Option<(temps_deployer::BuildResult, String)>> =
+            (0..self.platform_builders.len()).map(|_| None).collect();
+        let mut failure: Option<(usize, WorkflowError)> = None;
+        while let Some((index, result)) = builds.next().await {
+            match result {
+                Ok(built) => results[index] = Some(built),
+                Err(error) => {
+                    failure = Some((index, error));
+                    break;
+                }
+            }
+        }
+        // Dropping the remaining futures closes their build streams, which
+        // stops those builds on their workers.
+        drop(builds);
+
+        if let Some((failed_index, error)) = failure {
+            let failed = &self.platform_builders[failed_index];
+            for (index, target) in self.platform_builders.iter().enumerate() {
+                if index != failed_index && results[index].is_none() {
+                    self.log_with_level(
+                        context,
+                        LogLevel::Warning,
+                        format!(
+                            "[{}] Build on worker '{}' stopped: the {} build failed",
+                            target.platform, target.node_name, failed.platform
+                        ),
+                    )
+                    .await?;
+                }
+            }
+            self.log_with_level(
+                context,
+                LogLevel::Error,
+                format!(
+                    "ERROR: The {} image could not be built on worker '{}' (id={}), so this \
+                     deployment is not rolled out on any architecture: {}",
+                    failed.platform, failed.node_name, failed.node_id, error
+                ),
+            )
+            .await?;
+            return Err(error);
+        }
+
+        let mut image_tags_by_platform = HashMap::new();
+        let mut builder_node_ids_by_platform = HashMap::new();
+        let mut image_ids_by_platform = HashMap::new();
+        let mut primary = None;
+        for (index, (target, built)) in self.platform_builders.iter().zip(results).enumerate() {
+            let built = built.ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Internal error: the {} build on worker '{}' (id={}) produced no result",
+                    target.platform, target.node_name, target.node_id
+                ))
+            })?;
+            let (built, image_id) = built;
+            let platform = temps_deployer::platform::canonicalize_platform(&target.platform);
+            image_tags_by_platform.insert(platform.clone(), built.image_name.clone());
+            image_ids_by_platform.insert(platform.clone(), image_id);
+            builder_node_ids_by_platform.insert(platform, target.node_id);
+            if index == 0 {
+                primary = Some(built);
+            }
+        }
+        let primary = primary.ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(
+                "Internal error: a mixed-architecture build had no platforms".to_string(),
+            )
+        })?;
+        self.log(
+            context,
+            format!(
+                "All {} architecture images built: {}",
+                image_tags_by_platform.len(),
+                plan.join("; ")
+            ),
+        )
+        .await?;
+        Ok(PerArchitectureBuild {
+            primary,
+            image_tags_by_platform,
+            builder_node_ids_by_platform,
+            image_ids_by_platform,
+        })
+    }
+
+    /// One platform of [`Self::build_on_platform_workers`].
+    #[allow(clippy::too_many_arguments)]
+    async fn build_on_platform_worker(
+        &self,
+        context: &WorkflowContext,
+        index: usize,
+        target: &WorkerPlatformBuilder,
+        build_context: &Path,
+        dockerfile_path: &Path,
+        build_args: &HashMap<String, String>,
+        build_args_buildkit: &HashMap<String, String>,
+    ) -> Result<(temps_deployer::BuildResult, String), WorkflowError> {
+        let platform = target.platform.as_str();
+        let tag = self.platform_image_tag(index, platform);
+        self.log(
+            context,
+            format!(
+                "[{platform}] Building '{tag}' on worker '{}' (id={})...",
+                target.node_name, target.node_id
+            ),
+        )
+        .await?;
+        let request = temps_deployer::BuildRequestWithCallback {
+            request: BuildRequest {
+                cache_from: self.build_config.cache_from.clone(),
+                image_name: tag.clone(),
+                context_path: build_context.to_path_buf(),
+                dockerfile_path: Some(dockerfile_path.to_path_buf()),
+                build_args: platform_build_args(build_args, index, Some(platform)),
+                build_args_buildkit: platform_build_args(
+                    build_args_buildkit,
+                    index,
+                    Some(platform),
+                ),
+                platform: Some(platform.to_string()),
+                log_path: std::env::temp_dir().join(format!(
+                    "build_{}_{}.log",
+                    self.job_id,
+                    temps_deployer::platform::platform_tag_suffix(platform)
+                )),
+            },
+            log_callback: self.prefixed_log_callback(platform),
+        };
+        let built = target
+            .builder
+            .build_image_with_callback(request)
+            .await
+            .map_err(|error| {
+                let reason = Self::describe_build_failure(
+                    Some(platform),
+                    &target.builder.get_native_platform(),
+                    &error,
+                );
+                WorkflowError::JobExecutionFailed(format!(
+                    "{reason} (built on worker '{}', id={})",
+                    target.node_name, target.node_id
+                ))
+            })?;
+        // The id the worker reports for the image it just built: what every
+        // later transfer of this tag, and every rollback reusing it, must
+        // match before the image is run anywhere else.
+        let image_id = self
+            .verify_built_platform(
+                target.builder.as_ref(),
+                &built.image_name,
+                platform,
+                context,
+            )
+            .await?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cannot verify the {platform} image '{}' built on worker '{}' (id={})",
+                    built.image_name, target.node_name, target.node_id
+                ))
+            })?;
+        self.log(
+            context,
+            format!(
+                "[{platform}] Image built on worker '{}': {} ({}), {} MB in {} ms",
+                target.node_name,
+                built.image_name,
+                built.image_id,
+                built.size_bytes / (1024 * 1024),
+                built.build_duration_ms
+            ),
+        )
+        .await?;
+        Ok((built, image_id))
     }
 
     /// Confirm the image the daemon produced is actually for the platform we
@@ -1825,12 +2254,13 @@ impl BuildImageJob {
     /// missing check must not block an otherwise fine build.
     async fn verify_built_platform(
         &self,
+        builder: &dyn ImageBuilder,
         image_name: &str,
         requested_platform: &str,
         context: &WorkflowContext,
-    ) -> Result<(), WorkflowError> {
-        let built_platform = match self.image_builder.inspect_image(image_name).await {
-            Ok(info) => info.platform,
+    ) -> Result<Option<String>, WorkflowError> {
+        let (built_platform, image_id) = match builder.inspect_image(image_name).await {
+            Ok(info) => (info.platform, info.id),
             Err(e) if self.remote_builder_node_id.is_some() => {
                 return Err(WorkflowError::JobExecutionFailed(format!(
                     "Cannot verify worker-built image '{image_name}' for {requested_platform}: {e}"
@@ -1842,21 +2272,26 @@ impl BuildImageJob {
                     "Could not inspect the built image to verify its platform: {}",
                     e
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
 
         if temps_deployer::platform::platforms_match(&built_platform, requested_platform) {
-            return Ok(());
+            return Ok(Some(image_id));
         }
 
+        let build_host = if self.remote_builder_node_id.is_some() {
+            "the worker that built it"
+        } else {
+            "the control plane"
+        };
         let msg = format!(
             "Build for {} produced a {} image ('{}'). The Docker daemon accepted the \
              requested platform but ignored it — this is what the legacy builder does. \
-             Enable BuildKit on the control plane (Docker 23+ enables it by default; \
+             Enable BuildKit on {} (Docker 23+ enables it by default; \
              otherwise set DOCKER_BUILDKIT=1 or install docker-buildx) and redeploy. \
              Deploying this image would fail on the target node with 'exec format error'.",
-            requested_platform, built_platform, image_name
+            requested_platform, built_platform, image_name, build_host
         );
         self.log(context, format!("ERROR: {}", msg)).await?;
         Err(WorkflowError::JobExecutionFailed(msg))
@@ -2069,6 +2504,19 @@ impl WorkflowTask for BuildImageJob {
             &image_output.image_tags_by_platform,
         )?;
         context.set_output(&self.job_id, "builder_node_id", self.remote_builder_node_id)?;
+        // Only a mixed-architecture worker build has more than one builder.
+        if !image_output.builder_node_ids_by_platform.is_empty() {
+            context.set_output(
+                &self.job_id,
+                "builder_node_ids_by_platform",
+                &image_output.builder_node_ids_by_platform,
+            )?;
+            context.set_output(
+                &self.job_id,
+                "image_ids_by_platform",
+                &image_output.image_ids_by_platform,
+            )?;
+        }
 
         // Read .temps.yaml health config and pass it to downstream jobs
         // The DeployImageJob will use this to configure its health check path
@@ -2199,6 +2647,7 @@ pub struct BuildImageJobBuilder {
     build_location_notice: Option<String>,
     control_plane_copy: Option<(Arc<dyn ImageBuilder>, String)>,
     worker_build_arg_keys: BTreeSet<String>,
+    platform_builders: Vec<WorkerPlatformBuilder>,
 }
 
 impl BuildImageJobBuilder {
@@ -2218,7 +2667,16 @@ impl BuildImageJobBuilder {
             build_location_notice: None,
             control_plane_copy: None,
             worker_build_arg_keys: BTreeSet::new(),
+            platform_builders: Vec::new(),
         }
+    }
+
+    /// Build each platform natively on its own worker (a mixed-architecture
+    /// deployment in the control-plane profile). The first builder owns the
+    /// plain tag and replaces the builder passed to [`Self::build`].
+    pub fn platform_builders(mut self, builders: Vec<WorkerPlatformBuilder>) -> Self {
+        self.platform_builders = builders;
+        self
     }
 
     /// Names of the build arguments whose values may be sent to a worker
@@ -2363,7 +2821,8 @@ impl BuildImageJobBuilder {
         job = job
             .with_build_location_notice(self.build_location_notice)
             .with_control_plane_copy(self.control_plane_copy)
-            .with_worker_build_arg_keys(self.worker_build_arg_keys);
+            .with_worker_build_arg_keys(self.worker_build_arg_keys)
+            .with_platform_builders(self.platform_builders);
 
         Ok(job)
     }
@@ -4129,7 +4588,12 @@ mod tests {
             .unwrap();
         let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
         assert!(job
-            .verify_built_platform("app:latest", "linux/arm64", &context)
+            .verify_built_platform(
+                job.image_builder.as_ref(),
+                "app:latest",
+                "linux/arm64",
+                &context
+            )
             .await
             .is_err());
     }
@@ -4856,5 +5320,401 @@ mod tests {
             !dir.path().join("nixpacks.toml").exists(),
             "a nixpacks.toml written after planning never influences the build"
         );
+    }
+
+    /// A worker of one architecture, for mixed-architecture build tests: it
+    /// builds natively, streams one build line, and reports `built_platform`
+    /// when the control plane inspects the result.
+    struct ArchWorker {
+        platform: &'static str,
+        built_platform: &'static str,
+        failure: Option<&'static str>,
+        /// Never finish, until the build future is dropped.
+        hang: bool,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+        requests: std::sync::Mutex<Vec<BuildRequest>>,
+    }
+
+    impl ArchWorker {
+        fn new(platform: &'static str) -> Self {
+            Self {
+                platform,
+                built_platform: platform,
+                failure: None,
+                hang: false,
+                stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn request(&self) -> BuildRequest {
+            self.requests.lock().unwrap()[0].clone()
+        }
+    }
+
+    /// Sets its flag when dropped: proves a hanging build was stopped.
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ImageBuilder for ArchWorker {
+        async fn build_image(&self, _request: BuildRequest) -> Result<BuildResult, BuilderError> {
+            unreachable!("worker builds stream their output")
+        }
+
+        async fn build_image_with_callback(
+            &self,
+            request: BuildRequestWithCallback,
+        ) -> Result<BuildResult, BuilderError> {
+            self.requests.lock().unwrap().push(request.request.clone());
+            if let Some(callback) = request.log_callback.as_ref() {
+                callback(format!("#1 building on {}", self.platform)).await;
+            }
+            if self.hang {
+                let _stopped = SetOnDrop(self.stopped.clone());
+                std::future::pending::<()>().await;
+            }
+            if let Some(failure) = self.failure {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                return Err(BuilderError::BuildFailed(failure.to_string()));
+            }
+            Ok(BuildResult {
+                image_id: format!("sha256:{}", self.platform.replace('/', "-")),
+                image_name: request.request.image_name,
+                size_bytes: 2 * 1024 * 1024,
+                build_duration_ms: 5,
+            })
+        }
+
+        async fn import_image(&self, _: PathBuf, _: &str) -> Result<String, BuilderError> {
+            unreachable!()
+        }
+
+        async fn extract_from_image(&self, _: &str, _: &str, _: &Path) -> Result<(), BuilderError> {
+            unreachable!()
+        }
+
+        async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
+            Ok(vec![])
+        }
+
+        async fn remove_image(&self, _: &str) -> Result<(), BuilderError> {
+            Ok(())
+        }
+
+        async fn inspect_image(
+            &self,
+            image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, BuilderError> {
+            Ok(temps_deployer::ImageInfo {
+                id: format!("sha256:{}", self.platform.replace('/', "-")),
+                architecture: temps_deployer::platform::platform_arch(self.built_platform),
+                os: "linux".to_string(),
+                platform: self.built_platform.to_string(),
+                size_bytes: 1,
+                tags: vec![image_name.to_string()],
+                created: None,
+                working_dir: None,
+            })
+        }
+
+        async fn save_image(&self, _: &str, _: &Path) -> Result<(), BuilderError> {
+            unreachable!()
+        }
+
+        fn get_native_platform(&self) -> String {
+            self.platform.to_string()
+        }
+    }
+
+    const CACHE_NS: &str = "0123456789abcdef";
+
+    fn per_architecture_job(
+        workers: &[(i32, &str, Arc<ArchWorker>)],
+        log_service: Option<Arc<LogService>>,
+    ) -> BuildImageJob {
+        let mut builder = BuildImageJobBuilder::new()
+            .job_id("build_image".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .local_workloads_enabled(false)
+            .build_args(vec![
+                (
+                    temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                    CACHE_NS.to_string(),
+                ),
+                ("PUBLIC_GREETING".to_string(), "hello".to_string()),
+                ("DATABASE_PASSWORD".to_string(), "do-not-send".to_string()),
+            ])
+            .worker_build_arg_keys(["PUBLIC_GREETING".to_string()])
+            .platform_builders(
+                workers
+                    .iter()
+                    .map(|(node_id, name, worker)| WorkerPlatformBuilder {
+                        platform: worker.platform.to_string(),
+                        node_id: *node_id,
+                        node_name: name.to_string(),
+                        builder: worker.clone(),
+                    })
+                    .collect(),
+            );
+        if let Some(log_service) = log_service {
+            builder = builder.log_id("build-log".into()).log_service(log_service);
+        }
+        builder.build(Arc::new(PanicsIfCalledImageBuilder)).unwrap()
+    }
+
+    fn per_architecture_context() -> (WorkflowContext, Arc<CapturingLogWriter>) {
+        let writer = Arc::new(CapturingLogWriter::default());
+        let context = WorkflowContext::new("wf".into(), 1, 1, 1, writer.clone());
+        (context, writer)
+    }
+
+    /// A mixed-architecture deployment builds each platform once, natively,
+    /// on the worker of that architecture: the first platform owns the plain
+    /// tag, each image records the worker that holds it, every build line is
+    /// prefixed with its platform, and each architecture gets its own
+    /// BuildKit cache namespace. No secret value reaches either worker.
+    #[tokio::test]
+    async fn mixed_architecture_build_runs_natively_on_one_worker_per_platform() {
+        let amd = Arc::new(ArchWorker::new("linux/amd64"));
+        let arm = Arc::new(ArchWorker::new("linux/arm64"));
+        let logs_dir = tempfile::tempdir().unwrap();
+        let log_service = Arc::new(LogService::new(logs_dir.path().to_path_buf()));
+        let job = per_architecture_job(
+            &[(4, "w-amd", amd.clone()), (5, "w-arm", arm.clone())],
+            Some(log_service.clone()),
+        );
+        assert_eq!(job.remote_builder_node_id, Some(4));
+        let (dir, repo) = repo_with_dockerfile();
+        let (context, writer) = per_architecture_context();
+
+        let output = job.build_image(&repo, &context).await.unwrap();
+        drop(dir);
+
+        assert_eq!(output.image_tag, "app:latest");
+        assert_eq!(output.image_id, "sha256:linux-amd64");
+        assert_eq!(
+            output.image_tags_by_platform,
+            HashMap::from([
+                ("linux/amd64".to_string(), "app:latest".to_string()),
+                ("linux/arm64".to_string(), "app:latest-arm64".to_string()),
+            ])
+        );
+        assert_eq!(
+            output.builder_node_ids_by_platform,
+            HashMap::from([
+                ("linux/amd64".to_string(), 4),
+                ("linux/arm64".to_string(), 5)
+            ])
+        );
+        // The id each worker reported for its own image, which every later
+        // transfer of that tag must match.
+        assert_eq!(
+            output.image_ids_by_platform,
+            HashMap::from([
+                ("linux/amd64".to_string(), "sha256:linux-amd64".to_string()),
+                ("linux/arm64".to_string(), "sha256:linux-arm64".to_string()),
+            ])
+        );
+
+        let (amd_request, arm_request) = (amd.request(), arm.request());
+        assert_eq!(amd_request.platform.as_deref(), Some("linux/amd64"));
+        assert_eq!(arm_request.platform.as_deref(), Some("linux/arm64"));
+        assert_eq!(amd_request.image_name, "app:latest");
+        assert_eq!(arm_request.image_name, "app:latest-arm64");
+        let ns = temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG;
+        assert_eq!(
+            amd_request.build_args.get(ns).map(String::as_str),
+            Some(CACHE_NS)
+        );
+        assert_eq!(
+            arm_request.build_args.get(ns).cloned(),
+            Some(format!("{CACHE_NS}-arm64"))
+        );
+        for request in [&amd_request, &arm_request] {
+            assert_eq!(
+                request
+                    .build_args
+                    .get("PUBLIC_GREETING")
+                    .map(String::as_str),
+                Some("hello")
+            );
+            assert!(!request.build_args.contains_key("DATABASE_PASSWORD"));
+            assert!(request.build_args_buildkit.is_empty());
+        }
+
+        let lines = writer.lines.lock().unwrap().join("\n");
+        assert!(lines.contains("building 2 images in parallel"), "{lines}");
+        assert!(
+            lines.contains("[linux/arm64] Building 'app:latest-arm64' on worker 'w-arm' (id=5)"),
+            "{lines}"
+        );
+        assert!(lines.contains("All 2 architecture images built"), "{lines}");
+        assert!(!lines.contains("do-not-send"), "{lines}");
+        let log = log_service
+            .get_structured_logs("build-log")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.message)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            log.contains("[linux/amd64] #1 building on linux/amd64"),
+            "{log}"
+        );
+        assert!(
+            log.contains("[linux/arm64] #1 building on linux/arm64"),
+            "{log}"
+        );
+        assert!(!log.contains("do-not-send"), "{log}");
+    }
+
+    /// One architecture failing fails the whole build with that
+    /// architecture's reason, and stops the builds still running: a
+    /// deployment never rolls out on only some of its architectures.
+    #[tokio::test]
+    async fn mixed_architecture_build_fails_whole_when_one_architecture_fails() {
+        let amd = Arc::new(ArchWorker {
+            hang: true,
+            ..ArchWorker::new("linux/amd64")
+        });
+        let arm = Arc::new(ArchWorker {
+            failure: Some("RUN npm ci exited with code 1"),
+            ..ArchWorker::new("linux/arm64")
+        });
+        let job = per_architecture_job(&[(4, "w-amd", amd.clone()), (5, "w-arm", arm)], None);
+        let (dir, repo) = repo_with_dockerfile();
+        let (context, writer) = per_architecture_context();
+
+        let error = tokio::time::timeout(Duration::from_secs(10), job.build_image(&repo, &context))
+            .await
+            .expect("a failed architecture must not wait for the others")
+            .unwrap_err();
+        drop(dir);
+
+        let message = error.to_string();
+        assert!(message.contains("linux/arm64"), "{message}");
+        assert!(
+            message.contains("RUN npm ci exited with code 1"),
+            "{message}"
+        );
+        assert!(message.contains("worker 'w-arm', id=5"), "{message}");
+        assert!(
+            amd.stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "the amd64 build still running must be stopped"
+        );
+        let lines = writer.lines.lock().unwrap().join("\n");
+        assert!(
+            lines.contains(
+                "[linux/amd64] Build on worker 'w-amd' stopped: the linux/arm64 build failed"
+            ),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("not rolled out on any architecture"),
+            "{lines}"
+        );
+    }
+
+    /// A worker whose image is not the architecture it was asked to build is
+    /// a failure, never a mislabelled image deployed to the wrong nodes.
+    #[tokio::test]
+    async fn mixed_architecture_build_refuses_an_image_of_the_wrong_architecture() {
+        let amd = Arc::new(ArchWorker::new("linux/amd64"));
+        let arm = Arc::new(ArchWorker {
+            built_platform: "linux/amd64",
+            ..ArchWorker::new("linux/arm64")
+        });
+        let job = per_architecture_job(&[(4, "w-amd", amd), (5, "w-arm", arm)], None);
+        let (dir, repo) = repo_with_dockerfile();
+        let (context, _writer) = per_architecture_context();
+
+        let error = job.build_image(&repo, &context).await.unwrap_err();
+        drop(dir);
+        let message = error.to_string();
+        assert!(
+            message.contains("Build for linux/arm64 produced a linux/amd64 image"),
+            "{message}"
+        );
+    }
+
+    /// The job's outputs carry each architecture's builder, which the deploy
+    /// and rollback paths read back; a single-architecture build records no
+    /// such map, exactly as before.
+    #[tokio::test]
+    async fn mixed_architecture_build_records_each_builder_in_its_outputs() {
+        let amd = Arc::new(ArchWorker::new("linux/amd64"));
+        let arm = Arc::new(ArchWorker::new("linux/arm64"));
+        let job = per_architecture_job(&[(4, "w-amd", amd), (5, "w-arm", arm)], None);
+        let (dir, _repo) = repo_with_dockerfile();
+        let (mut context, _writer) = per_architecture_context();
+        for (key, value) in [
+            ("repo_dir", dir.path().to_string_lossy().to_string()),
+            ("checkout_ref", "main".to_string()),
+            ("repo_owner", "owner".to_string()),
+            ("repo_name", "repo".to_string()),
+        ] {
+            context.set_output("download_repo", key, value).unwrap();
+        }
+
+        let result = job.execute(context).await.unwrap();
+        let outputs = &result.context;
+        let by_platform: HashMap<String, i32> = outputs
+            .get_output("build_image", "builder_node_ids_by_platform")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            by_platform,
+            HashMap::from([
+                ("linux/amd64".to_string(), 4),
+                ("linux/arm64".to_string(), 5)
+            ])
+        );
+        let primary: Option<i32> = outputs
+            .get_output("build_image", "builder_node_id")
+            .unwrap();
+        assert_eq!(primary, Some(4));
+        let image_ids: HashMap<String, String> = outputs
+            .get_output("build_image", "image_ids_by_platform")
+            .unwrap()
+            .unwrap();
+        assert_eq!(image_ids.len(), 2);
+        let image = ImageOutput::from_context(outputs, "build_image").unwrap();
+        assert_eq!(image.builder_node_ids_by_platform, by_platform);
+        assert_eq!(image.image_ids_by_platform, image_ids);
+    }
+
+    /// A single-architecture build -- one platform, or the control plane's
+    /// own multi-platform loop -- keeps the plain cache namespace and is not
+    /// spread across workers.
+    #[test]
+    fn single_architecture_builds_keep_their_cache_namespace() {
+        let ns = temps_deployer::build_protocol::CACHE_MOUNT_NAMESPACE_ARG;
+        let args = HashMap::from([(ns.to_string(), CACHE_NS.to_string())]);
+        assert_eq!(platform_build_args(&args, 0, Some("linux/arm64")), args);
+        assert_eq!(platform_build_args(&args, 0, None), args);
+        assert_eq!(
+            platform_build_args(&args, 1, Some("linux/arm/v7"))[ns],
+            format!("{CACHE_NS}-arm-v7")
+        );
+        let no_namespace = HashMap::from([("A".to_string(), "1".to_string())]);
+        assert_eq!(
+            platform_build_args(&no_namespace, 1, Some("linux/arm64")),
+            no_namespace
+        );
+
+        let one = per_architecture_job(
+            &[(4, "w-amd", Arc::new(ArchWorker::new("linux/amd64")))],
+            None,
+        );
+        assert!(!one.is_per_architecture_worker_build());
+        assert_eq!(one.worker_nodes_phrase(4), "worker node 4");
     }
 }

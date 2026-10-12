@@ -1025,6 +1025,9 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "does not match the specified platform",
         ],
     ) || r.contains("no node can run this image")
+        // A mixed-architecture deployment with an architecture no worker
+        // can build natively (`NoBuilderForArchitecture`).
+        || r.contains("worker can build its image")
         || (r.contains("built for")
             && contains_any(r, &["but the control plane runs", "but node '"]));
     if platform_mismatch {

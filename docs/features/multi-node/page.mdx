@@ -657,12 +657,13 @@ file-type limits as a local build, and serves it from its own proxy like any
 other static deployment. Static output does not depend on CPU architecture, so
 any eligible worker can build it, including on a mixed-architecture cluster.
 
+When the nodes a deployment may run on span **more than one architecture**
+(for example arm64 and amd64 workers), it builds one image per architecture,
+each natively on a worker of that architecture, in parallel — see
+[Worker builds on a mixed cluster](#mixed-architecture-worker-builds).
+
 Current limits of worker builds:
 
-- **One target architecture per container image.** If the nodes a deployment
-  may run on span more than one architecture, it fails before any source is
-  uploaded and asks you to restrict target nodes or labels to one
-  architecture, or to deploy a prebuilt multi-platform registry image.
 - **Secrets stay on the control plane.** A worker build receives the values
   of variables that are not secret: your project variables that are not marked
   secret, and the platform's public ones (the bind address, the browser
@@ -761,6 +762,43 @@ excluded from the deployment — the rest of the cluster still deploys normally.
 If emulated build times don't suit you, the alternatives are to restrict the
 environment to nodes of a single architecture with target nodes or labels, or
 to push a pre-built image.
+
+### Worker builds on a mixed cluster {{ anchor: true, id: 'mixed-architecture-worker-builds' }}
+
+With `--profile control-plane`, a deployment whose eligible nodes span several
+architectures needs no setting and no emulation. Temps builds each
+architecture on a worker of that architecture — a `temps.sh/role=builder`
+node when there is one, otherwise a worker the deployment could run on — and
+all of them in parallel. The first architecture keeps the plain tag; the
+others are suffixed, as above. A cluster whose workers share one architecture
+builds once, exactly as before.
+
+- **Logs.** Every line of each build is prefixed with its platform
+  (`[linux/arm64] ...`) in the deployment's build log, followed by which
+  worker built which image.
+- **All or nothing.** If one architecture fails, the builds still running are
+  stopped and the deployment fails with that architecture's error. It is never
+  rolled out on only some of its architectures.
+- **Placement.** Each replica lands on a node whose architecture has an image,
+  and receives that image from the worker that built it, over the same
+  authenticated agent channel as any other worker-built image. Rollbacks and
+  promotions reuse the same per-architecture images; a replica that moves to a
+  node of another architecture runs that architecture's image, and a deploy
+  that would need an architecture it never built fails instead of running the
+  wrong one.
+- **Caches.** Each architecture gets its own `RUN --mount=type=cache`
+  namespace, so native artifacts (`node_modules`, `target/`) built for one
+  architecture are never reused by another.
+- **No worker for an architecture.** Before anything is built, each chosen
+  worker is checked over its agent connection (10-second limit). Candidates
+  are tried in order: every `temps.sh/role=builder` node of that
+  architecture, lowest id first, then the workers the deployment could run
+  on. An unreachable worker, or one whose agent reports another
+  architecture, is replaced by the next candidate; if none is left, the
+  deployment fails naming the architecture, for example
+  `Deployment 42 targets linux/amd64 nodes, but no linux/amd64 worker can
+  build its image`. Bring such a worker online, or restrict target nodes or
+  labels to the architectures that have one.
 
 ### Replica counts on a mixed cluster
 
