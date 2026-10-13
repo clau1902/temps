@@ -93,7 +93,7 @@ function PublicLinkRow({
           <Button variant="outline" size="sm" asChild>
             <a href={url} target="_blank" rel="noreferrer">
               <ExternalLink className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">Open</span>
+              <span className="max-sm:sr-only">Open</span>
             </a>
           </Button>
         )}

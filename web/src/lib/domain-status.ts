@@ -67,3 +67,89 @@ export function failedRetryAction(
 ): FailedRetryAction {
   return !order || isTerminalOrderStatus(order.status) ? 'new-order' : 'verify'
 }
+
+/**
+ * Statuses a domain passes through on its way to a certificate: the order is
+ * being set up, waiting for the challenge to be published, or being validated
+ * and issued. Anything else (`active`, `active_renewal_failed`, `failed`,
+ * `expired`, ...) is settled until the operator acts again.
+ */
+export const ISSUANCE_IN_FLIGHT_STATUSES: readonly string[] = [
+  'pending',
+  'pending_dns',
+  'pending_http',
+  'challenge_requested',
+  'processing',
+  'on_demand_issuing',
+]
+
+/** True while issuance may still move the domain to a different status. */
+export function isIssuanceInFlight(status: string | null | undefined): boolean {
+  return !!status && ISSUANCE_IN_FLIGHT_STATUSES.includes(status)
+}
+
+/** How often to re-read a domain that is mid-issuance. */
+export const DOMAIN_POLL_FAST_MS = 3_000
+/** Back-off once a status has stayed in flight for a minute or so. */
+export const DOMAIN_POLL_SLOW_MS = 15_000
+/** Number of fast reads before backing off (~1 minute at the fast rate). */
+export const DOMAIN_POLL_FAST_READS = 20
+
+/**
+ * ACME order statuses after which the order cannot change on its own: the
+ * terminal ones above, plus `valid` (issued).
+ */
+export const ORDER_SETTLED_STATUSES: readonly string[] = [
+  'valid',
+  ...TERMINAL_ORDER_STATUSES,
+]
+
+/** How long a settled domain keeps re-reading an order that is still open. */
+export const ORDER_CATCH_UP_WINDOW_MS = 60_000
+
+/**
+ * `refetchInterval` for the order read that sits beside a domain.
+ *
+ * The domain and the order poll on independent timers, so the domain can be
+ * seen as `failed` while the last order read still says `pending`. Following
+ * the domain status alone would stop polling at that moment and leave the
+ * stale order next to a fresh `failed` badge, so the order keeps polling
+ * until it has settled itself, for at most `ORDER_CATCH_UP_WINDOW_MS` after
+ * the domain settled.
+ */
+export function orderRefetchInterval(
+  domainStatus: string | null | undefined,
+  orderStatus: string | null | undefined,
+  readCount: number,
+  /** The order's latest read time minus the domain's, in ms. */
+  msSinceDomainSettled: number
+): number | false {
+  if (isIssuanceInFlight(domainStatus)) {
+    return domainRefetchInterval(domainStatus, readCount)
+  }
+  const orderSettled =
+    !orderStatus || ORDER_SETTLED_STATUSES.includes(orderStatus)
+  // Bounded by time since the *domain* settled, not by the order's own read
+  // count: an issuance that ran for minutes has long used up its reads, and
+  // the catch-up read is needed exactly then.
+  if (orderSettled || msSinceDomainSettled >= ORDER_CATCH_UP_WINDOW_MS) {
+    return false
+  }
+  return DOMAIN_POLL_FAST_MS
+}
+
+/**
+ * React Query `refetchInterval` for a domain read: poll while issuance is in
+ * flight, and stop (`false`) as soon as the status is settled so a failed
+ * attempt shows up without a reload and a finished one stops costing requests.
+ * `readCount` is how many successful reads the query has already made.
+ */
+export function domainRefetchInterval(
+  status: string | null | undefined,
+  readCount: number
+): number | false {
+  if (!isIssuanceInFlight(status)) return false
+  return readCount < DOMAIN_POLL_FAST_READS
+    ? DOMAIN_POLL_FAST_MS
+    : DOMAIN_POLL_SLOW_MS
+}

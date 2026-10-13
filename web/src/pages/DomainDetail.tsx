@@ -68,9 +68,12 @@ import {
 import {
   STATUS_ACTIVE_RENEWAL_FAILED,
   type FailedRetryAction,
+  domainRefetchInterval,
   failedRetryAction,
+  isIssuanceInFlight,
   isServingCert,
   isTerminalOrderStatus,
+  orderRefetchInterval,
 } from '@/lib/domain-status'
 import {
   selectCustomDomainLookup,
@@ -105,7 +108,7 @@ import {
   Wand2,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
@@ -138,6 +141,15 @@ export function DomainDetail() {
     ...getDomainByIdOptions({ path: { domain: Number(id) } }),
     enabled: !!id,
     retry: false,
+    // The backend moves a domain between statuses on its own (a failed
+    // validation flips it to `failed` while the page still shows
+    // `challenge_requested`). Poll while issuance is in flight; the interval
+    // is `false` for settled statuses, so polling stops by itself.
+    refetchInterval: (query) =>
+      domainRefetchInterval(
+        query.state.data?.status,
+        query.state.dataUpdateCount
+      ),
   })
   const domain = domainQuery.data
 
@@ -252,6 +264,22 @@ export function DomainDetail() {
     // `null` once loaded means the domain has no ACME order (not an error).
     select: selectDomainOrder,
     retry: false,
+    // The order carries the per-authorization error. It follows the domain's
+    // polling and keeps going until the order itself has settled, so a domain
+    // seen as `failed` between two order reads never sits beside a stale
+    // `pending` order.
+    refetchInterval: (query) =>
+      orderRefetchInterval(
+        domain?.status,
+        // `state.data` is the raw response, ahead of `select`.
+        query.state.data?.order?.status,
+        query.state.dataUpdateCount,
+        // The domain stops polling when it settles, so its last read is the
+        // moment it was seen settled; the order's own last read, relative to
+        // that, is how long the catch-up has been running.
+        query.state.dataUpdatedAt -
+          (queryClient.getQueryState(domainQueryKey)?.dataUpdatedAt ?? 0)
+      ),
   })
 
   const order = orderQuery.data ?? undefined
@@ -352,6 +380,27 @@ export function DomainDetail() {
 
   usePageTitle(domain ? `${domain.domain} - Domain Details` : 'Domain Details')
 
+  // Tell the operator when a certificate they were waiting on lands, even if
+  // they never saw the intermediate statuses.
+  const previousStatus = useRef<string | undefined>(undefined)
+  const currentStatus = domain?.status
+  useEffect(() => {
+    if (
+      currentStatus === 'active' &&
+      isIssuanceInFlight(previousStatus.current)
+    ) {
+      toast.success('TLS certificate is now active!')
+    }
+    previousStatus.current = currentStatus
+  }, [currentStatus])
+
+  // A failed mutation usually leaves the backend in a new state (a failed
+  // validation sets `failed` and `last_error`), so re-read instead of keeping
+  // the status the page was showing before the attempt.
+  const refreshAfterFailure = async () => {
+    await refreshAll()
+  }
+
   const createOrder = useMutation({
     ...createOrRecreateOrderMutation(),
     meta: { errorTitle: 'Failed to create ACME order' },
@@ -359,6 +408,7 @@ export function DomainDetail() {
       toast.success('ACME order created successfully')
       await refreshAll()
     },
+    onError: refreshAfterFailure,
   })
 
   const finalizeOrder = useMutation({
@@ -367,27 +417,15 @@ export function DomainDetail() {
     // A failed verification changes server state (the domain moves to `failed`
     // with the error, and the CA may invalidate the order). Refetch right away
     // so the page does not keep showing `challenge_requested` until a reload.
-    onError: async () => {
-      await refreshAll()
-    },
+    // A failed validation is returned as an error, so `onSuccess` never runs.
+    onError: refreshAfterFailure,
     onSuccess: async () => {
       toast.success(
         'DNS challenge verified! TLS certificate provisioning in progress.'
       )
+      // The domain query keeps polling while issuance is in flight and the
+      // effect above announces the active certificate.
       await refreshAll()
-
-      const pollInterval = setInterval(async () => {
-        await refreshAll()
-        const latest = queryClient.getQueryData(domainQueryKey) as
-          { status?: string } | undefined
-        if (latest?.status === 'active') {
-          clearInterval(pollInterval)
-          toast.success('TLS certificate is now active!')
-          await refreshAll()
-        }
-      }, 3000)
-
-      setTimeout(() => clearInterval(pollInterval), 120000)
     },
   })
 
@@ -417,6 +455,7 @@ export function DomainDetail() {
       }
       await refreshAll()
     },
+    onError: refreshAfterFailure,
   })
 
   const setupDns = useMutation({
@@ -435,6 +474,7 @@ export function DomainDetail() {
       })
       await refreshAll()
     },
+    onError: refreshAfterFailure,
   })
 
   const handleCreateOrder = () => {
@@ -1490,14 +1530,14 @@ function DnsRecordsList({
               minimal
               className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
             >
-              <span className="hidden sm:inline">Name</span>
+              <span className="max-sm:sr-only">Name</span>
             </CopyButton>
             <CopyButton
               value={record.value}
               minimal
               className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
             >
-              <span className="hidden sm:inline">Value</span>
+              <span className="max-sm:sr-only">Value</span>
             </CopyButton>
           </div>
         </div>

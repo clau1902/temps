@@ -404,7 +404,7 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
               onClick={() => unpublish.mutate(path)}
             >
               <EyeOff className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">
+              <span className="max-sm:sr-only">
                 {unpublish.isPending ? 'Unpublishing...' : 'Unpublish'}
               </span>
             </Button>
@@ -414,7 +414,7 @@ export function StatusPageDetail({ project }: { project: ProjectResponse }) {
               onClick={() => publish.mutate(path)}
             >
               <Eye className="size-4 sm:mr-2" />
-              <span className="hidden sm:inline">
+              <span className="max-sm:sr-only">
                 {publish.isPending ? 'Publishing...' : 'Publish'}
               </span>
             </Button>
