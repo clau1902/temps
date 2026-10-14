@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useServiceGroup } from '@/components/project-groups/ServiceGroupControl'
+import { groupHref, TERMS } from '@/lib/terminology'
 import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import {
   getLastDeploymentOptions,
@@ -162,8 +164,8 @@ export function ProjectDetail() {
         : 'Variable not found')
   const isVariableRoute = !!variableRoute
 
-  const { data: lastDeploymentOrNull, isLoading: isLoadingLastDeployment } = useQuery(
-    {
+  const { data: lastDeploymentOrNull, isLoading: isLoadingLastDeployment } =
+    useQuery({
       ...getLastDeploymentOptions({
         path: {
           id: project?.id || 0,
@@ -189,8 +191,7 @@ export function ProjectDetail() {
       },
       // Also refetch when window regains focus
       refetchOnWindowFocus: true,
-    }
-  )
+    })
   // The API answers 200 with `deployment: null` for a project that has never
   // deployed; consumers take `undefined` for "nothing yet".
   const lastDeployment = lastDeploymentOrNull ?? undefined
@@ -304,7 +305,7 @@ export function ProjectDetail() {
         savedRuntime.image_ref ||
         lastDeployment?.metadata?.externalImageRef
       if (!imageRef) {
-        toast.error('No image reference found for this project')
+        toast.error('No image reference found for this service')
         return
       }
       await deployImage.mutateAsync({
@@ -323,12 +324,21 @@ export function ProjectDetail() {
     navigate(deploymentsAfterStartPath(project.slug))
   }
 
+  // Breadcrumb shows the project (group) this service belongs to.
+  const serviceGroup = useServiceGroup(project?.id).data?.group ?? null
+
   useEffect(() => {
     const projectPath = `/projects/${project?.slug || slug}`
     const variablesPath = `${projectPath}/environment-variables`
     setBreadcrumbs([
       { label: 'Projects', href: '/projects' },
-      { label: project?.slug || 'Project Details', href: projectPath },
+      ...(serviceGroup
+        ? [{ label: serviceGroup.name, href: groupHref(serviceGroup.slug) }]
+        : []),
+      {
+        label: project?.slug || `${TERMS.service.singular} details`,
+        href: projectPath,
+      },
       ...(isVariableRoute
         ? [
             { label: 'Environment Variables', href: variablesPath },
@@ -349,6 +359,7 @@ export function ProjectDetail() {
   }, [
     setBreadcrumbs,
     project?.slug,
+    serviceGroup,
     slug,
     isVariableRoute,
     breadcrumbVariableId,
@@ -386,7 +397,7 @@ export function ProjectDetail() {
     return (
       <div className="p-4 sm:p-6">
         <ErrorAlert
-          title="Failed to load project"
+          title="Failed to load service"
           description={
             readFailureServerDetail(error) ?? readFailureExplanation(error)
           }
@@ -616,7 +627,6 @@ export function ProjectDetail() {
             repository?.clone_url || project.git_url || undefined
           }
           repositoryProviderType={repositoryProviderType}
-          lastDeployment={lastDeployment}
           lastDeploymentUrl={
             lastDeployment ? resolveStableUrl(lastDeployment) : null
           }
@@ -650,7 +660,7 @@ export function ProjectDetail() {
               <ShieldAlert className="h-4 w-4 text-primary" />
               <AlertDescription className="flex items-center justify-between">
                 <span className="text-foreground">
-                  Attack Mode is enabled for this project
+                  Attack Mode is enabled for this service
                 </span>
                 <Button
                   variant="ghost"

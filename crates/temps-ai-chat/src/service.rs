@@ -11101,6 +11101,7 @@ mod tests {
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
             name: name.to_string(),
             repo_name: "r".to_string(),
@@ -11125,6 +11126,7 @@ mod tests {
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             ai_debug_chat_enabled: toggle,
             ai_write_actions_enabled: false,
             error_source_context_enabled: false,

@@ -619,7 +619,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           disabled={projectsLoading || projects.length === 0 || bulk.isPending}
         >
           <SelectTrigger className="w-full sm:w-[240px]">
-            <SelectValue placeholder="Select a project…" />
+            <SelectValue placeholder="Select a service…" />
           </SelectTrigger>
           <SelectContent>
             {projects.map((p) => (
@@ -818,8 +818,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                     <EmptyState
                       size="compact"
                       icon={AlarmClock}
-                      title="No project selected"
-                      description="Select a project to view its alarm history."
+                      title="No service selected"
+                      description="Select a service to view its alarm history."
                     />
                   </TableCell>
                 </TableRow>
@@ -859,7 +859,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                       description={
                         hasFilters
                           ? 'Try adjusting your filters to see more results.'
-                          : 'Nothing has fired for this project yet.'
+                          : 'Nothing has fired for this service yet.'
                       }
                     />
                   </TableCell>
@@ -1087,8 +1087,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmAction === 'acknowledge'
-                ? 'Every firing alarm in this project that matches the current filters — including ones on other pages — will be marked acknowledged.'
-                : 'Every firing or acknowledged alarm in this project that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
+                ? 'Every firing alarm in this service that matches the current filters — including ones on other pages — will be marked acknowledged.'
+                : 'Every firing or acknowledged alarm in this service that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

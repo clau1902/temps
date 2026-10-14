@@ -59,7 +59,7 @@ function inputNamed(
   return attrs
 }
 
-test('project name and slug inputs are named by their visible labels', () => {
+test('service name and slug inputs are named by their visible labels', () => {
   const markup = render()
 
   const nameInput = inputNamed(markup, 'name')
@@ -69,8 +69,8 @@ test('project name and slug inputs are named by their visible labels', () => {
   expect(nameInput?.id).not.toEqual(slugInput?.id)
 
   // getByLabelText resolves exactly this: label[for] -> control#id.
-  expect(labelFor(markup, nameInput?.id ?? '')).toBe('Project Name')
-  expect(labelFor(markup, slugInput?.id ?? '')).toBe('Project Slug')
+  expect(labelFor(markup, nameInput?.id ?? '')).toBe('Service name')
+  expect(labelFor(markup, slugInput?.id ?? '')).toBe('Service slug')
 })
 
 test('both settings switches are named by their labels', () => {
@@ -79,7 +79,7 @@ test('both settings switches are named by their labels', () => {
   expect(markup).toContain('id="cross-project-trace-sharing"')
   expect(markup).toContain('role="switch"')
   expect(labelFor(markup, 'cross-project-trace-sharing')).toBe(
-    'Cross-project trace sharing'
+    'Cross-service trace sharing'
   )
   expect(markup).toContain('id="error-source-context"')
   expect(labelFor(markup, 'error-source-context')).toBe(

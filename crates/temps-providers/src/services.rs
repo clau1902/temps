@@ -20782,6 +20782,7 @@ mod tests {
             source_type: Default::default(),
             project_type: temps_entities::types::ProjectType::Server,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             template_slug: None,
             service_template: None,
             gitlab_webhook_id: None,
@@ -20797,6 +20798,7 @@ mod tests {
             cloud_telemetry_attribute_allowlist: Vec::new(),
             cloud_telemetry_write_mode: Default::default(),
             cloud_analytics_write_mode: Default::default(),
+            instantiation_token: None,
         }
     }
 

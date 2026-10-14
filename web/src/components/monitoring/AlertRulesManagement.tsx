@@ -188,13 +188,13 @@ export function AlertRulesManagement({
     return (
       <EmptyState
         icon={ShieldAlert}
-        title="No projects found"
-        description="Error alert rules belong to a project. Create one to configure them."
+        title="No services found"
+        description="Error alert rules belong to a service. Create one to configure them."
         action={
           <Button asChild>
             <Link to="/projects/new">
               <Plus className="h-4 w-4 mr-2" />
-              Create project
+              Create service
             </Link>
           </Button>
         }
@@ -229,9 +229,9 @@ export function AlertRulesManagement({
             >
               <SelectTrigger
                 className="w-full sm:w-[200px]"
-                aria-label="Project"
+                aria-label="Service"
               >
-                <SelectValue placeholder="Select project" />
+                <SelectValue placeholder="Select service" />
               </SelectTrigger>
               <SelectContent>
                 {projectList!.map((p) => (

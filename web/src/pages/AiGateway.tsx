@@ -3371,10 +3371,10 @@ export function AgentActivity() {
               onValueChange={(v) => setSelectedProjectId(Number(v))}
             >
               <SelectTrigger
-                aria-label="Project"
+                aria-label="Service"
                 className="w-full sm:w-[180px]"
               >
-                <SelectValue placeholder="Select project" />
+                <SelectValue placeholder="Select service" />
               </SelectTrigger>
               <SelectContent>
                 {projects.map((p) => (
@@ -3414,8 +3414,8 @@ export function AgentActivity() {
       {!projectId ? (
         <EmptyState
           icon={Bot}
-          title="No project selected"
-          description="Select a project to view AI agent activity traces."
+          title="No service selected"
+          description="Select a service to view AI agent activity traces."
         />
       ) : tracesLoading ? (
         <div className="space-y-2">

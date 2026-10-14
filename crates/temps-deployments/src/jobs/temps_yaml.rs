@@ -123,6 +123,8 @@ pub(crate) mod test_support {
             project_type: temps_entities::types::ProjectType::Server,
             template_slug: None,
             service_template: None,
+            hosting: Default::default(),
+            instantiation_token: None,
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,

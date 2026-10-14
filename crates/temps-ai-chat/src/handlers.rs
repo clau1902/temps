@@ -2236,6 +2236,7 @@ async fn create_starter_project(
             memory_limit: None,
             source_type: SourceType::UploadedSource,
             template_slug: None,
+            hosting: Default::default(),
         })
         .await
 }

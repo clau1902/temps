@@ -14,7 +14,10 @@ import {
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { revealServiceParameter } from '@/api/client/sdk.gen'
+import {
+  revealServiceEnvironmentVariables,
+  revealServiceParameter,
+} from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
 import {
   externalServiceBackupsQueryKey,
@@ -413,9 +416,9 @@ export function ServiceDetail() {
 
   const linkService = useMutation({
     ...linkServiceToProjectMutation(),
-    meta: { errorTitle: 'Failed to link project' },
+    meta: { errorTitle: 'Failed to link service' },
     onSuccess: (_data, variables) => {
-      toast.success('Project linked successfully')
+      toast.success('Service linked successfully')
       refetchLinkedProjects()
       setIsLinkPopoverOpen(false)
       const project = allProjectsData?.projects?.find(
@@ -796,7 +799,7 @@ export function ServiceDetail() {
               <PopoverContent className="w-[320px] p-0" align="end">
                 <div className="border-b p-3">
                   <p className="text-xs font-medium text-muted-foreground">
-                    Linked projects
+                    Linked services
                   </p>
                   <LinkedResourceNote
                     serviceType={service.service.service_type}
@@ -826,14 +829,14 @@ export function ServiceDetail() {
                     </ul>
                   ) : (
                     <p className="mt-2 text-xs text-muted-foreground">
-                      No projects yet.
+                      No services linked yet.
                     </p>
                   )}
                 </div>
                 <Command>
-                  <CommandInput placeholder="Link a project..." />
+                  <CommandInput placeholder="Link a service..." />
                   <CommandList>
-                    <CommandEmpty>No projects found.</CommandEmpty>
+                    <CommandEmpty>No services found.</CommandEmpty>
                     <CommandGroup>
                       {allProjectsData?.projects
                         ?.filter(
@@ -1866,8 +1869,8 @@ export function ServiceDetail() {
               <CardHeader>
                 <CardTitle>Environment Variables</CardTitle>
                 <CardDescription>
-                  Preview of environment variables available to projects using
-                  this service
+                  Preview of environment variables available to the services
+                  linked to it
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -1888,15 +1891,24 @@ export function ServiceDetail() {
                 ) : envVars ? (
                   <>
                     <EnvVariablesDisplay
+                      key={id}
                       variables={envVars}
                       showCopy={true}
                       showMaskToggle={true}
                       defaultMasked={true}
                       maxHeight="20rem"
+                      reveal={async () =>
+                        (
+                          await revealServiceEnvironmentVariables({
+                            path: { id: parseInt(id!) },
+                            throwOnError: true,
+                          })
+                        ).data
+                      }
                     />
                     <p className="text-xs text-muted-foreground text-center mt-3">
-                      These variables are automatically available to projects
-                      that use this service
+                      These variables are automatically available to every
+                      linked service
                     </p>
                   </>
                 ) : null}
@@ -1915,8 +1927,8 @@ export function ServiceDetail() {
               <span className="font-medium text-foreground">
                 {service.service.name}
               </span>
-              ? All connected projects will lose access to this service until it
-              is started again.
+              ? Every linked service will lose access to it until it is started
+              again.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

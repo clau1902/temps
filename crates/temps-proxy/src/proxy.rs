@@ -45,8 +45,9 @@ use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::static_file_serving::{
     bounded_cas_etag, bounded_log_value, canonical_redirect_location, cap_static_chunk,
     if_none_match_matches, metadata_etag, object_etag, open_static_file, opened_cas_size_matches,
-    read_static_chunk, resolve_static_object_request, static_not_found_contract, static_object_key,
-    unavailable_outcome, StaticFileMatch, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
+    read_static_chunk, resolve_static_object_request, static_mount_prefix,
+    static_not_found_contract, static_object_key, unavailable_outcome, StaticFileMatch,
+    StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
 };
 use crate::tls_fingerprint;
 use crate::traits::*;
@@ -1095,6 +1096,11 @@ pub struct ProxyContext {
     /// project/environment resolved for this request — e.g. console/preview
     /// traffic).
     pub connection_permit: Option<crate::connection_limiter::ConnectionPermit>,
+    /// Set when the host's environment hands this path to another service of
+    /// its project (ADR 050). Resolved once from the in-memory route table;
+    /// project context, static serving and the upstream peer all follow the
+    /// target instead of the host's own service.
+    pub path_route: Option<temps_routes::PathRoute>,
 }
 
 /// Main load balancer proxy implementation using traits
@@ -2962,6 +2968,36 @@ impl LoadBalancer {
         builder.build().to_string()
     }
 
+    /// Serve the static target the request resolved to, honouring a path
+    /// route.
+    ///
+    /// A stripping path route looks the file up without its prefix, so
+    /// `ctx.path` holds the route-relative path while the file is served and
+    /// the requested path again afterwards (the request log keeps it). Every
+    /// absolute path the static layer writes back to the client is built from
+    /// the route-relative `ctx.path` and must be re-mounted under the route
+    /// prefix by the writer (see [`static_mount_prefix`]).
+    async fn serve_static_target(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        static_dir: &str,
+    ) -> Result<StaticFileServeOutcome> {
+        let requested_path = ctx
+            .path_route
+            .as_ref()
+            .filter(|route| route.strip_prefix)
+            .map(|route| {
+                let target_path = route.upstream_path(&ctx.path);
+                std::mem::replace(&mut ctx.path, target_path)
+            });
+        let served = self.serve_static_file(session, ctx, static_dir).await;
+        if let Some(requested_path) = requested_path {
+            ctx.path = requested_path;
+        }
+        served
+    }
+
     /// Serve a static file from the filesystem using fixed-size response chunks.
     ///
     /// Filesystem/path failures are deliberately returned as a uniform not-found
@@ -3168,7 +3204,11 @@ impl LoadBalancer {
         ctx: &mut ProxyContext,
         page_content_type: &str,
     ) -> Result<StaticFileServeOutcome> {
-        let Some(location) = canonical_redirect_location(&ctx.path, ctx.query_string.as_deref())
+        // `ctx.path` is the route-relative path while a stripping path route
+        // is being served; the client must be sent back under the mount.
+        let mount_prefix = static_mount_prefix(ctx.path_route.as_ref());
+        let Some(location) =
+            canonical_redirect_location(mount_prefix, &ctx.path, ctx.query_string.as_deref())
         else {
             warn!(
                 request_path = %bounded_log_value(&ctx.path),
@@ -4893,6 +4933,7 @@ impl ProxyHttp for LoadBalancer {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            path_route: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -5851,11 +5892,220 @@ impl ProxyHttp for LoadBalancer {
             }
         }
 
+        // Path routes (ADR 050): `frontend: /api -> backend` serves this
+        // path from another service of the project. In-memory lookup only.
+        //
+        // The password form rendered for a path-routed target posts to the
+        // reserved `/_temps/password-verify`, which never matches a path
+        // route; `resolve_request_path_route` matches it by the routed path
+        // the form carries, so the password is checked (and the cookie
+        // issued) for the target environment the form was rendered for,
+        // never the host's own. Client input only selects among the
+        // prefixes this host already serves.
+        if ctx.preview_route.is_none() {
+            ctx.path_route = crate::handler::password_wall::resolve_request_path_route(
+                &ctx.method,
+                &ctx.path,
+                ctx.query_string.as_deref(),
+                |path| {
+                    self.project_context_resolver
+                        .match_path_route(&ctx.host, path)
+                },
+            );
+        }
+
+        // Path-route wake-on-demand: if the target service is sleeping
+        // (scale-to-zero), wake it inline before resolving the route, using the
+        // same mechanism as host-level wake-on-demand.
+        if let Some(sleeping_env_id) = ctx
+            .path_route
+            .as_ref()
+            .and_then(|r| (r.target.is_none()).then_some(r.sleeping_environment_id))
+            .flatten()
+        {
+            if let Some(ref on_demand) = self.on_demand_manager {
+                if let Some(sleeping_info) =
+                    on_demand.get_sleeping_environment_by_id(sleeping_env_id)
+                {
+                    let wake_timeout = sleeping_info.wake_timeout_seconds;
+                    info!(
+                        environment_id = sleeping_env_id,
+                        host = %ctx.host,
+                        prefix = %ctx.path_route.as_ref().map(|r| r.prefix.as_str()).unwrap_or(""),
+                        "Path-route target is sleeping, waking inline"
+                    );
+                    let _wake_slot = match on_demand.try_acquire_wake_slot() {
+                        Some(permit) => permit,
+                        None => {
+                            warn!(
+                                environment_id = sleeping_env_id,
+                                host = %ctx.host,
+                                "Wake path at capacity for path-route target; returning retryable 503"
+                            );
+                            let mut response =
+                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                            response.insert_header("Retry-After", "2")?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "application/json")?;
+                            let body_bytes = Bytes::from_static(
+                                br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
+                            );
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session.write_response_body(Some(body_bytes), true).await?;
+                            ctx.routing_status = "wake_throttled".to_string();
+                            return Ok(true);
+                        }
+                    };
+                    match on_demand
+                        .wake_environment(sleeping_env_id, wake_timeout)
+                        .await
+                    {
+                        Ok(()) => {
+                            info!(
+                                environment_id = sleeping_env_id,
+                                "Path-route target woke up, waiting for route reload"
+                            );
+                            let reload_timeout = std::time::Duration::from_secs(10);
+                            let reloaded = on_demand.wait_for_route_reload(reload_timeout).await;
+                            if !reloaded {
+                                warn!(
+                                    environment_id = sleeping_env_id,
+                                    "Route reload not observed within timeout after path-route wake"
+                                );
+                            }
+                            // Re-resolve the path route after the target is awake.
+                            let resolve_deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            let rematch = |ctx: &ProxyContext| {
+                                crate::handler::password_wall::resolve_request_path_route(
+                                    &ctx.method,
+                                    &ctx.path,
+                                    ctx.query_string.as_deref(),
+                                    |path| {
+                                        self.project_context_resolver
+                                            .match_path_route(&ctx.host, path)
+                                    },
+                                )
+                            };
+                            ctx.path_route = rematch(ctx);
+                            while ctx.path_route.as_ref().is_none_or(|r| r.target.is_none())
+                                && std::time::Instant::now() < resolve_deadline
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                ctx.path_route = rematch(ctx);
+                            }
+                            if ctx.path_route.as_ref().is_none_or(|r| r.target.is_none()) {
+                                error!(
+                                    environment_id = sleeping_env_id,
+                                    host = %ctx.host,
+                                    "Path-route target woke but route did not resolve; returning retryable 503"
+                                );
+                                let mut response =
+                                    ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                                response.insert_header("Retry-After", "2")?;
+                                response.insert_header("Cache-Control", "no-store")?;
+                                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                                response.insert_header("Content-Type", "application/json")?;
+                                let body_bytes = Bytes::from_static(
+                                    br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
+                                );
+                                session
+                                    .write_response_header(Box::new(response), false)
+                                    .await?;
+                                session.write_response_body(Some(body_bytes), true).await?;
+                                ctx.routing_status = "wake_pending".to_string();
+                                return Ok(true);
+                            }
+                            // Fall through: ctx.path_route now has a live target.
+                        }
+                        Err(e) => {
+                            error!(
+                                environment_id = sleeping_env_id,
+                                error = %e,
+                                "Failed to wake path-route target environment"
+                            );
+                            let mut response =
+                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                            response.insert_header("Retry-After", "5")?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "application/json")?;
+                            let body_bytes = Bytes::from_static(
+                                br#"{"status":"wake_failed","message":"Failed to start environment, please retry"}"#,
+                            );
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session.write_response_body(Some(body_bytes), true).await?;
+                            ctx.routing_status = "wake_failed".to_string();
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(path_route) = ctx.path_route.as_ref() {
+            if path_route.target.is_none() {
+                // Never let the host's own service (or another environment)
+                // answer in the target's place: that hides the problem
+                // behind the frontend's index.html. The body carries only
+                // the requested prefix; the service name goes to the log.
+                warn!(
+                    host = %ctx.host,
+                    prefix = %path_route.prefix,
+                    target_service = %path_route.target_service,
+                    "path route target has no running deployment in this environment"
+                );
+                let body = Bytes::from(
+                    serde_json::json!({
+                        "status": "path_route_unavailable",
+                        "message": format!(
+                            "The service that serves {} is not deployed in this environment",
+                            path_route.prefix
+                        ),
+                    })
+                    .to_string(),
+                );
+                let mut response = ResponseHeader::build(StatusCode::BAD_GATEWAY, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "application/json")?;
+                response.insert_header("Content-Length", body.len().to_string())?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session.write_response_body(Some(body), true).await?;
+                ctx.routing_status = "path_route_unavailable".to_string();
+                return Ok(true);
+            }
+        }
+
         // Resolve project context early to set routing status for all requests
-        let project_context = self
-            .project_context_resolver
-            .resolve_context(&ctx.host)
-            .await;
+        let path_target_context = ctx
+            .path_route
+            .as_ref()
+            .and_then(|route| route.target.as_ref())
+            .and_then(|target| {
+                Some(ProjectContext {
+                    project: target.project.clone()?,
+                    environment: target.environment.clone()?,
+                    deployment: target.deployment.clone()?,
+                    // A target is only attached once it has a live backend.
+                    upstream_unavailable: false,
+                })
+            });
+        let project_context = match path_target_context {
+            Some(context) => Some(context),
+            None => {
+                self.project_context_resolver
+                    .resolve_context(&ctx.host)
+                    .await
+            }
+        };
 
         if let Some(project_ctx) = &project_context {
             ctx.project = Some(project_ctx.project.clone());
@@ -6245,9 +6495,10 @@ impl ProxyHttp for LoadBalancer {
                 let env_id = project_ctx.environment.id;
                 let project_name = &project_ctx.project.name;
                 let environment_name = &project_ctx.environment.name;
-
                 // Check if this is the password verify POST endpoint
-                if ctx.path == "/_temps/password-verify" && ctx.method == "POST" {
+                if ctx.path == crate::handler::password_wall::PASSWORD_VERIFY_PATH
+                    && ctx.method == "POST"
+                {
                     // Read the POST body to get the password
                     let body = session.read_request_body().await.map_err(|e| {
                         error!("Failed to read password verify body: {}", e);
@@ -6327,11 +6578,18 @@ impl ProxyHttp for LoadBalancer {
                         self.preview_auth_limiter
                             .clear_password_wall(client_ip, env_id);
                         let host = ctx.host.clone();
-                        let set_cookie = crate::handler::password_wall::build_set_cookie_header(
-                            env_id,
-                            &password_hash,
-                            &host,
-                        );
+                        let set_cookie =
+                            crate::handler::password_wall::build_set_cookie_header_for_path(
+                                env_id,
+                                &password_hash,
+                                &host,
+                                // A path-routed target is unlocked under
+                                // its prefix only, so its cookie coexists
+                                // with the host's own `Path=/` one.
+                                ctx.path_route
+                                    .as_ref()
+                                    .map_or("/", |route| route.prefix.as_str()),
+                            );
 
                         let mut resp = ResponseHeader::build(303, None)?;
                         resp.insert_header("Location", redirect)?;
@@ -6346,12 +6604,22 @@ impl ProxyHttp for LoadBalancer {
                     } else {
                         // Wrong password — the attempt is already counted;
                         // show the form again with an error
-                        let html = crate::handler::password_wall::generate_password_form_html(
-                            redirect,
-                            true,
-                            project_name,
-                            environment_name,
-                        );
+                        let html =
+                            crate::handler::password_wall::generate_password_form_html_for_route(
+                                redirect,
+                                true,
+                                project_name,
+                                environment_name,
+                                // Behind a path route the form posts back
+                                // the routed path, so the next attempt
+                                // resolves to this environment again.
+                                crate::handler::password_wall::routed_form_path(
+                                    ctx.path_route.is_some(),
+                                    &ctx.path,
+                                    ctx.query_string.as_deref(),
+                                )
+                                .as_deref(),
+                            );
                         let html_bytes = Bytes::from(html);
 
                         let mut resp = ResponseHeader::build(StatusCode::OK, None)?;
@@ -6369,17 +6637,22 @@ impl ProxyHttp for LoadBalancer {
                     }
                 }
 
-                // Check for valid password cookie
-                // The first cookie with this name decides, as before.
+                // Check for valid password cookie. Several cookies may carry
+                // this name: the host's own environment (`Path=/`) and a
+                // path-routed target's (`Path=<prefix>`) coexist, and the
+                // browser sends both on a routed path. Each is bound to its
+                // environment id and password hash, so any one that
+                // validates for THIS environment unlocks it.
                 let has_valid_cookie = find_request_cookie(
                     session.req_header(),
                     crate::handler::password_wall::PASSWORD_COOKIE_NAME,
                     |value| {
-                        Some(crate::handler::password_wall::validate_cookie(
+                        crate::handler::password_wall::validate_cookie(
                             value,
                             env_id,
                             &password_hash,
-                        ))
+                        )
+                        .then_some(true)
                     },
                 )
                 .unwrap_or(false);
@@ -6396,11 +6669,20 @@ impl ProxyHttp for LoadBalancer {
                         ctx.path.clone()
                     };
 
-                    let html = crate::handler::password_wall::generate_password_form_html(
+                    let html = crate::handler::password_wall::generate_password_form_html_for_route(
                         &current_path,
                         false,
                         project_name,
                         environment_name,
+                        // Behind a path route the form posts back the routed
+                        // path, so the verify request resolves to this
+                        // (target) environment, not the host's own.
+                        crate::handler::password_wall::routed_form_path(
+                            ctx.path_route.is_some(),
+                            &ctx.path,
+                            ctx.query_string.as_deref(),
+                        )
+                        .as_deref(),
                     );
                     let html_bytes = Bytes::from(html);
 
@@ -6797,12 +7079,22 @@ impl ProxyHttp for LoadBalancer {
             return Ok(true);
         }
 
-        // Check if this is a static deployment using route table
-        if let Some(static_dir) = self
-            .project_context_resolver
-            .get_static_path(&ctx.host)
-            .await
-        {
+        // Check if this is a static deployment using route table. A path
+        // route serves from its target instead: its files if the target is
+        // static, the upstream otherwise.
+        let static_dir = match ctx.path_route.as_ref() {
+            Some(route) => route
+                .target
+                .as_ref()
+                .and_then(|target| target.static_dir())
+                .map(str::to_string),
+            None => {
+                self.project_context_resolver
+                    .get_static_path(&ctx.host)
+                    .await
+            }
+        };
+        if let Some(static_dir) = static_dir {
             debug!(
                 "Static deployment detected for {}: {}",
                 ctx.host, static_dir
@@ -6811,8 +7103,8 @@ impl ProxyHttp for LoadBalancer {
             // IMPORTANT: Skip static file serving for /api/_temps/* paths
             // These must ALWAYS be proxied to the console address (admin API)
             if !ctx.path.starts_with("/api/_temps/") {
-                // Serve static file
-                match self.serve_static_file(session, ctx, &static_dir).await {
+                let served = self.serve_static_target(session, ctx, &static_dir).await;
+                match served {
                     Ok(StaticFileServeOutcome::Served) => {
                         debug!("Served static file: {}", ctx.path);
                         ctx.routing_status = "static_file".to_string();
@@ -6969,6 +7261,7 @@ impl ProxyHttp for LoadBalancer {
         // For container deployments where the upstream didn't have the asset,
         // check the path-keyed file store (stale-chunk fallback).
         if Self::is_cacheable_static_asset(&ctx.path)
+            && ctx.path_route.is_none()
             && !self
                 .project_context_resolver
                 .is_static_deployment(&ctx.host)
@@ -7348,6 +7641,41 @@ impl ProxyHttp for LoadBalancer {
         Ok(())
     }
 
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut PingoraSession,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // A stripping path route forwards `/api/users` as `/users` and tells
+        // the target where it is mounted, for apps that build absolute URLs.
+        // Only the platform sets that header on routed requests: a client
+        // could otherwise choose the mount path the target believes in.
+        if ctx.path_route.is_some() {
+            upstream_request.remove_header("X-Forwarded-Prefix");
+        }
+        if let Some(route) = ctx.path_route.as_ref().filter(|route| route.strip_prefix) {
+            let original = upstream_request
+                .uri
+                .path_and_query()
+                .map_or("/", |path_and_query| path_and_query.as_str());
+            let rewritten = route.upstream_path(original);
+            let uri = rewritten.parse::<axum::http::Uri>().map_err(|e| {
+                Error::because(
+                    pingora::ErrorType::InternalError,
+                    "path route produced an invalid upstream URI",
+                    e,
+                )
+            })?;
+            upstream_request.set_uri(uri);
+            upstream_request.insert_header("X-Forwarded-Prefix", route.prefix.as_str())?;
+        }
+        Ok(())
+    }
+
     async fn upstream_peer(
         &self,
         session: &mut PingoraSession,
@@ -7431,29 +7759,57 @@ impl ProxyHttp for LoadBalancer {
 
         // The admin gate denied this request: it may reach the console's
         // public routes and nothing else (ADR-051). Skip resolution entirely
-        // so no path or `Host` can steer it to another peer.
+        // so no path or `Host` can steer it to another peer. This takes
+        // precedence over a path route's target for the same reason.
         let public_surface_address = ctx
             .public_surface_only
             .then(|| self.upstream_resolver.console_ingress_address())
             .flatten();
-        let selection = match public_surface_address {
-            Some(ingress_address) => PeerSelection {
+        // A path route's target was resolved in `request_filter`; the
+        // request goes to its current deployment, not the host's service.
+        let path_target = if public_surface_address.is_some() {
+            None
+        } else {
+            ctx.path_route
+                .as_ref()
+                .and_then(|route| route.target.as_ref())
+        };
+        let selection = if let Some(ingress_address) = public_surface_address {
+            PeerSelection {
                 peer: Box::new(HttpPeer::new(ingress_address, false, String::new())),
                 container_id: None,
                 container_name: None,
-            },
+            }
+        } else if let Some(target) = path_target {
+            // Static targets are answered in `request_filter`; reaching here
+            // with one would otherwise fall back to the console address.
+            if target.is_static() {
+                return Err(Error::explain(
+                    pingora::ErrorType::HTTPStatus(502),
+                    "path route target is static and has no upstream",
+                ));
+            }
+            let backend = target.select_backend();
+            PeerSelection {
+                peer: Box::new(HttpPeer::new(
+                    backend.address.as_str(),
+                    false,
+                    String::new(),
+                )),
+                container_id: backend.container_id,
+                container_name: backend.container_name,
+            }
+        } else {
             // Use the upstream resolver trait
             // Pass SNI hostname for TLS-based routing
-            None => {
-                self.upstream_resolver
-                    .resolve_peer_for_request(
-                        &domain,
-                        &path,
-                        session.req_header().method.as_str(),
-                        ctx.sni_hostname.as_deref(),
-                    )
-                    .await?
-            }
+            self.upstream_resolver
+                .resolve_peer_for_request(
+                    &domain,
+                    &path,
+                    session.req_header().method.as_str(),
+                    ctx.sni_hostname.as_deref(),
+                )
+                .await?
         };
 
         let mut peer = selection.peer;
@@ -8235,6 +8591,7 @@ mod markdown_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            path_route: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -8771,6 +9128,7 @@ mod markdown_pipeline_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            path_route: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -11060,6 +11418,225 @@ mod status_page_host_tests {
             }
             Outcome::Answered { head, .. } => panic!("{head}"),
         }
+        Ok(())
+    }
+}
+
+/// A path route mounts a static target under a prefix (ADR 050). The static
+/// layer resolves files against the route-relative path, so the redirects it
+/// writes must be re-mounted under the prefix or the client leaves the route.
+#[cfg(test)]
+mod static_path_route_redirect_tests {
+    use super::{LoadBalancer, StaticFileServeOutcome};
+    use crate::config::ProxyConfig;
+    use crate::services::{ProjectContextResolverImpl, UpstreamResolverImpl};
+    use crate::traits::{ProjectContextResolver, UpstreamResolver};
+    use anyhow::Result;
+    use pingora_proxy::{ProxyHttp, Session};
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::sync::Arc;
+    use temp_dir::TempDir;
+    use temps_routes::{CachedPeerTable, PathRoute};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const STORED_DIR: &str = "projects/site/production/deploy-1";
+
+    /// Load balancer over an in-memory database: serving a redirect never
+    /// queries it, so these tests need no Docker.
+    fn load_balancer(data_dir: &std::path::Path) -> Result<LoadBalancer> {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let mut config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test@localhost/test".to_string(),
+            None,
+            None,
+        )?;
+        config.data_dir = data_dir.to_path_buf();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(config),
+            db.clone(),
+        ));
+
+        std::env::set_var("TEMPS_GEO_MOCK", "true");
+        let geoip_service = Arc::new(temps_geo::GeoIpService::new()?);
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip_service));
+        let proxy_log_storage: Arc<dyn crate::storage::ProxyLogStorage> = Arc::new(
+            crate::storage::TimescaleDbProxyLogStore::new(db.clone(), ip_service.clone()),
+        );
+        let (proxy_log_handle, tracking_handle, _proxy_log_writer) =
+            crate::service::proxy_log_batch_writer::ProxyLogBatchWriter::new(
+                db.clone(),
+                ip_service,
+                proxy_log_storage,
+            );
+
+        let route_table = Arc::new(CachedPeerTable::new(db.clone()));
+        let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
+            Arc::new(ProxyConfig::default()),
+            Arc::new(crate::service::lb_service::LbService::new(db.clone())),
+            route_table.clone(),
+        )) as Arc<dyn UpstreamResolver>;
+        let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table))
+            as Arc<dyn ProjectContextResolver>;
+
+        Ok(LoadBalancer::new(
+            upstream_resolver,
+            proxy_log_handle,
+            tracking_handle,
+            project_context_resolver,
+            Arc::new(temps_core::CookieCrypto::new(
+                "default-32-byte-key-for-testing!",
+            )?),
+            db.clone(),
+            config_service,
+            Arc::new(
+                crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+            ),
+            Arc::new(temps_core::OpenIpGate),
+            Arc::new(crate::service::challenge_service::ChallengeService::new(
+                db.clone(),
+            )),
+            Arc::new(crate::service::cert_host_cache::CertHostCache::new(
+                db.clone(),
+            )),
+            false,
+        ))
+    }
+
+    /// `<data_dir>/static/<STORED_DIR>` holding a root page, `guide.html` and
+    /// `docs/other.html` (a deployment that itself ships a `docs/` folder).
+    fn write_deployment(data_dir: &std::path::Path) -> Result<()> {
+        let deployment = data_dir.join("static").join(STORED_DIR);
+        std::fs::create_dir_all(deployment.join("docs"))?;
+        std::fs::write(deployment.join("index.html"), b"root")?;
+        std::fs::write(deployment.join("guide.html"), b"guide")?;
+        std::fs::write(deployment.join("docs/other.html"), b"other")?;
+        Ok(())
+    }
+
+    fn route(prefix: &str, strip_prefix: bool) -> PathRoute {
+        PathRoute {
+            prefix: prefix.to_string(),
+            strip_prefix,
+            target_service: "docs".to_string(),
+            target: None,
+            sleeping_environment_id: None,
+        }
+    }
+
+    /// Serve `path_and_query` through the same entry point `request_filter`
+    /// uses for a static target and return the raw response head.
+    async fn serve(
+        lb: &LoadBalancer,
+        path_route: Option<PathRoute>,
+        path_and_query: &str,
+    ) -> Result<(StaticFileServeOutcome, String, String)> {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(
+                format!("GET {path_and_query} HTTP/1.1\r\nHost: site.example.com\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await?, "request must parse");
+
+        let mut ctx = lb.new_ctx();
+        let (path, query) = match path_and_query.split_once('?') {
+            Some((path, query)) => (path, Some(query.to_string())),
+            None => (path_and_query, None),
+        };
+        ctx.method = "GET".to_string();
+        ctx.host = "site.example.com".to_string();
+        ctx.path = path.to_string();
+        ctx.query_string = query;
+        ctx.path_route = path_route;
+
+        let outcome = lb
+            .serve_static_target(&mut session, &mut ctx, STORED_DIR)
+            .await?;
+        assert_eq!(
+            ctx.path, path,
+            "the requested path is restored after serving"
+        );
+        drop(session);
+
+        let mut raw = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut raw),
+        )
+        .await??;
+        let response = String::from_utf8_lossy(&raw).to_string();
+        let head = response
+            .split_once("\r\n\r\n")
+            .map(|(head, _)| head.to_string())
+            .unwrap_or(response.clone());
+        let location = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("location")
+                    .then(|| value.trim().to_string())
+            })
+            .unwrap_or_default();
+        Ok((outcome, head, location))
+    }
+
+    #[tokio::test]
+    async fn stripped_route_redirect_keeps_the_mount_prefix_and_query() -> Result<()> {
+        let data_dir = TempDir::new()?;
+        write_deployment(data_dir.path())?;
+        let lb = load_balancer(data_dir.path())?;
+
+        let (outcome, head, location) =
+            serve(&lb, Some(route("/docs", true)), "/docs/guide/?ref=home&x=1").await?;
+        assert_eq!(outcome, StaticFileServeOutcome::Redirected, "{head}");
+        assert!(head.starts_with("HTTP/1.1 308"), "{head}");
+        assert_eq!(location, "/docs/guide?ref=home&x=1");
+
+        let (_, head, location) = serve(&lb, Some(route("/docs", true)), "/docs/guide/").await?;
+        assert!(head.starts_with("HTTP/1.1 308"), "{head}");
+        assert_eq!(location, "/docs/guide");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stripped_route_root_is_served_not_redirected() -> Result<()> {
+        let data_dir = TempDir::new()?;
+        write_deployment(data_dir.path())?;
+        let lb = load_balancer(data_dir.path())?;
+
+        for requested in ["/docs", "/docs/"] {
+            let (outcome, head, location) =
+                serve(&lb, Some(route("/docs", true)), requested).await?;
+            assert_eq!(
+                outcome,
+                StaticFileServeOutcome::Served,
+                "{requested}: {head}"
+            );
+            assert!(head.starts_with("HTTP/1.1 200"), "{requested}: {head}");
+            assert_eq!(location, "", "{requested}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redirect_is_unchanged_without_a_stripping_route() -> Result<()> {
+        let data_dir = TempDir::new()?;
+        write_deployment(data_dir.path())?;
+        let lb = load_balancer(data_dir.path())?;
+
+        // Not path-routed.
+        let (outcome, head, location) = serve(&lb, None, "/guide/?ref=home").await?;
+        assert_eq!(outcome, StaticFileServeOutcome::Redirected, "{head}");
+        assert_eq!(location, "/guide?ref=home");
+
+        // A route that keeps its prefix: the lookup path already carries it.
+        let (outcome, head, location) =
+            serve(&lb, Some(route("/docs", false)), "/docs/other/").await?;
+        assert_eq!(outcome, StaticFileServeOutcome::Redirected, "{head}");
+        assert_eq!(location, "/docs/other");
         Ok(())
     }
 }

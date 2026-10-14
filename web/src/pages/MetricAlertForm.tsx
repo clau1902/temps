@@ -588,7 +588,7 @@ function AlertFormBody({
             {isEditing
               ? 'Update the signal, threshold, and notification settings.'
               : 'Fire a notification when a metric crosses a threshold.'}{' '}
-            Watches metrics from project{' '}
+            Watches metrics from service{' '}
             <span className="font-medium text-foreground">{project.name}</span>{' '}
             only.
           </p>
@@ -1360,7 +1360,7 @@ function AlertFormBody({
                     </Select>
                     <FormDescription>
                       Maps to the notification severity. Alerts are delivered
-                      through notification routes, which apply to all projects;
+                      through notification routes, which apply to all services;
                       routes match on this severity.
                     </FormDescription>
                     <FormMessage />

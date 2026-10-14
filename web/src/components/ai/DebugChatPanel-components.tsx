@@ -687,7 +687,7 @@ function PendingActionCard({
     return (
       <div className="min-w-0 overflow-hidden rounded-lg border border-green-500/30 bg-green-500/5 text-xs">
         <GeneratedProjectCollection
-          title="Application projects"
+          title="Application services"
           presentation={committedApplicationProjects}
           framed={false}
         />
@@ -698,7 +698,7 @@ function PendingActionCard({
           </summary>
           <div className="min-w-0 space-y-2 border-t border-green-500/20 px-3 py-2.5 sm:px-4">
             <div className="font-medium text-green-700 dark:text-green-400">
-              Project created and attached to the persistent workspace
+              Service created and attached to the persistent workspace
             </div>
             <ToolBlock value={tool.result ?? ''} />
           </div>
@@ -1313,7 +1313,7 @@ function InteractiveToolsNotice({
 
 function requiredProjectId(projectId?: number): number {
   if (projectId == null) {
-    throw new Error('A project-scoped chat requires a project id.')
+    throw new Error('A service-scoped chat requires a service id.')
   }
   return projectId
 }
@@ -1937,7 +1937,7 @@ export function DebugChatPanel({
   autoStart = false,
   placeholder = 'Ask a follow-up…',
   lazyCreate = false,
-  emptyHint = 'Ask anything about this project.',
+  emptyHint = 'Ask anything about this service.',
   onConversationChange,
   onLiveEvent,
   onConversationStatusInvalidated,
