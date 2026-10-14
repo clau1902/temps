@@ -1299,6 +1299,56 @@ export type AnalyticsProjectOption = {
     project_name: string;
 };
 
+/**
+ * How long product analytics data, and the identifiers attached to it, are
+ * kept.
+ *
+ * `ip_geolocations` holds the full client IP address and is referenced by
+ * events, proxy logs, error events, visitors, performance metrics and audit
+ * logs. Before these settings existed nothing ever removed an IP once stored,
+ * and nothing removed visitors, so the retention of the referencing tables
+ * said nothing about how long an address was kept.
+ *
+ * A job removes an IP row only when **no** table references it, so the
+ * effective retention of an address is the longest window among the data that
+ * still points at it. Audit logs keep their IP for as long as the audit
+ * record exists.
+ *
+ * `None` on an optional window means "keep" -- the behaviour before the
+ * setting existed -- so upgrading never starts deleting data on its own,
+ * except for the unreferenced-IP cleanup, which only drops cache rows that
+ * nothing points at.
+ */
+export type AnalyticsRetentionSettings = {
+    /**
+     * Retain captured error events for this many days. `null` keeps them
+     * until the project is deleted. Error groups keep their counters.
+     */
+    error_events_days?: number | null;
+    /**
+     * Retain analytics events (page views, custom events) for this many
+     * days. Applied as the TimescaleDB retention policy of the `events`
+     * hypertable. ClickHouse-backed analytics keep their own storage TTL.
+     */
+    events_days?: number;
+    /**
+     * Delete a stored client IP address (and its derived location) once
+     * nothing references it and it has not been looked up for this many
+     * days. Never applied sooner than the proxy-log retention
+     * (`observability_retention.proxy_logs_days`): request logs kept outside
+     * PostgreSQL still point at the address. `null` keeps every address ever
+     * seen.
+     */
+    unreferenced_ip_days?: number | null;
+    /**
+     * Delete visitors that have not been seen for this many days. Their
+     * events, proxy logs and error events stay (until their own retention
+     * ends) but are no longer linked to a visitor; session replays of the
+     * visitor are deleted with it. `null` keeps visitors indefinitely.
+     */
+    visitor_days?: number | null;
+};
+
 export type AnalyticsSessionEventsResponse = {
     events: Array<SessionEvent>;
     session_id: string;
@@ -1649,6 +1699,13 @@ export type AppSettings = {
      */
     ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
     /**
+     * Retention windows for product analytics data and for the personal
+     * identifiers (visitors, client IP addresses) attached to it.
+     * Applied by a background job, not at save time, so a change takes
+     * effect within the job's interval.
+     */
+    analytics_retention?: AnalyticsRetentionSettings;
+    /**
      * Admin preference for anonymous product telemetry (the events sent to
      * the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
      * mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
@@ -1922,6 +1979,11 @@ export type AppSettingsResponse = {
      * Persistent AI workspace file transfer and preview limits.
      */
     ai_workspace_file_limits: AiWorkspaceFileLimitsSettings;
+    /**
+     * Retention of analytics events and of the visitors and client IP
+     * addresses attached to them.
+     */
+    analytics_retention: AnalyticsRetentionSettings;
     /**
      * Build-time resource limits (control-plane only). No sensitive content,
      * passed through as-is.
@@ -8143,6 +8205,59 @@ export type DigestSections = {
  * Which side(s) of an anomaly band count as a deviation.
  */
 export type Direction = 'both' | 'above' | 'below';
+
+export type DirectoryEntry = {
+    kind: DirectoryEntryKind;
+    /**
+     * Name within the directory, without any path.
+     */
+    name: string;
+};
+
+/**
+ * What a directory entry is. Symlinks are reported, never followed.
+ */
+export type DirectoryEntryKind = 'file' | 'directory' | 'symlink' | 'other';
+
+export type DirectoryListingResponse = {
+    /**
+     * Directories first, then everything else, each group in byte order of
+     * the name. One page of the directory.
+     */
+    entries: Array<DirectoryEntry>;
+    /**
+     * `false` when the path does not exist (not an error).
+     */
+    exists: boolean;
+    /**
+     * More entries exist after this page.
+     */
+    has_more: boolean;
+    /**
+     * `false` when the path exists but is not a directory.
+     */
+    is_dir: boolean;
+    /**
+     * 1-based page these entries are.
+     */
+    page: number;
+    /**
+     * Entries per page that was applied (default 20, at most 100).
+     */
+    page_size: number;
+    path: string;
+    /**
+     * Entries in the whole directory, so `ceil(total / page_size)` is the
+     * number of pages. At most 10000: see `truncated`.
+     */
+    total: number;
+    /**
+     * The directory has more entries than the listing reads (10000), so
+     * `total` and the pages cover only the first 10000 names the filesystem
+     * returned.
+     */
+    truncated: boolean;
+};
 
 /**
  * Response after disabling Blob service
@@ -73271,6 +73386,52 @@ export type ExtendTimeoutResponses = {
 };
 
 export type ExtendTimeoutResponse = ExtendTimeoutResponses[keyof ExtendTimeoutResponses];
+
+export type ListDirData = {
+    body?: never;
+    path: {
+        id: string;
+    };
+    query: {
+        /**
+         * Absolute path of a directory inside the sandbox
+         */
+        path: string;
+        /**
+         * 1-based page (default 1)
+         */
+        page?: number;
+        /**
+         * Entries per page (default 20, max 100)
+         */
+        page_size?: number;
+    };
+    url: '/v1/sandboxes/{id}/fs/list';
+};
+
+export type ListDirErrors = {
+    /**
+     * Validation error, or the directory is not readable by the sandbox user
+     */
+    400: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Sandbox is not running (stopped or paused), so its filesystem cannot be listed
+     */
+    409: unknown;
+};
+
+export type ListDirResponses = {
+    /**
+     * One page of directory entries (exists=false when missing, is_dir=false for a file — not errors)
+     */
+    200: DirectoryListingResponse;
+};
+
+export type ListDirResponse = ListDirResponses[keyof ListDirResponses];
 
 export type MkdirData = {
     body: MkdirBody;

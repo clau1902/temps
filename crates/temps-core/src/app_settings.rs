@@ -216,6 +216,13 @@ pub struct AppSettings {
     /// TimescaleDB policies are updated at runtime by the Settings API.
     pub observability_retention: ObservabilityRetentionSettings,
 
+    /// Retention windows for product analytics data and for the personal
+    /// identifiers (visitors, client IP addresses) attached to it.
+    /// Applied by a background job, not at save time, so a change takes
+    /// effect within the job's interval.
+    #[serde(default)]
+    pub analytics_retention: AnalyticsRetentionSettings,
+
     /// How Temps talks to the instance's ClickHouse server (wire compression
     /// of query responses). Read once when the process starts, so a change
     /// is applied by the next restart; the Settings API reports the mode the
@@ -1792,6 +1799,137 @@ impl Default for ObservabilityRetentionSettings {
     }
 }
 
+/// Bounds every [`AnalyticsRetentionSettings`] window is validated against.
+pub const MIN_ANALYTICS_RETENTION_DAYS: u32 = 1;
+pub const MAX_ANALYTICS_RETENTION_DAYS: u32 = 3650;
+/// Default for [`AnalyticsRetentionSettings::events_days`]: the window the
+/// initial schema installs on the `events` hypertable.
+pub const DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS: u32 = 90;
+/// Default for [`AnalyticsRetentionSettings::unreferenced_ip_days`].
+pub const DEFAULT_UNREFERENCED_IP_RETENTION_DAYS: u32 = 30;
+
+/// Days added to the proxy-log window before a stored IP address may be
+/// deleted. An address's `last_used_at` is refreshed at most every 12 hours
+/// and a cached lookup reuses its id for 6 more, so the last log that points
+/// at an address can be written up to ~18 hours after the timestamp the
+/// sweep reads. A whole day covers that lag and the delay before the proxy
+/// applies a newly saved window.
+pub const IP_REFERENCE_SLACK_DAYS: u32 = 1;
+
+/// How long product analytics data, and the identifiers attached to it, are
+/// kept.
+///
+/// `ip_geolocations` holds the full client IP address and is referenced by
+/// events, proxy logs, error events, visitors, performance metrics and audit
+/// logs. Before these settings existed nothing ever removed an IP once stored,
+/// and nothing removed visitors, so the retention of the referencing tables
+/// said nothing about how long an address was kept.
+///
+/// A job removes an IP row only when **no** table references it, so the
+/// effective retention of an address is the longest window among the data that
+/// still points at it. Audit logs keep their IP for as long as the audit
+/// record exists.
+///
+/// `None` on an optional window means "keep" -- the behaviour before the
+/// setting existed -- so upgrading never starts deleting data on its own,
+/// except for the unreferenced-IP cleanup, which only drops cache rows that
+/// nothing points at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct AnalyticsRetentionSettings {
+    /// Retain analytics events (page views, custom events) for this many
+    /// days. Applied as the TimescaleDB retention policy of the `events`
+    /// hypertable. ClickHouse-backed analytics keep their own storage TTL.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub events_days: u32,
+
+    /// Retain captured error events for this many days. `null` keeps them
+    /// until the project is deleted. Error groups keep their counters.
+    #[schema(minimum = 1, maximum = 3650, nullable = true, example = 90)]
+    pub error_events_days: Option<u32>,
+
+    /// Delete visitors that have not been seen for this many days. Their
+    /// events, proxy logs and error events stay (until their own retention
+    /// ends) but are no longer linked to a visitor; session replays of the
+    /// visitor are deleted with it. `null` keeps visitors indefinitely.
+    #[schema(minimum = 1, maximum = 3650, nullable = true, example = 425)]
+    pub visitor_days: Option<u32>,
+
+    /// Delete a stored client IP address (and its derived location) once
+    /// nothing references it and it has not been looked up for this many
+    /// days. Never applied sooner than the proxy-log retention
+    /// (`observability_retention.proxy_logs_days`): request logs kept outside
+    /// PostgreSQL still point at the address. `null` keeps every address ever
+    /// seen.
+    #[schema(minimum = 1, maximum = 3650, nullable = true, example = 30)]
+    pub unreferenced_ip_days: Option<u32>,
+
+    /// Server-managed; a value sent by a client is replaced on save. Set when
+    /// `observability_retention.proxy_logs_days` is lowered: request logs
+    /// stored outside PostgreSQL keep the window they were written with, so
+    /// they can still point at an address for the previous window. Stored IP
+    /// addresses are not deleted until this moment has passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
+    pub ip_hold_until: Option<DateTime<Utc>>,
+}
+
+impl Default for AnalyticsRetentionSettings {
+    fn default() -> Self {
+        Self {
+            events_days: DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS,
+            error_events_days: None,
+            visitor_days: None,
+            unreferenced_ip_days: Some(DEFAULT_UNREFERENCED_IP_RETENTION_DAYS),
+            ip_hold_until: None,
+        }
+    }
+}
+
+impl AnalyticsRetentionSettings {
+    /// Recompute [`Self::ip_hold_until`] for a save that moves the proxy-log
+    /// retention from `previous_days` to `next_days`, starting from the value
+    /// that was stored (a client-supplied one is never trusted).
+    ///
+    /// Lowering the window means logs already written still live for up to
+    /// `previous_days`, so addresses are held until then; a later lowering can
+    /// only extend the hold. Raising or keeping it changes nothing, and a hold
+    /// that has passed is dropped.
+    pub fn with_ip_hold(
+        mut self,
+        stored_hold: Option<DateTime<Utc>>,
+        previous_days: u32,
+        next_days: u32,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let mut hold = stored_hold.filter(|until| *until > now);
+        if next_days < previous_days {
+            let until = now
+                + chrono::Duration::days(
+                    i64::from(previous_days) + i64::from(IP_REFERENCE_SLACK_DAYS),
+                );
+            hold = Some(hold.map_or(until, |existing| existing.max(until)));
+        }
+        self.ip_hold_until = hold;
+        self
+    }
+
+    /// The first window outside `1..=3650`, as `(field, value)`.
+    pub fn out_of_range(&self) -> Option<(&'static str, u32)> {
+        let windows = [
+            ("events_days", Some(self.events_days)),
+            ("error_events_days", self.error_events_days),
+            ("visitor_days", self.visitor_days),
+            ("unreferenced_ip_days", self.unreferenced_ip_days),
+        ];
+        windows.into_iter().find_map(|(field, days)| {
+            let days = days?;
+            (!(MIN_ANALYTICS_RETENTION_DAYS..=MAX_ANALYTICS_RETENTION_DAYS).contains(&days))
+                .then_some((field, days))
+        })
+    }
+}
+
 /// How often the scheduled job re-downloads the GeoLite2 city database when the
 /// admin has not chosen an interval. MaxMind publishes GeoLite2 twice a week,
 /// so a daily check picks up a new build within a day of release.
@@ -2170,6 +2308,7 @@ impl Default for AppSettings {
             monitoring: MonitoringSettings::default(),
             observability_compression: ObservabilityCompressionSettings::default(),
             observability_retention: ObservabilityRetentionSettings::default(),
+            analytics_retention: AnalyticsRetentionSettings::default(),
             clickhouse: ClickHouseSettings::default(),
             geo: GeoSettings::default(),
             mcp_server: McpServerSettings::default(),
@@ -2520,6 +2659,57 @@ impl AppSettings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lowering_proxy_log_retention_holds_addresses_for_the_old_window() {
+        let now = Utc::now();
+        let settings = AnalyticsRetentionSettings::default().with_ip_hold(None, 90, 7, now);
+
+        assert_eq!(
+            settings.ip_hold_until,
+            Some(now + chrono::Duration::days(90 + i64::from(IP_REFERENCE_SLACK_DAYS))),
+            "logs written under the 90-day window can outlive the new 7-day one"
+        );
+    }
+
+    #[test]
+    fn a_client_supplied_hold_is_not_trusted() {
+        let now = Utc::now();
+        let forged = AnalyticsRetentionSettings {
+            ip_hold_until: Some(now + chrono::Duration::days(3000)),
+            ..AnalyticsRetentionSettings::default()
+        };
+
+        let settings = forged.with_ip_hold(None, 30, 30, now);
+
+        assert_eq!(settings.ip_hold_until, None);
+    }
+
+    #[test]
+    fn raising_the_window_keeps_a_hold_and_a_second_lowering_only_extends_it() {
+        let now = Utc::now();
+        let later = now + chrono::Duration::days(60);
+
+        let kept = AnalyticsRetentionSettings::default().with_ip_hold(Some(later), 7, 30, now);
+        assert_eq!(kept.ip_hold_until, Some(later));
+
+        let extended = AnalyticsRetentionSettings::default().with_ip_hold(Some(later), 30, 7, now);
+        assert_eq!(
+            extended.ip_hold_until,
+            Some(later),
+            "a shorter hold never replaces a longer one"
+        );
+    }
+
+    #[test]
+    fn a_hold_that_has_passed_is_dropped() {
+        let now = Utc::now();
+        let past = now - chrono::Duration::days(1);
+
+        let settings = AnalyticsRetentionSettings::default().with_ip_hold(Some(past), 30, 30, now);
+
+        assert_eq!(settings.ip_hold_until, None);
+    }
+
     use super::*;
 
     #[test]
@@ -3241,6 +3431,54 @@ mod tests {
         );
         assert_eq!(parsed.observability_retention.proxy_logs_days, 30);
         assert_eq!(parsed.observability_retention.otel_spans_days, 90);
+    }
+
+    #[test]
+    fn legacy_settings_json_uses_analytics_retention_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com"
+        }));
+
+        assert_eq!(parsed.analytics_retention.events_days, 90);
+        // Upgrading must not start deleting visitors or error events.
+        assert_eq!(parsed.analytics_retention.visitor_days, None);
+        assert_eq!(parsed.analytics_retention.error_events_days, None);
+        assert_eq!(parsed.analytics_retention.unreferenced_ip_days, Some(30));
+    }
+
+    #[test]
+    fn analytics_retention_round_trips_and_null_means_keep() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "analytics_retention": {
+                "events_days": 30,
+                "visitor_days": 425,
+                "unreferenced_ip_days": null
+            }
+        }));
+
+        assert_eq!(parsed.analytics_retention.events_days, 30);
+        assert_eq!(parsed.analytics_retention.visitor_days, Some(425));
+        assert_eq!(parsed.analytics_retention.unreferenced_ip_days, None);
+
+        let again = AppSettings::from_json(parsed.to_json());
+        assert_eq!(again.analytics_retention, parsed.analytics_retention);
+    }
+
+    #[test]
+    fn analytics_retention_reports_the_first_window_out_of_range() {
+        assert_eq!(AnalyticsRetentionSettings::default().out_of_range(), None);
+
+        let zero = AnalyticsRetentionSettings {
+            visitor_days: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(zero.out_of_range(), Some(("visitor_days", 0)));
+
+        let too_long = AnalyticsRetentionSettings {
+            events_days: 3651,
+            ..Default::default()
+        };
+        assert_eq!(too_long.out_of_range(), Some(("events_days", 3651)));
     }
 
     #[test]
