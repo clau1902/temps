@@ -227,19 +227,19 @@ impl FirecrackerSandboxConfig {
         }
     }
 
-    fn fc_root(&self) -> PathBuf {
+    pub(crate) fn fc_root(&self) -> PathBuf {
         self.data_dir.join("firecracker")
     }
     fn firecracker_bin(&self) -> PathBuf {
         self.fc_root().join("bin/firecracker")
     }
-    fn agent_bin(&self) -> PathBuf {
+    pub(crate) fn agent_bin(&self) -> PathBuf {
         self.fc_root().join("bin/temps-vm-agent")
     }
     /// Static musl `temps-pty-agent`, injected next to the VM agent so the
     /// guest can serve interactive terminals. Optional: a host without it
     /// still creates sandboxes, just without terminals.
-    fn pty_agent_bin(&self) -> PathBuf {
+    pub(crate) fn pty_agent_bin(&self) -> PathBuf {
         self.fc_root().join("bin/temps-pty-agent")
     }
     fn kernel_glob_dir(&self) -> PathBuf {
@@ -1838,6 +1838,7 @@ impl FirecrackerSandboxProvider {
 #[async_trait]
 impl SandboxProvider for FirecrackerSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Firecracker)?;
         let name = self.resolve_name(&config);
         let vm_dir = self.config.vm_dir(&name);
         let image = config
@@ -2309,6 +2310,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         artifact: &super::SnapshotArtifact,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Firecracker)?;
         if artifact.backend != super::SandboxBackend::Firecracker {
             return Err(AgentError::SandboxCreationFailed {
                 run_id: config.run_id,
@@ -2814,6 +2816,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -3540,6 +3543,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: Some(0),
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
