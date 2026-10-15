@@ -44,6 +44,7 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
+import { IDLE_LIST_POLL_MS, refetchOnFocusWhenStale } from '@/lib/live-refetch'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ChevronDown, Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -210,10 +211,14 @@ function EnvironmentVariableRow({
   useEffect(() => {
     const guard = createCredentialRevealGuard()
     revealGuard.current = guard
-    // Drop plaintext whenever this row changes project, identity, or version.
+    // Drop revealed plaintext whenever this row changes project, identity, or
+    // version. The edit draft is deliberately left alone: the list polls, so
+    // `updated_at` can change while the editor is open, and clearing the draft
+    // there would leave `valueLoaded` true with an empty box that Save sends
+    // as an explicit empty value. The editor clears its own draft when it
+    // closes or saves.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setRevealedValue(undefined)
-    setEditValue('')
     return () => guard.invalidate()
   }, [revealScope])
 
@@ -348,12 +353,24 @@ function EnvironmentVariableRow({
   // accidentally expose it as a regular value.
   const [convertToSecret, setConvertToSecret] = useState(false)
 
-  // Update selected environments and preview flag when variable changes (after refetch)
+  // Keep the editor's environment and preview choices in step with the stored
+  // variable, but never while the editor is open: the list polls, so a refetch
+  // (even one returning the same values in a fresh array) would otherwise wipe
+  // what the user just picked and Save would send the reset choices. Closing
+  // the editor re-syncs, which also discards an abandoned draft. Keyed on the
+  // ids rather than the array identity for the same reason.
+  const storedEnvironmentIds = variable.environments
+    .map((env) => env.id)
+    .join(',')
+  const storedIncludeInPreview = variable.include_in_preview ?? false
   useEffect(() => {
+    if (isEditModalOpen) return
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setSelectedEditEnvironments(variable.environments.map((env) => env.id))
-    setEditIncludeInPreview(variable.include_in_preview ?? false)
-  }, [variable.environments, variable.include_in_preview])
+    setSelectedEditEnvironments(
+      storedEnvironmentIds ? storedEnvironmentIds.split(',').map(Number) : []
+    )
+    setEditIncludeInPreview(storedIncludeInPreview)
+  }, [storedEnvironmentIds, storedIncludeInPreview, isEditModalOpen])
 
   const openEditDialog = async () => {
     setIsEditModalOpen(true)
@@ -1374,6 +1391,10 @@ export function EnvironmentVariablesSettings({
         project_id: project.id,
       },
     }),
+    // Variables are also written through the API and CLI; keep the list in
+    // step with them while it is on screen (paused when the tab is hidden).
+    refetchOnWindowFocus: refetchOnFocusWhenStale,
+    refetchInterval: IDLE_LIST_POLL_MS,
   })
 
   const {
@@ -1385,6 +1406,8 @@ export function EnvironmentVariablesSettings({
     queryKey: ['resolved-env-vars', project.id, selectedEnvId],
     queryFn: () => getResolvedEnvVars(project.id, selectedEnvId ?? undefined),
     staleTime: 15_000,
+    refetchOnWindowFocus: refetchOnFocusWhenStale,
+    refetchInterval: IDLE_LIST_POLL_MS,
     enabled: Boolean(projectEnvironments) && !environmentsFailed,
   })
 
@@ -1750,7 +1773,9 @@ export function EnvironmentVariablesSettings({
     return <EnvironmentVariablesLoadingState />
   }
 
-  if (variablesFailed)
+  // A failed background refresh keeps the rows already loaded: replacing the
+  // table with this error view would unmount an open editor and its draft.
+  if (variablesFailed && envVariables === undefined)
     return (
       <div role="alert" className="space-y-3">
         <p>Could not load environment variables for {project.name}.</p>

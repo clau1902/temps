@@ -7,6 +7,7 @@ import {
   deleteBackupScheduleMutation,
   disableBackupScheduleMutation,
   enableBackupScheduleMutation,
+  getBackupOptions,
   getS3SourceOptions,
   listBackupSchedulesOptions,
   listSourceBackupsOptions,
@@ -67,7 +68,12 @@ import {
   useUrlState,
   type DetailFact,
 } from '@temps-sdk/ds'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
@@ -92,6 +98,14 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
+import {
+  ACTIVE_LIST_POLL_MS,
+  inProgressBackupIds,
+  isBackupInProgress,
+  withSettledBackupStates,
+  refetchOnFocusWhenStale,
+  sourceBackupsRefetchInterval,
+} from '@/lib/live-refetch'
 
 /** Format a wall-clock timeout from seconds into a human-readable string.
  * Mirrors the helper in `BackupDetail.tsx`; if this gets copied a third
@@ -152,7 +166,39 @@ export function S3SourceDetail() {
       path: { id: sourceId! },
     }),
     enabled: !!sourceId,
+    refetchOnWindowFocus: refetchOnFocusWhenStale,
+    // A backup started by a schedule, the CLI or another operator must show
+    // up in Recent Backups. The listing returns the whole history, so it is
+    // only polled slowly; running backups are followed per record below.
+    refetchInterval: (query) =>
+      sourceBackupsRefetchInterval(query.state.data?.backups),
   })
+
+  // Follow each running backup on its own record (O(running)) instead of
+  // re-reading the whole listing every few seconds, and refetch the listing
+  // once when one of them settles so its row shows the final state.
+  const runningBackupIds = useMemo(
+    () => inProgressBackupIds(backupIndex?.backups),
+    [backupIndex]
+  )
+  const runningBackupQueries = useQueries({
+    queries: runningBackupIds.map((backupId) => ({
+      ...getBackupOptions({ path: { id: backupId } }),
+      // Stop once the record is terminal (its cached state still feeds the
+      // overlay below); the listing refetch that follows drops it from here.
+      refetchInterval: (query: {
+        state: { data: { state: string } | undefined }
+      }) =>
+        query.state.data && !isBackupInProgress(query.state.data)
+          ? (false as const)
+          : ACTIVE_LIST_POLL_MS,
+    })),
+  })
+  const settledRunningBackups = runningBackupQueries
+    .map((result) => result.data)
+    .filter((backup) => backup && !isBackupInProgress(backup))
+    .map((backup) => backup!.backup_id)
+    .join(',')
 
   const {
     data: schedules = [],
@@ -207,6 +253,13 @@ export function S3SourceDetail() {
 
   const queryClient = useQueryClient()
 
+  useEffect(() => {
+    if (!settledRunningBackups || !sourceId) return
+    void queryClient.invalidateQueries({
+      queryKey: listSourceBackupsOptions({ path: { id: sourceId } }).queryKey,
+    })
+  }, [settledRunningBackups, sourceId, queryClient])
+
   // "Discover orphan backups" — explicit opt-in S3 scan. Slow on some
   // endpoints (5-30 s on OVH); only triggered by user action.
   const discoverOrphansMutation = useMutation({
@@ -227,7 +280,8 @@ export function S3SourceDetail() {
       )
       // Refresh the normal listing so newly discovered entries appear.
       void queryClient.invalidateQueries({
-        queryKey: ['backups', 's3-source', sourceId],
+        queryKey: listSourceBackupsOptions({ path: { id: sourceId! } })
+          .queryKey,
       })
     },
     onError: (err: unknown) => {
@@ -275,19 +329,28 @@ export function S3SourceDetail() {
 
   usePageTitle(source?.name || 'S3 Source Details')
 
+  // Rows of a backup that has settled on its own record show the final state
+  // even when the listing refetch that follows has not (yet) succeeded.
   const sortedBackups = useMemo(
     () =>
-      [...(backupIndex?.backups || [])].sort(
+      [
+        ...withSettledBackupStates(
+          backupIndex?.backups ?? [],
+          runningBackupQueries.map((result) => result.data)
+        ),
+      ].sort(
         (a, b) =>
           new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
       ),
-    [backupIndex]
+    [backupIndex, runningBackupQueries]
   )
 
   // Client-side filter + pagination over the recent-backups list. The list
-  // is DB-first (ADR-014 §"Fast listings") and capped, so doing this on the
-  // client is fine — no backend pagination needed yet. If/when the cap goes
-  // away, swap this for `?page=&page_size=` on the API. Search text and page
+  // is DB-first (ADR-014 §"Fast listings") but the endpoint returns every
+  // retained backup, not a capped page, so filtering here is only fine while
+  // the history is small. That is also why idle polling above stops past a few
+  // hundred rows (see `sourceBackupsRefetchInterval`). Once the endpoint takes
+  // `?page=&page_size=`, swap this for server-side paging. Search text and page
   // number live in the URL (not local state) so a filtered/paged view can be
   // shared or survive a refresh.
   const { get: getBackupsUrlState, patch: patchBackupsUrlState } = useUrlState<
