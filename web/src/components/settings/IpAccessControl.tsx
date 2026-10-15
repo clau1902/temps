@@ -39,6 +39,8 @@ import { Ban, Plus, Shield, Trash2, Edit, Loader2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useMutation, useQuery } from '@tanstack/react-query'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { toast } from 'sonner'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
@@ -57,6 +59,9 @@ const ipAccessControlSchema = z.object({
 
 type IpAccessControlFormData = z.infer<typeof ipAccessControlSchema>
 
+/** Stable fallback so memoised lists do not recompute on every render. */
+const NO_RULES: IpAccessControlResponse[] = []
+
 export function IpAccessControl() {
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -66,10 +71,19 @@ export function IpAccessControl() {
     useState<IpAccessControlResponse | null>(null)
 
   const {
-    data: rules = [],
+    data: cachedRules,
     isLoading,
+    isFetching,
+    error: readError,
     refetch,
   } = useQuery(listIpAccessControlOptions())
+  const rules = cachedRules ?? NO_RULES
+  // A refused or failed read is not an empty rule list: the zero-rule view
+  // would invite an Add IP Rule that the server also refuses. A failed
+  // *refresh* (e.g. the refetch after a mutation) keeps the last-known rules
+  // on screen with the failure beside them instead of replacing them.
+  const readFailed = readError != null
+  const showFailureOnly = readFailed && cachedRules === undefined
 
   const createMutation = useMutation({
     ...createIpAccessControlMutation(),
@@ -213,24 +227,48 @@ export function IpAccessControl() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
-        <div className="flex justify-end">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => handleCreateDialogOpen(true)}
-          >
-            <Plus className="h-4 w-4 mr-2" />
-            Add IP Rule
-          </Button>
-        </div>
+        {!showFailureOnly && (
+          <div className="flex justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => handleCreateDialogOpen(true)}
+            >
+              <Plus className="h-4 w-4 mr-2" />
+              Add IP Rule
+            </Button>
+          </div>
+        )}
 
-        {isLoading ? (
+        {showFailureOnly ? (
+          <ReadFailure
+            resource="IP access control rules"
+            error={readError}
+            onRetry={
+              isForbiddenRead(readError) ? undefined : () => void refetch()
+            }
+            retrying={isFetching}
+            embedded
+          />
+        ) : isLoading ? (
           <div className="flex items-center justify-center py-8">
             <Loader2 className="h-6 w-6 animate-spin" />
           </div>
         ) : (
           <div className="space-y-6">
+            {readFailed && (
+              <ReadFailure
+                resource="IP access control rules"
+                error={readError}
+                cached
+                onRetry={
+                  isForbiddenRead(readError) ? undefined : () => void refetch()
+                }
+                retrying={isFetching}
+                embedded
+              />
+            )}
             {/* Blocked IPs Section */}
             <div>
               <div className="flex items-center gap-2 mb-3">

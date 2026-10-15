@@ -35,7 +35,10 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { useAuth } from '@/contexts/AuthContext'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -93,6 +96,9 @@ export function UsersManagement({
   const [userToResetPassword, setUserToResetPassword] =
     useState<ResetPasswordTarget | null>(null)
   const { user: currentUser } = useAuth()
+  // Creating a user needs `users:write`, which only instance administrators
+  // hold; offering it to anyone else just leads to a refusal.
+  const canAddUsers = useIsInstanceAdmin()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const { handleSensitiveActionError, verificationDialog } =
@@ -223,13 +229,24 @@ export function UsersManagement({
         title="Users"
         description="Manage user access and roles"
         actions={
-          <CreateActionButton
-            onClick={() => navigate('/settings/users/new')}
-            label="Add User"
-            icon={<UserPlus className="h-4 w-4" />}
-          />
+          // Not rendered at all for a role that cannot use it: a disabled
+          // administrative action only invites the question why.
+          canAddUsers ? (
+            <CreateActionButton
+              onClick={() => navigate('/settings/users/new')}
+              label="Add User"
+              icon={<UserPlus className="h-4 w-4" />}
+            />
+          ) : undefined
         }
       />
+
+      {!canAddUsers && (
+        <AdminOnlyNote
+          action="add, edit or remove users"
+          role={currentUser?.role}
+        />
+      )}
 
       <ConfirmDeleteDialog
         open={userToDelete !== null}
@@ -393,7 +410,7 @@ export function UsersManagement({
         <ReadFailure
           resource="Users"
           error={error}
-          onRetry={reloadUsers}
+          onRetry={isForbiddenRead(error) ? undefined : reloadUsers}
           retrying={retrying}
         />
       ) : !users?.length ? (
@@ -402,10 +419,12 @@ export function UsersManagement({
           title="No users found"
           description="Get started by creating a new user."
           action={
-            <Button onClick={() => navigate('/settings/users/new')}>
-              <Plus className="mr-2 h-4 w-4" />
-              Add User
-            </Button>
+            canAddUsers ? (
+              <Button onClick={() => navigate('/settings/users/new')}>
+                <Plus className="mr-2 h-4 w-4" />
+                Add User
+              </Button>
+            ) : undefined
           }
         />
       ) : (
