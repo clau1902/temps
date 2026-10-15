@@ -7,6 +7,7 @@ import {
   CompactErrorFallback,
   ErrorBoundary,
   ErrorFallback,
+  RouteQueryFailureBanner,
 } from '@/components/error'
 import { ThemeProvider } from '@/components/providers/ThemeProvider'
 import { ThemeWrapper } from '@/components/theme/ThemeWrapper'
@@ -19,6 +20,7 @@ import {
   type ConsoleExtensions,
 } from '@temps-sdk/console-kit'
 import {
+  MutationCache,
   QueryCache,
   QueryClient,
   QueryClientProvider,
@@ -44,6 +46,10 @@ import {
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'
 import { attachHttpStatus } from './lib/http-error-status'
+import {
+  installUnhandledRejectionReporter,
+  markErrorReported,
+} from './lib/unhandled-rejections'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
@@ -635,6 +641,7 @@ const FullAppRoutes = () => {
                     the screen. Anything sized to 100% of it — a plugin
                     iframe, say — lost its last rows off-screen. */}
                 <div className="flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4">
+                  <RouteQueryFailureBanner />
                   <Routes>
                     {extraRoutes?.map((r) => (
                       <Route key={r.path} path={r.path} element={r.element} />
@@ -1167,6 +1174,13 @@ const getErrorTitle = (
 }
 
 const queryClient = new QueryClient({
+  // Runs for every failed mutation, including those that define their own
+  // `onError` (which replaces the default one below). Whoever announces the
+  // failure, a handler that also awaits the mutation without a catch must not
+  // have it announced a second time by the unhandled-rejection reporter.
+  mutationCache: new MutationCache({
+    onError: (error) => markErrorReported(error),
+  }),
   queryCache: new QueryCache({
     onError: (error, query) => {
       // ProblemDetails response bodies never carry a "status" field -- the
@@ -1324,6 +1338,16 @@ export const TempsConsole = ({
   useEffect(() => {
     if (!document.documentElement.lang) document.documentElement.lang = 'en'
   }, [])
+
+  // An API failure nobody awaited with a `catch` would otherwise end as an
+  // "uncaught exception: Object" with nothing on screen.
+  useEffect(
+    () =>
+      installUnhandledRejectionReporter((notice) =>
+        toast.error(notice.title, { description: notice.description })
+      ),
+    []
+  )
 
   return (
     <ThemeProvider defaultTheme="system" enableSystem attribute="class">
