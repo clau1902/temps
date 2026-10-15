@@ -16,6 +16,7 @@ import {
   sendFailureReportMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ComposeCheckAction } from '@/components/deployments/ComposeCheckAction'
 import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
@@ -312,6 +313,11 @@ function commitWebUrls(
       ? `${base}${treeSeg}${encodeURIComponent(deployment.branch)}`
       : null,
   }
+}
+
+function isComposeProject(project: ProjectResponse): boolean {
+  const preset = project.preset ?? ''
+  return preset === 'docker-compose' || preset === 'dockercompose'
 }
 
 interface OverviewActions {
@@ -1558,6 +1564,13 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         />
 
         <DeployFailureReport project={project} deployment={deployment} />
+
+        {isComposeProject(project) && (
+          <ComposeCheckAction
+            projectId={deployment.project_id}
+            deploymentId={deployment.id}
+          />
+        )}
 
         {resourceBadges.length > 0 && (
           <div className="flex flex-wrap items-center gap-2">
