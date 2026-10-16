@@ -2651,6 +2651,13 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_repository_preset_live",
         // Git connection metadata (connection IDs, names, provider type).
         "get_provider_connections",
+        // ── Getting started: what a repository / template needs ──
+        // Preset detection and `.env.example` discovery for a public
+        // repository, and the project template catalogue. Read-only metadata.
+        "detect_public_presets",
+        "detect_public_env_example",
+        "list_project_templates",
+        "get_project_template",
         // ── Log aggregator: context window — excluded ──
         // `get_log_context` is intentionally NOT included. It returns raw
         // `message`/`fields` from application stdout/stderr (arbitrary
@@ -2771,6 +2778,33 @@ fn ai_write_allowlist() -> Vec<String> {
         //    unlinked / left running unused; nothing is deleted).
         "create_service",
         "link_service_to_project",
+        // ── Getting started: create a project and ship it ──
+        // `create_project` takes a Git URL (public) or a connected provider
+        // repository and creates the project plus its first environment.
+        // Reversible (a project can be deleted by a human) and it only
+        // starts a build the user asked for. Credentials are never part of
+        // this payload: a private repository goes through a Git connection
+        // the user added in the console, referenced by id.
+        "create_project",
+        "create_project_from_template",
+        "create_environment",
+        // Refresh the repository list of an existing Git connection.
+        "sync_repositories",
+        // ── Getting started: backups ──
+        // Schedules reference an S3 source by id. Creating the source itself
+        // (`create_s3_source`) is deliberately NOT here: its payload carries the
+        // bucket secret key, which must go through the console form and never
+        // through a chat transcript or model context. Same for Git provider
+        // tokens (`create_*_pat_provider`, `create_generic_provider`).
+        "create_backup_schedule",
+        "update_backup_schedule",
+        "enable_backup_schedule",
+        "disable_backup_schedule",
+        "attach_schedule_services",
+        "run_schedule_now",
+        // Connectivity probe against a stored source; reads nothing back but
+        // an ok/error result.
+        "test_s3_source_connection",
         // ── AI application topology ──
         // Composite create is the only safe way for the model to create a
         // Temps project and immediately link its generated id to the current
@@ -5908,6 +5942,50 @@ mod ai_tool_allowlist_tests {
             assert!(
                 writes.contains(operation),
                 "automatic-deployment diagnosis cannot stage `{operation}`"
+            );
+        }
+    }
+
+    /// The assistant must be able to take a user from nothing to a deployed
+    /// project and scheduled backups, and must never be handed an operation whose
+    /// payload carries a stored credential: those go through the console forms.
+    #[test]
+    fn getting_started_operations_are_proposable_but_credential_forms_are_not() {
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+        for operation in [
+            "create_project",
+            "create_project_from_template",
+            "create_environment",
+            "create_backup_schedule",
+            "update_backup_schedule",
+            "run_schedule_now",
+            "test_s3_source_connection",
+        ] {
+            assert!(
+                writes.contains(operation),
+                "getting-started flow cannot stage `{operation}`"
+            );
+        }
+        for operation in [
+            "create_s3_source",
+            "update_s3_source",
+            "create_github_pat_provider",
+            "create_gitlab_pat_provider",
+            "create_gitea_pat_provider",
+            "create_generic_provider",
+            "create_bitbucket_provider",
+            "update_git_provider_credentials",
+        ] {
+            assert!(
+                !writes.contains(operation),
+                "`{operation}` carries a secret and must stay out of the assistant's write tool"
+            );
+        }
+        let reads: std::collections::HashSet<String> = ai_read_allowlist().into_iter().collect();
+        for operation in ["list_s3_sources", "get_s3_source"] {
+            assert!(
+                !reads.contains(operation),
+                "`{operation}` returns the bucket secret and must stay out of the read tool"
             );
         }
     }
