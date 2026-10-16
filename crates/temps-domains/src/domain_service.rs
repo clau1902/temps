@@ -62,10 +62,22 @@ fn sorted_domains_query(
     if let Some(search) = search.filter(|value| !value.is_empty()) {
         query = query.filter(domains::Column::Domain.contains(search));
     }
-    query
-        .order_by_with_nulls(column, order, NullOrdering::Last)
-        .order_by_asc(domains::Column::Domain)
-        .order_by_asc(domains::Column::Id)
+    // Tiebreakers: descending (the default) keeps `domain ASC, id ASC`;
+    // ascending is its exact reverse. When most rows share the sort value
+    // (typically a certificate expiry that is still unknown), a fixed
+    // tiebreaker made the second click on "Certificate expires" look like a
+    // no-op. `id` keeps the order total so LIMIT/OFFSET pages never overlap.
+    let tiebreak = match direction {
+        DomainSortDirection::Asc => Order::Desc,
+        DomainSortDirection::Desc => Order::Asc,
+    };
+    let mut query = query.order_by_with_nulls(column, order, NullOrdering::Last);
+    // Sorting by the domain name already orders by that column; repeating it
+    // as a tiebreaker would only add a redundant key.
+    if !matches!(sort, DomainSort::Domain) {
+        query = query.order_by(domains::Column::Domain, tiebreak.clone());
+    }
+    query.order_by(domains::Column::Id, tiebreak)
 }
 
 #[derive(Error, Debug)]
@@ -2186,9 +2198,11 @@ mod tests {
     #[test]
     fn domain_sorting_is_bounded_and_stable() {
         use sea_orm::{DbBackend, QuerySelect, QueryTrait};
-        for (direction, sql_direction) in [
-            (DomainSortDirection::Asc, "ASC"),
-            (DomainSortDirection::Desc, "DESC"),
+        // Descending keeps the original `domain ASC, id ASC` tiebreak; ascending
+        // is its exact reverse so a second click always reorders tied rows.
+        for (direction, sql_direction, tie_direction) in [
+            (DomainSortDirection::Asc, "ASC", "DESC"),
+            (DomainSortDirection::Desc, "DESC", "ASC"),
         ] {
             let sql = sorted_domains_query(Some("example"), DomainSort::Expiration, direction)
                 .limit(20)
@@ -2200,12 +2214,24 @@ mod tests {
                 "{sql}"
             );
             assert!(
-                sql.contains("\"domain\" ASC, \"domains\".\"id\" ASC"),
+                sql.contains(&format!(
+                    "\"domain\" {tie_direction}, \"domains\".\"id\" {tie_direction}"
+                )),
                 "{sql}"
             );
             assert!(sql.contains("LIKE '%example%'"), "{sql}");
             assert!(sql.contains("LIMIT 20 OFFSET 20"), "{sql}");
         }
+        // Sorting by name must not repeat the column as its own tiebreaker.
+        let by_name = sorted_domains_query(None, DomainSort::Domain, DomainSortDirection::Asc)
+            .build(DbBackend::Postgres)
+            .to_string();
+        assert!(
+            by_name.contains(
+                "ORDER BY \"domains\".\"domain\" ASC NULLS LAST, \"domains\".\"id\" DESC"
+            ),
+            "{by_name}"
+        );
         for (sort, column) in [
             (DomainSort::Domain, "domain"),
             (DomainSort::Status, "status"),
