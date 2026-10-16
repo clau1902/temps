@@ -25,10 +25,9 @@ import {
   KeyRound,
   Loader2,
   Send,
-  ShieldCheck,
   Sparkles,
 } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
@@ -213,8 +212,8 @@ function AssistantExample() {
         {ASSISTANT_EXAMPLE_PROMPTS[0]}
       </p>
       <p className="px-1 text-xs leading-5 text-muted-foreground">
-        Reads run straight away. Anything that changes your setup is shown to
-        you first and only runs when you approve it.
+        Reads and changes run straight away unless you turn on “Ask before
+        changes”. Deletions always wait for your approval.
       </p>
     </div>
   )
@@ -326,8 +325,8 @@ export function AssistantStart({
           What should we look at?
         </h2>
         <p className="text-sm leading-6 text-muted-foreground">
-          Ask about your projects, deployments or settings. Changes always wait
-          for your approval.
+          Ask about your projects, deployments or settings. Deletions always
+          wait for your approval.
         </p>
       </div>
       <div className="grid gap-2">
@@ -393,8 +392,8 @@ function AssistantStartSkeleton() {
  *
  * Simple is a chat box on the default model. Advanced adds the model and
  * reasoning pickers and opens every tool call so its arguments and result are
- * visible. Approval of changes is not a setting: the assistant's provider only
- * offers confirm-every-action, so the badge states a fact rather than a toggle.
+ * visible. Whether changes ask first is a switch inside the composer, so it is
+ * reachable in both modes.
  */
 export function AssistantThread({
   conversation,
@@ -427,11 +426,6 @@ export function AssistantThread({
             </TabsTrigger>
           </TabsList>
         </Tabs>
-        <ApprovalBadge>
-          {level === 'advanced'
-            ? 'Every change asks for approval'
-            : 'Changes need your approval'}
-        </ApprovalBadge>
       </div>
       <div className="min-h-0 flex-1">
         <DebugChatPanel
@@ -448,17 +442,5 @@ export function AssistantThread({
         />
       </div>
     </div>
-  )
-}
-
-function ApprovalBadge({ children }: { children: ReactNode }) {
-  return (
-    <Badge
-      variant="outline"
-      className="gap-1.5 font-normal text-muted-foreground"
-    >
-      <ShieldCheck className="size-3" aria-hidden="true" />
-      {children}
-    </Badge>
   )
 }

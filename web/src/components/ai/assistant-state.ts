@@ -16,6 +16,24 @@ export const OPENROUTER_SETUP_PATH = '/ai-gateway?add=openrouter'
 export const NO_PROVIDER_REASON =
   'No AI provider is configured. Add an OpenRouter API key to start managing Temps by chat.'
 
+/** Gateway permission mode that has every change wait for the user's approval. */
+export const ASK_BEFORE_CHANGES_MODE = 'confirm-actions'
+
+/**
+ * Gateway permission mode that applies changes without asking. Deletions still
+ * wait for approval: the server never auto-approves them.
+ */
+export const RUN_CHANGES_AUTOMATICALLY_MODE = 'auto'
+
+/** Whether a conversation's permission mode makes changes wait for approval. */
+export function asksBeforeChanges(permissionModeId: string | null): boolean {
+  return permissionModeId === ASK_BEFORE_CHANGES_MODE
+}
+
+export function permissionModeForAsk(ask: boolean): string {
+  return ask ? ASK_BEFORE_CHANGES_MODE : RUN_CHANGES_AUTOMATICALLY_MODE
+}
+
 /** Concrete things to ask, shown before the first message. */
 export const ASSISTANT_EXAMPLE_PROMPTS: readonly string[] = [
   'Which of my deployments failed this week, and why?',

@@ -106,6 +106,8 @@ import { toast } from 'sonner'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAiAssistant } from './AiAssistantContext'
+import { AskBeforeChangesToggle } from './AskBeforeChangesToggle'
+import { ASSISTANT_CONTEXT_TYPE } from './assistant-state'
 import {
   chatDraftStorageKey,
   chatHarnessProviderOptions,
@@ -3709,8 +3711,18 @@ function DebugChatPanelBody({
               >
                 <Paperclip className="size-3.5" />
               </Button>
-              {!chatDetail.showRuntimeControls ? null : providerStatusState ===
-                'loading' ? (
+              {!chatDetail.showRuntimeControls ? (
+                contextType === ASSISTANT_CONTEXT_TYPE &&
+                runtimeSelection.permissionModeId !== null ? (
+                  <AskBeforeChangesToggle
+                    permissionModeId={runtimeSelection.permissionModeId}
+                    disabled={starting || turnActive}
+                    onChange={(permissionModeId) =>
+                      void changePermissionMode(permissionModeId)
+                    }
+                  />
+                ) : null
+              ) : providerStatusState === 'loading' ? (
                 <div
                   className="flex h-8 items-center gap-2 px-2"
                   role="status"

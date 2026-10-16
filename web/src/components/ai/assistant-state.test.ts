@@ -6,9 +6,13 @@ import {
   ASSISTANT_EXAMPLE_PROMPTS,
   NO_PROVIDER_REASON,
   OPENROUTER_SETUP_PATH,
+  ASK_BEFORE_CHANGES_MODE,
+  RUN_CHANGES_AUTOMATICALLY_MODE,
   assistantReadiness,
+  asksBeforeChanges,
   isAssistantConversation,
   loadDetailLevel,
+  permissionModeForAsk,
   saveDetailLevel,
   setupPathFromProblem,
 } from './assistant-state'
@@ -138,5 +142,20 @@ describe('example prompts', () => {
     for (const prompt of ASSISTANT_EXAMPLE_PROMPTS) {
       expect(prompt.trim().length).toBeGreaterThan(10)
     }
+  })
+})
+
+describe('ask before changes', () => {
+  test('only the confirming mode asks', () => {
+    expect(asksBeforeChanges(ASK_BEFORE_CHANGES_MODE)).toBe(true)
+    expect(asksBeforeChanges(RUN_CHANGES_AUTOMATICALLY_MODE)).toBe(false)
+    expect(asksBeforeChanges(null)).toBe(false)
+  })
+
+  test('round-trips through the permission mode ids the server accepts', () => {
+    expect(permissionModeForAsk(true)).toBe('confirm-actions')
+    expect(permissionModeForAsk(false)).toBe('auto')
+    expect(asksBeforeChanges(permissionModeForAsk(true))).toBe(true)
+    expect(asksBeforeChanges(permissionModeForAsk(false))).toBe(false)
   })
 })

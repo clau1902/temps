@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 
+import { AskBeforeChangesToggle } from './AskBeforeChangesToggle'
 import { AssistantOnboarding, AssistantStart } from './AssistantPanels'
 import {
   ASSISTANT_EXAMPLE_PROMPTS,
@@ -39,7 +40,7 @@ describe('AssistantOnboarding', () => {
 
   test('shows a concrete example of what it would do', () => {
     expect(markup).toContain(ASSISTANT_EXAMPLE_PROMPTS[0])
-    expect(markup).toContain('only runs when you approve it')
+    expect(markup).toContain('Deletions always wait for your approval')
   })
 
   test('takes the key inline, as a masked field that is never prefilled', () => {
@@ -75,5 +76,43 @@ describe('AssistantStart', () => {
     expect(markup).toContain('role="status"')
     expect(markup).toContain('animate-pulse')
     expect(markup).not.toContain('animate-spin')
+  })
+})
+
+describe('AskBeforeChangesToggle', () => {
+  test('is off when changes run automatically', () => {
+    const markup = render(
+      <AskBeforeChangesToggle permissionModeId="auto" onChange={() => {}} />
+    )
+    expect(markup).toContain('Ask before changes')
+    expect(markup).toContain('aria-checked="false"')
+  })
+
+  test('is on when every change asks first', () => {
+    const markup = render(
+      <AskBeforeChangesToggle
+        permissionModeId="confirm-actions"
+        onChange={() => {}}
+      />
+    )
+    expect(markup).toContain('aria-checked="true"')
+  })
+
+  test('says deletions always ask, so the off state is not read as "no safety"', () => {
+    const markup = render(
+      <AskBeforeChangesToggle permissionModeId="auto" onChange={() => {}} />
+    )
+    expect(markup).toContain('Deletions always ask')
+  })
+
+  test('can be disabled while a turn is running', () => {
+    const markup = render(
+      <AskBeforeChangesToggle
+        permissionModeId="auto"
+        disabled
+        onChange={() => {}}
+      />
+    )
+    expect(markup).toContain('disabled=""')
   })
 })
