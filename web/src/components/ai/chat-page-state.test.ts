@@ -32,24 +32,22 @@ const conversations = [
 ]
 
 describe('resolvePageChat', () => {
-  test('redirects a bare chat route to the first conversation', () => {
-    expect(resolvePageChat(null, conversations)?.public_id).toBe('most-recent')
-  })
-
   test('keeps the conversation selected by the URL across reloads', () => {
     expect(resolvePageChat('older-chat', conversations)?.public_id).toBe(
       'older-chat'
     )
   })
 
-  test('redirects a stale conversation URL to the first conversation', () => {
-    expect(resolvePageChat('deleted-chat', conversations)?.public_id).toBe(
-      'most-recent'
-    )
+  test('does not resume a conversation on a bare chat route', () => {
+    expect(resolvePageChat(null, conversations)).toBeNull()
   })
 
-  test('leaves the route empty when there are no conversations', () => {
-    expect(resolvePageChat(null, [])).toBeNull()
+  test('does not substitute another conversation for a stale URL', () => {
+    expect(resolvePageChat('deleted-chat', conversations)).toBeNull()
+  })
+
+  test('is empty when there are no conversations', () => {
+    expect(resolvePageChat('older-chat', [])).toBeNull()
   })
 })
 

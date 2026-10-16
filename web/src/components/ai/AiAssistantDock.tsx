@@ -342,7 +342,11 @@ export function DockBody({
   // Assistant chat: `assistantStarting` is the prompt screen before a
   // conversation exists; `assistant` is the open conversation.
   const [assistant, setAssistant] = useState<AssistantChat | null>(null)
-  const [assistantStarting, setAssistantStarting] = useState(false)
+  // The full-screen page opens on the assistant (onboarding, or the starter
+  // prompts) unless the URL names a conversation to resume.
+  const [assistantStarting, setAssistantStarting] = useState(
+    () => layout === 'page' && !urlChatId && !initialContext
+  )
   const [detailLevel, setDetailLevel] = useState<ChatDetailLevel>(() =>
     loadDetailLevel()
   )
@@ -433,18 +437,18 @@ export function DockBody({
     })
   }, [])
 
-  // Resolve the initial full-page route exactly once after the list arrives.
-  // A valid `?chat=` is restored; bare or stale routes are replaced with the
-  // API's first (most recently active) conversation. Keeping this separate
-  // from ongoing URL synchronization prevents the mount-time race where a
-  // still-null active id removed a valid URL before it could be resolved.
+  // Resolve a `?chat=` route exactly once after the list arrives. A valid id
+  // is restored; a stale one falls back to the assistant start screen. A bare
+  // route needs no resolving: the page already opened on that screen.
+  // Keeping this separate from ongoing URL synchronization prevents the
+  // mount-time race where a still-null active id removed a valid URL before it
+  // could be resolved.
   const initialPageRouteResolvedRef = useRef(false)
   useEffect(() => {
-    if (layout !== 'page' || initialContext) return
+    if (layout !== 'page' || initialContext || !urlChatId) return
     if (initialPageRouteResolvedRef.current || !listReady) return
 
     const conversation = resolvePageChat(urlChatId, conversations)
-    if (!conversation) return
 
     // Defer the state transition out of the effect body. The cancellation
     // guard keeps React Strict Mode's setup/cleanup replay from consuming the
@@ -453,12 +457,14 @@ export function DockBody({
     queueMicrotask(() => {
       if (cancelled) return
       initialPageRouteResolvedRef.current = true
-      openConversation(conversation)
-      if (urlChatId !== conversation.public_id) {
-        const next = new URLSearchParams(searchParams)
-        next.set('chat', conversation.public_id)
-        setSearchParams(next, { replace: true })
+      if (conversation) {
+        openConversation(conversation)
+        return
       }
+      const next = new URLSearchParams(searchParams)
+      next.delete('chat')
+      setSearchParams(next, { replace: true })
+      setAssistantStarting(true)
     })
     return () => {
       cancelled = true
@@ -531,6 +537,13 @@ export function DockBody({
     setAssistant(null)
     setActivePublicId(null)
     setAssistantStarting(true)
+    // A new chat must not leave the previous conversation's id in the address
+    // bar; the sync effect writes the new one once its first message creates it.
+    if (layout === 'page' && searchParams.has('chat')) {
+      const next = new URLSearchParams(searchParams)
+      next.delete('chat')
+      setSearchParams(next, { replace: true })
+    }
   }
 
   const handleAssistantStarted = (
@@ -904,14 +917,18 @@ export function DockBody({
 
         <div className="min-h-0 flex-1">
           {assistantStarting ? (
-            <AssistantStart
-              onStarted={handleAssistantStarted}
-              onNavigate={() => {
-                if (typeof window !== 'undefined' && window.innerWidth < 1024)
-                  onClose()
-              }}
-              cloudPath="/settings/cloud"
-            />
+            // On the full-screen page the start screen keeps a readable measure
+            // instead of stretching its prompts across the whole viewport.
+            <div className={cn('h-full', isPage && 'mx-auto w-full max-w-2xl')}>
+              <AssistantStart
+                onStarted={handleAssistantStarted}
+                onNavigate={() => {
+                  if (typeof window !== 'undefined' && window.innerWidth < 1024)
+                    onClose()
+                }}
+                cloudPath="/settings/cloud"
+              />
+            </div>
           ) : assistant ? (
             <AssistantThread
               key={assistant.conversation.public_id}

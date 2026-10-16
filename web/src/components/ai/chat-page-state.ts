@@ -70,23 +70,23 @@ export function conversationListNeedsRefresh<T extends ChatRouteItem>(
 }
 
 /**
- * Resolve the conversation a full-page chat route should display.
+ * Find the conversation a full-page chat route (`/chat?chat=<id>`) points at.
  *
- * A valid URL always wins. Bare and stale URLs fall back to the first item,
- * which is the most recently active conversation returned by the API.
+ * Only a URL that names an existing conversation resolves. A bare or stale
+ * route returns null: the page then opens on the assistant's start screen
+ * (onboarding, or "what should we look at?") rather than silently resuming
+ * whichever conversation happened to be most recent.
  */
 export function resolvePageChat<T extends ChatRouteItem>(
   requestedId: string | null,
   conversations: T[]
 ): T | null {
-  if (requestedId) {
-    const requested = conversations.find(
+  if (!requestedId) return null
+  return (
+    conversations.find(
       (conversation) => conversation.public_id === requestedId
-    )
-    if (requested) return requested
-  }
-
-  return conversations[0] ?? null
+    ) ?? null
+  )
 }
 
 export interface ProjectChatTarget {
