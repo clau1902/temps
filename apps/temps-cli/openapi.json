@@ -26289,6 +26289,67 @@
         ],
         "type": "object"
       },
+      "GoalResponse": {
+        "description": "Goal as returned to the console.",
+        "properties": {
+          "attempts": {
+            "description": "Fix turns started so far.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "check_operation": {
+            "description": "The read operation that observes the goal.",
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "deadline_at": {
+            "description": "The goal is given up, as failed, after this instant (ISO 8601).",
+            "type": "string"
+          },
+          "id": {
+            "description": "Opaque goal id.",
+            "type": "string"
+          },
+          "last_checked_at": {
+            "description": "ISO 8601, `Z` suffix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_observation": {
+            "description": "What the last check saw, in one sentence.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_attempts": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "status": {
+            "description": "`active`, `healing`, `needs_you`, `achieved`, `failed` or `cancelled`.",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "status",
+          "attempts",
+          "max_attempts",
+          "deadline_at",
+          "created_at",
+          "check_operation"
+        ],
+        "type": "object"
+      },
       "GroupKey": {
         "description": "What to group or facet by.",
         "oneOf": [
@@ -64245,6 +64306,281 @@
           }
         ],
         "summary": "Export the bounded, server-redacted diagnostic state Temps currently owns.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/goals": {
+      "get": {
+        "operationId": "list_goals",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GoalResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Goals of the conversation"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the goals a chat is watching or has finished with, newest first.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/goals/{goal_id}/cancel": {
+      "post": {
+        "operationId": "cancel_goal",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Goal id",
+            "in": "path",
+            "name": "goal_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoalResponse"
+                }
+              }
+            },
+            "description": "Goal cancelled"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or goal not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Goal is already finished"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop watching a goal. The check never runs again and no fix turn starts.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/goals/{goal_id}/retry": {
+      "post": {
+        "operationId": "retry_goal",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Goal id",
+            "in": "path",
+            "name": "goal_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoalResponse"
+                }
+              }
+            },
+            "description": "Goal reopened"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or goal not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Goal is not failed or waiting"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Give a failed or waiting goal a fresh attempt budget and check it again now.",
         "tags": [
           "AI Chat"
         ],

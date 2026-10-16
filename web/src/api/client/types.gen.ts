@@ -12238,6 +12238,43 @@ export type GlobalTracesResponse = {
 };
 
 /**
+ * Goal as returned to the console.
+ */
+export type GoalResponse = {
+    /**
+     * Fix turns started so far.
+     */
+    attempts: number;
+    /**
+     * The read operation that observes the goal.
+     */
+    check_operation: string;
+    created_at: string;
+    /**
+     * The goal is given up, as failed, after this instant (ISO 8601).
+     */
+    deadline_at: string;
+    /**
+     * Opaque goal id.
+     */
+    id: string;
+    /**
+     * ISO 8601, `Z` suffix.
+     */
+    last_checked_at?: string | null;
+    /**
+     * What the last check saw, in one sentence.
+     */
+    last_observation?: string | null;
+    max_attempts: number;
+    /**
+     * `active`, `healing`, `needs_you`, `achieved`, `failed` or `cancelled`.
+     */
+    status: string;
+    title: string;
+};
+
+/**
  * What to group or facet by.
  */
 export type GroupKey = {
@@ -30279,6 +30316,148 @@ export type GetUserConversationDiagnosticsResponses = {
 };
 
 export type GetUserConversationDiagnosticsResponse = GetUserConversationDiagnosticsResponses[keyof GetUserConversationDiagnosticsResponses];
+
+export type ListGoalsData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/goals';
+};
+
+export type ListGoalsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListGoalsError = ListGoalsErrors[keyof ListGoalsErrors];
+
+export type ListGoalsResponses = {
+    /**
+     * Goals of the conversation
+     */
+    200: Array<GoalResponse>;
+};
+
+export type ListGoalsResponse = ListGoalsResponses[keyof ListGoalsResponses];
+
+export type CancelGoalData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Goal id
+         */
+        goal_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/goals/{goal_id}/cancel';
+};
+
+export type CancelGoalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or goal not found
+     */
+    404: ProblemDetails;
+    /**
+     * Goal is already finished
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CancelGoalError = CancelGoalErrors[keyof CancelGoalErrors];
+
+export type CancelGoalResponses = {
+    /**
+     * Goal cancelled
+     */
+    200: GoalResponse;
+};
+
+export type CancelGoalResponse = CancelGoalResponses[keyof CancelGoalResponses];
+
+export type RetryGoalData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Goal id
+         */
+        goal_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/goals/{goal_id}/retry';
+};
+
+export type RetryGoalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or goal not found
+     */
+    404: ProblemDetails;
+    /**
+     * Goal is not failed or waiting
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RetryGoalError = RetryGoalErrors[keyof RetryGoalErrors];
+
+export type RetryGoalResponses = {
+    /**
+     * Goal reopened
+     */
+    200: GoalResponse;
+};
+
+export type RetryGoalResponse = RetryGoalResponses[keyof RetryGoalResponses];
 
 export type SendUserMessageData = {
     body: SendMessageRequest;
