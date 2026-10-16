@@ -2187,6 +2187,46 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_service_type_parameters",
         "get_cluster_health",
         "get_cluster_member",
+        // Service detail with every sensitive parameter masked
+        // (`mask_sensitive_parameter_values`); `connection_info` is never
+        // populated. Without it the assistant could not see why a service
+        // failed (`error_message`) or how its members were laid out.
+        // `reveal_service_parameter` / `reveal_service_environment_variables`
+        // stay out: those return plaintext.
+        "get_service",
+        "get_service_by_slug",
+        // ── Agentic follow-up reads: what a change did, and what to do next ──
+        "list_container_history",
+        "tail_deployment_job_logs",
+        "get_restore_run",
+        "get_external_service_backup_capability",
+        "list_renewal_attempts",
+        "get_compose_security",
+        "get_project_service_template",
+        // The public IPs and whether domains can be created: what a user needs
+        // to point a DNS record at this platform.
+        "get_access_info",
+        // Repository files fetched through the stored Git connection, so a
+        // private repo's `.env.example` / compose file can be read when
+        // planning a deployment.
+        "get_repository_env_example_live",
+        "get_repository_compose_services_live",
+        "get_public_compose_services",
+        // ── Monitoring the user already configured ──
+        "listHttpChecks",
+        "getHttpChecksCapabilities",
+        "listHttpCheckPresets",
+        "listSystemAlarms",
+        "getSystemAlarmsSummary",
+        "list_global_error_groups",
+        // ── Cross-project analytics and traces (same scope rules as the
+        //    per-project reads above). API traffic summaries, routes and
+        //    callers are deliberately absent: a test pins them out. ──
+        "get_global_analytics",
+        "get_analytics_projects",
+        "query_global_traces",
+        "query_global_trace_summaries",
+        "getUnifiedTrace",
         "getPostgresWalHealth",
         "ExternalServiceMetricsGetLatest",
         "ExternalServiceMetricsGetRange",
@@ -2654,10 +2694,7 @@ fn ai_read_allowlist() -> Vec<String> {
         // ── Getting started: what a repository / template needs ──
         // Preset detection and `.env.example` discovery for a public
         // repository, and the project template catalogue. Read-only metadata.
-        "detect_public_presets",
         "detect_public_env_example",
-        "list_project_templates",
-        "get_project_template",
         // ── Log aggregator: context window — excluded ──
         // `get_log_context` is intentionally NOT included. It returns raw
         // `message`/`fields` from application stdout/stderr (arbitrary
@@ -2778,6 +2815,10 @@ fn ai_write_allowlist() -> Vec<String> {
         //    unlinked / left running unused; nothing is deleted).
         "create_service",
         "link_service_to_project",
+        // A cluster that failed while coming up is repaired in place; the
+        // alternative is a second cluster beside the broken one. It carries no
+        // credentials and only re-runs the creation the user asked for.
+        "retry_cluster",
         // ── Getting started: create a project and ship it ──
         // `create_project` takes a Git URL (public) or a connected provider
         // repository and creates the project plus its first environment.
@@ -2805,6 +2846,73 @@ fn ai_write_allowlist() -> Vec<String> {
         // Connectivity probe against a stored source; reads nothing back but
         // an ok/error result.
         "test_s3_source_connection",
+        // ── Operating a database service ──
+        // Lifecycle and sizing of a service the user already has. None of
+        // these carry a credential. `upgrade_service`, `promote_cluster_member`
+        // (a failover), restores and Postgres upgrades are deliberately NOT
+        // here: they put data or availability at risk and are done from the
+        // console where the user sees the plan first.
+        "start_service",
+        "stop_service",
+        "update_service_resources",
+        "trigger_service_health_check",
+        "add_cluster_member",
+        "unlink_service_from_project",
+        // Removing a service is the only way to clean up a cluster that failed
+        // to come up. DELETE always waits for the user, in every mode.
+        "delete_service",
+        // ── Project configuration ──
+        // `update_project_deployment_config` is NOT here: its payload can carry
+        // a password-protection secret and arbitrary headers.
+        "update_project",
+        "update_project_settings",
+        "update_environment_subdomain",
+        // ── Backups: run and manage, never create the destination ──
+        "run_external_service_backup",
+        "cancel_backup",
+        "cancel_schedule_run",
+        "detach_schedule_service",
+        "delete_backup_schedule",
+        // ── Domains and certificates ──
+        // Registering a domain, ordering and finalizing its certificate and
+        // pointing a project at it. DNS provider credentials are stored on
+        // the provider and never travel in these payloads.
+        "create_domain",
+        "provision_domain",
+        "renew_domain",
+        "create_or_recreate_order",
+        "finalize_order",
+        "setup_dns_challenge",
+        "cancel_domain_order",
+        "create_custom_domain",
+        "update_custom_domain",
+        "delete_custom_domain",
+        "link_custom_domain_to_certificate",
+        // ── Alarms and incidents ──
+        "acknowledgeAlarm",
+        "resolveAlarm",
+        "silenceAlarm",
+        "acknowledgeSystemAlarm",
+        "resolveSystemAlarm",
+        "silenceSystemAlarm",
+        // Checks are created in the console (their payload can hold request
+        // headers); the assistant can switch one on or off and run it now.
+        "setHttpCheckEnabled",
+        "runHttpCheck",
+        "create_monitor",
+        "update_monitor",
+        "create_incident",
+        "update_incident_status",
+        // ── Feature flags, error rules and scans ──
+        "create_flag",
+        "update_flag",
+        "set_flag_environment",
+        "restore_flag",
+        "archive_flag",
+        "create_alert_rule",
+        "update_alert_rule",
+        "update_error_group",
+        "trigger_scan",
         // ── AI application topology ──
         // Composite create is the only safe way for the model to create a
         // Temps project and immediately link its generated id to the current
@@ -5986,6 +6094,80 @@ mod ai_tool_allowlist_tests {
             assert!(
                 !reads.contains(operation),
                 "`{operation}` returns the bucket secret and must stay out of the read tool"
+            );
+        }
+    }
+
+    /// The assistant has to be able to run the platform it set up: see why a
+    /// service failed, repair or remove it, size it, put a domain on a project.
+    /// And the operations whose payload or response carries a secret, or that
+    /// can lose data, stay with the console. Pinning both keeps a later
+    /// addition from quietly crossing the line in either direction.
+    #[test]
+    fn operating_operations_are_proposable_and_secret_or_data_risking_ones_are_not() {
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+        let reads: std::collections::HashSet<String> = ai_read_allowlist().into_iter().collect();
+        for operation in [
+            "start_service",
+            "stop_service",
+            "update_service_resources",
+            "add_cluster_member",
+            "retry_cluster",
+            "delete_service",
+            "update_project",
+            "run_external_service_backup",
+            "create_custom_domain",
+            "provision_domain",
+            "acknowledgeAlarm",
+        ] {
+            assert!(
+                writes.contains(operation),
+                "operating flow cannot stage `{operation}`"
+            );
+        }
+        for operation in ["get_service", "get_service_by_slug", "get_access_info"] {
+            assert!(
+                reads.contains(operation),
+                "operating flow cannot read `{operation}`"
+            );
+        }
+        // Payload carries a secret, or the operation can lose data or fail over.
+        for operation in [
+            "update_project_deployment_config",
+            "createHttpCheck",
+            "updateHttpCheck",
+            "create_webhook",
+            "create_api_key",
+            "create_deployment_token",
+            "createProjectSecret",
+            "upsert_secret",
+            "create_dsn",
+            "upgrade_service",
+            "promote_cluster_member",
+            "start_restore",
+            "start_data_import",
+            "start_pg_upgrade",
+            "delete_project",
+            "delete_backup",
+        ] {
+            assert!(
+                !writes.contains(operation),
+                "`{operation}` must stay out of the assistant's write tool"
+            );
+        }
+        // Responses that return plaintext secrets.
+        for operation in [
+            "reveal_service_parameter",
+            "reveal_service_environment_variables",
+            "get_environment_variable_value",
+            "get_resolved_environment_variable_value",
+            "get_container_environment_variable",
+            "get_service_environment_variable",
+            "get_settings",
+        ] {
+            assert!(
+                !reads.contains(operation),
+                "`{operation}` returns plaintext secrets and must stay out of the read tool"
             );
         }
     }

@@ -58,6 +58,7 @@ Most conversations start from a goal. Follow this loop for every one:
 
 ### Other starting points
 - **Add a database or cache for a project:** list the available service types, read the parameters the type needs, create the service, link it to the project, and tell the user which environment variables the project now receives. Redeploy only if they want it applied now.
+- **A highly available Postgres:** create the service with `topology` set to `cluster` and leave `members` out. Temps then builds a monitor, a primary and a replica on this host, which survives a member failing but not the host failing. Only list `members` (one `monitor`, plus `primary` and `replica` entries, each with an optional worker `node_id`) when the user wants them spread across nodes. A cluster takes a minute or two to come up: check its status before saying it is ready, and if it failed, retry it rather than creating a second one.
 - **A custom domain:** read the project's environments and domains, add the domain to the right environment, and give the DNS records the user must create. Check status and report when it resolves.
 - **Something is broken:** start from the latest deployment and its logs, state the cause in one sentence, then offer the smallest fix.
 
@@ -154,6 +155,9 @@ mod tests {
         assert!(seed
             .system
             .contains("Never ask the user to paste a secret into this chat"));
+        // A highly available Postgres is asked for without inventing members.
+        assert!(seed.system.contains("A highly available Postgres"));
+        assert!(seed.system.contains("leave `members` out"));
         // The generic tool grammar is still included.
         assert!(seed.system.contains(TOOL_USAGE_GUIDANCE));
     }
