@@ -980,12 +980,41 @@ fn is_temps_write_tool_name(name: &str) -> bool {
     matches!(name, TEMPS_WRITE_TOOL_NAME | "mcp__temps-chat__temps_write")
 }
 
+/// Most a visible API-tool result may occupy in the live stream and in the
+/// persisted transcript. The model still gets the full result for the turn.
+const MAX_PUBLIC_API_RESULT_BYTES: usize = 16 * 1024;
+
+fn truncate_for_display(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n… truncated, {} of {} bytes shown",
+        &text[..end],
+        end,
+        text.len()
+    )
+}
+
 /// Client-visible tool results must not contain raw data fetched through
-/// server-side credentials. The model keeps the full result for reasoning;
-/// the live stream and persisted transcript receive only this safe status.
+/// server-side credentials. The model keeps the full result for reasoning.
+///
+/// The `temps` API tool is different: it replays the request through the real
+/// router with the caller's own permissions, over an allowlist that excludes
+/// secret-bearing reads, so the user is entitled to everything it returns. They
+/// see it redacted (credential-looking keys and strings masked) and capped.
+/// Every other tool, such as repository reads made with server-side provider
+/// credentials, shows only a status.
 fn public_tool_result(name: &str, result: &str) -> String {
     if is_temps_write_tool_name(name) {
         return redact_json_string(result);
+    }
+    if name == "temps" {
+        return truncate_for_display(redact_json_string(result), MAX_PUBLIC_API_RESULT_BYTES);
     }
 
     "Tool completed; detailed result is withheld from the chat transcript.".to_string()
@@ -9762,6 +9791,22 @@ mod tests {
             public_tool_result("mcp__temps-chat__temps_write", r#"{"status":"proposed"}"#),
             r#"{"status":"proposed"}"#
         );
+    }
+
+    #[test]
+    fn api_tool_results_are_shown_redacted_and_capped() {
+        let shown = public_tool_result(
+            "temps",
+            r#"{"status":200,"body":{"name":"web","api_key":"abc123","note":"token=hunter2"}}"#,
+        );
+        assert!(shown.contains(r#""name":"web""#), "{shown}");
+        assert!(!shown.contains("abc123"), "{shown}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+
+        let huge = format!(r#"{{"body":"{}"}}"#, "é".repeat(MAX_PUBLIC_API_RESULT_BYTES));
+        let capped = public_tool_result("temps", &huge);
+        assert!(capped.len() < MAX_PUBLIC_API_RESULT_BYTES + 100);
+        assert!(capped.contains("truncated"), "{}", &capped[capped.len() - 60..]);
     }
 
     #[test]
