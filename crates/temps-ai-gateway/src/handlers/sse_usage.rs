@@ -6,7 +6,7 @@
 //! token, independently of the size of a terminal Responses event.
 
 #[derive(Clone, Copy)]
-pub(super) enum UsageKind {
+pub(crate) enum UsageKind {
     ChatCompletions,
     Responses,
 }

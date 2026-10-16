@@ -22,8 +22,12 @@ use temps_ai::{
     RefreshPolicy, TokenStream, ToolCall,
 };
 
+use crate::handlers::gateway::wrap_stream_with_usage_tracking;
+use crate::handlers::sse_usage::UsageKind;
 use crate::providers::route_model_to_provider;
-use crate::services::{gateway_provider_capabilities, ByokOverride, GatewayService};
+use crate::services::gateway_service::CredentialType;
+use crate::services::usage_service::AiRequestContext;
+use crate::services::{gateway_provider_capabilities, ByokOverride, GatewayService, UsageService};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, MessageContent,
 };
@@ -32,11 +36,25 @@ use crate::types::{
 pub struct GatewayAiService {
     gateway: Arc<GatewayService>,
     db: Arc<DatabaseConnection>,
+    /// Records token usage for streamed chat turns. `None` in tests and any
+    /// embedding that does not track usage.
+    usage: Option<Arc<UsageService>>,
 }
 
 impl GatewayAiService {
     pub fn new(gateway: Arc<GatewayService>, db: Arc<DatabaseConnection>) -> Self {
-        Self { gateway, db }
+        Self {
+            gateway,
+            db,
+            usage: None,
+        }
+    }
+
+    /// Attach the usage service so streamed chat turns appear in the AI
+    /// Gateway usage views, attributed to the user and conversation.
+    pub fn with_usage_service(mut self, usage: Arc<UsageService>) -> Self {
+        self.usage = Some(usage);
+        self
     }
 
     fn route_override(provider: Option<&str>, purpose: &str) -> Result<ByokOverride, AiError> {
@@ -860,7 +878,8 @@ impl AiService for GatewayAiService {
             "chat_stream_turn: model={model} tools={} purpose={purpose}",
             chat_req.tools.as_ref().map(|t| t.len()).unwrap_or(0)
         );
-        let (byte_stream, _cred) = self
+        let started = std::time::Instant::now();
+        let (byte_stream, credential) = self
             .gateway
             .chat_completion_stream(&chat_req, &route)
             .await
@@ -868,6 +887,30 @@ impl AiService for GatewayAiService {
                 purpose: purpose.clone(),
                 reason: e.to_string(),
             })?;
+        // Count tokens as the stream passes through, and log them once it ends
+        // (or is dropped on cancel). Memory stays constant: only the usage
+        // fields are retained, never the transcript.
+        let byte_stream = match &self.usage {
+            Some(usage) => wrap_stream_with_usage_tracking(
+                byte_stream,
+                usage.clone(),
+                request.principal_id,
+                route_model_to_provider(&model)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                model.clone(),
+                started,
+                credential == CredentialType::Byok,
+                AiRequestContext {
+                    conversation_id: request.conversation_id.clone(),
+                    tags: vec![purpose.clone()],
+                    request_id: None,
+                    trace_id: request.trace_id.clone(),
+                },
+                UsageKind::ChatCompletions,
+            ),
+            None => byte_stream,
+        };
 
         // Parse the OpenAI-format SSE byte stream into interleaved text + tool-call
         // deltas. Tool calls arrive incrementally: the first delta for a given

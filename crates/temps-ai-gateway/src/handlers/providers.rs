@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use anyhow::Result as AnyhowResult;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -14,6 +15,7 @@ use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
+use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::error::AiGatewayError;
@@ -303,6 +305,79 @@ pub struct TestProviderKeyResponse {
 }
 
 // ============================================================================
+// Audit event
+// ============================================================================
+
+/// Audit entry for a provider key write. Carries identifiers only; the key
+/// material itself is never part of an audit record.
+#[derive(Debug, Clone, Serialize)]
+struct AiProviderKeyAudit {
+    context: AuditContext,
+    /// `created`, `updated` or `deleted`.
+    action: &'static str,
+    provider_key_id: i32,
+    provider: String,
+    display_name: String,
+    /// Whether the stored secret was replaced by this request.
+    key_rotated: bool,
+}
+
+impl AuditOperation for AiProviderKeyAudit {
+    fn operation_type(&self) -> String {
+        format!("ai_gateway.provider_key.{}", self.action)
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> AnyhowResult<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    }
+}
+
+/// Record a provider-key write. A failed audit write is logged and never fails
+/// the operation that already succeeded.
+async fn audit_provider_key(
+    app_state: &AiGatewayAppState,
+    auth_user_id: i32,
+    metadata: &RequestMetadata,
+    action: &'static str,
+    key: &temps_entities::ai_provider_keys::Model,
+    key_rotated: bool,
+) {
+    let audit = AiProviderKeyAudit {
+        context: AuditContext {
+            user_id: auth_user_id,
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        action,
+        provider_key_id: key.id,
+        provider: key.provider.clone(),
+        display_name: key.display_name.clone(),
+        key_rotated,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            provider_key_id = key.id,
+            action,
+            %error,
+            "Failed to create audit log for AI provider key"
+        );
+    }
+}
+
+// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -367,6 +442,7 @@ async fn get_provider_key(
 async fn create_provider_key(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AiGatewayAppState>>,
+    axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
     Json(request): Json<CreateProviderKeyRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayWrite);
@@ -419,6 +495,7 @@ async fn create_provider_key(
             .await?;
     }
     app_state.provider_status_cache.invalidate().await;
+    audit_provider_key(&app_state, auth.user_id(), &metadata, "created", &key, true).await;
 
     Ok((StatusCode::CREATED, Json(ProviderKeyResponse::from(key))))
 }
@@ -537,6 +614,7 @@ async fn delete_provider_model(
 async fn update_provider_key(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AiGatewayAppState>>,
+    axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
     Path(id): Path<i32>,
     Json(request): Json<UpdateProviderKeyRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -561,6 +639,15 @@ async fn update_provider_key(
         )
         .await?;
     app_state.provider_status_cache.invalidate().await;
+    audit_provider_key(
+        &app_state,
+        auth.user_id(),
+        &metadata,
+        "updated",
+        &key,
+        request.api_key.is_some(),
+    )
+    .await;
 
     Ok(Json(ProviderKeyResponse::from(key)))
 }
@@ -580,12 +667,24 @@ async fn update_provider_key(
 async fn delete_provider_key(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AiGatewayAppState>>,
+    axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayWrite);
 
+    // Load first so the audit entry can name what was removed.
+    let key = app_state.provider_key_service.get_by_id(id).await?;
     app_state.provider_key_service.delete(id).await?;
     app_state.provider_status_cache.invalidate().await;
+    audit_provider_key(
+        &app_state,
+        auth.user_id(),
+        &metadata,
+        "deleted",
+        &key,
+        false,
+    )
+    .await;
 
     Ok(StatusCode::NO_CONTENT)
 }

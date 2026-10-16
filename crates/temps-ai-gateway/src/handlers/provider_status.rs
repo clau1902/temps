@@ -320,6 +320,30 @@ impl AuditOperation for AiSummaryPreferenceUpdatedAudit {
     }
 }
 
+/// Shown when no active provider key exists. The wording is user-facing: the
+/// console renders it verbatim in the assistant's onboarding state.
+const NO_PROVIDER_REASON: &str =
+    "No AI provider is configured. Add an OpenRouter API key to start managing Temps by chat.";
+
+/// Opens the provider-key dialog on the OpenRouter row, so a single key is the
+/// only thing the operator has to supply.
+const NO_PROVIDER_SETUP_PATH: &str = "/ai-gateway?add=openrouter";
+
+/// `(configured, reason, setup_path)` for the capability response. When
+/// unconfigured, both `reason` and `setup_path` are always present so the UI
+/// can render an onboarding state without guessing.
+fn capability_hint(gateway_available: bool) -> (bool, Option<String>, Option<String>) {
+    if gateway_available {
+        (true, None, None)
+    } else {
+        (
+            false,
+            Some(NO_PROVIDER_REASON.to_string()),
+            Some(NO_PROVIDER_SETUP_PATH.to_string()),
+        )
+    }
+}
+
 // ============================================================================
 // Shared helper
 // ============================================================================
@@ -383,15 +407,7 @@ async fn build_status_response(
             ),
         ));
     }
-    let (configured, reason, setup_path) = if gateway_available {
-        (true, None, None)
-    } else {
-        (
-            false,
-            Some("No AI provider key is configured".to_string()),
-            Some("/ai-gateway".to_string()),
-        )
-    };
+    let (configured, reason, setup_path) = capability_hint(gateway_available);
 
     // Legacy response fields are now derived from the provider-neutral
     // realtime contract. The old Claude-only bridge toggle no longer controls
@@ -634,6 +650,21 @@ fn summary_preference_validation_problem(detail: impl Into<String>) -> Problem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_hint_explains_the_gap_and_links_to_the_fix() {
+        let (configured, reason, setup_path) = capability_hint(false);
+        assert!(!configured);
+        assert!(reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("No AI provider is configured")));
+        assert_eq!(setup_path.as_deref(), Some("/ai-gateway?add=openrouter"));
+    }
+
+    #[test]
+    fn capability_hint_is_silent_when_a_provider_exists() {
+        assert_eq!(capability_hint(true), (true, None, None));
+    }
 
     fn cached_response() -> AiProviderStatusResponse {
         AiProviderStatusResponse {

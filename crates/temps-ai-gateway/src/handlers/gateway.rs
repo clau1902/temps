@@ -117,7 +117,7 @@ fn extract_line(line: &str, kind: UsageKind) -> Option<(i64, i64)> {
 /// from the final chunks, then logs it after the stream ends. Only usage fields
 /// and bounded JSON structure are retained, even for very large output events.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn wrap_stream_with_usage_tracking(
+pub(crate) fn wrap_stream_with_usage_tracking(
     inner: std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<Bytes, AiGatewayError>> + Send>,
     >,
