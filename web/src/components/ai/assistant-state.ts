@@ -119,3 +119,47 @@ export function setupPathFromProblem(problem: unknown): string | undefined {
     ? (path as string)
     : undefined
 }
+
+/** Tile and label colours for a chat in the list. Full class names, so the
+ * Tailwind scanner keeps every one of them. */
+export interface ChatTint {
+  tile: string
+  label: string
+}
+
+const CHAT_TINTS: readonly ChatTint[] = [
+  {
+    tile: 'bg-violet-500/15 text-violet-600 dark:text-violet-300',
+    label: 'bg-violet-500/10 text-violet-700 dark:text-violet-300',
+  },
+  {
+    tile: 'bg-sky-500/15 text-sky-600 dark:text-sky-300',
+    label: 'bg-sky-500/10 text-sky-700 dark:text-sky-300',
+  },
+  {
+    tile: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-300',
+    label: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+  },
+  {
+    tile: 'bg-amber-500/15 text-amber-600 dark:text-amber-300',
+    label: 'bg-amber-500/10 text-amber-700 dark:text-amber-300',
+  },
+  {
+    tile: 'bg-rose-500/15 text-rose-600 dark:text-rose-300',
+    label: 'bg-rose-500/10 text-rose-700 dark:text-rose-300',
+  },
+  {
+    tile: 'bg-cyan-500/15 text-cyan-600 dark:text-cyan-300',
+    label: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
+  },
+]
+
+/** A stable colour per chat, so a chat keeps its look across reloads and the
+ * list is scannable without reading every title. */
+export function chatTint(seed: string): ChatTint {
+  let hash = 0
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
+  }
+  return CHAT_TINTS[hash % CHAT_TINTS.length]
+}

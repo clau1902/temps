@@ -10,6 +10,7 @@ import {
   RUN_CHANGES_AUTOMATICALLY_MODE,
   assistantReadiness,
   asksBeforeChanges,
+  chatTint,
   isAssistantConversation,
   permissionModeForAsk,
   setupPathFromProblem,
@@ -169,5 +170,25 @@ describe('last assistant model', () => {
     fakeWindow('throws')
     expect(loadLastAssistantModel()).toBeNull()
     expect(() => saveLastAssistantModel('vendor/model-a')).not.toThrow()
+  })
+})
+
+describe('chatTint', () => {
+  test('is stable for the same chat and always yields classes', () => {
+    const first = chatTint('conv-a1b2')
+    expect(chatTint('conv-a1b2')).toEqual(first)
+    expect(first.tile).toContain('bg-')
+    expect(first.label).toContain('text-')
+  })
+
+  test('spreads different chats over more than one colour', () => {
+    const tiles = new Set(
+      Array.from({ length: 24 }, (_, i) => chatTint(`chat-${i}`).tile)
+    )
+    expect(tiles.size).toBeGreaterThan(1)
+  })
+
+  test('handles an empty id', () => {
+    expect(chatTint('').tile).toContain('bg-')
   })
 })

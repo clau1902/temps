@@ -67,7 +67,7 @@ import {
 } from './chat-page-state'
 import { DebugChatPanel } from './DebugChatPanel'
 import { AssistantStart, AssistantThread } from './AssistantPanels'
-import { isAssistantConversation } from './assistant-state'
+import { chatTint, isAssistantConversation } from './assistant-state'
 
 interface ActiveChat {
   projectId: number
@@ -117,15 +117,33 @@ function metaFor(contextType: string) {
 function ContextAvatar({
   projectName,
   contextType,
+  seed,
   className,
   badgeClassName,
 }: {
   projectName?: string
   contextType: string
+  /** Chat id. A projectless chat has no project to identify it, so it gets a
+   * stable colour from this instead. */
+  seed?: string
   className?: string
   badgeClassName?: string
 }) {
   const { label, Icon } = metaFor(contextType)
+  if (!projectName && seed) {
+    return (
+      <div
+        className={cn(
+          'flex size-8 shrink-0 items-center justify-center rounded-md',
+          chatTint(seed).tile,
+          className
+        )}
+        title={label}
+      >
+        <Icon className="h-4 w-4" />
+      </div>
+    )
+  }
   return (
     <div className="relative shrink-0">
       <ProjectAvatar
@@ -1161,6 +1179,7 @@ function ConversationList({
               <ContextAvatar
                 projectName={c.project_name ?? undefined}
                 contextType={c.context_type}
+                seed={c.public_id}
               />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium">
@@ -1172,8 +1191,18 @@ function ConversationList({
                     "· ·" gap. The avatar badge already encodes the context
                     type, so the project name replaces the label when present. */}
                 <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+                  <span
+                    className={cn(
+                      'shrink-0 rounded px-1.5 py-px text-[10px] font-medium',
+                      c.project_name
+                        ? 'bg-muted text-muted-foreground'
+                        : chatTint(c.public_id).label
+                    )}
+                  >
+                    {label}
+                  </span>
                   <span className="min-w-0 flex-1 truncate">
-                    {c.project_name ?? label}
+                    {c.project_name ?? ''}
                   </span>
                   <span className="shrink-0">
                     <TimeAgo date={c.last_activity_at} />
