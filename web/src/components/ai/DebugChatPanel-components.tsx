@@ -3599,7 +3599,13 @@ function DebugChatPanelBody({
         </div>
       ) : (
         <div
-          className="shrink-0 overflow-hidden rounded-2xl border border-input bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20"
+          className={cn(
+            'shrink-0 overflow-hidden rounded-2xl border border-input bg-background',
+            // The assistant's prompt stays calm while typing, like the start
+            // screen; the other chats keep the focus ring.
+            contextType !== ASSISTANT_CONTEXT_TYPE &&
+              'focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/20'
+          )}
           onDragOver={(event) => {
             if (
               persistentAttachments &&
