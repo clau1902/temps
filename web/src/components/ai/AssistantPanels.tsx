@@ -42,6 +42,7 @@ import {
 import { AssistantModelChip, AssistantModelSetup } from './AssistantModelPicker'
 import { useNewChatModel } from './assistant-model-hooks'
 import { DebugChatPanel } from './DebugChatPanel'
+import { GoalPanel } from './GoalPanel'
 
 const keySchema = z.object({
   api_key: z.string().trim().min(1, 'Paste your OpenRouter API key'),
@@ -556,6 +557,7 @@ export function AssistantThread({
 }) {
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
+      <GoalPanel conversationPublicId={conversation.public_id} />
       <div className="min-h-0 flex-1">
         <DebugChatPanel
           key={conversation.public_id}

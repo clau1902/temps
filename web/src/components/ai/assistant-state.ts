@@ -42,6 +42,7 @@ export const ASSISTANT_EXAMPLE_PROMPTS: readonly string[] = [
   'Set up daily backups of my databases to S3',
   'Add a Postgres database to one of my projects',
   'Why did my last deployment fail?',
+  'Deploy my app and keep trying to fix it until it is live',
 ]
 
 const LAST_MODEL_KEY = 'temps.assistant.last-model'
