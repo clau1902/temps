@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  type ConversationResponse,
   type GlobalConversationResponse,
   type ProjectResponse,
   archiveConversation,
+  archiveUserConversation,
   getProjects,
   listAllConversations,
   renameConversation,
+  renameUserConversation,
 } from '@/api/client'
 import {
   AlertDialog,
@@ -64,6 +67,13 @@ import {
   resolvePageChat,
 } from './chat-page-state'
 import { DebugChatPanel } from './DebugChatPanel'
+import { AssistantStart, AssistantThread } from './AssistantPanels'
+import {
+  isAssistantConversation,
+  loadDetailLevel,
+  saveDetailLevel,
+} from './assistant-state'
+import type { ChatDetailLevel } from './chat-detail-level'
 
 interface ActiveChat {
   projectId: number
@@ -77,13 +87,26 @@ interface ActiveChat {
   autoStart: boolean
 }
 
-type ProjectConversation = GlobalConversationResponse & { project_id: number }
+/**
+ * A row in the conversation list: a project-attached chat, or a projectless
+ * assistant chat (`project_id` is null), which uses the user-rooted routes.
+ */
+type ProjectConversation = GlobalConversationResponse
+
+/** The open assistant conversation, and the first message to send into it. */
+interface AssistantChat {
+  conversation: Pick<ConversationResponse, 'public_id' | 'context_id'> & {
+    title?: string | null
+  }
+  firstMessage?: string
+}
 
 const CONTEXT_META: Record<string, { label: string; Icon: typeof GitBranch }> =
   {
     deployment: { label: 'Deployment', Icon: GitBranch },
     alert: { label: 'Alert', Icon: Bell },
     project: { label: 'Project', Icon: FolderGit2 },
+    assistant: { label: 'Assistant', Icon: Sparkles },
   }
 
 function metaFor(contextType: string) {
@@ -308,14 +331,25 @@ export function DockBody({
   const [activePublicId, setActivePublicId] = useState<string | null>(null)
   const [resetKey, setResetKey] = useState(0)
   const [pendingDelete, setPendingDelete] = useState<{
-    projectId: number
+    projectId: number | null
     publicId: string
     title: string
   } | null>(null)
   const [pendingRename, setPendingRename] = useState<{
-    projectId: number
+    projectId: number | null
     publicId: string
   } | null>(null)
+  // Assistant chat: `assistantStarting` is the prompt screen before a
+  // conversation exists; `assistant` is the open conversation.
+  const [assistant, setAssistant] = useState<AssistantChat | null>(null)
+  const [assistantStarting, setAssistantStarting] = useState(false)
+  const [detailLevel, setDetailLevel] = useState<ChatDetailLevel>(() =>
+    loadDetailLevel()
+  )
+  const changeDetailLevel = (level: ChatDetailLevel) => {
+    setDetailLevel(level)
+    saveDetailLevel(level)
+  }
   const [renameValue, setRenameValue] = useState('')
   const [renaming, setRenaming] = useState(false)
   // When true, the body shows the project picker for starting a fresh
@@ -327,11 +361,16 @@ export function DockBody({
   const loadList = useCallback(() => {
     setLoadingList(true)
     listAllConversations()
-      // The classic assistant only operates through legacy project routes.
-      // User-owned application/global chats live in the AI workspace and must
-      // not be coerced back into a fabricated project scope here.
+      // Project chats use the legacy project routes and assistant chats the
+      // user-rooted ones. Other user-owned application/global chats live in
+      // the AI workspace and must not be coerced into a fabricated project
+      // scope here.
       .then(({ data }) =>
-        setConversations((data ?? []).filter(hasProjectScope))
+        setConversations(
+          (data ?? []).filter(
+            (c) => hasProjectScope(c) || isAssistantConversation(c)
+          )
+        )
       )
       .catch(() => setConversations([]))
       .finally(() => {
@@ -375,8 +414,16 @@ export function DockBody({
     // conversation for an unsaved draft.
     setActivePublicId(c.public_id)
     setPicking(false)
+    setAssistantStarting(false)
+    if (isAssistantConversation(c)) {
+      setActive(null)
+      setAssistant({ conversation: c })
+      return
+    }
+    setAssistant(null)
+    if (!hasProjectScope(c)) return
     setActive({
-      projectId: c.project_id,
+      projectId: c.project_id ?? null,
       projectSlug: c.project_slug ?? undefined,
       projectName: c.project_name ?? undefined,
       contextType: c.context_type,
@@ -449,6 +496,8 @@ export function DockBody({
     name: string
   }) => {
     setPicking(false)
+    setAssistant(null)
+    setAssistantStarting(false)
     setActivePublicId(null)
     const contextId =
       typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -469,8 +518,28 @@ export function DockBody({
 
   const backToList = () => {
     setActive(null)
+    setAssistant(null)
+    setAssistantStarting(false)
     setActivePublicId(null)
     setPicking(false)
+    loadList()
+  }
+
+  const startAssistant = () => {
+    setPicking(false)
+    setActive(null)
+    setAssistant(null)
+    setActivePublicId(null)
+    setAssistantStarting(true)
+  }
+
+  const handleAssistantStarted = (
+    conversation: ConversationResponse,
+    firstMessage: string
+  ) => {
+    setAssistantStarting(false)
+    setActivePublicId(conversation.public_id)
+    setAssistant({ conversation, firstMessage })
     loadList()
   }
 
@@ -495,11 +564,15 @@ export function DockBody({
     const d = pendingDelete
     if (!d) return
     setPendingDelete(null)
-    await archiveConversation({
-      path: { project_id: d.projectId, public_id: d.publicId },
-    }).catch(() => {})
+    await (
+      d.projectId == null
+        ? archiveUserConversation({ path: { public_id: d.publicId } })
+        : archiveConversation({
+            path: { project_id: d.projectId, public_id: d.publicId },
+          })
+    ).catch(() => {})
     toast.success('Chat deleted')
-    if (active && activePublicId === d.publicId) {
+    if (activePublicId === d.publicId) {
       backToList()
     } else {
       setConversations((prev) => prev.filter((c) => c.public_id !== d.publicId))
@@ -508,7 +581,7 @@ export function DockBody({
 
   const startRename = (c: ProjectConversation) => {
     setRenameValue(c.title ?? '')
-    setPendingRename({ projectId: c.project_id, publicId: c.public_id })
+    setPendingRename({ projectId: c.project_id ?? null, publicId: c.public_id })
   }
 
   const confirmRename = async () => {
@@ -517,10 +590,16 @@ export function DockBody({
     if (!r || !title) return
     setRenaming(true)
     try {
-      const { data } = await renameConversation({
-        path: { project_id: r.projectId, public_id: r.publicId },
-        body: { title },
-      })
+      const { data } =
+        r.projectId == null
+          ? await renameUserConversation({
+              path: { public_id: r.publicId },
+              body: { title },
+            })
+          : await renameConversation({
+              path: { project_id: r.projectId, public_id: r.publicId },
+              body: { title },
+            })
       const newTitle = data?.title ?? title
       setConversations((prev) =>
         prev.map((c) =>
@@ -561,7 +640,9 @@ export function DockBody({
     )
     onClose()
   }
-  const inConversation = active !== null
+  const inProjectChat = active !== null
+  const inAssistant = assistant !== null || assistantStarting
+  const inConversation = inProjectChat || inAssistant
   const href = active ? sourceHref(active) : null
   const sourceLabel = active
     ? `${metaFor(active.contextType).label}${active.projectName ? ` · ${active.projectName}` : ''}`
@@ -596,7 +677,7 @@ export function DockBody({
           onRename={startRename}
           onDelete={(c) =>
             setPendingDelete({
-              projectId: c.project_id,
+              projectId: c.project_id ?? null,
               publicId: c.public_id,
               title:
                 c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
@@ -644,7 +725,7 @@ export function DockBody({
               ) : (
                 <Sparkles className="h-5 w-5 text-primary" />
               )}
-              {inConversation && active && (
+              {inProjectChat && active && (
                 <ContextAvatar
                   projectName={active.projectName}
                   contextType={active.contextType}
@@ -652,14 +733,20 @@ export function DockBody({
                 />
               )}
               <h2 className="min-w-0 truncate text-lg font-semibold">
-                {inConversation
-                  ? (active?.title ?? 'AI chat')
-                  : picking
-                    ? 'New project chat'
-                    : 'AI assistant'}
+                {inAssistant
+                  ? (assistant?.conversation.title ?? 'Temps assistant')
+                  : inConversation
+                    ? (active?.title ?? 'AI chat')
+                    : picking
+                      ? 'New project chat'
+                      : 'AI assistant'}
               </h2>
             </div>
-            {inConversation ? (
+            {inAssistant ? (
+              <p className="text-sm text-muted-foreground">
+                Acts with your own permissions
+              </p>
+            ) : inConversation ? (
               <p className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
                 <span>{sourceLabel}</span>
                 {href && (
@@ -685,6 +772,17 @@ export function DockBody({
             )}
           </div>
           <div className="flex shrink-0 items-center gap-0.5">
+            {!inConversation && !picking && (
+              <Button
+                size="sm"
+                onClick={startAssistant}
+                className="mr-1 h-8 gap-1"
+                title="Ask Temps to inspect or change something"
+              >
+                <Sparkles className="h-4 w-4" />
+                <span className="hidden sm:inline">Ask Temps</span>
+              </Button>
+            )}
             {!inConversation &&
               !picking &&
               (currentProject ? (
@@ -734,7 +832,18 @@ export function DockBody({
                 <Maximize2 className="h-4 w-4" />
               </button>
             )}
-            {inConversation && active && (
+            {inAssistant && (
+              <button
+                type="button"
+                onClick={startAssistant}
+                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                title="New assistant chat"
+                aria-label="New assistant chat"
+              >
+                <Plus className="h-4 w-4" />
+              </button>
+            )}
+            {inProjectChat && active && (
               <button
                 type="button"
                 onClick={() =>
@@ -751,7 +860,7 @@ export function DockBody({
                 <Plus className="h-4 w-4" />
               </button>
             )}
-            {inConversation && (
+            {inProjectChat && (
               <button
                 type="button"
                 onClick={resetConversation}
@@ -767,9 +876,12 @@ export function DockBody({
                 type="button"
                 onClick={() =>
                   setPendingDelete({
-                    projectId: active!.projectId,
+                    projectId: active?.projectId ?? null,
                     publicId: activePublicId,
-                    title: active!.title ?? 'this chat',
+                    title:
+                      active?.title ??
+                      assistant?.conversation.title ??
+                      'this chat',
                   })
                 }
                 className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
@@ -791,7 +903,24 @@ export function DockBody({
         </div>
 
         <div className="min-h-0 flex-1">
-          {inConversation ? (
+          {assistantStarting ? (
+            <AssistantStart
+              onStarted={handleAssistantStarted}
+              onNavigate={() => {
+                if (typeof window !== 'undefined' && window.innerWidth < 1024)
+                  onClose()
+              }}
+              cloudPath="/settings/cloud"
+            />
+          ) : assistant ? (
+            <AssistantThread
+              key={assistant.conversation.public_id}
+              conversation={assistant.conversation}
+              firstMessage={assistant.firstMessage}
+              level={detailLevel}
+              onLevelChange={changeDetailLevel}
+            />
+          ) : inProjectChat ? (
             <DebugChatPanel
               key={`${active!.contextType}:${active!.contextId}:${activePublicId ?? 'new'}:${resetKey}`}
               projectId={active!.projectId}
@@ -820,14 +949,24 @@ export function DockBody({
               <div>
                 <p className="font-medium">No AI conversations yet</p>
                 <p className="mt-1 max-w-sm text-sm text-muted-foreground">
-                  Start a project chat to investigate deployments, logs, traces,
-                  and errors with context.
+                  Ask Temps to inspect or change your setup, or start a project
+                  chat to investigate deployments, logs, traces, and errors.
                 </p>
               </div>
-              <Button size="sm" onClick={() => setPicking(true)}>
-                <Plus className="mr-1.5 size-4" />
-                Create first chat
-              </Button>
+              <div className="flex gap-2">
+                <Button size="sm" onClick={startAssistant}>
+                  <Sparkles className="mr-1.5 size-4" />
+                  Ask Temps
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setPicking(true)}
+                >
+                  <Plus className="mr-1.5 size-4" />
+                  Project chat
+                </Button>
+              </div>
             </div>
           ) : (
             <ConversationList
@@ -845,7 +984,7 @@ export function DockBody({
               onRename={startRename}
               onDelete={(c) =>
                 setPendingDelete({
-                  projectId: c.project_id,
+                  projectId: c.project_id ?? null,
                   publicId: c.public_id,
                   title:
                     c.title ??
@@ -968,8 +1107,9 @@ function ConversationList({
         <MessageSquare className="h-7 w-7 text-muted-foreground" />
         <p className="text-sm font-medium">No AI conversations yet</p>
         <p className="max-w-xs text-sm text-muted-foreground">
-          Click “New chat” to start one for a project, or open a failed
-          deployment / firing alert and choose “Debug with AI”.
+          Click “Ask Temps” to manage your setup by chat, “New chat” to start
+          one for a project, or open a failed deployment / firing alert and
+          choose “Debug with AI”.
         </p>
       </div>
     )

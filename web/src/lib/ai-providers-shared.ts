@@ -86,6 +86,19 @@ export const BY_ID: Record<string, AiProviderMeta> = Object.fromEntries(
   AI_PROVIDERS.map((p) => [p.id, p])
 )
 
+/**
+ * The provider named by an `?add=<id>` deep link, whose add-key dialog the AI
+ * Gateway page should open. Anything that is not a supported provider id —
+ * including inherited object keys like `constructor` — is ignored.
+ */
+export function providerFromAddParam(
+  value: string | null | undefined
+): AiProviderMeta | undefined {
+  return value && Object.prototype.hasOwnProperty.call(BY_ID, value)
+    ? BY_ID[value]
+    : undefined
+}
+
 /** Look up provider metadata by id. Returns `undefined` for unknown ids. */
 export function getAiProvider(id: string): AiProviderMeta | undefined {
   return BY_ID[id]

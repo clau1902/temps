@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { ChatDetailContext, chatDetailFor } from './chat-detail-level'
 import { ToolCard, toolLabel, processToolSummary } from './DebugChatPanel'
 
 const tool = { id: 'call-1', name: 'bash', arguments: '{"command":"npm test"}' }
@@ -198,4 +199,27 @@ test('process receipts distinguish exited state and bounded logs and reject unkn
       result: '{"type":"process","process":{"status":"running"}}',
     })
   ).toBeUndefined()
+})
+
+test('advanced detail opens a completed tool to show its input and result', () => {
+  const html = renderToStaticMarkup(
+    <ChatDetailContext.Provider value={chatDetailFor('advanced')}>
+      <ToolCard tool={{ ...tool, result: 'all tests passed' }} />
+    </ChatDetailContext.Provider>
+  )
+  expect(html).toContain('aria-expanded="true"')
+  expect(html).toContain('Input')
+  expect(html).toContain('npm test')
+  expect(html).toContain('Result')
+  expect(html).toContain('all tests passed')
+})
+
+test('simple detail keeps tool calls collapsed like the default', () => {
+  const html = renderToStaticMarkup(
+    <ChatDetailContext.Provider value={chatDetailFor('simple')}>
+      <ToolCard tool={{ ...tool, result: 'all tests passed' }} />
+    </ChatDetailContext.Provider>
+  )
+  expect(html).toContain('aria-expanded="false"')
+  expect(html).not.toContain('all tests passed')
 })

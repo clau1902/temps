@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { ChatDetailLevel } from './chat-detail-level'
 import { type ConversationDetailResponse } from '@/api/client'
 import { type PermissionRequest } from '@/components/ai/PermissionCard'
 
@@ -783,6 +784,16 @@ export interface DebugChatPanelProps {
   readOnly?: boolean
   /** Prevent new turns without hiding saved history or the composer draft. */
   runtimeUpdateRequired?: boolean
+  /**
+   * Opening message for a user-owned thread the caller already created. Sent
+   * once after the empty thread loads; ignored if the thread has history.
+   */
+  initialMessage?: string
+  /**
+   * `simple` hides the model/reasoning pickers; `advanced` shows them and opens
+   * every tool call. Unset keeps the panel's original behaviour.
+   */
+  detailLevel?: ChatDetailLevel
 }
 
 export function chatApiPaths(userScoped: boolean, projectId?: number) {

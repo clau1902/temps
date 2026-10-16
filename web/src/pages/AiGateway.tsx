@@ -24,7 +24,7 @@ import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
-import { Fragment, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -166,6 +166,7 @@ import {
   aiProviderName,
   aiProviderModels,
   getAiProvider,
+  providerFromAddParam,
 } from '@/lib/ai-providers'
 import {
   compareAiModelIdsByRelevance,
@@ -3905,6 +3906,36 @@ export function AiGatewayPage() {
   const [newDisplayName, setNewDisplayName] = useState('')
   const [newApiKey, setNewApiKey] = useState('')
   const [newBaseUrl, setNewBaseUrl] = useState('')
+
+  // `/ai-gateway?add=openrouter` is where the assistant's onboarding sends
+  // operators: open the add-key dialog for that provider, then drop the
+  // parameter so a reload or a back-navigation does not reopen it.
+  const [addSearchParams, setAddSearchParams] = useSearchParams()
+  const addProvider = addSearchParams.get('add')
+  const [handledAddProvider, setHandledAddProvider] = useState<string | null>(
+    null
+  )
+  // Adjusted during render rather than in an effect: the page can already be
+  // mounted when the link is followed, and this avoids a cascading render.
+  if (addProvider !== handledAddProvider) {
+    setHandledAddProvider(addProvider)
+    const provider = providerFromAddParam(addProvider)
+    if (provider) {
+      setNewProvider(provider.id)
+      setNewDisplayName(provider.name)
+      setDialogOpen(true)
+    }
+  }
+  useEffect(() => {
+    if (addProvider === null) return
+    setAddSearchParams(
+      (params) => {
+        params.delete('add')
+        return params
+      },
+      { replace: true }
+    )
+  }, [addProvider, setAddSearchParams])
 
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin

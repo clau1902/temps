@@ -1,0 +1,79 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { describe, expect, test } from 'bun:test'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { MemoryRouter } from 'react-router'
+
+import { AssistantOnboarding, AssistantStart } from './AssistantPanels'
+import {
+  ASSISTANT_EXAMPLE_PROMPTS,
+  NO_PROVIDER_REASON,
+  OPENROUTER_SETUP_PATH,
+} from './assistant-state'
+
+function render(node: React.ReactNode) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  return renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>{node}</MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+describe('AssistantOnboarding', () => {
+  const markup = render(
+    <AssistantOnboarding
+      reason={NO_PROVIDER_REASON}
+      setupPath={OPENROUTER_SETUP_PATH}
+      cloudPath="/settings/cloud"
+    />
+  )
+
+  test('states precisely what is missing', () => {
+    expect(markup).toContain('No AI provider is configured')
+  })
+
+  test('shows a concrete example of what it would do', () => {
+    expect(markup).toContain(ASSISTANT_EXAMPLE_PROMPTS[0])
+    expect(markup).toContain('only runs when you approve it')
+  })
+
+  test('takes the key inline, as a masked field that is never prefilled', () => {
+    expect(markup).toContain('OpenRouter API key')
+    expect(markup).toContain('type="password"')
+    expect(markup).toContain('autoComplete="off"')
+    expect(markup).not.toContain('value="')
+    expect(markup).toContain('Save key')
+  })
+
+  test('deep-links to the setup page, not documentation', () => {
+    expect(markup).toContain(
+      `href="${OPENROUTER_SETUP_PATH.replace('?', '?')}"`
+    )
+    expect(markup).toContain('Open AI provider settings')
+  })
+
+  test('offers Temps Cloud only as a secondary route, and only when given', () => {
+    expect(markup).toContain('href="/settings/cloud"')
+    const without = render(
+      <AssistantOnboarding
+        reason={NO_PROVIDER_REASON}
+        setupPath={OPENROUTER_SETUP_PATH}
+      />
+    )
+    expect(without).not.toContain('Temps Cloud')
+  })
+})
+
+describe('AssistantStart', () => {
+  test('shows skeleton placeholders, not a spinner, while checking the provider', () => {
+    const markup = render(<AssistantStart onStarted={() => {}} />)
+    expect(markup).toContain('role="status"')
+    expect(markup).toContain('animate-pulse')
+    expect(markup).not.toContain('animate-spin')
+  })
+})

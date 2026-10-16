@@ -3,6 +3,11 @@
 
 import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 import {
+  ChatDetailContext,
+  chatDetailFor,
+  useChatDetail,
+} from './chat-detail-level'
+import {
   confirmPendingAction,
   confirmUserPendingAction,
   createConversation,
@@ -445,7 +450,8 @@ function ToolBlock({ value }: { value: string }) {
 
 /** A collapsible card for one tool invocation + its result. */
 export function ToolCard({ tool }: { tool: ToolCall }) {
-  const [open, setOpen] = useState(false)
+  const { expandToolCalls } = useChatDetail()
+  const [open, setOpen] = useState(expandToolCalls)
   const state = toolExecutionState(tool)
   const running = state === 'running'
   const failed = state === 'failed'
@@ -1926,7 +1932,15 @@ function useConversationStream(
  * message submission is a short HTTP command and the conversation WebSocket
  * owns all real-time output; find/create/history use the generated SDK.
  */
-export function DebugChatPanel({
+export function DebugChatPanel(props: DebugChatPanelProps) {
+  return (
+    <ChatDetailContext.Provider value={chatDetailFor(props.detailLevel)}>
+      <DebugChatPanelBody {...props} />
+    </ChatDetailContext.Provider>
+  )
+}
+
+function DebugChatPanelBody({
   projectId,
   conversationPublicId,
   userScoped = false,
@@ -1942,7 +1956,9 @@ export function DebugChatPanel({
   onConversationStatusInvalidated,
   readOnly = false,
   runtimeUpdateRequired = false,
+  initialMessage,
 }: DebugChatPanelProps) {
+  const chatDetail = useChatDetail()
   const platformFeatures = usePlatformFeatures()
   const persistentAttachments = persistentWorkspaceStorageSupported(
     platformFeatures.data
@@ -2808,6 +2824,14 @@ export function DebugChatPanel({
   useEffect(() => {
     startRef.current = start
   }, [start])
+  // The opening message of a user-owned thread created by the caller. Sent once
+  // after the (still empty) thread has loaded, so the first prompt typed on a
+  // start screen is not lost to the composer remounting.
+  const sendRef = useRef(send)
+  useEffect(() => {
+    sendRef.current = send
+  }, [send])
+  const initialMessageRef = useRef(initialMessage)
 
   // Initialise exactly once per mount: load the existing conversation for this
   // context, or auto-start a fresh one. The panel is re-keyed per context by its
@@ -2921,6 +2945,15 @@ export function DebugChatPanel({
           setContextUsage(detail.context_usage ?? null)
           setWsTurnActive(running)
           setTurnStartedAt(running ? (detail.turn_started_at ?? null) : null)
+          const opening = initialMessageRef.current
+          initialMessageRef.current = undefined
+          if (
+            opening &&
+            !running &&
+            !detail.messages.some((message) => message.role === 'user')
+          ) {
+            void sendRef.current(opening, conv.public_id)
+          }
         }
       } catch (cause) {
         if (!ignore) {
@@ -3676,7 +3709,8 @@ export function DebugChatPanel({
               >
                 <Paperclip className="size-3.5" />
               </Button>
-              {providerStatusState === 'loading' ? (
+              {!chatDetail.showRuntimeControls ? null : providerStatusState ===
+                'loading' ? (
                 <div
                   className="flex h-8 items-center gap-2 px-2"
                   role="status"
