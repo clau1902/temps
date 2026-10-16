@@ -25,7 +25,13 @@ import {
 import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense, useEffect } from 'react'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+import {
+  BrowserRouter,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+} from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
 import {
@@ -45,6 +51,7 @@ import { client } from './api/client/client.gen'
 import { attachHttpStatus } from './lib/http-error-status'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
+import { AssistantTopBar } from './components/ai/AssistantTopBar'
 import AppSidebar from './components/dashboard/Sidebar'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
@@ -521,6 +528,9 @@ const PageLoader = () => (
 // Full app routes with sidebar
 const FullAppRoutes = () => {
   const { routes: extraRoutes } = useConsoleExtensions()
+  // The assistant is a focus mode: no console sidebar, header or banners, just
+  // the conversation and a way back (see `AssistantTopBar`).
+  const focusMode = useLocation().pathname === '/chat'
 
   // Lock the document to the viewport while the app shell is mounted. The shell
   // is a fixed-height (`dvh`) layout whose content scrolls in inner containers,
@@ -552,53 +562,65 @@ const FullAppRoutes = () => {
         <AutofixOnboardingProvider>
           <SidebarProvider>
             {/* Wrap sidebar with independent error boundary */}
-            <ErrorBoundary
-              fallback={(error, _errorInfo, resetError) => (
-                <CompactErrorFallback
-                  error={error}
-                  resetError={resetError}
-                  componentName="Sidebar"
-                />
-              )}
-              onError={(error, errorInfo) => {
-                console.error('[App] Sidebar error caught by boundary:', error)
-                console.error(
-                  '[App] Component stack:',
-                  errorInfo.componentStack
-                )
-              }}
-            >
-              <AppSidebar />
-            </ErrorBoundary>
-            <SidebarInset>
-              {/* App-wide disk-space banner — sits above the header inside the
-              content column (to the right of the fixed sidebar, so it's never
-              clipped by it), full content width, on every page. */}
-              <DiskSpaceAlert />
-              {/* App-wide "newer release published" banner — informational, per-
-              version dismissible, links the upgrade docs. */}
-              <UpdateAvailableBanner />
-              <AiHarnessPendingBanner />
-              {/* Wrap header with independent error boundary */}
+            {!focusMode && (
               <ErrorBoundary
                 fallback={(error, _errorInfo, resetError) => (
                   <CompactErrorFallback
                     error={error}
                     resetError={resetError}
-                    componentName="Header"
-                    minimal
+                    componentName="Sidebar"
                   />
                 )}
                 onError={(error, errorInfo) => {
-                  console.error('[App] Header error caught by boundary:', error)
+                  console.error(
+                    '[App] Sidebar error caught by boundary:',
+                    error
+                  )
                   console.error(
                     '[App] Component stack:',
                     errorInfo.componentStack
                   )
                 }}
               >
-                <Header />
+                <AppSidebar />
               </ErrorBoundary>
+            )}
+            <SidebarInset>
+              {/* App-wide disk-space banner — sits above the header inside the
+              content column (to the right of the fixed sidebar, so it's never
+              clipped by it), full content width, on every page. */}
+              {!focusMode && <DiskSpaceAlert />}
+              {/* App-wide "newer release published" banner — informational, per-
+              version dismissible, links the upgrade docs. */}
+              {!focusMode && <UpdateAvailableBanner />}
+              {!focusMode && <AiHarnessPendingBanner />}
+              {/* Wrap header with independent error boundary */}
+              {focusMode ? (
+                <AssistantTopBar />
+              ) : (
+                <ErrorBoundary
+                  fallback={(error, _errorInfo, resetError) => (
+                    <CompactErrorFallback
+                      error={error}
+                      resetError={resetError}
+                      componentName="Header"
+                      minimal
+                    />
+                  )}
+                  onError={(error, errorInfo) => {
+                    console.error(
+                      '[App] Header error caught by boundary:',
+                      error
+                    )
+                    console.error(
+                      '[App] Component stack:',
+                      errorInfo.componentStack
+                    )
+                  }}
+                >
+                  <Header />
+                </ErrorBoundary>
+              )}
               {/* Wrap page content with error boundary */}
               <ErrorBoundary
                 fallback={(error, errorInfo, resetError) => (
@@ -623,7 +645,13 @@ const FullAppRoutes = () => {
                     with a banner showing this box hung past the bottom of
                     the screen. Anything sized to 100% of it — a plugin
                     iframe, say — lost its last rows off-screen. */}
-                <div className="flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4">
+                <div
+                  className={
+                    focusMode
+                      ? 'flex-1 min-h-0 overflow-hidden'
+                      : 'flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4'
+                  }
+                >
                   <Routes>
                     {extraRoutes?.map((r) => (
                       <Route key={r.path} path={r.path} element={r.element} />

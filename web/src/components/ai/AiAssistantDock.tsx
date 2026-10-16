@@ -40,7 +40,6 @@ import {
   Bell,
   ChevronDown,
   ChevronLeft,
-  PanelLeft,
   ExternalLink,
   FolderGit2,
   GitBranch,
@@ -359,7 +358,6 @@ export function DockBody({
   // When true, the body shows the project picker for starting a fresh
   // project-scoped chat (a new thread, not tied to a deployment/alert).
   const [picking, setPicking] = useState(false)
-  const [railOpen, setRailOpen] = useState(true)
 
   // Unified list across every project.
   const loadList = useCallback(() => {
@@ -386,13 +384,12 @@ export function DockBody({
   // A project chat is created lazily by DebugChatPanel when its first message
   // is sent. Until that point the list is necessarily a pre-creation snapshot.
   // Reconcile the parent as one transition: select the new conversation,
-  // reveal the page rail, and fetch the row so it appears there immediately.
+  // and fetch the row so it appears in the chat list immediately.
   // Existing conversations are already present and do not need another fetch.
   const handleConversationChange = useCallback(
     (publicId: string | null) => {
       setActivePublicId(publicId)
       if (!conversationListNeedsRefresh(publicId, conversations)) return
-      setRailOpen(true)
       loadList()
     },
     [conversations, loadList]
@@ -661,69 +658,23 @@ export function DockBody({
     ? `${metaFor(active.contextType).label}${active.projectName ? ` · ${active.projectName}` : ''}`
     : ''
 
-  // Full-height chat rail, only in page layout. It sits beside the whole
-  // column (header included) so the list lines up with the top of the page
-  // instead of starting under the conversation title.
-  const rail = isPage && railOpen && (
-    <aside className="flex h-full w-80 shrink-0 flex-col border-r">
-      <div className="flex items-center justify-between gap-2 px-4 pb-2 pt-4">
-        <h2 className="text-sm font-medium text-muted-foreground">Chats</h2>
-        <span className="text-xs tabular-nums text-muted-foreground">
-          {conversations.length}
-        </span>
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
-        <ConversationList
-          loading={loadingList}
-          conversations={conversations}
-          compactEmpty
-          activeId={activePublicId}
-          onOpen={openConversation}
-          onOpenSource={(c) => {
-            const h = sourceHref({
-              contextType: c.context_type,
-              contextId: c.context_id,
-              projectSlug: c.project_slug ?? undefined,
-            })
-            if (h) goToSource(h)
-          }}
-          onRename={startRename}
-          onDelete={(c) =>
-            setPendingDelete({
-              projectId: c.project_id ?? null,
-              publicId: c.public_id,
-              title:
-                c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
-            })
-          }
-        />
-      </div>
-    </aside>
-  )
-
   return (
-    <div className={cn('flex h-full', !isPage && 'flex-col gap-3 p-4')}>
-      {rail}
+    <div className={cn('flex h-full flex-col', !isPage && 'gap-3 p-4')}>
       <div
         className={cn(
-          isPage && 'flex h-full min-w-0 flex-1 flex-col gap-3 p-4',
+          isPage && 'flex h-full min-h-0 min-w-0 flex-1 flex-col',
           !isPage && 'contents'
         )}
       >
-        <div className="flex items-start justify-between gap-2">
+        <div
+          className={cn(
+            'flex items-start justify-between gap-2',
+            isPage && 'items-center border-b px-4 py-3 sm:px-6'
+          )}
+        >
           <div className="min-w-0 space-y-1">
             <div className="flex items-center gap-2">
-              {isPage ? (
-                <button
-                  type="button"
-                  onClick={() => setRailOpen((v) => !v)}
-                  className="-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  aria-label={railOpen ? 'Hide chat list' : 'Show chat list'}
-                  title={railOpen ? 'Hide chat list' : 'Show chat list'}
-                >
-                  <PanelLeft className="h-4 w-4" />
-                </button>
-              ) : inConversation || picking ? (
+              {inConversation || picking ? (
                 <button
                   type="button"
                   onClick={
@@ -904,31 +855,35 @@ export function DockBody({
                 <Trash2 className="h-4 w-4" />
               </button>
             )}
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-              aria-label="Close AI assistant"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            {!isPage && (
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                aria-label="Close AI assistant"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
           </div>
         </div>
 
-        <div className="min-h-0 flex-1">
+        <div
+          className={cn(
+            'min-h-0 flex-1',
+            // Full screen: a centred reading column, like a focused chat app.
+            isPage && 'mx-auto w-full max-w-3xl px-4 pb-4 pt-3'
+          )}
+        >
           {assistantStarting ? (
-            // On the full-screen page the start screen keeps a readable measure
-            // instead of stretching its prompts across the whole viewport.
-            <div className={cn('h-full', isPage && 'mx-auto w-full max-w-2xl')}>
-              <AssistantStart
-                onStarted={handleAssistantStarted}
-                onNavigate={() => {
-                  if (typeof window !== 'undefined' && window.innerWidth < 1024)
-                    onClose()
-                }}
-                cloudPath="/settings/cloud"
-              />
-            </div>
+            <AssistantStart
+              onStarted={handleAssistantStarted}
+              onNavigate={() => {
+                if (typeof window !== 'undefined' && window.innerWidth < 1024)
+                  onClose()
+              }}
+              cloudPath="/settings/cloud"
+            />
           ) : assistant ? (
             <AssistantThread
               key={assistant.conversation.public_id}
@@ -1092,7 +1047,6 @@ function ConversationList({
   onOpenSource,
   onRename,
   onDelete,
-  compactEmpty = false,
 }: {
   loading: boolean
   conversations: ProjectConversation[]
@@ -1102,7 +1056,6 @@ function ConversationList({
   onOpenSource: (c: ProjectConversation) => void
   onRename: (c: ProjectConversation) => void
   onDelete: (c: ProjectConversation) => void
-  compactEmpty?: boolean
 }) {
   if (loading) {
     return (
@@ -1114,11 +1067,6 @@ function ConversationList({
     )
   }
   if (conversations.length === 0) {
-    if (compactEmpty) {
-      return (
-        <p className="px-2 py-3 text-sm text-muted-foreground">No chats yet</p>
-      )
-    }
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
         <MessageSquare className="h-7 w-7 text-muted-foreground" />
