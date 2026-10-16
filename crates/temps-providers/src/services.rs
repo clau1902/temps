@@ -10,9 +10,9 @@ use crate::externalsvc::{
     redis::RedisService,
     rustfs::{RustfsService, DEFAULT_RUSTFS_IMAGE},
     s3::S3Service,
-    AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ExternalService, HealthProbeStatus,
-    ManagedS3BackendKind, ManagedS3BackendSelection, PgAutoFailoverState, ServiceConfig,
-    ServiceType,
+    AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ClusterRole, ExternalService,
+    HealthProbeStatus, ManagedS3BackendKind, ManagedS3BackendSelection, PgAutoFailoverState,
+    ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
 use crate::readiness::{
@@ -518,6 +518,79 @@ fn validate_cluster_member_count(name: &str, requested: usize) -> Result<(), Ext
     Ok(())
 }
 
+/// The layout a cluster gets when the request does not name its members: a
+/// monitor, a primary and one replica, all on the control plane.
+///
+/// Three members is the smallest set pg_auto_failover can fail over with, and
+/// the control plane is where every member lands when `node_id` is omitted, so
+/// "create a cluster" works on a single host. That protects against a member
+/// container dying, not against the host dying: spread members across worker
+/// nodes (`node_id`) for that.
+fn default_cluster_members() -> Vec<ClusterMemberRequest> {
+    [
+        ClusterRole::Monitor,
+        ClusterRole::Primary,
+        ClusterRole::Replica,
+    ]
+    .into_iter()
+    .map(|role| ClusterMemberRequest {
+        role: role.as_str().to_string(),
+        node_id: None,
+    })
+    .collect()
+}
+
+/// Settle the member list of a new cluster before anything is saved.
+///
+/// An empty list gets [`default_cluster_members`]. An explicit list must hold
+/// exactly one monitor and at least one data member, with known roles.
+/// Without this check a cluster with no monitor was accepted, went through
+/// "creating" and only then failed in the background with a bare "no monitor
+/// member" error that never said what a valid request looks like.
+fn resolve_cluster_members(
+    name: &str,
+    members: &[ClusterMemberRequest],
+) -> Result<Vec<ClusterMemberRequest>, ExternalServiceError> {
+    if members.is_empty() {
+        return Ok(default_cluster_members());
+    }
+    let invalid = |reason: String| ExternalServiceError::ParameterValidationFailed {
+        service_id: 0,
+        reason: format!(
+            "Invalid members for cluster '{name}': {reason}. Expected one monitor and at least \
+             one primary or replica, e.g. [{{\"role\":\"monitor\"}},{{\"role\":\"primary\"}},\
+             {{\"role\":\"replica\"}}]; omit node_id to place a member on the control plane. \
+             Omit members entirely to get that layout."
+        ),
+    };
+    let known = [
+        ClusterRole::Monitor.as_str(),
+        ClusterRole::Primary.as_str(),
+        ClusterRole::Replica.as_str(),
+    ];
+    if let Some(unknown) = members.iter().find(|m| !known.contains(&m.role.as_str())) {
+        return Err(invalid(format!(
+            "role '{}' is not one of {:?}",
+            unknown.role, known
+        )));
+    }
+    let monitors = members
+        .iter()
+        .filter(|m| m.role == ClusterRole::Monitor.as_str())
+        .count();
+    if monitors != 1 {
+        return Err(invalid(format!(
+            "found {monitors} monitor member(s), need exactly 1"
+        )));
+    }
+    if members.len() == monitors {
+        return Err(invalid(
+            "the cluster has a monitor but no data member".to_string(),
+        ));
+    }
+    Ok(members.to_vec())
+}
+
 /// Host port of the member with `ordinal` in the block starting at `base`,
 /// or `None` when the ordinal does not fit in the cluster's block.
 fn cluster_member_port(base: u16, ordinal: i32) -> Option<u16> {
@@ -913,8 +986,10 @@ pub struct CreateExternalServiceRequest {
     /// Service topology: "standalone" (default, single container) or "cluster" (HA multi-member).
     #[serde(default = "default_topology")]
     pub topology: String,
-    /// Cluster member specifications. Required when topology is "cluster".
-    /// Each member specifies a role, target node, and ordinal.
+    /// Cluster member specifications for topology "cluster". Optional: when
+    /// omitted the cluster gets a monitor, a primary and a replica, all on the
+    /// control plane. When given it must hold exactly one monitor and at least
+    /// one primary or replica. Each member specifies a role and a target node.
     #[serde(default)]
     pub members: Vec<ClusterMemberRequest>,
 }
@@ -3556,6 +3631,11 @@ impl ExternalServiceManager {
         created_by_user_id: Option<i32>,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         info!("Creating new external service");
+
+        let mut request = request;
+        if request.topology == "cluster" {
+            request.members = resolve_cluster_members(&request.name, &request.members)?;
+        }
 
         #[allow(deprecated)]
         if request.service_type == ServiceType::Minio {
@@ -9133,16 +9213,19 @@ echo "[restore] Pre-seed complete"
             .await?;
 
         // Reconstruct member specs from preserved records if none were provided
-        let effective_members: Vec<ClusterMemberRequest> = if member_requests.is_empty() {
-            if leftover_members.is_empty() {
-                return Err(ExternalServiceError::ParameterValidationFailed {
-                    service_id,
-                    reason:
-                        "No member configuration provided and no previous member records found. \
-                             Please provide the members array in the retry request."
-                            .to_string(),
-                });
-            }
+        let effective_members: Vec<ClusterMemberRequest> = if !member_requests.is_empty() {
+            resolve_cluster_members(&service.name, member_requests)?
+        } else if leftover_members.is_empty() {
+            // Nothing to rebuild from: the cluster failed before any member
+            // was recorded, which is what a create without a member list used
+            // to do. Give it the default layout rather than asking the caller
+            // to guess the format.
+            info!(
+                "No member records for failed cluster {}; retrying with the default layout",
+                service_id
+            );
+            default_cluster_members()
+        } else {
             info!(
                 "Reconstructing member config from {} preserved records for service {}",
                 leftover_members.len(),
@@ -9155,8 +9238,6 @@ echo "[restore] Pre-seed complete"
                     node_id: m.node_id,
                 })
                 .collect()
-        } else {
-            member_requests.to_vec()
         };
         // Before tearing anything down: a member list that cannot fit would
         // only fail again after the leftover members were removed.
@@ -22834,6 +22915,75 @@ mod tests {
                 if name == "ha-pg"
         ));
         assert!(err.to_string().contains("at most 10"), "{err}");
+    }
+
+    #[test]
+    fn cluster_without_members_gets_monitor_primary_and_replica_on_the_control_plane() {
+        let members = resolve_cluster_members("ha-pg", &[]).unwrap();
+        let roles: Vec<&str> = members.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["monitor", "primary", "replica"]);
+        assert!(members.iter().all(|m| m.node_id.is_none()));
+    }
+
+    #[test]
+    fn explicit_cluster_members_are_kept_as_given() {
+        let given = vec![
+            member("monitor", None),
+            member("primary", Some(2)),
+            member("replica", Some(3)),
+        ];
+        let resolved = resolve_cluster_members("ha-pg", &given).unwrap();
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[1].node_id, Some(2));
+        assert_eq!(resolved[2].node_id, Some(3));
+    }
+
+    #[test]
+    fn cluster_without_a_monitor_is_rejected_with_the_expected_shape() {
+        let err =
+            resolve_cluster_members("ha-pg", &[member("primary", None), member("replica", None)])
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            ExternalServiceError::ParameterValidationFailed { .. }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("ha-pg"), "{msg}");
+        assert!(msg.contains("found 0 monitor"), "{msg}");
+        assert!(msg.contains("\"role\":\"monitor\""), "{msg}");
+    }
+
+    #[test]
+    fn cluster_with_two_monitors_is_rejected() {
+        let err = resolve_cluster_members(
+            "ha-pg",
+            &[
+                member("monitor", None),
+                member("monitor", None),
+                member("primary", None),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("found 2 monitor"), "{err}");
+    }
+
+    #[test]
+    fn cluster_with_only_a_monitor_is_rejected() {
+        let err = resolve_cluster_members("ha-pg", &[member("monitor", None)]).unwrap_err();
+        assert!(err.to_string().contains("no data member"), "{err}");
+    }
+
+    #[test]
+    fn cluster_with_an_unknown_role_is_rejected() {
+        let err =
+            resolve_cluster_members("ha-pg", &[member("monitor", None), member("leader", None)])
+                .unwrap_err();
+        assert!(err.to_string().contains("role 'leader'"), "{err}");
+    }
+
+    #[test]
+    fn default_cluster_layout_fits_the_port_block() {
+        assert!(validate_cluster_member_count("ha-pg", default_cluster_members().len()).is_ok());
     }
 
     /// Regression: the ten-member limit was only enforced inside the

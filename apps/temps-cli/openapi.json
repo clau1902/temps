@@ -11969,7 +11969,7 @@
       "CreateExternalServiceRequest": {
         "properties": {
           "members": {
-            "description": "Cluster member specifications. Required when topology is \"cluster\".",
+            "description": "Cluster member specifications for topology \"cluster\". Optional: when\nomitted the cluster gets a monitor, a primary and a replica, all on the\ncontrol plane (one host, so it survives a member failing, not the host\nfailing). When given it must hold exactly one `monitor` and at least\none `primary` or `replica`; set `node_id` to spread members across\nworker nodes.",
             "items": {
               "$ref": "#/components/schemas/ClusterMemberRequest"
             },
@@ -44755,7 +44755,7 @@
         "description": "Request body for retrying a failed cluster initialization.",
         "properties": {
           "members": {
-            "description": "Cluster member specifications (same format as create).\nIf omitted, the original member configuration is reconstructed from\nthe preserved service_members records.",
+            "description": "Cluster member specifications (same format as create).\nIf omitted, the original member configuration is reconstructed from\nthe preserved service_members records, or, when none were recorded,\nthe default monitor + primary + replica layout is used.",
             "items": {
               "$ref": "#/components/schemas/ClusterMemberRequest"
             },

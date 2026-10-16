@@ -5625,7 +5625,12 @@ export type CreateEnvironmentVariableRequest = {
 
 export type CreateExternalServiceRequest = {
     /**
-     * Cluster member specifications. Required when topology is "cluster".
+     * Cluster member specifications for topology "cluster". Optional: when
+     * omitted the cluster gets a monitor, a primary and a replica, all on the
+     * control plane (one host, so it survives a member failing, not the host
+     * failing). When given it must hold exactly one `monitor` and at least
+     * one `primary` or `replica`; set `node_id` to spread members across
+     * worker nodes.
      */
     members?: Array<ClusterMemberRequest>;
     name: string;
@@ -20816,7 +20821,8 @@ export type RetryClusterRequest = {
     /**
      * Cluster member specifications (same format as create).
      * If omitted, the original member configuration is reconstructed from
-     * the preserved service_members records.
+     * the preserved service_members records, or, when none were recorded,
+     * the default monitor + primary + replica layout is used.
      */
     members?: Array<ClusterMemberRequest>;
 };

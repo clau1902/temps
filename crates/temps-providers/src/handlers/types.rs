@@ -670,7 +670,12 @@ pub struct CreateExternalServiceRequest {
     #[serde(default = "default_topology")]
     #[schema(example = "standalone")]
     pub topology: String,
-    /// Cluster member specifications. Required when topology is "cluster".
+    /// Cluster member specifications for topology "cluster". Optional: when
+    /// omitted the cluster gets a monitor, a primary and a replica, all on the
+    /// control plane (one host, so it survives a member failing, not the host
+    /// failing). When given it must hold exactly one `monitor` and at least
+    /// one `primary` or `replica`; set `node_id` to spread members across
+    /// worker nodes.
     #[serde(default)]
     pub members: Vec<ClusterMemberRequest>,
 }
@@ -695,7 +700,8 @@ pub struct ClusterMemberRequest {
 pub struct RetryClusterRequest {
     /// Cluster member specifications (same format as create).
     /// If omitted, the original member configuration is reconstructed from
-    /// the preserved service_members records.
+    /// the preserved service_members records, or, when none were recorded,
+    /// the default monitor + primary + replica layout is used.
     #[serde(default)]
     pub members: Vec<ClusterMemberRequest>,
 }
