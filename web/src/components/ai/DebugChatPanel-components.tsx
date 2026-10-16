@@ -1966,9 +1966,13 @@ function DebugChatPanelBody({
 }: DebugChatPanelProps) {
   const chatDetail = useChatDetail()
   const platformFeatures = usePlatformFeatures()
-  const persistentAttachments = persistentWorkspaceStorageSupported(
-    platformFeatures.data
-  )
+  // The server refuses attachments on assistant chats (they have no
+  // workspace to store them in), so the control says so instead of offering an
+  // upload that can only fail.
+  const attachmentsSupportedHere = contextType !== ASSISTANT_CONTEXT_TYPE
+  const persistentAttachments =
+    attachmentsSupportedHere &&
+    persistentWorkspaceStorageSupported(platformFeatures.data)
   const paths = chatApiPaths(userScoped, projectId)
   const base = paths.conversations
   const ctxId = String(contextId)
@@ -3710,13 +3714,15 @@ function DebugChatPanelBody({
                 onClick={() => attachmentInputRef.current?.click()}
                 aria-label="Attach files or images"
                 title={
-                  platformFeatures.data === undefined
-                    ? 'Loading file attachment capabilities'
-                    : !persistentAttachments
-                      ? 'File attachments require persistent workspace storage'
-                      : !publicId
-                        ? 'Create the workspace thread before attaching files'
-                        : 'Attach files or images (20 MB each)'
+                  !attachmentsSupportedHere
+                    ? 'The Temps assistant can\u2019t take files or images yet. Describe what you see, or paste the relevant text.'
+                    : platformFeatures.data === undefined
+                      ? 'Loading file attachment capabilities'
+                      : !persistentAttachments
+                        ? 'File attachments require persistent workspace storage'
+                        : !publicId
+                          ? 'Create the workspace thread before attaching files'
+                          : 'Attach files or images (20 MB each)'
                 }
               >
                 <Paperclip className="size-3.5" />
