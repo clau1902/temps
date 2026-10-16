@@ -133,11 +133,18 @@ pub fn gateway_provider_capabilities(
         auth_source: ProviderAuthSource::ConfiguredKey,
         models,
         default_model_id,
-        permission_modes: vec![option(
-            "confirm-actions",
-            "Confirm actions",
-            "Require confirmation for write actions",
-        )],
+        permission_modes: vec![
+            option(
+                "confirm-actions",
+                "Ask before changes",
+                "Require confirmation for write actions",
+            ),
+            option(
+                "auto",
+                "Run changes automatically",
+                "Apply changes without asking; deletions still ask",
+            ),
+        ],
         default_permission_mode_id: Some("confirm-actions".to_string()),
         realtime: RealtimeCapabilities {
             text_streaming: true,
@@ -166,6 +173,24 @@ mod tests {
         assert_eq!(
             capabilities.default_model_id.as_deref(),
             Some("custom-model")
+        );
+    }
+
+    #[test]
+    fn gateway_providers_offer_both_confirming_and_automatic_writes() {
+        let capabilities = gateway_provider_capabilities(
+            "gateway_key:7".to_string(),
+            "OpenRouter".to_string(),
+            "openrouter",
+            None,
+            Vec::new(),
+        );
+        assert!(capabilities.permission_mode("confirm-actions").is_some());
+        assert!(capabilities.permission_mode("auto").is_some());
+        // Existing conversations and non-assistant chats keep asking by default.
+        assert_eq!(
+            capabilities.default_permission_mode_id.as_deref(),
+            Some("confirm-actions")
         );
     }
 

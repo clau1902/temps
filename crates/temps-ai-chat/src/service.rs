@@ -3420,7 +3420,7 @@ impl ConversationService {
             Some(&provider),
             requested_model,
             None,
-            None,
+            Some(ASSISTANT_DEFAULT_PERMISSION_MODE),
         )
         .await
     }
@@ -6397,6 +6397,10 @@ const GATEWAY_PROVIDER_PREFIX: &str = "gateway_key:";
 /// is watching, every write needs their click, and a turn that has not settled
 /// in this many model round-trips is looping, not working. The wall-clock
 /// deadline still applies on top; this is the step-count backstop.
+/// New assistant conversations apply changes without asking (deletions still
+/// ask, see `automatic_platform_decision`). The user can switch a thread back
+/// to `confirm-actions` from the composer.
+const ASSISTANT_DEFAULT_PERMISSION_MODE: &str = "auto";
 const ASSISTANT_MAX_ROUNDS: usize = 24;
 /// Tool calls honoured from a single model response. Models can emit dozens of
 /// parallel calls; each is a replayed API request plus a transcript entry.
@@ -11820,6 +11824,23 @@ mod tests {
         assert!(registry.contains_key("provider-question"));
         drop(registry);
         running.abort();
+    }
+
+    #[test]
+    fn assistant_defaults_to_running_changes_but_still_asks_for_deletions() {
+        assert!(permission_mode_auto_approves_provider_tools(
+            ASSISTANT_DEFAULT_PERMISSION_MODE
+        ));
+        assert!(!permission_mode_auto_approves_provider_tools(
+            "confirm-actions"
+        ));
+        let delete = PermissionRequest {
+            id: "delete".to_string(),
+            kind: PermissionKind::ToolApproval,
+            tool_name: TEMPS_WRITE_TOOL_NAME.to_string(),
+            input: serde_json::json!({"method": "DELETE"}),
+        };
+        assert!(automatic_platform_decision(&delete).is_none());
     }
 
     #[test]
