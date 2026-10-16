@@ -181,6 +181,7 @@ impl SnapshotService {
             .one(self.db.as_ref())
             .await
             .map_err(SandboxSnapshotError::Database)?;
+        let sandbox_row_exists = sandbox_row.is_some();
         if let Some(backend) = sandbox_row.as_ref().and_then(|row| row.backend.as_deref()) {
             ensure_backend_can_snapshot(backend)?;
         }
@@ -288,6 +289,17 @@ impl SnapshotService {
                     "snapshot: cannot reach the sandbox's provider handle"
                 );
                 let _ = self.mark_failed(row.id, &reason).await;
+                // A VM that is down, or that the provider has no trace of
+                // while the sandbox's row exists (its files were lost), is a
+                // 409 telling the caller what to do, not a 404 for a sandbox
+                // that is listed. A missing row stays a 404.
+                if matches!(error, AgentError::SandboxNotRunning { .. })
+                    || (sandbox_row_exists && matches!(error, AgentError::SandboxNotFound { .. }))
+                {
+                    return Err(SandboxSnapshotError::SandboxNotRunning {
+                        sandbox_id: sandbox_public_id.to_string(),
+                    });
+                }
                 return Err(SandboxSnapshotError::SandboxNotFound {
                     sandbox_id: sandbox_public_id.to_string(),
                     reason: error.to_string(),
@@ -1204,8 +1216,10 @@ mod tests {
             })
         }
 
-        async fn is_alive(&self, _handle: &SandboxHandle) -> Result<bool, AgentError> {
-            Ok(true)
+        /// A sandbox whose container name contains `down` has no running VM,
+        /// so one fake can serve both the live and the dead case.
+        async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
+            Ok(!handle.sandbox_name.contains("down"))
         }
 
         async fn write_file(
@@ -2043,6 +2057,79 @@ mod tests {
         assert!(matches!(
             result,
             Err(SandboxSnapshotError::SandboxNotFound { .. })
+        ));
+    }
+
+    /// The provider having no trace of a sandbox whose row exists (its VM
+    /// files are gone) is the same 409, not a 404 for a listed sandbox.
+    #[tokio::test]
+    async fn a_vm_the_provider_lost_is_a_409_when_the_row_exists() {
+        let creating = make_snapshot_model(1, "snap_vmlost11112222", 8, "creating", 0);
+        let failed = {
+            let mut model = creating.clone();
+            model.status = "failed".to_string();
+            model
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_sandbox_row(
+                    10,
+                    "sbx_vmlost11112222",
+                    "running",
+                )]])
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
+                .append_query_results(vec![vec![creating.clone()]])
+                .append_query_results(vec![vec![creating]])
+                .append_query_results(vec![vec![failed]])
+                .into_connection(),
+        );
+        let provider = FakeSnapshotProvider {
+            fail_recover: true,
+            ..FakeSnapshotProvider::new()
+        };
+        let svc = make_service_with_provider(db, provider);
+
+        let result = svc
+            .create_snapshot(10, "sbx_vmlost11112222", 8, None, None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SandboxSnapshotError::SandboxNotRunning { .. })
+        ));
+    }
+
+    /// A sandbox whose VM is down is a 409 telling the caller to resume it,
+    /// not a 404 for a sandbox that is still listed.
+    #[tokio::test]
+    async fn a_down_vm_is_a_409_not_a_404_for_snapshots() {
+        let creating = make_snapshot_model(1, "snap_vmdown11112222", 8, "creating", 0);
+        let failed = {
+            let mut model = creating.clone();
+            model.status = "failed".to_string();
+            model
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
+                .append_query_results(vec![vec![make_creating_count_row(0)]])
+                .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
+                .append_query_results(vec![vec![creating.clone()]])
+                .append_query_results(vec![vec![creating]])
+                .append_query_results(vec![vec![failed]])
+                .into_connection(),
+        );
+        let svc = make_service_with_provider(db, FakeSnapshotProvider::new());
+
+        let result = svc
+            .create_snapshot(99, "sbx_vmdown11112222", 8, None, None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SandboxSnapshotError::SandboxNotRunning { .. })
         ));
     }
 
