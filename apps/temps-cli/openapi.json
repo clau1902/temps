@@ -32499,6 +32499,65 @@
         ],
         "type": "string"
       },
+      "ModelDetails": {
+        "description": "What a provider's model catalogue says about one model, kept so a user can\nchoose between models without leaving the console. Every field is optional\nbecause catalogues differ: OpenRouter publishes all of them, others few.",
+        "properties": {
+          "context_length": {
+            "description": "Maximum context window in tokens.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_modalities": {
+            "description": "What the model accepts: `text`, `image`, `file`, `audio`, ...",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "input_price_per_million": {
+            "description": "USD per one million input (prompt) tokens.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Human-readable name, when it differs from the model id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output_modalities": {
+            "description": "What the model produces: `text`, `image`, ...",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "output_price_per_million": {
+            "description": "USD per one million output (completion) tokens.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "supports_tools": {
+            "description": "Whether the catalogue lists tool calling. The Temps assistant needs it.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ModelInfo": {
         "properties": {
           "id": {
@@ -41009,6 +41068,17 @@
       },
       "ProviderModelResponse": {
         "properties": {
+          "details": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ModelDetails",
+                "description": "What the provider's catalogue says about the model: name, context\nwindow, input/output modalities, prices and tool support. Absent for\nmanual models and for providers whose catalogue lists only ids."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "display_name": {
             "type": "string"
           },

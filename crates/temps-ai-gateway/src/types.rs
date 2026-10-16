@@ -206,6 +206,96 @@ pub struct EmbeddingUsage {
 // Model listing
 // ============================================================================
 
+/// What a provider's model catalogue says about one model, kept so a user can
+/// choose between models without leaving the console. Every field is optional
+/// because catalogues differ: OpenRouter publishes all of them, others few.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ModelDetails {
+    /// Human-readable name, when it differs from the model id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Maximum context window in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    /// What the model accepts: `text`, `image`, `file`, `audio`, ...
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<String>,
+    /// What the model produces: `text`, `image`, ...
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_modalities: Vec<String>,
+    /// USD per one million input (prompt) tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_price_per_million: Option<f64>,
+    /// USD per one million output (completion) tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_price_per_million: Option<f64>,
+    /// Whether the catalogue lists tool calling. The Temps assistant needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tools: Option<bool>,
+}
+
+impl ModelDetails {
+    /// Read the fields a catalogue entry publishes. Returns `None` when the
+    /// entry carries none of them, so providers that list only ids store
+    /// nothing instead of an empty object.
+    pub fn from_catalog_entry(entry: &serde_json::Value) -> Option<Self> {
+        let strings = |value: Option<&serde_json::Value>| -> Vec<String> {
+            value
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // Prices arrive as USD-per-token decimal strings.
+        let per_million = |value: Option<&serde_json::Value>| -> Option<f64> {
+            let per_token = match value? {
+                serde_json::Value::String(text) => text.trim().parse::<f64>().ok()?,
+                serde_json::Value::Number(number) => number.as_f64()?,
+                _ => return None,
+            };
+            // A negative price is OpenRouter's marker for "varies"; not a price.
+            (per_token.is_finite() && per_token >= 0.0).then_some(per_token * 1_000_000.0)
+        };
+        let architecture = entry.get("architecture");
+        let pricing = entry.get("pricing");
+        let supported = entry
+            .get("supported_parameters")
+            .and_then(serde_json::Value::as_array);
+        let details = Self {
+            name: entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .map(str::to_string),
+            context_length: entry
+                .get("context_length")
+                .and_then(serde_json::Value::as_u64),
+            input_modalities: strings(architecture.and_then(|a| a.get("input_modalities"))),
+            output_modalities: strings(architecture.and_then(|a| a.get("output_modalities"))),
+            input_price_per_million: per_million(pricing.and_then(|p| p.get("prompt"))),
+            output_price_per_million: per_million(pricing.and_then(|p| p.get("completion"))),
+            supports_tools: supported.map(|params| {
+                params
+                    .iter()
+                    .any(|param| param.as_str().is_some_and(|name| name == "tools"))
+            }),
+        };
+        (details != Self::default()).then_some(details)
+    }
+}
+
+/// A catalogue entry together with whatever the provider said about it.
+#[derive(Debug, Clone)]
+pub struct DiscoveredModel {
+    pub info: ModelInfo,
+    pub details: Option<ModelDetails>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
     pub id: String,
@@ -257,5 +347,66 @@ impl OpenAiErrorResponse {
 
     pub fn rate_limit(message: impl Into<String>) -> Self {
         Self::new(message, "rate_limit_error", Some("rate_limit_exceeded"))
+    }
+}
+
+#[cfg(test)]
+mod model_details_tests {
+    use super::ModelDetails;
+    use serde_json::json;
+
+    #[test]
+    fn reads_modalities_prices_context_and_tool_support() {
+        let entry = json!({
+            "id": "vendor/model-a",
+            "name": "Vendor: Model A",
+            "context_length": 200000,
+            "architecture": {
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"]
+            },
+            "pricing": { "prompt": "0.000003", "completion": "0.000015" },
+            "supported_parameters": ["temperature", "tools", "max_tokens"]
+        });
+        let details = ModelDetails::from_catalog_entry(&entry).expect("details");
+        assert_eq!(details.name.as_deref(), Some("Vendor: Model A"));
+        assert_eq!(details.context_length, Some(200_000));
+        assert_eq!(details.input_modalities, vec!["text", "image"]);
+        assert_eq!(details.output_modalities, vec!["text"]);
+        assert!((details.input_price_per_million.unwrap() - 3.0).abs() < 1e-9);
+        assert!((details.output_price_per_million.unwrap() - 15.0).abs() < 1e-9);
+        assert_eq!(details.supports_tools, Some(true));
+    }
+
+    #[test]
+    fn missing_tools_parameter_means_unsupported_but_absent_list_means_unknown() {
+        let without_tools = json!({ "supported_parameters": ["temperature"] });
+        assert_eq!(
+            ModelDetails::from_catalog_entry(&without_tools)
+                .unwrap()
+                .supports_tools,
+            Some(false)
+        );
+        let no_list = json!({ "name": "Only A Name" });
+        assert_eq!(
+            ModelDetails::from_catalog_entry(&no_list)
+                .unwrap()
+                .supports_tools,
+            None
+        );
+    }
+
+    #[test]
+    fn variable_or_malformed_prices_are_not_reported() {
+        let entry = json!({ "pricing": { "prompt": "-1", "completion": "free" } });
+        assert_eq!(ModelDetails::from_catalog_entry(&entry), None);
+    }
+
+    #[test]
+    fn an_entry_with_only_an_id_has_no_details() {
+        assert_eq!(
+            ModelDetails::from_catalog_entry(&json!({ "id": "plain" })),
+            None
+        );
     }
 }

@@ -189,6 +189,11 @@ pub struct ProviderModelResponse {
     pub is_available: bool,
     pub is_enabled: bool,
     pub owned_by: Option<String>,
+    /// What the provider's catalogue says about the model: name, context
+    /// window, input/output modalities, prices and tool support. Absent for
+    /// manual models and for providers whose catalogue lists only ids.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<crate::types::ModelDetails>,
     pub last_seen_at: Option<String>,
     pub updated_at: String,
 }
@@ -204,6 +209,9 @@ impl From<temps_entities::ai_provider_models::Model> for ProviderModelResponse {
             is_available: model.is_available,
             is_enabled: model.is_enabled,
             owned_by: model.owned_by,
+            details: model
+                .metadata
+                .and_then(|metadata| serde_json::from_value(metadata).ok()),
             last_seen_at: model.last_seen_at.map(|value| value.to_rfc3339()),
             updated_at: model.updated_at.to_rfc3339(),
         }

@@ -13,6 +13,7 @@ use temps_entities::{ai_provider_keys, ai_provider_models};
 
 use crate::error::AiGatewayError;
 use crate::services::{GatewayService, ProviderKeyService};
+use crate::types::DiscoveredModel;
 
 pub const MODEL_SOURCE_DISCOVERED: &str = "discovered";
 pub const MODEL_SOURCE_MANUAL: &str = "manual";
@@ -121,7 +122,7 @@ impl ProviderModelService {
     ) -> Result<Vec<ai_provider_models::Model>, AiGatewayError> {
         let discovered = self
             .gateway
-            .discover_models_for_key(provider_key_id)
+            .discover_model_catalog_for_key(provider_key_id)
             .await?;
         let existing = self.list_for_key(provider_key_id).await?;
         let manual_ids: HashSet<&str> = existing
@@ -146,7 +147,14 @@ impl ProviderModelService {
             .exec(&transaction)
             .await?;
 
-        for model in discovered {
+        for discovered_model in discovered {
+            let DiscoveredModel {
+                info: model,
+                details,
+            } = discovered_model;
+            let metadata = details
+                .as_ref()
+                .and_then(|details| serde_json::to_value(details).ok());
             if manual_ids.contains(model.id.as_str()) {
                 continue;
             }
@@ -156,6 +164,7 @@ impl ProviderModelService {
                 active.source = Set(MODEL_SOURCE_DISCOVERED.to_string());
                 active.is_available = Set(true);
                 active.owned_by = Set(Some(model.owned_by));
+                active.metadata = Set(metadata);
                 active.last_seen_at = Set(Some(now));
                 active.update(&transaction).await?;
             } else {
@@ -167,6 +176,7 @@ impl ProviderModelService {
                     is_available: Set(true),
                     is_enabled: Set(true),
                     owned_by: Set(Some(model.owned_by)),
+                    metadata: Set(metadata),
                     last_seen_at: Set(Some(now)),
                     ..Default::default()
                 }

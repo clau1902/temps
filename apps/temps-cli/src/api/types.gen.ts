@@ -14965,6 +14965,42 @@ export type ModelCapability = {
  */
 export type ModelCatalogSource = 'live' | 'cache' | 'stale_cache' | 'bootstrap';
 
+/**
+ * What a provider's model catalogue says about one model, kept so a user can
+ * choose between models without leaving the console. Every field is optional
+ * because catalogues differ: OpenRouter publishes all of them, others few.
+ */
+export type ModelDetails = {
+    /**
+     * Maximum context window in tokens.
+     */
+    context_length?: number | null;
+    /**
+     * What the model accepts: `text`, `image`, `file`, `audio`, ...
+     */
+    input_modalities?: Array<string>;
+    /**
+     * USD per one million input (prompt) tokens.
+     */
+    input_price_per_million?: number | null;
+    /**
+     * Human-readable name, when it differs from the model id.
+     */
+    name?: string | null;
+    /**
+     * What the model produces: `text`, `image`, ...
+     */
+    output_modalities?: Array<string>;
+    /**
+     * USD per one million output (completion) tokens.
+     */
+    output_price_per_million?: number | null;
+    /**
+     * Whether the catalogue lists tool calling. The Temps assistant needs it.
+     */
+    supports_tools?: boolean | null;
+};
+
 export type ModelInfo = {
     id: string;
     object: string;
@@ -19086,6 +19122,7 @@ export type ProviderMetadata = {
 };
 
 export type ProviderModelResponse = {
+    details?: ModelDetails | null;
     display_name: string;
     id: number;
     is_available: boolean;

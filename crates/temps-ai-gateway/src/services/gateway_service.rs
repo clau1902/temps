@@ -125,6 +125,20 @@ impl GatewayService {
         &self,
         key_id: i32,
     ) -> Result<Vec<ModelInfo>, AiGatewayError> {
+        Ok(self
+            .discover_model_catalog_for_key(key_id)
+            .await?
+            .into_iter()
+            .map(|model| model.info)
+            .collect())
+    }
+
+    /// Like [`Self::discover_models_for_key`], keeping what the catalogue says
+    /// about each model (modalities, prices, context window, tool support).
+    pub async fn discover_model_catalog_for_key(
+        &self,
+        key_id: i32,
+    ) -> Result<Vec<DiscoveredModel>, AiGatewayError> {
         let key = self.provider_key_service.get_by_id(key_id).await?;
         let provider = self.providers.get(key.provider.as_str()).ok_or_else(|| {
             AiGatewayError::ProviderNotConfigured {
@@ -224,7 +238,7 @@ impl GatewayService {
             reason: "Provider model catalog did not contain a model array".to_string(),
         })?;
 
-        let mut models: Vec<ModelInfo> = entries
+        let mut models: Vec<DiscoveredModel> = entries
             .iter()
             .filter(|entry| {
                 key.provider != "gemini"
@@ -246,16 +260,19 @@ impl GatewayService {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(key.provider.as_str())
                     .to_string();
-                Some(ModelInfo {
-                    id,
-                    object: "model".to_string(),
-                    owned_by,
+                Some(DiscoveredModel {
+                    details: ModelDetails::from_catalog_entry(entry),
+                    info: ModelInfo {
+                        id,
+                        object: "model".to_string(),
+                        owned_by,
+                    },
                 })
             })
             .take(5_000)
             .collect();
-        models.sort_by(|left, right| left.id.cmp(&right.id));
-        models.dedup_by(|left, right| left.id == right.id);
+        models.sort_by(|left, right| left.info.id.cmp(&right.info.id));
+        models.dedup_by(|left, right| left.info.id == right.info.id);
         Ok(models)
     }
 
