@@ -5352,6 +5352,19 @@ export type CreateApplicationRequest = {
     starter_project?: CreateApplicationProjectRequest | null;
 };
 
+export type CreateAssistantConversationRequest = {
+    /**
+     * Model id to start with; defaults to the provider's default model.
+     */
+    ai_model?: string | null;
+    /**
+     * An AI-gateway provider id (`gateway_key:<id>`). Defaults to the active
+     * OpenRouter key, then to the instance default. Host harnesses are
+     * rejected: the assistant has no sandbox.
+     */
+    ai_provider?: string | null;
+};
+
 export type CreateBackupScheduleRequest = {
     backup_type: string;
     description?: string | null;
@@ -29984,6 +29997,41 @@ export type UploadApplicationWorkspaceFilesResponses = {
 };
 
 export type UploadApplicationWorkspaceFilesResponse = UploadApplicationWorkspaceFilesResponses[keyof UploadApplicationWorkspaceFilesResponses];
+
+export type CreateAssistantConversationData = {
+    body: CreateAssistantConversationRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/assistant/conversations';
+};
+
+export type CreateAssistantConversationErrors = {
+    /**
+     * Provider is not an AI-gateway provider
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No AI provider is configured; the problem carries `setup_path`
+     */
+    409: unknown;
+};
+
+export type CreateAssistantConversationResponses = {
+    /**
+     * Conversation created
+     */
+    201: ConversationResponse;
+};
+
+export type CreateAssistantConversationResponse = CreateAssistantConversationResponses[keyof CreateAssistantConversationResponses];
 
 export type ListAllConversationsData = {
     body?: never;

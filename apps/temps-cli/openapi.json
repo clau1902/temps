@@ -11357,6 +11357,25 @@
         ],
         "type": "object"
       },
+      "CreateAssistantConversationRequest": {
+        "properties": {
+          "ai_model": {
+            "description": "Model id to start with; defaults to the provider's default model.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_provider": {
+            "description": "An AI-gateway provider id (`gateway_key:<id>`). Defaults to the active\nOpenRouter key, then to the instance default. Host harnesses are\nrejected: the assistant has no sandbox.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "CreateBackupScheduleRequest": {
         "properties": {
           "backup_type": {
@@ -63693,6 +63712,56 @@
         "summary": "Upload files into an application workspace",
         "tags": [
           "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/assistant/conversations": {
+      "post": {
+        "description": "The assistant runs on the AI gateway (an OpenRouter key is enough), has no\nsandbox, and acts with the calling user's own permissions: every tool call\nis replayed through the real router with their auth, and every change is a\nproposal the user confirms in the UI. When no provider is configured this\nanswers `409` with `setup_path`, so the client can onboard instead of\nfailing.",
+        "operationId": "create_assistant_conversation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAssistantConversationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationResponse"
+                }
+              }
+            },
+            "description": "Conversation created"
+          },
+          "400": {
+            "description": "Provider is not an AI-gateway provider"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "No AI provider is configured; the problem carries `setup_path`"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Start a chat with the Temps assistant.",
+        "tags": [
+          "AI Chat"
         ],
         "x-maturity": "experimental"
       }
