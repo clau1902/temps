@@ -112,6 +112,7 @@ impl TempsPlugin for AiChatPlugin {
                     applications.clone(),
                 )),
                 Arc::new(crate::GlobalChatProvider),
+                Arc::new(crate::AssistantChatProvider),
                 Arc::new(ProjectChatProvider::new(db.clone())),
                 // ADR-024: generic API meta-tools (search_api, describe_api, call_api).
                 // Uses the sentinel context_type "__api_tools__" — never selected as a

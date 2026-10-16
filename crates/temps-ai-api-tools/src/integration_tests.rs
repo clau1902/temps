@@ -179,6 +179,7 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
         };
 
         let response = caller
@@ -209,6 +210,7 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Allowed(vec![7]),
+            origin: None,
         };
 
         // Admin has ProjectsRead → the handler returns 200.
@@ -246,6 +248,7 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Allowed(vec![7]),
+            origin: None,
         };
 
         let err = caller
@@ -272,6 +275,7 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
         };
 
         let err = caller
@@ -298,6 +302,7 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
         };
 
         let err = caller
@@ -329,6 +334,7 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
         };
 
         let results = caller.search("guarded", &scope);

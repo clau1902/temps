@@ -3383,6 +3383,66 @@ impl ConversationService {
             permission_mode,
         })
     }
+    /// Create a private, projectless assistant conversation on an AI-gateway
+    /// provider.
+    ///
+    /// The provider is the caller's explicit choice when given, otherwise the
+    /// active OpenRouter key (the one the console asks operators to paste),
+    /// otherwise the instance default. Harness providers are refused: the
+    /// assistant has no sandbox, so it must never fall back to host access.
+    pub async fn create_assistant_conversation(
+        &self,
+        user_id: i32,
+        requested_provider: Option<&str>,
+        requested_model: Option<&str>,
+    ) -> Result<ai_conversations::Model, ChatError> {
+        if let Some(provider) = requested_provider {
+            if !provider.starts_with(GATEWAY_PROVIDER_PREFIX) {
+                return Err(ChatError::Ai(format!(
+                    "the assistant runs on an AI gateway provider; '{provider}' is not one"
+                )));
+            }
+        }
+        let provider = match requested_provider {
+            Some(provider) => provider.to_string(),
+            None => self.resolve_assistant_provider().await?,
+        };
+        let context_id = format!(
+            "{}{}",
+            crate::providers::assistant::ASSISTANT_CONTEXT_ID_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        );
+        self.get_or_create(
+            None,
+            "assistant",
+            &context_id,
+            user_id,
+            Some(&provider),
+            requested_model,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Prefer the active OpenRouter key, so pasting that one key is the whole
+    /// setup even when other gateway providers exist; fall back to the
+    /// instance default otherwise.
+    async fn resolve_assistant_provider(&self) -> Result<String, ChatError> {
+        use temps_entities::ai_provider_keys;
+
+        let openrouter = ai_provider_keys::Entity::find()
+            .filter(ai_provider_keys::Column::IsActive.eq(true))
+            .filter(ai_provider_keys::Column::Provider.eq("openrouter"))
+            .order_by_asc(ai_provider_keys::Column::Id)
+            .one(self.db.as_ref())
+            .await?;
+        match openrouter {
+            Some(key) => Ok(format!("{GATEWAY_PROVIDER_PREFIX}{}", key.id)),
+            None => self.resolve_default_provider().await,
+        }
+    }
+
     async fn resolve_default_provider(&self) -> Result<String, ChatError> {
         use temps_entities::ai_provider_keys;
 
@@ -3396,7 +3456,7 @@ impl ConversationService {
             .one(self.db.as_ref())
             .await?
             .ok_or(ChatError::AiUnavailable)?;
-        Ok(format!("gateway_key:{}", key.id))
+        Ok(format!("{GATEWAY_PROVIDER_PREFIX}{}", key.id))
     }
 
     async fn insert_message(
@@ -3790,6 +3850,20 @@ impl ConversationService {
                     Some(sys) => sys.content = seed.system,
                     None => messages.insert(0, ChatMessage::system(seed.system)),
                 }
+            }
+        }
+
+        // Bound after the system framing is refreshed so the omission notice
+        // below is not overwritten by it.
+        if conv.context_type == "assistant" {
+            let dropped = bound_history_for_model(&mut messages, ASSISTANT_MAX_HISTORY_BYTES);
+            if dropped > 0 {
+                tracing::info!(
+                    conversation_id = conv.id,
+                    dropped,
+                    budget_bytes = ASSISTANT_MAX_HISTORY_BYTES,
+                    "bounded assistant conversation history for the model"
+                );
             }
         }
 
@@ -4224,6 +4298,8 @@ impl ConversationService {
         // is a ceiling — set far beyond anything a real task approaches, so it
         // is never what ends a turn in practice.
         const MAX_ROUNDS: usize = 500;
+        let max_rounds = max_rounds_for_context(&conv.context_type, MAX_ROUNDS);
+        let max_calls_per_round = max_calls_per_round_for_context(&conv.context_type);
         // Independent of both: a turn where every call was rejected several
         // rounds running is stuck, and stopping it in seconds beats letting it
         // grind for the rest of the deadline. This never shortens a turn that
@@ -4854,7 +4930,7 @@ impl ConversationService {
                 "AI turn timing"
             );
 
-            'rounds: for round_index in 0..MAX_ROUNDS {
+            'rounds: for round_index in 0..max_rounds {
                 if turn_started.elapsed() >= max_turn_duration {
                     stop_reason = Some(TURN_TIMEOUT_REASON);
                     break 'rounds;
@@ -5446,46 +5522,53 @@ impl ConversationService {
                     tool_calls: Some(round_calls.clone()),
                     tool_call_id: None,
                 });
-                for tc in &round_calls {
+                for (call_index, tc) in round_calls.iter().enumerate() {
                     // Route the ADR-024 `temps` CLI tool to the API-tools provider;
                     // `temps_write` to the write-proposal path;
                     // otherwise to the context provider. `project_id` is always the
                     // conversation's project, never anything the model supplied — so
                     // a tool can't be steered to another tenant's data.
-                    let result = match refresh_tool_authorization(db.as_ref(), &auth).await {
-                        Ok(fresh_auth) => {
-                            let mut state = execution_state.lock().await;
-                            dispatch_conversation_tool(
-                                tc,
-                                project_id,
-                                conv_id,
-                                &context_id,
-                                &fresh_auth,
-                                project_access_checker.as_ref(),
-                                provider.as_ref(),
-                                api_tools.as_ref(),
-                                repo_tools.as_ref(),
-                                write_handle_opt.as_deref(),
-                                pending_svc_opt.as_deref(),
-                                write_support_audit.as_deref(),
-                                Some(&platform_interactions),
-                                &mut state,
-                            )
-                            .await
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                conversation_id = conv_id,
-                                tool = %tc.name,
-                                %error,
-                                "denied conversation tool after authorization refresh failed"
-                            );
-                            emit_turn_event(
-                                &tx,
-                                &turn_live,
-                                Err(ChatError::AuthorizationRefresh(error)),
-                            );
-                            return true;
+                    let result = if call_index >= max_calls_per_round {
+                        // Answer the call rather than dropping it: a provider rejects an
+                        // assistant tool_calls block with unanswered ids, and the model
+                        // needs to know the call did not run.
+                        tool_call_cap_message(max_calls_per_round)
+                    } else {
+                        match refresh_tool_authorization(db.as_ref(), &auth).await {
+                            Ok(fresh_auth) => {
+                                let mut state = execution_state.lock().await;
+                                dispatch_conversation_tool(
+                                    tc,
+                                    project_id,
+                                    conv_id,
+                                    &context_id,
+                                    &fresh_auth,
+                                    project_access_checker.as_ref(),
+                                    provider.as_ref(),
+                                    api_tools.as_ref(),
+                                    repo_tools.as_ref(),
+                                    write_handle_opt.as_deref(),
+                                    pending_svc_opt.as_deref(),
+                                    write_support_audit.as_deref(),
+                                    Some(&platform_interactions),
+                                    &mut state,
+                                )
+                                .await
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    conversation_id = conv_id,
+                                    tool = %tc.name,
+                                    %error,
+                                    "denied conversation tool after authorization refresh failed"
+                                );
+                                emit_turn_event(
+                                    &tx,
+                                    &turn_live,
+                                    Err(ChatError::AuthorizationRefresh(error)),
+                                );
+                                return true;
+                            }
                         }
                     };
                     let display_arguments = redact_json_string(&tc.arguments);
@@ -5553,7 +5636,7 @@ impl ConversationService {
                 // Bound what gets replayed next round. This, not the round
                 // count, is what keeps a long turn from running out of context.
                 trim_carried_tool_results(&mut messages, MAX_CARRIED_TOOL_BYTES);
-                if round_index + 1 == MAX_ROUNDS {
+                if round_index + 1 == max_rounds {
                     round_backstop_exhausted = true;
                 }
             }
@@ -6296,6 +6379,7 @@ fn tool_result_is_productive(result: &str) -> bool {
                 "Unknown command",
                 "is not available",
                 "authorization could not be verified",
+                TOOL_CALL_CAP_REJECTION,
                 "You already ran",
                 "Not staged",
                 "Invalid `temps_write` arguments",
@@ -6303,6 +6387,96 @@ fn tool_result_is_productive(result: &str) -> bool {
             !REJECTIONS.iter().any(|r| result.contains(r)) && !result.contains("` failed:")
         }
     }
+}
+
+/// Provider-id prefix of AI-gateway providers (`gateway_key:<provider key id>`).
+const GATEWAY_PROVIDER_PREFIX: &str = "gateway_key:";
+
+/// Tool-call rounds one assistant turn may take. Far below the generic
+/// anti-spin ceiling because the assistant is a conversational surface: a user
+/// is watching, every write needs their click, and a turn that has not settled
+/// in this many model round-trips is looping, not working. The wall-clock
+/// deadline still applies on top; this is the step-count backstop.
+const ASSISTANT_MAX_ROUNDS: usize = 24;
+/// Tool calls honoured from a single model response. Models can emit dozens of
+/// parallel calls; each is a replayed API request plus a transcript entry.
+const ASSISTANT_MAX_CALLS_PER_ROUND: usize = 8;
+/// Largest transcript, in bytes of message content, replayed to the model on
+/// a new turn of an assistant conversation.
+const ASSISTANT_MAX_HISTORY_BYTES: usize = 128 * 1024;
+/// Marker the over-cap result starts with; also registered as an unproductive
+/// result so a model that keeps exceeding the cap is stopped.
+const TOOL_CALL_CAP_REJECTION: &str = "Not executed:";
+
+fn max_rounds_for_context(context_type: &str, default: usize) -> usize {
+    if context_type == "assistant" {
+        ASSISTANT_MAX_ROUNDS.min(default)
+    } else {
+        default
+    }
+}
+
+fn max_calls_per_round_for_context(context_type: &str) -> usize {
+    if context_type == "assistant" {
+        ASSISTANT_MAX_CALLS_PER_ROUND
+    } else {
+        usize::MAX
+    }
+}
+
+fn tool_call_cap_message(cap: usize) -> String {
+    format!(
+        "{TOOL_CALL_CAP_REJECTION} at most {cap} tool calls run per step. Make fewer, more \
+         targeted calls (or one call per step) and repeat this one if it is still needed."
+    )
+}
+
+/// Keep a long conversation inside the model's context by dropping its oldest
+/// turns. System messages and the most recent message always survive, and a
+/// note appended to the system message marks the gap so the model does not
+/// mistake the remainder for the whole conversation. Returns the number of
+/// messages dropped.
+///
+/// Only whole messages are removed, oldest first, so no tool-call/result pair
+/// is ever split (history loaded from storage holds only system, user and
+/// assistant text).
+fn bound_history_for_model(messages: &mut Vec<ChatMessage>, budget: usize) -> usize {
+    let total: usize = messages.iter().map(|m| m.content.len()).sum();
+    if total <= budget || messages.len() < 2 {
+        return 0;
+    }
+    let last = messages.len() - 1;
+    let mut over = total - budget;
+    let mut drop = vec![false; messages.len()];
+    let mut dropped = 0usize;
+    for (index, message) in messages.iter().enumerate() {
+        if over == 0 {
+            break;
+        }
+        if index == last || message.role == "system" {
+            continue;
+        }
+        over = over.saturating_sub(message.content.len());
+        drop[index] = true;
+        dropped += 1;
+    }
+    if dropped == 0 {
+        return 0;
+    }
+    let mut index = 0;
+    messages.retain(|_| {
+        let keep = !drop[index];
+        index += 1;
+        keep
+    });
+    let note = format!(
+        "\n\n[{dropped} earlier message(s) of this conversation were omitted to stay within the context budget. Ask the user, or re-run a read, if you need something from them.]"
+    );
+    match messages.iter_mut().find(|m| m.role == "system") {
+        Some(system) => system.content.push_str(&note),
+        None => messages.insert(0, ChatMessage::system(note.trim_start().to_string())),
+    }
+    dropped
 }
 
 /// Replace the oldest tool results with a stub once the carried-forward
@@ -6632,7 +6806,7 @@ async fn dispatch_write_tool(
         None => None,
     };
     let application_scope = context_id.starts_with("app_") && context_id.contains(':');
-    let global_scope = context_id.starts_with("global_");
+    let global_scope = crate::provider::is_cross_project_context(context_id);
     let (selected_project_id, project_scope) = if application_scope {
         // A workspace is a machine and context boundary, not an authorization
         // boundary for the Temps control plane. Project links describe which
@@ -6668,6 +6842,7 @@ async fn dispatch_write_tool(
     let scope = ApiCallScope {
         auth: auth.clone(),
         project_scope,
+        origin: None,
     };
 
     // Two shapes: a single `command` (standalone action) or an ordered
@@ -6777,6 +6952,7 @@ async fn dispatch_write_tool(
                         &row.public_id,
                         &resolution.auth,
                         Some(resolution.auth.user_id()),
+                        Some(approver_origin(&resolution)),
                     )
                     .await
                 {
@@ -6913,6 +7089,7 @@ async fn dispatch_write_tool(
                         &row.public_id,
                         &resolution.auth,
                         Some(resolution.auth.user_id()),
+                        Some(approver_origin(&resolution)),
                     )
                     .await
                 {
@@ -7040,6 +7217,16 @@ fn pending_action_tool_result(action: &temps_entities::ai_pending_actions::Model
         );
     }
     value.to_string()
+}
+
+/// The client that approved an action, so the audit trail of the API call the
+/// assistant then makes names the approver's address and browser rather than
+/// the `unknown` of an in-process request.
+fn approver_origin(resolution: &PermissionResolution) -> temps_core::ai_tool_call::AiToolOrigin {
+    temps_core::ai_tool_call::AiToolOrigin {
+        ip_address: resolution.metadata.ip_address.clone(),
+        user_agent: resolution.metadata.user_agent.clone(),
+    }
 }
 
 async fn audit_confirmed_action(
@@ -7764,6 +7951,83 @@ mod tests {
         trim_carried_tool_results(&mut messages, 192 * 1024);
         assert_eq!(messages[0].content, before[0].content);
         assert_eq!(messages[1].content, before[1].content);
+    }
+
+    fn user_msg(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn history_within_budget_is_left_alone() {
+        let mut messages = vec![ChatMessage::system("seed"), user_msg("hi")];
+        assert_eq!(bound_history_for_model(&mut messages, 1024), 0);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "seed");
+    }
+
+    #[test]
+    fn history_over_budget_drops_oldest_turns_and_keeps_system_and_latest() {
+        let big = "x".repeat(400);
+        let mut messages = vec![
+            ChatMessage::system("seed"),
+            user_msg(&big),
+            ChatMessage::assistant(big.clone()),
+            user_msg(&big),
+            user_msg("the current question"),
+        ];
+        let dropped = bound_history_for_model(&mut messages, 700);
+
+        assert_eq!(dropped, 2);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages.last().map(|m| m.content.as_str()),
+            Some("the current question")
+        );
+        // The gap is announced inside the system message, not as a second one.
+        assert_eq!(messages.iter().filter(|m| m.role == "system").count(), 1);
+        assert!(messages[0].content.starts_with("seed"));
+        assert!(messages[0].content.contains("2 earlier message(s)"));
+        let total: usize = messages.iter().map(|m| m.content.len()).sum();
+        assert!(
+            total <= 700 + messages[0].content.len(),
+            "still over budget: {total}"
+        );
+    }
+
+    #[test]
+    fn history_never_drops_the_latest_message_even_when_it_alone_is_over_budget() {
+        let mut messages = vec![ChatMessage::system("seed"), user_msg(&"y".repeat(5000))];
+        assert_eq!(bound_history_for_model(&mut messages, 100), 0);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn only_assistant_conversations_get_the_tighter_turn_caps() {
+        assert_eq!(
+            max_rounds_for_context("assistant", 500),
+            ASSISTANT_MAX_ROUNDS
+        );
+        assert_eq!(max_rounds_for_context("project", 500), 500);
+        assert_eq!(max_rounds_for_context("global", 500), 500);
+        assert_eq!(
+            max_calls_per_round_for_context("assistant"),
+            ASSISTANT_MAX_CALLS_PER_ROUND
+        );
+        assert_eq!(max_calls_per_round_for_context("project"), usize::MAX);
+    }
+
+    #[test]
+    fn the_over_cap_result_names_the_cap_and_counts_as_unproductive() {
+        let message = tool_call_cap_message(8);
+        assert!(message.contains('8'));
+        assert!(
+            !tool_result_is_productive(&message),
+            "a turn that only exceeds the cap must trip the stuck-turn guard"
+        );
     }
 
     /// A `create_alert` proposal with no prior backtest must be refused.

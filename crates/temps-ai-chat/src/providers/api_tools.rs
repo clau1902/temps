@@ -228,7 +228,7 @@ impl ConversationContextProvider for ApiToolsProvider {
 
     async fn tools(&self, _project_id: Option<i32>, context_id: &str) -> Vec<ChatTool> {
         let application_scope = context_id.starts_with("app_") && context_id.contains(':');
-        let global_scope = context_id.starts_with("global_");
+        let global_scope = crate::provider::is_cross_project_context(context_id);
         vec![ChatTool {
             name: "temps".to_string(),
             description: "Read-only Temps MCP tool over the platform API. Invoke this registered \
@@ -332,7 +332,7 @@ impl ApiToolsProvider {
             None => None,
         };
         let application_scope = context_id.starts_with("app_") && context_id.contains(':');
-        let global_scope = context_id.starts_with("global_");
+        let global_scope = crate::provider::is_cross_project_context(context_id);
         let project_scope = if application_scope || global_scope {
             requested_project_id.map_or(ProjectSelectorScope::Unrestricted, |project_id| {
                 ProjectSelectorScope::Allowed(vec![project_id])
@@ -351,6 +351,7 @@ impl ApiToolsProvider {
         let scope = ApiCallScope {
             auth: auth.clone(),
             project_scope,
+            origin: None,
         };
         caller.run_cli(command, &scope).await
     }

@@ -5760,6 +5760,7 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: admin_auth(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
+            origin: None,
         };
 
         let base = "alerts create_alert --name p95 --metric_name http.server.duration \
@@ -5840,6 +5841,7 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: auth.clone(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
+            origin: None,
         };
 
         // Discoverable by browsing, which is how the model finds anything.
@@ -6012,6 +6014,7 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: admin_auth(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Unrestricted,
+            origin: None,
         };
         let catalog = caller.run_cli("projects --help", &scope).await;
         assert!(catalog.contains("get_projects"), "catalog: {catalog}");
@@ -6031,6 +6034,7 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: admin_auth(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
+            origin: None,
         };
 
         let recovery = caller
@@ -6090,6 +6094,7 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: admin_auth(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Unrestricted,
+            origin: None,
         };
         let catalog = caller.run_cli("external-services --help", &scope).await;
         assert!(catalog.contains("list_services"), "catalog: {catalog}");

@@ -49,6 +49,15 @@ When the user asks for read-only data you can fetch, just fetch it with sensible
 ## Output
 Be concise and practical: lead with the answer, then supporting detail. Use compact lists or tables for multi-row data.";
 
+/// Context-id prefixes of user-owned conversations that are not attached to a
+/// project: the harness-backed `global_` operator chat and the gateway-backed
+/// `assistant_` chat. In both, the project a tool call targets is chosen per
+/// call through the top-level `project_id` selector and checked against the
+/// caller's live permissions, rather than being fixed when the thread began.
+pub fn is_cross_project_context(context_id: &str) -> bool {
+    context_id.starts_with("global_") || context_id.starts_with("assistant_")
+}
+
 /// The seed for a new conversation.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationSeed {

@@ -350,6 +350,16 @@ pub struct CreateGlobalConversationRequest {
     pub ai_permission_mode: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct CreateAssistantConversationRequest {
+    /// An AI-gateway provider id (`gateway_key:<id>`). Defaults to the active
+    /// OpenRouter key, then to the instance default. Host harnesses are
+    /// rejected: the assistant has no sandbox.
+    pub ai_provider: Option<String>,
+    /// Model id to start with; defaults to the provider's default model.
+    pub ai_model: Option<String>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateApplicationPreviewLinkRequest {
     /// The development server port detected or selected in the sandbox.
@@ -5874,6 +5884,85 @@ pub async fn create_global_conversation(
     ))
 }
 
+/// The calling client, attached to assistant-issued API calls so the audit trail
+/// of what the assistant did names who approved it and from where.
+fn request_origin(metadata: &RequestMetadata) -> temps_core::ai_tool_call::AiToolOrigin {
+    temps_core::ai_tool_call::AiToolOrigin {
+        ip_address: metadata.ip_address.clone(),
+        user_agent: metadata.user_agent.clone(),
+    }
+}
+
+/// Console path where an operator adds the AI provider key the assistant needs.
+const ASSISTANT_SETUP_PATH: &str = "/ai-gateway?add=openrouter";
+
+/// Start a chat with the Temps assistant.
+///
+/// The assistant runs on the AI gateway (an OpenRouter key is enough), has no
+/// sandbox, and acts with the calling user's own permissions: every tool call
+/// is replayed through the real router with their auth, and every change is a
+/// proposal the user confirms in the UI. When no provider is configured this
+/// answers `409` with `setup_path`, so the client can onboard instead of
+/// failing.
+#[utoipa::path(
+    post, tag = "AI Chat",
+    path = "/ai/assistant/conversations",
+    request_body = CreateAssistantConversationRequest,
+    responses(
+        (status = 201, description = "Conversation created", body = ConversationResponse),
+        (status = 400, description = "Provider is not an AI-gateway provider"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "No AI provider is configured; the problem carries `setup_path`")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_assistant_conversation(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<CreateAssistantConversationRequest>,
+) -> Result<(StatusCode, Json<ConversationResponse>), Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let conversation = state
+        .service
+        .create_assistant_conversation(
+            auth.user_id(),
+            request.ai_provider.as_deref(),
+            request.ai_model.as_deref(),
+        )
+        .await
+        .map_err(|error| match error {
+            ChatError::AiUnavailable => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("AI Not Configured")
+                .with_detail(
+                    "No AI provider is configured. Add an OpenRouter API key to start managing Temps by chat.",
+                )
+                .with_value("setup_path", ASSISTANT_SETUP_PATH),
+            ChatError::Ai(message) => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Assistant Provider Not Usable")
+                .with_detail(message),
+            other => Problem::from(other),
+        })?;
+    state
+        .audit(&ConversationCreatedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id: None,
+            conversation_id: conversation.public_id.clone(),
+            context_type: "assistant".to_string(),
+        })
+        .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ConversationResponse::from(conversation)),
+    ))
+}
+
 fn global_workspace_context_id(user_id: i32) -> String {
     format!("global-user-{user_id}")
 }
@@ -9192,7 +9281,13 @@ pub async fn confirm_pending_action(
     let confirmed_by = Some(auth.user_id());
     let updated = state
         .pending_actions
-        .confirm(Some(project_id), &action_public_id, &auth, confirmed_by)
+        .confirm(
+            Some(project_id),
+            &action_public_id,
+            &auth,
+            confirmed_by,
+            Some(request_origin(&metadata)),
+        )
         .await
         .map_err(Problem::from)?;
 
@@ -9362,6 +9457,7 @@ pub async fn confirm_user_pending_action(
             &action_public_id,
             &auth,
             Some(auth.user_id()),
+            Some(request_origin(&metadata)),
         )
         .await
         .map_err(Problem::from)?;
@@ -9639,6 +9735,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             get(list_all_conversations).post(create_global_conversation),
         )
         .route(
+            "/ai/assistant/conversations",
+            post(create_assistant_conversation),
+        )
+        .route(
             "/ai/conversations/{public_id}",
             get(get_user_conversation).patch(rename_user_conversation),
         )
@@ -9814,6 +9914,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         list_all_conversations,
         get_workspace_activity,
         create_global_conversation,
+        create_assistant_conversation,
         get_global_ai_workspace,
         get_user_conversation,
         get_user_conversation_diagnostics,
@@ -9885,6 +9986,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         WorkspaceHarnessActivity,
         CreateConversationRequest,
         CreateGlobalConversationRequest,
+        CreateAssistantConversationRequest,
         RenameConversationRequest,
         UpdatePermissionModeRequest,
         SendMessageRequest,

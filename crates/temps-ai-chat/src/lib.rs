@@ -30,6 +30,7 @@ pub use provider::{ConversationContextProvider, ConversationSeed};
 pub use providers::alert::AlertChatProvider;
 pub use providers::api_tools::ApiToolsProvider;
 pub use providers::application::ApplicationChatProvider;
+pub use providers::assistant::{AssistantChatProvider, ASSISTANT_CONTEXT_ID_PREFIX};
 pub use providers::deployment::DeploymentChatProvider;
 pub use providers::global::GlobalChatProvider;
 pub use providers::project::ProjectChatProvider;

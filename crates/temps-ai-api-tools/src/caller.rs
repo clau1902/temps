@@ -56,6 +56,10 @@ pub struct ApiCallScope {
     /// How project selectors are constrained for this call. Global operations
     /// are unaffected and always inherit authorization from `auth`.
     pub project_scope: ProjectSelectorScope,
+    /// The human client behind the call, when known (the user who approved a
+    /// write). Recorded in the audit trail next to the "via Temps AI assistant"
+    /// label; `None` for calls that have no client to attribute, such as reads.
+    pub origin: Option<temps_core::ai_tool_call::AiToolOrigin>,
 }
 
 /// Independent policy for project selectors embedded in API operations.
@@ -977,6 +981,9 @@ impl InternalApiCaller {
         // send row contents to a third-party AI provider.
         req.extensions_mut()
             .insert(temps_core::ai_tool_call::AiToolCall);
+        if let Some(origin) = &scope.origin {
+            req.extensions_mut().insert(origin.clone());
+        }
 
         // Step 4: replay through the router.
         let response =
@@ -2751,6 +2758,7 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
         };
 
         let outcome = caller.prepare_write_cli("--help", &scope);
@@ -2792,6 +2800,7 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
         };
 
         // Supply the required `branch` param.
@@ -2844,6 +2853,7 @@ mod tests {
         let scope = ApiCallScope {
             auth: AuthContext::new_session(user, Role::Admin),
             project_scope: ProjectSelectorScope::Allowed(Vec::new()),
+            origin: None,
         };
 
         let outcome =
@@ -2896,6 +2906,7 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
         };
 
         // Do NOT supply `branch` — should get Invalid.

@@ -21,6 +21,7 @@ use sea_orm::{
 use temps_ai_api_tools::{ApiCallScope, ProjectSelectorScope, WriteApiToolsHandle};
 use temps_auth::context::AuthContext;
 use temps_auth::permissions::Permission;
+use temps_core::ai_tool_call::AiToolOrigin;
 use temps_entities::ai_pending_actions;
 
 use crate::sensitive::{decrypt_value, encrypt_value, redact_text, redact_value};
@@ -387,9 +388,17 @@ impl PendingActionService {
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
+        origin: Option<AiToolOrigin>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
-        self.confirm_with_status(project_id, public_id, auth, confirmed_by, "proposed")
-            .await
+        self.confirm_with_status(
+            project_id,
+            public_id,
+            auth,
+            confirmed_by,
+            origin,
+            "proposed",
+        )
+        .await
     }
 
     /// Resolve an action that belongs to the currently active inline waiter.
@@ -399,12 +408,14 @@ impl PendingActionService {
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
+        origin: Option<AiToolOrigin>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         self.confirm_with_status(
             project_id,
             public_id,
             auth,
             confirmed_by,
+            origin,
             "awaiting_inline_approval",
         )
         .await
@@ -416,6 +427,7 @@ impl PendingActionService {
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
+        origin: Option<AiToolOrigin>,
         expected_status: &str,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         // 1. Load + project-scope check.
@@ -504,6 +516,7 @@ impl PendingActionService {
             project_scope: project_id.map_or(ProjectSelectorScope::Unrestricted, |project_id| {
                 ProjectSelectorScope::Allowed(vec![project_id])
             }),
+            origin,
         };
         let exec_result = caller
             .execute_write(&action.operation_id, executable_params, &scope)
@@ -925,7 +938,7 @@ mod tests {
         let auth = make_auth();
 
         let error = svc
-            .confirm(Some(7), "inline", &auth, Some(auth.user_id()))
+            .confirm(Some(7), "inline", &auth, Some(auth.user_id()), None)
             .await
             .expect_err("legacy confirmation must reject inline lifecycle rows");
         assert!(matches!(
@@ -1031,8 +1044,14 @@ mod tests {
             Err(PendingActionError::NotFound { .. })
         ));
         assert!(matches!(
-            svc.confirm(Some(7), "other-user-or-legacy", &auth, Some(auth.user_id()))
-                .await,
+            svc.confirm(
+                Some(7),
+                "other-user-or-legacy",
+                &auth,
+                Some(auth.user_id()),
+                None
+            )
+            .await,
             Err(PendingActionError::NotFound { .. })
         ));
         assert!(matches!(
@@ -1070,7 +1089,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1), None)
             .await
             .expect_err("empty write handle remains unavailable");
         assert!(matches!(err, PendingActionError::Unavailable));
@@ -1111,7 +1130,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1), None)
             .await
             .expect_err("should fail");
         assert!(
@@ -1141,7 +1160,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "step2", &auth, Some(1))
+            .confirm(Some(7), "step2", &auth, Some(1), None)
             .await
             .expect_err("step 2 must be blocked until step 1 executes");
         assert!(
@@ -1290,7 +1309,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1), None)
             .await
             .expect_err("should fail with Unavailable");
         assert!(

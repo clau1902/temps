@@ -36,6 +36,32 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AiToolCall;
 
+/// Where an agent-issued request came from: the human client behind it.
+///
+/// The replayed request has no socket and no `User-Agent` of its own, so
+/// without this every audit row written by an assistant action would record
+/// `unknown` for both. The caller that holds the real approver's metadata
+/// inserts it next to [`AiToolCall`]; [`crate::request_metadata`] folds it into
+/// the [`crate::RequestMetadata`] the handlers hand to the audit log, together
+/// with a visible "via Temps AI assistant" label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiToolOrigin {
+    pub ip_address: String,
+    pub user_agent: String,
+}
+
+/// Suffix appended to the recorded `user_agent` of every request issued by the
+/// AI assistant, so an audit entry reads as "done from the assistant".
+pub const AI_ASSISTANT_USER_AGENT_LABEL: &str = "via Temps AI assistant";
+
+/// The `user_agent` an audit entry records for an assistant-issued request.
+pub fn assistant_user_agent(origin: Option<&AiToolOrigin>) -> String {
+    match origin {
+        Some(origin) => format!("{} ({})", origin.user_agent, AI_ASSISTANT_USER_AGENT_LABEL),
+        None => format!("Temps AI assistant ({AI_ASSISTANT_USER_AGENT_LABEL})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +75,18 @@ mod tests {
 
         extensions.insert(AiToolCall);
         assert_eq!(extensions.get::<AiToolCall>(), Some(&AiToolCall));
+    }
+
+    #[test]
+    fn assistant_user_agent_keeps_the_real_client_and_names_the_assistant() {
+        let origin = AiToolOrigin {
+            ip_address: "203.0.113.7".to_string(),
+            user_agent: "Mozilla/5.0".to_string(),
+        };
+        assert_eq!(
+            assistant_user_agent(Some(&origin)),
+            "Mozilla/5.0 (via Temps AI assistant)"
+        );
+        assert!(assistant_user_agent(None).contains("via Temps AI assistant"));
     }
 }
