@@ -70,6 +70,26 @@ describe('AssistantOnboarding', () => {
   })
 })
 
+describe('AssistantOnboarding sizing', () => {
+  const props = {
+    reason: NO_PROVIDER_REASON,
+    setupPath: OPENROUTER_SETUP_PATH,
+  }
+
+  test('is compact in the dock', () => {
+    const markup = render(<AssistantOnboarding {...props} />)
+    expect(markup).not.toContain('text-4xl')
+    expect(markup).not.toContain('h-12')
+  })
+
+  test('is larger and centred on the full-screen page', () => {
+    const markup = render(<AssistantOnboarding {...props} roomy />)
+    expect(markup).toContain('text-4xl')
+    expect(markup).toContain('justify-center')
+    expect(markup).toContain('h-12')
+  })
+})
+
 describe('AssistantStart', () => {
   test('shows skeleton placeholders, not a spinner, while checking the provider', () => {
     const markup = render(<AssistantStart onStarted={() => {}} />)

@@ -16,6 +16,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -61,9 +62,12 @@ export function AssistantOnboarding({
   onConfigured,
   onNavigate,
   cloudPath,
+  roomy,
 }: {
   reason: string
   setupPath: string
+  /** Full-screen sizing: larger type and controls, content centred. */
+  roomy?: boolean
   /** Called once the key is saved and the assistant can start. */
   onConfigured?: () => void
   /** Called when a link is followed, e.g. to close the dock on small screens. */
@@ -101,37 +105,62 @@ export function AssistantOnboarding({
   })
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-5 overflow-y-auto p-5">
-      <div className="space-y-2">
-        <Badge variant="outline" className="gap-1.5 font-normal">
-          <KeyRound className="size-3" aria-hidden="true" />
+    <div
+      className={cn(
+        'flex h-full min-h-0 flex-col gap-5 overflow-y-auto p-5',
+        roomy && 'justify-center gap-8 p-6'
+      )}
+    >
+      <div className={cn('space-y-2', roomy && 'space-y-4')}>
+        <Badge
+          variant="outline"
+          className={cn(
+            'gap-1.5 whitespace-normal font-normal',
+            roomy && 'px-3 py-1 text-sm'
+          )}
+        >
+          <KeyRound
+            className={cn('size-3 shrink-0', roomy && 'size-4')}
+            aria-hidden="true"
+          />
           {reason}
         </Badge>
-        <h2 className="text-xl font-semibold tracking-tight">
+        <h2
+          className={cn(
+            'text-xl font-semibold tracking-tight',
+            roomy && 'text-4xl'
+          )}
+        >
           Manage Temps by chat
         </h2>
-        <p className="text-sm leading-6 text-muted-foreground">
+        <p
+          className={cn(
+            'text-sm leading-6 text-muted-foreground',
+            roomy && 'text-lg leading-8'
+          )}
+        >
           Ask questions about your projects, deployments and settings in plain
           language. The assistant uses the same API as this console, with your
           own permissions.
         </p>
       </div>
 
-      <AssistantExample />
+      <AssistantExample roomy={roomy} />
 
       <form
         noValidate
         onSubmit={form.handleSubmit((values) => save.mutate(values))}
-        className="space-y-2"
+        className={cn('space-y-2', roomy && 'space-y-3')}
       >
         <label
           htmlFor="assistant-openrouter-key"
-          className="text-sm font-medium"
+          className={cn('text-sm font-medium', roomy && 'text-base')}
         >
           OpenRouter API key
         </label>
         <div className="flex gap-2">
           <Input
+            className={cn(roomy && 'h-12 text-base md:text-base')}
             id="assistant-openrouter-key"
             type="password"
             autoComplete="off"
@@ -141,7 +170,11 @@ export function AssistantOnboarding({
             aria-invalid={form.formState.errors.api_key ? true : undefined}
             {...form.register('api_key')}
           />
-          <Button type="submit" disabled={save.isPending}>
+          <Button
+            type="submit"
+            disabled={save.isPending}
+            className={cn(roomy && 'h-12 px-6 text-base')}
+          >
             {save.isPending ? (
               <Loader2 className="size-4 animate-spin" aria-hidden="true" />
             ) : null}
@@ -161,7 +194,12 @@ export function AssistantOnboarding({
             )}
           </p>
         ) : null}
-        <p className="text-xs leading-5 text-muted-foreground">
+        <p
+          className={cn(
+            'text-xs leading-5 text-muted-foreground',
+            roomy && 'text-sm leading-6'
+          )}
+        >
           The key is checked with OpenRouter, then stored encrypted. It is never
           shown again.{' '}
           <a
@@ -175,8 +213,12 @@ export function AssistantOnboarding({
         </p>
       </form>
 
-      <div className="grid gap-2">
-        <Button asChild variant="outline" className="w-full justify-between">
+      <div className={cn('grid gap-2', roomy && 'gap-3')}>
+        <Button
+          asChild
+          variant="outline"
+          className={cn('w-full justify-between', roomy && 'h-12 text-base')}
+        >
           <Link to={setupPath} onClick={onNavigate}>
             Open AI provider settings <ArrowRight className="size-4" />
           </Link>
@@ -185,7 +227,10 @@ export function AssistantOnboarding({
           <Button
             asChild
             variant="ghost"
-            className="w-full justify-between text-muted-foreground"
+            className={cn(
+              'w-full justify-between text-muted-foreground',
+              roomy && 'h-12 text-base'
+            )}
           >
             <Link to={cloudPath} onClick={onNavigate}>
               <span className="flex items-center gap-2">
@@ -202,16 +247,31 @@ export function AssistantOnboarding({
 }
 
 /** A concrete exchange, so "ask the assistant" is not an abstract promise. */
-function AssistantExample() {
+function AssistantExample({ roomy }: { roomy?: boolean }) {
   return (
-    <div className="space-y-2 rounded-lg border border-border bg-muted/30 p-3 text-sm">
+    <div
+      className={cn(
+        'space-y-2 rounded-lg border border-border bg-muted/30 p-3 text-sm',
+        roomy && 'space-y-3 p-5 text-base'
+      )}
+    >
       <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
         Example
       </p>
-      <p className="rounded-md bg-background px-3 py-2">
+      <p
+        className={cn(
+          'rounded-md bg-background px-3 py-2',
+          roomy && 'px-4 py-3'
+        )}
+      >
         {ASSISTANT_EXAMPLE_PROMPTS[0]}
       </p>
-      <p className="px-1 text-xs leading-5 text-muted-foreground">
+      <p
+        className={cn(
+          'px-1 text-xs leading-5 text-muted-foreground',
+          roomy && 'text-sm leading-6'
+        )}
+      >
         Reads and changes run straight away unless you turn on “Ask before
         changes”. Deletions always wait for your approval.
       </p>
@@ -238,10 +298,13 @@ export function AssistantStart({
   onStarted,
   onNavigate,
   cloudPath,
+  roomy,
 }: {
   onStarted: (conversation: ConversationResponse, firstMessage: string) => void
   onNavigate?: () => void
   cloudPath?: string
+  /** Full-screen sizing: larger type and controls, content centred. */
+  roomy?: boolean
 }) {
   const status = useQuery({
     ...getAiProviderStatusOptions(),
@@ -294,7 +357,7 @@ export function AssistantStart({
     },
   })
 
-  if (status.isPending) return <AssistantStartSkeleton />
+  if (status.isPending) return <AssistantStartSkeleton roomy={roomy} />
 
   const readiness = assistantReadiness(status.data)
   if (blocked || readiness.state === 'unconfigured') {
@@ -305,6 +368,7 @@ export function AssistantStart({
         reason={view?.reason ?? ''}
         setupPath={view?.setupPath ?? '/ai-gateway?add=openrouter'}
         cloudPath={cloudPath}
+        roomy={roomy}
         onNavigate={onNavigate}
         onConfigured={() => setBlocked(null)}
       />
@@ -318,25 +382,46 @@ export function AssistantStart({
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col justify-end gap-4 p-5">
-      <div className="space-y-2">
-        <h2 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
-          <Sparkles className="size-5 text-primary" aria-hidden="true" />
+    <div
+      className={cn(
+        'flex h-full min-h-0 flex-col justify-end gap-4 p-5',
+        roomy && 'justify-center gap-8 p-6'
+      )}
+    >
+      <div className={cn('space-y-2', roomy && 'space-y-4')}>
+        <h2
+          className={cn(
+            'flex items-center gap-2 text-xl font-semibold tracking-tight',
+            roomy && 'gap-3 text-4xl'
+          )}
+        >
+          <Sparkles
+            className={cn('size-5 text-primary', roomy && 'size-8')}
+            aria-hidden="true"
+          />
           What should we look at?
         </h2>
-        <p className="text-sm leading-6 text-muted-foreground">
+        <p
+          className={cn(
+            'text-sm leading-6 text-muted-foreground',
+            roomy && 'text-lg leading-8'
+          )}
+        >
           Ask about your projects, deployments or settings. Deletions always
           wait for your approval.
         </p>
       </div>
-      <div className="grid gap-2">
+      <div className={cn('grid gap-2', roomy && 'gap-3')}>
         {ASSISTANT_EXAMPLE_PROMPTS.map((prompt) => (
           <button
             key={prompt}
             type="button"
             disabled={start.isPending}
             onClick={() => submit(prompt)}
-            className="rounded-md border border-border px-3 py-2 text-left text-sm transition-colors hover:bg-accent disabled:opacity-50"
+            className={cn(
+              'rounded-md border border-border px-3 py-2 text-left text-sm transition-colors hover:bg-accent disabled:opacity-50',
+              roomy && 'rounded-lg px-5 py-4 text-base'
+            )}
           >
             {prompt}
           </button>
@@ -350,6 +435,7 @@ export function AssistantStart({
         }}
       >
         <Input
+          className={cn(roomy && 'h-12 text-base md:text-base')}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           placeholder="Ask Temps to inspect or change something…"
@@ -360,6 +446,7 @@ export function AssistantStart({
         <Button
           type="submit"
           size="icon"
+          className={cn(roomy && 'size-12 shrink-0')}
           disabled={!draft.trim() || start.isPending}
           aria-label="Send message"
         >
@@ -374,9 +461,13 @@ export function AssistantStart({
   )
 }
 
-function AssistantStartSkeleton() {
+function AssistantStartSkeleton({ roomy }: { roomy?: boolean }) {
   return (
-    <div className="mt-auto space-y-3 p-5" role="status" aria-label="Loading">
+    <div
+      className={cn('mt-auto space-y-3 p-5', roomy && 'my-auto space-y-5 p-6')}
+      role="status"
+      aria-label="Loading"
+    >
       <Skeleton className="h-6 w-48" />
       <Skeleton className="h-4 w-full" />
       <Skeleton className="h-9 w-full" />

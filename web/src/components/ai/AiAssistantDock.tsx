@@ -883,6 +883,7 @@ export function DockBody({
                   onClose()
               }}
               cloudPath="/settings/cloud"
+              roomy={isPage}
             />
           ) : assistant ? (
             <AssistantThread
