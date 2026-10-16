@@ -107,7 +107,11 @@ import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAiAssistant } from './AiAssistantContext'
 import { AskBeforeChangesToggle } from './AskBeforeChangesToggle'
-import { ASSISTANT_CONTEXT_TYPE } from './assistant-state'
+import { AssistantModelChip } from './AssistantModelPicker'
+import {
+  ASSISTANT_CONTEXT_TYPE,
+  saveLastAssistantModel,
+} from './assistant-state'
 import {
   chatDraftStorageKey,
   chatHarnessProviderOptions,
@@ -3712,15 +3716,35 @@ function DebugChatPanelBody({
                 <Paperclip className="size-3.5" />
               </Button>
               {!chatDetail.showRuntimeControls ? (
-                contextType === ASSISTANT_CONTEXT_TYPE &&
-                runtimeSelection.permissionModeId !== null ? (
-                  <AskBeforeChangesToggle
-                    permissionModeId={runtimeSelection.permissionModeId}
-                    disabled={starting || turnActive}
-                    onChange={(permissionModeId) =>
-                      void changePermissionMode(permissionModeId)
-                    }
-                  />
+                contextType === ASSISTANT_CONTEXT_TYPE ? (
+                  <>
+                    <AssistantModelChip
+                      value={runtimeSelection.modelId}
+                      disabled={starting || turnActive}
+                      onChange={(modelId) => {
+                        saveLastAssistantModel(modelId)
+                        setRuntimeSelection((selection) =>
+                          resolveChatRuntimeSelection(
+                            providerOptions,
+                            selection.providerId,
+                            {
+                              modelId,
+                              permissionModeId: selection.permissionModeId,
+                            }
+                          )
+                        )
+                      }}
+                    />
+                    {runtimeSelection.permissionModeId !== null ? (
+                      <AskBeforeChangesToggle
+                        permissionModeId={runtimeSelection.permissionModeId}
+                        disabled={starting || turnActive}
+                        onChange={(permissionModeId) =>
+                          void changePermissionMode(permissionModeId)
+                        }
+                      />
+                    ) : null}
+                  </>
                 ) : null
               ) : providerStatusState === 'loading' ? (
                 <div

@@ -67,12 +67,7 @@ import {
 } from './chat-page-state'
 import { DebugChatPanel } from './DebugChatPanel'
 import { AssistantStart, AssistantThread } from './AssistantPanels'
-import {
-  isAssistantConversation,
-  loadDetailLevel,
-  saveDetailLevel,
-} from './assistant-state'
-import type { ChatDetailLevel } from './chat-detail-level'
+import { isAssistantConversation } from './assistant-state'
 
 interface ActiveChat {
   projectId: number
@@ -347,13 +342,6 @@ export function DockBody({
   const [assistantStarting, setAssistantStarting] = useState(
     () => layout === 'page' && !urlChatId && !initialContext
   )
-  const [detailLevel, setDetailLevel] = useState<ChatDetailLevel>(() =>
-    loadDetailLevel()
-  )
-  const changeDetailLevel = (level: ChatDetailLevel) => {
-    setDetailLevel(level)
-    saveDetailLevel(level)
-  }
   const [renameValue, setRenameValue] = useState('')
   const [renaming, setRenaming] = useState(false)
   // When true, the body shows the project picker for starting a fresh
@@ -960,8 +948,6 @@ export function DockBody({
               key={assistant.conversation.public_id}
               conversation={assistant.conversation}
               firstMessage={assistant.firstMessage}
-              level={detailLevel}
-              onLevelChange={changeDetailLevel}
             />
           ) : inProjectChat ? (
             <DebugChatPanel

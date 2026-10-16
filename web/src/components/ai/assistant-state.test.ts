@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import {
   ASSISTANT_EXAMPLE_PROMPTS,
   NO_PROVIDER_REASON,
@@ -11,10 +11,10 @@ import {
   assistantReadiness,
   asksBeforeChanges,
   isAssistantConversation,
-  loadDetailLevel,
   permissionModeForAsk,
-  saveDetailLevel,
   setupPathFromProblem,
+  loadLastAssistantModel,
+  saveLastAssistantModel,
 } from './assistant-state'
 
 describe('assistantReadiness', () => {
@@ -100,43 +100,14 @@ describe('isAssistantConversation', () => {
   })
 })
 
-describe('detail level preference', () => {
-  function memoryStorage() {
-    const data = new Map<string, string>()
-    return {
-      getItem: (key: string) => data.get(key) ?? null,
-      setItem: (key: string, value: string) => void data.set(key, value),
-      removeItem: (key: string) => void data.delete(key),
-    }
-  }
-
-  test('defaults to simple and round-trips advanced', () => {
-    const storage = memoryStorage()
-    expect(loadDetailLevel(storage)).toBe('simple')
-    saveDetailLevel('advanced', storage)
-    expect(loadDetailLevel(storage)).toBe('advanced')
-    saveDetailLevel('simple', storage)
-    expect(loadDetailLevel(storage)).toBe('simple')
-  })
-
-  test('survives storage that throws', () => {
-    const broken = {
-      getItem: () => {
-        throw new Error('denied')
-      },
-      setItem: () => {
-        throw new Error('denied')
-      },
-      removeItem: () => {
-        throw new Error('denied')
-      },
-    }
-    expect(loadDetailLevel(broken)).toBe('simple')
-    expect(() => saveDetailLevel('advanced', broken)).not.toThrow()
-  })
-})
-
 describe('example prompts', () => {
+  test('cover the first things a new user wants to do', () => {
+    const all = ASSISTANT_EXAMPLE_PROMPTS.join('\n').toLowerCase()
+    expect(all).toContain('git repository')
+    expect(all).toContain('backups')
+    expect(all).toContain('s3')
+  })
+
   test('are concrete, non-empty questions', () => {
     expect(ASSISTANT_EXAMPLE_PROMPTS.length).toBeGreaterThan(0)
     for (const prompt of ASSISTANT_EXAMPLE_PROMPTS) {
@@ -157,5 +128,46 @@ describe('ask before changes', () => {
     expect(permissionModeForAsk(false)).toBe('auto')
     expect(asksBeforeChanges(permissionModeForAsk(true))).toBe(true)
     expect(asksBeforeChanges(permissionModeForAsk(false))).toBe(false)
+  })
+})
+
+describe('last assistant model', () => {
+  const original = globalThis.window
+
+  afterEach(() => {
+    globalThis.window = original
+  })
+
+  function fakeWindow(storage: Record<string, string> | 'throws') {
+    const localStorage =
+      storage === 'throws'
+        ? {
+            getItem: () => {
+              throw new Error('denied')
+            },
+            setItem: () => {
+              throw new Error('denied')
+            },
+          }
+        : {
+            getItem: (key: string) => storage[key] ?? null,
+            setItem: (key: string, value: string) => {
+              storage[key] = value
+            },
+          }
+    globalThis.window = { localStorage } as unknown as typeof window
+  }
+
+  test('remembers the model a chat was last given', () => {
+    fakeWindow({})
+    expect(loadLastAssistantModel()).toBeNull()
+    saveLastAssistantModel('vendor/model-a')
+    expect(loadLastAssistantModel()).toBe('vendor/model-a')
+  })
+
+  test('falls back quietly when storage is unavailable', () => {
+    fakeWindow('throws')
+    expect(loadLastAssistantModel()).toBeNull()
+    expect(() => saveLastAssistantModel('vendor/model-a')).not.toThrow()
   })
 })

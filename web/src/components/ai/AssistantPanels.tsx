@@ -14,8 +14,8 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -24,11 +24,11 @@ import {
   ArrowRight,
   Cloud,
   KeyRound,
+  ArrowUp,
   Loader2,
-  Send,
   Sparkles,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
@@ -39,7 +39,8 @@ import {
   assistantReadiness,
   setupPathFromProblem,
 } from './assistant-state'
-import type { ChatDetailLevel } from './chat-detail-level'
+import { AssistantModelChip, AssistantModelSetup } from './AssistantModelPicker'
+import { useNewChatModel } from './assistant-model-hooks'
 import { DebugChatPanel } from './DebugChatPanel'
 
 const keySchema = z.object({
@@ -76,6 +77,10 @@ export function AssistantOnboarding({
   cloudPath?: string
 }) {
   const queryClient = useQueryClient()
+  // Set once the key is stored: the second step picks the model. The provider
+  // status is only refreshed when that step ends, because a ready status swaps
+  // this onboarding out for the chat before the model has been chosen.
+  const [savedKeyId, setSavedKeyId] = useState<number | null>(null)
   const form = useForm<KeyForm>({
     resolver: zodResolver(keySchema),
     defaultValues: { api_key: '' },
@@ -90,19 +95,25 @@ export function AssistantOnboarding({
         },
         throwOnError: true,
       }),
-    onSuccess: async () => {
+    onSuccess: async (result) => {
       form.reset()
       await Promise.all([
-        queryClient.invalidateQueries({
-          queryKey: getAiProviderStatusQueryKey(),
-        }),
         queryClient.invalidateQueries({ queryKey: listProviderKeysQueryKey() }),
         queryClient.invalidateQueries({ queryKey: ['providerKeys'] }),
       ])
       toast.success('OpenRouter key saved')
-      onConfigured?.()
+      setSavedKeyId(result.data?.id ?? null)
+      if (result.data?.id == null) await finishSetup()
     },
   })
+
+  const finishSetup = async () => {
+    await queryClient.invalidateQueries({
+      queryKey: getAiProviderStatusQueryKey(),
+    })
+    setSavedKeyId(null)
+    onConfigured?.()
+  }
 
   return (
     <div
@@ -131,7 +142,7 @@ export function AssistantOnboarding({
             roomy && 'text-4xl'
           )}
         >
-          Manage Temps by chat
+          Get things running on Temps by chat
         </h2>
         <p
           className={cn(
@@ -139,109 +150,123 @@ export function AssistantOnboarding({
             roomy && 'text-lg leading-8'
           )}
         >
-          Ask questions about your projects, deployments and settings in plain
-          language. The assistant uses the same API as this console, with your
-          own permissions.
+          Say what you want: deploy a repository from a Git URL, back up your
+          databases to S3, add a database to a project. The assistant works out
+          the steps and uses the same API as this console, with your own
+          permissions.
         </p>
       </div>
 
-      <AssistantExample roomy={roomy} />
+      {savedKeyId !== null ? (
+        <AssistantModelSetup
+          providerKeyId={savedKeyId}
+          onDone={() => void finishSetup()}
+          roomy={roomy}
+        />
+      ) : (
+        <>
+          <AssistantExample roomy={roomy} />
 
-      <form
-        noValidate
-        onSubmit={form.handleSubmit((values) => save.mutate(values))}
-        className={cn('space-y-2', roomy && 'space-y-3')}
-      >
-        <label
-          htmlFor="assistant-openrouter-key"
-          className={cn('text-sm font-medium', roomy && 'text-base')}
-        >
-          OpenRouter API key
-        </label>
-        <div className="flex gap-2">
-          <Input
-            className={cn(roomy && 'h-12 text-base md:text-base')}
-            id="assistant-openrouter-key"
-            type="password"
-            autoComplete="off"
-            spellCheck={false}
-            placeholder="sk-or-…"
-            disabled={save.isPending}
-            aria-invalid={form.formState.errors.api_key ? true : undefined}
-            {...form.register('api_key')}
-          />
-          <Button
-            type="submit"
-            disabled={save.isPending}
-            className={cn(roomy && 'h-12 px-6 text-base')}
+          <form
+            noValidate
+            onSubmit={form.handleSubmit((values) => save.mutate(values))}
+            className={cn('space-y-2', roomy && 'space-y-3')}
           >
-            {save.isPending ? (
-              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+            <label
+              htmlFor="assistant-openrouter-key"
+              className={cn('text-sm font-medium', roomy && 'text-base')}
+            >
+              OpenRouter API key
+            </label>
+            <div className="flex gap-2">
+              <Input
+                className={cn(roomy && 'h-12 text-base md:text-base')}
+                id="assistant-openrouter-key"
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="sk-or-…"
+                disabled={save.isPending}
+                aria-invalid={form.formState.errors.api_key ? true : undefined}
+                {...form.register('api_key')}
+              />
+              <Button
+                type="submit"
+                disabled={save.isPending}
+                className={cn(roomy && 'h-12 px-6 text-base')}
+              >
+                {save.isPending ? (
+                  <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                ) : null}
+                Save key
+              </Button>
+            </div>
+            {form.formState.errors.api_key ? (
+              <p className="text-sm text-destructive" role="alert">
+                {form.formState.errors.api_key.message}
+              </p>
             ) : null}
-            Save key
-          </Button>
-        </div>
-        {form.formState.errors.api_key ? (
-          <p className="text-sm text-destructive" role="alert">
-            {form.formState.errors.api_key.message}
-          </p>
-        ) : null}
-        {save.isError ? (
-          <p className="text-sm text-destructive" role="alert">
-            {getErrorMessage(
-              save.error,
-              'OpenRouter rejected the key. Check it and try again.'
-            )}
-          </p>
-        ) : null}
-        <p
-          className={cn(
-            'text-xs leading-5 text-muted-foreground',
-            roomy && 'text-sm leading-6'
-          )}
-        >
-          The key is checked with OpenRouter, then stored encrypted. It is never
-          shown again.{' '}
-          <a
-            className="underline underline-offset-2"
-            href="https://openrouter.ai/keys"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Get a key
-          </a>
-        </p>
-      </form>
+            {save.isError ? (
+              <p className="text-sm text-destructive" role="alert">
+                {getErrorMessage(
+                  save.error,
+                  'OpenRouter rejected the key. Check it and try again.'
+                )}
+              </p>
+            ) : null}
+            <p
+              className={cn(
+                'text-xs leading-5 text-muted-foreground',
+                roomy && 'text-sm leading-6'
+              )}
+            >
+              The key is checked with OpenRouter, then stored encrypted. It is
+              never shown again.{' '}
+              <a
+                className="underline underline-offset-2"
+                href="https://openrouter.ai/keys"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Get a key
+              </a>
+            </p>
+          </form>
 
-      <div className={cn('grid gap-2', roomy && 'gap-3')}>
-        <Button
-          asChild
-          variant="outline"
-          className={cn('w-full justify-between', roomy && 'h-12 text-base')}
-        >
-          <Link to={setupPath} onClick={onNavigate}>
-            Open AI provider settings <ArrowRight className="size-4" />
-          </Link>
-        </Button>
-        {cloudPath ? (
-          <Button
-            asChild
-            variant="ghost"
-            className={cn(
-              'w-full justify-between text-muted-foreground',
-              roomy && 'h-12 text-base'
-            )}
-          >
-            <Link to={cloudPath} onClick={onNavigate}>
-              <span className="flex items-center gap-2">
-                <Cloud className="size-4" aria-hidden="true" />
-                Use Temps Cloud managed AI instead
-              </span>
-              <ArrowRight className="size-4" />
-            </Link>
-          </Button>
-        ) : null}
-      </div>
+          <div className={cn('grid gap-2', roomy && 'gap-3')}>
+            <Button
+              asChild
+              variant="outline"
+              className={cn(
+                'w-full justify-between',
+                roomy && 'h-12 text-base'
+              )}
+            >
+              <Link to={setupPath} onClick={onNavigate}>
+                Open AI provider settings <ArrowRight className="size-4" />
+              </Link>
+            </Button>
+            {cloudPath ? (
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  'w-full justify-between text-muted-foreground',
+                  roomy && 'h-12 text-base'
+                )}
+              >
+                <Link to={cloudPath} onClick={onNavigate}>
+                  <span className="flex items-center gap-2">
+                    <Cloud className="size-4" aria-hidden="true" />
+                    Use Temps Cloud managed AI instead
+                  </span>
+                  <ArrowRight className="size-4" />
+                </Link>
+              </Button>
+            ) : null}
+          </div>
+        </>
+      )}
     </div>
   )
 }
@@ -316,11 +341,13 @@ export function AssistantStart({
     setupPath: string
   } | null>(null)
   const [draft, setDraft] = useState('')
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const newChatModel = useNewChatModel()
 
   const start = useMutation({
     mutationFn: async (firstMessage: string) => {
       const { data, error, response } = await createAssistantConversation({
-        body: {},
+        body: newChatModel.model ? { ai_model: newChatModel.model } : {},
       })
       if (!data) {
         throw new AssistantStartError(
@@ -399,7 +426,7 @@ export function AssistantStart({
             className={cn('size-5 text-primary', roomy && 'size-8')}
             aria-hidden="true"
           />
-          What should we look at?
+          What should we get running?
         </h2>
         <p
           className={cn(
@@ -407,56 +434,93 @@ export function AssistantStart({
             roomy && 'text-lg leading-8'
           )}
         >
-          Ask about your projects, deployments or settings. Deletions always
-          wait for your approval.
+          Describe the outcome and Temps works out the steps, using the same API
+          as this console with your own permissions. Deletions always wait for
+          your approval.
         </p>
       </div>
-      <div className={cn('grid gap-2', roomy && 'gap-3')}>
+      <form
+        className={cn(
+          'rounded-2xl border border-border bg-background shadow-sm transition-shadow focus-within:shadow-md',
+          roomy && 'rounded-3xl'
+        )}
+        onSubmit={(event) => {
+          event.preventDefault()
+          submit(draft)
+        }}
+      >
+        <Textarea
+          ref={inputRef}
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            // Enter sends, Shift+Enter breaks the line. Ignore Enter while an
+            // IME is composing so confirming a candidate never sends.
+            if (
+              event.key === 'Enter' &&
+              !event.shiftKey &&
+              !event.nativeEvent.isComposing
+            ) {
+              event.preventDefault()
+              submit(draft)
+            }
+          }}
+          placeholder="Describe what you want to set up or change…"
+          aria-label="Message the Temps assistant"
+          disabled={start.isPending}
+          maxLength={8000}
+          rows={3}
+          className={cn(
+            'min-h-[84px] resize-none border-0 bg-transparent px-4 pb-1 pt-4 text-sm shadow-none focus-visible:border-transparent focus-visible:outline-none focus-visible:ring-0',
+            roomy && 'min-h-[120px] px-5 pt-5 text-base md:text-base'
+          )}
+        />
+        <div className="flex items-center justify-between gap-2 px-3 pb-3">
+          <AssistantModelChip
+            value={newChatModel.model}
+            onChange={newChatModel.choose}
+            disabled={start.isPending}
+            roomy={roomy}
+          />
+          <Button
+            type="submit"
+            size="icon"
+            className={cn('size-8 shrink-0 rounded-full', roomy && 'size-10')}
+            disabled={!draft.trim() || start.isPending}
+            aria-label="Send message"
+          >
+            {start.isPending ? (
+              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+            ) : (
+              <ArrowUp className="size-4" aria-hidden="true" />
+            )}
+          </Button>
+        </div>
+      </form>
+      {/* Suggestions fill the box rather than send: most goals need the user to
+          add a detail (the repository URL, the bucket) before they make sense. */}
+      <div
+        className={cn('flex flex-wrap gap-2', roomy && 'gap-3')}
+        aria-label="Suggestions"
+      >
         {ASSISTANT_EXAMPLE_PROMPTS.map((prompt) => (
           <button
             key={prompt}
             type="button"
             disabled={start.isPending}
-            onClick={() => submit(prompt)}
+            onClick={() => {
+              setDraft(prompt)
+              inputRef.current?.focus()
+            }}
             className={cn(
-              'rounded-md border border-border px-3 py-2 text-left text-sm transition-colors hover:bg-accent disabled:opacity-50',
-              roomy && 'rounded-lg px-5 py-4 text-base'
+              'rounded-full border border-border px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50',
+              roomy && 'px-4 py-2'
             )}
           >
             {prompt}
           </button>
         ))}
       </div>
-      <form
-        className="flex gap-2"
-        onSubmit={(event) => {
-          event.preventDefault()
-          submit(draft)
-        }}
-      >
-        <Input
-          className={cn(roomy && 'h-12 text-base md:text-base')}
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          placeholder="Ask Temps to inspect or change something…"
-          aria-label="Message the Temps assistant"
-          disabled={start.isPending}
-          maxLength={8000}
-        />
-        <Button
-          type="submit"
-          size="icon"
-          className={cn(roomy && 'size-12 shrink-0')}
-          disabled={!draft.trim() || start.isPending}
-          aria-label="Send message"
-        >
-          {start.isPending ? (
-            <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-          ) : (
-            <Send className="size-4" aria-hidden="true" />
-          )}
-        </Button>
-      </form>
     </div>
   )
 }
@@ -478,46 +542,20 @@ function AssistantStartSkeleton({ roomy }: { roomy?: boolean }) {
 }
 
 /**
- * An assistant conversation: the shared chat panel plus the one control the
- * assistant adds, Simple / Advanced.
- *
- * Simple is a chat box on the default model. Advanced adds the model and
- * reasoning pickers and opens every tool call so its arguments and result are
- * visible. Whether changes ask first is a switch inside the composer, so it is
- * reachable in both modes.
+ * An assistant conversation: the shared chat panel on the chat's model, named
+ * above it. Whether changes ask first is a switch inside the composer.
  */
 export function AssistantThread({
   conversation,
   firstMessage,
-  level,
-  onLevelChange,
   readOnly,
 }: {
   conversation: Pick<ConversationResponse, 'public_id' | 'context_id'>
   firstMessage?: string
-  level: ChatDetailLevel
-  onLevelChange: (level: ChatDetailLevel) => void
   readOnly?: boolean
 }) {
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <Tabs
-          value={level}
-          onValueChange={(value) =>
-            onLevelChange(value === 'advanced' ? 'advanced' : 'simple')
-          }
-        >
-          <TabsList className="h-8">
-            <TabsTrigger value="simple" className="px-3 py-1 text-xs">
-              Simple
-            </TabsTrigger>
-            <TabsTrigger value="advanced" className="px-3 py-1 text-xs">
-              Advanced
-            </TabsTrigger>
-          </TabsList>
-        </Tabs>
-      </div>
       <div className="min-h-0 flex-1">
         <DebugChatPanel
           key={conversation.public_id}
@@ -525,7 +563,7 @@ export function AssistantThread({
           userScoped
           contextType={ASSISTANT_CONTEXT_TYPE}
           contextId={conversation.context_id}
-          detailLevel={level}
+          detailLevel="simple"
           initialMessage={firstMessage}
           emptyHint="Ask about your projects, deployments or settings."
           placeholder="Ask Temps to inspect or change something…"

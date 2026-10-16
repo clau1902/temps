@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { isInternalConsolePath } from '@/lib/cloud-telemetry-activation'
-import type { ChatDetailLevel } from './chat-detail-level'
 
 /** `context_type` of conversations started from the Temps assistant. */
 export const ASSISTANT_CONTEXT_TYPE = 'assistant'
@@ -34,12 +33,39 @@ export function permissionModeForAsk(ask: boolean): string {
   return ask ? ASK_BEFORE_CHANGES_MODE : RUN_CHANGES_AUTOMATICALLY_MODE
 }
 
-/** Concrete things to ask, shown before the first message. */
+/**
+ * Outcomes people open the assistant for, shown before the first message. Each
+ * names a goal, not a question: the assistant works out the steps itself.
+ */
 export const ASSISTANT_EXAMPLE_PROMPTS: readonly string[] = [
-  'Which of my deployments failed this week, and why?',
-  'Show me the environment variables set on my newest project',
-  'Create a staging environment for my API project',
+  'Deploy my app from a Git repository URL',
+  'Set up daily backups of my databases to S3',
+  'Add a Postgres database to one of my projects',
+  'Why did my last deployment fail?',
 ]
+
+const LAST_MODEL_KEY = 'temps.assistant.last-model'
+
+/** The model the user last started or switched a chat to, if any. */
+export function loadLastAssistantModel(): string | null {
+  try {
+    return window.localStorage.getItem(LAST_MODEL_KEY)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Remember a model so the next new chat starts on it. This is only a starting
+ * point for new chats: every chat keeps the model it was given.
+ */
+export function saveLastAssistantModel(modelId: string): void {
+  try {
+    window.localStorage.setItem(LAST_MODEL_KEY, modelId)
+  } catch {
+    // Storage can be unavailable (private mode); the default still applies.
+  }
+}
 
 export function isAssistantConversation(conversation: {
   context_type: string
@@ -92,36 +118,4 @@ export function setupPathFromProblem(problem: unknown): string | undefined {
   return isInternalConsolePath(typeof path === 'string' ? path : undefined)
     ? (path as string)
     : undefined
-}
-
-const ADVANCED_KEY = 'temps.ai.assistant.advanced'
-
-export function loadDetailLevel(
-  storage: Pick<Storage, 'getItem'> | undefined = safeStorage()
-): ChatDetailLevel {
-  try {
-    return storage?.getItem(ADVANCED_KEY) === '1' ? 'advanced' : 'simple'
-  } catch {
-    return 'simple'
-  }
-}
-
-export function saveDetailLevel(
-  level: ChatDetailLevel,
-  storage: Pick<Storage, 'setItem' | 'removeItem'> | undefined = safeStorage()
-): void {
-  try {
-    if (level === 'advanced') storage?.setItem(ADVANCED_KEY, '1')
-    else storage?.removeItem(ADVANCED_KEY)
-  } catch {
-    /* storage unavailable — the choice just won't persist */
-  }
-}
-
-function safeStorage(): Storage | undefined {
-  try {
-    return typeof localStorage === 'undefined' ? undefined : localStorage
-  } catch {
-    return undefined
-  }
 }
