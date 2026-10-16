@@ -287,6 +287,7 @@ export function DockBody({
   // fallback, and correct per-tab where a shared localStorage key isn't.
   const [searchParams, setSearchParams] = useSearchParams()
   const urlChatId = layout === 'page' ? searchParams.get('chat') : null
+  const isPage = layout === 'page'
 
   const [active, setActive] = useState<ActiveChat | null>(() => {
     if (initialContext && openedProjectId != null) {
@@ -583,7 +584,13 @@ export function DockBody({
     ).catch(() => {})
     toast.success('Chat deleted')
     if (activePublicId === d.publicId) {
-      backToList()
+      // Full screen has the sidebar for browsing; land on a fresh chat.
+      if (isPage) {
+        startAssistant()
+        loadList()
+      } else {
+        backToList()
+      }
     } else {
       setConversations((prev) => prev.filter((c) => c.public_id !== d.publicId))
     }
@@ -625,8 +632,6 @@ export function DockBody({
     }
   }
 
-  const isPage = layout === 'page'
-
   // Dock -> `/chat`. The open conversation is handed over through the provider
   // so the full-screen view lands on the same thread rather than dumping the
   // user back on the chat list; the dock closes so only one copy is on screen.
@@ -659,7 +664,69 @@ export function DockBody({
     : ''
 
   return (
-    <div className={cn('flex h-full flex-col', !isPage && 'gap-3 p-4')}>
+    <div
+      className={cn('flex h-full', isPage ? 'flex-row' : 'flex-col gap-3 p-4')}
+    >
+      {isPage && (
+        // Full screen: past chats live in a left sidebar, so switching or
+        // starting one never leaves the conversation. Below `lg` the sidebar is
+        // hidden and the back arrow in the header opens the same list instead.
+        <aside
+          aria-label="Chats"
+          className="hidden w-72 shrink-0 flex-col border-r lg:flex"
+        >
+          <div className="flex items-center justify-between gap-2 px-3 py-3">
+            <h2 className="text-sm font-semibold">Chats</h2>
+            <div className="flex items-center gap-1">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setPicking(true)}
+                className="h-8 gap-1"
+                title="New chat about a specific project"
+              >
+                <Plus className="h-4 w-4" />
+                Project
+              </Button>
+              <Button
+                size="sm"
+                onClick={startAssistant}
+                className="h-8 gap-1"
+                title="Ask Temps to inspect or change something"
+              >
+                <Sparkles className="h-4 w-4" />
+                New
+              </Button>
+            </div>
+          </div>
+          <div className="min-h-0 flex-1 px-2 pb-3">
+            <ConversationList
+              loading={loadingList && conversations.length === 0}
+              conversations={conversations}
+              activeId={activePublicId}
+              onOpen={openConversation}
+              onOpenSource={(c) => {
+                const h = sourceHref({
+                  contextType: c.context_type,
+                  contextId: c.context_id,
+                  projectSlug: c.project_slug ?? undefined,
+                })
+                if (h) goToSource(h)
+              }}
+              onRename={startRename}
+              onDelete={(c) =>
+                setPendingDelete({
+                  projectId: c.project_id ?? null,
+                  publicId: c.public_id,
+                  title:
+                    c.title ??
+                    `${metaFor(c.context_type).label} ${c.context_id}`,
+                })
+              }
+            />
+          </div>
+        </aside>
+      )}
       <div
         className={cn(
           isPage && 'flex h-full min-h-0 min-w-0 flex-1 flex-col',
@@ -680,7 +747,10 @@ export function DockBody({
                   onClick={
                     inConversation ? backToList : () => setPicking(false)
                   }
-                  className="-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  className={cn(
+                    '-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+                    isPage && 'lg:hidden'
+                  )}
                   aria-label="Back to all conversations"
                   title="All chats"
                 >
@@ -740,7 +810,7 @@ export function DockBody({
               <Button
                 size="sm"
                 onClick={startAssistant}
-                className="mr-1 h-8 gap-1"
+                className={cn('mr-1 h-8 gap-1', isPage && 'lg:hidden')}
                 title="Ask Temps to inspect or change something"
               >
                 <Sparkles className="h-4 w-4" />
