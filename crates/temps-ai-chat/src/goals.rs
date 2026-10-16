@@ -1,0 +1,1272 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Goals the Temps assistant tracks for a chat, and heals when they fail.
+//!
+//! A goal is one observable condition, such as "this deployment is healthy",
+//! written as a read-only API operation plus the values that mean success and
+//! failure. [`GoalService`] stores them. [`GoalWatcher`] evaluates the open ones
+//! on an interval, as the user who created them, and starts a bounded fix turn
+//! in the owning chat when a check fails.
+//!
+//! The watcher is O(open goals due): one indexed query per tick, no per-goal
+//! scan of anything else. Fix turns are capped per goal (`max_attempts`) and by
+//! the goal's deadline, so an unattended chat cannot loop forever.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use temps_ai_api_tools::{ApiCallScope, ApiToolsHandle, ProjectSelectorScope};
+use temps_auth::context::{AuthContext, AuthSource};
+use temps_entities::{ai_conversations, ai_goals};
+use thiserror::Error;
+use utoipa::ToSchema;
+
+use crate::ConversationService;
+
+pub const STATUS_ACTIVE: &str = "active";
+pub const STATUS_HEALING: &str = "healing";
+pub const STATUS_NEEDS_YOU: &str = "needs_you";
+pub const STATUS_ACHIEVED: &str = "achieved";
+pub const STATUS_FAILED: &str = "failed";
+pub const STATUS_CANCELLED: &str = "cancelled";
+
+/// Statuses the watcher still looks at.
+const WATCHED_STATUSES: [&str; 3] = [STATUS_ACTIVE, STATUS_HEALING, STATUS_NEEDS_YOU];
+
+/// Goals a chat may have open at once. Each costs a check per interval.
+pub const MAX_OPEN_GOALS_PER_CONVERSATION: u64 = 5;
+/// Goals returned for one chat; closed ones past this fall off the panel.
+const MAX_GOALS_LISTED: u64 = 50;
+const DEFAULT_MAX_ATTEMPTS: i32 = 3;
+const MAX_ATTEMPTS_CEILING: i32 = 5;
+const DEFAULT_DEADLINE_MINUTES: i64 = 30;
+const MAX_DEADLINE_MINUTES: i64 = 240;
+const ACTIVE_CHECK_SECONDS: i64 = 15;
+const NEEDS_YOU_CHECK_SECONDS: i64 = 60;
+const TICK: Duration = Duration::from_secs(10);
+const DUE_BATCH: u64 = 25;
+const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_OBSERVATION_CHARS: usize = 500;
+const MAX_VALUES: usize = 20;
+const MAX_VALUE_CHARS: usize = 100;
+
+#[derive(Debug, Error)]
+pub enum GoalError {
+    #[error("Goal '{goal_id}' was not found in conversation {conversation_id}")]
+    NotFound {
+        goal_id: String,
+        conversation_id: i64,
+    },
+    #[error("Invalid goal for conversation {conversation_id}: {message}")]
+    Validation {
+        conversation_id: i64,
+        message: String,
+    },
+    #[error("Conversation {conversation_id} already has {open} open goals; the limit is {limit}")]
+    TooManyOpen {
+        conversation_id: i64,
+        open: u64,
+        limit: u64,
+    },
+    #[error("Goal '{goal_id}' is {status} and cannot be {action}")]
+    InvalidState {
+        goal_id: String,
+        status: String,
+        action: &'static str,
+    },
+    #[error("Database error while handling goals: {0}")]
+    Database(#[from] sea_orm::DbErr),
+}
+
+/// What the assistant supplies to start tracking a goal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrackGoalInput {
+    pub title: String,
+    pub operation_id: String,
+    #[serde(default)]
+    pub params: Value,
+    pub success_path: String,
+    pub success_values: Vec<String>,
+    #[serde(default)]
+    pub failure_values: Vec<String>,
+    #[serde(default)]
+    pub max_attempts: Option<i32>,
+    #[serde(default)]
+    pub deadline_minutes: Option<i64>,
+}
+
+/// What one evaluation of a goal's check concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observation {
+    Pending(String),
+    Achieved(String),
+    Failed(String),
+}
+
+impl Observation {
+    #[cfg(test)]
+    fn text(&self) -> &str {
+        match self {
+            Self::Pending(text) | Self::Achieved(text) | Self::Failed(text) => text,
+        }
+    }
+}
+
+/// Goal as returned to the console.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GoalResponse {
+    /// Opaque goal id.
+    pub id: String,
+    pub title: String,
+    /// `active`, `healing`, `needs_you`, `achieved`, `failed` or `cancelled`.
+    pub status: String,
+    /// Fix turns started so far.
+    pub attempts: i32,
+    pub max_attempts: i32,
+    /// What the last check saw, in one sentence.
+    pub last_observation: Option<String>,
+    /// ISO 8601, `Z` suffix.
+    pub last_checked_at: Option<String>,
+    /// The goal is given up, as failed, after this instant (ISO 8601).
+    pub deadline_at: String,
+    pub created_at: String,
+    /// The read operation that observes the goal.
+    pub check_operation: String,
+}
+
+impl From<ai_goals::Model> for GoalResponse {
+    fn from(goal: ai_goals::Model) -> Self {
+        Self {
+            id: goal.public_id,
+            title: goal.title,
+            status: goal.status,
+            attempts: goal.attempts,
+            max_attempts: goal.max_attempts,
+            last_observation: goal.last_observation,
+            last_checked_at: goal.last_checked_at.map(|at| at.to_rfc3339()),
+            deadline_at: goal.deadline_at.to_rfc3339(),
+            created_at: goal.created_at.to_rfc3339(),
+            check_operation: goal.check_operation,
+        }
+    }
+}
+
+fn valid_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 200
+        && path
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+}
+
+fn validate_values(label: &str, values: &[String]) -> Result<(), String> {
+    if values.len() > MAX_VALUES {
+        return Err(format!("{label} has more than {MAX_VALUES} values"));
+    }
+    if values
+        .iter()
+        .any(|v| v.trim().is_empty() || v.chars().count() > MAX_VALUE_CHARS)
+    {
+        return Err(format!(
+            "every value in {label} must be 1 to {MAX_VALUE_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+impl TrackGoalInput {
+    fn validate(&self, conversation_id: i64) -> Result<(), GoalError> {
+        let fail = |message: String| GoalError::Validation {
+            conversation_id,
+            message,
+        };
+        let title = self.title.trim();
+        if title.is_empty() || title.chars().count() > 200 {
+            return Err(fail("title must be 1 to 200 characters".into()));
+        }
+        if self.operation_id.trim().is_empty() || self.operation_id.len() > 200 {
+            return Err(fail("operation_id must be 1 to 200 characters".into()));
+        }
+        if !(self.params.is_null() || self.params.is_object()) {
+            return Err(fail("params must be a JSON object".into()));
+        }
+        if !valid_path(&self.success_path) {
+            return Err(fail(format!(
+                "success_path '{}' must be a dot path of letters, digits, '_' or '-', e.g. 'status'",
+                self.success_path
+            )));
+        }
+        if self.success_values.is_empty() {
+            return Err(fail(
+                "success_values must list at least one value that means the goal is achieved"
+                    .into(),
+            ));
+        }
+        if self.failure_values.is_empty() {
+            return Err(fail(
+                "failure_values must list at least one value that means it went wrong (for \
+                 example [\"failed\", \"cancelled\"]); without one the goal can never fail, so \
+                 it could never be fixed"
+                    .into(),
+            ));
+        }
+        validate_values("success_values", &self.success_values).map_err(&fail)?;
+        validate_values("failure_values", &self.failure_values).map_err(&fail)?;
+        if self.success_values.iter().any(|s| {
+            self.failure_values
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(s))
+        }) {
+            return Err(fail(
+                "a value cannot be both a success value and a failure value".into(),
+            ));
+        }
+        if let Some(attempts) = self.max_attempts {
+            if !(1..=MAX_ATTEMPTS_CEILING).contains(&attempts) {
+                return Err(fail(format!(
+                    "max_attempts must be between 1 and {MAX_ATTEMPTS_CEILING}"
+                )));
+            }
+        }
+        if let Some(minutes) = self.deadline_minutes {
+            if !(1..=MAX_DEADLINE_MINUTES).contains(&minutes) {
+                return Err(fail(format!(
+                    "deadline_minutes must be between 1 and {MAX_DEADLINE_MINUTES}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn lookup<'a>(body: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.').try_fold(body, |current, part| match current {
+        Value::Object(map) => map.get(part),
+        Value::Array(items) => part.parse::<usize>().ok().and_then(|i| items.get(i)),
+        _ => None,
+    })
+}
+
+fn render(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn clip(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_OBSERVATION_CHARS {
+        flat
+    } else {
+        let head: String = flat.chars().take(MAX_OBSERVATION_CHARS).collect();
+        format!("{head}…")
+    }
+}
+
+fn string_list(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Decide what a check response means for a goal. Pure so the rules are
+/// testable without a router.
+pub fn evaluate(goal: &ai_goals::Model, status: u16, body: &Value) -> Observation {
+    if matches!(status, 401 | 403 | 404 | 410) {
+        return Observation::Failed(format!(
+            "The check {} answered {status}: what it watches is gone or no longer visible to you",
+            goal.check_operation
+        ));
+    }
+    if status == 429 || status >= 500 {
+        return Observation::Pending(format!(
+            "The check {} answered {status}; trying again",
+            goal.check_operation
+        ));
+    }
+    if !(200..300).contains(&status) {
+        return Observation::Failed(format!(
+            "The check {} answered {status}: {}",
+            goal.check_operation,
+            clip(&render(body))
+        ));
+    }
+    let Some(found) = lookup(body, &goal.success_path) else {
+        return Observation::Pending(format!(
+            "The response has no '{}' yet",
+            goal.success_path
+        ));
+    };
+    let shown = render(found);
+    let matches_any = |values: Vec<String>| values.iter().any(|v| v.eq_ignore_ascii_case(&shown));
+    if matches_any(string_list(&goal.success_values)) {
+        Observation::Achieved(format!("{} is {shown}", goal.success_path))
+    } else if matches_any(string_list(&goal.failure_values)) {
+        let detail = ["error_message", "error", "message", "reason"]
+            .iter()
+            .find_map(|key| lookup(body, key).and_then(Value::as_str))
+            .map(|text| format!(": {}", clip(text)))
+            .unwrap_or_default();
+        Observation::Failed(format!("{} is {shown}{detail}", goal.success_path))
+    } else {
+        Observation::Pending(format!("{} is {shown}", goal.success_path))
+    }
+}
+
+/// Message a fix turn starts from. It is shown in the chat as a note from the
+/// goal, so it states plainly what happened and what is allowed.
+pub fn heal_prompt(goal: &ai_goals::Model, observation: &str) -> String {
+    format!(
+        "Goal check failed: \"{title}\" (goal {id}). {observation}.\n\n\
+         This is fix attempt {attempt} of {max}. Find the cause with your read tools (logs, status, \
+         configuration), make the smallest change that fixes it, and redeploy or retry as needed. \
+         If the fix creates a new deployment or resource, call `temps_goal` with action `retarget`, \
+         goal_id `{id}` and a check on the new one so the goal keeps being watched. \
+         If you cannot fix it without something only the user can provide, say exactly what you need.",
+        title = goal.title,
+        id = goal.public_id,
+        attempt = goal.attempts,
+        max = goal.max_attempts,
+    )
+}
+
+pub struct GoalService {
+    db: Arc<DatabaseConnection>,
+}
+
+impl GoalService {
+    pub fn new(db: Arc<DatabaseConnection>) -> Self {
+        Self { db }
+    }
+
+    pub async fn track(
+        &self,
+        conversation_id: i64,
+        owner_user_id: i32,
+        auth_session_id: Option<i32>,
+        input: TrackGoalInput,
+    ) -> Result<ai_goals::Model, GoalError> {
+        input.validate(conversation_id)?;
+        let open = ai_goals::Entity::find()
+            .filter(ai_goals::Column::ConversationId.eq(conversation_id))
+            .filter(ai_goals::Column::Status.is_in(WATCHED_STATUSES))
+            .count(self.db.as_ref())
+            .await?;
+        if open >= MAX_OPEN_GOALS_PER_CONVERSATION {
+            return Err(GoalError::TooManyOpen {
+                conversation_id,
+                open,
+                limit: MAX_OPEN_GOALS_PER_CONVERSATION,
+            });
+        }
+        let now = Utc::now();
+        let minutes = input.deadline_minutes.unwrap_or(DEFAULT_DEADLINE_MINUTES);
+        let goal = ai_goals::ActiveModel {
+            public_id: Set(format!("goal_{}", uuid::Uuid::new_v4().simple())),
+            conversation_id: Set(conversation_id),
+            owner_user_id: Set(owner_user_id),
+            title: Set(input.title.trim().to_string()),
+            check_operation: Set(input.operation_id.trim().to_string()),
+            check_params: Set(if input.params.is_null() {
+                Value::Object(Default::default())
+            } else {
+                input.params
+            }),
+            success_path: Set(input.success_path),
+            success_values: Set(serde_json::json!(input.success_values)),
+            failure_values: Set(serde_json::json!(input.failure_values)),
+            status: Set(STATUS_ACTIVE.to_string()),
+            attempts: Set(0),
+            max_attempts: Set(input.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS)),
+            next_check_at: Set(now + chrono::Duration::seconds(ACTIVE_CHECK_SECONDS)),
+            deadline_at: Set(now + chrono::Duration::minutes(minutes)),
+            auth_session_id: Set(auth_session_id),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(self.db.as_ref())
+        .await?;
+        Ok(goal)
+    }
+
+    pub async fn list(&self, conversation_id: i64) -> Result<Vec<ai_goals::Model>, GoalError> {
+        Ok(ai_goals::Entity::find()
+            .filter(ai_goals::Column::ConversationId.eq(conversation_id))
+            .order_by_desc(ai_goals::Column::CreatedAt)
+            .limit(MAX_GOALS_LISTED)
+            .all(self.db.as_ref())
+            .await?)
+    }
+
+    pub async fn get(
+        &self,
+        conversation_id: i64,
+        goal_id: &str,
+    ) -> Result<ai_goals::Model, GoalError> {
+        ai_goals::Entity::find()
+            .filter(ai_goals::Column::ConversationId.eq(conversation_id))
+            .filter(ai_goals::Column::PublicId.eq(goal_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| GoalError::NotFound {
+                goal_id: goal_id.to_string(),
+                conversation_id,
+            })
+    }
+
+    /// Point an existing goal at a new check, usually the deployment a fix just
+    /// created. Re-opens it for watching; the attempt count is kept so a fix
+    /// that keeps failing still runs out.
+    pub async fn retarget(
+        &self,
+        conversation_id: i64,
+        goal_id: &str,
+        input: TrackGoalInput,
+    ) -> Result<ai_goals::Model, GoalError> {
+        input.validate(conversation_id)?;
+        let goal = self.get(conversation_id, goal_id).await?;
+        if matches!(goal.status.as_str(), STATUS_ACHIEVED | STATUS_CANCELLED) {
+            return Err(GoalError::InvalidState {
+                goal_id: goal_id.to_string(),
+                status: goal.status,
+                action: "retargeted",
+            });
+        }
+        let now = Utc::now();
+        let minutes = input.deadline_minutes.unwrap_or(DEFAULT_DEADLINE_MINUTES);
+        let mut update: ai_goals::ActiveModel = goal.into();
+        update.check_operation = Set(input.operation_id.trim().to_string());
+        update.check_params = Set(if input.params.is_null() {
+            Value::Object(Default::default())
+        } else {
+            input.params
+        });
+        update.success_path = Set(input.success_path);
+        update.success_values = Set(serde_json::json!(input.success_values));
+        update.failure_values = Set(serde_json::json!(input.failure_values));
+        update.status = Set(STATUS_ACTIVE.to_string());
+        update.last_observation = Set(Some("Watching the new target".to_string()));
+        update.next_check_at = Set(now + chrono::Duration::seconds(ACTIVE_CHECK_SECONDS));
+        update.deadline_at = Set(now + chrono::Duration::minutes(minutes));
+        update.updated_at = Set(now);
+        Ok(update.update(self.db.as_ref()).await?)
+    }
+
+    pub async fn cancel(
+        &self,
+        conversation_id: i64,
+        goal_id: &str,
+    ) -> Result<ai_goals::Model, GoalError> {
+        let goal = self.get(conversation_id, goal_id).await?;
+        if !WATCHED_STATUSES.contains(&goal.status.as_str()) {
+            return Err(GoalError::InvalidState {
+                goal_id: goal_id.to_string(),
+                status: goal.status,
+                action: "cancelled",
+            });
+        }
+        let mut update: ai_goals::ActiveModel = goal.into();
+        update.status = Set(STATUS_CANCELLED.to_string());
+        update.last_observation = Set(Some("Stopped by you".to_string()));
+        update.updated_at = Set(Utc::now());
+        Ok(update.update(self.db.as_ref()).await?)
+    }
+
+    /// Give a goal that ran out of attempts, time or patience a fresh budget.
+    pub async fn retry(
+        &self,
+        conversation_id: i64,
+        goal_id: &str,
+    ) -> Result<ai_goals::Model, GoalError> {
+        let goal = self.get(conversation_id, goal_id).await?;
+        if !matches!(goal.status.as_str(), STATUS_FAILED | STATUS_NEEDS_YOU) {
+            return Err(GoalError::InvalidState {
+                goal_id: goal_id.to_string(),
+                status: goal.status,
+                action: "retried",
+            });
+        }
+        let now = Utc::now();
+        let mut update: ai_goals::ActiveModel = goal.into();
+        update.status = Set(STATUS_ACTIVE.to_string());
+        update.attempts = Set(0);
+        update.last_observation = Set(Some("Retrying".to_string()));
+        update.next_check_at = Set(now);
+        update.deadline_at = Set(now + chrono::Duration::minutes(DEFAULT_DEADLINE_MINUTES));
+        update.updated_at = Set(now);
+        Ok(update.update(self.db.as_ref()).await?)
+    }
+
+    async fn due(&self, now: DateTime<Utc>) -> Result<Vec<ai_goals::Model>, GoalError> {
+        Ok(ai_goals::Entity::find()
+            .filter(ai_goals::Column::Status.is_in(WATCHED_STATUSES))
+            .filter(ai_goals::Column::NextCheckAt.lte(now))
+            .order_by_asc(ai_goals::Column::NextCheckAt)
+            .limit(DUE_BATCH)
+            .all(self.db.as_ref())
+            .await?)
+    }
+
+    async fn record(
+        &self,
+        goal: ai_goals::Model,
+        status: &str,
+        observation: &str,
+        next_check_in: Option<i64>,
+    ) -> Result<ai_goals::Model, GoalError> {
+        let now = Utc::now();
+        let mut update: ai_goals::ActiveModel = goal.into();
+        update.status = Set(status.to_string());
+        update.last_observation = Set(Some(clip(observation)));
+        update.last_checked_at = Set(Some(now));
+        if let Some(seconds) = next_check_in {
+            update.next_check_at = Set(now + chrono::Duration::seconds(seconds));
+        }
+        update.updated_at = Set(now);
+        Ok(update.update(self.db.as_ref()).await?)
+    }
+
+    /// Claim the one transition from `active` to `healing`, counting the
+    /// attempt. Returns false when another tick or a user action got there
+    /// first, so a goal never starts two fix turns.
+    async fn begin_heal(&self, goal: &ai_goals::Model) -> Result<bool, GoalError> {
+        let result = ai_goals::Entity::update_many()
+            .col_expr(
+                ai_goals::Column::Status,
+                sea_orm::sea_query::Expr::value(STATUS_HEALING),
+            )
+            .col_expr(
+                ai_goals::Column::Attempts,
+                sea_orm::sea_query::Expr::col(ai_goals::Column::Attempts).add(1),
+            )
+            .col_expr(
+                ai_goals::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(Utc::now()),
+            )
+            .filter(ai_goals::Column::Id.eq(goal.id))
+            .filter(ai_goals::Column::Status.eq(STATUS_ACTIVE))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    async fn undo_heal(&self, goal: &ai_goals::Model) -> Result<(), GoalError> {
+        ai_goals::Entity::update_many()
+            .col_expr(
+                ai_goals::Column::Status,
+                sea_orm::sea_query::Expr::value(STATUS_ACTIVE),
+            )
+            .col_expr(
+                ai_goals::Column::Attempts,
+                sea_orm::sea_query::Expr::col(ai_goals::Column::Attempts).sub(1),
+            )
+            .filter(ai_goals::Column::Id.eq(goal.id))
+            .filter(ai_goals::Column::Status.eq(STATUS_HEALING))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+}
+
+/// Everything the assistant's `temps_goal` tool needs.
+#[derive(Clone)]
+pub struct GoalToolSupport {
+    pub goals: Arc<GoalService>,
+    pub read_api: Arc<ApiToolsHandle>,
+}
+
+fn session_id_of(auth: &AuthContext) -> Option<i32> {
+    match &auth.source {
+        AuthSource::Session { session_id, .. } => *session_id,
+        _ => None,
+    }
+}
+
+impl GoalToolSupport {
+    /// Handle one `temps_goal` call from the model and return the text it
+    /// reads back. Failures are sentences written to be acted on.
+    pub async fn dispatch(
+        &self,
+        arguments: &str,
+        conversation_id: i64,
+        auth: &AuthContext,
+    ) -> String {
+        let args: Value = match serde_json::from_str(arguments) {
+            Ok(args) => args,
+            Err(error) => return format!("`temps_goal` arguments are not valid JSON: {error}"),
+        };
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("track");
+        match action {
+            "track" | "retarget" => {}
+            other => {
+                return format!(
+                    "Unknown `temps_goal` action '{other}'. Use `track` or `retarget`; the user \
+                     stops a goal from the goal panel."
+                )
+            }
+        }
+        let input: TrackGoalInput = match serde_json::from_value(args.clone()) {
+            Ok(input) => input,
+            Err(error) => {
+                return format!(
+                    "`temps_goal` arguments are incomplete: {error}. Send every field, for example \
+                     {{\"action\":\"track\",\"title\":\"Deployment 4 is live\",\
+                     \"operation_id\":\"get_deployment\",\"params\":{{\"project_id\":2,\"deployment_id\":4}},\
+                     \"success_path\":\"status\",\"success_values\":[\"completed\"],\
+                     \"failure_values\":[\"failed\",\"cancelled\"]}}"
+                )
+            }
+        };
+        if let Err(message) = self.probe(&input, auth).await {
+            return message;
+        }
+        let outcome = if action == "retarget" {
+            let Some(goal_id) = args.get("goal_id").and_then(Value::as_str) else {
+                return "`temps_goal` retarget needs the goal_id of the goal to re-point.".into();
+            };
+            self.goals.retarget(conversation_id, goal_id, input).await
+        } else {
+            let owner = auth.user_id();
+            self.goals
+                .track(conversation_id, owner, session_id_of(auth), input)
+                .await
+        };
+        match outcome {
+            Ok(goal) => serde_json::json!({
+                "status": "tracking",
+                "goal_id": goal.public_id,
+                "title": goal.title,
+                "checks": goal.check_operation,
+                "max_attempts": goal.max_attempts,
+                "note": "Temps now watches this and will bring you back into the chat if it fails."
+            })
+            .to_string(),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// Run the check once now. A goal whose check cannot even run is a mistake
+    /// to report to the model immediately, not one to discover minutes later.
+    async fn probe(&self, input: &TrackGoalInput, auth: &AuthContext) -> Result<(), String> {
+        let Some(caller) = self.read_api.get() else {
+            return Err("Goal tracking is not ready yet; try again in a moment.".to_string());
+        };
+        let Some(schema) = caller.describe(input.operation_id.trim()) else {
+            return Err(format!(
+                "'{}' is not an operation `temps_goal` can watch. Use a read-only operation you \
+                 have already called with the `temps` tool.",
+                input.operation_id
+            ));
+        };
+        if !schema.method.eq_ignore_ascii_case("GET") {
+            return Err(format!(
+                "'{}' is a {} operation. A goal check must be a GET so watching it never changes anything.",
+                input.operation_id, schema.method
+            ));
+        }
+        let scope = ApiCallScope {
+            auth: auth.clone(),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+        };
+        let params = if input.params.is_null() {
+            Value::Object(Default::default())
+        } else {
+            input.params.clone()
+        };
+        match caller.call(input.operation_id.trim(), params, &scope).await {
+            Ok(response) if (200..300).contains(&response.status) => {
+                if lookup(&response.body, &input.success_path).is_none() {
+                    Err(format!(
+                        "The check ran, but its response has no '{}'. Pick a success_path that exists in what `{}` returns.",
+                        input.success_path, input.operation_id
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(response) => Err(format!(
+                "The check `{}` answered {} right now, so it cannot be watched as given: {}",
+                input.operation_id,
+                response.status,
+                clip(&render(&response.body))
+            )),
+            Err(error) => Err(format!(
+                "The check `{}` could not run: {error}",
+                input.operation_id
+            )),
+        }
+    }
+}
+
+/// Evaluates open goals and starts fix turns. One instance per server.
+pub struct GoalWatcher {
+    goals: Arc<GoalService>,
+    db: Arc<DatabaseConnection>,
+    read_api: Arc<ApiToolsHandle>,
+    conversations: Arc<ConversationService>,
+    project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    audit: Arc<dyn temps_core::AuditLogger>,
+}
+
+impl GoalWatcher {
+    pub fn new(
+        goals: Arc<GoalService>,
+        db: Arc<DatabaseConnection>,
+        read_api: Arc<ApiToolsHandle>,
+        conversations: Arc<ConversationService>,
+        project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+        audit: Arc<dyn temps_core::AuditLogger>,
+    ) -> Self {
+        Self {
+            goals,
+            db,
+            read_api,
+            conversations,
+            project_access_checker,
+            audit,
+        }
+    }
+
+    /// Run until the process ends. Each tick is bounded: at most [`DUE_BATCH`]
+    /// goals, each check capped at [`CHECK_TIMEOUT`].
+    pub async fn run(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) = self.tick().await {
+                tracing::warn!("AI goal watcher tick failed: {error}");
+            }
+        }
+    }
+
+    async fn tick(&self) -> Result<(), GoalError> {
+        for goal in self.goals.due(Utc::now()).await? {
+            let goal_id = goal.public_id.clone();
+            if let Err(error) = self.step(goal).await {
+                tracing::warn!(goal_id, "AI goal step failed: {error}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn step(&self, goal: ai_goals::Model) -> Result<(), GoalError> {
+        let now = Utc::now();
+        if goal.deadline_at <= now {
+            self.goals
+                .record(
+                    goal,
+                    STATUS_FAILED,
+                    "Gave up: the goal was not reached before its deadline",
+                    None,
+                )
+                .await?;
+            return Ok(());
+        }
+        let conversation = ai_conversations::Entity::find_by_id(goal.conversation_id)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(conversation) = conversation else {
+            self.goals
+                .record(goal, STATUS_CANCELLED, "The chat no longer exists", None)
+                .await?;
+            return Ok(());
+        };
+        if conversation.status != "active" {
+            self.goals
+                .record(goal, STATUS_CANCELLED, "The chat was archived", None)
+                .await?;
+            return Ok(());
+        }
+        let turn_running = conversation.turn_status == "running";
+        if goal.status == STATUS_HEALING && turn_running {
+            // The fix turn is still working; look again later.
+            self.goals
+                .record(
+                    goal,
+                    STATUS_HEALING,
+                    "Working on a fix",
+                    Some(ACTIVE_CHECK_SECONDS),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        let auth = match self.conversations.authorization_for_goal(&goal).await {
+            Ok(auth) => auth,
+            Err(reason) => {
+                self.goals
+                    .record(
+                        goal,
+                        STATUS_NEEDS_YOU,
+                        &format!("Watching paused: {reason}. Open the chat to continue."),
+                        Some(NEEDS_YOU_CHECK_SECONDS),
+                    )
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        let observation = self.check(&goal, &auth).await;
+        match observation {
+            Observation::Achieved(text) => {
+                self.goals
+                    .record(goal, STATUS_ACHIEVED, &text, None)
+                    .await?;
+            }
+            Observation::Pending(text) => {
+                // A healing goal whose fix turn already ended and which was not
+                // re-targeted is waiting on the user, not on a turn.
+                let (status, next) = match goal.status.as_str() {
+                    STATUS_HEALING => (STATUS_NEEDS_YOU, NEEDS_YOU_CHECK_SECONDS),
+                    STATUS_NEEDS_YOU => (STATUS_NEEDS_YOU, NEEDS_YOU_CHECK_SECONDS),
+                    _ => (STATUS_ACTIVE, ACTIVE_CHECK_SECONDS),
+                };
+                self.goals.record(goal, status, &text, Some(next)).await?;
+            }
+            Observation::Failed(text) => self.on_failed(goal, conversation, auth, text).await?,
+        }
+        Ok(())
+    }
+
+    async fn check(&self, goal: &ai_goals::Model, auth: &AuthContext) -> Observation {
+        let Some(caller) = self.read_api.get() else {
+            return Observation::Pending("The API is not ready yet".to_string());
+        };
+        let scope = ApiCallScope {
+            auth: auth.clone(),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+        };
+        let call = caller.call(&goal.check_operation, goal.check_params.clone(), &scope);
+        match tokio::time::timeout(CHECK_TIMEOUT, call).await {
+            Ok(Ok(response)) => evaluate(goal, response.status, &response.body),
+            Ok(Err(error)) => Observation::Pending(format!(
+                "The check {} could not run: {error}",
+                goal.check_operation
+            )),
+            Err(_) => Observation::Pending(format!(
+                "The check {} took longer than {}s",
+                goal.check_operation,
+                CHECK_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    async fn on_failed(
+        &self,
+        goal: ai_goals::Model,
+        conversation: ai_conversations::Model,
+        auth: AuthContext,
+        observation: String,
+    ) -> Result<(), GoalError> {
+        if goal.status != STATUS_ACTIVE {
+            // A goal already being healed, or waiting on the user, keeps
+            // showing what it sees without spending another attempt.
+            let status = if goal.status == STATUS_HEALING {
+                STATUS_NEEDS_YOU
+            } else {
+                goal.status.as_str()
+            }
+            .to_string();
+            self.goals
+                .record(goal, &status, &observation, Some(NEEDS_YOU_CHECK_SECONDS))
+                .await?;
+            return Ok(());
+        }
+        if goal.attempts >= goal.max_attempts {
+            let text = format!(
+                "Gave up after {} fix attempts. Last check: {observation}",
+                goal.attempts
+            );
+            self.goals.record(goal, STATUS_FAILED, &text, None).await?;
+            return Ok(());
+        }
+        if conversation.turn_status == "running" {
+            // The user is mid-conversation; do not talk over them.
+            self.goals
+                .record(
+                    goal,
+                    STATUS_ACTIVE,
+                    &format!("{observation}. Waiting for the current reply to finish"),
+                    Some(ACTIVE_CHECK_SECONDS),
+                )
+                .await?;
+            return Ok(());
+        }
+        if !self.goals.begin_heal(&goal).await? {
+            return Ok(());
+        }
+        let goal = self.goals.get(goal.conversation_id, &goal.public_id).await?;
+        let prompt = heal_prompt(&goal, &observation);
+        let metadata = serde_json::json!({
+            "origin": "goal",
+            "goal_id": goal.public_id,
+            "goal_title": goal.title,
+            "attempt": goal.attempts,
+        });
+        let started = self
+            .conversations
+            .start_goal_turn(
+                &conversation,
+                &prompt,
+                metadata,
+                &auth,
+                self.project_access_checker.clone(),
+            )
+            .await;
+        match started {
+            Ok(()) => {
+                tracing::info!(
+                    goal_id = %goal.public_id,
+                    conversation_id = conversation.id,
+                    attempt = goal.attempts,
+                    "AI goal failed; started a fix turn as the owner"
+                );
+                self.audit_heal(&goal, &conversation).await;
+                self.goals
+                    .record(
+                        goal,
+                        STATUS_HEALING,
+                        &format!("{observation}. Working on a fix"),
+                        Some(ACTIVE_CHECK_SECONDS),
+                    )
+                    .await?;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    goal_id = %goal.public_id,
+                    conversation_id = conversation.id,
+                    "could not start a fix turn: {error}"
+                );
+                self.goals.undo_heal(&goal).await?;
+                self.goals
+                    .record(
+                        goal,
+                        STATUS_ACTIVE,
+                        &format!("{observation}. Could not start a fix yet"),
+                        Some(ACTIVE_CHECK_SECONDS),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn audit_heal(&self, goal: &ai_goals::Model, conversation: &ai_conversations::Model) {
+        let entry = crate::audit::AiGoalHealStartedAudit {
+            context: temps_core::AuditContext {
+                user_id: goal.owner_user_id,
+                ip_address: None,
+                user_agent: "temps-ai-goal-watcher".to_string(),
+            },
+            project_id: conversation.project_id,
+            conversation_id: conversation.public_id.clone(),
+            goal_id: goal.public_id.clone(),
+            attempt: goal.attempts,
+        };
+        if let Err(error) = self.audit.create_audit_log(&entry).await {
+            tracing::error!(
+                goal_id = %goal.public_id,
+                "failed to audit the goal fix turn: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn goal(success: &[&str], failure: &[&str]) -> ai_goals::Model {
+        let now = Utc::now();
+        ai_goals::Model {
+            id: 1,
+            public_id: "goal_test".into(),
+            conversation_id: 7,
+            owner_user_id: 3,
+            title: "Deployment is healthy".into(),
+            check_operation: "get_deployment".into(),
+            check_params: serde_json::json!({"project_id": 1, "deployment_id": 2}),
+            success_path: "status".into(),
+            success_values: serde_json::json!(success),
+            failure_values: serde_json::json!(failure),
+            status: STATUS_ACTIVE.into(),
+            attempts: 1,
+            max_attempts: 3,
+            last_observation: None,
+            last_checked_at: None,
+            next_check_at: now,
+            deadline_at: now + chrono::Duration::minutes(30),
+            auth_session_id: Some(9),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn input() -> TrackGoalInput {
+        TrackGoalInput {
+            title: "Deployment is healthy".into(),
+            operation_id: "get_deployment".into(),
+            params: serde_json::json!({"project_id": 1}),
+            success_path: "status".into(),
+            success_values: vec!["completed".into()],
+            failure_values: vec!["failed".into()],
+            max_attempts: None,
+            deadline_minutes: None,
+        }
+    }
+
+    #[test]
+    fn success_failure_and_pending_are_told_apart() {
+        let g = goal(&["completed"], &["failed", "cancelled"]);
+        assert!(matches!(
+            evaluate(&g, 200, &serde_json::json!({"status": "Completed"})),
+            Observation::Achieved(_)
+        ));
+        assert!(matches!(
+            evaluate(&g, 200, &serde_json::json!({"status": "running"})),
+            Observation::Pending(_)
+        ));
+        let failed = evaluate(
+            &g,
+            200,
+            &serde_json::json!({"status": "failed", "error_message": "build exited 1"}),
+        );
+        assert_eq!(
+            failed,
+            Observation::Failed("status is failed: build exited 1".into())
+        );
+    }
+
+    #[test]
+    fn nested_paths_and_non_string_values_are_matched() {
+        let mut g = goal(&["true"], &["false"]);
+        g.success_path = "health.ready".into();
+        assert!(matches!(
+            evaluate(&g, 200, &serde_json::json!({"health": {"ready": true}})),
+            Observation::Achieved(_)
+        ));
+        assert!(matches!(
+            evaluate(&g, 200, &serde_json::json!({"health": {"ready": false}})),
+            Observation::Failed(_)
+        ));
+        assert!(matches!(
+            evaluate(&g, 200, &serde_json::json!({"health": {}})),
+            Observation::Pending(_)
+        ));
+    }
+
+    #[test]
+    fn http_errors_are_classified_by_whether_waiting_can_help() {
+        let g = goal(&["completed"], &["failed"]);
+        for status in [401, 403, 404, 410] {
+            assert!(
+                matches!(evaluate(&g, status, &serde_json::json!({})), Observation::Failed(_)),
+                "{status} must fail the goal"
+            );
+        }
+        for status in [429, 500, 502, 503] {
+            assert!(
+                matches!(evaluate(&g, status, &serde_json::json!({})), Observation::Pending(_)),
+                "{status} must be retried"
+            );
+        }
+        assert!(matches!(
+            evaluate(&g, 422, &serde_json::json!({"detail": "bad"})),
+            Observation::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn observations_are_clipped_to_one_short_line() {
+        let g = goal(&["completed"], &["failed"]);
+        let long = "line\n".repeat(400);
+        let observation = evaluate(&g, 418, &serde_json::json!(long));
+        assert!(observation.text().chars().count() < MAX_OBSERVATION_CHARS + 200);
+        assert!(!observation.text().contains('\n'));
+    }
+
+    #[test]
+    fn valid_input_passes_and_bad_input_names_the_problem() {
+        assert!(input().validate(1).is_ok());
+
+        let mut bad = input();
+        bad.title = "  ".into();
+        assert!(bad.validate(1).unwrap_err().to_string().contains("title"));
+
+        let mut bad = input();
+        bad.success_values.clear();
+        assert!(bad
+            .validate(1)
+            .unwrap_err()
+            .to_string()
+            .contains("success_values"));
+
+        let mut bad = input();
+        bad.success_path = "status; drop".into();
+        assert!(bad
+            .validate(1)
+            .unwrap_err()
+            .to_string()
+            .contains("success_path"));
+
+        let mut bad = input();
+        bad.failure_values = Vec::new();
+        assert!(bad
+            .validate(1)
+            .unwrap_err()
+            .to_string()
+            .contains("failure_values must list at least one value"));
+
+        let mut bad = input();
+        bad.failure_values = vec!["COMPLETED".into()];
+        assert!(bad
+            .validate(1)
+            .unwrap_err()
+            .to_string()
+            .contains("both a success value and a failure value"));
+
+        let mut bad = input();
+        bad.params = serde_json::json!([1]);
+        assert!(bad.validate(1).unwrap_err().to_string().contains("params"));
+
+        let mut bad = input();
+        bad.max_attempts = Some(0);
+        assert!(bad
+            .validate(1)
+            .unwrap_err()
+            .to_string()
+            .contains("max_attempts"));
+
+        let mut bad = input();
+        bad.deadline_minutes = Some(MAX_DEADLINE_MINUTES + 1);
+        assert!(bad
+            .validate(1)
+            .unwrap_err()
+            .to_string()
+            .contains("deadline_minutes"));
+    }
+
+    #[test]
+    fn heal_prompt_names_the_goal_attempt_and_retarget_instruction() {
+        let g = goal(&["completed"], &["failed"]);
+        let prompt = heal_prompt(&g, "status is failed: build exited 1");
+        assert!(prompt.contains("goal_test"));
+        assert!(prompt.contains("attempt 1 of 3"));
+        assert!(prompt.contains("build exited 1"));
+        assert!(prompt.contains("retarget"));
+    }
+
+    #[test]
+    fn response_uses_iso_timestamps_and_hides_the_check_params() {
+        let response = GoalResponse::from(goal(&["completed"], &["failed"]));
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json["deadline_at"].as_str().unwrap().ends_with("+00:00") || json["deadline_at"].as_str().unwrap().ends_with('Z'));
+        assert!(json.get("check_params").is_none());
+        assert_eq!(json["id"], "goal_test");
+    }
+
+    fn count_row(n: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([("num_items".to_string(), sea_orm::Value::BigInt(Some(n)))])
+    }
+
+    fn service(db: sea_orm::DatabaseConnection) -> GoalService {
+        GoalService::new(Arc::new(db))
+    }
+
+    #[tokio::test]
+    async fn track_stores_an_active_goal_for_the_owner() {
+        let stored = goal(&["completed"], &["failed"]);
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![count_row(0)]])
+            .append_query_results([vec![stored.clone()]])
+            .into_connection();
+        let goal = service(db).track(7, 3, Some(9), input()).await.unwrap();
+        assert_eq!(goal.conversation_id, 7);
+        assert_eq!(goal.owner_user_id, 3);
+        assert_eq!(goal.status, STATUS_ACTIVE);
+    }
+
+    #[tokio::test]
+    async fn track_refuses_a_sixth_open_goal_and_names_the_limit() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![count_row(MAX_OPEN_GOALS_PER_CONVERSATION as i64)]])
+            .into_connection();
+        let error = service(db).track(7, 3, None, input()).await.unwrap_err();
+        assert!(matches!(
+            error,
+            GoalError::TooManyOpen { conversation_id: 7, open: 5, limit: 5 }
+        ));
+        assert!(error.to_string().contains("Conversation 7"));
+    }
+
+    #[tokio::test]
+    async fn track_rejects_invalid_input_before_touching_the_database() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let mut bad = input();
+        bad.success_values.clear();
+        let error = service(db).track(7, 3, None, bad).await.unwrap_err();
+        assert!(matches!(error, GoalError::Validation { conversation_id: 7, .. }));
+    }
+
+    #[tokio::test]
+    async fn a_missing_goal_is_not_found_with_both_ids() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<ai_goals::Model>::new()])
+            .into_connection();
+        let error = service(db).get(7, "goal_nope").await.unwrap_err();
+        assert!(matches!(
+            &error,
+            GoalError::NotFound { goal_id, conversation_id: 7 } if goal_id == "goal_nope"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_finished_goal_cannot_be_cancelled_or_retargeted() {
+        let mut achieved = goal(&["completed"], &["failed"]);
+        achieved.status = STATUS_ACHIEVED.into();
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![achieved.clone()], vec![achieved.clone()]])
+            .into_connection();
+        let svc = service(db);
+        assert!(matches!(
+            svc.cancel(7, "goal_test").await.unwrap_err(),
+            GoalError::InvalidState { action: "cancelled", .. }
+        ));
+        assert!(matches!(
+            svc.retarget(7, "goal_test", input()).await.unwrap_err(),
+            GoalError::InvalidState { action: "retargeted", .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_failed_or_waiting_goals_can_be_retried() {
+        let mut active = goal(&["completed"], &["failed"]);
+        active.status = STATUS_ACTIVE.into();
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![active]])
+            .into_connection();
+        assert!(matches!(
+            service(db).retry(7, "goal_test").await.unwrap_err(),
+            GoalError::InvalidState { action: "retried", .. }
+        ));
+    }
+}

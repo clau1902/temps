@@ -62,6 +62,34 @@ pub struct ConversationPermissionModeChangedAudit {
     pub applied_to_active_turn: bool,
 }
 
+/// A watched goal failed and the assistant started a fix turn on the owner's
+/// behalf. Recorded because it is the one case where the assistant acts while
+/// the user is not looking.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiGoalHealStartedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub goal_id: String,
+    pub attempt: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiGoalCancelledAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub goal_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiGoalRetriedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub goal_id: String,
+}
+
 macro_rules! impl_audit_operation {
     ($type:ty, $op:expr) => {
         impl AuditOperation for $type {
@@ -277,6 +305,9 @@ pub struct AiActionTransitionFailedAudit {
     pub error: String,
 }
 
+impl_audit_operation!(AiGoalHealStartedAudit, "ai.goal.heal_started");
+impl_audit_operation!(AiGoalCancelledAudit, "ai.goal.cancelled");
+impl_audit_operation!(AiGoalRetriedAudit, "ai.goal.retried");
 impl_audit_operation!(AiActionConfirmedAudit, "ai.pending_action.confirmed");
 impl_audit_operation!(AiActionRejectedAudit, "ai.pending_action.rejected");
 impl_audit_operation!(

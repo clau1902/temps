@@ -961,7 +961,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 use temps_auth::context::AuthContext;
-use temps_entities::{ai_conversations, ai_messages, projects};
+use temps_entities::{ai_conversations, ai_goals, ai_messages, projects};
 
 use temps_ai_api_tools::{
     ApiCallScope, ProjectSelectorScope, WriteApiToolsHandle, WritePrepareOutcome,
@@ -975,6 +975,9 @@ use crate::ChatError;
 
 /// Tool name for the write-proposal (confirm-gated) tool.
 const TEMPS_WRITE_TOOL_NAME: &str = "temps_write";
+
+/// Tool name for goal tracking (assistant chats).
+const TEMPS_GOAL_TOOL_NAME: &str = "temps_goal";
 
 fn is_temps_write_tool_name(name: &str) -> bool {
     matches!(name, TEMPS_WRITE_TOOL_NAME | "mcp__temps-chat__temps_write")
@@ -1011,6 +1014,9 @@ fn truncate_for_display(text: String, max_bytes: usize) -> String {
 /// credentials, shows only a status.
 fn public_tool_result(name: &str, result: &str) -> String {
     if is_temps_write_tool_name(name) {
+        return redact_json_string(result);
+    }
+    if name == TEMPS_GOAL_TOOL_NAME {
         return redact_json_string(result);
     }
     if name == "temps" {
@@ -1667,6 +1673,10 @@ pub struct ConversationService {
     /// Optional write-tool wiring. `None` until
     /// [`ConversationService::with_write_support`] is called.
     write_support: Option<WriteSupport>,
+    /// Goal tracking for assistant chats. `None` until
+    /// [`ConversationService::with_goal_support`] is called; the `temps_goal`
+    /// tool is then simply not offered.
+    goal_support: Option<crate::goals::GoalToolSupport>,
     /// Reads operator-tunable chat limits. Consulted once per turn (the service
     /// caches, so this is not a per-turn database hit) rather than at startup,
     /// so changing the timeout in Settings takes effect on the next message
@@ -2089,6 +2099,7 @@ impl ConversationService {
             ai,
             providers,
             write_support: None,
+            goal_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
@@ -2702,6 +2713,91 @@ impl ConversationService {
             audit,
         });
         self
+    }
+
+    /// Let assistant chats track goals and be brought back to fix them.
+    pub fn with_goal_support(mut self, support: crate::goals::GoalToolSupport) -> Self {
+        self.goal_support = Some(support);
+        self
+    }
+
+    /// Re-derive the owner's authorization for a goal from the browser session
+    /// it was created in. The session is the user's own: once it ends, expires
+    /// or loses MFA, the goal can no longer act and says so.
+    pub(crate) async fn authorization_for_goal(
+        &self,
+        goal: &ai_goals::Model,
+    ) -> Result<AuthContext, String> {
+        let session_id = goal.auth_session_id.ok_or_else(|| {
+            "this chat was not started from a browser session, so it cannot act on its own"
+                .to_string()
+        })?;
+        let session = temps_entities::sessions::Entity::find_by_id(session_id)
+            .filter(temps_entities::sessions::Column::UserId.eq(goal.owner_user_id))
+            .filter(temps_entities::sessions::Column::MfaPending.eq(false))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| format!("could not read the session: {error}"))?
+            .filter(|session| session.expires_at > Utc::now())
+            .ok_or_else(|| "your session has ended".to_string())?;
+        let user = active_user(self.db.as_ref(), session.user_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let role = current_user_role(self.db.as_ref(), user.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(AuthContext::new_persisted_session(user, role, session.id))
+    }
+
+    /// Start a turn in a chat on the owner's behalf, as the goal watcher does
+    /// when a check fails. Goes through the same claim and preparation as a
+    /// message the user sends, so the usual one-turn-at-a-time rule holds.
+    pub async fn start_goal_turn(
+        &self,
+        conv: &ai_conversations::Model,
+        prompt: &str,
+        metadata: serde_json::Value,
+        auth: &AuthContext,
+        project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    ) -> Result<(), ChatError> {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        self.claim_turn(conv, &turn_id).await?;
+        let request_metadata = RequestMetadata {
+            ip_address: String::new(),
+            user_agent: "temps-ai-goal-watcher".to_string(),
+            headers: Default::default(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: String::new(),
+            scheme: String::new(),
+            host: String::new(),
+            is_secure: false,
+        };
+        if let Err(error) = self
+            .send_message(
+                conv,
+                &turn_id,
+                prompt,
+                Some(metadata),
+                None,
+                Vec::new(),
+                None,
+                auth,
+                &request_metadata,
+                project_access_checker,
+            )
+            .await
+        {
+            if let Err(finish_error) = self.finish_failed_turn(conv.id, &turn_id, &error).await {
+                tracing::error!(
+                    conversation_id = conv.id,
+                    turn_id,
+                    "failed to release goal turn after preparation error: {finish_error}"
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Is the selected AI provider configured? Feature opt-in is checked by
@@ -4182,6 +4278,9 @@ impl ConversationService {
             // Write capability follows the native harness approval mode. The
             // operation still executes with the current user's RBAC and project
             // scope; there is no second project-level feature toggle.
+            if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+                self.maybe_add_goal_tool(&mut tools);
+            }
             let write_appendix = self.maybe_add_write_tool(&mut tools, &messages, auth);
             if let Some(appendix) = write_appendix {
                 // Append the write-CLI section map to the system framing so the model
@@ -4253,6 +4352,52 @@ impl ConversationService {
         // server-owned task or its broadcast publication.
         drop(detached_viewer);
         Ok(())
+    }
+
+    /// Offer `temps_goal` when goal tracking is wired.
+    fn maybe_add_goal_tool(&self, tools: &mut Vec<ChatTool>) {
+        if self.goal_support.is_none() {
+            return;
+        }
+        tools.push(ChatTool {
+            name: TEMPS_GOAL_TOOL_NAME.to_string(),
+            description: "Keep watching an outcome after the turn ends, and be brought back to \
+                fix it if it goes wrong. Use it right after you start something that can fail \
+                later: a deployment, a new service becoming ready, a domain being provisioned. \
+                A goal is a read-only check (`operation_id` plus `params`, exactly as you would \
+                pass to the `temps` tool), the dot path `success_path` into its response, the \
+                values that mean it worked (`success_values`) and the values that mean it failed \
+                (`failure_values`). Prefer a check on something that stays put (a service's \
+                status, an environment's current deployment) over one pinned to a single \
+                deployment id. When a goal fails Temps starts a fix turn in this chat, up to \
+                `max_attempts` times (default 3). In that turn, after you redeploy, call this \
+                tool with `action` `retarget` and the `goal_id` so the new deployment is \
+                watched. Every call needs ALL of title, operation_id, params, success_path, \
+                success_values and failure_values: a goal with no failure value can never \
+                fail, so it can never be fixed. The check runs with the user's own permissions and never \
+                changes anything."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["track", "retarget"],
+                        "description": "`track` (default) starts watching, `retarget` points an existing goal at a new check."
+                    },
+                    "goal_id": { "type": "string", "description": "Required for `retarget`." },
+                    "title": { "type": "string", "description": "What 'done' means, e.g. 'Deployment of my-app is live'." },
+                    "operation_id": { "type": "string", "description": "A read-only (GET) operation, e.g. `get_deployment`." },
+                    "params": { "type": "object", "description": "Flat parameters for the operation." },
+                    "success_path": { "type": "string", "description": "Dot path into the response, e.g. `status`." },
+                    "success_values": { "type": "array", "items": { "type": "string" }, "description": "Values at the path meaning it worked, e.g. [\"completed\"]." },
+                    "failure_values": { "type": "array", "items": { "type": "string" }, "description": "Values at the path meaning it failed, e.g. [\"failed\", \"cancelled\"]." },
+                    "max_attempts": { "type": "integer", "description": "Fix turns allowed, 1 to 5. Default 3." },
+                    "deadline_minutes": { "type": "integer", "description": "Give up after this long, 1 to 240. Default 30." }
+                },
+                "required": ["title", "operation_id", "params", "success_path", "success_values", "failure_values"]
+            }),
+        });
     }
 
     /// If write support is wired, append the `temps_write` tool to `tools` and
@@ -4579,6 +4724,10 @@ impl ConversationService {
             .and_then(|ws| ws.write_handle.get());
         let pending_svc_opt = self.write_support.as_ref().map(|ws| ws.pending.clone());
         let write_support_audit = self.write_support.as_ref().map(|ws| ws.audit.clone());
+        let goal_support_opt = (conv.context_type
+            == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
+            .then(|| self.goal_support.clone())
+            .flatten();
 
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
@@ -4615,7 +4764,10 @@ impl ConversationService {
                 return true;
             }
             let mut messages = base_messages;
-            let execution_state = Arc::new(tokio::sync::Mutex::new(ToolExecutionState::default()));
+            let execution_state = Arc::new(tokio::sync::Mutex::new(ToolExecutionState {
+                goals: goal_support_opt.clone(),
+                ..Default::default()
+            }));
             let interaction_conv_public_id = conv_public_id.clone();
             let interaction_registry = pending_permissions.clone();
             type PermissionRegistrar = Arc<
@@ -6831,6 +6983,7 @@ fn missing_backtest(
 
 #[derive(Default)]
 struct ToolExecutionState {
+    goals: Option<crate::goals::GoalToolSupport>,
     proposed_action_ids: Vec<i64>,
     seen_calls: std::collections::HashMap<String, String>,
 }
@@ -6947,6 +7100,11 @@ async fn dispatch_conversation_tool(
             &state.seen_calls,
         )
         .await
+    } else if call.name == TEMPS_GOAL_TOOL_NAME {
+        match &state.goals {
+            Some(goals) => goals.dispatch(&call.arguments, conversation_id, auth).await,
+            None => "Goal tracking is not available in this chat.".to_string(),
+        }
     } else if call.name == "temps" {
         if let Some(provider) = api_tools {
             provider
@@ -9719,6 +9877,7 @@ mod tests {
             ai,
             providers: HashMap::new(),
             write_support: None,
+            goal_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
@@ -10145,6 +10304,7 @@ mod tests {
             ai,
             providers: HashMap::new(),
             write_support: None,
+            goal_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
@@ -10767,6 +10927,7 @@ mod tests {
             ai: Arc::new(ScriptedAi::new(vec![])),
             providers: HashMap::new(),
             write_support: None,
+            goal_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
@@ -10784,6 +10945,7 @@ mod tests {
             ai,
             providers: HashMap::new(),
             write_support: None,
+            goal_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
@@ -11411,6 +11573,7 @@ mod tests {
             ai: Arc::new(ScriptedAi::new(vec![])),
             providers,
             write_support: None,
+            goal_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,

@@ -81,6 +81,7 @@ impl TempsPlugin for AiChatPlugin {
             // the same cell.
             let api_tools_handle = Arc::new(ApiToolsHandle::new());
             context.register_service(api_tools_handle.clone());
+            let api_tools_handle_for_goals = api_tools_handle.clone();
 
             // Write handle (distinct type — see WriteApiToolsHandle docs). Registered
             // empty here; console wiring calls write_handle.set(write_caller) after
@@ -96,6 +97,9 @@ impl TempsPlugin for AiChatPlugin {
                 encryption,
             ));
             context.register_service(pending_actions.clone());
+
+            let goals = Arc::new(crate::goals::GoalService::new(db.clone()));
+            context.register_service(goals.clone());
 
             let applications = Arc::new(crate::ApplicationService::new(db.clone()));
             context.register_service(applications.clone());
@@ -241,6 +245,10 @@ impl TempsPlugin for AiChatPlugin {
             let config_service = context.get_service::<temps_config::ConfigService>();
             let mut service = ConversationService::new(db.clone(), ai, providers)
                 .with_write_support(write_handle, pending_actions.clone(), audit_service.clone())
+                .with_goal_support(crate::goals::GoalToolSupport {
+                    goals: goals.clone(),
+                    read_api: api_tools_handle_for_goals,
+                })
                 .with_application_workspaces(application_workspaces.clone())
                 .with_application_service(applications.clone());
             if let Some(sandboxes) = &application_sandboxes {
@@ -278,6 +286,7 @@ impl TempsPlugin for AiChatPlugin {
                 audit_service,
                 pending_actions,
                 applications,
+                goals,
                 project_service,
                 application_workspaces,
                 config_service,
@@ -294,6 +303,28 @@ impl TempsPlugin for AiChatPlugin {
         })
     }
 
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            // The watcher is the only thing here that acts while nobody is
+            // looking, so it is started last, once every service it uses is
+            // registered, and holds only clones of them.
+            let watcher = crate::goals::GoalWatcher::new(
+                context.require_service::<crate::goals::GoalService>(),
+                context.require_service::<sea_orm::DatabaseConnection>(),
+                context.require_service::<ApiToolsHandle>(),
+                context.require_service::<ConversationService>(),
+                context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+                context.require_service::<dyn temps_core::AuditLogger>(),
+            );
+            tokio::spawn(Arc::new(watcher).run());
+            tracing::debug!("AI goal watcher started");
+            Ok(())
+        })
+    }
+
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let old = context.get_plugin_state::<AppState>("ai_chat")?;
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
@@ -303,6 +334,7 @@ impl TempsPlugin for AiChatPlugin {
             audit_service: old.audit_service.clone(),
             pending_actions: old.pending_actions.clone(),
             applications: old.applications.clone(),
+            goals: old.goals.clone(),
             project_service: old.project_service.clone(),
             application_workspaces: old.application_workspaces.clone(),
             config_service: old.config_service.clone(),
@@ -319,6 +351,7 @@ impl TempsPlugin for AiChatPlugin {
         let model_relay = context.require_service::<temps_ai_agent_cli::SandboxModelRelayService>();
         let router = handlers::configure_routes()
             .merge(crate::git_bindings_handlers::configure_routes())
+            .merge(crate::goals_handlers::configure_routes())
             .with_state(app_state)
             .merge(temps_ai_agent_cli::sandbox_model_relay_routes().with_state(model_relay));
         Some(PluginRoutes::new(router))
@@ -328,6 +361,7 @@ impl TempsPlugin for AiChatPlugin {
         let mut document = <AiChatApiDoc as OpenApiTrait>::openapi();
         document
             .merge(<crate::git_bindings_handlers::GitBindingsApiDoc as OpenApiTrait>::openapi());
+        document.merge(<crate::goals_handlers::GoalsApiDoc as OpenApiTrait>::openapi());
         Some(document)
     }
 }

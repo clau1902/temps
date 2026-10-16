@@ -8,6 +8,7 @@ pub mod ai_application_projects;
 pub mod ai_application_workspaces;
 pub mod ai_applications;
 pub mod ai_conversations;
+pub mod ai_goals;
 pub mod ai_gateway_config;
 pub mod ai_gateway_objects;
 pub mod ai_messages;

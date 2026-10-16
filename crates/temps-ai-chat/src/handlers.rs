@@ -83,6 +83,8 @@ pub struct AppState {
     /// Pending-action service (confirm/reject write proposals).
     pub pending_actions: Arc<PendingActionService>,
     pub applications: Arc<ApplicationService>,
+    /// Goals the assistant is watching for each chat.
+    pub goals: Arc<crate::goals::GoalService>,
     pub project_service: Arc<temps_projects::ProjectService>,
     /// Derives the durable, Temps-owned directory mounted into an application
     /// harness sandbox. This never accepts a browser-supplied host path.
@@ -104,7 +106,7 @@ pub struct AppState {
 impl AppState {
     /// Emit an audit entry, best-effort: a logging failure must never fail the
     /// underlying operation (it already succeeded).
-    async fn audit(&self, op: &dyn temps_core::AuditOperation) {
+    pub(crate) async fn audit(&self, op: &dyn temps_core::AuditOperation) {
         if let Err(e) = self.audit_service.create_audit_log(op).await {
             error!("Failed to write AI-chat audit log: {e}");
         }
@@ -7197,7 +7199,7 @@ pub async fn get_conversation(
     }))
 }
 
-async fn ensure_user_conversation_access(
+pub(crate) async fn ensure_user_conversation_access(
     state: &AppState,
     auth: &AuthContext,
     conversation: &ai_conversations::Model,

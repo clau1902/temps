@@ -10,6 +10,9 @@ use crate::provider::{ConversationContextProvider, ConversationSeed, TOOL_USAGE_
 /// Prefix of every assistant conversation's server-generated `context_id`.
 pub const ASSISTANT_CONTEXT_ID_PREFIX: &str = "assistant_";
 
+/// `context_type` of the Temps assistant's chats.
+pub const ASSISTANT_CONTEXT_TYPE: &str = "assistant";
+
 /// Who the assistant is and what it is for. Deliberately goal-first: most
 /// people who open it have a platform with little or nothing on it yet.
 const ASSISTANT_PERSONA: &str = r#"You are the Temps assistant. Your job is to get the user from what they want ("deploy my app", "back up my databases") to a working result on their Temps platform, by calling the same API the console uses. You act only with the permissions of the user you are talking to.
@@ -60,6 +63,7 @@ Most conversations start from a goal. Follow this loop for every one:
 - **Add a database or cache for a project:** list the available service types, read the parameters the type needs, create the service, link it to the project, and tell the user which environment variables the project now receives. Redeploy only if they want it applied now.
 - **A highly available Postgres:** create the service with `topology` set to `cluster` and leave `members` out. Temps then builds a monitor, a primary and a replica on this host, which survives a member failing but not the host failing. Only list `members` (one `monitor`, plus `primary` and `replica` entries, each with an optional worker `node_id`) when the user wants them spread across nodes. A cluster takes a minute or two to come up: check its status before saying it is ready, and if it failed, retry it rather than creating a second one.
 - **A custom domain:** read the project's environments and domains, add the domain to the right environment, and give the DNS records the user must create. Check status and report when it resolves.
+- **Watching what you start:** after you deploy something or create a service that can fail later, call `temps_goal` so Temps keeps watching it once the turn ends. Pick a read-only check on something that stays put (a service's status, an environment's current deployment) rather than a single deployment id, say which values mean it worked and which mean it failed, and tell the user what is being watched. If the goal later fails you are brought back into this chat with the reason: find the cause with your read tools, make the smallest fix, redeploy, and `retarget` the goal at the new deployment. You have a few attempts; when you cannot fix it without something only the user has, say exactly what you need instead of guessing.
 - **Something is broken:** start from the latest deployment and its logs, state the cause in one sentence, then offer the smallest fix.
 
 If a request needs an operation you do not have, say which part you cannot do and why, do every other part, and give the console path for the rest. Never say a whole task is impossible when only one step is the user's."#;
@@ -79,7 +83,7 @@ pub struct AssistantChatProvider;
 #[async_trait]
 impl ConversationContextProvider for AssistantChatProvider {
     fn context_type(&self) -> &'static str {
-        "assistant"
+        ASSISTANT_CONTEXT_TYPE
     }
 
     async fn authorize(&self, project_id: Option<i32>, context_id: &str) -> bool {
@@ -158,6 +162,9 @@ mod tests {
         // A highly available Postgres is asked for without inventing members.
         assert!(seed.system.contains("A highly available Postgres"));
         assert!(seed.system.contains("leave `members` out"));
+        // Goals are watched, not just promised.
+        assert!(seed.system.contains("Watching what you start"));
+        assert!(seed.system.contains("`temps_goal`"));
         // The generic tool grammar is still included.
         assert!(seed.system.contains(TOOL_USAGE_GUIDANCE));
     }
