@@ -13,12 +13,15 @@ export const CONSOLE_HOME_PATH = '/projects'
  * The only chrome around the full-screen assistant: the product mark, where
  * you are, and a way back. The console sidebar and header are deliberately not
  * rendered in this mode so the conversation is all there is to look at.
+ *
+ * Below `md` it is not shown: the conversation header is then the only line,
+ * and carries the way back to the console itself (see `AiAssistantDock`).
  */
 export function AssistantTopBar() {
   const { logoIcon, logoText } = useConsoleExtensions()
 
   return (
-    <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b px-4 sm:px-6">
+    <header className="hidden h-14 shrink-0 md:flex items-center justify-between gap-3 border-b px-4 sm:px-6">
       <div className="flex min-w-0 items-center gap-2">
         <Link
           to={CONSOLE_HOME_PATH}

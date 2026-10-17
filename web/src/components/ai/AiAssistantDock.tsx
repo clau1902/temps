@@ -49,6 +49,7 @@ import {
   ChevronLeft,
   ChevronsUpDown,
   ExternalLink,
+  LayoutDashboard,
   FolderGit2,
   GitBranch,
   Loader2,
@@ -66,7 +67,8 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
-import { useNavigate, useSearchParams } from 'react-router'
+import { Link, useNavigate, useSearchParams } from 'react-router'
+import { CONSOLE_HOME_PATH } from './AssistantTopBar'
 import { toast } from 'sonner'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
 import { AiAssistantGate } from './AiAssistantGate'
@@ -820,6 +822,10 @@ export function DockBody({
         ? 'New project chat'
         : 'AI assistant'
 
+  // On a phone the header is a single line: the subtitle gives way to the
+  // icon buttons below.
+  const subtitleClass = isPage ? 'max-md:hidden' : undefined
+
   const main = (
     <div
       className={cn(
@@ -830,7 +836,7 @@ export function DockBody({
       <div
         className={cn(
           'flex items-start justify-between gap-2',
-          isPage && 'items-center border-b px-4 py-3 sm:px-6'
+          isPage && 'items-center border-b px-3 py-2 sm:px-6 sm:py-3'
         )}
       >
         <div className="min-w-0 space-y-1">
@@ -855,10 +861,10 @@ export function DockBody({
               <ContextAvatar
                 projectName={active.projectName}
                 contextType={active.contextType}
-                className="size-7"
+                className="size-7 max-md:hidden"
               />
             )}
-            <h2 className="min-w-0 truncate text-lg font-semibold">
+            <h2 className="min-w-0 truncate text-base font-semibold sm:text-lg">
               {workView ? (
                 <button
                   type="button"
@@ -881,11 +887,16 @@ export function DockBody({
             </h2>
           </div>
           {inAssistant ? (
-            <p className="text-sm text-muted-foreground">
+            <p className={cn(subtitleClass, 'text-sm text-muted-foreground')}>
               Acts with your own permissions
             </p>
           ) : inConversation ? (
-            <p className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
+            <p
+              className={cn(
+                subtitleClass,
+                'flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground'
+              )}
+            >
               <span>{sourceLabel}</span>
               {href && (
                 <button
@@ -899,17 +910,46 @@ export function DockBody({
               )}
             </p>
           ) : picking ? (
-            <p className="text-sm text-muted-foreground">
+            <p className={cn(subtitleClass, 'text-sm text-muted-foreground')}>
               Choose a project to start a general chat about it.
             </p>
           ) : (
-            <p className="text-sm text-muted-foreground">
+            <p className={cn(subtitleClass, 'text-sm text-muted-foreground')}>
               Resume any AI conversation across your projects, or start a new
               chat for a project.
             </p>
           )}
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
+          {isPage && inConversation && href && (
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-8 md:hidden"
+              onClick={() => goToSource(href)}
+              title={`View source: ${sourceLabel}`}
+              aria-label={`View source: ${sourceLabel}`}
+            >
+              <ExternalLink className="size-4" />
+            </Button>
+          )}
+          {isPage && (
+            <Button
+              asChild
+              size="icon"
+              variant="ghost"
+              className="size-8 md:hidden"
+            >
+              <Link
+                to={CONSOLE_HOME_PATH}
+                title="Back to console"
+                aria-label="Back to console"
+              >
+                <LayoutDashboard className="size-4" />
+              </Link>
+            </Button>
+          )}
           {isPage && (
             <div
               role="group"

@@ -51,6 +51,7 @@ import { attachHttpStatus } from './lib/http-error-status'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
 import { AssistantTopBar } from './components/ai/AssistantTopBar'
+import { useVisualViewportFit } from './hooks/useVisualViewportFit'
 import AppSidebar from './components/dashboard/Sidebar'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
@@ -527,6 +528,8 @@ const FullAppRoutes = () => {
   // The assistant is a focus mode: no console sidebar, header or banners, just
   // the conversation and a way back (see `AssistantTopBar`).
   const focusMode = useLocation().pathname === '/chat'
+  // On a phone the keyboard must not push the header off screen.
+  useVisualViewportFit(focusMode)
 
   // Lock the document to the viewport while the app shell is mounted. The shell
   // is a fixed-height (`dvh`) layout whose content scrolls in inner containers,
@@ -581,7 +584,13 @@ const FullAppRoutes = () => {
                 <AppSidebar />
               </ErrorBoundary>
             )}
-            <SidebarInset>
+            <SidebarInset
+              className={
+                focusMode
+                  ? 'max-md:fixed max-md:inset-x-0 max-md:top-[var(--app-top,0px)] max-md:h-[var(--app-height,100dvh)]'
+                  : undefined
+              }
+            >
               {/* App-wide disk-space banner — sits above the header inside the
               content column (to the right of the fixed sidebar, so it's never
               clipped by it), full content width, on every page. */}
