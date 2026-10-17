@@ -1019,7 +1019,7 @@ fn public_tool_result(name: &str, result: &str) -> String {
     if name == TEMPS_GOAL_TOOL_NAME {
         return redact_json_string(result);
     }
-    if name == "temps" {
+    if name == "temps" || crate::sandbox_link::is_sandbox_tool(name) {
         return truncate_for_display(redact_json_string(result), MAX_PUBLIC_API_RESULT_BYTES);
     }
 
@@ -4318,6 +4318,7 @@ impl ConversationService {
             // scope; there is no second project-level feature toggle.
             if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
                 self.maybe_add_goal_tool(&mut tools);
+                tools.extend(self.sandbox_tools(&conv, auth));
             }
             let write_appendix = self.maybe_add_write_tool(&mut tools, &messages, auth);
             if let Some(appendix) = write_appendix {
@@ -4393,6 +4394,32 @@ impl ConversationService {
     }
 
     /// Offer `temps_goal` when goal tracking is wired.
+    /// The sandbox link service for an assistant chat, when this server has a
+    /// sandbox backend. Other chat kinds never get sandbox tools.
+    fn sandbox_link_for(
+        &self,
+        conv: &ai_conversations::Model,
+    ) -> Option<crate::sandbox_link::SandboxLinkService> {
+        if conv.context_type != crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+            return None;
+        }
+        self.application_sandboxes.as_ref().map(|sandboxes| {
+            crate::sandbox_link::SandboxLinkService::new(self.db.clone(), sandboxes.clone())
+        })
+    }
+
+    /// Shell tools for the sandbox linked to this chat, or the one-time offer
+    /// to link one when none is.
+    fn sandbox_tools(&self, conv: &ai_conversations::Model, auth: &AuthContext) -> Vec<ChatTool> {
+        let metadata = conv.metadata.as_ref();
+        crate::sandbox_link::tools_for(
+            crate::sandbox_link::link_from_metadata(metadata).is_some(),
+            crate::sandbox_link::offered_in_metadata(metadata),
+            self.sandbox_link_for(conv).is_some(),
+            auth.has_permission(&temps_auth::permissions::Permission::SandboxesExec),
+        )
+    }
+
     fn maybe_add_goal_tool(&self, tools: &mut Vec<ChatTool>) {
         if self.goal_support.is_none() {
             return;
@@ -4766,6 +4793,7 @@ impl ConversationService {
             == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
             .then(|| self.goal_support.clone())
             .flatten();
+        let sandbox_link_opt = self.sandbox_link_for(&conv);
 
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
@@ -4804,6 +4832,7 @@ impl ConversationService {
             let mut messages = base_messages;
             let execution_state = Arc::new(tokio::sync::Mutex::new(ToolExecutionState {
                 goals: goal_support_opt.clone(),
+                sandbox: sandbox_link_opt.clone(),
                 ..Default::default()
             }));
             let interaction_conv_public_id = conv_public_id.clone();
@@ -7023,6 +7052,8 @@ fn missing_backtest(
 #[derive(Default)]
 struct ToolExecutionState {
     goals: Option<crate::goals::GoalToolSupport>,
+    /// Present for assistant chats on a server with a sandbox backend.
+    sandbox: Option<crate::sandbox_link::SandboxLinkService>,
     proposed_action_ids: Vec<i64>,
     seen_calls: std::collections::HashMap<String, String>,
 }
@@ -7117,7 +7148,11 @@ async fn dispatch_conversation_tool(
     state: &mut ToolExecutionState,
 ) -> String {
     let call_key = format!("{}|{}", call.name, call.arguments.trim());
-    if let Some(previous) = state.seen_calls.get(&call_key) {
+    // Shell commands and file reads legitimately repeat (`git status`, a
+    // `curl` against the server just started) because the sandbox changes
+    // between calls, so the repeat guard does not apply to them.
+    let repeatable = crate::sandbox_link::is_sandbox_tool(&call.name);
+    if let Some(previous) = state.seen_calls.get(&call_key).filter(|_| !repeatable) {
         return format!(
             "You already ran `{}` with these exact arguments earlier this turn. \
              Do NOT repeat it. Use a different next step or answer from the previous result:\n\n{}",
@@ -7143,6 +7178,15 @@ async fn dispatch_conversation_tool(
         match &state.goals {
             Some(goals) => goals.dispatch(&call.arguments, conversation_id, auth).await,
             None => "Goal tracking is not available in this chat.".to_string(),
+        }
+    } else if crate::sandbox_link::is_sandbox_tool(&call.name) {
+        match &state.sandbox {
+            Some(sandbox) => {
+                sandbox
+                    .dispatch(&call.name, &call.arguments, conversation_id, auth)
+                    .await
+            }
+            None => "Sandboxes are not available in this chat.".to_string(),
         }
     } else if call.name == "temps" {
         if let Some(provider) = api_tools {
@@ -7182,9 +7226,11 @@ async fn dispatch_conversation_tool(
     } else {
         format!("Tool '{}' is not available in this context.", call.name)
     };
-    state
-        .seen_calls
-        .insert(call_key, summarize_for_recall(&result));
+    if !repeatable {
+        state
+            .seen_calls
+            .insert(call_key, summarize_for_recall(&result));
+    }
     result
 }
 

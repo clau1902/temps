@@ -90,6 +90,24 @@ pub struct AiGoalRetriedAudit {
     pub goal_id: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSandboxLinkedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub sandbox_id: String,
+    /// True when the sandbox was created for the chat rather than picked.
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSandboxUnlinkedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub sandbox_id: Option<String>,
+}
+
 macro_rules! impl_audit_operation {
     ($type:ty, $op:expr) => {
         impl AuditOperation for $type {
@@ -308,6 +326,8 @@ pub struct AiActionTransitionFailedAudit {
 impl_audit_operation!(AiGoalHealStartedAudit, "ai.goal.heal_started");
 impl_audit_operation!(AiGoalCancelledAudit, "ai.goal.cancelled");
 impl_audit_operation!(AiGoalRetriedAudit, "ai.goal.retried");
+impl_audit_operation!(AiSandboxLinkedAudit, "ai.sandbox.linked");
+impl_audit_operation!(AiSandboxUnlinkedAudit, "ai.sandbox.unlinked");
 impl_audit_operation!(AiActionConfirmedAudit, "ai.pending_action.confirmed");
 impl_audit_operation!(AiActionRejectedAudit, "ai.pending_action.rejected");
 impl_audit_operation!(

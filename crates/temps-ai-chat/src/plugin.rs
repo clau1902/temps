@@ -359,6 +359,7 @@ impl TempsPlugin for AiChatPlugin {
         let router = handlers::configure_routes()
             .merge(crate::git_bindings_handlers::configure_routes())
             .merge(crate::goals_handlers::configure_routes())
+            .merge(crate::sandbox_link_handlers::configure_routes())
             .with_state(app_state)
             .merge(temps_ai_agent_cli::sandbox_model_relay_routes().with_state(model_relay));
         Some(PluginRoutes::new(router))
@@ -369,6 +370,8 @@ impl TempsPlugin for AiChatPlugin {
         document
             .merge(<crate::git_bindings_handlers::GitBindingsApiDoc as OpenApiTrait>::openapi());
         document.merge(<crate::goals_handlers::GoalsApiDoc as OpenApiTrait>::openapi());
+        document
+            .merge(<crate::sandbox_link_handlers::SandboxLinkApiDoc as OpenApiTrait>::openapi());
         Some(document)
     }
 }
