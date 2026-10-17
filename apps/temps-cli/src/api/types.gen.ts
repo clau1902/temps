@@ -5194,6 +5194,31 @@ export type ConversationSummary = {
     total_tokens: number;
 };
 
+/**
+ * What one conversation has cost so far.
+ */
+export type ConversationUsage = {
+    /**
+     * Requests made with the user's own provider key rather than the
+     * platform's, which Temps does not bill.
+     */
+    byok_requests: number;
+    /**
+     * Estimated cost in microcents (1/10000 of a cent), summed over the
+     * requests that have a known price.
+     */
+    cost_microcents: number;
+    input_tokens: number;
+    models: Array<ModelSpend>;
+    output_tokens: number;
+    requests: number;
+    /**
+     * Requests that used tokens but were logged at zero cost because the
+     * model has no known price. When this is not zero, the cost is a floor.
+     */
+    unpriced_requests: number;
+};
+
 export type ConversationsQueryParams = {
     /**
      * ISO 8601 start time (defaults to 24h ago)
@@ -15199,6 +15224,20 @@ export type ModelPricing = {
      * Provider ID (e.g. "openai", "anthropic")
      */
     provider: string;
+};
+
+/**
+ * Spend for one model within a chat.
+ */
+export type ModelSpend = {
+    /**
+     * Estimated cost in microcents (1/10000 of a cent), as logged.
+     */
+    cost_microcents: number;
+    input_tokens: number;
+    model: string;
+    output_tokens: number;
+    requests: number;
 };
 
 export type ModelUsage = {
@@ -30330,6 +30369,27 @@ export type StopUserTurnResponses = {
 };
 
 export type StopUserTurnResponse = StopUserTurnResponses[keyof StopUserTurnResponses];
+
+export type GetUserConversationUsageData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/usage';
+};
+
+export type GetUserConversationUsageErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserConversationUsageResponses = {
+    200: ConversationUsage;
+};
+
+export type GetUserConversationUsageResponse = GetUserConversationUsageResponses[keyof GetUserConversationUsageResponses];
 
 export type GetUserPendingActionData = {
     body?: never;

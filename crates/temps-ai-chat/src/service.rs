@@ -3182,6 +3182,15 @@ impl ConversationService {
             .ok_or_else(|| ChatError::NotFound(public_id.to_string()))
     }
 
+    /// What the conversation has cost so far, for its owner.
+    pub async fn usage_for_owned_conversation(
+        &self,
+        conversation: &ai_conversations::Model,
+        user_id: i32,
+    ) -> Result<crate::usage::ConversationUsage, ChatError> {
+        Ok(crate::usage::conversation_usage(self.db.as_ref(), conversation.id, user_id).await?)
+    }
+
     /// The still-unresolved permission request for this conversation, if any
     /// (ADR-038 Phase 2). A page reload only sees the plain-text "asked"
     /// message persisted by `send_message_via_interactive_cli` — without this,

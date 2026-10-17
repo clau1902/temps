@@ -24,6 +24,7 @@ pub mod provider;
 pub mod providers;
 mod sensitive;
 pub mod service;
+pub mod usage;
 
 pub use applications::{ApplicationError, ApplicationService, ApplicationWorkspaceService};
 pub use git_bindings::{GitBindingError, GitBindingService};

@@ -7356,6 +7356,44 @@ pub async fn get_user_conversation(
     }))
 }
 
+/// What this conversation has cost so far.
+///
+/// Read from the AI gateway's usage log for the conversation's owner only.
+/// Figures are estimates: requests to a model with no known price are counted
+/// in `unpriced_requests` instead of being silently priced at zero.
+#[utoipa::path(
+    get,
+    operation_id = "getUserConversationUsage",
+    tag = "AI Chat",
+    path = "/ai/conversations/{public_id}/usage",
+    params(("public_id" = String, Path,)),
+    responses(
+        (status = 200, body = crate::usage::ConversationUsage),
+        (status = 401),
+        (status = 403),
+        (status = 404),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_user_conversation_usage(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(public_id): Path<String>,
+) -> Result<Json<crate::usage::ConversationUsage>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let conversation = state
+        .service
+        .get_owned_by_public_id(auth.user_id(), &public_id)
+        .await?;
+    ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    let usage = state
+        .service
+        .usage_for_owned_conversation(&conversation, auth.user_id())
+        .await?;
+    Ok(Json(usage))
+}
+
 /// Export the bounded, server-redacted diagnostic state Temps currently owns.
 #[utoipa::path(
     get,
@@ -9924,6 +9962,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             get(get_user_conversation_diagnostics),
         )
         .route(
+            "/ai/conversations/{public_id}/usage",
+            get(get_user_conversation_usage),
+        )
+        .route(
             "/ai/conversations/{public_id}/attachments",
             post(upload_user_conversation_attachment)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_ATTACHMENT_UPLOAD_BYTES)),
@@ -10091,6 +10133,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_global_ai_workspace,
         get_user_conversation,
         get_user_conversation_diagnostics,
+        get_user_conversation_usage,
         send_user_message,
         upload_user_conversation_attachment,
         get_user_conversation_attachment,
@@ -10118,6 +10161,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         reject_pending_action,
     ),
     components(schemas(
+        crate::usage::ConversationUsage,
+        crate::usage::ModelSpend,
         ApplicationProjectResponse,
         ApplicationProjectEnvironmentResponse,
         ApplicationResponse,

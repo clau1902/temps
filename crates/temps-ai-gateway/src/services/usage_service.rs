@@ -3,14 +3,43 @@
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Set, Statement,
+    ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_entities::ai_usage_logs;
+use temps_entities::{ai_provider_models, ai_usage_logs};
 use utoipa::ToSchema;
 
 use crate::error::AiGatewayError;
+use crate::types::ModelDetails;
+
+/// How many catalogue rows for one model id are inspected for a price. The
+/// same model can be listed under several provider keys; the newest entries
+/// that carry a price win.
+const PRICE_LOOKUP_ROWS: u64 = 5;
+
+/// USD per million tokens is numerically the same as microcents per token
+/// (1 USD = 1,000,000 microcents), so a request costs
+/// `input_tokens * input_price + output_tokens * output_price` microcents.
+///
+/// Returns `None` when the catalogue publishes no price for the model, so the
+/// caller can tell "unpriced" from "free".
+pub(crate) fn cost_microcents_from_details(
+    details: &ModelDetails,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> Option<i64> {
+    let input_price = details.input_price_per_million?;
+    let output_price = details.output_price_per_million?;
+    if !input_price.is_finite() || !output_price.is_finite() {
+        return None;
+    }
+    let cost =
+        input_tokens.max(0) as f64 * input_price + output_tokens.max(0) as f64 * output_price;
+    // Saturate rather than wrap on an absurd product.
+    Some(cost.round().clamp(0.0, i64::MAX as f64) as i64)
+}
 
 // ============================================================================
 // Response structs
@@ -309,6 +338,42 @@ impl UsageService {
         .await
     }
 
+    /// Estimate a request's cost from the model catalogue's published price.
+    /// A failed lookup is logged and priced at zero: usage logging must never
+    /// fail a request over a missing estimate.
+    async fn estimate_cost_microcents<C: sea_orm::ConnectionTrait>(
+        &self,
+        connection: &C,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> i64 {
+        if input_tokens <= 0 && output_tokens <= 0 {
+            return 0;
+        }
+        let rows = ai_provider_models::Entity::find()
+            .filter(ai_provider_models::Column::ModelId.eq(model))
+            .filter(ai_provider_models::Column::Metadata.is_not_null())
+            .order_by_desc(ai_provider_models::Column::UpdatedAt)
+            .limit(PRICE_LOOKUP_ROWS)
+            .all(connection)
+            .await;
+        match rows {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|row| row.metadata)
+                .filter_map(|metadata| serde_json::from_value::<ModelDetails>(metadata).ok())
+                .find_map(|details| {
+                    cost_microcents_from_details(&details, input_tokens, output_tokens)
+                })
+                .unwrap_or(0),
+            Err(error) => {
+                tracing::warn!(model, %error, "could not look up a model price; logging zero cost");
+                0
+            }
+        }
+    }
+
     /// Write usage on the caller's transaction so batch accounting and its
     /// idempotency marker commit together.
     #[allow(clippy::too_many_arguments)]
@@ -327,6 +392,17 @@ impl UsageService {
         is_byok: bool,
         context: &AiRequestContext,
     ) -> Result<(), AiGatewayError> {
+        // Callers do not price what they log: they pass zero. Price it here,
+        // once, from the model catalogue, so every path records the same
+        // estimate. A model with no catalogue price stays at zero. A BYOK
+        // request is billed by the user's own provider account, so it is not
+        // priced here.
+        let estimated_cost_microcents = if estimated_cost_microcents > 0 || is_byok {
+            estimated_cost_microcents
+        } else {
+            self.estimate_cost_microcents(connection, model, input_tokens, output_tokens)
+                .await
+        };
         let record = ai_usage_logs::ActiveModel {
             timestamp: Set(chrono::Utc::now()),
             user_id: Set(user_id),
@@ -968,6 +1044,143 @@ fn usage_log_from_row(r: UsageLogRow) -> UsageLogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn priced(input: Option<f64>, output: Option<f64>) -> ModelDetails {
+        ModelDetails {
+            input_price_per_million: input,
+            output_price_per_million: output,
+            ..ModelDetails::default()
+        }
+    }
+
+    #[test]
+    fn cost_is_tokens_times_the_per_million_price_in_microcents() {
+        // $3 / $15 per million tokens: 1,000 in + 200 out = $0.003 + $0.003.
+        let details = priced(Some(3.0), Some(15.0));
+        assert_eq!(
+            cost_microcents_from_details(&details, 1_000, 200),
+            Some(6_000)
+        );
+        // 6,000 microcents is $0.006.
+        assert_eq!(6_000.0 / 1_000_000.0, 0.006);
+    }
+
+    #[test]
+    fn a_model_without_a_published_price_is_unpriced_not_free() {
+        assert_eq!(
+            cost_microcents_from_details(&priced(None, None), 1_000, 200),
+            None
+        );
+        assert_eq!(
+            cost_microcents_from_details(&priced(Some(3.0), None), 1_000, 200),
+            None
+        );
+    }
+
+    #[test]
+    fn a_free_model_is_priced_at_zero() {
+        assert_eq!(
+            cost_microcents_from_details(&priced(Some(0.0), Some(0.0)), 5_000, 500),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn negative_tokens_and_non_finite_prices_cannot_produce_a_negative_or_wild_cost() {
+        let details = priced(Some(3.0), Some(15.0));
+        assert_eq!(cost_microcents_from_details(&details, -50, -50), Some(0));
+        assert_eq!(
+            cost_microcents_from_details(&priced(Some(f64::NAN), Some(1.0)), 10, 10),
+            None
+        );
+        assert_eq!(
+            cost_microcents_from_details(&priced(Some(f64::MAX), Some(f64::MAX)), i64::MAX, 1),
+            Some(i64::MAX)
+        );
+    }
+
+    fn catalogue_row(metadata: Option<serde_json::Value>) -> ai_provider_models::Model {
+        let now = chrono::Utc::now();
+        ai_provider_models::Model {
+            id: 1,
+            provider_key_id: 1,
+            model_id: "vendor/model".to_string(),
+            display_name: "Model".to_string(),
+            source: "discovered".to_string(),
+            is_available: true,
+            is_enabled: true,
+            owned_by: None,
+            metadata,
+            last_seen_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn service() -> UsageService {
+        // The lookup runs on the connection it is handed, so the service's own
+        // handle is not used by these tests.
+        UsageService::new(Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_logged_request_is_priced_from_the_newest_catalogue_entry_that_has_a_price() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![
+                // Newest entry publishes nothing; the next one does.
+                catalogue_row(Some(serde_json::json!({ "name": "Model" }))),
+                catalogue_row(Some(serde_json::json!({
+                    "input_price_per_million": 3.0,
+                    "output_price_per_million": 15.0
+                }))),
+            ]])
+            .into_connection();
+
+        let cost = service()
+            .estimate_cost_microcents(&db, "vendor/model", 1_000, 200)
+            .await;
+
+        assert_eq!(cost, 6_000);
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_model_is_logged_at_zero_cost() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<ai_provider_models::Model>::new()])
+            .into_connection();
+
+        let cost = service()
+            .estimate_cost_microcents(&db, "vendor/unknown", 1_000, 200)
+            .await;
+
+        assert_eq!(cost, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_price_lookup_does_not_fail_logging() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+            .into_connection();
+
+        let cost = service()
+            .estimate_cost_microcents(&db, "vendor/model", 1_000, 200)
+            .await;
+
+        assert_eq!(cost, 0);
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_tokens_skips_the_lookup() {
+        // No query results queued: a lookup would error and be logged, so the
+        // zero here proves it returned early either way.
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let cost = service()
+            .estimate_cost_microcents(&db, "vendor/model", 0, 0)
+            .await;
+        assert_eq!(cost, 0);
+    }
 
     #[test]
     fn test_shift_params_basic() {

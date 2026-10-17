@@ -10997,6 +10997,54 @@
         ],
         "type": "object"
       },
+      "ConversationUsage": {
+        "description": "What one conversation has cost so far.",
+        "properties": {
+          "byok_requests": {
+            "description": "Requests made with the user's own provider key rather than the\nplatform's, which Temps does not bill.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "cost_microcents": {
+            "description": "Estimated cost in microcents (1/10000 of a cent), summed over the\nrequests that have a known price.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelSpend"
+            },
+            "type": "array"
+          },
+          "output_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "requests": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "unpriced_requests": {
+            "description": "Requests that used tokens but were logged at zero cost because the\nmodel has no known price. When this is not zero, the cost is a floor.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "requests",
+          "input_tokens",
+          "output_tokens",
+          "cost_microcents",
+          "unpriced_requests",
+          "byok_requests",
+          "models"
+        ],
+        "type": "object"
+      },
       "ConversationsQueryParams": {
         "properties": {
           "from": {
@@ -32922,6 +32970,39 @@
           "provider",
           "input_per_million",
           "output_per_million"
+        ],
+        "type": "object"
+      },
+      "ModelSpend": {
+        "description": "Spend for one model within a chat.",
+        "properties": {
+          "cost_microcents": {
+            "description": "Estimated cost in microcents (1/10000 of a cent), as logged.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "model": {
+            "type": "string"
+          },
+          "output_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "requests": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model",
+          "requests",
+          "input_tokens",
+          "output_tokens",
+          "cost_microcents"
         ],
         "type": "object"
       },
@@ -65092,6 +65173,46 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/usage": {
+      "get": {
+        "description": "Read from the AI gateway's usage log for the conversation's owner only.\nFigures are estimates: requests to a model with no known price are counted\nin `unpriced_requests` instead of being silently priced at zero.",
+        "operationId": "getUserConversationUsage",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationUsage"
+                }
+              }
+            }
+          },
+          "401": {},
+          "403": {},
+          "404": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "What this conversation has cost so far.",
         "tags": [
           "AI Chat"
         ],

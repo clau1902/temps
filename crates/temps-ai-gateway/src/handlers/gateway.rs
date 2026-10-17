@@ -1195,7 +1195,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_terminal_events_forward_unchanged_and_log_usage_once() {
         use sea_orm::{DatabaseBackend, MockDatabase};
-        use temps_entities::ai_usage_logs;
+        use temps_entities::{ai_provider_models, ai_usage_logs};
         use tokio_stream::StreamExt;
 
         for (index, event_type) in [
@@ -1234,27 +1234,32 @@ mod tests {
                     }
                     yield Ok(source_suffix);
                 };
+                // A non-BYOK request is priced from the catalogue first; the
+                // test model has no catalogue row.
+                let mut mock = MockDatabase::new(DatabaseBackend::Postgres);
+                if !is_byok {
+                    mock = mock.append_query_results([Vec::<ai_provider_models::Model>::new()]);
+                }
                 let db = Arc::new(
-                    MockDatabase::new(DatabaseBackend::Postgres)
-                        .append_query_results([vec![ai_usage_logs::Model {
-                            id: 1,
-                            timestamp: chrono::Utc::now(),
-                            user_id: Some(42),
-                            provider: "openai".into(),
-                            model: "streaming-test-model".into(),
-                            input_tokens: 74122,
-                            output_tokens: 32989,
-                            latency_ms: 0,
-                            estimated_cost_microcents: 0,
-                            status: 200,
-                            is_streaming: true,
-                            is_byok,
-                            conversation_id: None,
-                            tags: vec![],
-                            request_id: None,
-                            trace_id: None,
-                        }]])
-                        .into_connection(),
+                    mock.append_query_results([vec![ai_usage_logs::Model {
+                        id: 1,
+                        timestamp: chrono::Utc::now(),
+                        user_id: Some(42),
+                        provider: "openai".into(),
+                        model: "streaming-test-model".into(),
+                        input_tokens: 74122,
+                        output_tokens: 32989,
+                        latency_ms: 0,
+                        estimated_cost_microcents: 0,
+                        status: 200,
+                        is_streaming: true,
+                        is_byok,
+                        conversation_id: None,
+                        tags: vec![],
+                        request_id: None,
+                        trace_id: None,
+                    }]])
+                    .into_connection(),
                 );
                 let mut wrapped = wrap_stream_with_usage_tracking(
                     Box::pin(source),
@@ -1290,10 +1295,13 @@ mod tests {
                 .await
                 .expect("usage insert finished");
                 let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
-                assert_eq!(transactions.len(), 1, "exactly one usage insert");
-                let statements = transactions[0].statements();
-                assert_eq!(statements.len(), 1);
-                let statement = &statements[0];
+                let inserts: Vec<_> = transactions
+                    .iter()
+                    .flat_map(|transaction| transaction.statements())
+                    .filter(|statement| statement.sql.starts_with("INSERT"))
+                    .collect();
+                assert_eq!(inserts.len(), 1, "exactly one usage insert");
+                let statement = inserts[0];
                 assert!(statement.sql.starts_with("INSERT INTO \"ai_usage_logs\""));
                 let values = &statement.values.as_ref().expect("insert bindings").0;
                 assert_eq!(values[4], sea_orm::Value::BigInt(Some(74122)));

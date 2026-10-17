@@ -57,6 +57,7 @@ import {
   attachmentSelectionError,
   type OpeningAttachment,
 } from './attachment-previews'
+import { ChatSpend } from './ChatSpend'
 import { DebugChatPanel } from './DebugChatPanel'
 import { DeploymentSidebar } from './DeploymentSidebar'
 import { ProjectReferencesProvider } from './ProjectReference'
@@ -801,8 +802,9 @@ export function AssistantThread({
               !docked && 'mx-auto w-full max-w-3xl'
             )}
           >
-            {hasTabs && !workView && (
-              <div className="flex shrink-0 justify-end">
+            <div className="flex shrink-0 items-center justify-end gap-2">
+              <ChatSpend conversationPublicId={conversation.public_id} />
+              {hasTabs && !workView && (
                 <Button
                   type="button"
                   variant="outline"
@@ -815,8 +817,8 @@ export function AssistantThread({
                   <Rocket className="size-4" />
                   Working tabs
                 </Button>
-              </div>
-            )}
+              )}
+            </div>
             <GoalPanel conversationPublicId={conversation.public_id} />
             <div className="min-h-0 flex-1">
               <DebugChatPanel
