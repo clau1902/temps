@@ -140,10 +140,49 @@ pub struct GoalResponse {
     pub created_at: String,
     /// The read operation that observes the goal.
     pub check_operation: String,
+    /// The deployment this goal watches, when it watches one, so the console
+    /// can show its build stages next to the chat.
+    pub deployment: Option<GoalDeployment>,
+}
+
+/// A deployment a goal is watching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct GoalDeployment {
+    pub project_id: i32,
+    /// Absent when the goal watches whichever deployment is the project's
+    /// latest, so the console follows that deployment as it changes.
+    pub deployment_id: Option<i32>,
+}
+
+/// Reads the deployment out of a goal's check, which is a flat parameter
+/// object. Only the numeric ids are surfaced; the rest of the parameters stay
+/// private to the server.
+fn watched_deployment(operation: &str, params: &Value) -> Option<GoalDeployment> {
+    let id = |key: &str| -> Option<i32> {
+        let value = params.get(key)?;
+        let number = value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))?;
+        i32::try_from(number).ok().filter(|id| *id > 0)
+    };
+    match operation {
+        "get_deployment" => Some(GoalDeployment {
+            project_id: id("project_id")?,
+            deployment_id: Some(id("deployment_id")?),
+        }),
+        // These read the project's latest deployment; the project is the path
+        // parameter `id`, though a model may also have written `project_id`.
+        "get_last_deployment" | "get_project_deployments" => Some(GoalDeployment {
+            project_id: id("id").or_else(|| id("project_id"))?,
+            deployment_id: None,
+        }),
+        _ => None,
+    }
 }
 
 impl From<ai_goals::Model> for GoalResponse {
     fn from(goal: ai_goals::Model) -> Self {
+        let deployment = watched_deployment(&goal.check_operation, &goal.check_params);
         Self {
             id: goal.public_id,
             title: goal.title,
@@ -155,6 +194,7 @@ impl From<ai_goals::Model> for GoalResponse {
             deadline_at: goal.deadline_at.to_rfc3339(),
             created_at: goal.created_at.to_rfc3339(),
             check_operation: goal.check_operation,
+            deployment,
         }
     }
 }
@@ -1186,6 +1226,63 @@ mod tests {
         assert!(prompt.contains("attempt 1 of 3"));
         assert!(prompt.contains("build exited 1"));
         assert!(prompt.contains("retarget"));
+    }
+
+    #[test]
+    fn a_deployment_goal_exposes_only_the_two_ids() {
+        let response = GoalResponse::from(goal(&["completed"], &["failed"]));
+        assert_eq!(
+            response.deployment,
+            Some(GoalDeployment {
+                project_id: 1,
+                deployment_id: Some(2)
+            })
+        );
+    }
+
+    #[test]
+    fn deployment_ids_are_read_from_numbers_or_numeric_strings_only() {
+        let ids = |params: Value| watched_deployment("get_deployment", &params);
+        assert!(ids(serde_json::json!({"project_id": "4", "deployment_id": " 9 "})).is_some());
+        assert!(ids(serde_json::json!({"project_id": 4})).is_none());
+        assert!(ids(serde_json::json!({"project_id": 0, "deployment_id": 9})).is_none());
+        assert!(ids(serde_json::json!({"project_id": "x", "deployment_id": 9})).is_none());
+        assert!(
+            ids(serde_json::json!({"project_id": 4, "deployment_id": 99999999999_i64})).is_none()
+        );
+        assert!(watched_deployment(
+            "get_service",
+            &serde_json::json!({"project_id": 4, "deployment_id": 9})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn latest_deployment_checks_name_only_the_project() {
+        for operation in ["get_last_deployment", "get_project_deployments"] {
+            assert_eq!(
+                watched_deployment(operation, &serde_json::json!({"id": 7})),
+                Some(GoalDeployment {
+                    project_id: 7,
+                    deployment_id: None
+                }),
+                "{operation} with the path parameter"
+            );
+        }
+        assert_eq!(
+            watched_deployment(
+                "get_last_deployment",
+                &serde_json::json!({"project_id": "3"})
+            ),
+            Some(GoalDeployment {
+                project_id: 3,
+                deployment_id: None
+            })
+        );
+        assert!(watched_deployment("get_last_deployment", &serde_json::json!({})).is_none());
+        assert!(
+            watched_deployment("get_last_deployment", &serde_json::json!({"id": -2})).is_none()
+        );
     }
 
     #[test]

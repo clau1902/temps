@@ -20,7 +20,7 @@ use temps_core::{
 use utoipa::OpenApi;
 
 use crate::audit::{AiGoalCancelledAudit, AiGoalRetriedAudit};
-use crate::goals::{GoalError, GoalResponse};
+use crate::goals::{GoalDeployment, GoalError, GoalResponse};
 use crate::handlers::{ensure_user_conversation_access, AppState};
 
 impl From<GoalError> for Problem {
@@ -181,7 +181,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[derive(OpenApi)]
 #[openapi(
     paths(list_goals, cancel_goal, retry_goal),
-    components(schemas(GoalResponse))
+    components(schemas(GoalResponse, GoalDeployment))
 )]
 pub struct GoalsApiDoc;
 

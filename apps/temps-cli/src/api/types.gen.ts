@@ -12238,6 +12238,18 @@ export type GlobalTracesResponse = {
 };
 
 /**
+ * A deployment a goal is watching.
+ */
+export type GoalDeployment = {
+    /**
+     * Absent when the goal watches whichever deployment is the project's
+     * latest, so the console follows that deployment as it changes.
+     */
+    deployment_id?: number | null;
+    project_id: number;
+};
+
+/**
  * Goal as returned to the console.
  */
 export type GoalResponse = {
@@ -12254,6 +12266,7 @@ export type GoalResponse = {
      * The goal is given up, as failed, after this instant (ISO 8601).
      */
     deadline_at: string;
+    deployment?: GoalDeployment | null;
     /**
      * Opaque goal id.
      */

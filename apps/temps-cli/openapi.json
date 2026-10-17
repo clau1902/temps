@@ -26289,6 +26289,27 @@
         ],
         "type": "object"
       },
+      "GoalDeployment": {
+        "description": "A deployment a goal is watching.",
+        "properties": {
+          "deployment_id": {
+            "description": "Absent when the goal watches whichever deployment is the project's\nlatest, so the console follows that deployment as it changes.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "type": "object"
+      },
       "GoalResponse": {
         "description": "Goal as returned to the console.",
         "properties": {
@@ -26307,6 +26328,17 @@
           "deadline_at": {
             "description": "The goal is given up, as failed, after this instant (ISO 8601).",
             "type": "string"
+          },
+          "deployment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GoalDeployment",
+                "description": "The deployment this goal watches, when it watches one, so the console\ncan show its build stages next to the chat."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "id": {
             "description": "Opaque goal id.",
