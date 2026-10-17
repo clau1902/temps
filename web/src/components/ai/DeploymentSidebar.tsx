@@ -245,9 +245,13 @@ function DeploymentTab({
 export function DeploymentSidebar({
   deployments,
   onClose,
+  inDrawer = false,
 }: {
   deployments: WatchedDeployment[]
-  onClose: () => void
+  /** Omit when the panel is a fixed part of the layout. */
+  onClose?: () => void
+  /** Shown in a drawer, which brings its own close button. */
+  inDrawer?: boolean
 }) {
   const shown = deployments.slice(0, MAX_TABS)
   const newest = shown[0]
@@ -257,9 +261,33 @@ export function DeploymentSidebar({
   // until then.
   useEffect(() => setSelected(newestKey), [newestKey])
 
+  if (shown.length === 0) {
+    return (
+      <aside
+        aria-label="Working tabs"
+        className="flex h-full min-h-0 min-w-0 flex-col items-center justify-center gap-2 bg-background p-6 text-center"
+      >
+        <Rocket className="size-7 text-muted-foreground" aria-hidden="true" />
+        <p className="text-sm font-medium">
+          Nothing running from this chat yet
+        </p>
+        <p className="max-w-xs text-sm text-muted-foreground">
+          When Temps deploys something for you, its build stages and link open
+          here as a tab. Try &ldquo;Deploy my app from a Git repository
+          URL&rdquo;.
+        </p>
+        {onClose && (
+          <Button type="button" variant="outline" size="sm" onClick={onClose}>
+            Close
+          </Button>
+        )}
+      </aside>
+    )
+  }
+
   return (
     <aside
-      aria-label="Deployment"
+      aria-label="Working tabs"
       className="flex h-full min-h-0 min-w-0 flex-col bg-background"
     >
       <Tabs
@@ -267,7 +295,12 @@ export function DeploymentSidebar({
         onValueChange={setSelected}
         className="flex min-h-0 flex-1 flex-col"
       >
-        <div className="flex items-center gap-1 border-b px-2 py-2">
+        <div
+          className={cn(
+            'flex items-center gap-1 border-b px-2 py-2',
+            inDrawer && 'pr-12'
+          )}
+        >
           <TabsList className="h-8 min-w-0 flex-1 justify-start overflow-x-auto">
             {shown.map((d) => (
               <TabsTrigger
@@ -280,16 +313,18 @@ export function DeploymentSidebar({
               </TabsTrigger>
             ))}
           </TabsList>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-8 shrink-0"
-            onClick={onClose}
-            aria-label="Close deployment panel"
-          >
-            <X className="size-4" />
-          </Button>
+          {onClose && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-8 shrink-0"
+              onClick={onClose}
+              aria-label="Close working tabs"
+            >
+              <X className="size-4" />
+            </Button>
+          )}
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto">
           {shown.map((d) => (

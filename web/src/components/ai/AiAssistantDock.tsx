@@ -33,6 +33,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import {
   ResizableHandle,
   ResizablePanel,
@@ -46,6 +47,7 @@ import {
   Bell,
   ChevronDown,
   ChevronLeft,
+  ChevronsUpDown,
   ExternalLink,
   FolderGit2,
   GitBranch,
@@ -53,6 +55,8 @@ import {
   Maximize2,
   MessageSquare,
   Pencil,
+  PanelLeft,
+  PanelRight,
   Plus,
   RotateCcw,
   Search,
@@ -73,7 +77,14 @@ import {
   resolvePageChat,
 } from './chat-page-state'
 import { DebugChatPanel } from './DebugChatPanel'
+import { AgentSwitcher } from './AgentSwitcher'
 import { AssistantStart, AssistantThread } from './AssistantPanels'
+import {
+  isSwitcherShortcut,
+  readAssistantView,
+  writeAssistantView,
+  type AssistantView,
+} from './assistant-view'
 import type { OpeningAttachment } from './attachment-previews'
 import { chatTint, isAssistantConversation } from './assistant-state'
 
@@ -320,16 +331,42 @@ export function DockBody({
     id: 'assistant-chat-list-split',
     onlySaveAfterUserInteractions: true,
   })
+
+  // Two layouts: the chat list beside the conversation, or the conversation
+  // beside its working tabs with the list behind the title (and ⌘K).
+  const [view, setViewState] = useState<AssistantView>(readAssistantView)
+  const setView = (next: AssistantView) => {
+    setViewState(next)
+    writeAssistantView(next)
+  }
+  const workView = isPage && isDesktop && view === 'work'
+  const listShown = isDesktop && !workView
+  const [switcherOpen, setSwitcherOpen] = useState(false)
   useEffect(() => {
     if (!isPage) return
     const panel = sidebarRef.current
     if (!panel) return
-    if (isDesktop) {
+    if (listShown) {
       if (panel.isCollapsed()) panel.expand()
     } else if (!panel.isCollapsed()) {
       panel.collapse()
     }
-  }, [isPage, isDesktop, sidebarRef])
+  }, [isPage, listShown, sidebarRef])
+
+  // ⌘K opens the switcher in the work view, where the list is out of sight. It
+  // takes the shortcut before the console-wide palette sees it; elsewhere the
+  // palette keeps it.
+  useEffect(() => {
+    if (!workView) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!isSwitcherShortcut(event)) return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      setSwitcherOpen((open) => !open)
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [workView])
 
   const [active, setActive] = useState<ActiveChat | null>(() => {
     if (initialContext && openedProjectId != null) {
@@ -775,6 +812,14 @@ export function DockBody({
     </aside>
   )
 
+  const headerTitle = inAssistant
+    ? (assistant?.conversation.title ?? 'Temps assistant')
+    : inConversation
+      ? (active?.title ?? 'AI chat')
+      : picking
+        ? 'New project chat'
+        : 'AI assistant'
+
   const main = (
     <div
       className={cn(
@@ -814,13 +859,25 @@ export function DockBody({
               />
             )}
             <h2 className="min-w-0 truncate text-lg font-semibold">
-              {inAssistant
-                ? (assistant?.conversation.title ?? 'Temps assistant')
-                : inConversation
-                  ? (active?.title ?? 'AI chat')
-                  : picking
-                    ? 'New project chat'
-                    : 'AI assistant'}
+              {workView ? (
+                <button
+                  type="button"
+                  onClick={() => setSwitcherOpen(true)}
+                  className="-ml-1.5 inline-flex max-w-full items-center gap-2 rounded-md px-1.5 py-0.5 text-left transition-colors hover:bg-accent"
+                  title="Switch chat (⌘K)"
+                  aria-label={`${headerTitle}. Switch chat`}
+                  aria-haspopup="dialog"
+                >
+                  <span className="truncate">{headerTitle}</span>
+                  <ChevronsUpDown
+                    className="size-4 shrink-0 text-muted-foreground"
+                    aria-hidden="true"
+                  />
+                  <KbdBadge keys={['⌘', 'K']} />
+                </button>
+              ) : (
+                headerTitle
+              )}
             </h2>
           </div>
           {inAssistant ? (
@@ -853,6 +910,38 @@ export function DockBody({
           )}
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
+          {isPage && (
+            <div
+              role="group"
+              aria-label="Layout"
+              className="mr-2 hidden items-center rounded-md border p-0.5 lg:flex"
+            >
+              <Button
+                type="button"
+                size="sm"
+                variant={view === 'chats' ? 'secondary' : 'ghost'}
+                className="h-7 gap-1.5 px-2"
+                aria-pressed={view === 'chats'}
+                onClick={() => setView('chats')}
+                title="Chat list beside the conversation"
+              >
+                <PanelLeft className="size-4" />
+                <span className="hidden xl:inline">Chats</span>
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={view === 'work' ? 'secondary' : 'ghost'}
+                className="h-7 gap-1.5 px-2"
+                aria-pressed={view === 'work'}
+                onClick={() => setView('work')}
+                title="Conversation beside its working tabs"
+              >
+                <PanelRight className="size-4" />
+                <span className="hidden xl:inline">Work</span>
+              </Button>
+            </div>
+          )}
           {!inConversation && !picking && (
             <Button
               size="sm"
@@ -989,7 +1078,11 @@ export function DockBody({
         className={cn(
           'min-h-0 flex-1',
           // Full screen: a centred reading column, like a focused chat app.
-          isPage && 'mx-auto w-full max-w-3xl px-4 pb-4 pt-3'
+          // A conversation uses the whole width (its working tabs sit beside
+          // it and centre the chat column themselves); the rest read best in
+          // a centred column.
+          isPage && 'w-full px-4 pb-4 pt-3',
+          isPage && !(assistant && !assistantStarting) && 'mx-auto max-w-3xl'
         )}
       >
         {assistantStarting ? (
@@ -1008,6 +1101,7 @@ export function DockBody({
             conversation={assistant.conversation}
             firstMessage={assistant.firstMessage}
             firstAttachments={assistant.firstAttachments}
+            workView={workView}
           />
         ) : inProjectChat ? (
           <DebugChatPanel
@@ -1078,6 +1172,26 @@ export function DockBody({
           />
         )}
       </div>
+
+      <AgentSwitcher
+        open={switcherOpen}
+        onOpenChange={setSwitcherOpen}
+        chats={conversations.map((c) => ({
+          id: c.public_id,
+          title: c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
+          subtitle: isAssistantConversation(c)
+            ? 'Assistant'
+            : (c.project_name ?? metaFor(c.context_type).label),
+          lastActivityAt: c.last_activity_at,
+        }))}
+        activeId={activePublicId}
+        onOpen={(id) => {
+          const chat = conversations.find((c) => c.public_id === id)
+          if (chat) openConversation(chat)
+        }}
+        onNewAssistant={startAssistant}
+        onNewProjectChat={startPicking}
+      />
 
       <AlertDialog
         open={pendingDelete !== null}
@@ -1155,7 +1269,12 @@ export function DockBody({
       orientation="horizontal"
       className="h-full"
       defaultLayout={defaultLayout}
-      onLayoutChanged={onLayoutChanged}
+      onLayoutChanged={(layout, meta) => {
+        onLayoutChanged(layout, meta)
+        // Once a drag ends: the chats view never rests with an empty list.
+        const panel = sidebarRef.current
+        if (listShown && panel?.isCollapsed()) panel.expand()
+      }}
     >
       {/* Numbers are pixels in v4, strings are percentages: the list can grow
           to 40% of the screen but never crowd out the conversation. Below `lg`
@@ -1167,9 +1286,14 @@ export function DockBody({
         defaultSize={288}
         minSize={260}
         maxSize="40"
-        collapsible={!isDesktop}
+        collapsible
         collapsedSize={0}
-        disabled={!isDesktop}
+        disabled={!listShown}
+        onResize={(size) => {
+          // Collapsing is only for hiding the list (work view, narrow
+          // screens); a drag that empties it on the chats view springs back.
+          if (size.asPercentage === 0 && listShown) sidebarRef.current?.expand()
+        }}
         className="min-w-0"
       >
         {sidebar}
@@ -1177,7 +1301,7 @@ export function DockBody({
       <ResizableHandle
         withHandle
         aria-label="Resize chat list"
-        className={isDesktop ? undefined : 'hidden'}
+        className={listShown ? undefined : 'hidden'}
       />
       <ResizablePanel id="thread" minSize={isDesktop ? 360 : 0}>
         {main}

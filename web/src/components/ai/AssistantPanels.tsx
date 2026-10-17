@@ -707,12 +707,15 @@ export function AssistantThread({
   firstMessage,
   firstAttachments,
   readOnly,
+  workView = false,
 }: {
   conversation: Pick<ConversationResponse, 'public_id' | 'context_id'>
   firstMessage?: string
   /** Files already uploaded to this chat, sent with `firstMessage`. */
   firstAttachments?: OpeningAttachment[]
   readOnly?: boolean
+  /** The work view: working tabs are always docked beside the chat. */
+  workView?: boolean
 }) {
   const goals = useChatGoals(conversation.public_id)
   const deployments = useMemo(
@@ -744,7 +747,7 @@ export function AssistantThread({
 
   // Wide screens dock the panel beside the chat (resizable); narrower ones
   // show the same content in a drawer, so the chat is never squeezed.
-  const docked = isDesktop && hasDeployments && panelOpen
+  const docked = isDesktop && (workView || (hasDeployments && panelOpen))
   useEffect(() => {
     const panel = panelRef.current
     if (!panel) return
@@ -755,7 +758,7 @@ export function AssistantThread({
   const sidebar = (
     <DeploymentSidebar
       deployments={deployments}
-      onClose={() => setPanelOpen(false)}
+      onClose={workView ? undefined : () => setPanelOpen(false)}
     />
   )
 
@@ -765,11 +768,22 @@ export function AssistantThread({
         orientation="horizontal"
         className="h-full"
         defaultLayout={defaultLayout}
-        onLayoutChanged={onLayoutChanged}
+        onLayoutChanged={(layout, meta) => {
+          onLayoutChanged(layout, meta)
+          // The work view always rests with its tabs open.
+          const panel = panelRef.current
+          if (workView && isDesktop && panel?.isCollapsed()) panel.expand()
+        }}
       >
         <ResizablePanel id="thread" minSize={isDesktop ? 360 : 0}>
-          <div className="flex h-full min-h-0 min-w-0 flex-col gap-2">
-            {hasDeployments && (
+          <div
+            className={cn(
+              'flex h-full min-h-0 min-w-0 flex-col gap-2',
+              // Alone, the chat reads best as a centred column; beside its tabs it fills its half.
+              !docked && 'mx-auto w-full max-w-3xl'
+            )}
+          >
+            {hasDeployments && !workView && (
               <div className="flex shrink-0 justify-end">
                 <Button
                   type="button"
@@ -818,7 +832,10 @@ export function AssistantThread({
           collapsedSize={0}
           disabled={!docked}
           onResize={(size) => {
-            if (size.asPercentage === 0 && docked) setPanelOpen(false)
+            if (size.asPercentage !== 0 || !docked) return
+            // The work view keeps its tabs; elsewhere closing is the user's call.
+            if (workView) panelRef.current?.expand()
+            else setPanelOpen(false)
           }}
           className="min-w-0"
         >
@@ -836,7 +853,7 @@ export function AssistantThread({
               Build stages of the deployments in this chat.
             </SheetDescription>
           </SheetHeader>
-          {sidebar}
+          <DeploymentSidebar deployments={deployments} inDrawer />
         </SheetContent>
       </Sheet>
     </>
