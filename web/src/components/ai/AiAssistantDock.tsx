@@ -537,6 +537,22 @@ export function DockBody({
     loadList()
   }
 
+  // Open the project picker. It only renders when no chat is open, so any open
+  // conversation (or the assistant's start screen) has to be closed first —
+  // otherwise the button looks dead while a chat is showing.
+  const startPicking = () => {
+    setActive(null)
+    setAssistant(null)
+    setAssistantStarting(false)
+    setActivePublicId(null)
+    setPicking(true)
+    if (layout === 'page' && searchParams.has('chat')) {
+      const next = new URLSearchParams(searchParams)
+      next.delete('chat')
+      setSearchParams(next, { replace: true })
+    }
+  }
+
   const startAssistant = () => {
     setPicking(false)
     setActive(null)
@@ -690,7 +706,7 @@ export function DockBody({
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => setPicking(true)}
+                onClick={startPicking}
                 className="h-8 gap-1"
                 title="New chat about a specific project"
               >
@@ -845,7 +861,7 @@ export function DockBody({
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => setPicking(true)}
+                    onClick={startPicking}
                     className="h-8 rounded-l-none px-1.5"
                     title="New chat in another project"
                     aria-label="New chat in another project"
@@ -857,7 +873,7 @@ export function DockBody({
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={() => setPicking(true)}
+                  onClick={startPicking}
                   className="mr-1 h-8 gap-1"
                 >
                   <Plus className="h-4 w-4" />
@@ -1012,7 +1028,7 @@ export function DockBody({
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={() => setPicking(true)}
+                  onClick={startPicking}
                 >
                   <Plus className="mr-1.5 size-4" />
                   Project chat
