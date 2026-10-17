@@ -37,9 +37,21 @@ pub const MAX_RESOURCES: u64 = 100;
 const OP_CREATE_PROJECT: &str = "create_project";
 const OP_CREATE_SERVICE: &str = "create_service";
 const OP_CREATE_REPOSITORY: &str = "create_repository";
+/// Attaching an existing service to a project. The service was not made by the
+/// chat, but the chat put it to use, and the user wants to see the database
+/// their app now runs on next to the app.
+const OP_LINK_SERVICE: &str = "link_service_to_project";
 
 /// Write operations whose executed result names a piece the chat made.
 const CREATING_OPERATIONS: [&str; 3] = [OP_CREATE_PROJECT, OP_CREATE_SERVICE, OP_CREATE_REPOSITORY];
+
+/// Every operation read back: the creating ones plus [`OP_LINK_SERVICE`].
+const LISTED_OPERATIONS: [&str; 4] = [
+    OP_CREATE_PROJECT,
+    OP_CREATE_SERVICE,
+    OP_CREATE_REPOSITORY,
+    OP_LINK_SERVICE,
+];
 
 #[derive(Debug, Error)]
 pub enum ChatResourceError {
@@ -127,6 +139,15 @@ fn text_from(value: &Value, key: &str) -> Option<String> {
 /// Read what an executed creating action made out of its recorded result.
 /// `None` for any other operation and for a result with no usable identity.
 fn created_by(operation_id: &str, params: &Value, result: Option<&Value>) -> Option<Created> {
+    if operation_id == OP_LINK_SERVICE {
+        // The approved parameters carry the service id; the result is only the
+        // link itself.
+        let service_id = id_from(params.get("__temps_display")?)?;
+        return Some(Created::Service {
+            id: service_id,
+            service_type: None,
+        });
+    }
     let result = result?;
     match operation_id {
         OP_CREATE_PROJECT => Some(Created::Project {
@@ -179,7 +200,7 @@ impl ChatResourceService {
         let mut actions = ai_pending_actions::Entity::find()
             .filter(ai_pending_actions::Column::ConversationId.eq(conversation.id))
             .filter(ai_pending_actions::Column::Status.eq("executed"))
-            .filter(ai_pending_actions::Column::OperationId.is_in(CREATING_OPERATIONS))
+            .filter(ai_pending_actions::Column::OperationId.is_in(LISTED_OPERATIONS))
             .order_by(ai_pending_actions::Column::CreatedAt, Order::Desc)
             .order_by(ai_pending_actions::Column::Id, Order::Desc)
             .limit(MAX_RESOURCES + 1)
@@ -434,9 +455,19 @@ mod tests {
             created_by("trigger_project_pipeline", &json!({}), Some(&result)),
             None
         );
+        // A link with no recorded service names nothing.
+        assert_eq!(created_by(OP_LINK_SERVICE, &json!({}), Some(&result)), None);
+    }
+
+    #[test]
+    fn a_service_the_chat_linked_to_a_project_is_listed_by_its_id() {
+        let params = json!({"__temps_display": {"id": 1, "project_id": 36}});
         assert_eq!(
-            created_by("link_service_to_project", &json!({}), Some(&result)),
-            None
+            created_by(OP_LINK_SERVICE, &params, None),
+            Some(Created::Service {
+                id: 1,
+                service_type: None
+            })
         );
     }
 
