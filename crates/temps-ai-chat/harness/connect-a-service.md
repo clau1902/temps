@@ -29,9 +29,22 @@ project when it is linked.
    - S3: `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` and
      `S3_REGION`; the `AWS_*` equivalents are set too.
 3. Change the app to use them: add the client library, read the variable, and
-   run one small query or call so the page shows a real value. Do this in the
-   sandbox when you have one. The sandbox does not receive these variables, so
-   build and check it there, and prove the connection on the deployed app.
+   run one small query or call so the page shows a real value. Build and check
+   it in the sandbox when you have one:
+   - When the user has connected the sandbox to the project, every
+     `sandbox_exec` command already has the PostgreSQL variables above. They
+     point at a database of the sandbox's own, empty at first, with a role that
+     reaches nothing else; production data is never there. Create the tables
+     from the app itself on start (a migration in the repository), so the same
+     code works in the sandbox and in production. Never write a value into a
+     file, a command line or the chat, and print variable names only. Add a
+     `.env.example` that lists names with no values.
+   - When it is not connected, the sandbox has none of these variables. Say in
+     one sentence that the user can press Connect sandbox on the project in the
+     Made here tab, and carry on without asking them for a password. Until
+     then, write the code and prove the connection on the deployed app.
+   - Only PostgreSQL can be connected to the sandbox so far. For Redis, MongoDB
+     and S3, prove the connection on the deployed app.
 4. The variables reach the app on the next deployment, so deploy the project
    again after linking and after the code change. To get the code to the
    project, follow the `build-an-app` playbook.

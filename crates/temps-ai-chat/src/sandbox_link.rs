@@ -15,9 +15,17 @@
 //! sandbox or a revoked permission takes effect on the next call, and the
 //! model can never name a sandbox of its own choosing. Nothing here holds
 //! platform or Git credentials; the sandbox is an ordinary user sandbox.
+//!
+//! The user can also connect the sandbox to the services of a project
+//! (ADR-051). The projects are recorded under [`SANDBOX_PROJECTS_KEY`], ids
+//! only. Each command then runs with credentials that reach a database of the
+//! sandbox's own, resolved on the server for that command: they are never
+//! written to a file in the sandbox, never shown to the model, and removed
+//! from the output if a command prints them.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
@@ -47,6 +55,12 @@ pub const SANDBOX_LINK_KEY: &str = "sandbox_link";
 pub const SANDBOX_PREVIEW_KEY: &str = "sandbox_preview_port";
 /// Key recording that the user has already been offered a sandbox in this chat.
 pub const SANDBOX_OFFERED_KEY: &str = "sandbox_offered_at";
+/// Key holding the ids of the projects whose services the linked sandbox is
+/// connected to. Ids only: credentials are resolved when a command runs.
+pub const SANDBOX_PROJECTS_KEY: &str = "sandbox_connected_projects";
+/// How long the credentials resolved for a chat's commands are reused, so a
+/// run of commands does not provision the database role again for each one.
+const CREDENTIAL_CACHE_SECS: u64 = 300;
 
 pub const SANDBOX_EXEC_TOOL: &str = "sandbox_exec";
 pub const SANDBOX_READ_TOOL: &str = "sandbox_read_file";
@@ -148,6 +162,71 @@ pub struct SandboxLink {
 pub fn link_from_metadata(metadata: Option<&Value>) -> Option<SandboxLink> {
     let link = metadata?.get(SANDBOX_LINK_KEY)?;
     serde_json::from_value(link.clone()).ok()
+}
+
+/// The projects the linked sandbox is connected to, sorted and without
+/// duplicates.
+pub fn connected_projects_from_metadata(metadata: Option<&Value>) -> Vec<i32> {
+    let mut projects: Vec<i32> = metadata
+        .and_then(|value| value.get(SANDBOX_PROJECTS_KEY))
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_i64)
+                .filter_map(|id| i32::try_from(id).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    projects.sort_unstable();
+    projects.dedup();
+    projects
+}
+
+/// Whether a variable holds something that must not be shown.
+fn is_secret_variable(name: &str) -> bool {
+    ["PASSWORD", "SECRET", "TOKEN", "KEY", "URL"]
+        .iter()
+        .any(|marker| name.to_ascii_uppercase().contains(marker))
+}
+
+/// Replace the secret values among `variables` that appear in `text`.
+///
+/// This keeps a password out of the transcript when a command prints its
+/// environment. It is hygiene, not the boundary: the credential only reaches a
+/// database of the sandbox's own.
+pub fn redact_secrets(text: &str, variables: &HashMap<String, String>) -> String {
+    let mut secrets: Vec<&str> = variables
+        .iter()
+        .filter(|(name, value)| is_secret_variable(name) && value.len() >= 6)
+        .map(|(_, value)| value.as_str())
+        .collect();
+    // Longest first, so a URL that contains the password is replaced whole.
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    let mut redacted = text.to_string();
+    for secret in secrets {
+        redacted = redacted.replace(secret, "[redacted]");
+    }
+    redacted
+}
+
+/// What connecting the sandbox to a project's services gave it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct SandboxConnections {
+    /// Projects the sandbox is now connected to.
+    pub project_ids: Vec<i32>,
+    /// Names (never values) of the variables commands now run with.
+    pub variable_names: Vec<String>,
+    /// Services the sandbox can now reach.
+    pub connected_service_ids: Vec<i32>,
+    /// Linked services left out because their type cannot give a sandbox
+    /// credentials of its own yet.
+    pub skipped_service_ids: Vec<i32>,
+}
+
+struct CachedCredentials {
+    resolved: Instant,
+    variables: Arc<HashMap<String, String>>,
 }
 
 /// The port the assistant last confirmed serving a page, if one is recorded.
@@ -571,6 +650,9 @@ pub struct SandboxLinkService {
     db: Arc<DatabaseConnection>,
     sandboxes: Arc<SandboxService>,
     audit: Option<Arc<dyn AuditLogger>>,
+    /// Credentials resolved for recent commands, by sandbox and project set.
+    /// Held in memory only.
+    credentials: Arc<Mutex<HashMap<String, CachedCredentials>>>,
 }
 
 impl SandboxLinkService {
@@ -579,6 +661,7 @@ impl SandboxLinkService {
             db,
             sandboxes,
             audit: None,
+            credentials: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -748,8 +831,12 @@ impl SandboxLinkService {
         })?;
         self.merge_metadata_key(conversation, SANDBOX_LINK_KEY, &value)
             .await?;
-        // A port confirmed on the previous sandbox says nothing about this one.
+        // A port confirmed on the previous sandbox says nothing about this one,
+        // and neither do the services that sandbox was connected to.
         self.remove_metadata_key(conversation, SANDBOX_PREVIEW_KEY)
+            .await?;
+        self.release_connections(conversation).await;
+        self.remove_metadata_key(conversation, SANDBOX_PROJECTS_KEY)
             .await?;
         info!(
             conversation_id = %conversation.public_id,
@@ -764,15 +851,271 @@ impl SandboxLinkService {
         &self,
         conversation: &ai_conversations::Model,
     ) -> Result<(), SandboxLinkError> {
+        self.release_connections(conversation).await;
         self.remove_metadata_key(conversation, SANDBOX_LINK_KEY)
             .await?;
         self.remove_metadata_key(conversation, SANDBOX_PREVIEW_KEY)
+            .await?;
+        self.remove_metadata_key(conversation, SANDBOX_PROJECTS_KEY)
             .await?;
         info!(
             conversation_id = %conversation.public_id,
             "sandbox unlinked from assistant chat"
         );
         Ok(())
+    }
+
+    /// Cut the sandbox the conversation is linked to off from the services it
+    /// was connected to. Best effort: the link is being dropped either way.
+    async fn release_connections(&self, conversation: &ai_conversations::Model) {
+        let projects = connected_projects_from_metadata(conversation.metadata.as_ref());
+        let Some(link) = link_from_metadata(conversation.metadata.as_ref()) else {
+            return;
+        };
+        self.forget_credentials(&link.sandbox_id);
+        if projects.is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .sandboxes
+            .scoped_runtime_environment(conversation.created_by, &link.sandbox_id, &[])
+            .await
+        {
+            warn!(
+                conversation_id = %conversation.public_id,
+                sandbox_id = %link.sandbox_id,
+                "could not disconnect the sandbox from its services: {error}"
+            );
+        }
+    }
+
+    fn forget_credentials(&self, sandbox_id: &str) {
+        self.credentials
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|key, _| !key.starts_with(&format!("{sandbox_id}:")));
+    }
+
+    /// Connect the chat's sandbox to the services of `project_id`.
+    ///
+    /// The sandbox gets a database of its own on each PostgreSQL service the
+    /// project uses, and commands then run with credentials for it. Nothing is
+    /// recorded unless at least one service could be connected.
+    pub async fn connect_project(
+        &self,
+        conversation: &ai_conversations::Model,
+        user_id: i32,
+        project_id: i32,
+    ) -> Result<SandboxConnections, SandboxLinkError> {
+        let link = link_from_metadata(conversation.metadata.as_ref()).ok_or_else(|| {
+            SandboxLinkError::NotLinked {
+                conversation_id: conversation.public_id.clone(),
+            }
+        })?;
+        let previous = connected_projects_from_metadata(conversation.metadata.as_ref());
+        let mut projects = previous.clone();
+        projects.push(project_id);
+        projects.sort_unstable();
+        projects.dedup();
+
+        let row = self
+            .sandboxes
+            .find_by_public_id(&link.sandbox_id, user_id)
+            .await
+            .map_err(|_| SandboxLinkError::SandboxNotFound {
+                sandbox_id: link.sandbox_id.clone(),
+                user_id,
+            })?;
+        if readiness(&row.status) == SandboxReadiness::Asleep {
+            self.wake(conversation.id, &link, user_id)
+                .await
+                .map_err(|reason| SandboxLinkError::Sandbox {
+                    conversation_id: conversation.public_id.clone(),
+                    reason,
+                })?;
+        }
+        let runtime = self
+            .sandboxes
+            .scoped_runtime_environment(user_id, &link.sandbox_id, &projects)
+            .await
+            .map_err(|error| Self::connection_error(conversation, error))?;
+        if runtime.connected_service_ids.is_empty() {
+            // Put the network back as it was before reporting the problem.
+            if let Err(error) = self
+                .sandboxes
+                .scoped_runtime_environment(user_id, &link.sandbox_id, &previous)
+                .await
+            {
+                warn!(
+                    conversation_id = %conversation.public_id,
+                    "could not restore the sandbox's connections: {error}"
+                );
+            }
+            return Err(SandboxLinkError::Validation {
+                conversation_id: conversation.public_id.clone(),
+                message: format!(
+                    "project {project_id} has no linked service that can give a sandbox \
+                     credentials of its own yet (PostgreSQL can). Link a database to the project \
+                     first"
+                ),
+            });
+        }
+        self.merge_metadata_key(conversation, SANDBOX_PROJECTS_KEY, &json!(projects))
+            .await?;
+        self.forget_credentials(&link.sandbox_id);
+        info!(
+            conversation_id = %conversation.public_id,
+            sandbox_id = %link.sandbox_id,
+            project_id,
+            services = ?runtime.connected_service_ids,
+            "connected the chat's sandbox to a project's services"
+        );
+        Ok(Self::connections_of(projects, &runtime))
+    }
+
+    /// Disconnect the chat's sandbox from the services of `project_id`.
+    pub async fn disconnect_project(
+        &self,
+        conversation: &ai_conversations::Model,
+        user_id: i32,
+        project_id: i32,
+    ) -> Result<SandboxConnections, SandboxLinkError> {
+        let link = link_from_metadata(conversation.metadata.as_ref()).ok_or_else(|| {
+            SandboxLinkError::NotLinked {
+                conversation_id: conversation.public_id.clone(),
+            }
+        })?;
+        let mut projects = connected_projects_from_metadata(conversation.metadata.as_ref());
+        projects.retain(|id| *id != project_id);
+        let runtime = self
+            .sandboxes
+            .scoped_runtime_environment(user_id, &link.sandbox_id, &projects)
+            .await
+            .map_err(|error| Self::connection_error(conversation, error))?;
+        if projects.is_empty() {
+            self.remove_metadata_key(conversation, SANDBOX_PROJECTS_KEY)
+                .await?;
+        } else {
+            self.merge_metadata_key(conversation, SANDBOX_PROJECTS_KEY, &json!(projects))
+                .await?;
+        }
+        self.forget_credentials(&link.sandbox_id);
+        info!(
+            conversation_id = %conversation.public_id,
+            sandbox_id = %link.sandbox_id,
+            project_id,
+            "disconnected the chat's sandbox from a project's services"
+        );
+        Ok(Self::connections_of(projects, &runtime))
+    }
+
+    fn connections_of(
+        project_ids: Vec<i32>,
+        runtime: &temps_sandbox::services::ScopedRuntime,
+    ) -> SandboxConnections {
+        let mut variable_names = runtime.variable_names();
+        variable_names.sort();
+        SandboxConnections {
+            project_ids,
+            variable_names,
+            connected_service_ids: runtime.connected_service_ids.clone(),
+            skipped_service_ids: runtime.skipped_service_ids.clone(),
+        }
+    }
+
+    fn connection_error(
+        conversation: &ai_conversations::Model,
+        error: SandboxError,
+    ) -> SandboxLinkError {
+        match error {
+            SandboxError::RuntimeVariableConflict { .. } => SandboxLinkError::Validation {
+                conversation_id: conversation.public_id.clone(),
+                message: format!(
+                    "{error}. Two connected projects each have a database, and an app reads one \
+                     set of POSTGRES_* variables: connect the sandbox to one project at a time"
+                ),
+            },
+            other => SandboxLinkError::Sandbox {
+                conversation_id: conversation.public_id.clone(),
+                reason: other.to_string(),
+            },
+        }
+    }
+
+    /// The projects the conversation's sandbox is connected to, read fresh.
+    async fn connected_projects(
+        &self,
+        conversation_id: i64,
+        user_id: i32,
+    ) -> Result<Vec<i32>, DbErr> {
+        let row = ai_conversations::Entity::find_by_id(conversation_id)
+            .filter(ai_conversations::Column::CreatedBy.eq(user_id))
+            .one(self.db.as_ref())
+            .await?;
+        Ok(row
+            .map(|row| connected_projects_from_metadata(row.metadata.as_ref()))
+            .unwrap_or_default())
+    }
+
+    /// The variables a command in the chat's sandbox runs with: empty when no
+    /// project is connected. `Err` is the complete tool result for a command
+    /// that must not run without them.
+    async fn exec_environment(
+        &self,
+        conversation_id: i64,
+        link: &SandboxLink,
+        user_id: i32,
+    ) -> Result<Arc<HashMap<String, String>>, String> {
+        let projects = self
+            .connected_projects(conversation_id, user_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "`{SANDBOX_EXEC_TOOL}` failed: could not read the connected projects: {error}"
+                )
+            })?;
+        if projects.is_empty() {
+            return Ok(Arc::new(HashMap::new()));
+        }
+        let key = format!("{}:{projects:?}", link.sandbox_id);
+        let fresh = Duration::from_secs(CREDENTIAL_CACHE_SECS);
+        if let Some(cached) = self
+            .credentials
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .filter(|cached| cached.resolved.elapsed() < fresh)
+        {
+            return Ok(cached.variables.clone());
+        }
+        let runtime = self
+            .sandboxes
+            .scoped_runtime_variables(user_id, &link.sandbox_id, &projects)
+            .await
+            .map_err(|error| {
+                warn!(
+                    conversation_id,
+                    sandbox_id = %link.sandbox_id,
+                    "could not prepare the sandbox's database credentials: {error}"
+                );
+                format!(
+                    "Nothing ran: the database credentials for this sandbox could not be \
+                     prepared ({error}). Tell the user; they can disconnect the sandbox from \
+                     the project's services in the chat's Made here tab."
+                )
+            })?;
+        let variables = Arc::new(runtime.variables);
+        self.credentials
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                key,
+                CachedCredentials {
+                    resolved: Instant::now(),
+                    variables: variables.clone(),
+                },
+            );
+        Ok(variables)
     }
 
     /// Record that the user has been offered a sandbox. Returns `false` when
@@ -882,8 +1225,20 @@ impl SandboxLinkService {
         };
         let result = match tool {
             SANDBOX_EXEC_TOOL => {
-                self.run_exec(arguments, conversation_id, &link, &row.work_dir, user_id)
-                    .await
+                match self.exec_environment(conversation_id, &link, user_id).await {
+                    Ok(environment) => {
+                        self.run_exec(
+                            arguments,
+                            conversation_id,
+                            &link,
+                            &row.work_dir,
+                            user_id,
+                            &environment,
+                        )
+                        .await
+                    }
+                    Err(message) => message,
+                }
             }
             SANDBOX_READ_TOOL => {
                 self.run_read(arguments, conversation_id, &link, &row.work_dir, user_id)
@@ -927,6 +1282,8 @@ impl SandboxLinkService {
                     seconds,
                     "resumed the chat's sleeping sandbox"
                 );
+                self.reconnect_after_wake(conversation_id, link, user_id)
+                    .await;
                 Ok(format!(
                     "Sandbox {} was asleep and has been resumed (took {seconds}s). Its files \
                      are intact. Mention in one short sentence that you woke it.",
@@ -964,6 +1321,33 @@ impl SandboxLinkService {
                     link.name
                 ))
             }
+        }
+    }
+
+    /// Put a woken sandbox back on the data network of the services it was
+    /// connected to. Best effort: a failure surfaces when a command needs them.
+    async fn reconnect_after_wake(&self, conversation_id: i64, link: &SandboxLink, user_id: i32) {
+        let projects = match self.connected_projects(conversation_id, user_id).await {
+            Ok(projects) if !projects.is_empty() => projects,
+            Ok(_) => return,
+            Err(error) => {
+                warn!(
+                    conversation_id,
+                    "could not read the connected projects: {error}"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self
+            .sandboxes
+            .scoped_runtime_environment(user_id, &link.sandbox_id, &projects)
+            .await
+        {
+            warn!(
+                conversation_id,
+                sandbox_id = %link.sandbox_id,
+                "could not reconnect the woken sandbox to its services: {error}"
+            );
         }
     }
 
@@ -1167,6 +1551,7 @@ impl SandboxLinkService {
         link: &SandboxLink,
         work_dir: &str,
         user_id: i32,
+        environment: &HashMap<String, String>,
     ) -> String {
         let args: ExecArgs = match serde_json::from_str(arguments) {
             Ok(args) => args,
@@ -1195,7 +1580,7 @@ impl SandboxLinkService {
         );
         let options = ExecOptions {
             cmd: vec!["sh".to_string(), "-c".to_string(), args.command],
-            env: Default::default(),
+            env: environment.clone(),
             cwd: Some(
                 args.cwd
                     .map(|cwd| resolve_path(work_dir, &cwd))
@@ -1237,8 +1622,14 @@ impl SandboxLinkService {
                     .host_template(&link.sandbox_id);
                 json!({
                     "exit_code": result.exit_code,
-                    "stdout": cap_tail(&result.stdout, MAX_TOOL_OUTPUT_BYTES / 2),
-                    "stderr": cap_tail(&result.stderr, MAX_TOOL_OUTPUT_BYTES / 2),
+                    "stdout": cap_tail(
+                        &redact_secrets(&result.stdout, environment),
+                        MAX_TOOL_OUTPUT_BYTES / 2,
+                    ),
+                    "stderr": cap_tail(
+                        &redact_secrets(&result.stderr, environment),
+                        MAX_TOOL_OUTPUT_BYTES / 2,
+                    ),
                     "preview_url_template": preview_url,
                     "preview_note": format!(
                         "To show the user a page, call `{SANDBOX_PREVIEW_TOOL}` with its port: it \
@@ -1444,6 +1835,79 @@ mod tests {
         );
         assert_eq!(result, "Resumed.\n\n{\"exit_code\":0}");
         assert_eq!(with_notice(None, "ok".to_string()), "ok");
+    }
+
+    #[test]
+    fn connected_projects_are_read_sorted_and_deduplicated() {
+        let metadata = json!({ "sandbox_connected_projects": [7, 3, 7, "x", 99999999999i64] });
+        assert_eq!(
+            connected_projects_from_metadata(Some(&metadata)),
+            vec![3, 7]
+        );
+        assert!(connected_projects_from_metadata(Some(&json!({}))).is_empty());
+        assert!(connected_projects_from_metadata(None).is_empty());
+        let wrong_shape = json!({ "sandbox_connected_projects": "3" });
+        assert!(connected_projects_from_metadata(Some(&wrong_shape)).is_empty());
+    }
+
+    fn database_variables() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "POSTGRES_PASSWORD".to_string(),
+                "p4ssw0rd-derived".to_string(),
+            ),
+            (
+                "POSTGRES_URL".to_string(),
+                "postgresql://sbx_app:p4ssw0rd-derived@postgres-main:5432/app_sandbox".to_string(),
+            ),
+            ("POSTGRES_USER".to_string(), "sbx_app".to_string()),
+            ("POSTGRES_HOST".to_string(), "postgres-main".to_string()),
+            ("POSTGRES_PORT".to_string(), "5432".to_string()),
+            ("POSTGRES_DB".to_string(), "app_sandbox".to_string()),
+        ])
+    }
+
+    #[test]
+    fn a_command_that_prints_its_environment_does_not_show_the_password() {
+        let variables = database_variables();
+        let printed = "POSTGRES_PASSWORD=p4ssw0rd-derived\nPOSTGRES_URL=postgresql://sbx_app:p4ssw0rd-derived@postgres-main:5432/app_sandbox\n";
+        let shown = redact_secrets(printed, &variables);
+        assert!(!shown.contains("p4ssw0rd-derived"), "{shown}");
+        assert_eq!(shown.matches("[redacted]").count(), 2);
+    }
+
+    #[test]
+    fn redaction_leaves_the_non_secret_names_readable() {
+        let variables = database_variables();
+        let shown = redact_secrets("host postgres-main db app_sandbox port 5432", &variables);
+        assert_eq!(shown, "host postgres-main db app_sandbox port 5432");
+    }
+
+    #[test]
+    fn short_values_are_not_redacted_so_ordinary_text_survives() {
+        let variables = HashMap::from([("APP_TOKEN".to_string(), "abc".to_string())]);
+        assert_eq!(redact_secrets("abc abc", &variables), "abc abc");
+    }
+
+    #[test]
+    fn variable_names_are_classified_by_what_they_hold() {
+        for secret in [
+            "POSTGRES_PASSWORD",
+            "POSTGRES_URL",
+            "api_key",
+            "AUTH_TOKEN",
+            "CLIENT_SECRET",
+        ] {
+            assert!(is_secret_variable(secret), "{secret}");
+        }
+        for plain in [
+            "POSTGRES_HOST",
+            "POSTGRES_PORT",
+            "POSTGRES_DB",
+            "POSTGRES_USER",
+        ] {
+            assert!(!is_secret_variable(plain), "{plain}");
+        }
     }
 
     #[test]

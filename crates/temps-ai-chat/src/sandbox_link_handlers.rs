@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::get,
+    routing::{delete, get},
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -23,11 +23,15 @@ use temps_core::{
 };
 use utoipa::{OpenApi, ToSchema};
 
-use crate::audit::{AiSandboxLinkedAudit, AiSandboxUnlinkedAudit};
+use crate::audit::{
+    AiSandboxLinkedAudit, AiSandboxServicesConnectedAudit, AiSandboxServicesDisconnectedAudit,
+    AiSandboxUnlinkedAudit,
+};
 use crate::handlers::{ensure_user_conversation_access, AppState};
 use crate::sandbox_link::{
-    context_supports_sandbox, link_from_metadata, preview_port_from_metadata,
-    project_for_new_sandbox, SandboxLink, SandboxLinkError, SandboxLinkService,
+    connected_projects_from_metadata, context_supports_sandbox, link_from_metadata,
+    preview_port_from_metadata, project_for_new_sandbox, SandboxConnections, SandboxLink,
+    SandboxLinkError, SandboxLinkService,
 };
 
 impl From<SandboxLinkError> for Problem {
@@ -73,6 +77,16 @@ pub struct ChatSandboxStatus {
     pub offered: bool,
     /// Where the linked sandbox's apps are served, for the Preview tab.
     pub preview: Option<ChatPreview>,
+    /// Projects whose services the linked sandbox is connected to: its
+    /// commands run with credentials for a database of its own on each.
+    pub connected_projects: Vec<i32>,
+}
+
+/// Connect the chat's sandbox to the services of a project.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ConnectProjectRequest {
+    /// The project whose services the sandbox may use.
+    pub project_id: i32,
 }
 
 /// How to reach a page served from the chat's sandbox.
@@ -160,6 +174,7 @@ fn status_of(
         linked: link_from_metadata(metadata),
         offered: crate::sandbox_link::offered_in_metadata(metadata),
         preview: None,
+        connected_projects: connected_projects_from_metadata(metadata),
     }
 }
 
@@ -306,6 +321,7 @@ pub async fn link_chat_sandbox(
         linked: Some(link),
         offered: true,
         preview: None,
+        connected_projects: Vec::new(),
     }))
 }
 
@@ -358,22 +374,170 @@ pub async fn unlink_chat_sandbox(
         linked: None,
         offered: true,
         preview: None,
+        connected_projects: Vec::new(),
     }))
 }
 
+/// Guards shared by connecting and disconnecting: handing a sandbox database
+/// credentials is the same act as issuing a deployment its runtime variables.
+macro_rules! connection_guards {
+    ($auth:expr, $state:expr, $project_id:expr) => {
+        permission_guard!($auth, ProjectsRead);
+        permission_guard!($auth, SandboxesExec);
+        permission_guard!($auth, ExternalServicesWrite);
+        permission_guard!($auth, SecretsRead);
+        deny_deployment_token!($auth);
+        project_scope_guard!($auth, $project_id);
+        project_access_guard!($auth, $project_id, $state.project_access_checker);
+    };
+}
+
+/// Let the chat's sandbox use a project's database.
+///
+/// The sandbox gets a database of its own on each PostgreSQL service linked to
+/// the project, and a role that can use that database and no other. Commands
+/// the assistant runs there receive the credentials as the same `POSTGRES_*`
+/// variables a deployment gets; the values are never shown to the model.
+#[utoipa::path(
+    post, tag = "AI Chat", path = "/ai/conversations/{public_id}/sandbox/projects",
+    params(("public_id" = String, Path, description = "Conversation public id")),
+    request_body = ConnectProjectRequest,
+    responses(
+        (status = 200, description = "Sandbox connected", body = SandboxConnections),
+        (status = 400, description = "The project has no service that can be connected", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Conversation or sandbox not found", body = ProblemDetails),
+        (status = 409, description = "The chat has no linked sandbox", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+        (status = 503, description = "This server has no sandbox backend", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn connect_chat_sandbox_project(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(public_id): Path<String>,
+    Json(request): Json<ConnectProjectRequest>,
+) -> Result<Json<SandboxConnections>, Problem> {
+    connection_guards!(auth, state, request.project_id);
+    let conversation = state
+        .service
+        .get_owned_by_public_id(auth.user_id(), &public_id)
+        .await?;
+    ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    let service = link_service(&state, &conversation.public_id)?;
+    let connections = service
+        .connect_project(&conversation, auth.user_id(), request.project_id)
+        .await?;
+    let sandbox_id = link_from_metadata(conversation.metadata.as_ref())
+        .map(|link| link.sandbox_id)
+        .unwrap_or_default();
+    state
+        .audit(&AiSandboxServicesConnectedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id: request.project_id,
+            conversation_id: conversation.public_id.clone(),
+            sandbox_id,
+            connected_service_ids: connections.connected_service_ids.clone(),
+            variable_names: connections.variable_names.clone(),
+        })
+        .await;
+    Ok(Json(connections))
+}
+
+/// Stop the chat's sandbox using a project's database.
+#[utoipa::path(
+    delete, tag = "AI Chat", path = "/ai/conversations/{public_id}/sandbox/projects/{project_id}",
+    params(
+        ("public_id" = String, Path, description = "Conversation public id"),
+        ("project_id" = i32, Path, description = "Project to disconnect")
+    ),
+    responses(
+        (status = 200, description = "Sandbox disconnected", body = SandboxConnections),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Conversation or sandbox not found", body = ProblemDetails),
+        (status = 409, description = "The chat has no linked sandbox", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+        (status = 503, description = "This server has no sandbox backend", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn disconnect_chat_sandbox_project(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((public_id, project_id)): Path<(String, i32)>,
+) -> Result<Json<SandboxConnections>, Problem> {
+    connection_guards!(auth, state, project_id);
+    let conversation = state
+        .service
+        .get_owned_by_public_id(auth.user_id(), &public_id)
+        .await?;
+    ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    let service = link_service(&state, &conversation.public_id)?;
+    let connections = service
+        .disconnect_project(&conversation, auth.user_id(), project_id)
+        .await?;
+    let sandbox_id = link_from_metadata(conversation.metadata.as_ref())
+        .map(|link| link.sandbox_id)
+        .unwrap_or_default();
+    state
+        .audit(&AiSandboxServicesDisconnectedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id,
+            conversation_id: conversation.public_id.clone(),
+            sandbox_id,
+        })
+        .await;
+    Ok(Json(connections))
+}
+
 pub fn configure_routes() -> Router<Arc<AppState>> {
-    Router::new().route(
-        "/ai/conversations/{public_id}/sandbox",
-        get(get_chat_sandbox)
-            .post(link_chat_sandbox)
-            .delete(unlink_chat_sandbox),
-    )
+    Router::new()
+        .route(
+            "/ai/conversations/{public_id}/sandbox",
+            get(get_chat_sandbox)
+                .post(link_chat_sandbox)
+                .delete(unlink_chat_sandbox),
+        )
+        .route(
+            "/ai/conversations/{public_id}/sandbox/projects",
+            axum::routing::post(connect_chat_sandbox_project),
+        )
+        .route(
+            "/ai/conversations/{public_id}/sandbox/projects/{project_id}",
+            delete(disconnect_chat_sandbox_project),
+        )
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_chat_sandbox, link_chat_sandbox, unlink_chat_sandbox),
-    components(schemas(ChatSandboxStatus, ChatPreview, LinkSandboxRequest, SandboxLink))
+    paths(
+        get_chat_sandbox,
+        link_chat_sandbox,
+        unlink_chat_sandbox,
+        connect_chat_sandbox_project,
+        disconnect_chat_sandbox_project
+    ),
+    components(schemas(
+        ChatSandboxStatus,
+        ChatPreview,
+        LinkSandboxRequest,
+        SandboxLink,
+        ConnectProjectRequest,
+        SandboxConnections
+    ))
 )]
 pub struct SandboxLinkApiDoc;
 
@@ -455,7 +619,8 @@ mod tests {
                 "name": "scratch",
                 "linked_at": "2026-10-17T09:30:00Z"
             },
-            "sandbox_offered_at": "2026-10-17T09:00:00Z"
+            "sandbox_offered_at": "2026-10-17T09:00:00Z",
+            "sandbox_connected_projects": [12, 5]
         });
         let status = status_of(
             Availability {
@@ -466,6 +631,7 @@ mod tests {
         );
         assert_eq!(status.linked.map(|l| l.sandbox_id), Some("sbx_abc".into()));
         assert!(status.offered);
+        assert_eq!(status.connected_projects, vec![5, 12]);
 
         let empty = status_of(
             Availability {
@@ -475,6 +641,7 @@ mod tests {
             None,
         );
         assert!(empty.linked.is_none() && !empty.offered && !empty.configured);
+        assert!(empty.connected_projects.is_empty());
         assert!(empty.reason.is_some());
     }
 }

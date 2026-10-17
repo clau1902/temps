@@ -108,6 +108,26 @@ pub struct AiSandboxUnlinkedAudit {
     pub sandbox_id: Option<String>,
 }
 
+/// A chat's sandbox was connected to a project's services (ADR-051). Names the
+/// variables the sandbox's commands run with, never their values.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSandboxServicesConnectedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub conversation_id: String,
+    pub sandbox_id: String,
+    pub connected_service_ids: Vec<i32>,
+    pub variable_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSandboxServicesDisconnectedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub conversation_id: String,
+    pub sandbox_id: String,
+}
+
 macro_rules! impl_audit_operation {
     ($type:ty, $op:expr) => {
         impl AuditOperation for $type {
@@ -328,6 +348,14 @@ impl_audit_operation!(AiGoalCancelledAudit, "ai.goal.cancelled");
 impl_audit_operation!(AiGoalRetriedAudit, "ai.goal.retried");
 impl_audit_operation!(AiSandboxLinkedAudit, "ai.sandbox.linked");
 impl_audit_operation!(AiSandboxUnlinkedAudit, "ai.sandbox.unlinked");
+impl_audit_operation!(
+    AiSandboxServicesConnectedAudit,
+    "ai.sandbox.services_connected"
+);
+impl_audit_operation!(
+    AiSandboxServicesDisconnectedAudit,
+    "ai.sandbox.services_disconnected"
+);
 impl_audit_operation!(AiActionConfirmedAudit, "ai.pending_action.confirmed");
 impl_audit_operation!(AiActionRejectedAudit, "ai.pending_action.rejected");
 impl_audit_operation!(
