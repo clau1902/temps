@@ -29875,7 +29875,6 @@ export type UploadUserConversationAttachmentErrors = {
     404: unknown;
     409: unknown;
     413: unknown;
-    415: unknown;
 };
 
 export type UploadUserConversationAttachmentResponses = {
