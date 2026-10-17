@@ -120,6 +120,14 @@ function GoalRow({
   )
 }
 
+/** The chat's goals, polled quickly while one is open. Shared by the strip and the deployment panel, which read the same cache entry. */
+export function useChatGoals(conversationPublicId: string) {
+  return useQuery({
+    ...listGoalsOptions({ path: { public_id: conversationPublicId } }),
+    refetchInterval: (query) => goalPollingInterval(query.state.data ?? []),
+  })
+}
+
 /**
  * What this chat is keeping an eye on. The assistant registers a goal after it
  * starts something that can fail later (a deployment, a new service); Temps then
@@ -133,10 +141,7 @@ export function GoalPanel({
 }) {
   const queryClient = useQueryClient()
   const options = { path: { public_id: conversationPublicId } }
-  const goals = useQuery({
-    ...listGoalsOptions(options),
-    refetchInterval: (query) => goalPollingInterval(query.state.data ?? []),
-  })
+  const goals = useChatGoals(conversationPublicId)
   const refresh = () =>
     queryClient.invalidateQueries({ queryKey: listGoalsQueryKey(options) })
 

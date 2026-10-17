@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import type { GoalResponse } from '@/api/client'
 import {
   goalPollingInterval,
   presentGoal,
   visibleGoals,
+  watchedDeployments,
 } from './goal-presentation'
 
 const goal = (status: string, attempts = 0) => ({
@@ -57,7 +59,7 @@ describe('goalPollingInterval', () => {
 })
 
 describe('visibleGoals', () => {
-  test('keeps every open goal and only the latest closed ones', () => {
+  test('keeps open goals and ones that gave up, drops finished and stopped', () => {
     const goals = [
       goal('achieved'),
       goal('active'),
@@ -68,8 +70,50 @@ describe('visibleGoals', () => {
     expect(visibleGoals(goals).map((g) => g.status)).toEqual([
       'active',
       'needs_you',
-      'achieved',
       'failed',
+    ])
+  })
+
+  test('shows only the latest goals that gave up', () => {
+    const goals = [goal('failed'), goal('failed'), goal('failed')]
+    expect(visibleGoals(goals)).toHaveLength(2)
+  })
+})
+
+describe('watchedDeployments', () => {
+  const watching = (
+    id: string,
+    created_at: string,
+    deployment?: { project_id: number; deployment_id?: number | null }
+  ) =>
+    ({
+      ...goal('achieved'),
+      id,
+      created_at,
+      deployment,
+    }) as unknown as GoalResponse
+
+  test('lists each deployment once, newest first, and skips other goals', () => {
+    const found = watchedDeployments([
+      watching('a', '2026-10-17T08:00:00Z', {
+        project_id: 1,
+        deployment_id: 10,
+      }),
+      watching('b', '2026-10-17T09:00:00Z', {
+        project_id: 1,
+        deployment_id: 11,
+      }),
+      watching('c', '2026-10-17T09:30:00Z'),
+      watching('e', '2026-10-17T07:00:00Z', { project_id: 2 }),
+      watching('d', '2026-10-17T10:00:00Z', {
+        project_id: 1,
+        deployment_id: 10,
+      }),
+    ])
+    expect(found.map((d) => [d.deploymentId, d.goal.id])).toEqual([
+      [10, 'd'],
+      [11, 'b'],
+      [null, 'e'],
     ])
   })
 })

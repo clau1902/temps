@@ -28,10 +28,12 @@ import {
   ArrowUp,
   Loader2,
   Paperclip,
+  Rocket,
   Sparkles,
   X,
 } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
@@ -56,7 +58,22 @@ import {
   type OpeningAttachment,
 } from './attachment-previews'
 import { DebugChatPanel } from './DebugChatPanel'
-import { GoalPanel } from './GoalPanel'
+import { DeploymentSidebar } from './DeploymentSidebar'
+import { GoalPanel, useChatGoals } from './GoalPanel'
+import { presentGoal, watchedDeployments } from './goal-presentation'
+import { useIsDesktop } from '@/components/hooks/use-mobile'
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from '@/components/ui/resizable'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
 
 const keySchema = z.object({
   api_key: z.string().trim().min(1, 'Paste your OpenRouter API key'),
@@ -697,24 +714,131 @@ export function AssistantThread({
   firstAttachments?: OpeningAttachment[]
   readOnly?: boolean
 }) {
+  const goals = useChatGoals(conversation.public_id)
+  const deployments = useMemo(
+    () => watchedDeployments(goals.data ?? []),
+    [goals.data]
+  )
+  const hasDeployments = deployments.length > 0
+  const isDesktop = useIsDesktop()
+  const [panelOpen, setPanelOpen] = useState(false)
+  const panelRef = usePanelRef()
+  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
+    id: 'assistant-deployment-split',
+    onlySaveAfterUserInteractions: true,
+  })
+
+  // A deployment that is still being built opens the panel by itself, once per
+  // deployment; a finished one in an old chat waits for the button instead.
+  const newest = deployments[0]
+  const newestKey = newest
+    ? `${newest.projectId}:${newest.deploymentId ?? 'latest'}`
+    : ''
+  const announced = useRef('')
+  const newestOpen = newest ? presentGoal(newest.goal).open : false
+  useEffect(() => {
+    if (!newestKey || announced.current === newestKey) return
+    announced.current = newestKey
+    if (newestOpen) setPanelOpen(true)
+  }, [newestKey, newestOpen])
+
+  // Wide screens dock the panel beside the chat (resizable); narrower ones
+  // show the same content in a drawer, so the chat is never squeezed.
+  const docked = isDesktop && hasDeployments && panelOpen
+  useEffect(() => {
+    const panel = panelRef.current
+    if (!panel) return
+    if (docked && panel.isCollapsed()) panel.expand()
+    if (!docked && !panel.isCollapsed()) panel.collapse()
+  }, [docked, panelRef])
+
+  const sidebar = (
+    <DeploymentSidebar
+      deployments={deployments}
+      onClose={() => setPanelOpen(false)}
+    />
+  )
+
   return (
-    <div className="flex h-full min-h-0 flex-col gap-2">
-      <GoalPanel conversationPublicId={conversation.public_id} />
-      <div className="min-h-0 flex-1">
-        <DebugChatPanel
-          key={conversation.public_id}
-          conversationPublicId={conversation.public_id}
-          userScoped
-          contextType={ASSISTANT_CONTEXT_TYPE}
-          contextId={conversation.context_id}
-          detailLevel="simple"
-          initialMessage={firstMessage}
-          initialAttachments={firstAttachments}
-          emptyHint="Ask about your projects, deployments or settings."
-          placeholder="Ask Temps to inspect or change something…"
-          readOnly={readOnly}
+    <>
+      <ResizablePanelGroup
+        orientation="horizontal"
+        className="h-full"
+        defaultLayout={defaultLayout}
+        onLayoutChanged={onLayoutChanged}
+      >
+        <ResizablePanel id="thread" minSize={isDesktop ? 360 : 0}>
+          <div className="flex h-full min-h-0 min-w-0 flex-col gap-2">
+            {hasDeployments && (
+              <div className="flex shrink-0 justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5"
+                  aria-pressed={panelOpen}
+                  onClick={() => setPanelOpen((open) => !open)}
+                  title="Show the build stages of this chat's deployments"
+                >
+                  <Rocket className="size-4" />
+                  Deployment
+                </Button>
+              </div>
+            )}
+            <GoalPanel conversationPublicId={conversation.public_id} />
+            <div className="min-h-0 flex-1">
+              <DebugChatPanel
+                key={conversation.public_id}
+                conversationPublicId={conversation.public_id}
+                userScoped
+                contextType={ASSISTANT_CONTEXT_TYPE}
+                contextId={conversation.context_id}
+                detailLevel="simple"
+                initialMessage={firstMessage}
+                initialAttachments={firstAttachments}
+                emptyHint="Ask about your projects, deployments or settings."
+                placeholder="Ask Temps to inspect or change something…"
+                readOnly={readOnly}
+              />
+            </div>
+          </div>
+        </ResizablePanel>
+        <ResizableHandle
+          withHandle
+          aria-label="Resize deployment panel"
+          className={docked ? 'mx-2' : 'hidden'}
         />
-      </div>
-    </div>
+        <ResizablePanel
+          id="deployment"
+          panelRef={panelRef}
+          defaultSize={0}
+          minSize={300}
+          maxSize="50"
+          collapsible
+          collapsedSize={0}
+          disabled={!docked}
+          onResize={(size) => {
+            if (size.asPercentage === 0 && docked) setPanelOpen(false)
+          }}
+          className="min-w-0"
+        >
+          {docked && sidebar}
+        </ResizablePanel>
+      </ResizablePanelGroup>
+      <Sheet
+        open={!isDesktop && hasDeployments && panelOpen}
+        onOpenChange={setPanelOpen}
+      >
+        <SheetContent side="right" className="w-full p-0 sm:max-w-md">
+          <SheetHeader className="sr-only">
+            <SheetTitle>Deployment</SheetTitle>
+            <SheetDescription>
+              Build stages of the deployments in this chat.
+            </SheetDescription>
+          </SheetHeader>
+          {sidebar}
+        </SheetContent>
+      </Sheet>
+    </>
   )
 }

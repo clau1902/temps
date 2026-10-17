@@ -27,7 +27,7 @@ import {
   matchingDeployment,
 } from './deployment-card-state'
 
-function statusPresentation(status: string) {
+export function statusPresentation(status: string) {
   if (status === 'completed') {
     return {
       label: 'Ready',
@@ -49,7 +49,7 @@ function statusPresentation(status: string) {
   }
 }
 
-function JobStatusIcon({ status }: { status: string }) {
+export function JobStatusIcon({ status }: { status: string }) {
   if (status === 'success') {
     return (
       <CheckCircle2 className="size-3.5 text-green-600 dark:text-green-400" />

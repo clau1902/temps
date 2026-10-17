@@ -87,13 +87,49 @@ export function goalPollingInterval(
   return goals.some((goal) => presentGoal(goal).open) ? 4000 : 15000
 }
 
-/** Goals worth a row: everything open, plus the few most recent that closed. */
+/**
+ * Goals worth a row in the chat: everything still open, plus the latest few
+ * that gave up (they can be retried). A goal that finished, or was stopped, has
+ * nothing left to act on, so it leaves the list; a deployment it watched stays
+ * available in the deployment panel.
+ */
 export function visibleGoals<
   T extends Pick<GoalResponse, 'status' | 'attempts' | 'max_attempts'>,
->(goals: readonly T[], closedToShow = 2): T[] {
+>(goals: readonly T[], failedToShow = 2): T[] {
   const open = goals.filter((goal) => presentGoal(goal).open)
-  const closed = goals
-    .filter((goal) => !presentGoal(goal).open)
-    .slice(0, closedToShow)
-  return [...open, ...closed]
+  const failed = goals
+    .filter((goal) => goal.status === 'failed')
+    .slice(0, failedToShow)
+  return [...open, ...failed]
+}
+
+export interface WatchedDeployment {
+  projectId: number
+  /** Absent when the goal follows the project's latest deployment. */
+  deploymentId: number | null
+  /** The goal that watched it, for its title and status. */
+  goal: GoalResponse
+}
+
+/** Each deployment this chat has watched once, newest first. */
+export function watchedDeployments(
+  goals: readonly GoalResponse[]
+): WatchedDeployment[] {
+  const seen = new Set<string>()
+  const found: WatchedDeployment[] = []
+  const newestFirst = [...goals].sort((a, b) =>
+    b.created_at.localeCompare(a.created_at)
+  )
+  for (const goal of newestFirst) {
+    if (!goal.deployment) continue
+    const key = `${goal.deployment.project_id}:${goal.deployment.deployment_id ?? 'latest'}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    found.push({
+      projectId: goal.deployment.project_id,
+      deploymentId: goal.deployment.deployment_id ?? null,
+      goal,
+    })
+  }
+  return found
 }
