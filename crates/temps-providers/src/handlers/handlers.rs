@@ -91,6 +91,7 @@ pub(crate) fn worker_node_required(
         | E::DecryptionFailed { .. }
         | E::InvalidServiceType { .. }
         | E::ServiceNotLinkedToProject { .. }
+        | E::SandboxAccessUnsupported { .. }
         | E::ServiceClaimDenied { .. }
         | E::InvalidDatabaseProvisioning { .. }
         | E::ProjectNotFound { .. }
@@ -164,6 +165,7 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::DecryptionFailed { .. }
         | E::InvalidServiceType { .. }
         | E::ServiceNotLinkedToProject { .. }
+        | E::SandboxAccessUnsupported { .. }
         | E::ServiceClaimDenied { .. }
         | E::InvalidDatabaseProvisioning { .. }
         | E::ProjectNotFound { .. }
@@ -239,6 +241,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::DecryptionFailed { .. }
         | E::InvalidServiceType { .. }
         | E::ServiceNotLinkedToProject { .. }
+        | E::SandboxAccessUnsupported { .. }
         | E::ServiceClaimDenied { .. }
         | E::InvalidDatabaseProvisioning { .. }
         | E::ProjectNotFound { .. }

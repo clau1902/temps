@@ -19,6 +19,19 @@ pub trait SandboxRuntimeCredentialsProvider: Send + Sync {
         project_id: i32,
         environment_id: i32,
     ) -> Result<HashMap<String, String>, SandboxRuntimeCredentialsError>;
+
+    /// Variables for a sandbox to use `service_id` as part of `project_id`,
+    /// authenticating as a credential that reaches only a database of the
+    /// sandbox's own (ADR-051), never the deployment's.
+    ///
+    /// A service type with no such mechanism returns
+    /// [`SandboxRuntimeCredentialsError::NoScopedCredentials`]; the caller
+    /// decides whether to go without or to use [`Self::issue`].
+    async fn issue_for_sandbox(
+        &self,
+        service_id: i32,
+        project_id: i32,
+    ) -> Result<HashMap<String, String>, SandboxRuntimeCredentialsError>;
 }
 
 #[derive(Debug, Error)]
@@ -32,6 +45,11 @@ pub enum SandboxRuntimeCredentialsError {
     },
     #[error("service {service_id} is not linked to project {project_id}")]
     ServiceNotLinked { service_id: i32, project_id: i32 },
+    #[error("service {service_id} ({service_type}) has no credentials scoped to a sandbox yet")]
+    NoScopedCredentials {
+        service_id: i32,
+        service_type: String,
+    },
     #[error("runtime credentials for service {service_id} could not be issued: {reason}")]
     Provider { service_id: i32, reason: String },
 }

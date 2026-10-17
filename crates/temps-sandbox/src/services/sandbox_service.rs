@@ -3165,14 +3165,33 @@ impl SandboxService {
         let service_count = links.len();
         let mut variables = HashMap::new();
         for link in links {
-            let issued = provider
-                .issue(link.service_id, project_id, environment.id)
+            // A sandbox runs code nobody reviewed, so it gets credentials of
+            // its own where the service can mint them (ADR-051). Only a
+            // service type with no such mechanism yet keeps the credentials
+            // a deployment of the environment would receive.
+            let issued = match provider
+                .issue_for_sandbox(link.service_id, project_id)
                 .await
-                .map_err(|error| SandboxError::RuntimeCredentialsFailed {
-                    sandbox_id: sandbox_public_id.to_string(),
-                    service_id: link.service_id,
-                    reason: error.to_string(),
-                })?;
+            {
+                Ok(issued) => issued,
+                Err(temps_core::SandboxRuntimeCredentialsError::NoScopedCredentials { .. }) => {
+                    provider
+                        .issue(link.service_id, project_id, environment.id)
+                        .await
+                        .map_err(|error| SandboxError::RuntimeCredentialsFailed {
+                            sandbox_id: sandbox_public_id.to_string(),
+                            service_id: link.service_id,
+                            reason: error.to_string(),
+                        })?
+                }
+                Err(error) => {
+                    return Err(SandboxError::RuntimeCredentialsFailed {
+                        sandbox_id: sandbox_public_id.to_string(),
+                        service_id: link.service_id,
+                        reason: error.to_string(),
+                    })
+                }
+            };
             merge_runtime_variables(&mut variables, issued).map_err(|variable| {
                 SandboxError::RuntimeVariableConflict {
                     sandbox_id: sandbox_public_id.to_string(),
@@ -3196,9 +3215,124 @@ impl SandboxService {
         Ok(variables)
     }
 
+    /// Connect `sandbox_public_id` to the services of `project_ids` that can
+    /// give it credentials of its own, and return the variables to run code
+    /// with (ADR-051).
+    ///
+    /// Strict where [`Self::runtime_environment`] is lenient: a service type
+    /// with no scoped credentials is left out entirely, neither reachable nor
+    /// given the deployment's credentials. The data network is rebuilt from
+    /// `project_ids` on every call, so an empty list disconnects the sandbox.
+    /// Rebuilding drops the sandbox's open connections: call it when the
+    /// connection set changes, and use [`Self::scoped_runtime_variables`] to
+    /// run each command.
+    pub async fn scoped_runtime_environment(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+        project_ids: &[i32],
+    ) -> Result<ScopedRuntime, SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
+        let _workspace_mutation = self.lock_application_workspace(key).await;
+        let containers = self
+            .data_service_containers_of_types(project_ids, Some(SANDBOX_SCOPED_SERVICE_TYPES))
+            .await?;
+        let network_name = sandbox_data_network_name(&row.public_id)?;
+        self.registry
+            .configure_application_network(row.id, &row.public_id, &network_name, &containers)
+            .await
+            .map_err(|error| from_agent_error(&row.public_id, error))?;
+        self.issue_scoped(&row, project_ids).await
+    }
+
+    /// The variables of [`Self::scoped_runtime_environment`] without touching
+    /// the network, for running a command in an already connected sandbox.
+    pub async fn scoped_runtime_variables(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+        project_ids: &[i32],
+    ) -> Result<ScopedRuntime, SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        self.issue_scoped(&row, project_ids).await
+    }
+
+    async fn issue_scoped(
+        &self,
+        row: &sandboxes::Model,
+        project_ids: &[i32],
+    ) -> Result<ScopedRuntime, SandboxError> {
+        let mut runtime = ScopedRuntime::default();
+        if project_ids.is_empty() {
+            return Ok(runtime);
+        }
+        let provider =
+            self.runtime_credentials
+                .as_ref()
+                .ok_or_else(|| SandboxError::Unavailable {
+                    reason: "runtime credential provider is not registered".to_string(),
+                })?;
+        let links = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.is_in(project_ids.iter().copied()))
+            .order_by_asc(project_services::Column::Id)
+            .all(self.db.as_ref())
+            .await?;
+        for link in links {
+            let issued = match provider
+                .issue_for_sandbox(link.service_id, link.project_id)
+                .await
+            {
+                Ok(issued) => issued,
+                Err(temps_core::SandboxRuntimeCredentialsError::NoScopedCredentials { .. }) => {
+                    runtime.skipped_service_ids.push(link.service_id);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(SandboxError::RuntimeCredentialsFailed {
+                        sandbox_id: row.public_id.clone(),
+                        service_id: link.service_id,
+                        reason: error.to_string(),
+                    })
+                }
+            };
+            merge_runtime_variables(&mut runtime.variables, issued).map_err(|variable| {
+                SandboxError::RuntimeVariableConflict {
+                    sandbox_id: row.public_id.clone(),
+                    variable,
+                }
+            })?;
+            runtime.connected_service_ids.push(link.service_id);
+        }
+        let mut variable_names = runtime.variable_names();
+        variable_names.sort();
+        self.record_event(
+            row.id,
+            "scoped_credentials_issued",
+            Some(serde_json::json!({
+                "project_ids": project_ids,
+                "service_ids": runtime.connected_service_ids,
+                "variable_names": variable_names,
+            })),
+        )
+        .await;
+        Ok(runtime)
+    }
+
     async fn application_data_service_containers(
         &self,
         project_ids: &[i32],
+    ) -> Result<Vec<String>, SandboxError> {
+        self.data_service_containers_of_types(project_ids, None)
+            .await
+    }
+
+    /// Like [`Self::application_data_service_containers`], optionally limited
+    /// to services of the given types.
+    async fn data_service_containers_of_types(
+        &self,
+        project_ids: &[i32],
+        only_types: Option<&[&str]>,
     ) -> Result<Vec<String>, SandboxError> {
         let links = project_services::Entity::find()
             .filter(project_services::Column::ProjectId.is_in(project_ids.iter().copied()))
@@ -3216,6 +3350,16 @@ impl SandboxService {
                 .all(self.db.as_ref())
                 .await?
         };
+        let services = services
+            .into_iter()
+            .filter(|service| {
+                only_types.is_none_or(|types| types.contains(&service.service_type.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let service_ids = services
+            .iter()
+            .map(|service| service.id)
+            .collect::<std::collections::HashSet<_>>();
         let members = if service_ids.is_empty() {
             Vec::new()
         } else {
@@ -4972,6 +5116,40 @@ TEMPS_ASKPASS_EOF\n\
     }
 }
 
+/// Service types that can give a sandbox credentials of its own (ADR-051).
+pub const SANDBOX_SCOPED_SERVICE_TYPES: &[&str] = &["postgres"];
+
+/// What a sandbox was connected to, and the variables to run code with.
+#[derive(Default)]
+pub struct ScopedRuntime {
+    /// Secret values: never log or persist them.
+    pub variables: HashMap<String, String>,
+    /// Services the variables reach.
+    pub connected_service_ids: Vec<i32>,
+    /// Linked services left out because their type has no scoped credentials
+    /// yet.
+    pub skipped_service_ids: Vec<i32>,
+}
+
+impl ScopedRuntime {
+    pub fn variable_names(&self) -> Vec<String> {
+        self.variables.keys().cloned().collect()
+    }
+}
+
+impl std::fmt::Debug for ScopedRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names = self.variable_names();
+        names.sort();
+        formatter
+            .debug_struct("ScopedRuntime")
+            .field("variable_names", &names)
+            .field("connected_service_ids", &self.connected_service_ids)
+            .field("skipped_service_ids", &self.skipped_service_ids)
+            .finish()
+    }
+}
+
 fn merge_runtime_variables(
     destination: &mut HashMap<String, String>,
     issued: HashMap<String, String>,
@@ -5428,6 +5606,27 @@ pub(crate) mod tests {
             explicit.image.as_deref(),
             Some("ghcr.io/gotempsh/temps-sandbox-all:0.2.0")
         );
+    }
+
+    #[test]
+    fn scoped_runtime_debug_output_names_variables_but_never_values() {
+        let runtime = ScopedRuntime {
+            variables: HashMap::from([(
+                "POSTGRES_PASSWORD".to_string(),
+                "s3cr3t-value".to_string(),
+            )]),
+            connected_service_ids: vec![4],
+            skipped_service_ids: vec![9],
+        };
+        let shown = format!("{runtime:?}");
+        assert!(shown.contains("POSTGRES_PASSWORD"));
+        assert!(!shown.contains("s3cr3t-value"), "{shown}");
+        assert!(shown.contains("skipped_service_ids"));
+    }
+
+    #[test]
+    fn only_postgres_has_sandbox_scoped_credentials_so_far() {
+        assert_eq!(SANDBOX_SCOPED_SERVICE_TYPES, &["postgres"]);
     }
 
     #[test]
