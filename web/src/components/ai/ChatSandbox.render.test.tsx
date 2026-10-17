@@ -50,27 +50,40 @@ describe('sandbox control', () => {
       configured: false,
       reason: 'This server has no sandbox backend.',
       offered: false,
+      connected_projects: [],
     })
     expect(markup).toContain('Sandbox unavailable')
     expect(markup).toContain('This server has no sandbox backend.')
   })
 
   test('an unlinked chat shows what a sandbox is for and how to get one', () => {
-    const markup = render({ configured: true, offered: false })
+    const markup = render({
+      configured: true,
+      offered: false,
+      connected_projects: [],
+    })
     expect(markup).toContain('Give this chat a sandbox')
     expect(markup).toContain('Create a sandbox')
     expect(markup).toContain('unpack an uploaded archive')
   })
 
   test('a project chat says a new sandbox starts as a clone of the project', () => {
-    const markup = render({ configured: true, offered: false }, false, true)
+    const markup = render(
+      { configured: true, offered: false, connected_projects: [] },
+      false,
+      true
+    )
     expect(markup).toContain('clone of this project')
     expect(markup).toContain('Create a sandbox')
     expect(markup).not.toContain('unpack an uploaded archive')
   })
 
   test('a project chat offer carries the same explanation', () => {
-    const markup = render({ configured: true, offered: true }, true, true)
+    const markup = render(
+      { configured: true, offered: true, connected_projects: [] },
+      true,
+      true
+    )
     expect(markup).toContain('would like a sandbox to unpack the archive.')
     expect(markup).toContain('clone of this project')
   })
@@ -86,6 +99,7 @@ describe('sandbox control', () => {
     const markup = render({
       configured: true,
       offered: true,
+      connected_projects: [],
       linked: {
         sandbox_id: 'sbx_abc',
         name: 'scratch',
@@ -97,11 +111,29 @@ describe('sandbox control', () => {
     expect(markup).toContain('Unlink')
     expect(markup).toContain('/sandboxes/sbx_abc')
   })
+
+  test('a linked chat explains project databases before any project exists', () => {
+    const markup = render({
+      configured: true,
+      offered: true,
+      connected_projects: [],
+      linked: {
+        sandbox_id: 'sbx_abc',
+        name: 'scratch',
+        linked_at: '2026-10-17T09:30:00Z',
+      },
+    })
+    expect(markup).toContain('Project databases')
+    expect(markup).toContain('never receives production')
+  })
 })
 
 describe('sandbox offer card', () => {
   test('shows why the assistant wants a sandbox and lets the user decline', () => {
-    const markup = render({ configured: true, offered: true }, true)
+    const markup = render(
+      { configured: true, offered: true, connected_projects: [] },
+      true
+    )
     expect(markup).toContain('would like a sandbox to unpack the archive.')
     expect(markup).toContain('Create a sandbox')
     expect(markup).toContain('Not now')
@@ -112,6 +144,7 @@ describe('sandbox offer card', () => {
       {
         configured: true,
         offered: true,
+        connected_projects: [],
         linked: {
           sandbox_id: 'sbx_abc',
           name: 'scratch',

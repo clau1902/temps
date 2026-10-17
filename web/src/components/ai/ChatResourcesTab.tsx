@@ -16,6 +16,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { Link } from 'react-router'
+import { ConnectSandboxButton } from './ConnectSandboxButton'
 import {
   groupResources,
   projectRefOf,
@@ -42,9 +43,11 @@ function statusTone(status: string): string {
 }
 
 function ResourceRow({
+  conversationPublicId,
   resource,
   onOpenProject,
 }: {
+  conversationPublicId: string
   resource: ChatResource
   onOpenProject: (project: ProjectRef) => void
 }) {
@@ -90,6 +93,12 @@ function ResourceRow({
         </Link>
       ) : (
         <div className={cn(rowClass, 'hover:bg-transparent')}>{body}</div>
+      )}
+      {project && (
+        <ConnectSandboxButton
+          conversationPublicId={conversationPublicId}
+          project={project}
+        />
       )}
       {resource.url && (
         <a
@@ -165,6 +174,7 @@ export function ChatResourcesTab({
             {group.resources.map((resource) => (
               <ResourceRow
                 key={`${resource.kind}:${resource.id}`}
+                conversationPublicId={conversationPublicId}
                 resource={resource}
                 onOpenProject={onOpenProject}
               />

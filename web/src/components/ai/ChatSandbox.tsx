@@ -21,6 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
@@ -30,6 +31,12 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { linkableSandboxes, sandboxButtonLabel } from './chat-sandbox'
+import { projectRefOf, useChatResources } from './chat-resources'
+import {
+  ConnectSandboxButton,
+  useSandboxConnections,
+} from './ConnectSandboxButton'
+import type { ProjectRef } from './project-refs'
 
 /** Shown instead of the example when the chat is about a project. */
 const PROJECT_EXAMPLE =
@@ -73,6 +80,90 @@ function useChatSandbox(conversationPublicId: string) {
       }),
   })
   return { status, link, unlink }
+}
+
+/** The projects this chat made: the ones a sandbox can be connected to. */
+function useChatProjects(conversationPublicId: string): ProjectRef[] {
+  const resources = useChatResources(conversationPublicId)
+  return (resources.data?.resources ?? []).flatMap((resource) => {
+    const project = projectRefOf(resource)
+    return project ? [project] : []
+  })
+}
+
+/** Linked sandbox: which of the chat's projects' databases it may use. */
+function ProjectDatabases({
+  conversationPublicId,
+}: {
+  conversationPublicId: string
+}) {
+  const projects = useChatProjects(conversationPublicId)
+  return (
+    <div className="space-y-2">
+      <p className="text-xs font-medium">Project databases</p>
+      {projects.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          Projects this chat creates appear here, so the sandbox can get a
+          database of its own from them. It never receives production
+          credentials.
+        </p>
+      ) : (
+        <ul className="grid gap-1.5">
+          {projects.map((project) => (
+            <li
+              key={project.id}
+              className="flex min-w-0 items-center justify-between gap-2"
+            >
+              <span className="min-w-0 truncate text-xs">{project.name}</span>
+              <ConnectSandboxButton
+                conversationPublicId={conversationPublicId}
+                project={project}
+              />
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+/** Creation opt-in: also connect the new sandbox to these projects' databases. */
+function ConnectOnCreate({
+  projects,
+  selected,
+  onToggle,
+}: {
+  projects: ProjectRef[]
+  selected: ReadonlySet<number>
+  onToggle: (projectId: number) => void
+}) {
+  if (projects.length === 0) return null
+  return (
+    <fieldset className="space-y-1.5">
+      <legend className="text-xs font-medium">
+        Connect to this project&rsquo;s databases
+      </legend>
+      {projects.map((project) => (
+        <label
+          key={project.id}
+          className="flex cursor-pointer items-start gap-2 text-xs"
+        >
+          <Checkbox
+            checked={selected.has(project.id)}
+            onCheckedChange={() => onToggle(project.id)}
+            className="mt-0.5"
+          />
+          <span className="min-w-0">
+            <span className="block truncate">{project.name}</span>
+            <span className="text-muted-foreground">
+              The sandbox gets a database of its own and credentials for it
+              alone.
+            </span>
+          </span>
+        </label>
+      ))}
+    </fieldset>
+  )
 }
 
 function SandboxPicker({
@@ -132,6 +223,38 @@ export function SandboxLinkBody({
   onDecline?: () => void
 }) {
   const { status, link, unlink } = useChatSandbox(conversationPublicId)
+  const { connect } = useSandboxConnections(conversationPublicId)
+  const chatProjects = useChatProjects(conversationPublicId)
+  const [connectOnCreate, setConnectOnCreate] = useState<ReadonlySet<number>>(
+    new Set()
+  )
+  const toggleConnectOnCreate = (projectId: number) =>
+    setConnectOnCreate((current) => {
+      const next = new Set(current)
+      if (!next.delete(projectId)) next.add(projectId)
+      return next
+    })
+  const createAndConnect = async () => {
+    try {
+      await link.mutateAsync({
+        path: { public_id: conversationPublicId },
+        body: { create: true },
+      })
+    } catch {
+      return
+    }
+    for (const projectId of connectOnCreate) {
+      try {
+        await connect.mutateAsync({
+          path: { public_id: conversationPublicId },
+          body: { project_id: projectId },
+        })
+      } catch {
+        // The failure is already shown; the sandbox stays linked.
+      }
+    }
+    setConnectOnCreate(new Set())
+  }
 
   if (status.isPending) return <Skeleton className="h-20 w-full" />
   if (status.isError || !status.data) {
@@ -176,6 +299,7 @@ export function SandboxLinkBody({
           The assistant can run commands and read and write files in this
           sandbox only. It holds no Git or platform credentials.
         </p>
+        <ProjectDatabases conversationPublicId={conversationPublicId} />
         <div className="flex flex-wrap gap-2">
           <Button asChild variant="outline" size="sm">
             <Link to={`/sandboxes/${data.linked.sandbox_id}`}>
@@ -199,7 +323,7 @@ export function SandboxLinkBody({
     )
   }
 
-  const busy = link.isPending
+  const busy = link.isPending || connect.isPending
   return (
     <div className="space-y-3 text-sm">
       <div>
@@ -208,17 +332,17 @@ export function SandboxLinkBody({
           {fromProject ? PROJECT_EXAMPLE : EXAMPLE}
         </p>
       </div>
+      <ConnectOnCreate
+        projects={chatProjects}
+        selected={connectOnCreate}
+        onToggle={toggleConnectOnCreate}
+      />
       <Button
         type="button"
         size="sm"
         className="w-full"
         disabled={busy}
-        onClick={() =>
-          link.mutate({
-            path: { public_id: conversationPublicId },
-            body: { create: true },
-          })
-        }
+        onClick={() => void createAndConnect()}
       >
         {busy ? (
           <Loader2 className="size-4 animate-spin" />
