@@ -167,6 +167,16 @@ pub enum GitProviderManagerError {
         source: GitProviderError,
     },
 
+    #[error(
+        "Failed to {operation} in '{repository}' through connection {connection_id}: {reason}"
+    )]
+    RepositoryOperation {
+        connection_id: i32,
+        repository: String,
+        operation: &'static str,
+        reason: String,
+    },
+
     #[error("Queue error: {0}")]
     QueueError(String),
 
@@ -192,14 +202,7 @@ fn validate_new_repository(
     description: Option<&str>,
 ) -> Result<(), GitProviderManagerError> {
     let invalid = |reason: String| GitProviderManagerError::InvalidConfiguration(reason);
-    let segment_ok = |segment: &str| {
-        !segment.is_empty()
-            && segment != "."
-            && segment != ".."
-            && segment
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
+    let segment_ok = is_safe_name_segment;
 
     if repo_name.len() > MAX_REPOSITORY_NAME_LEN || !segment_ok(repo_name) {
         return Err(invalid(format!(
@@ -229,6 +232,145 @@ fn validate_new_repository(
         }
     }
     Ok(())
+}
+
+/// Whether `segment` is an account, group or repository name every supported
+/// provider accepts: letters, digits, `-`, `_` and `.`, and never `.`/`..`.
+fn is_safe_name_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Most files one commit may carry.
+pub const MAX_COMMIT_FILES: usize = 100;
+/// Most file content, in bytes, one commit may carry.
+pub const MAX_COMMIT_BYTES: usize = 5 * 1024 * 1024;
+const MAX_COMMIT_PATH_LEN: usize = 255;
+const MAX_COMMIT_MESSAGE_LEN: usize = 500;
+const MAX_BRANCH_NAME_LEN: usize = 200;
+const MAX_PULL_REQUEST_TITLE_LEN: usize = 256;
+const MAX_PULL_REQUEST_BODY_LEN: usize = 20_000;
+/// How long a clone + commit + push may take before the caller gets an error.
+const COMMIT_FILES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Check a branch name before it reaches a git ref or a provider URL.
+fn validate_branch_name(
+    connection_id: i32,
+    repository: &str,
+    branch: &str,
+) -> Result<(), GitProviderManagerError> {
+    let bad = branch.is_empty()
+        || branch.len() > MAX_BRANCH_NAME_LEN
+        || branch.starts_with(['/', '.', '-'])
+        || branch.ends_with(['/', '.'])
+        || branch.ends_with(".lock")
+        || branch.contains("..")
+        || branch.contains("//")
+        || branch.contains("@{")
+        || !branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
+    if bad {
+        return Err(GitProviderManagerError::InvalidConfiguration(format!(
+            "Branch '{branch}' for repository '{repository}' (connection {connection_id}) must be 1-{MAX_BRANCH_NAME_LEN} characters of letters, digits, '-', '_', '.' or '/', and must not start with '/', '.' or '-', end with '/', '.' or '.lock', or contain '..', '//' or '@{{'"
+        )));
+    }
+    Ok(())
+}
+
+/// Check the owner/name pair of an existing repository.
+fn validate_repository_ref(
+    connection_id: i32,
+    owner: &str,
+    repo: &str,
+) -> Result<(), GitProviderManagerError> {
+    if owner.len() > MAX_REPOSITORY_NAME_LEN
+        || !owner.split('/').all(is_safe_name_segment)
+        || repo.len() > MAX_REPOSITORY_NAME_LEN
+        || !is_safe_name_segment(repo)
+    {
+        return Err(GitProviderManagerError::InvalidConfiguration(format!(
+            "Repository '{owner}/{repo}' (connection {connection_id}) must be an owner and a name of letters, digits, '-', '_' or '.'"
+        )));
+    }
+    Ok(())
+}
+
+/// Check everything a caller supplies to a commit before any credentialed
+/// call: paths must stay inside the repository and out of `.git`, and the
+/// whole commit is bounded in file count and bytes.
+fn validate_commit_request(
+    connection_id: i32,
+    owner: &str,
+    repo: &str,
+    branch: Option<&str>,
+    files: &[(String, Vec<u8>)],
+    message: &str,
+) -> Result<(), GitProviderManagerError> {
+    let invalid = |reason: String| GitProviderManagerError::InvalidConfiguration(reason);
+    let repository = format!("{owner}/{repo}");
+    validate_repository_ref(connection_id, owner, repo)?;
+    if let Some(branch) = branch {
+        validate_branch_name(connection_id, &repository, branch)?;
+    }
+    if message.trim().is_empty() || message.len() > MAX_COMMIT_MESSAGE_LEN || message.contains('\0')
+    {
+        return Err(invalid(format!(
+            "Commit message for '{repository}' (connection {connection_id}) must be 1-{MAX_COMMIT_MESSAGE_LEN} bytes with no NUL characters"
+        )));
+    }
+    if files.is_empty() || files.len() > MAX_COMMIT_FILES {
+        return Err(invalid(format!(
+            "A commit to '{repository}' (connection {connection_id}) must contain 1-{MAX_COMMIT_FILES} files, got {}",
+            files.len()
+        )));
+    }
+    let total: usize = files.iter().map(|(_, content)| content.len()).sum();
+    if total > MAX_COMMIT_BYTES {
+        return Err(invalid(format!(
+            "A commit to '{repository}' (connection {connection_id}) carries {total} bytes; the limit is {MAX_COMMIT_BYTES}"
+        )));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(files.len());
+    for (path, _) in files {
+        let bad_segment = |segment: &str| {
+            segment.is_empty()
+                || segment == "."
+                || segment == ".."
+                || segment.eq_ignore_ascii_case(".git")
+        };
+        if path.len() > MAX_COMMIT_PATH_LEN
+            || path.starts_with('/')
+            || path.contains('\\')
+            || path.chars().any(char::is_control)
+            || path.split('/').any(bad_segment)
+        {
+            return Err(invalid(format!(
+                "File path '{}' in a commit to '{repository}' (connection {connection_id}) must be a relative path of at most {MAX_COMMIT_PATH_LEN} characters, without '..', empty or '.git' segments, backslashes or control characters",
+                path.escape_debug()
+            )));
+        }
+        if !seen.insert(path.as_str()) {
+            return Err(invalid(format!(
+                "File path '{path}' appears more than once in a commit to '{repository}' (connection {connection_id})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Replace every occurrence of `secret` in `text`, so a provider or git error
+/// that echoes the authenticated URL cannot carry the token to a response.
+fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, "***")
+    }
 }
 
 /// Hard ceiling on a single sync run. If we haven't finished within this
@@ -5118,57 +5260,65 @@ impl GitProviderManager {
             ))
         })?;
 
-        // Checkout the correct branch if it's not the default
-        let head_ref = repo.head().map_err(|e| {
-            GitProviderManagerError::InvalidConfiguration(format!(
-                "Failed to get HEAD reference: {}",
-                e
-            ))
-        })?;
+        // Move onto the target branch. An empty repository has no HEAD commit
+        // yet, and a branch that does not exist remotely is started from the
+        // default branch's tip.
+        let current_branch = repo
+            .head()
+            .ok()
+            .and_then(|head| head.shorthand().ok().map(str::to_string));
 
-        let current_branch = head_ref.shorthand().unwrap_or("main");
-
-        if current_branch != branch {
-            // Try to checkout the specified branch
-            let branch_ref = format!("refs/remotes/origin/{}", branch);
-            if let Ok(reference) = repo.find_reference(&branch_ref) {
-                let commit = reference.peel_to_commit().map_err(|e| {
+        if current_branch.as_deref() != Some(branch) {
+            let start_commit = match repo.find_reference(&format!("refs/remotes/origin/{}", branch))
+            {
+                Ok(reference) => Some(reference.peel_to_commit().map_err(|e| {
                     GitProviderManagerError::InvalidConfiguration(format!(
                         "Failed to peel to commit: {}",
                         e
                     ))
-                })?;
+                })?),
+                Err(_) => repo.head().ok().and_then(|head| head.peel_to_commit().ok()),
+            };
 
-                repo.branch(branch, &commit, false).map_err(|e| {
-                    GitProviderManagerError::InvalidConfiguration(format!(
-                        "Failed to create local branch: {}",
-                        e
-                    ))
-                })?;
-
-                let obj = repo
-                    .revparse_single(&format!("refs/heads/{}", branch))
-                    .map_err(|e| {
+            match start_commit {
+                Some(commit) => {
+                    repo.branch(branch, &commit, false).map_err(|e| {
                         GitProviderManagerError::InvalidConfiguration(format!(
-                            "Failed to find branch: {}",
+                            "Failed to create local branch: {}",
                             e
                         ))
                     })?;
-
-                repo.checkout_tree(&obj, None).map_err(|e| {
-                    GitProviderManagerError::InvalidConfiguration(format!(
-                        "Failed to checkout tree: {}",
-                        e
-                    ))
-                })?;
-
-                repo.set_head(&format!("refs/heads/{}", branch))
-                    .map_err(|e| {
+                    let obj = repo
+                        .revparse_single(&format!("refs/heads/{}", branch))
+                        .map_err(|e| {
+                            GitProviderManagerError::InvalidConfiguration(format!(
+                                "Failed to find branch: {}",
+                                e
+                            ))
+                        })?;
+                    repo.checkout_tree(&obj, None).map_err(|e| {
                         GitProviderManagerError::InvalidConfiguration(format!(
-                            "Failed to set HEAD: {}",
+                            "Failed to checkout tree: {}",
                             e
                         ))
                     })?;
+                    repo.set_head(&format!("refs/heads/{}", branch))
+                        .map_err(|e| {
+                            GitProviderManagerError::InvalidConfiguration(format!(
+                                "Failed to set HEAD: {}",
+                                e
+                            ))
+                        })?;
+                }
+                None => {
+                    repo.set_head(&format!("refs/heads/{}", branch))
+                        .map_err(|e| {
+                            GitProviderManagerError::InvalidConfiguration(format!(
+                                "Failed to set HEAD on empty repository: {}",
+                                e
+                            ))
+                        })?;
+                }
             }
         }
 
@@ -5307,6 +5457,37 @@ impl GitProviderManager {
         // Validate before any lookup or token refresh: a bad name is the
         // caller's mistake and must not cost a credentialed round trip.
         validate_new_repository(connection_id, repo_name, repo_owner, description)?;
+        let (_, provider_service, access_token) = self
+            .usable_connection_for_user(connection_id, user_id)
+            .await?;
+        provider_service
+            .create_repository(&access_token, repo_name, repo_owner, description, private)
+            .await
+            .map_err(|source| GitProviderManagerError::RepositoryCreation {
+                connection_id,
+                repository_name: repo_name.to_string(),
+                source,
+            })
+    }
+
+    /// Resolve a connection the caller owns into everything a credentialed
+    /// repository operation needs: the connection row, its provider service
+    /// and a fresh access token.
+    ///
+    /// Another user's connection is reported as not found, and an inactive or
+    /// expired connection or provider is refused before any token refresh.
+    async fn usable_connection_for_user(
+        &self,
+        connection_id: i32,
+        user_id: i32,
+    ) -> Result<
+        (
+            git_provider_connections::Model,
+            Arc<dyn GitProviderService>,
+            String,
+        ),
+        GitProviderManagerError,
+    > {
         let connection = self.get_connection_for_user(connection_id, user_id).await?;
         // MockDatabase does not apply query predicates, and this defense also
         // protects future alternative data-access implementations.
@@ -5331,13 +5512,162 @@ impl GitProviderManager {
         let access_token = self
             .validate_and_refresh_connection_token(connection_id)
             .await?;
+        Ok((connection, provider_service, access_token))
+    }
+
+    /// Look up `owner/repo` through a provider. A repository that does not
+    /// exist, or that the token cannot see, comes back as the provider's own
+    /// message in [`GitProviderManagerError::RepositoryOperation`].
+    async fn existing_repository(
+        provider_service: &Arc<dyn GitProviderService>,
+        access_token: &str,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+    ) -> Result<super::git_provider::Repository, GitProviderManagerError> {
         provider_service
-            .create_repository(&access_token, repo_name, repo_owner, description, private)
+            .get_repository(access_token, owner, repo)
             .await
-            .map_err(|source| GitProviderManagerError::RepositoryCreation {
+            .map_err(|source| GitProviderManagerError::RepositoryOperation {
                 connection_id,
-                repository_name: repo_name.to_string(),
-                source,
+                repository: format!("{owner}/{repo}"),
+                operation: "look up the repository",
+                reason: redact_secret(&source.to_string(), access_token),
+            })
+    }
+
+    /// Commit `files` to `owner/repo` through a connection owned by `user_id`.
+    ///
+    /// The commit is a normal fast-forward on top of `branch` (default: the
+    /// repository's default branch), so existing history is never rewritten.
+    /// A branch that does not exist yet is started from the default branch's
+    /// tip. Returns the new commit's SHA and the branch it landed on.
+    pub async fn commit_files_for_user(
+        &self,
+        connection_id: i32,
+        user_id: i32,
+        owner: &str,
+        repo: &str,
+        branch: Option<&str>,
+        files: Vec<(String, Vec<u8>)>,
+        commit_message: &str,
+    ) -> Result<(String, String), GitProviderManagerError> {
+        validate_commit_request(connection_id, owner, repo, branch, &files, commit_message)?;
+        let (connection, provider_service, access_token) = self
+            .usable_connection_for_user(connection_id, user_id)
+            .await?;
+        let repository =
+            Self::existing_repository(&provider_service, &access_token, connection_id, owner, repo)
+                .await?;
+        let branch = branch
+            .map(str::to_string)
+            .unwrap_or_else(|| repository.default_branch.clone());
+        validate_branch_name(connection_id, &repository.full_name, &branch)?;
+
+        let author_name = if connection.account_name.is_empty() {
+            "Temps Bot".to_string()
+        } else {
+            connection.account_name.clone()
+        };
+        let clone_url = repository.clone_url.clone();
+        let token = access_token.clone();
+        let target_branch = branch.clone();
+        let message = commit_message.to_string();
+        let file_count = files.len();
+
+        // git2 is blocking: run it off the async workers, and bound how long
+        // the caller waits for a stuck remote.
+        let task = tokio::task::spawn_blocking(move || {
+            Self::push_files_with_git(
+                &clone_url,
+                &token,
+                &target_branch,
+                files,
+                &message,
+                &author_name,
+                "bot@temps.sh",
+            )
+        });
+        let failure = |reason: String| GitProviderManagerError::RepositoryOperation {
+            connection_id,
+            repository: repository.full_name.clone(),
+            operation: "commit files",
+            reason: redact_secret(&reason, &access_token),
+        };
+        let commit_sha = match tokio::time::timeout(COMMIT_FILES_TIMEOUT, task).await {
+            Ok(Ok(Ok(sha))) => sha,
+            Ok(Ok(Err(e))) => return Err(failure(e.to_string())),
+            Ok(Err(join_error)) => return Err(failure(format!("push task failed: {join_error}"))),
+            Err(_) => {
+                return Err(failure(format!(
+                    "timed out after {}s",
+                    COMMIT_FILES_TIMEOUT.as_secs()
+                )))
+            }
+        };
+        info!(
+            connection_id,
+            user_id,
+            repository = %repository.full_name,
+            branch = %branch,
+            file_count,
+            commit_sha = %commit_sha,
+            "Committed files to repository"
+        );
+        Ok((commit_sha, branch))
+    }
+
+    /// Open a pull request on `owner/repo` through a connection owned by
+    /// `user_id`. `base_branch` defaults to the repository's default branch.
+    pub async fn open_pull_request_for_user(
+        &self,
+        connection_id: i32,
+        user_id: i32,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+        head_branch: &str,
+        base_branch: Option<&str>,
+    ) -> Result<super::git_provider::PullRequest, GitProviderManagerError> {
+        validate_repository_ref(connection_id, owner, repo)?;
+        let repository_ref = format!("{owner}/{repo}");
+        validate_branch_name(connection_id, &repository_ref, head_branch)?;
+        if let Some(base) = base_branch {
+            validate_branch_name(connection_id, &repository_ref, base)?;
+        }
+        if title.trim().is_empty()
+            || title.len() > MAX_PULL_REQUEST_TITLE_LEN
+            || title.chars().any(char::is_control)
+            || body.len() > MAX_PULL_REQUEST_BODY_LEN
+            || body.contains('\0')
+        {
+            return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                "Pull request for '{repository_ref}' (connection {connection_id}) needs a title of 1-{MAX_PULL_REQUEST_TITLE_LEN} characters with no control characters and a body of at most {MAX_PULL_REQUEST_BODY_LEN} bytes"
+            )));
+        }
+        let (_, provider_service, access_token) = self
+            .usable_connection_for_user(connection_id, user_id)
+            .await?;
+        let repository =
+            Self::existing_repository(&provider_service, &access_token, connection_id, owner, repo)
+                .await?;
+        let base = base_branch
+            .map(str::to_string)
+            .unwrap_or_else(|| repository.default_branch.clone());
+        if base == head_branch {
+            return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                "Pull request for '{repository_ref}' (connection {connection_id}) must come from a branch other than its base '{base}'"
+            )));
+        }
+        provider_service
+            .create_pull_request(&access_token, owner, repo, title, body, head_branch, &base)
+            .await
+            .map_err(|source| GitProviderManagerError::RepositoryOperation {
+                connection_id,
+                repository: repository_ref,
+                operation: "open a pull request",
+                reason: redact_secret(&source.to_string(), &access_token),
             })
     }
 
@@ -6940,6 +7270,293 @@ mod tests {
         assert!(validate_new_repository(7, "app", None, Some("line\nbreak")).is_err());
         let long = "d".repeat(MAX_REPOSITORY_DESCRIPTION_LEN + 1);
         assert!(validate_new_repository(7, "app", None, Some(&long)).is_err());
+    }
+
+    fn one_file(path: &str) -> Vec<(String, Vec<u8>)> {
+        vec![(path.to_string(), b"package main\n".to_vec())]
+    }
+
+    #[test]
+    fn a_commit_accepts_ordinary_paths_branches_and_messages() {
+        let files = vec![
+            ("main.go".to_string(), b"package main".to_vec()),
+            ("cmd/server/main.go".to_string(), b"x".to_vec()),
+            (".github/workflows/ci.yml".to_string(), b"on: push".to_vec()),
+            ("docs/.gitkeep".to_string(), Vec::new()),
+        ];
+        validate_commit_request(3, "acme", "app", None, &files, "Add starter")
+            .expect("plain commit");
+        validate_commit_request(3, "acme", "app", Some("feature/add-starter_1"), &files, "m")
+            .expect("slashed branch");
+    }
+
+    #[test]
+    fn a_commit_rejects_paths_that_could_leave_the_repository_or_touch_git_metadata() {
+        for path in [
+            "",
+            "/etc/passwd",
+            "../outside",
+            "a/../../outside",
+            "a//b",
+            "a/./b",
+            ".git/config",
+            "src/.GIT/hooks/pre-commit",
+            "a\\b",
+            "bad\nname",
+            "trailing/",
+        ] {
+            let result = validate_commit_request(3, "acme", "app", None, &one_file(path), "m");
+            assert!(result.is_err(), "path {path:?} should be rejected");
+        }
+        let long = "a".repeat(MAX_COMMIT_PATH_LEN + 1);
+        assert!(validate_commit_request(3, "acme", "app", None, &one_file(&long), "m").is_err());
+    }
+
+    #[test]
+    fn a_commit_rejects_duplicate_paths_and_oversized_or_empty_file_sets() {
+        let duplicated = vec![
+            ("a.txt".to_string(), vec![1]),
+            ("a.txt".to_string(), vec![2]),
+        ];
+        let error = validate_commit_request(3, "acme", "app", None, &duplicated, "m")
+            .expect_err("duplicate path");
+        assert!(error.to_string().contains("a.txt"));
+        assert!(error.to_string().contains("connection 3"));
+
+        assert!(validate_commit_request(3, "acme", "app", None, &[], "m").is_err());
+
+        let too_many: Vec<_> = (0..=MAX_COMMIT_FILES)
+            .map(|i| (format!("f{i}.txt"), vec![0u8]))
+            .collect();
+        assert!(validate_commit_request(3, "acme", "app", None, &too_many, "m").is_err());
+
+        let too_big = vec![("big.bin".to_string(), vec![0u8; MAX_COMMIT_BYTES + 1])];
+        assert!(validate_commit_request(3, "acme", "app", None, &too_big, "m").is_err());
+    }
+
+    #[test]
+    fn a_commit_rejects_bad_messages_branches_and_repositories() {
+        let files = one_file("a.txt");
+        for message in ["", "   ", "nul\0byte"] {
+            assert!(validate_commit_request(3, "acme", "app", None, &files, message).is_err());
+        }
+        let long = "m".repeat(MAX_COMMIT_MESSAGE_LEN + 1);
+        assert!(validate_commit_request(3, "acme", "app", None, &files, &long).is_err());
+
+        for branch in [
+            "",
+            "/main",
+            "main/",
+            ".hidden",
+            "-flag",
+            "a..b",
+            "a//b",
+            "a@{1}",
+            "x.lock",
+            "has space",
+            "semi;colon",
+            "end.",
+        ] {
+            assert!(
+                validate_commit_request(3, "acme", "app", Some(branch), &files, "m").is_err(),
+                "branch {branch:?} should be rejected"
+            );
+        }
+
+        for (owner, repo) in [
+            ("", "app"),
+            ("acme", ""),
+            ("..", "app"),
+            ("acme", ".."),
+            ("a b", "app"),
+            ("acme", "a/b"),
+        ] {
+            assert!(
+                validate_commit_request(3, owner, repo, None, &files, "m").is_err(),
+                "{owner:?}/{repo:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn redacting_a_secret_removes_every_occurrence_and_ignores_an_empty_one() {
+        let text = "clone https://x-access-token:s3cr3t@host/o/r failed: s3cr3t rejected";
+        let redacted = redact_secret(text, "s3cr3t");
+        assert!(!redacted.contains("s3cr3t"));
+        assert_eq!(redact_secret(text, ""), text);
+    }
+
+    #[tokio::test]
+    async fn commit_and_pull_request_reject_bad_input_before_any_connection_lookup() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        // No query results are queued: reaching the database would fail with a
+        // different (database) error, so an InvalidConfiguration proves the
+        // input was refused first.
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .expect("test encryption key should be valid"),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+
+        let commit = manager
+            .commit_files_for_user(9, 5, "acme", "app", None, one_file("../x"), "m")
+            .await
+            .expect_err("path traversal must be refused");
+        assert!(matches!(
+            commit,
+            GitProviderManagerError::InvalidConfiguration(_)
+        ));
+
+        let same_branch = manager
+            .open_pull_request_for_user(9, 5, "acme", "app", "Title", "", "bad branch", None)
+            .await
+            .expect_err("bad head branch must be refused");
+        assert!(matches!(
+            same_branch,
+            GitProviderManagerError::InvalidConfiguration(_)
+        ));
+
+        let no_title = manager
+            .open_pull_request_for_user(9, 5, "acme", "app", "  ", "", "feature", None)
+            .await
+            .expect_err("blank title must be refused");
+        assert!(matches!(
+            no_title,
+            GitProviderManagerError::InvalidConfiguration(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn commit_files_for_user_treats_another_users_connection_as_missing() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[connection_fixture(11, Some(6))]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .expect("test encryption key should be valid"),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+
+        let error = manager
+            .commit_files_for_user(11, 5, "acme", "app", None, one_file("a.txt"), "Add file")
+            .await
+            .expect_err("a connection owned by someone else must not be usable");
+        assert!(matches!(
+            error,
+            GitProviderManagerError::ConnectionNotFound(id) if id == "11"
+        ));
+    }
+
+    fn bare_remote() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = git2::Repository::init_bare(dir.path()).expect("bare repo");
+        // A provider's repository names its default branch in HEAD.
+        repo.set_head("refs/heads/main")
+            .expect("point HEAD at main");
+        let url = dir.path().to_str().expect("utf-8 path").to_string();
+        (dir, url)
+    }
+
+    fn files_at(remote: &str, branch: &str) -> Vec<(String, String)> {
+        let repo = git2::Repository::open_bare(remote).expect("open remote");
+        let commit = repo
+            .find_reference(&format!("refs/heads/{branch}"))
+            .expect("branch exists on the remote")
+            .peel_to_commit()
+            .expect("branch tip");
+        let tree = commit.tree().expect("tree");
+        let mut found = Vec::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if let Ok(name) = entry.name() {
+                found.push((format!("{dir}{name}"), entry.id().to_string()));
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .expect("walk");
+        found
+    }
+
+    #[test]
+    fn pushing_files_populates_an_empty_repository_and_then_a_new_branch() {
+        let (remote_dir, url) = bare_remote();
+
+        // An empty repository has no HEAD commit: the first push creates the branch.
+        let first = GitProviderManager::push_files_with_git(
+            &url,
+            "unused-token",
+            "main",
+            vec![
+                ("README.md".to_string(), b"hello".to_vec()),
+                ("cmd/app/main.go".to_string(), b"package main".to_vec()),
+            ],
+            "Initial files",
+            "Test Author",
+            "bot@example.invalid",
+        )
+        .expect("push into an empty repository");
+        let main_files = files_at(&url, "main");
+        assert!(main_files.iter().any(|(path, _)| path == "README.md"));
+        assert!(main_files.iter().any(|(path, _)| path == "cmd/app/main.go"));
+
+        // A branch that does not exist yet is started from the default branch.
+        let second = GitProviderManager::push_files_with_git(
+            &url,
+            "unused-token",
+            "feature/add-docs",
+            vec![("docs/guide.md".to_string(), b"# Guide".to_vec())],
+            "Add docs",
+            "Test Author",
+            "bot@example.invalid",
+        )
+        .expect("push to a new branch");
+        assert_ne!(first, second);
+        let feature_files = files_at(&url, "feature/add-docs");
+        assert!(feature_files.iter().any(|(path, _)| path == "README.md"));
+        assert!(feature_files
+            .iter()
+            .any(|(path, _)| path == "docs/guide.md"));
+        // The default branch is untouched by the feature branch.
+        assert!(!files_at(&url, "main")
+            .iter()
+            .any(|(path, _)| path == "docs/guide.md"));
+
+        // Committing to an existing branch stacks on top of it.
+        GitProviderManager::push_files_with_git(
+            &url,
+            "unused-token",
+            "main",
+            vec![("README.md".to_string(), b"hello again".to_vec())],
+            "Update README",
+            "Test Author",
+            "bot@example.invalid",
+        )
+        .expect("push to an existing branch");
+        let repo = git2::Repository::open_bare(remote_dir.path()).expect("open remote");
+        let tip = repo
+            .find_reference("refs/heads/main")
+            .expect("main")
+            .peel_to_commit()
+            .expect("tip");
+        assert_eq!(tip.parent_count(), 1, "history is extended, not rewritten");
+        assert_eq!(tip.parent_id(0).expect("parent").to_string(), first);
     }
 
     #[tokio::test]

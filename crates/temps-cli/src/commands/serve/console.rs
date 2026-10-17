@@ -2835,9 +2835,17 @@ fn ai_write_allowlist() -> Vec<String> {
         // The handler requires `git_repositories:create` and resolves the
         // connection by (id, caller), so another user's connection answers 404:
         // the assistant reaches exactly what its user could from the console,
-        // with that connection's own token. The payload carries no credential
-        // and nothing is pushed.
+        // with that connection's own token. The payload carries no credential.
         "create_repository",
+        // Commit files to a repository, and open a pull request, through the same
+        // kind of connection. Both require `git_repositories:write` and resolve
+        // the connection by (id, caller). A commit only adds history on top of
+        // the branch (it never force-pushes), is bounded in files and bytes, and
+        // is shown to the user for approval first; the token never enters the
+        // chat or a sandbox. The credential-bearing provider operations
+        // (`update_connection_token`, `create_*_pat_provider`) stay out.
+        "commit_repository_files",
+        "open_repository_pull_request",
         // ── Getting started: backups ──
         // Schedules reference an S3 source by id. Creating the source itself
         // (`create_s3_source`) is deliberately NOT here: its payload carries the
@@ -6065,18 +6073,30 @@ mod ai_tool_allowlist_tests {
     /// stays a proposal; pushing, which would need a token in the request, is not
     /// something the assistant can stage.
     #[test]
-    fn repository_creation_is_proposable_but_not_pushing() {
+    fn git_repository_operations_are_proposable_but_credential_ones_are_not() {
         let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
-        assert!(
-            writes.contains("create_repository"),
-            "the assistant cannot stage repository creation"
-        );
         let safe: std::collections::HashSet<String> = ai_read_safe_posts().into_iter().collect();
-        assert!(
-            !safe.contains("create_repository"),
-            "creating a repository is a write and needs the confirm card"
-        );
-        for operation in ["update_connection_token", "create_repository_and_push"] {
+        for operation in [
+            "create_repository",
+            "commit_repository_files",
+            "open_repository_pull_request",
+        ] {
+            assert!(
+                writes.contains(operation),
+                "the assistant cannot stage `{operation}`"
+            );
+            assert!(
+                !safe.contains(operation),
+                "`{operation}` is a write and needs the confirm card"
+            );
+        }
+        for operation in [
+            "update_connection_token",
+            "create_github_pat_provider",
+            "create_gitlab_pat_provider",
+            "create_git_provider",
+            "delete_connection",
+        ] {
             assert!(
                 !writes.contains(operation),
                 "`{operation}` must stay out of the assistant's write tool"

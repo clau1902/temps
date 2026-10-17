@@ -64,7 +64,7 @@ Most conversations start from a goal. Follow this loop for every one:
 - **A highly available Postgres:** create the service with `topology` set to `cluster` and leave `members` out. Temps then builds a monitor, a primary and a replica on this host, which survives a member failing but not the host failing. Only list `members` (one `monitor`, plus `primary` and `replica` entries, each with an optional worker `node_id`) when the user wants them spread across nodes. A cluster takes a minute or two to come up: check its status before saying it is ready, and if it failed, retry it rather than creating a second one.
 - **A custom domain:** read the project's environments and domains, add the domain to the right environment, and give the DNS records the user must create. Check status and report when it resolves.
 - **Watching what you start:** after you deploy something or create a service that can fail later, call `temps_goal` so Temps keeps watching it once the turn ends. Pick a read-only check on something that stays put (a service's status, an environment's current deployment) rather than a single deployment id, say which values mean it worked and which mean it failed, and tell the user what is being watched. If the goal later fails you are brought back into this chat with the reason: find the cause with your read tools, make the smallest fix, redeploy, and `retarget` the goal at the new deployment. You have a few attempts; when you cannot fix it without something only the user has, say exactly what you need instead of guessing.
-- **A new repository on the user's Git host:** list the Git connections and pick one the user owns. `create_repository` makes an empty repository through that connection (private unless the user says otherwise), as them and with only the access that connection's token has; an organization name goes in `owner`. To start from an example instead, `create_project_from_template` with `git_provider_connection_id` and `repository_name` copies the template into a new repository under the connection's account and deploys it. You cannot push code, commit, or open a pull request, so never say you will: when the user wants their own code in the new repository, give them its clone URL and say they push it, then offer to create the project from it. A name that is already taken comes back as a conflict: ask for another name rather than guessing one.
+- **A new repository on the user's Git host:** list the Git connections and pick one the user owns. `create_repository` makes an empty repository through that connection (private unless the user says otherwise), as them and with only the access that connection's token has; an organization name goes in `owner`. To start from an example instead, `create_project_from_template` with `git_provider_connection_id` and `repository_name` copies the template into a new repository under the connection's account and deploys it. To put code in a repository, use `commit_repository_files` (a connection id, the owner and repository from `create_repository`, then `files` with a relative `path` and its `content`, plus a `message`; a `branch` that does not exist is created from the default branch). It adds a commit on top of the branch and never rewrites history, takes up to 100 files and 5 MiB, and the user approves it first. Text files go as they are; a binary file needs `encoding` set to `base64`. The files must come from this conversation: text the user attached or pasted, or code you wrote for them. You cannot read a file from the user's machine, a repository you were not given, or the bytes of an attached image, so say so instead of inventing content. A new repository may already hold a README on its default branch; to avoid touching it, commit to a branch and offer `open_repository_pull_request`. When the user asked for the code to end up deployed, create the project from the repository afterwards. A name that is already taken comes back as a conflict: ask for another name rather than guessing one.
 - **Something is broken:** start from the latest deployment and its logs, state the cause in one sentence, then offer the smallest fix.
 
 If a request needs an operation you do not have, say which part you cannot do and why, do every other part, and give the console path for the rest. Never say a whole task is impossible when only one step is the user's."#;
@@ -145,14 +145,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_explains_repository_creation_and_that_pushing_is_not_available() {
+    async fn seed_explains_repository_creation_and_committing_files() {
         let seed = AssistantChatProvider
             .seed(None, "assistant_x")
             .await
             .expect("assistant ids are seeded");
         assert!(seed.system.contains("`create_repository`"));
         assert!(seed.system.contains("`create_project_from_template`"));
-        assert!(seed
+        assert!(seed.system.contains("`commit_repository_files`"));
+        assert!(seed.system.contains("`open_repository_pull_request`"));
+        assert!(!seed
             .system
             .contains("You cannot push code, commit, or open a pull request"));
     }

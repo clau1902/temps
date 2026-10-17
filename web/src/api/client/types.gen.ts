@@ -4211,6 +4211,52 @@ export type CommitExistsResponse = {
     exists: boolean;
 };
 
+/**
+ * How the `content` of a committed file is encoded.
+ */
+export type CommitFileEncoding = 'utf8' | 'base64';
+
+/**
+ * One file in a commit.
+ */
+export type CommitFileRequest = {
+    content: string;
+    encoding?: CommitFileEncoding;
+    /**
+     * Path inside the repository, relative and without `..` or `.git`
+     * segments, e.g. `cmd/server/main.go`.
+     */
+    path: string;
+};
+
+/**
+ * Request body for committing files to a repository.
+ */
+export type CommitFilesRequest = {
+    /**
+     * Branch to commit to. Defaults to the repository's default branch; a
+     * branch that does not exist is created from the default branch.
+     */
+    branch?: string | null;
+    /**
+     * Files to add or overwrite (1-100, at most 5 MiB in total). Files not
+     * listed are left as they are.
+     */
+    files: Array<CommitFileRequest>;
+    /**
+     * Commit message (at most 500 bytes).
+     */
+    message: string;
+};
+
+export type CommitFilesResponse = {
+    branch: string;
+    commit_sha: string;
+    connection_id: number;
+    file_count: number;
+    repository: string;
+};
+
 export type CommitInfo = {
     /**
      * Author name
@@ -16419,6 +16465,22 @@ export type OpenAiErrorResponse = {
     error: OpenAiError;
 };
 
+/**
+ * Request body for opening a pull request.
+ */
+export type OpenPullRequestRequest = {
+    /**
+     * Branch to merge into. Defaults to the repository's default branch.
+     */
+    base_branch?: string | null;
+    body?: string | null;
+    /**
+     * Branch holding the changes.
+     */
+    head_branch: string;
+    title: string;
+};
+
 export type OperatingSystemCount = {
     count: number;
     operating_system: string;
@@ -19762,6 +19824,16 @@ export type PublicRepositoryInfo = {
      * Star count
      */
     stars: number;
+};
+
+export type PullRequestResponse = {
+    base_branch: string;
+    connection_id: number;
+    head_branch: string;
+    number: number;
+    repository: string;
+    title: string;
+    url: string;
 };
 
 export type PurgeLogsRequest = {
@@ -43583,6 +43655,110 @@ export type CreateRepositoryResponses = {
 };
 
 export type CreateRepositoryResponse = CreateRepositoryResponses[keyof CreateRepositoryResponses];
+
+export type CommitRepositoryFilesData = {
+    body: CommitFilesRequest;
+    path: {
+        /**
+         * Connection ID
+         */
+        connection_id: number;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: never;
+    url: '/git-connections/{connection_id}/repositories/{owner}/{repo}/commits';
+};
+
+export type CommitRepositoryFilesErrors = {
+    /**
+     * Invalid path, branch, message or file content, or the connection is inactive
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Connection not found, or not owned by the caller
+     */
+    404: unknown;
+    /**
+     * The git provider rejected or failed the request
+     */
+    502: unknown;
+};
+
+export type CommitRepositoryFilesResponses = {
+    /**
+     * Files committed
+     */
+    201: CommitFilesResponse;
+};
+
+export type CommitRepositoryFilesResponse = CommitRepositoryFilesResponses[keyof CommitRepositoryFilesResponses];
+
+export type OpenRepositoryPullRequestData = {
+    body: OpenPullRequestRequest;
+    path: {
+        /**
+         * Connection ID
+         */
+        connection_id: number;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: never;
+    url: '/git-connections/{connection_id}/repositories/{owner}/{repo}/pull-requests';
+};
+
+export type OpenRepositoryPullRequestErrors = {
+    /**
+     * Invalid title, branch or body, or the connection is inactive
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Connection not found, or not owned by the caller
+     */
+    404: unknown;
+    /**
+     * The git provider rejected or failed the request
+     */
+    502: unknown;
+};
+
+export type OpenRepositoryPullRequestResponses = {
+    /**
+     * Pull request opened
+     */
+    201: PullRequestResponse;
+};
+
+export type OpenRepositoryPullRequestResponse = OpenRepositoryPullRequestResponses[keyof OpenRepositoryPullRequestResponses];
 
 export type SyncRepositoriesData = {
     body?: never;

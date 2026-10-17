@@ -182,6 +182,7 @@ pub enum Permission {
     GitRepositoriesRead,
     GitRepositoriesSync,
     GitRepositoriesCreate,
+    GitRepositoriesWrite,
 
     // Import permissions
     ImportsRead,
@@ -361,6 +362,7 @@ impl fmt::Display for Permission {
             Permission::GitRepositoriesRead => "git_repositories:read",
             Permission::GitRepositoriesSync => "git_repositories:sync",
             Permission::GitRepositoriesCreate => "git_repositories:create",
+            Permission::GitRepositoriesWrite => "git_repositories:write",
             Permission::ImportsRead => "imports:read",
             Permission::ImportsCreate => "imports:create",
             Permission::EmailProvidersRead => "email_providers:read",
@@ -516,6 +518,7 @@ impl Permission {
             "git_repositories:read" => Some(Permission::GitRepositoriesRead),
             "git_repositories:sync" => Some(Permission::GitRepositoriesSync),
             "git_repositories:create" => Some(Permission::GitRepositoriesCreate),
+            "git_repositories:write" => Some(Permission::GitRepositoriesWrite),
             "imports:read" => Some(Permission::ImportsRead),
             "imports:create" => Some(Permission::ImportsCreate),
             "email_providers:read" => Some(Permission::EmailProvidersRead),
@@ -668,6 +671,7 @@ impl Permission {
             Permission::GitRepositoriesRead,
             Permission::GitRepositoriesSync,
             Permission::GitRepositoriesCreate,
+            Permission::GitRepositoriesWrite,
             Permission::ImportsRead,
             Permission::ImportsCreate,
             Permission::EmailProvidersRead,
@@ -877,6 +881,7 @@ impl Role {
                 Permission::GitRepositoriesRead,
                 Permission::GitRepositoriesSync,
                 Permission::GitRepositoriesCreate,
+                Permission::GitRepositoriesWrite,
                 Permission::ImportsRead,
                 Permission::ImportsCreate,
                 Permission::EmailProvidersRead,
@@ -1019,6 +1024,7 @@ impl Role {
                 Permission::GitRepositoriesRead,
                 Permission::GitRepositoriesSync,
                 Permission::GitRepositoriesCreate,
+                Permission::GitRepositoriesWrite,
                 Permission::ImportsRead,
                 Permission::ImportsCreate,
                 Permission::EmailProvidersRead,
@@ -1139,6 +1145,7 @@ impl Role {
                 Permission::GitRepositoriesRead,
                 Permission::GitRepositoriesSync,
                 Permission::GitRepositoriesCreate,
+                Permission::GitRepositoriesWrite,
                 Permission::ImportsRead,
                 Permission::ImportsCreate,
                 Permission::EmailProvidersRead,
@@ -1252,6 +1259,19 @@ mod tests {
         assert!(Role::PlatformAdmin.has_permission(&create));
         assert!(Role::User.has_permission(&create));
         assert!(!Role::Reader.has_permission(&create));
+    }
+
+    #[test]
+    fn writing_to_a_git_repository_has_its_own_permission_that_readers_lack() {
+        let write = Permission::GitRepositoriesWrite;
+        assert_eq!(write.to_string(), "git_repositories:write");
+        assert_eq!(Permission::from_str("git_repositories:write"), Some(write));
+        assert!(Permission::all().contains(&write));
+
+        assert!(Role::Admin.has_permission(&write));
+        assert!(Role::PlatformAdmin.has_permission(&write));
+        assert!(Role::User.has_permission(&write));
+        assert!(!Role::Reader.has_permission(&write));
     }
 
     // Email permission tests

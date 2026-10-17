@@ -80,3 +80,72 @@ impl AuditOperation for GitRepositoryCreatedAudit {
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
     }
 }
+
+/// Files were committed to a repository through one of the user's connections.
+/// Records where and how much, never file contents or a token.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitFilesCommittedAudit {
+    pub context: AuditContext,
+    pub connection_id: i32,
+    pub repository_full_name: String,
+    pub branch: String,
+    pub commit_sha: String,
+    pub file_count: usize,
+}
+
+impl AuditOperation for GitFilesCommittedAudit {
+    fn operation_type(&self) -> String {
+        "GIT_FILES_COMMITTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// A pull request was opened on a repository through one of the user's connections.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitPullRequestOpenedAudit {
+    pub context: AuditContext,
+    pub connection_id: i32,
+    pub repository_full_name: String,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub pull_request_number: i32,
+}
+
+impl AuditOperation for GitPullRequestOpenedAudit {
+    fn operation_type(&self) -> String {
+        "GIT_PULL_REQUEST_OPENED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}

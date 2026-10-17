@@ -8729,6 +8729,91 @@
         ],
         "type": "object"
       },
+      "CommitFileEncoding": {
+        "description": "How the `content` of a committed file is encoded.",
+        "enum": [
+          "utf8",
+          "base64"
+        ],
+        "type": "string"
+      },
+      "CommitFileRequest": {
+        "description": "One file in a commit.",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "encoding": {
+            "$ref": "#/components/schemas/CommitFileEncoding"
+          },
+          "path": {
+            "description": "Path inside the repository, relative and without `..` or `.git`\nsegments, e.g. `cmd/server/main.go`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      },
+      "CommitFilesRequest": {
+        "description": "Request body for committing files to a repository.",
+        "properties": {
+          "branch": {
+            "description": "Branch to commit to. Defaults to the repository's default branch; a\nbranch that does not exist is created from the default branch.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "files": {
+            "description": "Files to add or overwrite (1-100, at most 5 MiB in total). Files not\nlisted are left as they are.",
+            "items": {
+              "$ref": "#/components/schemas/CommitFileRequest"
+            },
+            "type": "array"
+          },
+          "message": {
+            "description": "Commit message (at most 500 bytes).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "files",
+          "message"
+        ],
+        "type": "object"
+      },
+      "CommitFilesResponse": {
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "commit_sha": {
+            "type": "string"
+          },
+          "connection_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "file_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "repository": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id",
+          "repository",
+          "branch",
+          "commit_sha",
+          "file_count"
+        ],
+        "type": "object"
+      },
       "CommitInfo": {
         "properties": {
           "author": {
@@ -35340,6 +35425,36 @@
         ],
         "type": "object"
       },
+      "OpenPullRequestRequest": {
+        "description": "Request body for opening a pull request.",
+        "properties": {
+          "base_branch": {
+            "description": "Branch to merge into. Defaults to the repository's default branch.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head_branch": {
+            "description": "Branch holding the changes.",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "head_branch"
+        ],
+        "type": "object"
+      },
       "OperatingSystemCount": {
         "properties": {
           "count": {
@@ -42091,6 +42206,43 @@
           "default_branch",
           "stars",
           "forks"
+        ],
+        "type": "object"
+      },
+      "PullRequestResponse": {
+        "properties": {
+          "base_branch": {
+            "type": "string"
+          },
+          "connection_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "head_branch": {
+            "type": "string"
+          },
+          "number": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id",
+          "repository",
+          "number",
+          "url",
+          "title",
+          "head_branch",
+          "base_branch"
         ],
         "type": "object"
       },
@@ -85850,6 +86002,170 @@
           }
         ],
         "summary": "Create an empty repository through one of your git connections",
+        "tags": [
+          "Git Provider Connections"
+        ]
+      }
+    },
+    "/git-connections/{connection_id}/repositories/{owner}/{repo}/commits": {
+      "post": {
+        "description": "Adds a commit on top of the branch with the files given, using the token\nof a connection you own, so the push has exactly the access that token\nhas. History is never rewritten. Another user's connection answers 404.",
+        "operationId": "commit_repository_files",
+        "parameters": [
+          {
+            "description": "Connection ID",
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Repository owner",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommitFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitFilesResponse"
+                }
+              }
+            },
+            "description": "Files committed"
+          },
+          "400": {
+            "description": "Invalid path, branch, message or file content, or the connection is inactive"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Connection not found, or not owned by the caller"
+          },
+          "502": {
+            "description": "The git provider rejected or failed the request"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Commit files to a repository through one of your git connections",
+        "tags": [
+          "Git Provider Connections"
+        ]
+      }
+    },
+    "/git-connections/{connection_id}/repositories/{owner}/{repo}/pull-requests": {
+      "post": {
+        "description": "Uses the token of a connection you own. The head branch must already\nexist, for example after committing to it. Another user's connection\nanswers 404.",
+        "operationId": "open_repository_pull_request",
+        "parameters": [
+          {
+            "description": "Connection ID",
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Repository owner",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenPullRequestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PullRequestResponse"
+                }
+              }
+            },
+            "description": "Pull request opened"
+          },
+          "400": {
+            "description": "Invalid title, branch or body, or the connection is inactive"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Connection not found, or not owned by the caller"
+          },
+          "502": {
+            "description": "The git provider rejected or failed the request"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Open a pull request through one of your git connections",
         "tags": [
           "Git Provider Connections"
         ]

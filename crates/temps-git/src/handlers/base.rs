@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::audit::{AuditContext, GitRepositoryCreatedAudit};
+use super::audit::{
+    AuditContext, GitFilesCommittedAudit, GitPullRequestOpenedAudit, GitRepositoryCreatedAudit,
+};
 use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{
     check_commit_exists, get_branches_by_repository_id, get_repository_branches,
@@ -18,7 +20,7 @@ use crate::services::{
     repository::RepositoryFilter,
 };
 use axum::{
-    extract::{OriginalUri, Path, Query, State},
+    extract::{DefaultBodyLimit, OriginalUri, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     Extension,
@@ -162,6 +164,19 @@ impl From<GitProviderManagerError> for Problem {
                         repository_name, connection_id
                     )),
             },
+            GitProviderManagerError::RepositoryOperation {
+                connection_id,
+                repository,
+                operation,
+                reason,
+            } => problem_new(StatusCode::BAD_GATEWAY)
+                .with_title("Git Provider Operation Failed")
+                .with_detail(format!(
+                    "Failed to {} in '{}' through connection {}: {}",
+                    operation, repository, connection_id, reason
+                ))
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository),
             GitProviderManagerError::QueueError(msg) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Queue Error")
                 .with_detail(msg),
@@ -1100,6 +1115,266 @@ pub async fn create_repository(
     ))
 }
 
+/// How the `content` of a committed file is encoded.
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CommitFileEncoding {
+    /// `content` is the file's text, as is.
+    #[default]
+    Utf8,
+    /// `content` is the file's bytes, base64-encoded (for binary files).
+    Base64,
+}
+
+/// One file in a commit.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CommitFileRequest {
+    /// Path inside the repository, relative and without `..` or `.git`
+    /// segments, e.g. `cmd/server/main.go`.
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub encoding: CommitFileEncoding,
+}
+
+/// Request body for committing files to a repository.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CommitFilesRequest {
+    /// Files to add or overwrite (1-100, at most 5 MiB in total). Files not
+    /// listed are left as they are.
+    pub files: Vec<CommitFileRequest>,
+    /// Commit message (at most 500 bytes).
+    pub message: String,
+    /// Branch to commit to. Defaults to the repository's default branch; a
+    /// branch that does not exist is created from the default branch.
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CommitFilesResponse {
+    pub connection_id: i32,
+    pub repository: String,
+    pub branch: String,
+    pub commit_sha: String,
+    pub file_count: usize,
+}
+
+/// Commit files to a repository through one of your git connections
+///
+/// Adds a commit on top of the branch with the files given, using the token
+/// of a connection you own, so the push has exactly the access that token
+/// has. History is never rewritten. Another user's connection answers 404.
+#[utoipa::path(
+    post,
+    path = "/git-connections/{connection_id}/repositories/{owner}/{repo}/commits",
+    params(
+        ("connection_id" = i32, Path, description = "Connection ID"),
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    request_body = CommitFilesRequest,
+    responses(
+        (status = 201, description = "Files committed", body = CommitFilesResponse),
+        (status = 400, description = "Invalid path, branch, message or file content, or the connection is inactive"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Connection not found, or not owned by the caller"),
+        (status = 502, description = "The git provider rejected or failed the request")
+    ),
+    tag = "Git Provider Connections",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn commit_repository_files(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((connection_id, owner, repo)): Path<(i32, String, String)>,
+    Json(request): Json<CommitFilesRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, GitRepositoriesWrite);
+
+    use base64::Engine as _;
+    let mut files = Vec::with_capacity(request.files.len());
+    for file in request.files {
+        let content = match file.encoding {
+            CommitFileEncoding::Utf8 => file.content.into_bytes(),
+            CommitFileEncoding::Base64 => base64::engine::general_purpose::STANDARD
+                .decode(file.content.as_bytes())
+                .map_err(|e| {
+                    problem_new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid File Content")
+                        .with_detail(format!(
+                            "File '{}' in a commit to '{}/{}' is not valid base64: {}",
+                            file.path.escape_debug(),
+                            owner,
+                            repo,
+                            e
+                        ))
+                })?,
+        };
+        files.push((file.path, content));
+    }
+    let file_count = files.len();
+
+    let (commit_sha, branch) = state
+        .git_provider_manager
+        .commit_files_for_user(
+            connection_id,
+            auth.user_id(),
+            &owner,
+            &repo,
+            request.branch.as_deref(),
+            files,
+            &request.message,
+        )
+        .await?;
+
+    let repository = format!("{owner}/{repo}");
+    let audit = GitFilesCommittedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        connection_id,
+        repository_full_name: repository.clone(),
+        branch: branch.clone(),
+        commit_sha: commit_sha.clone(),
+        file_count,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            "Failed to create audit log for commit {} to {} through connection {}: {}",
+            commit_sha,
+            repository,
+            connection_id,
+            e
+        );
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CommitFilesResponse {
+            connection_id,
+            repository,
+            branch,
+            commit_sha,
+            file_count,
+        }),
+    ))
+}
+
+/// Request body for opening a pull request.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct OpenPullRequestRequest {
+    pub title: String,
+    pub body: Option<String>,
+    /// Branch holding the changes.
+    pub head_branch: String,
+    /// Branch to merge into. Defaults to the repository's default branch.
+    pub base_branch: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PullRequestResponse {
+    pub connection_id: i32,
+    pub repository: String,
+    pub number: i32,
+    pub url: String,
+    pub title: String,
+    pub head_branch: String,
+    pub base_branch: String,
+}
+
+/// Open a pull request through one of your git connections
+///
+/// Uses the token of a connection you own. The head branch must already
+/// exist, for example after committing to it. Another user's connection
+/// answers 404.
+#[utoipa::path(
+    post,
+    path = "/git-connections/{connection_id}/repositories/{owner}/{repo}/pull-requests",
+    params(
+        ("connection_id" = i32, Path, description = "Connection ID"),
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    request_body = OpenPullRequestRequest,
+    responses(
+        (status = 201, description = "Pull request opened", body = PullRequestResponse),
+        (status = 400, description = "Invalid title, branch or body, or the connection is inactive"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Connection not found, or not owned by the caller"),
+        (status = 502, description = "The git provider rejected or failed the request")
+    ),
+    tag = "Git Provider Connections",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn open_repository_pull_request(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((connection_id, owner, repo)): Path<(i32, String, String)>,
+    Json(request): Json<OpenPullRequestRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, GitRepositoriesWrite);
+
+    let pull_request = state
+        .git_provider_manager
+        .open_pull_request_for_user(
+            connection_id,
+            auth.user_id(),
+            &owner,
+            &repo,
+            &request.title,
+            request.body.as_deref().unwrap_or_default(),
+            &request.head_branch,
+            request.base_branch.as_deref(),
+        )
+        .await?;
+
+    let repository = format!("{owner}/{repo}");
+    let audit = GitPullRequestOpenedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        connection_id,
+        repository_full_name: repository.clone(),
+        head_branch: pull_request.head_branch.clone(),
+        base_branch: pull_request.base_branch.clone(),
+        pull_request_number: pull_request.number,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            "Failed to create audit log for pull request #{} on {} through connection {}: {}",
+            pull_request.number,
+            repository,
+            connection_id,
+            e
+        );
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(PullRequestResponse {
+            connection_id,
+            repository,
+            number: pull_request.number,
+            url: pull_request.url,
+            title: pull_request.title,
+            head_branch: pull_request.head_branch,
+            base_branch: pull_request.base_branch,
+        }),
+    ))
+}
+
 /// List repositories for a specific connection
 ///
 /// Fetches repositories from the connected git provider with support for pagination, search, and filtering.
@@ -1866,6 +2141,16 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
             get(list_repositories_by_connection).post(create_repository),
         )
         .route(
+            "/git-connections/{connection_id}/repositories/{owner}/{repo}/commits",
+            // Files travel inside the JSON body, so allow a little more than
+            // axum's 2 MiB default: the 5 MiB commit limit plus base64 overhead.
+            post(commit_repository_files).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/git-connections/{connection_id}/repositories/{owner}/{repo}/pull-requests",
+            post(open_repository_pull_request),
+        )
+        .route(
             "/git-connections/{connection_id}/update-token",
             post(update_connection_token),
         )
@@ -2236,6 +2521,8 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         get_provider_connections,
         sync_repositories,
         create_repository,
+        commit_repository_files,
+        open_repository_pull_request,
         list_repositories_by_connection,
         get_connection,
         list_repositories_by_provider,
@@ -2291,6 +2578,12 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             RepositorySyncStartedResponse,
             CreateRepositoryRequest,
             CreatedRepositoryResponse,
+            CommitFileEncoding,
+            CommitFileRequest,
+            CommitFilesRequest,
+            CommitFilesResponse,
+            OpenPullRequestRequest,
+            PullRequestResponse,
             CreateGitHubPATRequest,
             CreateGitLabPATRequest,
             CreateGitLabOAuthRequest,
@@ -3614,6 +3907,22 @@ mod repository_creation_problem_tests {
         assert_eq!(problem.status_code, StatusCode::CONFLICT);
         assert!(detail(&problem).contains("'my-app'"));
         assert!(detail(&problem).contains("connection 12"));
+    }
+
+    #[test]
+    fn a_failed_commit_is_a_bad_gateway_that_names_the_repository_and_connection() {
+        let problem = Problem::from(GitProviderManagerError::RepositoryOperation {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            operation: "commit files",
+            reason: "Failed to push to remote: permission denied".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        let detail = detail(&problem);
+        assert!(detail.contains("'acme/app'"));
+        assert!(detail.contains("connection 12"));
+        assert!(detail.contains("permission denied"));
     }
 
     #[test]
