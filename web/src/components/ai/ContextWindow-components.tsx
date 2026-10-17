@@ -35,6 +35,7 @@ export function ContextWindow({
         <button
           type="button"
           aria-label="Context window"
+          title="How much of the model's context window this chat uses"
           className="flex h-8 items-center gap-1.5 rounded-full px-2 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
         >
           {percentage === null ? (
@@ -66,11 +67,7 @@ export function ContextWindow({
               />
             </svg>
           )}
-          <span
-            className={
-              percentage === null ? 'sr-only md:not-sr-only' : undefined
-            }
-          >
+          <span className={percentage === null ? 'sr-only' : undefined}>
             {label}
           </span>
         </button>

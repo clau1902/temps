@@ -3854,58 +3854,89 @@ function DebugChatPanelBody({
                 </div>
               ) : (
                 <>
-                  <Select
-                    value={selectedProvider}
-                    onValueChange={(providerId) =>
-                      setRuntimeSelection(
-                        resolveChatRuntimeSelection(providerOptions, providerId)
-                      )
-                    }
-                    disabled={
-                      Boolean(publicId) ||
-                      turnActive ||
-                      starting ||
-                      providerRefreshing ||
-                      providerOptions.length === 0
-                    }
-                  >
-                    <SelectTrigger
-                      className="h-8 w-auto max-w-28 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-64"
-                      title={
-                        publicId
-                          ? 'Provider is fixed when a conversation is created'
-                          : 'Choose the provider for this new chat'
-                      }
+                  {publicId ? (
+                    // The provider cannot change once the chat exists, so it
+                    // is a mark with a tooltip rather than a control.
+                    <span
+                      className="flex h-8 shrink-0 items-center px-1.5"
+                      title={`Provider: ${
+                        selectedProviderOption
+                          ? chatProviderLabel(selectedProviderOption)
+                          : 'unknown'
+                      } (fixed when the chat was created)`}
                     >
-                      {publicId ? (
-                        <Lock className="mr-1 h-3 w-3 shrink-0" />
-                      ) : null}
                       {selectedProvider && (
                         <AiHarnessLogo
                           providerId={selectedProvider}
                           size={20}
-                          className="mr-1"
                         />
                       )}
-                      <SelectValue>
+                      <span className="sr-only">
                         {selectedProviderOption
                           ? chatProviderLabel(selectedProviderOption)
-                          : providerOptions.length === 0
-                            ? 'No provider configured'
-                            : 'Select provider'}
-                      </SelectValue>
-                    </SelectTrigger>
-                    <SelectContent>
-                      {providerOptions.map((provider) => (
-                        <SelectItem key={provider.id} value={provider.id}>
-                          <span className="flex items-center gap-2">
-                            <AiHarnessLogo providerId={provider.id} size={22} />
-                            <span>{chatProviderLabel(provider)}</span>
-                          </span>
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                          : 'Provider'}
+                      </span>
+                    </span>
+                  ) : (
+                    <Select
+                      value={selectedProvider}
+                      onValueChange={(providerId) =>
+                        setRuntimeSelection(
+                          resolveChatRuntimeSelection(
+                            providerOptions,
+                            providerId
+                          )
+                        )
+                      }
+                      disabled={
+                        Boolean(publicId) ||
+                        turnActive ||
+                        starting ||
+                        providerRefreshing ||
+                        providerOptions.length === 0
+                      }
+                    >
+                      <SelectTrigger
+                        className="h-8 w-auto max-w-28 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-64"
+                        title={
+                          publicId
+                            ? 'Provider is fixed when a conversation is created'
+                            : 'Choose the provider for this new chat'
+                        }
+                      >
+                        {publicId ? (
+                          <Lock className="mr-1 h-3 w-3 shrink-0" />
+                        ) : null}
+                        {selectedProvider && (
+                          <AiHarnessLogo
+                            providerId={selectedProvider}
+                            size={20}
+                            className="mr-1"
+                          />
+                        )}
+                        <SelectValue>
+                          {selectedProviderOption
+                            ? chatProviderLabel(selectedProviderOption)
+                            : providerOptions.length === 0
+                              ? 'No provider configured'
+                              : 'Select provider'}
+                        </SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {providerOptions.map((provider) => (
+                          <SelectItem key={provider.id} value={provider.id}>
+                            <span className="flex items-center gap-2">
+                              <AiHarnessLogo
+                                providerId={provider.id}
+                                size={22}
+                              />
+                              <span>{chatProviderLabel(provider)}</span>
+                            </span>
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
 
                   {providerStatusState === 'success' &&
                     providerOptions.length === 0 && (
@@ -4047,25 +4078,30 @@ function DebugChatPanelBody({
                       </Select>
                     )}
 
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    disabled={providerRefreshing || turnActive || starting}
-                    onClick={() =>
-                      void loadProviderStatus(true, runtimeSelection.providerId)
-                    }
-                    aria-label="Refresh provider authentication and models"
-                    title="Refresh provider authentication and models"
-                  >
-                    <RefreshCw
-                      className={cn(
-                        'h-3.5 w-3.5',
-                        providerRefreshing && 'animate-spin'
-                      )}
-                    />
-                  </Button>
+                  {(!publicId || providerStatusState === 'error') && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 shrink-0"
+                      disabled={providerRefreshing || turnActive || starting}
+                      onClick={() =>
+                        void loadProviderStatus(
+                          true,
+                          runtimeSelection.providerId
+                        )
+                      }
+                      aria-label="Refresh provider authentication and models"
+                      title="Refresh provider authentication and models"
+                    >
+                      <RefreshCw
+                        className={cn(
+                          'h-3.5 w-3.5',
+                          providerRefreshing && 'animate-spin'
+                        )}
+                      />
+                    </Button>
+                  )}
                 </>
               )}
             </div>
