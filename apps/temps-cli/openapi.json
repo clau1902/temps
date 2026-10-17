@@ -13218,6 +13218,38 @@
         ],
         "type": "object"
       },
+      "CreateRepositoryRequest": {
+        "description": "Request body for creating an empty repository through a git connection.",
+        "properties": {
+          "description": {
+            "description": "Short description, up to 350 characters.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Repository name: letters, digits, `-`, `_` and `.`, up to 100 characters.",
+            "example": "my-app",
+            "type": "string"
+          },
+          "owner": {
+            "description": "Account or organization to create it under. Defaults to the\nconnection's own account.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "private": {
+            "description": "Whether the repository is private. Defaults to `true`.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateRouteRequest": {
         "properties": {
           "domain": {
@@ -13679,6 +13711,47 @@
         "required": [
           "url",
           "events"
+        ],
+        "type": "object"
+      },
+      "CreatedRepositoryResponse": {
+        "description": "The repository that was created. Carries no credentials.",
+        "properties": {
+          "clone_url": {
+            "type": "string"
+          },
+          "connection_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "default_branch": {
+            "type": "string"
+          },
+          "full_name": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "web_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id",
+          "name",
+          "full_name",
+          "owner",
+          "private",
+          "default_branch",
+          "web_url",
+          "clone_url"
         ],
         "type": "object"
       },
@@ -85714,6 +85787,71 @@
         "summary": "List repositories for a specific connection",
         "tags": [
           "Git Providers"
+        ]
+      },
+      "post": {
+        "description": "Uses the token of a connection you own, so the repository is created as\nyou and with exactly the access that token has. Another user's connection\nanswers 404. Pushing code into the new repository is a separate step.",
+        "operationId": "create_repository",
+        "parameters": [
+          {
+            "description": "Connection ID",
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedRepositoryResponse"
+                }
+              }
+            },
+            "description": "Repository created"
+          },
+          "400": {
+            "description": "Invalid name, owner or description, or the connection is inactive"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Connection not found, or not owned by the caller"
+          },
+          "409": {
+            "description": "A repository with that name already exists"
+          },
+          "502": {
+            "description": "The git provider rejected or failed the request"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create an empty repository through one of your git connections",
+        "tags": [
+          "Git Provider Connections"
         ]
       }
     },

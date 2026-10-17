@@ -2831,6 +2831,13 @@ fn ai_write_allowlist() -> Vec<String> {
         "create_environment",
         // Refresh the repository list of an existing Git connection.
         "sync_repositories",
+        // Create an empty repository through a Git connection, referenced by id.
+        // The handler requires `git_repositories:create` and resolves the
+        // connection by (id, caller), so another user's connection answers 404:
+        // the assistant reaches exactly what its user could from the console,
+        // with that connection's own token. The payload carries no credential
+        // and nothing is pushed.
+        "create_repository",
         // ── Getting started: backups ──
         // Schedules reference an S3 source by id. Creating the source itself
         // (`create_s3_source`) is deliberately NOT here: its payload carries the
@@ -6050,6 +6057,29 @@ mod ai_tool_allowlist_tests {
             assert!(
                 writes.contains(operation),
                 "automatic-deployment diagnosis cannot stage `{operation}`"
+            );
+        }
+    }
+
+    /// Creating a repository is allowed through the user's own connection and
+    /// stays a proposal; pushing, which would need a token in the request, is not
+    /// something the assistant can stage.
+    #[test]
+    fn repository_creation_is_proposable_but_not_pushing() {
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+        assert!(
+            writes.contains("create_repository"),
+            "the assistant cannot stage repository creation"
+        );
+        let safe: std::collections::HashSet<String> = ai_read_safe_posts().into_iter().collect();
+        assert!(
+            !safe.contains("create_repository"),
+            "creating a repository is a write and needs the confirm card"
+        );
+        for operation in ["update_connection_token", "create_repository_and_push"] {
+            assert!(
+                !writes.contains(operation),
+                "`{operation}` must stay out of the assistant's write tool"
             );
         }
     }

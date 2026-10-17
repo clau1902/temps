@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::audit::{AuditContext, GitRepositoryCreatedAudit};
 use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{
     check_commit_exists, get_branches_by_repository_id, get_repository_branches,
@@ -20,6 +21,7 @@ use axum::{
     extract::{OriginalUri, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
+    Extension,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -28,6 +30,7 @@ use temps_auth::{
     permission_check, permission_guard, require_sensitive_action, Permission, RequireAuth,
 };
 use temps_core::telemetry::OperationFailureCode;
+use temps_core::RequestMetadata;
 use temps_core::SensitiveAction;
 use tracing::info;
 
@@ -138,13 +141,27 @@ impl From<GitProviderManagerError> for Problem {
             GitProviderManagerError::RepositoryCreation {
                 connection_id,
                 repository_name,
-                source: _,
-            } => problem_new(StatusCode::BAD_GATEWAY)
-                .with_title("Repository Creation Failed")
-                .with_detail(format!(
-                    "The git provider could not create repository '{}' through connection {}.",
-                    repository_name, connection_id
-                )),
+                source,
+            } => match source {
+                // A taken name is the caller's to fix, not an upstream outage.
+                GitProviderError::RepositoryAlreadyExists { .. } => {
+                    problem_new(StatusCode::CONFLICT)
+                        .with_type("https://docs.temps.sh/errors/repository_already_exists")
+                        .with_title("Repository Already Exists")
+                        .with_detail(format!(
+                            "A repository named '{}' already exists in the target account of connection {}. Choose a different name.",
+                            repository_name, connection_id
+                        ))
+                        .with_value("connection_id", connection_id)
+                        .with_value("repository_name", repository_name)
+                }
+                _ => problem_new(StatusCode::BAD_GATEWAY)
+                    .with_title("Repository Creation Failed")
+                    .with_detail(format!(
+                        "The git provider could not create repository '{}' through connection {}.",
+                        repository_name, connection_id
+                    )),
+            },
             GitProviderManagerError::QueueError(msg) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Queue Error")
                 .with_detail(msg),
@@ -960,6 +977,129 @@ pub async fn sync_repositories(
     ))
 }
 
+/// Request body for creating an empty repository through a git connection.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateRepositoryRequest {
+    /// Repository name: letters, digits, `-`, `_` and `.`, up to 100 characters.
+    #[schema(example = "my-app")]
+    pub name: String,
+    /// Account or organization to create it under. Defaults to the
+    /// connection's own account.
+    pub owner: Option<String>,
+    /// Short description, up to 350 characters.
+    pub description: Option<String>,
+    /// Whether the repository is private. Defaults to `true`.
+    #[serde(default = "default_repository_private")]
+    pub private: bool,
+}
+
+fn default_repository_private() -> bool {
+    true
+}
+
+/// The repository that was created. Carries no credentials.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CreatedRepositoryResponse {
+    pub connection_id: i32,
+    pub name: String,
+    pub full_name: String,
+    pub owner: String,
+    pub private: bool,
+    pub default_branch: String,
+    pub web_url: String,
+    pub clone_url: String,
+}
+
+/// Create an empty repository through one of your git connections
+///
+/// Uses the token of a connection you own, so the repository is created as
+/// you and with exactly the access that token has. Another user's connection
+/// answers 404. Pushing code into the new repository is a separate step.
+#[utoipa::path(
+    post,
+    path = "/git-connections/{connection_id}/repositories",
+    params(
+        ("connection_id" = i32, Path, description = "Connection ID")
+    ),
+    request_body = CreateRepositoryRequest,
+    responses(
+        (status = 201, description = "Repository created", body = CreatedRepositoryResponse),
+        (status = 400, description = "Invalid name, owner or description, or the connection is inactive"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Connection not found, or not owned by the caller"),
+        (status = 409, description = "A repository with that name already exists"),
+        (status = 502, description = "The git provider rejected or failed the request")
+    ),
+    tag = "Git Provider Connections",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn create_repository(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(connection_id): Path<i32>,
+    Json(request): Json<CreateRepositoryRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, GitRepositoriesCreate);
+
+    // The manager resolves the connection by (id, caller), so a connection
+    // that belongs to someone else is indistinguishable from a missing one.
+    let repository = state
+        .git_provider_manager
+        .create_repository_for_user(
+            connection_id,
+            auth.user_id(),
+            &request.name,
+            request.owner.as_deref(),
+            request.description.as_deref(),
+            request.private,
+        )
+        .await?;
+
+    let audit = GitRepositoryCreatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        connection_id,
+        repository_full_name: repository.full_name.clone(),
+        private: repository.private,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            "Failed to create audit log for repository {} created through connection {}: {}",
+            repository.full_name,
+            connection_id,
+            e
+        );
+    }
+
+    info!(
+        "Repository {} created through git connection {} by user {}",
+        repository.full_name,
+        connection_id,
+        auth.user_id()
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedRepositoryResponse {
+            connection_id,
+            name: repository.name,
+            full_name: repository.full_name,
+            owner: repository.owner,
+            private: repository.private,
+            default_branch: repository.default_branch,
+            web_url: repository.web_url,
+            clone_url: repository.clone_url,
+        }),
+    ))
+}
+
 /// List repositories for a specific connection
 ///
 /// Fetches repositories from the connected git provider with support for pagination, search, and filtering.
@@ -1723,7 +1863,7 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
         )
         .route(
             "/git-connections/{connection_id}/repositories",
-            get(list_repositories_by_connection),
+            get(list_repositories_by_connection).post(create_repository),
         )
         .route(
             "/git-connections/{connection_id}/update-token",
@@ -2095,6 +2235,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         list_connections,
         get_provider_connections,
         sync_repositories,
+        create_repository,
         list_repositories_by_connection,
         get_connection,
         list_repositories_by_provider,
@@ -2148,6 +2289,8 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             SyncedRepositoryListQuery,
             RepositoryListResponse,
             RepositorySyncStartedResponse,
+            CreateRepositoryRequest,
+            CreatedRepositoryResponse,
             CreateGitHubPATRequest,
             CreateGitLabPATRequest,
             CreateGitLabOAuthRequest,
@@ -3442,6 +3585,76 @@ mod permission_error_tests {
             .get("detail")
             .and_then(|value| value.as_str())
             .is_some_and(|detail| detail.contains("Resource not accessible by integration")));
+    }
+}
+
+#[cfg(test)]
+mod repository_creation_problem_tests {
+    use super::*;
+
+    fn detail(problem: &Problem) -> String {
+        problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn a_taken_name_is_a_conflict_that_names_the_repository_and_connection() {
+        let problem = Problem::from(GitProviderManagerError::RepositoryCreation {
+            connection_id: 12,
+            repository_name: "my-app".to_string(),
+            source: GitProviderError::RepositoryAlreadyExists {
+                name: "my-app".to_string(),
+            },
+        });
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert!(detail(&problem).contains("'my-app'"));
+        assert!(detail(&problem).contains("connection 12"));
+    }
+
+    #[test]
+    fn a_provider_failure_stays_a_bad_gateway() {
+        let problem = Problem::from(GitProviderManagerError::RepositoryCreation {
+            connection_id: 12,
+            repository_name: "my-app".to_string(),
+            source: GitProviderError::AuthenticationFailed("bad token".to_string()),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        // The provider's own message is not echoed to the caller.
+        assert!(!detail(&problem).contains("bad token"));
+    }
+
+    #[test]
+    fn a_connection_that_is_not_the_callers_looks_like_a_missing_one() {
+        let problem = Problem::from(GitProviderManagerError::ConnectionNotFound(
+            "12".to_string(),
+        ));
+
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_bad_name_is_a_bad_request() {
+        let problem = Problem::from(GitProviderManagerError::InvalidConfiguration(
+            "Repository name '..' (connection 12) must be 1-100 characters".to_string(),
+        ));
+
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn the_request_defaults_to_a_private_repository() {
+        let request: CreateRepositoryRequest =
+            serde_json::from_str(r#"{"name":"my-app"}"#).expect("minimal body parses");
+
+        assert!(request.private);
+        assert!(request.owner.is_none());
+        assert!(request.description.is_none());
     }
 }
 

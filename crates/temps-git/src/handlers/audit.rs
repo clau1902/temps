@@ -47,3 +47,36 @@ impl AuditOperation for PipelineTriggeredAudit {
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
     }
 }
+
+/// A repository was created on a git provider through one of the user's
+/// connections. Records who, where, and the visibility chosen, never a token.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitRepositoryCreatedAudit {
+    pub context: AuditContext,
+    pub connection_id: i32,
+    pub repository_full_name: String,
+    pub private: bool,
+}
+
+impl AuditOperation for GitRepositoryCreatedAudit {
+    fn operation_type(&self) -> String {
+        "GIT_REPOSITORY_CREATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}

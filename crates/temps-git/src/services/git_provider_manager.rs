@@ -174,6 +174,63 @@ pub enum GitProviderManagerError {
     OAuthStateInvalid(String),
 }
 
+/// Longest repository name the supported providers accept.
+const MAX_REPOSITORY_NAME_LEN: usize = 100;
+/// Longest description GitHub accepts; the strictest of the supported providers.
+const MAX_REPOSITORY_DESCRIPTION_LEN: usize = 350;
+
+/// Check the caller-supplied parts of a new repository before they are sent,
+/// with a user's token, to a git provider.
+///
+/// Names and owners are limited to the characters every supported provider
+/// accepts, so nothing path-like (`..`, a leading `/`) or control-character
+/// bearing reaches a provider URL or request body.
+fn validate_new_repository(
+    connection_id: i32,
+    repo_name: &str,
+    repo_owner: Option<&str>,
+    description: Option<&str>,
+) -> Result<(), GitProviderManagerError> {
+    let invalid = |reason: String| GitProviderManagerError::InvalidConfiguration(reason);
+    let segment_ok = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+
+    if repo_name.len() > MAX_REPOSITORY_NAME_LEN || !segment_ok(repo_name) {
+        return Err(invalid(format!(
+            "Repository name '{repo_name}' (connection {connection_id}) must be 1-{MAX_REPOSITORY_NAME_LEN} characters of letters, digits, '-', '_' or '.'"
+        )));
+    }
+    if repo_name.ends_with(".git") {
+        return Err(invalid(format!(
+            "Repository name '{repo_name}' (connection {connection_id}) must not end in '.git'"
+        )));
+    }
+    if let Some(owner) = repo_owner {
+        // GitLab namespaces may be nested groups (`group/subgroup`).
+        if owner.len() > MAX_REPOSITORY_NAME_LEN || !owner.split('/').all(segment_ok) {
+            return Err(invalid(format!(
+                "Repository owner '{owner}' (connection {connection_id}) must be an account or group name of letters, digits, '-', '_' or '.', optionally nested with '/'"
+            )));
+        }
+    }
+    if let Some(description) = description {
+        if description.chars().count() > MAX_REPOSITORY_DESCRIPTION_LEN
+            || description.chars().any(char::is_control)
+        {
+            return Err(invalid(format!(
+                "Repository description for '{repo_name}' (connection {connection_id}) must be at most {MAX_REPOSITORY_DESCRIPTION_LEN} characters with no control characters"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Hard ceiling on a single sync run. If we haven't finished within this
 /// window something has gone badly wrong (stuck HTTPS connection, provider
 /// outage with retries spinning, etc) and we'd rather abort and release
@@ -5247,6 +5304,9 @@ impl GitProviderManager {
         description: Option<&str>,
         private: bool,
     ) -> Result<super::git_provider::Repository, GitProviderManagerError> {
+        // Validate before any lookup or token refresh: a bad name is the
+        // caller's mistake and must not cost a credentialed round trip.
+        validate_new_repository(connection_id, repo_name, repo_owner, description)?;
         let connection = self.get_connection_for_user(connection_id, user_id).await?;
         // MockDatabase does not apply query predicates, and this defense also
         // protects future alternative data-access implementations.
@@ -6845,6 +6905,41 @@ mod tests {
         );
 
         assert_eq!(manager.get_valid_github_token_for_user(5).await, None);
+    }
+
+    #[test]
+    fn new_repository_accepts_ordinary_names_owners_and_descriptions() {
+        assert!(validate_new_repository(1, "my-app_2.0", None, None).is_ok());
+        assert!(validate_new_repository(1, "app", Some("acme"), Some("A demo")).is_ok());
+        assert!(validate_new_repository(1, "app", Some("group/sub-group"), None).is_ok());
+    }
+
+    #[test]
+    fn new_repository_rejects_names_that_could_reach_a_provider_url() {
+        for name in ["", ".", "..", "a/b", "a b", "a?x=1", "naïve", "repo.git"] {
+            let error =
+                validate_new_repository(7, name, None, None).expect_err("name should be rejected");
+            assert!(
+                matches!(&error, GitProviderManagerError::InvalidConfiguration(reason)
+                    if reason.contains("connection 7")),
+                "unexpected error for {name:?}: {error}"
+            );
+        }
+        let long = "a".repeat(MAX_REPOSITORY_NAME_LEN + 1);
+        assert!(validate_new_repository(7, &long, None, None).is_err());
+    }
+
+    #[test]
+    fn new_repository_rejects_bad_owners_and_descriptions() {
+        for owner in ["", "/acme", "acme/", "acme//x", "../acme", "acme x"] {
+            assert!(
+                validate_new_repository(7, "app", Some(owner), None).is_err(),
+                "owner {owner:?} should be rejected"
+            );
+        }
+        assert!(validate_new_repository(7, "app", None, Some("line\nbreak")).is_err());
+        let long = "d".repeat(MAX_REPOSITORY_DESCRIPTION_LEN + 1);
+        assert!(validate_new_repository(7, "app", None, Some(&long)).is_err());
     }
 
     #[tokio::test]

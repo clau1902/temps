@@ -6287,6 +6287,29 @@ export type CreateProviderRequest = {
     provider_type: string;
 };
 
+/**
+ * Request body for creating an empty repository through a git connection.
+ */
+export type CreateRepositoryRequest = {
+    /**
+     * Short description, up to 350 characters.
+     */
+    description?: string | null;
+    /**
+     * Repository name: letters, digits, `-`, `_` and `.`, up to 100 characters.
+     */
+    name: string;
+    /**
+     * Account or organization to create it under. Defaults to the
+     * connection's own account.
+     */
+    owner?: string | null;
+    /**
+     * Whether the repository is private. Defaults to `true`.
+     */
+    private?: boolean;
+};
+
 export type CreateRouteRequest = {
     domain: string;
     host: string;
@@ -6499,6 +6522,20 @@ export type CreateWebhookRequestBody = {
      * Target URL for webhook delivery
      */
     url: string;
+};
+
+/**
+ * The repository that was created. Carries no credentials.
+ */
+export type CreatedRepositoryResponse = {
+    clone_url: string;
+    connection_id: number;
+    default_branch: string;
+    full_name: string;
+    name: string;
+    owner: string;
+    private: boolean;
+    web_url: string;
 };
 
 /**
@@ -43498,6 +43535,54 @@ export type ListRepositoriesByConnectionResponses = {
 };
 
 export type ListRepositoriesByConnectionResponse = ListRepositoriesByConnectionResponses[keyof ListRepositoriesByConnectionResponses];
+
+export type CreateRepositoryData = {
+    body: CreateRepositoryRequest;
+    path: {
+        /**
+         * Connection ID
+         */
+        connection_id: number;
+    };
+    query?: never;
+    url: '/git-connections/{connection_id}/repositories';
+};
+
+export type CreateRepositoryErrors = {
+    /**
+     * Invalid name, owner or description, or the connection is inactive
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Connection not found, or not owned by the caller
+     */
+    404: unknown;
+    /**
+     * A repository with that name already exists
+     */
+    409: unknown;
+    /**
+     * The git provider rejected or failed the request
+     */
+    502: unknown;
+};
+
+export type CreateRepositoryResponses = {
+    /**
+     * Repository created
+     */
+    201: CreatedRepositoryResponse;
+};
+
+export type CreateRepositoryResponse = CreateRepositoryResponses[keyof CreateRepositoryResponses];
 
 export type SyncRepositoriesData = {
     body?: never;
