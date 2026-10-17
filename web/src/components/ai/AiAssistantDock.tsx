@@ -511,11 +511,15 @@ export function DockBody({
 
   // Resolve a `?chat=` route exactly once after the list arrives. A valid id
   // is restored; a stale one falls back to the assistant start screen. A bare
-  // route needs no resolving: the page already opened on that screen.
+  // route needs no resolving: the page already opened on that screen, so the
+  // ref starts out resolved. Otherwise the `?chat=` this component writes for
+  // the first chat it creates would be mistaken for a route to restore, and
+  // because the list was fetched before that chat existed it would not be
+  // found, which sent the user back to the start screen right after sending.
   // Keeping this separate from ongoing URL synchronization prevents the
   // mount-time race where a still-null active id removed a valid URL before it
   // could be resolved.
-  const initialPageRouteResolvedRef = useRef(false)
+  const initialPageRouteResolvedRef = useRef(!urlChatId)
   useEffect(() => {
     if (layout !== 'page' || initialContext || !urlChatId) return
     if (initialPageRouteResolvedRef.current || !listReady) return
