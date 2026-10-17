@@ -34,6 +34,14 @@ describe('assistantModelOptions', () => {
     expect(options.map((option) => option.id)).toEqual(['a/one'])
   })
 
+  it('leaves out batch-only variants, which cannot answer a chat', () => {
+    const options = assistantModelOptions([
+      row({ model_id: 'a/one', display_name: 'a/one' }),
+      row({ model_id: 'a/one:batch', display_name: 'a/one:batch' }),
+    ])
+    expect(options.map((option) => option.id)).toEqual(['a/one'])
+  })
+
   it('prefers the catalogue name and sorts by it', () => {
     const options = assistantModelOptions([
       row({ model_id: 'z/last', display_name: 'z/last' }),

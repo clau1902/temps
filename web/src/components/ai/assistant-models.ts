@@ -38,6 +38,10 @@ export function assistantModelOptions(
       .filter((row) => row.is_available && row.is_enabled)
       // Embedding models cannot chat.
       .filter((row) => !row.model_id.startsWith('text-embedding-'))
+      // A `:batch` variant is the provider's asynchronous batch endpoint: the
+      // gateway answers a chat request on it with a 404, so it can never be
+      // a chat's model.
+      .filter((row) => !row.model_id.endsWith(':batch'))
       .map((row) => ({
         id: row.model_id,
         name: row.details?.name?.trim() || row.display_name || row.model_id,
