@@ -1168,8 +1168,8 @@ impl SandboxLinkService {
             return format!(
                 "Nothing ran: `{service}` would publish the sandbox through a third party, and \
                  Temps does not use one. Use `{SANDBOX_PREVIEW_TOOL}` with the server's port to \
-                 get the address the user opens (it is served by Temps), or deploy the code as a \
-                 Temps project to publish it. If the user asked for that service by name, tell \
+                 get the address the user opens (it is served by Temps; the `show-a-running-app` \
+                 playbook has the steps), or deploy the code as a Temps project to publish it. If the user asked for that service by name, tell \
                  them this sandbox does not run it."
             );
         }

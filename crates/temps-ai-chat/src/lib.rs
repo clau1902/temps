@@ -18,6 +18,7 @@ pub mod git_bindings_handlers;
 pub mod goals;
 pub mod goals_handlers;
 pub mod handlers;
+pub mod harness;
 pub mod pending_actions;
 pub mod plugin;
 pub mod provider;

@@ -4378,6 +4378,22 @@ impl ConversationService {
                 self.sandbox_tools(&conv, auth, project_access_checker.as_ref())
                     .await,
             );
+            // Playbooks follow the tools the chat holds, so one that needs the
+            // sandbox is only listed once the sandbox tools are there.
+            let playbooks = {
+                let held: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+                crate::harness::applicable(&conv.context_type, &held)
+            };
+            if let Some(index) = crate::harness::index_section(&playbooks) {
+                tools.push(crate::harness::tool());
+                match messages.iter_mut().find(|m| m.role == "system") {
+                    Some(sys) => {
+                        sys.content.push_str("\n\n");
+                        sys.content.push_str(&index);
+                    }
+                    None => messages.insert(0, ChatMessage::system(index)),
+                }
+            }
             let write_appendix = self.maybe_add_write_tool(&mut tools, &messages, auth);
             if let Some(appendix) = write_appendix {
                 // Append the write-CLI section map to the system framing so the model
@@ -7257,6 +7273,8 @@ async fn dispatch_conversation_tool(
             &state.seen_calls,
         )
         .await
+    } else if call.name == crate::harness::PLAYBOOK_TOOL {
+        crate::harness::dispatch(&call.arguments)
     } else if call.name == TEMPS_GOAL_TOOL_NAME {
         match &state.goals {
             Some(goals) => goals.dispatch(&call.arguments, conversation_id, auth).await,
