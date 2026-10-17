@@ -16,7 +16,10 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { Link } from 'react-router'
-import { ConnectSandboxButton } from './ConnectSandboxButton'
+import {
+  ConnectSandboxButton,
+  ConnectSandboxServiceButton,
+} from './ConnectSandboxButton'
 import {
   groupResources,
   projectRefOf,
@@ -98,6 +101,13 @@ function ResourceRow({
         <ConnectSandboxButton
           conversationPublicId={conversationPublicId}
           project={project}
+        />
+      )}
+      {resource.kind === 'service' && Number.isInteger(Number(resource.id)) && (
+        <ConnectSandboxServiceButton
+          conversationPublicId={conversationPublicId}
+          serviceId={Number(resource.id)}
+          serviceName={resource.name}
         />
       )}
       {resource.url && (

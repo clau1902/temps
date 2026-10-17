@@ -198,6 +198,9 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Runtime Credentials Failed")
                     .with_detail(error.to_string())
             }
+            SandboxError::ServiceNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Service Not Found")
+                .with_detail(error.to_string()),
             SandboxError::RuntimeVariableConflict { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Ambiguous Sandbox Runtime Variables")

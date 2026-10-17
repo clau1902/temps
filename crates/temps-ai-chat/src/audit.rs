@@ -113,7 +113,8 @@ pub struct AiSandboxUnlinkedAudit {
 #[derive(Debug, Clone, Serialize)]
 pub struct AiSandboxServicesConnectedAudit {
     pub context: AuditContext,
-    pub project_id: i32,
+    /// The project the services were connected through, if any.
+    pub project_id: Option<i32>,
     pub conversation_id: String,
     pub sandbox_id: String,
     pub connected_service_ids: Vec<i32>,
@@ -123,7 +124,10 @@ pub struct AiSandboxServicesConnectedAudit {
 #[derive(Debug, Clone, Serialize)]
 pub struct AiSandboxServicesDisconnectedAudit {
     pub context: AuditContext,
-    pub project_id: i32,
+    /// The project whose services were disconnected, when the whole project was.
+    pub project_id: Option<i32>,
+    /// The single service disconnected, when it was disconnected on its own.
+    pub service_id: Option<i32>,
     pub conversation_id: String,
     pub sandbox_id: String,
 }

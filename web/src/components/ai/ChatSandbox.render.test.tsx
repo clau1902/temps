@@ -51,6 +51,7 @@ describe('sandbox control', () => {
       reason: 'This server has no sandbox backend.',
       offered: false,
       connected_projects: [],
+      connected_services: [],
     })
     expect(markup).toContain('Sandbox unavailable')
     expect(markup).toContain('This server has no sandbox backend.')
@@ -61,6 +62,7 @@ describe('sandbox control', () => {
       configured: true,
       offered: false,
       connected_projects: [],
+      connected_services: [],
     })
     expect(markup).toContain('Give this chat a sandbox')
     expect(markup).toContain('Create a sandbox')
@@ -69,7 +71,12 @@ describe('sandbox control', () => {
 
   test('a project chat says a new sandbox starts as a clone of the project', () => {
     const markup = render(
-      { configured: true, offered: false, connected_projects: [] },
+      {
+        configured: true,
+        offered: false,
+        connected_projects: [],
+        connected_services: [],
+      },
       false,
       true
     )
@@ -80,7 +87,12 @@ describe('sandbox control', () => {
 
   test('a project chat offer carries the same explanation', () => {
     const markup = render(
-      { configured: true, offered: true, connected_projects: [] },
+      {
+        configured: true,
+        offered: true,
+        connected_projects: [],
+        connected_services: [],
+      },
       true,
       true
     )
@@ -100,6 +112,7 @@ describe('sandbox control', () => {
       configured: true,
       offered: true,
       connected_projects: [],
+      connected_services: [],
       linked: {
         sandbox_id: 'sbx_abc',
         name: 'scratch',
@@ -117,6 +130,7 @@ describe('sandbox control', () => {
       configured: true,
       offered: true,
       connected_projects: [],
+      connected_services: [],
       linked: {
         sandbox_id: 'sbx_abc',
         name: 'scratch',
@@ -131,7 +145,12 @@ describe('sandbox control', () => {
 describe('sandbox offer card', () => {
   test('shows why the assistant wants a sandbox and lets the user decline', () => {
     const markup = render(
-      { configured: true, offered: true, connected_projects: [] },
+      {
+        configured: true,
+        offered: true,
+        connected_projects: [],
+        connected_services: [],
+      },
       true
     )
     expect(markup).toContain('would like a sandbox to unpack the archive.')
@@ -145,6 +164,7 @@ describe('sandbox offer card', () => {
         configured: true,
         offered: true,
         connected_projects: [],
+        connected_services: [],
         linked: {
           sandbox_id: 'sbx_abc',
           name: 'scratch',

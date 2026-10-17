@@ -7519,6 +7519,13 @@
             },
             "type": "array"
           },
+          "connected_services": {
+            "description": "Every service the linked sandbox is connected to, whether or not it was\nconnected through a project.",
+            "items": {
+              "$ref": "#/components/schemas/ConnectedService"
+            },
+            "type": "array"
+          },
           "linked": {
             "oneOf": [
               {
@@ -7563,7 +7570,8 @@
         "required": [
           "configured",
           "offered",
-          "connected_projects"
+          "connected_projects",
+          "connected_services"
         ],
         "type": "object"
       },
@@ -9442,6 +9450,49 @@
         },
         "required": [
           "project_id"
+        ],
+        "type": "object"
+      },
+      "ConnectServiceRequest": {
+        "description": "Connect the chat's sandbox to one service.",
+        "properties": {
+          "project_id": {
+            "description": "A project the service is linked to. Names the sandbox's database or\nbucket after the project; without it the name comes from the sandbox.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "description": "The service the sandbox may use.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id"
+        ],
+        "type": "object"
+      },
+      "ConnectedService": {
+        "description": "A service a sandbox is linked to.",
+        "properties": {
+          "project_id": {
+            "description": "The project the link was made through, if it was made through one.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id"
         ],
         "type": "object"
       },
@@ -46039,7 +46090,7 @@
         "type": "object"
       },
       "SandboxConnections": {
-        "description": "What connecting the sandbox to a project's services gave it.",
+        "description": "What linking the sandbox to services gave it.",
         "properties": {
           "connected_service_ids": {
             "description": "Services the sandbox can now reach.",
@@ -46050,10 +46101,17 @@
             "type": "array"
           },
           "project_ids": {
-            "description": "Projects the sandbox is now connected to.",
+            "description": "Projects the sandbox is now linked to services through.",
             "items": {
               "format": "int32",
               "type": "integer"
+            },
+            "type": "array"
+          },
+          "services": {
+            "description": "Every service the sandbox is now linked to.",
+            "items": {
+              "$ref": "#/components/schemas/ConnectedService"
             },
             "type": "array"
           },
@@ -46075,6 +46133,7 @@
         },
         "required": [
           "project_ids",
+          "services",
           "variable_names",
           "connected_service_ids",
           "skipped_service_ids"
@@ -66038,6 +66097,232 @@
           }
         ],
         "summary": "Stop the chat's sandbox using a project's database.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/sandbox/services": {
+      "post": {
+        "operationId": "connect_chat_sandbox_service",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectServiceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxConnections"
+                }
+              }
+            },
+            "description": "Sandbox connected"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service cannot give a sandbox credentials"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The chat has no linked sandbox"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Let the chat's sandbox use one service, whether or not it belongs to a\nproject. The service must be one the sandbox can get credentials of its own\non; the variables commands receive are the same a deployment gets.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/sandbox/services/{service_id}": {
+      "delete": {
+        "operationId": "disconnect_chat_sandbox_service",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Service to disconnect",
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxConnections"
+                }
+              }
+            },
+            "description": "Sandbox disconnected"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The chat has no linked sandbox"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop the chat's sandbox using one service. Its data is left as it is.",
         "tags": [
           "AI Chat"
         ],

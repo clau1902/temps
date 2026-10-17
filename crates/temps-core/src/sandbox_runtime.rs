@@ -11,6 +11,16 @@ use thiserror::Error;
 ///
 /// Implementations may provision a tenant database as part of issuance. The
 /// returned values are secrets: callers must never log or persist them.
+/// Who a sandbox credential is for: the sandbox, and the project its link was
+/// made through. The project, when there is one, names the sandbox's database
+/// and bucket so a new chat on the project continues with the same data;
+/// without one the sandbox's own id does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxScope {
+    pub sandbox_public_id: String,
+    pub project_id: Option<i32>,
+}
+
 #[async_trait]
 pub trait SandboxRuntimeCredentialsProvider: Send + Sync {
     async fn issue(
@@ -33,9 +43,10 @@ pub trait SandboxRuntimeCredentialsProvider: Send + Sync {
         service_id: i32,
     ) -> Result<Vec<String>, SandboxRuntimeCredentialsError>;
 
-    /// Variables for a sandbox to use `service_id` as part of `project_id`,
-    /// authenticating as a credential that reaches only a database of the
-    /// sandbox's own (ADR-051), never the deployment's.
+    /// Variables for the sandbox in `scope` to use `service_id`,
+    /// authenticating as a credential that reaches only a namespace of the
+    /// sandbox's own (ADR-051), never the deployment's. When the scope names a
+    /// project, the service must be linked to it.
     ///
     /// A service type with no such mechanism returns
     /// [`SandboxRuntimeCredentialsError::NoScopedCredentials`]; the caller
@@ -43,7 +54,7 @@ pub trait SandboxRuntimeCredentialsProvider: Send + Sync {
     async fn issue_for_sandbox(
         &self,
         service_id: i32,
-        project_id: i32,
+        scope: &SandboxScope,
     ) -> Result<HashMap<String, String>, SandboxRuntimeCredentialsError>;
 }
 

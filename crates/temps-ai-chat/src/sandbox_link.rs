@@ -16,12 +16,13 @@
 //! model can never name a sandbox of its own choosing. Nothing here holds
 //! platform or Git credentials; the sandbox is an ordinary user sandbox.
 //!
-//! The user can also connect the sandbox to the services of a project
-//! (ADR-051). The projects are recorded under [`SANDBOX_PROJECTS_KEY`], ids
-//! only. Each command then runs with credentials that reach a database of the
-//! sandbox's own, resolved on the server for that command: they are never
-//! written to a file in the sandbox, never shown to the model, and removed
-//! from the output if a command prints them.
+//! The user can also link the sandbox to services, one at a time or all of a
+//! project's (ADR-051). The links belong to the sandbox (`sandbox_services`),
+//! the way a project's belong to the project. Each command then runs with
+//! credentials that reach a namespace of the sandbox's own on each service,
+//! resolved on the server for that command: they are never written to a file
+//! in the sandbox, never shown to the model, and removed from the output if a
+//! command prints them.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -40,7 +41,7 @@ use temps_auth::permissions::Permission;
 use temps_core::{AuditContext, AuditLogger};
 use temps_entities::ai_conversations;
 use temps_sandbox::error::SandboxError;
-use temps_sandbox::services::{CreateSandboxRequest, ExecOptions};
+use temps_sandbox::services::{CreateSandboxRequest, ExecOptions, LinkedService};
 use temps_sandbox::SandboxService;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -55,9 +56,6 @@ pub const SANDBOX_LINK_KEY: &str = "sandbox_link";
 pub const SANDBOX_PREVIEW_KEY: &str = "sandbox_preview_port";
 /// Key recording that the user has already been offered a sandbox in this chat.
 pub const SANDBOX_OFFERED_KEY: &str = "sandbox_offered_at";
-/// Key holding the ids of the projects whose services the linked sandbox is
-/// connected to. Ids only: credentials are resolved when a command runs.
-pub const SANDBOX_PROJECTS_KEY: &str = "sandbox_connected_projects";
 /// How long the credentials resolved for a chat's commands are reused, so a
 /// run of commands does not provision the database role again for each one.
 const CREDENTIAL_CACHE_SECS: u64 = 300;
@@ -165,24 +163,6 @@ pub fn link_from_metadata(metadata: Option<&Value>) -> Option<SandboxLink> {
     serde_json::from_value(link.clone()).ok()
 }
 
-/// The projects the linked sandbox is connected to, sorted and without
-/// duplicates.
-pub fn connected_projects_from_metadata(metadata: Option<&Value>) -> Vec<i32> {
-    let mut projects: Vec<i32> = metadata
-        .and_then(|value| value.get(SANDBOX_PROJECTS_KEY))
-        .and_then(Value::as_array)
-        .map(|ids| {
-            ids.iter()
-                .filter_map(Value::as_i64)
-                .filter_map(|id| i32::try_from(id).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    projects.sort_unstable();
-    projects.dedup();
-    projects
-}
-
 /// Whether a variable holds something that must not be shown.
 fn is_secret_variable(name: &str) -> bool {
     ["PASSWORD", "SECRET", "TOKEN", "KEY", "URL"]
@@ -211,11 +191,39 @@ pub fn redact_secrets(text: &str, variables: &HashMap<String, String>) -> String
     redacted
 }
 
-/// What connecting the sandbox to a project's services gave it.
+/// A service a sandbox is linked to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ConnectedService {
+    pub service_id: i32,
+    /// The project the link was made through, if it was made through one.
+    pub project_id: Option<i32>,
+}
+
+impl From<&LinkedService> for ConnectedService {
+    fn from(linked: &LinkedService) -> Self {
+        Self {
+            service_id: linked.service_id,
+            project_id: linked.project_id,
+        }
+    }
+}
+
+/// The projects a sandbox's links were made through, sorted and without
+/// duplicates.
+pub fn connected_project_ids(linked: &[LinkedService]) -> Vec<i32> {
+    let mut projects: Vec<i32> = linked.iter().filter_map(|link| link.project_id).collect();
+    projects.sort_unstable();
+    projects.dedup();
+    projects
+}
+
+/// What linking the sandbox to services gave it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct SandboxConnections {
-    /// Projects the sandbox is now connected to.
+    /// Projects the sandbox is now linked to services through.
     pub project_ids: Vec<i32>,
+    /// Every service the sandbox is now linked to.
+    pub services: Vec<ConnectedService>,
     /// Names (never values) of the variables commands now run with.
     pub variable_names: Vec<String>,
     /// Services the sandbox can now reach.
@@ -860,8 +868,6 @@ impl SandboxLinkService {
         self.remove_metadata_key(conversation, SANDBOX_PREVIEW_KEY)
             .await?;
         self.release_connections(conversation).await;
-        self.remove_metadata_key(conversation, SANDBOX_PROJECTS_KEY)
-            .await?;
         info!(
             conversation_id = %conversation.public_id,
             sandbox_id = %link.sandbox_id,
@@ -880,8 +886,6 @@ impl SandboxLinkService {
             .await?;
         self.remove_metadata_key(conversation, SANDBOX_PREVIEW_KEY)
             .await?;
-        self.remove_metadata_key(conversation, SANDBOX_PROJECTS_KEY)
-            .await?;
         info!(
             conversation_id = %conversation.public_id,
             "sandbox unlinked from assistant chat"
@@ -890,19 +894,35 @@ impl SandboxLinkService {
     }
 
     /// Cut the sandbox the conversation is linked to off from the services it
-    /// was connected to. Best effort: the link is being dropped either way.
+    /// was linked to. Best effort: the chat's link is being dropped either way,
+    /// and a sandbox nobody is working in should not keep reaching databases.
     async fn release_connections(&self, conversation: &ai_conversations::Model) {
-        let projects = connected_projects_from_metadata(conversation.metadata.as_ref());
         let Some(link) = link_from_metadata(conversation.metadata.as_ref()) else {
             return;
         };
         self.forget_credentials(&link.sandbox_id);
-        if projects.is_empty() {
+        let linked = match self
+            .sandboxes
+            .linked_services(conversation.created_by, &link.sandbox_id)
+            .await
+        {
+            Ok(linked) => linked,
+            Err(error) => {
+                warn!(
+                    conversation_id = %conversation.public_id,
+                    sandbox_id = %link.sandbox_id,
+                    "could not read the sandbox's service links: {error}"
+                );
+                return;
+            }
+        };
+        if linked.is_empty() {
             return;
         }
+        let service_ids: Vec<i32> = linked.iter().map(|link| link.service_id).collect();
         if let Err(error) = self
             .sandboxes
-            .scoped_runtime_environment(conversation.created_by, &link.sandbox_id, &[])
+            .unlink_services(conversation.created_by, &link.sandbox_id, &service_ids)
             .await
         {
             warn!(
@@ -920,28 +940,174 @@ impl SandboxLinkService {
             .retain(|key, _| !key.starts_with(&format!("{sandbox_id}:")));
     }
 
-    /// Connect the chat's sandbox to the services of `project_id`.
+    /// Link the chat's sandbox to the services of `project_id` that can give a
+    /// sandbox credentials of its own.
     ///
-    /// The sandbox gets a database of its own on each PostgreSQL service the
-    /// project uses, and commands then run with credentials for it. Nothing is
-    /// recorded unless at least one service could be connected.
+    /// The sandbox gets a namespace of its own on each (a database, a bucket),
+    /// named for the project, and commands then run with credentials for it.
+    /// Nothing is linked unless at least one service could be.
     pub async fn connect_project(
         &self,
         conversation: &ai_conversations::Model,
         user_id: i32,
         project_id: i32,
     ) -> Result<SandboxConnections, SandboxLinkError> {
-        let link = link_from_metadata(conversation.metadata.as_ref()).ok_or_else(|| {
+        let link = self.linked_sandbox(conversation)?;
+        self.wake_if_asleep(conversation, &link, user_id).await?;
+        let service_ids = self
+            .sandboxes
+            .linkable_project_services(project_id)
+            .await
+            .map_err(|error| Self::connection_error(conversation, error))?;
+        if service_ids.is_empty() {
+            return Err(SandboxLinkError::Validation {
+                conversation_id: conversation.public_id.clone(),
+                message: format!(
+                    "project {project_id} has no linked service that can give a sandbox \
+                     credentials of its own yet (PostgreSQL and S3 can). Link a database or a \
+                     bucket to the project first"
+                ),
+            });
+        }
+        let links: Vec<LinkedService> = service_ids
+            .into_iter()
+            .map(|service_id| LinkedService {
+                service_id,
+                project_id: Some(project_id),
+            })
+            .collect();
+        let runtime = self
+            .sandboxes
+            .link_services(user_id, &link.sandbox_id, &links)
+            .await
+            .map_err(|error| Self::connection_error(conversation, error))?;
+        self.forget_credentials(&link.sandbox_id);
+        info!(
+            conversation_id = %conversation.public_id,
+            sandbox_id = %link.sandbox_id,
+            project_id,
+            services = ?runtime.connected_service_ids,
+            "linked the chat's sandbox to a project's services"
+        );
+        self.connections_of(user_id, &link, &runtime).await
+    }
+
+    /// Link the chat's sandbox to one service. `project_id` is the project the
+    /// service is used through, when there is one: it names the sandbox's
+    /// database or bucket and must be a project the service is linked to.
+    pub async fn connect_service(
+        &self,
+        conversation: &ai_conversations::Model,
+        user_id: i32,
+        service_id: i32,
+        project_id: Option<i32>,
+    ) -> Result<SandboxConnections, SandboxLinkError> {
+        let link = self.linked_sandbox(conversation)?;
+        self.wake_if_asleep(conversation, &link, user_id).await?;
+        let supported = self
+            .sandboxes
+            .service_supports_sandbox(service_id)
+            .await
+            .map_err(|error| Self::connection_error(conversation, error))?;
+        if !supported {
+            return Err(SandboxLinkError::Validation {
+                conversation_id: conversation.public_id.clone(),
+                message: format!(
+                    "service {service_id} cannot give a sandbox credentials of its own: its type \
+                     is not supported yet (PostgreSQL and S3 are), or it does not run on this \
+                     server"
+                ),
+            });
+        }
+        let runtime = self
+            .sandboxes
+            .link_services(
+                user_id,
+                &link.sandbox_id,
+                &[LinkedService {
+                    service_id,
+                    project_id,
+                }],
+            )
+            .await
+            .map_err(|error| Self::connection_error(conversation, error))?;
+        self.forget_credentials(&link.sandbox_id);
+        info!(
+            conversation_id = %conversation.public_id,
+            sandbox_id = %link.sandbox_id,
+            service_id,
+            "linked the chat's sandbox to a service"
+        );
+        self.connections_of(user_id, &link, &runtime).await
+    }
+
+    /// Unlink the chat's sandbox from the services it was linked to through
+    /// `project_id`.
+    pub async fn disconnect_project(
+        &self,
+        conversation: &ai_conversations::Model,
+        user_id: i32,
+        project_id: i32,
+    ) -> Result<SandboxConnections, SandboxLinkError> {
+        let link = self.linked_sandbox(conversation)?;
+        let (removed, runtime) = self
+            .sandboxes
+            .unlink_project(user_id, &link.sandbox_id, project_id)
+            .await
+            .map_err(|error| Self::connection_error(conversation, error))?;
+        self.forget_credentials(&link.sandbox_id);
+        info!(
+            conversation_id = %conversation.public_id,
+            sandbox_id = %link.sandbox_id,
+            project_id,
+            services = ?removed,
+            "unlinked the chat's sandbox from a project's services"
+        );
+        self.connections_of(user_id, &link, &runtime).await
+    }
+
+    /// Unlink the chat's sandbox from one service.
+    pub async fn disconnect_service(
+        &self,
+        conversation: &ai_conversations::Model,
+        user_id: i32,
+        service_id: i32,
+    ) -> Result<SandboxConnections, SandboxLinkError> {
+        let link = self.linked_sandbox(conversation)?;
+        let runtime = self
+            .sandboxes
+            .unlink_services(user_id, &link.sandbox_id, &[service_id])
+            .await
+            .map_err(|error| Self::connection_error(conversation, error))?;
+        self.forget_credentials(&link.sandbox_id);
+        info!(
+            conversation_id = %conversation.public_id,
+            sandbox_id = %link.sandbox_id,
+            service_id,
+            "unlinked the chat's sandbox from a service"
+        );
+        self.connections_of(user_id, &link, &runtime).await
+    }
+
+    fn linked_sandbox(
+        &self,
+        conversation: &ai_conversations::Model,
+    ) -> Result<SandboxLink, SandboxLinkError> {
+        link_from_metadata(conversation.metadata.as_ref()).ok_or_else(|| {
             SandboxLinkError::NotLinked {
                 conversation_id: conversation.public_id.clone(),
             }
-        })?;
-        let previous = connected_projects_from_metadata(conversation.metadata.as_ref());
-        let mut projects = previous.clone();
-        projects.push(project_id);
-        projects.sort_unstable();
-        projects.dedup();
+        })
+    }
 
+    /// Wake the sandbox before changing what it is connected to: a sleeping
+    /// container has no network to attach to.
+    async fn wake_if_asleep(
+        &self,
+        conversation: &ai_conversations::Model,
+        link: &SandboxLink,
+        user_id: i32,
+    ) -> Result<(), SandboxLinkError> {
         let row = self
             .sandboxes
             .find_by_public_id(&link.sandbox_id, user_id)
@@ -951,100 +1117,40 @@ impl SandboxLinkService {
                 user_id,
             })?;
         if readiness(&row.status) == SandboxReadiness::Asleep {
-            self.wake(conversation.id, &link, user_id)
+            self.wake(conversation.id, link, user_id)
                 .await
                 .map_err(|reason| SandboxLinkError::Sandbox {
                     conversation_id: conversation.public_id.clone(),
                     reason,
                 })?;
         }
-        let runtime = self
-            .sandboxes
-            .scoped_runtime_environment(user_id, &link.sandbox_id, &projects)
-            .await
-            .map_err(|error| Self::connection_error(conversation, error))?;
-        if runtime.connected_service_ids.is_empty() {
-            // Put the network back as it was before reporting the problem.
-            if let Err(error) = self
-                .sandboxes
-                .scoped_runtime_environment(user_id, &link.sandbox_id, &previous)
-                .await
-            {
-                warn!(
-                    conversation_id = %conversation.public_id,
-                    "could not restore the sandbox's connections: {error}"
-                );
-            }
-            return Err(SandboxLinkError::Validation {
-                conversation_id: conversation.public_id.clone(),
-                message: format!(
-                    "project {project_id} has no linked service that can give a sandbox \
-                     credentials of its own yet (PostgreSQL can). Link a database to the project \
-                     first"
-                ),
-            });
-        }
-        self.merge_metadata_key(conversation, SANDBOX_PROJECTS_KEY, &json!(projects))
-            .await?;
-        self.forget_credentials(&link.sandbox_id);
-        info!(
-            conversation_id = %conversation.public_id,
-            sandbox_id = %link.sandbox_id,
-            project_id,
-            services = ?runtime.connected_service_ids,
-            "connected the chat's sandbox to a project's services"
-        );
-        Ok(Self::connections_of(projects, &runtime))
+        Ok(())
     }
 
-    /// Disconnect the chat's sandbox from the services of `project_id`.
-    pub async fn disconnect_project(
+    /// What the sandbox is now linked to, read fresh from its links.
+    async fn connections_of(
         &self,
-        conversation: &ai_conversations::Model,
         user_id: i32,
-        project_id: i32,
-    ) -> Result<SandboxConnections, SandboxLinkError> {
-        let link = link_from_metadata(conversation.metadata.as_ref()).ok_or_else(|| {
-            SandboxLinkError::NotLinked {
-                conversation_id: conversation.public_id.clone(),
-            }
-        })?;
-        let mut projects = connected_projects_from_metadata(conversation.metadata.as_ref());
-        projects.retain(|id| *id != project_id);
-        let runtime = self
-            .sandboxes
-            .scoped_runtime_environment(user_id, &link.sandbox_id, &projects)
-            .await
-            .map_err(|error| Self::connection_error(conversation, error))?;
-        if projects.is_empty() {
-            self.remove_metadata_key(conversation, SANDBOX_PROJECTS_KEY)
-                .await?;
-        } else {
-            self.merge_metadata_key(conversation, SANDBOX_PROJECTS_KEY, &json!(projects))
-                .await?;
-        }
-        self.forget_credentials(&link.sandbox_id);
-        info!(
-            conversation_id = %conversation.public_id,
-            sandbox_id = %link.sandbox_id,
-            project_id,
-            "disconnected the chat's sandbox from a project's services"
-        );
-        Ok(Self::connections_of(projects, &runtime))
-    }
-
-    fn connections_of(
-        project_ids: Vec<i32>,
+        link: &SandboxLink,
         runtime: &temps_sandbox::services::ScopedRuntime,
-    ) -> SandboxConnections {
+    ) -> Result<SandboxConnections, SandboxLinkError> {
+        let linked = self
+            .sandboxes
+            .linked_services(user_id, &link.sandbox_id)
+            .await
+            .map_err(|error| SandboxLinkError::Sandbox {
+                conversation_id: link.sandbox_id.clone(),
+                reason: error.to_string(),
+            })?;
         let mut variable_names = runtime.variable_names();
         variable_names.sort();
-        SandboxConnections {
-            project_ids,
+        Ok(SandboxConnections {
+            project_ids: connected_project_ids(&linked),
+            services: linked.iter().map(ConnectedService::from).collect(),
             variable_names,
             connected_service_ids: runtime.connected_service_ids.clone(),
             skipped_service_ids: runtime.skipped_service_ids.clone(),
-        }
+        })
     }
 
     fn connection_error(
@@ -1055,9 +1161,13 @@ impl SandboxLinkService {
             SandboxError::RuntimeVariableConflict { .. } => SandboxLinkError::Validation {
                 conversation_id: conversation.public_id.clone(),
                 message: format!(
-                    "{error}. Two connected projects each have a database, and an app reads one \
-                     set of POSTGRES_* variables: connect the sandbox to one project at a time"
+                    "{error}. Two linked services each set the same variables, and an app reads \
+                     one set (for example one PostgreSQL database): link one at a time"
                 ),
+            },
+            SandboxError::ServiceNotFound { .. } => SandboxLinkError::Validation {
+                conversation_id: conversation.public_id.clone(),
+                message: error.to_string(),
             },
             other => SandboxLinkError::Sandbox {
                 conversation_id: conversation.public_id.clone(),
@@ -1066,23 +1176,8 @@ impl SandboxLinkService {
         }
     }
 
-    /// The projects the conversation's sandbox is connected to, read fresh.
-    async fn connected_projects(
-        &self,
-        conversation_id: i64,
-        user_id: i32,
-    ) -> Result<Vec<i32>, DbErr> {
-        let row = ai_conversations::Entity::find_by_id(conversation_id)
-            .filter(ai_conversations::Column::CreatedBy.eq(user_id))
-            .one(self.db.as_ref())
-            .await?;
-        Ok(row
-            .map(|row| connected_projects_from_metadata(row.metadata.as_ref()))
-            .unwrap_or_default())
-    }
-
-    /// The variables a command in the chat's sandbox runs with: empty when no
-    /// project is connected. `Err` is the complete tool result for a command
+    /// The variables a command in the chat's sandbox runs with: empty when it
+    /// is linked to no service. `Err` is the complete tool result for a command
     /// that must not run without them.
     async fn exec_environment(
         &self,
@@ -1090,18 +1185,7 @@ impl SandboxLinkService {
         link: &SandboxLink,
         user_id: i32,
     ) -> Result<Arc<HashMap<String, String>>, String> {
-        let projects = self
-            .connected_projects(conversation_id, user_id)
-            .await
-            .map_err(|error| {
-                format!(
-                    "`{SANDBOX_EXEC_TOOL}` failed: could not read the connected projects: {error}"
-                )
-            })?;
-        if projects.is_empty() {
-            return Ok(Arc::new(HashMap::new()));
-        }
-        let key = format!("{}:{projects:?}", link.sandbox_id);
+        let key = link.sandbox_id.clone();
         let fresh = Duration::from_secs(CREDENTIAL_CACHE_SECS);
         if let Some(cached) = self
             .credentials
@@ -1114,7 +1198,7 @@ impl SandboxLinkService {
         }
         let runtime = self
             .sandboxes
-            .scoped_runtime_variables(user_id, &link.sandbox_id, &projects)
+            .scoped_runtime_variables(user_id, &link.sandbox_id)
             .await
             .map_err(|error| {
                 warn!(
@@ -1371,20 +1455,24 @@ impl SandboxLinkService {
     /// Put a woken sandbox back on the data network of the services it was
     /// connected to. Best effort: a failure surfaces when a command needs them.
     async fn reconnect_after_wake(&self, conversation_id: i64, link: &SandboxLink, user_id: i32) {
-        let projects = match self.connected_projects(conversation_id, user_id).await {
-            Ok(projects) if !projects.is_empty() => projects,
+        let linked = match self
+            .sandboxes
+            .linked_services(user_id, &link.sandbox_id)
+            .await
+        {
+            Ok(linked) if !linked.is_empty() => linked,
             Ok(_) => return,
             Err(error) => {
                 warn!(
                     conversation_id,
-                    "could not read the connected projects: {error}"
+                    "could not read the sandbox's service links: {error}"
                 );
                 return;
             }
         };
         if let Err(error) = self
             .sandboxes
-            .scoped_runtime_environment(user_id, &link.sandbox_id, &projects)
+            .link_services(user_id, &link.sandbox_id, &linked)
             .await
         {
             warn!(
@@ -1882,16 +1970,40 @@ mod tests {
     }
 
     #[test]
-    fn connected_projects_are_read_sorted_and_deduplicated() {
-        let metadata = json!({ "sandbox_connected_projects": [7, 3, 7, "x", 99999999999i64] });
-        assert_eq!(
-            connected_projects_from_metadata(Some(&metadata)),
-            vec![3, 7]
+    fn linking_to_a_service_that_does_not_exist_is_a_validation_error() {
+        let chat = conversation("assistant", None);
+        let error = SandboxLinkService::connection_error(
+            &chat,
+            SandboxError::ServiceNotFound { service_id: 999 },
         );
-        assert!(connected_projects_from_metadata(Some(&json!({}))).is_empty());
-        assert!(connected_projects_from_metadata(None).is_empty());
-        let wrong_shape = json!({ "sandbox_connected_projects": "3" });
-        assert!(connected_projects_from_metadata(Some(&wrong_shape)).is_empty());
+        match error {
+            SandboxLinkError::Validation { message, .. } => assert!(message.contains("999")),
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connected_projects_are_the_projects_the_links_were_made_through() {
+        let linked = [
+            LinkedService {
+                service_id: 1,
+                project_id: Some(7),
+            },
+            LinkedService {
+                service_id: 2,
+                project_id: Some(3),
+            },
+            LinkedService {
+                service_id: 3,
+                project_id: Some(7),
+            },
+            LinkedService {
+                service_id: 4,
+                project_id: None,
+            },
+        ];
+        assert_eq!(connected_project_ids(&linked), vec![3, 7]);
+        assert!(connected_project_ids(&[]).is_empty());
     }
 
     fn database_variables() -> HashMap<String, String> {

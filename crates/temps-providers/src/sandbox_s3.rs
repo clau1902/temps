@@ -450,7 +450,8 @@ impl SandboxAccessEngine for S3SandboxAccess {
     ) -> Result<HashMap<String, String>, ExternalServiceError> {
         let SandboxAccessRequest {
             service,
-            project,
+            namespace,
+            project_id,
             parameters,
         } = request;
         if !is_rustfs_backed(service, parameters) {
@@ -466,7 +467,7 @@ impl SandboxAccessEngine for S3SandboxAccess {
                 service_type: service.service_type.clone(),
             }
         })?;
-        let bucket = sandbox_bucket_name(&project.slug).map_err(|error| {
+        let bucket = sandbox_bucket_name(namespace).map_err(|error| {
             ExternalServiceError::SandboxAccessUnsupported {
                 service_id: service.id,
                 service_type: service.service_type.clone(),
@@ -541,7 +542,7 @@ impl SandboxAccessEngine for S3SandboxAccess {
 
         info!(
             service_id = service.id,
-            project_id = project.id,
+            project_id = ?project_id,
             bucket = %bucket,
             lifetime_secs = CREDENTIAL_LIFETIME_SECS,
             "Issued a bucket-scoped temporary credential for a sandbox"

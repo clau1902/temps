@@ -411,7 +411,8 @@ impl SandboxAccessEngine for PostgresSandboxAccess {
     ) -> Result<HashMap<String, String>, ExternalServiceError> {
         let SandboxAccessRequest {
             service,
-            project,
+            namespace,
+            project_id,
             parameters,
         } = request;
         let service_id = service.id;
@@ -425,13 +426,12 @@ impl SandboxAccessEngine for PostgresSandboxAccess {
         };
         let admin_user = param("username", "postgres");
         let admin_password = param("password", "");
-        let plan =
-            SandboxDatabasePlan::new(service_id, &project.slug, &admin_user, &admin_password)
-                .map_err(|error| ExternalServiceError::SandboxAccessUnsupported {
-                    service_id,
-                    service_type: service.service_type.clone(),
-                    reason: error.to_string(),
-                })?;
+        let plan = SandboxDatabasePlan::new(service_id, namespace, &admin_user, &admin_password)
+            .map_err(|error| ExternalServiceError::SandboxAccessUnsupported {
+                service_id,
+                service_type: service.service_type.clone(),
+                reason: error.to_string(),
+            })?;
 
         let hosts = if service.topology == "cluster" {
             let members = manager.get_service_members(service_id).await?;
@@ -537,7 +537,7 @@ impl SandboxAccessEngine for PostgresSandboxAccess {
 
         info!(
             service_id,
-            project_id = project.id,
+            project_id = ?project_id,
             database = %plan.database,
             role = %plan.role,
             "Provisioned a sandbox database and scoped role"

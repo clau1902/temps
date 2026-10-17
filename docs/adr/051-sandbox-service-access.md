@@ -111,17 +111,44 @@ secure and keep alive, while the network already isolates. A connected sandbox
 is attached to its per-sandbox internal data network, which holds only the
 containers each engine names for the services the user connected. The scoped credentials name
 those containers as hosts, on the container port, so the same names work
-inside the sandbox. A chat's connection set is a list of project ids; the
-network is rebuilt from it, so disconnecting also tears down open sockets
-(the reconciliation already disconnects the sandbox first).
+inside the sandbox. The connection set is the sandbox's rows in
+`sandbox_services` (see 3b); the network is rebuilt from it, so disconnecting
+also tears down open sockets (the reconciliation already disconnects the
+sandbox first).
 
 Supported first: the Docker backend, services running on the control plane. A
 service on another node, or another backend, is refused with a message that
 says why; it never falls back to the shared credentials.
 
+### 3b. Sandboxes link to services the way projects do
+
+`sandbox_services` is the mirror of `project_services`: one row per
+`(sandbox, service)`, the single source of truth for the data network, the
+per-command environment, the console and the audit trail. It replaces the list
+of project ids that used to live in the chat's metadata, so the link belongs to
+the sandbox and survives the chat being relinked or the sandbox waking up.
+
+- A row records the project it was made through, if any. That decides the
+  namespace: `<project>_sandbox` / `<project>-sandbox` for a link made through
+  a project, a name derived from the sandbox id (`sbx_ab12…` becomes `sab12…`)
+  for one made without. The same service linked to two sandboxes therefore
+  gives two separate databases or buckets.
+- "Connect a project's databases" is shorthand for linking every supported
+  service of the project. A single service, even one that belongs to no
+  project, can be linked or unlinked on its own
+  (`POST /ai/conversations/{id}/sandbox/services`,
+  `DELETE …/sandbox/services/{service_id}`).
+- Unlinking removes the sandbox from the network and revokes what its next
+  command receives. It never deletes the database or bucket, so linking again
+  finds the same data.
+- Unlinking or relinking the chat's sandbox releases its links (least
+  privilege); the service rows cascade away with the sandbox or the service.
+- The engines return the variable names a deployment gets, so code written in
+  the sandbox runs unchanged once deployed.
+
 ### 4. Credentials are injected per command, server side
 
-Connections are recorded on the chat as service ids only. On every
+Connections are recorded in `sandbox_services` by service id only. On every
 `sandbox_exec` the server resolves the variables fresh and passes them in the
 command's environment, naming the database containers on the data network. Nothing is baked
 into the container or written to a file, so revoking a connection or rotating a

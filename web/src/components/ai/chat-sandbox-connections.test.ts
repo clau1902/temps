@@ -7,6 +7,8 @@ import {
   connectionLabel,
   connectionState,
   connectionTitle,
+  serviceConnectionState,
+  serviceConnectionTitle,
 } from './chat-sandbox-connections'
 
 describe('connectionState', () => {
@@ -46,7 +48,7 @@ describe('connectedSummary', () => {
       connected_service_ids: [1],
       skipped_service_ids: [2, 5],
     })
-    expect(summary).toContain('1 database')
+    expect(summary).toContain('1 service')
     expect(summary).toContain('POSTGRES_URL, POSTGRES_DB')
     expect(summary).not.toContain('POSTGRES_PASSWORD')
     expect(summary).toContain('2 linked services of another type')
@@ -58,7 +60,28 @@ describe('connectedSummary', () => {
       connected_service_ids: [1, 2],
       skipped_service_ids: [],
     })
-    expect(summary).toContain('2 databases')
+    expect(summary).toContain('2 services')
     expect(summary).not.toContain('another type')
+  })
+})
+
+describe('serviceConnectionState', () => {
+  test('needs a linked sandbox, then tells a connected service from an available one', () => {
+    expect(serviceConnectionState(undefined, 1)).toBe('no-sandbox')
+    const status = {
+      linked: { name: 's' },
+      connected_services: [{ service_id: 1 }],
+    }
+    expect(serviceConnectionState(status, 1)).toBe('connected')
+    expect(serviceConnectionState(status, 2)).toBe('available')
+    expect(serviceConnectionState({ linked: { name: 's' } }, 2)).toBe(
+      'available'
+    )
+  })
+
+  test('every state explains itself', () => {
+    expect(serviceConnectionTitle('no-sandbox')).toContain('Link a sandbox')
+    expect(serviceConnectionTitle('available')).toContain('never production')
+    expect(serviceConnectionTitle('connected')).toContain('the data stays')
   })
 })

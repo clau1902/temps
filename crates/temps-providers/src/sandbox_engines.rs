@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use temps_entities::{external_services, projects};
+use temps_entities::external_services;
 
 use crate::sandbox_access::PostgresSandboxAccess;
 use crate::sandbox_s3::S3SandboxAccess;
@@ -28,7 +28,12 @@ use crate::services::{ExternalServiceError, ExternalServiceManager};
 /// (the service exists, is linked to the project) have already passed.
 pub struct SandboxAccessRequest<'a> {
     pub service: &'a external_services::Model,
-    pub project: &'a projects::Model,
+    /// The name the sandbox's database or bucket is derived from: the
+    /// project's slug, or one made from the sandbox's id when the link was
+    /// made to the service directly. A plain lowercase slug.
+    pub namespace: &'a str,
+    /// The project the link was made through, for the audit trail.
+    pub project_id: Option<i32>,
     /// The service's decrypted parameters, including its administrator
     /// credentials. Never copy them into the returned variables.
     pub parameters: &'a HashMap<String, serde_json::Value>,

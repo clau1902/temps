@@ -26,6 +26,7 @@ pub use registry::StandaloneSandboxRegistry;
 pub use sandbox_service::{
     is_managed_application_workspace_image, managed_application_workspace_image,
     ApplicationWorkspaceConfig, ApplicationWorkspaceSandbox, ApplicationWorkspaceUsage,
-    CreateSandboxRequest, SandboxService, SandboxSource, SandboxSummary, ScopedRuntime,
+    CreateSandboxRequest, LinkedService, SandboxService, SandboxSource, SandboxSummary,
+    ScopedRuntime,
 };
 pub use snapshot_service::{SnapshotService, StorageSummary};

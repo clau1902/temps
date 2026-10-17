@@ -3,7 +3,9 @@
 
 import {
   connectChatSandboxProjectMutation,
+  connectChatSandboxServiceMutation,
   disconnectChatSandboxProjectMutation,
+  disconnectChatSandboxServiceMutation,
   getChatSandboxOptions,
   getChatSandboxQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -18,6 +20,8 @@ import {
   connectionLabel,
   connectionState,
   connectionTitle,
+  serviceConnectionState,
+  serviceConnectionTitle,
 } from './chat-sandbox-connections'
 import type { ProjectRef } from './project-refs'
 
@@ -58,7 +62,38 @@ export function useSandboxConnections(conversationPublicId: string) {
         description: getErrorMessage(error),
       }),
   })
-  return { status, connect, disconnect, path }
+  const connectService = useMutation({
+    ...connectChatSandboxServiceMutation(),
+    onSuccess: (result) => {
+      toast.success('Sandbox connected', {
+        description: connectedSummary(result),
+      })
+      return refresh()
+    },
+    onError: (error) =>
+      toast.error('Could not connect the sandbox', {
+        description: getErrorMessage(error),
+      }),
+  })
+  const disconnectService = useMutation({
+    ...disconnectChatSandboxServiceMutation(),
+    onSuccess: () => {
+      toast.success('Sandbox disconnected from the service')
+      return refresh()
+    },
+    onError: (error) =>
+      toast.error('Could not disconnect the sandbox', {
+        description: getErrorMessage(error),
+      }),
+  })
+  return {
+    status,
+    connect,
+    disconnect,
+    connectService,
+    disconnectService,
+    path,
+  }
 }
 
 /**
@@ -103,6 +138,65 @@ export function ConnectSandboxButton({
       disabled={pending || status.isPending}
       title={connectionTitle(state)}
       aria-label={`${connectionLabel(state)} for ${project.name}`}
+      onClick={onClick}
+    >
+      {pending ? (
+        <Loader2 className="size-4 animate-spin" aria-hidden />
+      ) : state === 'connected' ? (
+        <Unplug className="size-4" aria-hidden />
+      ) : (
+        <Database className="size-4" aria-hidden />
+      )}
+      <span className="hidden sm:inline">{connectionLabel(state)}</span>
+    </Button>
+  )
+}
+
+/**
+ * "Connect sandbox" for one service, whether or not a project uses it. Shown on
+ * every service row; a service whose type cannot be used from a sandbox yet is
+ * explained by the server's answer rather than hidden.
+ */
+export function ConnectSandboxServiceButton({
+  conversationPublicId,
+  serviceId,
+  serviceName,
+  className,
+}: {
+  conversationPublicId: string
+  serviceId: number
+  serviceName: string
+  className?: string
+}) {
+  const { status, connectService, disconnectService, path } =
+    useSandboxConnections(conversationPublicId)
+  const state = serviceConnectionState(status.data, serviceId)
+  const pending = connectService.isPending || disconnectService.isPending
+
+  const onClick = () => {
+    if (state === 'no-sandbox') {
+      toast.info('Link a sandbox to this chat first', {
+        description:
+          'Use the Sandbox button above the message box, then connect it to this service.',
+      })
+      return
+    }
+    if (state === 'connected') {
+      disconnectService.mutate({ path: { ...path, service_id: serviceId } })
+      return
+    }
+    connectService.mutate({ path, body: { service_id: serviceId } })
+  }
+
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      className={cn('h-8 shrink-0 gap-1.5', className)}
+      disabled={pending || status.isPending}
+      title={serviceConnectionTitle(state)}
+      aria-label={`${connectionLabel(state)} for ${serviceName}`}
       onClick={onClick}
     >
       {pending ? (

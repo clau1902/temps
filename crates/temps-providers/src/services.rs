@@ -616,6 +616,19 @@ pub(crate) fn service_execution_route(node_id: Option<i32>) -> ServiceExecutionR
     }
 }
 
+/// The name a sandbox's database and bucket take when its link was made to a
+/// service directly, with no project to borrow a name from: a plain lowercase
+/// slug made from the sandbox's id (`sbx_ab12` becomes `sab12`).
+pub(crate) fn sandbox_namespace(sandbox_public_id: &str) -> String {
+    let id: String = sandbox_public_id
+        .trim_start_matches("sbx_")
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    format!("s{id}")
+}
+
 fn select_remote_container_name(
     persisted_name: Option<&str>,
     canonical_name: &str,
@@ -12675,10 +12688,10 @@ echo "[restore] Pre-seed complete"
             })
     }
 
-    /// Credentials for a sandbox to use `service_id_val`, a service linked to
-    /// `project_id`: a namespace of its own on the service and a credential
-    /// that reaches only that namespace (ADR-051). The deployment credentials
-    /// are never returned.
+    /// Credentials for the sandbox in `scope` to use `service_id_val`: a
+    /// namespace of its own on the service and a credential that reaches only
+    /// that namespace (ADR-051). The deployment credentials are never
+    /// returned.
     ///
     /// The engine for the service's type does the provisioning (see
     /// [`crate::sandbox_engines`]); this method owns the checks every engine
@@ -12689,7 +12702,7 @@ echo "[restore] Pre-seed complete"
     pub async fn issue_sandbox_runtime_env(
         &self,
         service_id_val: i32,
-        project_id: i32,
+        scope: &temps_core::SandboxScope,
     ) -> Result<HashMap<String, String>, ExternalServiceError> {
         let service = self.get_service(service_id_val).await?;
         let engine =
@@ -12699,32 +12712,41 @@ echo "[restore] Pre-seed complete"
                     service_type: service.service_type.clone(),
                 }
             })?;
-        let linked = project_services::Entity::find()
-            .filter(
-                project_services::Column::ServiceId
-                    .eq(service_id_val)
-                    .and(project_services::Column::ProjectId.eq(project_id)),
-            )
-            .one(self.db.as_ref())
-            .await?
-            .is_some();
-        if !linked {
-            return Err(ExternalServiceError::ServiceNotLinkedToProject {
-                service_id: service_id_val,
-                project_id,
-            });
-        }
-        let project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
+        // A link made through a project must still be a link of that project:
+        // the project is what the user was allowed to reach the service by.
+        let namespace = match scope.project_id {
+            Some(project_id) => {
+                let linked = project_services::Entity::find()
+                    .filter(
+                        project_services::Column::ServiceId
+                            .eq(service_id_val)
+                            .and(project_services::Column::ProjectId.eq(project_id)),
+                    )
+                    .one(self.db.as_ref())
+                    .await?
+                    .is_some();
+                if !linked {
+                    return Err(ExternalServiceError::ServiceNotLinkedToProject {
+                        service_id: service_id_val,
+                        project_id,
+                    });
+                }
+                projects::Entity::find_by_id(project_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?
+                    .slug
+            }
+            None => sandbox_namespace(&scope.sandbox_public_id),
+        };
         let parameters = self.get_service_parameters(service_id_val).await?;
         engine
             .issue(
                 self,
                 crate::sandbox_engines::SandboxAccessRequest {
                     service: &service,
-                    project: &project,
+                    namespace: &namespace,
+                    project_id: scope.project_id,
                     parameters: &parameters,
                 },
             )
@@ -15514,9 +15536,9 @@ impl temps_core::SandboxRuntimeCredentialsProvider for ExternalServiceManager {
     async fn issue_for_sandbox(
         &self,
         service_id: i32,
-        project_id: i32,
+        scope: &temps_core::SandboxScope,
     ) -> Result<HashMap<String, String>, temps_core::SandboxRuntimeCredentialsError> {
-        self.issue_sandbox_runtime_env(service_id, project_id)
+        self.issue_sandbox_runtime_env(service_id, scope)
             .await
             .map_err(|error| match error {
                 ExternalServiceError::ServiceNotFound { id } => {
@@ -23765,6 +23787,20 @@ mod tests {
         assert!(
             manager.local_workloads_enabled(),
             "full profile must report local_workloads_enabled = true"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_without_a_project_gets_a_plain_lowercase_namespace() {
+        assert_eq!(sandbox_namespace("sbx_AB12cd34"), "sab12cd34");
+        assert_eq!(
+            sandbox_namespace("sbx_deadbeef01234567"),
+            "sdeadbeef01234567"
+        );
+        // Two sandboxes never share a database or bucket on the same service.
+        assert_ne!(
+            sandbox_namespace("sbx_aaaa0000"),
+            sandbox_namespace("sbx_bbbb0000")
         );
     }
 }

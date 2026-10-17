@@ -3513,6 +3513,11 @@ export type ChatSandboxStatus = {
      * commands run with credentials for a database of its own on each.
      */
     connected_projects: Array<number>;
+    /**
+     * Every service the linked sandbox is connected to, whether or not it was
+     * connected through a project.
+     */
+    connected_services: Array<ConnectedService>;
     linked?: SandboxLink | null;
     /**
      * True once the assistant has asked the user to link a sandbox.
@@ -4527,6 +4532,32 @@ export type ConnectProjectRequest = {
      * The project whose services the sandbox may use.
      */
     project_id: number;
+};
+
+/**
+ * Connect the chat's sandbox to one service.
+ */
+export type ConnectServiceRequest = {
+    /**
+     * A project the service is linked to. Names the sandbox's database or
+     * bucket after the project; without it the name comes from the sandbox.
+     */
+    project_id?: number | null;
+    /**
+     * The service the sandbox may use.
+     */
+    service_id: number;
+};
+
+/**
+ * A service a sandbox is linked to.
+ */
+export type ConnectedService = {
+    /**
+     * The project the link was made through, if it was made through one.
+     */
+    project_id?: number | null;
+    service_id: number;
 };
 
 /**
@@ -21418,7 +21449,7 @@ export type S3SourceResponse = {
 };
 
 /**
- * What connecting the sandbox to a project's services gave it.
+ * What linking the sandbox to services gave it.
  */
 export type SandboxConnections = {
     /**
@@ -21426,9 +21457,13 @@ export type SandboxConnections = {
      */
     connected_service_ids: Array<number>;
     /**
-     * Projects the sandbox is now connected to.
+     * Projects the sandbox is now linked to services through.
      */
     project_ids: Array<number>;
+    /**
+     * Every service the sandbox is now linked to.
+     */
+    services: Array<ConnectedService>;
     /**
      * Linked services left out because their type cannot give a sandbox
      * credentials of its own yet.
@@ -30819,6 +30854,114 @@ export type DisconnectChatSandboxProjectResponses = {
 };
 
 export type DisconnectChatSandboxProjectResponse = DisconnectChatSandboxProjectResponses[keyof DisconnectChatSandboxProjectResponses];
+
+export type ConnectChatSandboxServiceData = {
+    body: ConnectServiceRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/services';
+};
+
+export type ConnectChatSandboxServiceErrors = {
+    /**
+     * The service cannot give a sandbox credentials
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type ConnectChatSandboxServiceError = ConnectChatSandboxServiceErrors[keyof ConnectChatSandboxServiceErrors];
+
+export type ConnectChatSandboxServiceResponses = {
+    /**
+     * Sandbox connected
+     */
+    200: SandboxConnections;
+};
+
+export type ConnectChatSandboxServiceResponse = ConnectChatSandboxServiceResponses[keyof ConnectChatSandboxServiceResponses];
+
+export type DisconnectChatSandboxServiceData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Service to disconnect
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/services/{service_id}';
+};
+
+export type DisconnectChatSandboxServiceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type DisconnectChatSandboxServiceError = DisconnectChatSandboxServiceErrors[keyof DisconnectChatSandboxServiceErrors];
+
+export type DisconnectChatSandboxServiceResponses = {
+    /**
+     * Sandbox disconnected
+     */
+    200: SandboxConnections;
+};
+
+export type DisconnectChatSandboxServiceResponse = DisconnectChatSandboxServiceResponses[keyof DisconnectChatSandboxServiceResponses];
 
 export type StopUserTurnData = {
     body?: never;
