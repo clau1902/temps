@@ -3433,6 +3433,56 @@ export type ChatReadinessResponse = {
 };
 
 /**
+ * One piece the chat made, with its current state.
+ */
+export type ChatResource = {
+    /**
+     * ISO 8601 time the piece was made (or, for a sandbox, linked).
+     */
+    created_at: string;
+    /**
+     * What it is: the framework preset, the service type, the repository's
+     * visibility, the sandbox backend.
+     */
+    detail?: string | null;
+    /**
+     * Numeric id for projects and services, `owner/name` for repositories,
+     * public id (`sbx_…`) for sandboxes.
+     */
+    id: string;
+    kind: ChatResourceKind;
+    name: string;
+    /**
+     * Project slug, for opening the project.
+     */
+    slug?: string | null;
+    /**
+     * Current status, for services and sandboxes.
+     */
+    status?: string | null;
+    /**
+     * Where to see it outside Temps: a repository's web page.
+     */
+    url?: string | null;
+};
+
+/**
+ * What kind of piece a chat made.
+ */
+export type ChatResourceKind = 'project' | 'service' | 'repository' | 'sandbox';
+
+/**
+ * Everything the chat made, newest first.
+ */
+export type ChatResourcesResponse = {
+    resources: Array<ChatResource>;
+    /**
+     * True when the chat made more pieces than this response covers.
+     */
+    truncated: boolean;
+};
+
+/**
  * What a chat can do with a sandbox, and the one it is linked to.
  */
 export type ChatSandboxStatus = {
@@ -30399,6 +30449,48 @@ export type ResolveUserPermissionResponses = {
 };
 
 export type ResolveUserPermissionResponse = ResolveUserPermissionResponses[keyof ResolveUserPermissionResponses];
+
+export type ListChatResourcesData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/resources';
+};
+
+export type ListChatResourcesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListChatResourcesError = ListChatResourcesErrors[keyof ListChatResourcesErrors];
+
+export type ListChatResourcesResponses = {
+    /**
+     * Pieces the conversation made
+     */
+    200: ChatResourcesResponse;
+};
+
+export type ListChatResourcesResponse = ListChatResourcesResponses[keyof ListChatResourcesResponses];
 
 export type RestoreUserConversationData = {
     body?: never;

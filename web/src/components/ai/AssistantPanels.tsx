@@ -61,6 +61,7 @@ import {
 import { ChatSpend } from './ChatSpend'
 import { DebugChatPanel } from './DebugChatPanel'
 import { DeploymentSidebar } from './DeploymentSidebar'
+import { resourceKeys, useChatResources } from './chat-resources'
 import { ProjectReferencesProvider } from './ProjectReference'
 import type { ProjectRef } from './project-refs'
 import { ChatSandbox } from './ChatSandbox'
@@ -733,7 +734,9 @@ export function AssistantThread({
   // Projects the user opened from a reply, newest first.
   const [openedProjects, setOpenedProjects] = useState<ProjectRef[]>([])
   const [focus, setFocus] = useState({ key: '', nonce: 0 })
-  const hasTabs = deployments.length > 0 || openedProjects.length > 0
+  // The panel always has its "Made here" tab, so it can always be opened: a
+  // chat that has made nothing yet says what will appear there.
+  const resources = useChatResources(conversation.public_id)
   const openProject = useCallback((project: ProjectRef) => {
     setOpenedProjects((current) => [
       project,
@@ -745,6 +748,16 @@ export function AssistantThread({
     }))
     setPanelOpen(true)
   }, [])
+  // A piece the chat makes while the user is watching opens the panel, once;
+  // what an old chat already made waits for the button instead.
+  const seenPieces = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    if (!resources.data) return
+    const keys = resourceKeys(resources.data.resources)
+    const seen = seenPieces.current
+    seenPieces.current = new Set(keys)
+    if (seen && keys.some((piece) => !seen.has(piece))) setPanelOpen(true)
+  }, [resources.data])
   const panelRef = usePanelRef()
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
     id: 'assistant-deployment-split',
@@ -767,7 +780,7 @@ export function AssistantThread({
 
   // Wide screens dock the panel beside the chat (resizable); narrower ones
   // show the same content in a drawer, so the chat is never squeezed.
-  const docked = isDesktop && (workView || (hasTabs && panelOpen))
+  const docked = isDesktop && (workView || panelOpen)
   useEffect(() => {
     const panel = panelRef.current
     if (!panel) return
@@ -780,6 +793,8 @@ export function AssistantThread({
       deployments={deployments}
       projects={openedProjects}
       focus={focus}
+      conversationPublicId={conversation.public_id}
+      onOpenProject={openProject}
       onClose={workView ? undefined : () => setPanelOpen(false)}
     />
   )
@@ -808,7 +823,7 @@ export function AssistantThread({
             <div className="flex shrink-0 items-center justify-end gap-2">
               <ChatSandbox conversationPublicId={conversation.public_id} />
               <ChatSpend conversationPublicId={conversation.public_id} />
-              {hasTabs && !workView && (
+              {!workView && (
                 <Button
                   type="button"
                   variant="outline"
@@ -816,7 +831,7 @@ export function AssistantThread({
                   className="h-8 gap-1.5"
                   aria-pressed={panelOpen}
                   onClick={() => setPanelOpen((open) => !open)}
-                  title="Show the deployments and projects this chat is working on"
+                  title="Show what this chat made and the deployments it is working on"
                 >
                   <Rocket className="size-4" />
                   Working tabs
@@ -866,21 +881,21 @@ export function AssistantThread({
           {docked && sidebar}
         </ResizablePanel>
       </ResizablePanelGroup>
-      <Sheet
-        open={!isDesktop && hasTabs && panelOpen}
-        onOpenChange={setPanelOpen}
-      >
+      <Sheet open={!isDesktop && panelOpen} onOpenChange={setPanelOpen}>
         <SheetContent side="right" className="w-full p-0 sm:max-w-md">
           <SheetHeader className="sr-only">
             <SheetTitle>Working tabs</SheetTitle>
             <SheetDescription>
-              Deployments and projects this chat is working on.
+              What this chat made, and the deployments and projects it is
+              working on.
             </SheetDescription>
           </SheetHeader>
           <DeploymentSidebar
             deployments={deployments}
             projects={openedProjects}
             focus={focus}
+            conversationPublicId={conversation.public_id}
+            onOpenProject={openProject}
             inDrawer
           />
         </SheetContent>

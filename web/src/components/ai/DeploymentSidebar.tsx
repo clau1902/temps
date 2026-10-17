@@ -20,11 +20,13 @@ import {
   ExternalLink,
   FolderGit2,
   GitBranch,
+  Layers,
   Rocket,
   X,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
+import { ChatResourcesTab } from './ChatResourcesTab'
 import { ProjectTab } from './ProjectTab'
 import type { ProjectRef } from './project-refs'
 import {
@@ -35,6 +37,9 @@ import { JobStatusIcon, statusPresentation } from './GeneratedDeploymentCard'
 import type { WatchedDeployment } from './goal-presentation'
 
 const MAX_TABS = 6
+
+/** The fixed tab that lists what the chat made. */
+const MADE_TAB = 'made'
 
 /** A tab beside the chat: a deployment it watches or a project the user opened. */
 export type SidebarTab =
@@ -267,6 +272,8 @@ export function DeploymentSidebar({
   deployments,
   projects = [],
   focus,
+  conversationPublicId,
+  onOpenProject,
   onClose,
   inDrawer = false,
 }: {
@@ -275,6 +282,10 @@ export function DeploymentSidebar({
   projects?: ProjectRef[]
   /** Selects a tab each time `nonce` changes, even if it is already open. */
   focus?: { key: string; nonce: number }
+  /** The chat, for the tab listing what it made. Without it that tab is left out. */
+  conversationPublicId?: string
+  /** Opens a project from the "made" tab as a tab of its own. */
+  onOpenProject?: (project: ProjectRef) => void
   /** Omit when the panel is a fixed part of the layout. */
   onClose?: () => void
   /** Shown in a drawer, which brings its own close button. */
@@ -289,17 +300,21 @@ export function DeploymentSidebar({
   ].slice(0, MAX_TABS)
   const newest = deployments[0]
   const newestKey = newest ? key(newest) : ''
-  const [selected, setSelected] = useState(newestKey)
+  const [selected, setSelected] = useState(
+    newestKey || (conversationPublicId ? MADE_TAB : '')
+  )
   // A deployment started later takes the focus; one the user picked stays put
   // until then.
-  useEffect(() => setSelected(newestKey), [newestKey])
+  useEffect(() => {
+    if (newestKey) setSelected(newestKey)
+  }, [newestKey])
   const focusKey = focus?.key
   const focusNonce = focus?.nonce
   useEffect(() => {
     if (focusKey) setSelected(focusKey)
   }, [focusKey, focusNonce])
 
-  if (tabs.length === 0) {
+  if (tabs.length === 0 && !conversationPublicId) {
     return (
       <aside
         aria-label="Working tabs"
@@ -323,14 +338,18 @@ export function DeploymentSidebar({
     )
   }
 
-  const firstKey = tabKey(tabs[0])
+  const firstKey = conversationPublicId ? MADE_TAB : tabKey(tabs[0])
+  const selectable = [
+    ...(conversationPublicId ? [MADE_TAB] : []),
+    ...tabs.map(tabKey),
+  ]
   return (
     <aside
       aria-label="Working tabs"
       className="flex h-full min-h-0 min-w-0 flex-col bg-background"
     >
       <Tabs
-        value={tabs.some((t) => tabKey(t) === selected) ? selected : firstKey}
+        value={selectable.includes(selected) ? selected : firstKey}
         onValueChange={setSelected}
         className="flex min-h-0 flex-1 flex-col"
       >
@@ -341,6 +360,12 @@ export function DeploymentSidebar({
           )}
         >
           <TabsList className="h-8 min-w-0 flex-1 justify-start overflow-x-auto">
+            {conversationPublicId && (
+              <TabsTrigger value={MADE_TAB} className="gap-1.5 text-xs">
+                <Layers className="size-3.5 shrink-0" />
+                Made here
+              </TabsTrigger>
+            )}
             {tabs.map((tab) => (
               <TabsTrigger
                 key={tabKey(tab)}
@@ -377,6 +402,14 @@ export function DeploymentSidebar({
           )}
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto">
+          {conversationPublicId && (
+            <TabsContent value={MADE_TAB} className="mt-0">
+              <ChatResourcesTab
+                conversationPublicId={conversationPublicId}
+                onOpenProject={onOpenProject ?? (() => undefined)}
+              />
+            </TabsContent>
+          )}
           {tabs.map((tab) => (
             <TabsContent key={tabKey(tab)} value={tabKey(tab)} className="mt-0">
               {tab.kind === 'project' ? (

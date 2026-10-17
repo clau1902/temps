@@ -7390,6 +7390,91 @@
         ],
         "type": "object"
       },
+      "ChatResource": {
+        "description": "One piece the chat made, with its current state.",
+        "properties": {
+          "created_at": {
+            "description": "ISO 8601 time the piece was made (or, for a sandbox, linked).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "detail": {
+            "description": "What it is: the framework preset, the service type, the repository's\nvisibility, the sandbox backend.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Numeric id for projects and services, `owner/name` for repositories,\npublic id (`sbx_…`) for sandboxes.",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ChatResourceKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "description": "Project slug, for opening the project.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Current status, for services and sandboxes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "Where to see it outside Temps: a repository's web page.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "id",
+          "name",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ChatResourceKind": {
+        "description": "What kind of piece a chat made.",
+        "enum": [
+          "project",
+          "service",
+          "repository",
+          "sandbox"
+        ],
+        "type": "string"
+      },
+      "ChatResourcesResponse": {
+        "description": "Everything the chat made, newest first.",
+        "properties": {
+          "resources": {
+            "items": {
+              "$ref": "#/components/schemas/ChatResource"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "description": "True when the chat made more pieces than this response covers.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "resources",
+          "truncated"
+        ],
+        "type": "object"
+      },
       "ChatSandboxStatus": {
         "description": "What a chat can do with a sandbox, and the one it is linked to.",
         "properties": {
@@ -65231,6 +65316,84 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/resources": {
+      "get": {
+        "operationId": "list_chat_resources",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatResourcesResponse"
+                }
+              }
+            },
+            "description": "Pieces the conversation made"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The projects, databases and services, repositories and sandbox this chat\nmade, with their current state.",
         "tags": [
           "AI Chat"
         ],

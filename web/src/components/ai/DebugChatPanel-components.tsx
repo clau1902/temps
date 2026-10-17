@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
+import { useQueryClient } from '@tanstack/react-query'
+import { invalidateChatResources } from './chat-resources'
 import {
   ChatDetailContext,
   chatDetailFor,
@@ -691,6 +693,13 @@ function PendingActionCard({
   const [open, setOpen] = useState(false)
   const [requestOpen, setRequestOpen] = useState(false)
   const onStatusChangeRef = useRef(onStatusChange)
+  const queryClient = useQueryClient()
+
+  // A write that ran may have made a project, service or repository: the
+  // chat's "Made here" tab asks again.
+  useEffect(() => {
+    if (status === 'executed') void invalidateChatResources(queryClient)
+  }, [status, queryClient])
 
   useEffect(() => {
     onStatusChangeRef.current = onStatusChange
@@ -1036,6 +1045,14 @@ function PlanActionCard({
   }, [plan, projectId, userScoped])
 
   useEffect(() => fetchAll(), [fetchAll])
+
+  const queryClient = useQueryClient()
+  const executedSteps = Object.values(states).filter(
+    (state) => state.status === 'executed'
+  ).length
+  useEffect(() => {
+    if (executedSteps > 0) void invalidateChatResources(queryClient)
+  }, [executedSteps, queryClient])
 
   const statuses = plan.steps.map(
     (s) => states[s.action_id]?.status ?? 'proposed'
