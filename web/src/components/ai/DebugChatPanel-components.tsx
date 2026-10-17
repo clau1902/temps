@@ -43,8 +43,13 @@ import {
   ChatSandbox,
   ChatSandboxPending,
   SandboxOfferCard,
+  SandboxStatusRefresher,
 } from '@/components/ai/ChatSandbox'
-import { isSandboxOfferTool, offerReason } from '@/components/ai/chat-sandbox'
+import {
+  isSandboxCreateTool,
+  isSandboxOfferTool,
+  offerReason,
+} from '@/components/ai/chat-sandbox'
 import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard'
 import { GeneratedProjectCollection } from '@/components/ai/GeneratedProjectCollection'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
@@ -106,6 +111,7 @@ import { useIsMobile } from '@/components/hooks/use-mobile'
 import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { persistentWorkspaceStorageSupported } from '@/lib/platform-capabilities'
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -1668,6 +1674,14 @@ export function AssistantBody({
               reason={offerReason(part.tool.arguments)}
               fromProject={fromProject}
             />
+          ) : isSandboxCreateTool(part.tool.name) && conversationPublicId ? (
+            <Fragment key={part.tool.id}>
+              <ReadToolResultCard tool={part.tool} />
+              <SandboxStatusRefresher
+                conversationPublicId={conversationPublicId}
+                done={part.tool.result != null}
+              />
+            </Fragment>
           ) : (
             <ReadToolResultCard key={part.tool.id} tool={part.tool} />
           )

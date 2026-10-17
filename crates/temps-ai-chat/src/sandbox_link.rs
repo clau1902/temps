@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 use temps_ai::ChatTool;
 use temps_auth::context::AuthContext;
 use temps_auth::permissions::Permission;
+use temps_core::{AuditContext, AuditLogger};
 use temps_entities::ai_conversations;
 use temps_sandbox::services::{CreateSandboxRequest, ExecOptions};
 use temps_sandbox::SandboxService;
@@ -47,6 +48,7 @@ pub const SANDBOX_EXEC_TOOL: &str = "sandbox_exec";
 pub const SANDBOX_READ_TOOL: &str = "sandbox_read_file";
 pub const SANDBOX_WRITE_TOOL: &str = "sandbox_write_file";
 pub const SANDBOX_OFFER_TOOL: &str = "temps_offer_sandbox";
+pub const SANDBOX_CREATE_TOOL: &str = "temps_create_sandbox";
 
 /// Most bytes of command output or file content handed back to the model.
 const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
@@ -239,26 +241,35 @@ struct OfferArgs {
 pub fn is_sandbox_tool(name: &str) -> bool {
     matches!(
         name,
-        SANDBOX_EXEC_TOOL | SANDBOX_READ_TOOL | SANDBOX_WRITE_TOOL | SANDBOX_OFFER_TOOL
+        SANDBOX_EXEC_TOOL
+            | SANDBOX_READ_TOOL
+            | SANDBOX_WRITE_TOOL
+            | SANDBOX_OFFER_TOOL
+            | SANDBOX_CREATE_TOOL
     )
 }
 
 /// The tools a chat gets for its sandbox situation.
 ///
 /// Linked: the three scoped tools, if the caller may execute in sandboxes.
-/// Unlinked: only the offer tool, if the caller could link one. Either way the
-/// model never picks the sandbox.
+/// Unlinked, and the caller has approved changes without asking (`may_create`):
+/// the same three plus `temps_create_sandbox`, which makes a brand-new sandbox
+/// for this chat. They are offered together so the model can create one and use
+/// it in the same turn; each call re-checks the link.
+/// Unlinked otherwise: only the offer tool, once, and the user decides.
+/// Either way the model never picks an existing sandbox.
 pub fn tools_for(
     linked: bool,
     offered: bool,
     backend_available: bool,
     may_exec: bool,
+    may_create: bool,
 ) -> Vec<ChatTool> {
     if !backend_available || !may_exec {
         return Vec::new();
     }
-    if linked {
-        return vec![
+    if linked || may_create {
+        let mut tools = vec![
             ChatTool {
                 name: SANDBOX_EXEC_TOOL.to_string(),
                 description: "Run a shell command in the sandbox the user linked to this chat. \
@@ -309,6 +320,10 @@ pub fn tools_for(
                 }),
             },
         ];
+        if !linked {
+            tools.push(create_tool());
+        }
+        return tools;
     }
     if offered {
         return Vec::new();
@@ -334,16 +349,49 @@ pub fn tools_for(
     }]
 }
 
+fn create_tool() -> ChatTool {
+    ChatTool {
+        name: SANDBOX_CREATE_TOOL.to_string(),
+        description: "Create a new sandbox for this chat and link it, when none is linked. \
+            Call it right away, without asking, when the user wants you to build or change an \
+            app or site and the work needs a shell: writing code, installing dependencies, \
+            running it and testing it. In a project chat the sandbox starts as a clone of the \
+            project's repository; otherwise it is empty. It creates a new sandbox only; you \
+            cannot pick or link an existing one. Do not call it for plain platform reads and \
+            changes. When it returns, `sandbox_exec`, `sandbox_read_file` and \
+            `sandbox_write_file` work in this same turn."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "reason": { "type": "string", "description": "One sentence on what you will build or run there." }
+            },
+            "required": ["reason"]
+        }),
+    }
+}
+
 /// Links a sandbox to a chat and runs the chat's scoped sandbox tools.
 #[derive(Clone)]
 pub struct SandboxLinkService {
     db: Arc<DatabaseConnection>,
     sandboxes: Arc<SandboxService>,
+    audit: Option<Arc<dyn AuditLogger>>,
 }
 
 impl SandboxLinkService {
     pub fn new(db: Arc<DatabaseConnection>, sandboxes: Arc<SandboxService>) -> Self {
-        Self { db, sandboxes }
+        Self {
+            db,
+            sandboxes,
+            audit: None,
+        }
+    }
+
+    /// Record sandboxes the assistant creates itself in the audit log.
+    pub fn with_audit(mut self, audit: Arc<dyn AuditLogger>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     fn db_err(conversation: &ai_conversations::Model, source: DbErr) -> SandboxLinkError {
@@ -551,6 +599,9 @@ impl SandboxLinkService {
         if tool == SANDBOX_OFFER_TOOL {
             return self.dispatch_offer(arguments, conversation_id).await;
         }
+        if tool == SANDBOX_CREATE_TOOL {
+            return self.dispatch_create(arguments, conversation_id, auth).await;
+        }
         if !auth.has_permission(&Permission::SandboxesExec) {
             return format!(
                 "`{tool}` is not available: running commands in a sandbox needs the {} permission.",
@@ -561,8 +612,9 @@ impl SandboxLinkService {
             Ok(Some(link)) => link,
             Ok(None) => {
                 return format!(
-                    "`{tool}` is not available: no sandbox is linked to this chat. Offer one \
-                     with `{SANDBOX_OFFER_TOOL}` if a shell step is really needed."
+                    "`{tool}` is not available: no sandbox is linked to this chat. Create one \
+                     with `{SANDBOX_CREATE_TOOL}` if you have it, otherwise offer one with \
+                     `{SANDBOX_OFFER_TOOL}`, when a shell step is really needed."
                 )
             }
             Err(error) => {
@@ -607,6 +659,124 @@ impl SandboxLinkService {
                     .await
             }
             other => format!("Unknown sandbox tool `{other}`."),
+        }
+    }
+
+    /// Create a sandbox for the chat on the model's request. The sandbox is
+    /// always new and always owned by the caller, so the model never chooses
+    /// which sandbox it gets.
+    async fn dispatch_create(
+        &self,
+        arguments: &str,
+        conversation_id: i64,
+        auth: &AuthContext,
+    ) -> String {
+        let user_id = auth.user_id();
+        let reason = serde_json::from_str::<OfferArgs>(arguments)
+            .map(|args| args.reason)
+            .unwrap_or_default();
+        for permission in [Permission::SandboxesExec, Permission::SandboxesWrite] {
+            if !auth.has_permission(&permission) {
+                return format!(
+                    "`{SANDBOX_CREATE_TOOL}` is not available: creating a sandbox needs the \
+                     {permission} permission. Tell the user, and carry on without a shell."
+                );
+            }
+        }
+        let conversation = match ai_conversations::Entity::find_by_id(conversation_id)
+            .filter(ai_conversations::Column::CreatedBy.eq(user_id))
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(conversation)) => conversation,
+            Ok(None) => {
+                return format!(
+                    "`{SANDBOX_CREATE_TOOL}` failed: conversation {conversation_id} was not found."
+                )
+            }
+            Err(error) => {
+                warn!(conversation_id, "could not load the conversation: {error}");
+                return format!(
+                    "`{SANDBOX_CREATE_TOOL}` failed: could not load this chat: {error}"
+                );
+            }
+        };
+        if !context_supports_sandbox(&conversation.context_type) {
+            return format!("`{SANDBOX_CREATE_TOOL}` is not available in this kind of chat.");
+        }
+        if project_for_new_sandbox(&conversation).is_some()
+            && !auth.has_permission(&Permission::GitRepositoriesRead)
+        {
+            return format!(
+                "`{SANDBOX_CREATE_TOOL}` is not available: cloning the project's repository \
+                 needs the {} permission.",
+                Permission::GitRepositoriesRead
+            );
+        }
+        if let Some(link) = link_from_metadata(conversation.metadata.as_ref()) {
+            return format!(
+                "A sandbox is already linked to this chat: {} ({}). Use the sandbox tools on it.",
+                link.name, link.sandbox_id
+            );
+        }
+        match self.create_and_link(&conversation, user_id).await {
+            Ok(link) => {
+                self.audit_created(&conversation, user_id, &link.sandbox_id, &reason)
+                    .await;
+                let seeded = if project_for_new_sandbox(&conversation).is_some() {
+                    "It starts as a clone of the project's repository."
+                } else {
+                    "It is empty."
+                };
+                format!(
+                    "Created sandbox {} ({}) and linked it to this chat. {seeded} Use \
+                     `{SANDBOX_EXEC_TOOL}`, `{SANDBOX_READ_TOOL}` and `{SANDBOX_WRITE_TOOL}` on it \
+                     now. Tell the user in one sentence that you created it.",
+                    link.name, link.sandbox_id
+                )
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id,
+                    "could not create a sandbox for the chat: {error}"
+                );
+                format!(
+                    "`{SANDBOX_CREATE_TOOL}` failed: {error}. Tell the user why and carry on \
+                     without a shell; they can link a sandbox themselves from the chat's \
+                     Sandbox button."
+                )
+            }
+        }
+    }
+
+    async fn audit_created(
+        &self,
+        conversation: &ai_conversations::Model,
+        user_id: i32,
+        sandbox_id: &str,
+        reason: &str,
+    ) {
+        let Some(audit) = self.audit.as_ref() else {
+            return;
+        };
+        let entry = crate::audit::AiSandboxLinkedAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: None,
+                user_agent: "temps-ai-assistant".to_string(),
+            },
+            project_id: conversation.project_id,
+            conversation_id: conversation.public_id.clone(),
+            sandbox_id: sandbox_id.to_string(),
+            created: true,
+        };
+        if let Err(error) = audit.create_audit_log(&entry).await {
+            warn!(
+                conversation_id = %conversation.public_id,
+                sandbox_id,
+                reason,
+                "failed to audit the sandbox the assistant created: {error}"
+            );
         }
     }
 
@@ -913,27 +1083,48 @@ mod tests {
 
     #[test]
     fn a_linked_chat_gets_the_scoped_tools_and_no_offer() {
-        assert_eq!(
-            names(tools_for(true, false, true, true)),
-            [SANDBOX_EXEC_TOOL, SANDBOX_READ_TOOL, SANDBOX_WRITE_TOOL]
-        );
+        for may_create in [false, true] {
+            assert_eq!(
+                names(tools_for(true, false, true, true, may_create)),
+                [SANDBOX_EXEC_TOOL, SANDBOX_READ_TOOL, SANDBOX_WRITE_TOOL]
+            );
+        }
     }
 
     #[test]
     fn an_unlinked_chat_gets_only_the_offer_until_it_was_made() {
         assert_eq!(
-            names(tools_for(false, false, true, true)),
+            names(tools_for(false, false, true, true, false)),
             [SANDBOX_OFFER_TOOL]
         );
-        assert!(tools_for(false, true, true, true).is_empty());
+        assert!(tools_for(false, true, true, true, false).is_empty());
+    }
+
+    #[test]
+    fn an_unlinked_chat_that_may_create_gets_create_and_the_shell_tools_together() {
+        // Together, so the sandbox it creates is usable in the same turn.
+        for offered in [false, true] {
+            assert_eq!(
+                names(tools_for(false, offered, true, true, true)),
+                [
+                    SANDBOX_EXEC_TOOL,
+                    SANDBOX_READ_TOOL,
+                    SANDBOX_WRITE_TOOL,
+                    SANDBOX_CREATE_TOOL
+                ]
+            );
+        }
+        assert!(is_sandbox_tool(SANDBOX_CREATE_TOOL));
     }
 
     #[test]
     fn no_backend_or_no_exec_permission_offers_nothing() {
-        assert!(tools_for(true, false, false, true).is_empty());
-        assert!(tools_for(false, false, false, true).is_empty());
-        assert!(tools_for(true, false, true, false).is_empty());
-        assert!(tools_for(false, false, true, false).is_empty());
+        for may_create in [false, true] {
+            assert!(tools_for(true, false, false, true, may_create).is_empty());
+            assert!(tools_for(false, false, false, true, may_create).is_empty());
+            assert!(tools_for(true, false, true, false, may_create).is_empty());
+            assert!(tools_for(false, false, true, false, may_create).is_empty());
+        }
     }
 
     #[test]

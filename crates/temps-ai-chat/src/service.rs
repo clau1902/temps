@@ -4319,7 +4319,10 @@ impl ConversationService {
             if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
                 self.maybe_add_goal_tool(&mut tools);
             }
-            tools.extend(self.sandbox_tools(&conv, auth));
+            tools.extend(
+                self.sandbox_tools(&conv, auth, project_access_checker.as_ref())
+                    .await,
+            );
             let write_appendix = self.maybe_add_write_tool(&mut tools, &messages, auth);
             if let Some(appendix) = write_appendix {
                 // Append the write-CLI section map to the system framing so the model
@@ -4404,19 +4407,44 @@ impl ConversationService {
             return None;
         }
         self.application_sandboxes.as_ref().map(|sandboxes| {
-            crate::sandbox_link::SandboxLinkService::new(self.db.clone(), sandboxes.clone())
+            let service =
+                crate::sandbox_link::SandboxLinkService::new(self.db.clone(), sandboxes.clone());
+            match self.write_support.as_ref() {
+                Some(ws) => service.with_audit(ws.audit.clone()),
+                None => service,
+            }
         })
     }
 
     /// Shell tools for the sandbox linked to this chat, or the one-time offer
     /// to link one when none is.
-    fn sandbox_tools(&self, conv: &ai_conversations::Model, auth: &AuthContext) -> Vec<ChatTool> {
+    ///
+    /// The assistant may create the sandbox itself only when the user chose a
+    /// mode that approves changes without asking and may create one directly
+    /// (and, in a project chat, clone the project's repository). In "ask before
+    /// changes" mode it offers one and the user decides.
+    async fn sandbox_tools(
+        &self,
+        conv: &ai_conversations::Model,
+        auth: &AuthContext,
+        project_access_checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+    ) -> Vec<ChatTool> {
+        use temps_auth::permissions::Permission;
         let metadata = conv.metadata.as_ref();
+        let may_exec = auth.has_permission(&Permission::SandboxesExec);
+        let mut may_create = may_exec
+            && auth.has_permission(&Permission::SandboxesWrite)
+            && permission_mode_auto_approves_provider_tools(&conv.ai_permission_mode);
+        if may_create && crate::sandbox_link::project_for_new_sandbox(conv).is_some() {
+            may_create =
+                project_repo_tools_allowed(auth, conv.project_id, project_access_checker).await;
+        }
         crate::sandbox_link::tools_for(
             crate::sandbox_link::link_from_metadata(metadata).is_some(),
             crate::sandbox_link::offered_in_metadata(metadata),
             self.sandbox_link_for(conv).is_some(),
-            auth.has_permission(&temps_auth::permissions::Permission::SandboxesExec),
+            may_exec,
+            may_create,
         )
     }
 
@@ -7179,6 +7207,17 @@ async fn dispatch_conversation_tool(
             Some(goals) => goals.dispatch(&call.arguments, conversation_id, auth).await,
             None => "Goal tracking is not available in this chat.".to_string(),
         }
+    } else if call.name == crate::sandbox_link::SANDBOX_CREATE_TOOL
+        && project_id.is_some()
+        && !project_repo_tools_allowed(auth, project_id, project_access_checker).await
+    {
+        // Defence in depth, as for the repository tools: creating a sandbox
+        // in a project chat clones the project's private source.
+        format!(
+            "Tool '{}' is not available: it requires current project access and the {} permission.",
+            call.name,
+            temps_auth::permissions::Permission::GitRepositoriesRead
+        )
     } else if crate::sandbox_link::is_sandbox_tool(&call.name) {
         match &state.sandbox {
             Some(sandbox) => {

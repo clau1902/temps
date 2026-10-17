@@ -26,7 +26,7 @@ import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Loader2, SquareTerminal } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { linkableSandboxes, sandboxButtonLabel } from './chat-sandbox'
@@ -304,6 +304,29 @@ export function ChatSandbox({
       </PopoverContent>
     </Popover>
   )
+}
+
+/**
+ * The assistant created a sandbox itself. Refreshes the chat's sandbox status
+ * once the tool has returned, so the Sandbox button shows the new link.
+ */
+export function SandboxStatusRefresher({
+  conversationPublicId,
+  done,
+}: {
+  conversationPublicId: string
+  done: boolean
+}) {
+  const queryClient = useQueryClient()
+  useEffect(() => {
+    if (!done) return
+    void queryClient.invalidateQueries({
+      queryKey: getChatSandboxQueryKey({
+        path: { public_id: conversationPublicId },
+      }),
+    })
+  }, [done, conversationPublicId, queryClient])
+  return null
 }
 
 /**

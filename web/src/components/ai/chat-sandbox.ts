@@ -4,6 +4,9 @@
 /** Tool the assistant calls to ask the user to link a sandbox. */
 export const SANDBOX_OFFER_TOOL_NAME = 'temps_offer_sandbox'
 
+/** Tool the assistant calls to create a sandbox for the chat itself. */
+export const SANDBOX_CREATE_TOOL_NAME = 'temps_create_sandbox'
+
 /** Application workspaces are managed from their application, never linked. */
 const APPLICATION_WORKSPACE_PREFIX = 'ai-application:'
 
@@ -11,6 +14,13 @@ export function isSandboxOfferTool(name: string): boolean {
   return (
     name === SANDBOX_OFFER_TOOL_NAME ||
     name.endsWith(`__${SANDBOX_OFFER_TOOL_NAME}`)
+  )
+}
+
+export function isSandboxCreateTool(name: string): boolean {
+  return (
+    name === SANDBOX_CREATE_TOOL_NAME ||
+    name.endsWith(`__${SANDBOX_CREATE_TOOL_NAME}`)
   )
 }
 

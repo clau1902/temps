@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  isSandboxCreateTool,
   isSandboxOfferTool,
   linkableSandboxes,
   offerReason,
@@ -17,6 +18,17 @@ describe('isSandboxOfferTool', () => {
     )
     expect(isSandboxOfferTool('temps_write')).toBe(false)
     expect(isSandboxOfferTool('sandbox_exec')).toBe(false)
+  })
+})
+
+describe('isSandboxCreateTool', () => {
+  test('matches the create tool only, with or without an MCP prefix', () => {
+    expect(isSandboxCreateTool('temps_create_sandbox')).toBe(true)
+    expect(isSandboxCreateTool('mcp__temps-chat__temps_create_sandbox')).toBe(
+      true
+    )
+    expect(isSandboxCreateTool('temps_offer_sandbox')).toBe(false)
+    expect(isSandboxCreateTool('sandbox_exec')).toBe(false)
   })
 })
 
