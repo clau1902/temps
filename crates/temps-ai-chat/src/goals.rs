@@ -162,9 +162,12 @@ impl From<ai_goals::Model> for GoalResponse {
 fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 200
-        && path
-            .split('.')
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        && path.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
 }
 
 fn validate_values(label: &str, values: &[String]) -> Result<(), String> {
@@ -248,11 +251,12 @@ impl TrackGoalInput {
 }
 
 fn lookup<'a>(body: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.').try_fold(body, |current, part| match current {
-        Value::Object(map) => map.get(part),
-        Value::Array(items) => part.parse::<usize>().ok().and_then(|i| items.get(i)),
-        _ => None,
-    })
+    path.split('.')
+        .try_fold(body, |current, part| match current {
+            Value::Object(map) => map.get(part),
+            Value::Array(items) => part.parse::<usize>().ok().and_then(|i| items.get(i)),
+            _ => None,
+        })
 }
 
 fn render(value: &Value) -> String {
@@ -307,10 +311,7 @@ pub fn evaluate(goal: &ai_goals::Model, status: u16, body: &Value) -> Observatio
         ));
     }
     let Some(found) = lookup(body, &goal.success_path) else {
-        return Observation::Pending(format!(
-            "The response has no '{}' yet",
-            goal.success_path
-        ));
+        return Observation::Pending(format!("The response has no '{}' yet", goal.success_path));
     };
     let shown = render(found);
     let matches_any = |values: Vec<String>| values.iter().any(|v| v.eq_ignore_ascii_case(&shown));
@@ -611,7 +612,10 @@ impl GoalToolSupport {
             Ok(args) => args,
             Err(error) => return format!("`temps_goal` arguments are not valid JSON: {error}"),
         };
-        let action = args.get("action").and_then(Value::as_str).unwrap_or("track");
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("track");
         match action {
             "track" | "retarget" => {}
             other => {
@@ -914,7 +918,10 @@ impl GoalWatcher {
         if !self.goals.begin_heal(&goal).await? {
             return Ok(());
         }
-        let goal = self.goals.get(goal.conversation_id, &goal.public_id).await?;
+        let goal = self
+            .goals
+            .get(goal.conversation_id, &goal.public_id)
+            .await?;
         let prompt = heal_prompt(&goal, &observation);
         let metadata = serde_json::json!({
             "origin": "goal",
@@ -1079,13 +1086,19 @@ mod tests {
         let g = goal(&["completed"], &["failed"]);
         for status in [401, 403, 404, 410] {
             assert!(
-                matches!(evaluate(&g, status, &serde_json::json!({})), Observation::Failed(_)),
+                matches!(
+                    evaluate(&g, status, &serde_json::json!({})),
+                    Observation::Failed(_)
+                ),
                 "{status} must fail the goal"
             );
         }
         for status in [429, 500, 502, 503] {
             assert!(
-                matches!(evaluate(&g, status, &serde_json::json!({})), Observation::Pending(_)),
+                matches!(
+                    evaluate(&g, status, &serde_json::json!({})),
+                    Observation::Pending(_)
+                ),
                 "{status} must be retried"
             );
         }
@@ -1179,13 +1192,19 @@ mod tests {
     fn response_uses_iso_timestamps_and_hides_the_check_params() {
         let response = GoalResponse::from(goal(&["completed"], &["failed"]));
         let json = serde_json::to_value(&response).unwrap();
-        assert!(json["deadline_at"].as_str().unwrap().ends_with("+00:00") || json["deadline_at"].as_str().unwrap().ends_with('Z'));
+        assert!(
+            json["deadline_at"].as_str().unwrap().ends_with("+00:00")
+                || json["deadline_at"].as_str().unwrap().ends_with('Z')
+        );
         assert!(json.get("check_params").is_none());
         assert_eq!(json["id"], "goal_test");
     }
 
     fn count_row(n: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
-        std::collections::BTreeMap::from([("num_items".to_string(), sea_orm::Value::BigInt(Some(n)))])
+        std::collections::BTreeMap::from([(
+            "num_items".to_string(),
+            sea_orm::Value::BigInt(Some(n)),
+        )])
     }
 
     fn service(db: sea_orm::DatabaseConnection) -> GoalService {
@@ -1213,7 +1232,11 @@ mod tests {
         let error = service(db).track(7, 3, None, input()).await.unwrap_err();
         assert!(matches!(
             error,
-            GoalError::TooManyOpen { conversation_id: 7, open: 5, limit: 5 }
+            GoalError::TooManyOpen {
+                conversation_id: 7,
+                open: 5,
+                limit: 5
+            }
         ));
         assert!(error.to_string().contains("Conversation 7"));
     }
@@ -1224,7 +1247,13 @@ mod tests {
         let mut bad = input();
         bad.success_values.clear();
         let error = service(db).track(7, 3, None, bad).await.unwrap_err();
-        assert!(matches!(error, GoalError::Validation { conversation_id: 7, .. }));
+        assert!(matches!(
+            error,
+            GoalError::Validation {
+                conversation_id: 7,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1249,11 +1278,17 @@ mod tests {
         let svc = service(db);
         assert!(matches!(
             svc.cancel(7, "goal_test").await.unwrap_err(),
-            GoalError::InvalidState { action: "cancelled", .. }
+            GoalError::InvalidState {
+                action: "cancelled",
+                ..
+            }
         ));
         assert!(matches!(
             svc.retarget(7, "goal_test", input()).await.unwrap_err(),
-            GoalError::InvalidState { action: "retargeted", .. }
+            GoalError::InvalidState {
+                action: "retargeted",
+                ..
+            }
         ));
     }
 
@@ -1266,7 +1301,10 @@ mod tests {
             .into_connection();
         assert!(matches!(
             service(db).retry(7, "goal_test").await.unwrap_err(),
-            GoalError::InvalidState { action: "retried", .. }
+            GoalError::InvalidState {
+                action: "retried",
+                ..
+            }
         ));
     }
 }

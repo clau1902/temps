@@ -1283,12 +1283,11 @@ impl From<crate::attachments::AttachmentError> for Problem {
                     .with_title("Unsupported Attachment")
                     .with_detail(error.to_string())
             }
-            AttachmentError::QuotaExceeded { .. } | AttachmentError::ModelCannotSeeImages { .. } => {
+            AttachmentError::QuotaExceeded { .. }
+            | AttachmentError::ModelCannotSeeImages { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title(match &error {
-                        AttachmentError::ModelCannotSeeImages { .. } => {
-                            "Model Cannot Read Images"
-                        }
+                        AttachmentError::ModelCannotSeeImages { .. } => "Model Cannot Read Images",
                         _ => "Attachment Quota Reached",
                     })
                     .with_detail(error.to_string())
@@ -8211,7 +8210,8 @@ pub async fn upload_user_conversation_attachment(
     ensure_user_conversation_mutation_access(&state, &auth, &conversation).await?;
     // Assistant chats keep their files in the database and never touch a
     // sandbox, so they need no sandbox permission; every other chat does.
-    let assistant = conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
+    let assistant =
+        conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
     let workspace_id = if assistant {
         None
     } else {

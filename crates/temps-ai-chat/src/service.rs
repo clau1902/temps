@@ -1475,7 +1475,9 @@ fn with_title_source(metadata: Option<serde_json::Value>, source: &str) -> serde
 /// subject has usually settled.
 fn conversation_digest<'a>(messages: impl Iterator<Item = (&'a str, &'a str)>) -> String {
     let lines: Vec<String> = messages
-        .filter(|(role, content)| matches!(*role, "user" | "assistant") && !content.trim().is_empty())
+        .filter(|(role, content)| {
+            matches!(*role, "user" | "assistant") && !content.trim().is_empty()
+        })
         .map(|(role, content)| {
             let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
             let clipped: String = flat.chars().take(TITLE_DIGEST_MESSAGE_CHARS).collect();
@@ -1494,7 +1496,10 @@ fn conversation_digest<'a>(messages: impl Iterator<Item = (&'a str, &'a str)>) -
         kept.push(line);
     }
     kept.reverse();
-    kept.into_iter().map(String::as_str).collect::<Vec<_>>().join("\n")
+    kept.into_iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One item in the live `send_message` stream. The plain-text path yields only
@@ -4146,7 +4151,9 @@ impl ConversationService {
                         persisted_attachment_prompt_context(m.metadata.as_ref(), &conv.public_id)
                     {
                         content = format!("{context}\n\n{content}");
-                    } else if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+                    } else if conv.context_type
+                        == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE
+                    {
                         // Assistant files are not mounted anywhere and are not
                         // resent, so the model is only told that they existed.
                         if let Some(note) =
@@ -10188,7 +10195,9 @@ mod tests {
         let marked = with_title_source(existing, "user");
         assert_eq!(marked["seed"]["log_id"], 7);
         assert!(title_was_set_by_user(Some(&marked)));
-        assert!(!title_was_set_by_user(Some(&with_title_source(None, "auto"))));
+        assert!(!title_was_set_by_user(Some(&with_title_source(
+            None, "auto"
+        ))));
         assert!(!title_was_set_by_user(None));
         // A scalar left in the column is replaced rather than crashing a rename.
         let replaced = with_title_source(Some(serde_json::json!("legacy")), "user");
@@ -10207,7 +10216,9 @@ mod tests {
         let digest = conversation_digest(rows.iter().copied());
         assert!(!digest.contains("ignored"));
         assert!(digest.ends_with("User: set up backups to S3"));
-        assert!(digest.lines().all(|l| l.chars().count() <= TITLE_DIGEST_MESSAGE_CHARS + 12));
+        assert!(digest
+            .lines()
+            .all(|l| l.chars().count() <= TITLE_DIGEST_MESSAGE_CHARS + 12));
 
         let many: Vec<(&str, String)> = (0..100)
             .map(|i| ("user", format!("message number {i} {}", "y".repeat(300))))
@@ -10229,10 +10240,17 @@ mod tests {
         assert!(!shown.contains("abc123"), "{shown}");
         assert!(!shown.contains("hunter2"), "{shown}");
 
-        let huge = format!(r#"{{"body":"{}"}}"#, "é".repeat(MAX_PUBLIC_API_RESULT_BYTES));
+        let huge = format!(
+            r#"{{"body":"{}"}}"#,
+            "é".repeat(MAX_PUBLIC_API_RESULT_BYTES)
+        );
         let capped = public_tool_result("temps", &huge);
         assert!(capped.len() < MAX_PUBLIC_API_RESULT_BYTES + 100);
-        assert!(capped.contains("truncated"), "{}", &capped[capped.len() - 60..]);
+        assert!(
+            capped.contains("truncated"),
+            "{}",
+            &capped[capped.len() - 60..]
+        );
     }
 
     #[test]
