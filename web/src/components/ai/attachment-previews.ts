@@ -6,7 +6,10 @@ import type { ChatAttachment } from './chat-message-parts'
 
 export interface AttachmentLimits {
   maxFiles: number
+  /** Largest file of any kind. */
   maxBytes: number
+  /** Images are held to less where they are re-sent to the model. */
+  maxImageBytes?: number
 }
 
 /** Workspace chats keep files on disk. */
@@ -17,11 +20,20 @@ export const WORKSPACE_ATTACHMENT_LIMITS: AttachmentLimits = {
 
 /**
  * Assistant chats keep files in the database and re-send images to the model on
- * every step of a turn, so they are held to less. Mirrors the server's caps.
+ * every step of a turn, so they are held to less. Mirrors the server's caps;
+ * text files are held to 128 KB there, which only the server can judge by
+ * content.
  */
 export const ASSISTANT_ATTACHMENT_LIMITS: AttachmentLimits = {
   maxFiles: 4,
-  maxBytes: 5 * 1024 * 1024,
+  maxBytes: 10 * 1024 * 1024,
+  maxImageBytes: 5 * 1024 * 1024,
+}
+
+/** A file uploaded before its chat's panel mounted, to go with the first message. */
+export interface OpeningAttachment {
+  payload: Omit<ChatAttachment, 'preview_url'>
+  file: File
 }
 
 function megabytes(bytes: number): string {
@@ -30,15 +42,24 @@ function megabytes(bytes: number): string {
 
 /** Reject the entire selection rather than silently dropping excess files. */
 export function attachmentSelectionError(
-  files: readonly Pick<File, 'name' | 'size'>[],
+  files: readonly (Pick<File, 'name' | 'size'> & { type?: string })[],
   pendingCount: number,
   limits: AttachmentLimits = WORKSPACE_ATTACHMENT_LIMITS
 ): string | null {
   if (files.length + pendingCount > limits.maxFiles)
     return `A message may include at most ${limits.maxFiles} files.`
   const oversized = files.find((file) => file.size > limits.maxBytes)
-  return oversized
-    ? `${oversized.name} exceeds the ${megabytes(limits.maxBytes)} attachment limit.`
+  if (oversized)
+    return `${oversized.name} exceeds the ${megabytes(limits.maxBytes)} attachment limit.`
+  const { maxImageBytes } = limits
+  const bigImage =
+    maxImageBytes === undefined
+      ? undefined
+      : files.find(
+          (file) => file.type?.startsWith('image/') && file.size > maxImageBytes
+        )
+  return bigImage && maxImageBytes !== undefined
+    ? `${bigImage.name} exceeds the ${megabytes(maxImageBytes)} limit for images.`
     : null
 }
 
@@ -57,28 +78,21 @@ export function assistantImageError(
     : null
 }
 
-/** What the file picker offers for an assistant chat on this model. */
-export function assistantAttachmentAccept(support: ImageSupport): string {
-  const text = 'text/*,.md,.log,.json,.yaml,.yml,.toml,.csv,.env,.conf'
-  return support === 'no'
-    ? text
-    : `image/png,image/jpeg,image/gif,image/webp,${text}`
-}
-
 /** Helper line under the composer. Names what this model can be given. */
 export function attachHint(
   isAssistantChat: boolean,
   support: ImageSupport,
   limits: AttachmentLimits
 ): string {
+  const size = megabytes(limits.maxBytes)
   if (!isAssistantChat) {
-    return `Attach, drop, or paste images and files · up to ${limits.maxFiles} files, ${megabytes(limits.maxBytes)} each`
+    return `Attach, drop, or paste images and files · up to ${limits.maxFiles} files, ${size} each`
   }
   const what =
     support === 'no'
-      ? 'text files (this model can\u2019t read images)'
-      : 'images and text files'
-  return `Attach, drop, or paste ${what} · up to ${limits.maxFiles} files, ${megabytes(limits.maxBytes)} each`
+      ? 'PDFs and files (this model can\u2019t read images)'
+      : 'images, PDFs, and files'
+  return `Attach, drop, or paste ${what} · up to ${limits.maxFiles} files, ${size} each`
 }
 
 /** Tooltip for the attach button in an assistant chat. */
@@ -89,11 +103,13 @@ export function assistantAttachTitle(
 ): string {
   if (!hasConversation) return 'Send a first message before attaching files'
   const size = megabytes(limits.maxBytes)
+  const readable =
+    'The assistant reads text files and the text of PDFs; other files it sees by name and size only.'
   if (support === 'no')
-    return `Attach text files (${size} each). This model can\u2019t read images.`
+    return `Attach PDFs and files (${size} each). This model can\u2019t read images. ${readable}`
   if (support === 'unknown')
-    return `Attach images or text files (${size} each). Images only work if the model can read them.`
-  return `Attach images or text files (${size} each)`
+    return `Attach images, PDFs and files (${size} each). Images only work if the model can read them. ${readable}`
+  return `Attach images, PDFs and files (${size} each). ${readable}`
 }
 
 interface ObjectUrlApi {

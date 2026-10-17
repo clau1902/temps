@@ -155,7 +155,6 @@ import {
   ASSISTANT_ATTACHMENT_LIMITS,
   WORKSPACE_ATTACHMENT_LIMITS,
   assistantAttachTitle,
-  assistantAttachmentAccept,
   assistantImageError,
   attachHint,
   attachmentSelectionError,
@@ -1970,6 +1969,7 @@ function DebugChatPanelBody({
   readOnly = false,
   runtimeUpdateRequired = false,
   initialMessage,
+  initialAttachments,
 }: DebugChatPanelProps) {
   const chatDetail = useChatDetail()
   const platformFeatures = usePlatformFeatures()
@@ -2867,6 +2867,7 @@ function DebugChatPanelBody({
     sendRef.current = send
   }, [send])
   const initialMessageRef = useRef(initialMessage)
+  const initialAttachmentsRef = useRef(initialAttachments)
 
   // Initialise exactly once per mount: load the existing conversation for this
   // context, or auto-start a fresh one. The panel is re-keyed per context by its
@@ -2982,12 +2983,22 @@ function DebugChatPanelBody({
           setTurnStartedAt(running ? (detail.turn_started_at ?? null) : null)
           const opening = initialMessageRef.current
           initialMessageRef.current = undefined
+          const openingFiles = initialAttachmentsRef.current ?? []
+          initialAttachmentsRef.current = undefined
           if (
             opening &&
             !running &&
             !detail.messages.some((message) => message.role === 'user')
           ) {
-            void sendRef.current(opening, conv.public_id)
+            const attachments = openingFiles.flatMap(({ payload, file }) => {
+              const attachment = createPendingAttachment(
+                payload,
+                file,
+                () => attachmentsMountedRef.current
+              )
+              return attachment ? [attachment] : []
+            })
+            void sendRef.current(opening, conv.public_id, attachments)
           }
         }
       } catch (cause) {
@@ -3719,11 +3730,6 @@ function DebugChatPanelBody({
                 ref={attachmentInputRef}
                 type="file"
                 multiple
-                accept={
-                  isAssistantChat
-                    ? assistantAttachmentAccept(modelImageSupport)
-                    : undefined
-                }
                 disabled={!persistentAttachments}
                 className="sr-only"
                 onChange={(event) => void uploadAttachments(event.target.files)}

@@ -5,7 +5,6 @@ import { describe, expect, it } from 'bun:test'
 import {
   ASSISTANT_ATTACHMENT_LIMITS,
   assistantAttachTitle,
-  assistantAttachmentAccept,
   assistantImageError,
   attachHint,
   attachmentSelectionError,
@@ -40,7 +39,16 @@ describe('assistant attachments', () => {
     ).toContain(`${limits.maxFiles} files`)
     expect(
       attachmentSelectionError([{ ...note, size: note.size + 1 }], 0, limits)
-    ).toContain('5 MB')
+    ).toContain('10 MB')
+  })
+
+  it('holds images to less than other files', () => {
+    const png = { name: 'shot.png', type: 'image/png', size: 6 * 1024 * 1024 }
+    const pdf = { name: 'doc.pdf', type: 'application/pdf', size: png.size }
+    expect(attachmentSelectionError([png], 0, limits)).toContain(
+      'shot.png exceeds the 5 MB limit for images'
+    )
+    expect(attachmentSelectionError([pdf], 0, limits)).toBeNull()
   })
 
   it('refuses an image before upload when the model cannot read images', () => {
@@ -52,13 +60,6 @@ describe('assistant attachments', () => {
     expect(assistantImageError([png], 'yes')).toBeNull()
     // The server decides when the catalogue is silent.
     expect(assistantImageError([png], 'unknown')).toBeNull()
-  })
-
-  it('only offers images in the picker when the model may read them', () => {
-    expect(assistantAttachmentAccept('yes')).toContain('image/png')
-    expect(assistantAttachmentAccept('unknown')).toContain('image/webp')
-    expect(assistantAttachmentAccept('no')).not.toContain('image/')
-    expect(assistantAttachmentAccept('no')).toContain('text/*')
   })
 })
 
@@ -117,15 +118,18 @@ describe('createPendingAttachment', () => {
 describe('attach copy for assistant chats', () => {
   const limits = ASSISTANT_ATTACHMENT_LIMITS
   it('says images are unavailable when the model is text-only', () => {
-    expect(attachHint(true, 'no', limits)).toContain('text files')
+    expect(attachHint(true, 'no', limits)).toContain('PDFs and files')
     expect(attachHint(true, 'no', limits)).toContain('can\u2019t read images')
     expect(assistantAttachTitle('no', limits, true)).toContain(
-      'Attach text files'
+      'Attach PDFs and files'
+    )
+    expect(assistantAttachTitle('no', limits, true)).toContain(
+      'other files it sees by name and size only'
     )
   })
   it('offers images when the model reads them', () => {
-    expect(attachHint(true, 'yes', limits)).toContain('images and text files')
-    expect(assistantAttachTitle('yes', limits, true)).toContain('5 MB')
+    expect(attachHint(true, 'yes', limits)).toContain('images, PDFs, and files')
+    expect(assistantAttachTitle('yes', limits, true)).toContain('10 MB')
   })
   it('warns that images depend on the model when the catalogue is silent', () => {
     expect(assistantAttachTitle('unknown', limits, true)).toContain(

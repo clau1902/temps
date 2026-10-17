@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { ChatDetailLevel } from './chat-detail-level'
+import type { OpeningAttachment } from './attachment-previews'
 import { type ConversationDetailResponse } from '@/api/client'
 import { type PermissionRequest } from '@/components/ai/PermissionCard'
 
@@ -789,6 +790,11 @@ export interface DebugChatPanelProps {
    * once after the empty thread loads; ignored if the thread has history.
    */
   initialMessage?: string
+  /**
+   * Files already uploaded to that thread, to go out with `initialMessage`.
+   * The panel makes their previews, so they are released with it.
+   */
+  initialAttachments?: OpeningAttachment[]
   /**
    * `simple` hides the model/reasoning pickers; `advanced` shows them and opens
    * every tool call. Unset keeps the panel's original behaviour.

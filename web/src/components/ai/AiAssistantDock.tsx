@@ -67,6 +67,7 @@ import {
 } from './chat-page-state'
 import { DebugChatPanel } from './DebugChatPanel'
 import { AssistantStart, AssistantThread } from './AssistantPanels'
+import type { OpeningAttachment } from './attachment-previews'
 import { chatTint, isAssistantConversation } from './assistant-state'
 
 interface ActiveChat {
@@ -93,6 +94,7 @@ interface AssistantChat {
     title?: string | null
   }
   firstMessage?: string
+  firstAttachments?: OpeningAttachment[]
 }
 
 const CONTEXT_META: Record<string, { label: string; Icon: typeof GitBranch }> =
@@ -552,11 +554,12 @@ export function DockBody({
 
   const handleAssistantStarted = (
     conversation: ConversationResponse,
-    firstMessage: string
+    firstMessage: string,
+    firstAttachments: OpeningAttachment[]
   ) => {
     setAssistantStarting(false)
     setActivePublicId(conversation.public_id)
-    setAssistant({ conversation, firstMessage })
+    setAssistant({ conversation, firstMessage, firstAttachments })
     loadList()
   }
 
@@ -966,6 +969,7 @@ export function DockBody({
               key={assistant.conversation.public_id}
               conversation={assistant.conversation}
               firstMessage={assistant.firstMessage}
+              firstAttachments={assistant.firstAttachments}
             />
           ) : inProjectChat ? (
             <DebugChatPanel

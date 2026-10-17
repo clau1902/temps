@@ -4,6 +4,7 @@
 import {
   createAssistantConversation,
   createProviderKey,
+  uploadUserConversationAttachment,
   type ConversationResponse,
 } from '@/api/client'
 import {
@@ -26,7 +27,9 @@ import {
   KeyRound,
   ArrowUp,
   Loader2,
+  Paperclip,
   Sparkles,
+  X,
 } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
@@ -40,7 +43,18 @@ import {
   setupPathFromProblem,
 } from './assistant-state'
 import { AssistantModelChip, AssistantModelSetup } from './AssistantModelPicker'
-import { useNewChatModel } from './assistant-model-hooks'
+import {
+  useAssistantImageSupport,
+  useNewChatModel,
+} from './assistant-model-hooks'
+import {
+  ASSISTANT_ATTACHMENT_LIMITS,
+  assistantAttachTitle,
+  assistantImageError,
+  attachHint,
+  attachmentSelectionError,
+  type OpeningAttachment,
+} from './attachment-previews'
 import { DebugChatPanel } from './DebugChatPanel'
 import { GoalPanel } from './GoalPanel'
 
@@ -326,7 +340,11 @@ export function AssistantStart({
   cloudPath,
   roomy,
 }: {
-  onStarted: (conversation: ConversationResponse, firstMessage: string) => void
+  onStarted: (
+    conversation: ConversationResponse,
+    firstMessage: string,
+    attachments: OpeningAttachment[]
+  ) => void
   onNavigate?: () => void
   cloudPath?: string
   /** Full-screen sizing: larger type and controls, content centred. */
@@ -342,25 +360,64 @@ export function AssistantStart({
     setupPath: string
   } | null>(null)
   const [draft, setDraft] = useState('')
+  const [files, setFiles] = useState<File[]>([])
+  // Set once the chat exists, so a failed upload retries into the same chat
+  // instead of leaving an empty one behind each time.
+  const [created, setCreated] = useState<ConversationResponse | null>(null)
+  const uploaded = useRef(new Map<File, OpeningAttachment>())
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const newChatModel = useNewChatModel()
+  const imageSupport = useAssistantImageSupport(true, newChatModel.model)
 
   const start = useMutation({
     mutationFn: async (firstMessage: string) => {
-      const { data, error, response } = await createAssistantConversation({
-        body: newChatModel.model ? { ai_model: newChatModel.model } : {},
-      })
-      if (!data) {
-        throw new AssistantStartError(
-          response?.status,
-          error,
-          getErrorMessage(error, 'Could not start the assistant.')
-        )
+      let conversation = created
+      if (!conversation) {
+        const { data, error, response } = await createAssistantConversation({
+          body: newChatModel.model ? { ai_model: newChatModel.model } : {},
+        })
+        if (!data) {
+          throw new AssistantStartError(
+            response?.status,
+            error,
+            getErrorMessage(error, 'Could not start the assistant.')
+          )
+        }
+        conversation = data
+        setCreated(data)
       }
-      return { conversation: data, firstMessage }
+      const target = conversation
+      await Promise.all(
+        files
+          .filter((file) => !uploaded.current.has(file))
+          .map(async (file) => {
+            const { data, error, response } =
+              await uploadUserConversationAttachment({
+                path: { public_id: target.public_id },
+                body: { file },
+              })
+            if (!data) {
+              throw new AssistantStartError(
+                response?.status,
+                error,
+                getErrorMessage(error, `Could not upload ${file.name}.`)
+              )
+            }
+            uploaded.current.set(file, { payload: data, file })
+          })
+      )
+      return {
+        conversation: target,
+        firstMessage,
+        attachments: files.flatMap((file) => {
+          const done = uploaded.current.get(file)
+          return done ? [done] : []
+        }),
+      }
     },
-    onSuccess: ({ conversation, firstMessage }) =>
-      onStarted(conversation, firstMessage),
+    onSuccess: ({ conversation, firstMessage, attachments }) =>
+      onStarted(conversation, firstMessage, attachments),
     onError: (error) => {
       // 409 is "no provider configured", and carries where to fix it. Show the
       // onboarding in place rather than a toast the user cannot act on.
@@ -379,11 +436,31 @@ export function AssistantStart({
         })
         return
       }
-      toast.error('Could not start the assistant', {
-        description: error.message,
-      })
+      toast.error(
+        created || files.length > 0
+          ? 'Could not send your files'
+          : 'Could not start the assistant',
+        { description: error.message }
+      )
     },
   })
+
+  const addFiles = (incoming: FileList | null) => {
+    if (!incoming || incoming.length === 0) return
+    const selected = Array.from(incoming)
+    const problem =
+      attachmentSelectionError(
+        selected,
+        files.length,
+        ASSISTANT_ATTACHMENT_LIMITS
+      ) ?? assistantImageError(selected, imageSupport)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+    if (problem) {
+      toast.error('Cannot attach these files', { description: problem })
+      return
+    }
+    setFiles((current) => [...current, ...selected])
+  }
 
   if (status.isPending) return <AssistantStartSkeleton roomy={roomy} />
 
@@ -476,13 +553,70 @@ export function AssistantStart({
             roomy && 'min-h-[120px] px-5 pt-5 text-base md:text-base'
           )}
         />
+        {files.length > 0 ? (
+          <ul
+            className="flex flex-wrap gap-2 px-3 pb-2"
+            aria-label="Attached files"
+          >
+            {files.map((file, index) => (
+              <li
+                key={`${file.name}:${file.size}:${index}`}
+                className="flex max-w-full items-center gap-1 rounded-full border border-border bg-muted px-2.5 py-1 text-xs"
+              >
+                <Paperclip className="size-3 shrink-0" aria-hidden="true" />
+                <span className="truncate">{file.name}</span>
+                <button
+                  type="button"
+                  className="rounded-full p-0.5 hover:bg-background disabled:opacity-50"
+                  aria-label={`Remove ${file.name}`}
+                  disabled={start.isPending}
+                  onClick={() =>
+                    setFiles((current) =>
+                      current.filter((_, at) => at !== index)
+                    )
+                  }
+                >
+                  <X className="size-3" aria-hidden="true" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : null}
         <div className="flex items-center justify-between gap-2 px-3 pb-3">
-          <AssistantModelChip
-            value={newChatModel.model}
-            onChange={newChatModel.choose}
-            disabled={start.isPending}
-            roomy={roomy}
-          />
+          <div className="flex min-w-0 items-center gap-1">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="sr-only"
+              aria-label="Attach files"
+              tabIndex={-1}
+              disabled={start.isPending}
+              onChange={(event) => addFiles(event.target.files)}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className={cn('size-8 shrink-0', roomy && 'size-10')}
+              disabled={start.isPending}
+              aria-label="Attach files"
+              title={assistantAttachTitle(
+                imageSupport,
+                ASSISTANT_ATTACHMENT_LIMITS,
+                true
+              )}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Paperclip className="size-4" aria-hidden="true" />
+            </Button>
+            <AssistantModelChip
+              value={newChatModel.model}
+              onChange={newChatModel.choose}
+              disabled={start.isPending || created !== null}
+              roomy={roomy}
+            />
+          </div>
           <Button
             type="submit"
             size="icon"
@@ -498,6 +632,9 @@ export function AssistantStart({
           </Button>
         </div>
       </form>
+      <p className="-mt-2 text-xs text-muted-foreground">
+        {attachHint(true, imageSupport, ASSISTANT_ATTACHMENT_LIMITS)}
+      </p>
       {/* Suggestions fill the box rather than send: most goals need the user to
           add a detail (the repository URL, the bucket) before they make sense. */}
       <div
@@ -549,10 +686,13 @@ function AssistantStartSkeleton({ roomy }: { roomy?: boolean }) {
 export function AssistantThread({
   conversation,
   firstMessage,
+  firstAttachments,
   readOnly,
 }: {
   conversation: Pick<ConversationResponse, 'public_id' | 'context_id'>
   firstMessage?: string
+  /** Files already uploaded to this chat, sent with `firstMessage`. */
+  firstAttachments?: OpeningAttachment[]
   readOnly?: boolean
 }) {
   return (
@@ -567,6 +707,7 @@ export function AssistantThread({
           contextId={conversation.context_id}
           detailLevel="simple"
           initialMessage={firstMessage}
+          initialAttachments={firstAttachments}
           emptyHint="Ask about your projects, deployments or settings."
           placeholder="Ask Temps to inspect or change something…"
           readOnly={readOnly}
