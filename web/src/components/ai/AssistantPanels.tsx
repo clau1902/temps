@@ -32,7 +32,7 @@ import {
   Sparkles,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
@@ -59,6 +59,8 @@ import {
 } from './attachment-previews'
 import { DebugChatPanel } from './DebugChatPanel'
 import { DeploymentSidebar } from './DeploymentSidebar'
+import { ProjectReferencesProvider } from './ProjectReference'
+import type { ProjectRef } from './project-refs'
 import { GoalPanel, useChatGoals } from './GoalPanel'
 import { presentGoal, watchedDeployments } from './goal-presentation'
 import { useIsDesktop } from '@/components/hooks/use-mobile'
@@ -722,9 +724,23 @@ export function AssistantThread({
     () => watchedDeployments(goals.data ?? []),
     [goals.data]
   )
-  const hasDeployments = deployments.length > 0
   const isDesktop = useIsDesktop()
   const [panelOpen, setPanelOpen] = useState(false)
+  // Projects the user opened from a reply, newest first.
+  const [openedProjects, setOpenedProjects] = useState<ProjectRef[]>([])
+  const [focus, setFocus] = useState({ key: '', nonce: 0 })
+  const hasTabs = deployments.length > 0 || openedProjects.length > 0
+  const openProject = useCallback((project: ProjectRef) => {
+    setOpenedProjects((current) => [
+      project,
+      ...current.filter((p) => p.id !== project.id),
+    ])
+    setFocus((current) => ({
+      key: `project:${project.id}`,
+      nonce: current.nonce + 1,
+    }))
+    setPanelOpen(true)
+  }, [])
   const panelRef = usePanelRef()
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
     id: 'assistant-deployment-split',
@@ -747,7 +763,7 @@ export function AssistantThread({
 
   // Wide screens dock the panel beside the chat (resizable); narrower ones
   // show the same content in a drawer, so the chat is never squeezed.
-  const docked = isDesktop && (workView || (hasDeployments && panelOpen))
+  const docked = isDesktop && (workView || (hasTabs && panelOpen))
   useEffect(() => {
     const panel = panelRef.current
     if (!panel) return
@@ -758,12 +774,14 @@ export function AssistantThread({
   const sidebar = (
     <DeploymentSidebar
       deployments={deployments}
+      projects={openedProjects}
+      focus={focus}
       onClose={workView ? undefined : () => setPanelOpen(false)}
     />
   )
 
   return (
-    <>
+    <ProjectReferencesProvider onOpen={openProject}>
       <ResizablePanelGroup
         orientation="horizontal"
         className="h-full"
@@ -783,7 +801,7 @@ export function AssistantThread({
               !docked && 'mx-auto w-full max-w-3xl'
             )}
           >
-            {hasDeployments && !workView && (
+            {hasTabs && !workView && (
               <div className="flex shrink-0 justify-end">
                 <Button
                   type="button"
@@ -792,10 +810,10 @@ export function AssistantThread({
                   className="h-8 gap-1.5"
                   aria-pressed={panelOpen}
                   onClick={() => setPanelOpen((open) => !open)}
-                  title="Show the build stages of this chat's deployments"
+                  title="Show the deployments and projects this chat is working on"
                 >
                   <Rocket className="size-4" />
-                  Deployment
+                  Working tabs
                 </Button>
               </div>
             )}
@@ -843,19 +861,24 @@ export function AssistantThread({
         </ResizablePanel>
       </ResizablePanelGroup>
       <Sheet
-        open={!isDesktop && hasDeployments && panelOpen}
+        open={!isDesktop && hasTabs && panelOpen}
         onOpenChange={setPanelOpen}
       >
         <SheetContent side="right" className="w-full p-0 sm:max-w-md">
           <SheetHeader className="sr-only">
-            <SheetTitle>Deployment</SheetTitle>
+            <SheetTitle>Working tabs</SheetTitle>
             <SheetDescription>
-              Build stages of the deployments in this chat.
+              Deployments and projects this chat is working on.
             </SheetDescription>
           </SheetHeader>
-          <DeploymentSidebar deployments={deployments} inDrawer />
+          <DeploymentSidebar
+            deployments={deployments}
+            projects={openedProjects}
+            focus={focus}
+            inDrawer
+          />
         </SheetContent>
       </Sheet>
-    </>
+    </ProjectReferencesProvider>
   )
 }

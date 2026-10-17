@@ -85,9 +85,11 @@ import {
 } from 'lucide-react'
 import {
   untrustedMarkdownImage,
-  untrustedMarkdownInlineUrl,
+  inlineCodeUrl,
+  UntrustedInlineCode,
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
+import { ProjectChip, useProjectReference } from './ProjectReference'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   SearchableSelect,
@@ -1548,6 +1550,31 @@ function TurnActivity({
 
 /** Open links (including `remark-gfm` autolinked bare URLs) in a new tab, styled
  *  as links. `rel="noopener noreferrer"` so the opened page can't access us. */
+/**
+ * Inline code in an assistant reply: a URL becomes a link, a project's name or
+ * slug becomes a chip that opens the project, anything else stays code.
+ */
+const ChatInlineCode: NonNullable<Components['code']> = (props) => {
+  const { className, children } = props
+  const text =
+    className || !(typeof children === 'string' || Array.isArray(children))
+      ? null
+      : [children].flat().join('')
+  const reference = useProjectReference(
+    text !== null && !inlineCodeUrl(className, children) ? text : null
+  )
+  if (reference && text !== null) {
+    return (
+      <ProjectChip
+        project={reference.project}
+        label={text}
+        onOpen={reference.open}
+      />
+    )
+  }
+  return <UntrustedInlineCode {...props} />
+}
+
 const markdownComponents: Components = {
   // Give horizontally-scrolling code blocks a thin, subtle scrollbar instead of
   // the chunky default OS bar over the dark code surface.
@@ -1556,7 +1583,7 @@ const markdownComponents: Components = {
   // with every other renderer of untrusted Markdown — see the module for why.
   ...untrustedMarkdownImage,
   ...untrustedMarkdownLink,
-  ...untrustedMarkdownInlineUrl,
+  code: ChatInlineCode,
 }
 
 /** Render one chunk of assistant prose as Markdown. */

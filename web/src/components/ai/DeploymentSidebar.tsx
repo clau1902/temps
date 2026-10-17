@@ -15,9 +15,18 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowRight, ExternalLink, GitBranch, Rocket, X } from 'lucide-react'
+import {
+  ArrowRight,
+  ExternalLink,
+  FolderGit2,
+  GitBranch,
+  Rocket,
+  X,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
+import { ProjectTab } from './ProjectTab'
+import type { ProjectRef } from './project-refs'
 import {
   isActiveDeploymentStatus,
   isFailedDeploymentStatus,
@@ -25,7 +34,18 @@ import {
 import { JobStatusIcon, statusPresentation } from './GeneratedDeploymentCard'
 import type { WatchedDeployment } from './goal-presentation'
 
-const MAX_TABS = 4
+const MAX_TABS = 6
+
+/** A tab beside the chat: a deployment it watches or a project the user opened. */
+export type SidebarTab =
+  | { kind: 'deployment'; deployment: WatchedDeployment }
+  | { kind: 'project'; project: ProjectRef }
+
+export function tabKey(tab: SidebarTab): string {
+  return tab.kind === 'project'
+    ? `project:${tab.project.id}`
+    : key(tab.deployment)
+}
 
 /** How far along the build is, as whole stages finished out of all of them. */
 export function stageProgress(jobs: ReadonlyArray<{ status: string }>): {
@@ -238,30 +258,48 @@ function DeploymentTab({
 }
 
 /**
- * The deployments this chat has started or watched, one tab each, with their
- * build stages. Sits beside the conversation so progress stays visible while
- * the assistant keeps working.
+ * What this chat is working on, one tab each: the deployments it has started
+ * or watched, with their build stages, and the projects the user opened from a
+ * reply. Sits beside the conversation so progress stays visible while the
+ * assistant keeps working.
  */
 export function DeploymentSidebar({
   deployments,
+  projects = [],
+  focus,
   onClose,
   inDrawer = false,
 }: {
   deployments: WatchedDeployment[]
+  /** Projects opened from the chat, newest first. */
+  projects?: ProjectRef[]
+  /** Selects a tab each time `nonce` changes, even if it is already open. */
+  focus?: { key: string; nonce: number }
   /** Omit when the panel is a fixed part of the layout. */
   onClose?: () => void
   /** Shown in a drawer, which brings its own close button. */
   inDrawer?: boolean
 }) {
-  const shown = deployments.slice(0, MAX_TABS)
-  const newest = shown[0]
+  const tabs: SidebarTab[] = [
+    ...projects.map((project): SidebarTab => ({ kind: 'project', project })),
+    ...deployments.map((deployment): SidebarTab => ({
+      kind: 'deployment',
+      deployment,
+    })),
+  ].slice(0, MAX_TABS)
+  const newest = deployments[0]
   const newestKey = newest ? key(newest) : ''
   const [selected, setSelected] = useState(newestKey)
   // A deployment started later takes the focus; one the user picked stays put
   // until then.
   useEffect(() => setSelected(newestKey), [newestKey])
+  const focusKey = focus?.key
+  const focusNonce = focus?.nonce
+  useEffect(() => {
+    if (focusKey) setSelected(focusKey)
+  }, [focusKey, focusNonce])
 
-  if (shown.length === 0) {
+  if (tabs.length === 0) {
     return (
       <aside
         aria-label="Working tabs"
@@ -273,8 +311,8 @@ export function DeploymentSidebar({
         </p>
         <p className="max-w-xs text-sm text-muted-foreground">
           When Temps deploys something for you, its build stages and link open
-          here as a tab. Try &ldquo;Deploy my app from a Git repository
-          URL&rdquo;.
+          here as a tab. A project named in a reply opens here too. Try
+          &ldquo;Deploy my app from a Git repository URL&rdquo;.
         </p>
         {onClose && (
           <Button type="button" variant="outline" size="sm" onClick={onClose}>
@@ -285,13 +323,14 @@ export function DeploymentSidebar({
     )
   }
 
+  const firstKey = tabKey(tabs[0])
   return (
     <aside
       aria-label="Working tabs"
       className="flex h-full min-h-0 min-w-0 flex-col bg-background"
     >
       <Tabs
-        value={shown.some((d) => key(d) === selected) ? selected : newestKey}
+        value={tabs.some((t) => tabKey(t) === selected) ? selected : firstKey}
         onValueChange={setSelected}
         className="flex min-h-0 flex-1 flex-col"
       >
@@ -302,14 +341,25 @@ export function DeploymentSidebar({
           )}
         >
           <TabsList className="h-8 min-w-0 flex-1 justify-start overflow-x-auto">
-            {shown.map((d) => (
+            {tabs.map((tab) => (
               <TabsTrigger
-                key={key(d)}
-                value={key(d)}
+                key={tabKey(tab)}
+                value={tabKey(tab)}
                 className="gap-1.5 text-xs"
               >
-                <Rocket className="size-3.5 shrink-0" />
-                <TabLabel deployment={d} />
+                {tab.kind === 'project' ? (
+                  <>
+                    <FolderGit2 className="size-3.5 shrink-0" />
+                    <span className="max-w-32 truncate">
+                      {tab.project.name}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Rocket className="size-3.5 shrink-0" />
+                    <TabLabel deployment={tab.deployment} />
+                  </>
+                )}
               </TabsTrigger>
             ))}
           </TabsList>
@@ -327,12 +377,16 @@ export function DeploymentSidebar({
           )}
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto">
-          {shown.map((d) => (
-            <TabsContent key={key(d)} value={key(d)} className="mt-0">
-              <DeploymentTab
-                projectId={d.projectId}
-                deploymentId={d.deploymentId}
-              />
+          {tabs.map((tab) => (
+            <TabsContent key={tabKey(tab)} value={tabKey(tab)} className="mt-0">
+              {tab.kind === 'project' ? (
+                <ProjectTab projectId={tab.project.id} />
+              ) : (
+                <DeploymentTab
+                  projectId={tab.deployment.projectId}
+                  deploymentId={tab.deployment.deploymentId}
+                />
+              )}
             </TabsContent>
           ))}
         </div>

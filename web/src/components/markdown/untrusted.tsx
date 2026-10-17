@@ -148,19 +148,27 @@ export function inlineCodeUrl(
  * span lines and are left to the code-block renderer.
  */
 export const untrustedMarkdownInlineUrl: Pick<Components, 'code'> = {
-  code({ node: _node, className, children, ...props }) {
-    const url = inlineCodeUrl(className, children)
-    if (!url) {
-      return (
-        <code className={className} {...props}>
-          {children}
-        </code>
-      )
-    }
+  code: UntrustedInlineCode,
+}
+
+/** The `code` renderer behind {@link untrustedMarkdownInlineUrl}, reusable by one that adds its own cases. */
+export function UntrustedInlineCode({
+  node: _node,
+  className,
+  children,
+  ...props
+}: ComponentPropsWithoutRef<'code'> & { node?: unknown }) {
+  const url = inlineCodeUrl(className, children)
+  if (!url) {
     return (
-      <UntrustedAnchor href={url}>
-        <code className="break-all">{url}</code>
-      </UntrustedAnchor>
+      <code className={className} {...props}>
+        {children}
+      </code>
     )
-  },
+  }
+  return (
+    <UntrustedAnchor href={url}>
+      <code className="break-all">{url}</code>
+    </UntrustedAnchor>
+  )
 }
