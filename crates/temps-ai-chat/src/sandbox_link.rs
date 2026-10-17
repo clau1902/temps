@@ -36,6 +36,8 @@ use thiserror::Error;
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
+use crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
+
 /// Key under `ai_conversations.metadata` that holds the link.
 pub const SANDBOX_LINK_KEY: &str = "sandbox_link";
 /// Key recording that the user has already been offered a sandbox in this chat.
@@ -60,6 +62,25 @@ const CREATED_SANDBOX_TIMEOUT_SECS: u64 = 3600;
 const CREATE_WAIT_SECS: u64 = 90;
 /// Prefix of the persistent per-user application workspace sandboxes.
 const APPLICATION_WORKSPACE_PREFIX: &str = "ai-application:";
+/// Context type of chats scoped to one project.
+pub const PROJECT_CONTEXT_TYPE: &str = "project";
+
+/// Whether a chat of this kind can have a sandbox linked to it: the Temps
+/// assistant, and chats about one project (whose sandbox is seeded from the
+/// project's repository).
+pub fn context_supports_sandbox(context_type: &str) -> bool {
+    context_type == ASSISTANT_CONTEXT_TYPE || context_type == PROJECT_CONTEXT_TYPE
+}
+
+/// The project a new sandbox for this chat is created from: only project chats
+/// carry one, and the sandbox then starts as a clone of its repository.
+pub fn project_for_new_sandbox(conversation: &ai_conversations::Model) -> Option<i32> {
+    if conversation.context_type == PROJECT_CONTEXT_TYPE {
+        conversation.project_id
+    } else {
+        None
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum SandboxLinkError {
@@ -403,7 +424,13 @@ impl SandboxLinkService {
         conversation: &ai_conversations::Model,
         user_id: i32,
     ) -> Result<SandboxLink, SandboxLinkError> {
-        let name: String = format!("assistant-chat-{}", conversation.public_id)
+        let project_id = project_for_new_sandbox(conversation);
+        let prefix = if project_id.is_some() {
+            "project-chat"
+        } else {
+            "assistant-chat"
+        };
+        let name: String = format!("{prefix}-{}", conversation.public_id)
             .chars()
             .take(48)
             .collect();
@@ -413,6 +440,7 @@ impl SandboxLinkService {
                 name: Some(name),
                 timeout_secs: Some(CREATED_SANDBOX_TIMEOUT_SECS),
                 lifecycle: Some("workspace".to_string()),
+                project_id,
                 ..Default::default()
             },
         );
@@ -453,7 +481,7 @@ impl SandboxLinkService {
         info!(
             conversation_id = %conversation.public_id,
             sandbox_id = %link.sandbox_id,
-            "sandbox linked to assistant chat"
+            "sandbox linked to chat"
         );
         Ok(link)
     }
@@ -752,6 +780,59 @@ mod tests {
             name: "assistant-chat-x".to_string(),
             linked_at: Utc.with_ymd_and_hms(2026, 10, 17, 9, 30, 0).unwrap(),
         }
+    }
+
+    fn conversation(context_type: &str, project_id: Option<i32>) -> ai_conversations::Model {
+        let now = Utc::now();
+        ai_conversations::Model {
+            id: 1,
+            public_id: "conv_test".to_string(),
+            project_id,
+            application_id: None,
+            context_type: context_type.to_string(),
+            context_id: "ctx".to_string(),
+            title: None,
+            status: "active".to_string(),
+            created_by: 7,
+            metadata: None,
+            created_at: now,
+            last_activity_at: now,
+            ai_provider: "anthropic".to_string(),
+            ai_model: "model".to_string(),
+            ai_thinking_level: None,
+            ai_permission_mode: "auto".to_string(),
+            cli_session_id: None,
+            cli_session_fingerprint: None,
+            turn_status: "idle".to_string(),
+            active_turn_id: None,
+            last_turn_id: None,
+            turn_started_at: None,
+        }
+    }
+
+    #[test]
+    fn only_assistant_and_project_chats_support_sandboxes() {
+        assert!(context_supports_sandbox("assistant"));
+        assert!(context_supports_sandbox("project"));
+        for other in ["deployment", "alert", "application", "global", ""] {
+            assert!(!context_supports_sandbox(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_new_sandbox_is_seeded_from_the_project_of_a_project_chat_only() {
+        assert_eq!(
+            project_for_new_sandbox(&conversation("project", Some(42))),
+            Some(42)
+        );
+        assert_eq!(
+            project_for_new_sandbox(&conversation("project", None)),
+            None
+        );
+        assert_eq!(
+            project_for_new_sandbox(&conversation("assistant", Some(42))),
+            None
+        );
     }
 
     #[test]

@@ -39,7 +39,11 @@ import {
   GeneratedServiceProposal,
   serviceProposalViewModel,
 } from '@/components/ai/GeneratedServiceProposal'
-import { SandboxOfferCard } from '@/components/ai/ChatSandbox'
+import {
+  ChatSandbox,
+  ChatSandboxPending,
+  SandboxOfferCard,
+} from '@/components/ai/ChatSandbox'
 import { isSandboxOfferTool, offerReason } from '@/components/ai/chat-sandbox'
 import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard'
 import { GeneratedProjectCollection } from '@/components/ai/GeneratedProjectCollection'
@@ -1622,6 +1626,7 @@ export function AssistantBody({
   conversationPublicId,
   userScoped,
   projectId,
+  fromProject = false,
   onFix,
   onPermissionResolved,
 }: {
@@ -1632,6 +1637,7 @@ export function AssistantBody({
   conversationPublicId: string | null
   userScoped: boolean
   projectId?: number
+  fromProject?: boolean
   onFix?: (text: string) => void
   onPermissionResolved?: () => void
 }) {
@@ -1660,6 +1666,7 @@ export function AssistantBody({
               key={part.tool.id}
               conversationPublicId={conversationPublicId}
               reason={offerReason(part.tool.arguments)}
+              fromProject={fromProject}
             />
           ) : (
             <ReadToolResultCard key={part.tool.id} tool={part.tool} />
@@ -3441,6 +3448,7 @@ function DebugChatPanelBody({
                       conversationPublicId={publicId}
                       userScoped={userScoped}
                       projectId={projectId}
+                      fromProject={contextType === 'project'}
                       onFix={(text) => void send(text)}
                       onPermissionResolved={pollForReply}
                     />
@@ -3778,6 +3786,17 @@ function DebugChatPanelBody({
                 usage={contextUsage}
                 model={runtimeSelection.modelId ?? undefined}
               />
+              {contextType === 'project' ? (
+                publicId ? (
+                  <ChatSandbox
+                    conversationPublicId={publicId}
+                    fromProject
+                    compact
+                  />
+                ) : (
+                  <ChatSandboxPending compact />
+                )
+              ) : null}
               <input
                 ref={attachmentInputRef}
                 type="file"

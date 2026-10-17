@@ -4318,8 +4318,8 @@ impl ConversationService {
             // scope; there is no second project-level feature toggle.
             if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
                 self.maybe_add_goal_tool(&mut tools);
-                tools.extend(self.sandbox_tools(&conv, auth));
             }
+            tools.extend(self.sandbox_tools(&conv, auth));
             let write_appendix = self.maybe_add_write_tool(&mut tools, &messages, auth);
             if let Some(appendix) = write_appendix {
                 // Append the write-CLI section map to the system framing so the model
@@ -4394,13 +4394,13 @@ impl ConversationService {
     }
 
     /// Offer `temps_goal` when goal tracking is wired.
-    /// The sandbox link service for an assistant chat, when this server has a
-    /// sandbox backend. Other chat kinds never get sandbox tools.
+    /// The sandbox link service for an assistant or project chat, when this
+    /// server has a sandbox backend. Other chat kinds never get sandbox tools.
     fn sandbox_link_for(
         &self,
         conv: &ai_conversations::Model,
     ) -> Option<crate::sandbox_link::SandboxLinkService> {
-        if conv.context_type != crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+        if !crate::sandbox_link::context_supports_sandbox(&conv.context_type) {
             return None;
         }
         self.application_sandboxes.as_ref().map(|sandboxes| {

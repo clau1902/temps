@@ -8,11 +8,15 @@ import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 
-import { SandboxLinkBody, SandboxOfferCard } from './ChatSandbox'
+import {
+  ChatSandboxPending,
+  SandboxLinkBody,
+  SandboxOfferCard,
+} from './ChatSandbox'
 
 const CHAT = 'conv_1'
 
-function render(status: ChatSandboxStatus, offer = false) {
+function render(status: ChatSandboxStatus, offer = false, fromProject = false) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
@@ -27,9 +31,13 @@ function render(status: ChatSandboxStatus, offer = false) {
           <SandboxOfferCard
             conversationPublicId={CHAT}
             reason="unpack the archive."
+            fromProject={fromProject}
           />
         ) : (
-          <SandboxLinkBody conversationPublicId={CHAT} />
+          <SandboxLinkBody
+            conversationPublicId={CHAT}
+            fromProject={fromProject}
+          />
         )}
       </MemoryRouter>
     </QueryClientProvider>
@@ -52,6 +60,26 @@ describe('sandbox control', () => {
     expect(markup).toContain('Give this chat a sandbox')
     expect(markup).toContain('Create a sandbox')
     expect(markup).toContain('unpack an uploaded archive')
+  })
+
+  test('a project chat says a new sandbox starts as a clone of the project', () => {
+    const markup = render({ configured: true, offered: false }, false, true)
+    expect(markup).toContain('clone of this project')
+    expect(markup).toContain('Create a sandbox')
+    expect(markup).not.toContain('unpack an uploaded archive')
+  })
+
+  test('a project chat offer carries the same explanation', () => {
+    const markup = render({ configured: true, offered: true }, true, true)
+    expect(markup).toContain('would like a sandbox to unpack the archive.')
+    expect(markup).toContain('clone of this project')
+  })
+
+  test('before the first message the control is shown, disabled, and says why', () => {
+    const markup = renderToStaticMarkup(<ChatSandboxPending />)
+    expect(markup).toContain('Sandbox')
+    expect(markup).toContain('disabled')
+    expect(markup).toContain('Send your first message')
   })
 
   test('a linked chat names its sandbox and offers to unlink it', () => {

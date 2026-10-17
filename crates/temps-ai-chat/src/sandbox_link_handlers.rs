@@ -14,7 +14,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use temps_auth::permissions::Permission;
-use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
+use temps_auth::{
+    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
+};
 use temps_core::{
     problemdetails::{self, Problem, ProblemDetails},
     AuditContext, RequestMetadata,
@@ -23,8 +25,10 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::audit::{AiSandboxLinkedAudit, AiSandboxUnlinkedAudit};
 use crate::handlers::{ensure_user_conversation_access, AppState};
-use crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
-use crate::sandbox_link::{link_from_metadata, SandboxLink, SandboxLinkError, SandboxLinkService};
+use crate::sandbox_link::{
+    context_supports_sandbox, link_from_metadata, project_for_new_sandbox, SandboxLink,
+    SandboxLinkError, SandboxLinkService,
+};
 
 impl From<SandboxLinkError> for Problem {
     fn from(error: SandboxLinkError) -> Self {
@@ -89,10 +93,12 @@ fn availability(
     auth: &temps_auth::context::AuthContext,
     context_type: &str,
 ) -> Availability {
-    if context_type != ASSISTANT_CONTEXT_TYPE {
+    if !context_supports_sandbox(context_type) {
         return Availability {
             configured: false,
-            reason: Some("Sandboxes can be linked to assistant chats only.".to_string()),
+            reason: Some(
+                "Sandboxes can be linked to Temps assistant chats and project chats.".to_string(),
+            ),
         };
     }
     if state.application_sandboxes.is_none() {
@@ -203,10 +209,13 @@ pub async fn link_chat_sandbox(
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
-    if conversation.context_type != ASSISTANT_CONTEXT_TYPE {
+    if !context_supports_sandbox(&conversation.context_type) {
         return Err(SandboxLinkError::Validation {
             conversation_id: conversation.public_id.clone(),
-            message: "sandboxes can be linked to assistant chats only".to_string(),
+            message: format!(
+                "sandboxes can be linked to assistant and project chats only, not '{}' chats",
+                conversation.context_type
+            ),
         }
         .into());
     }
@@ -224,6 +233,14 @@ pub async fn link_chat_sandbox(
         }
         (None, true) => {
             permission_guard!(auth, SandboxesWrite);
+            // A sandbox made for a project chat starts as a clone of the
+            // project's repository, which reads its stored Git credential: the
+            // same gates as creating a sandbox from a project directly.
+            if let Some(project_id) = project_for_new_sandbox(&conversation) {
+                permission_guard!(auth, GitRepositoriesRead);
+                project_scope_guard!(auth, project_id);
+                project_access_guard!(auth, project_id, state.project_access_checker);
+            }
             service
                 .create_and_link(&conversation, auth.user_id())
                 .await?

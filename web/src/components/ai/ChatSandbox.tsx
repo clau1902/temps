@@ -22,6 +22,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Loader2, SquareTerminal } from 'lucide-react'
@@ -29,6 +30,10 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { linkableSandboxes, sandboxButtonLabel } from './chat-sandbox'
+
+/** Shown instead of the example when the chat is about a project. */
+const PROJECT_EXAMPLE =
+  "A new sandbox starts as a clone of this project's repository, so the assistant can edit, test and run it there before anything is committed."
 
 /** What the assistant could do with a shell, shown while nothing is linked. */
 const EXAMPLE =
@@ -117,9 +122,12 @@ function SandboxPicker({
  */
 export function SandboxLinkBody({
   conversationPublicId,
+  fromProject = false,
   onDecline,
 }: {
   conversationPublicId: string
+  /** The chat is about a project: a new sandbox is cloned from its repository. */
+  fromProject?: boolean
   /** Offered only where the user can say "not now", i.e. the inline offer. */
   onDecline?: () => void
 }) {
@@ -196,7 +204,9 @@ export function SandboxLinkBody({
     <div className="space-y-3 text-sm">
       <div>
         <p className="font-medium">Give this chat a sandbox</p>
-        <p className="text-xs text-muted-foreground">{EXAMPLE}</p>
+        <p className="text-xs text-muted-foreground">
+          {fromProject ? PROJECT_EXAMPLE : EXAMPLE}
+        </p>
       </div>
       <Button
         type="button"
@@ -248,8 +258,13 @@ export function SandboxLinkBody({
  */
 export function ChatSandbox({
   conversationPublicId,
+  fromProject = false,
+  compact = false,
 }: {
   conversationPublicId: string
+  fromProject?: boolean
+  /** Icon only on narrow screens, for crowded toolbars. */
+  compact?: boolean
 }) {
   const status = useQuery(
     getChatSandboxOptions({ path: { public_id: conversationPublicId } })
@@ -276,13 +291,40 @@ export function ChatSandbox({
           ) : (
             <SquareTerminal className="size-4 shrink-0" />
           )}
-          <span className="truncate">{label}</span>
+          <span className={cn('truncate', compact && 'hidden sm:inline')}>
+            {label}
+          </span>
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-80">
-        <SandboxLinkBody conversationPublicId={conversationPublicId} />
+        <SandboxLinkBody
+          conversationPublicId={conversationPublicId}
+          fromProject={fromProject}
+        />
       </PopoverContent>
     </Popover>
+  )
+}
+
+/**
+ * The sandbox control of a chat that has no conversation yet. A sandbox is
+ * linked to a conversation, so it is shown, not hidden, and says what to do.
+ */
+export function ChatSandboxPending({ compact = false }: { compact?: boolean }) {
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      className="h-8 max-w-44 gap-1.5"
+      disabled
+      title="Send your first message, then give this chat a sandbox to run commands in"
+    >
+      <SquareTerminal className="size-4 shrink-0" />
+      <span className={cn('truncate', compact && 'hidden sm:inline')}>
+        Sandbox
+      </span>
+    </Button>
   )
 }
 
@@ -293,9 +335,11 @@ export function ChatSandbox({
 export function SandboxOfferCard({
   conversationPublicId,
   reason,
+  fromProject = false,
 }: {
   conversationPublicId: string
   reason: string | null
+  fromProject?: boolean
 }) {
   const [declined, setDeclined] = useState(false)
   const status = useQuery(
@@ -316,7 +360,7 @@ export function SandboxOfferCard({
     return (
       <div className="rounded-lg border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
         No sandbox for this chat. The assistant continues without a shell. You
-        can link one any time from the Sandbox button above.
+        can link one any time from the Sandbox button.
       </div>
     )
   }
@@ -329,6 +373,7 @@ export function SandboxOfferCard({
       )}
       <SandboxLinkBody
         conversationPublicId={conversationPublicId}
+        fromProject={fromProject}
         onDecline={() => setDeclined(true)}
       />
     </div>
