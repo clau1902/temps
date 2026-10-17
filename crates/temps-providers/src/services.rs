@@ -12738,7 +12738,16 @@ echo "[restore] Pre-seed complete"
                         && member.status == "running"
                         && member.node_id.is_none()
                 })
-                .map(|member| (member.container_name.clone(), 5432))
+                // A cluster member listens on its own stored port inside the
+                // container as well as on the host (the container publishes
+                // `port` to `port`), unlike a standalone service's 5432.
+                .map(|member| {
+                    let port = member
+                        .port
+                        .and_then(|port| u16::try_from(port).ok())
+                        .unwrap_or(5432);
+                    (member.container_name.clone(), port)
+                })
                 .collect();
             if hosts.is_empty() {
                 return Err(ExternalServiceError::SandboxAccessUnsupported {
