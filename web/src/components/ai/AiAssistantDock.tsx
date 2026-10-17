@@ -33,8 +33,14 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from '@/components/ui/resizable'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { useIsDesktop } from '@/components/hooks/use-mobile'
 import { cn } from '@/lib/utils'
 import {
   Bell,
@@ -55,6 +61,7 @@ import {
   X,
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
 import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
@@ -303,6 +310,26 @@ export function DockBody({
   const [searchParams, setSearchParams] = useSearchParams()
   const urlChatId = layout === 'page' ? searchParams.get('chat') : null
   const isPage = layout === 'page'
+
+  // The chat list is a resizable left panel on the full-screen page. The size
+  // is remembered across visits, but only once the user has dragged it — a
+  // collapse caused by a narrow window must not be saved as their preference.
+  const isDesktop = useIsDesktop()
+  const sidebarRef = usePanelRef()
+  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
+    id: 'assistant-chat-list-split',
+    onlySaveAfterUserInteractions: true,
+  })
+  useEffect(() => {
+    if (!isPage) return
+    const panel = sidebarRef.current
+    if (!panel) return
+    if (isDesktop) {
+      if (panel.isCollapsed()) panel.expand()
+    } else if (!panel.isCollapsed()) {
+      panel.collapse()
+    }
+  }, [isPage, isDesktop, sidebarRef])
 
   const [active, setActive] = useState<ActiveChat | null>(() => {
     if (initialContext && openedProjectId != null) {
@@ -688,449 +715,474 @@ export function DockBody({
     ? `${metaFor(active.contextType).label}${active.projectName ? ` · ${active.projectName}` : ''}`
     : ''
 
-  return (
-    <div
-      className={cn('flex h-full', isPage ? 'flex-row' : 'flex-col gap-3 p-4')}
+  // Full screen: past chats live in a left sidebar, so switching or starting
+  // one never leaves the conversation. Below `lg` the sidebar panel is collapsed
+  // and the back arrow in the header opens the same list instead.
+  const sidebar = (
+    <aside
+      aria-label="Chats"
+      className="hidden h-full min-w-0 flex-col lg:flex"
     >
-      {isPage && (
-        // Full screen: past chats live in a left sidebar, so switching or
-        // starting one never leaves the conversation. Below `lg` the sidebar is
-        // hidden and the back arrow in the header opens the same list instead.
-        <aside
-          aria-label="Chats"
-          className="hidden w-72 shrink-0 flex-col border-r lg:flex"
-        >
-          <div className="flex items-center justify-between gap-2 px-3 py-3">
-            <h2 className="text-sm font-semibold">Chats</h2>
-            <div className="flex items-center gap-1">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={startPicking}
-                className="h-8 gap-1"
-                title="New chat about a specific project"
-              >
-                <Plus className="h-4 w-4" />
-                Project
-              </Button>
-              <Button
-                size="sm"
-                onClick={startAssistant}
-                className="h-8 gap-1"
-                title="Ask Temps to inspect or change something"
-              >
-                <Sparkles className="h-4 w-4" />
-                New
-              </Button>
-            </div>
-          </div>
-          <div className="min-h-0 flex-1 px-2 pb-3">
-            <ConversationList
-              loading={loadingList && conversations.length === 0}
-              conversations={conversations}
-              activeId={activePublicId}
-              onOpen={openConversation}
-              onOpenSource={(c) => {
-                const h = sourceHref({
-                  contextType: c.context_type,
-                  contextId: c.context_id,
-                  projectSlug: c.project_slug ?? undefined,
-                })
-                if (h) goToSource(h)
-              }}
-              onRename={startRename}
-              onDelete={(c) =>
-                setPendingDelete({
-                  projectId: c.project_id ?? null,
-                  publicId: c.public_id,
-                  title:
-                    c.title ??
-                    `${metaFor(c.context_type).label} ${c.context_id}`,
-                })
-              }
-            />
-          </div>
-        </aside>
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-3">
+        <h2 className="text-sm font-semibold">Chats</h2>
+        <div className="flex items-center gap-1">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={startPicking}
+            className="h-8 gap-1"
+            title="New chat about a specific project"
+          >
+            <Plus className="h-4 w-4" />
+            Project
+          </Button>
+          <Button
+            size="sm"
+            onClick={startAssistant}
+            className="h-8 gap-1"
+            title="Ask Temps to inspect or change something"
+          >
+            <Sparkles className="h-4 w-4" />
+            New
+          </Button>
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 px-2 pb-3">
+        <ConversationList
+          loading={loadingList && conversations.length === 0}
+          conversations={conversations}
+          activeId={activePublicId}
+          onOpen={openConversation}
+          onOpenSource={(c) => {
+            const h = sourceHref({
+              contextType: c.context_type,
+              contextId: c.context_id,
+              projectSlug: c.project_slug ?? undefined,
+            })
+            if (h) goToSource(h)
+          }}
+          onRename={startRename}
+          onDelete={(c) =>
+            setPendingDelete({
+              projectId: c.project_id ?? null,
+              publicId: c.public_id,
+              title:
+                c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
+            })
+          }
+        />
+      </div>
+    </aside>
+  )
+
+  const main = (
+    <div
+      className={cn(
+        isPage && 'flex h-full min-h-0 min-w-0 flex-1 flex-col',
+        !isPage && 'contents'
       )}
+    >
       <div
         className={cn(
-          isPage && 'flex h-full min-h-0 min-w-0 flex-1 flex-col',
-          !isPage && 'contents'
+          'flex items-start justify-between gap-2',
+          isPage && 'items-center border-b px-4 py-3 sm:px-6'
         )}
       >
-        <div
-          className={cn(
-            'flex items-start justify-between gap-2',
-            isPage && 'items-center border-b px-4 py-3 sm:px-6'
-          )}
-        >
-          <div className="min-w-0 space-y-1">
-            <div className="flex items-center gap-2">
-              {inConversation || picking ? (
+        <div className="min-w-0 space-y-1">
+          <div className="flex items-center gap-2">
+            {inConversation || picking ? (
+              <button
+                type="button"
+                onClick={inConversation ? backToList : () => setPicking(false)}
+                className={cn(
+                  '-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+                  isPage && 'lg:hidden'
+                )}
+                aria-label="Back to all conversations"
+                title="All chats"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+            ) : (
+              <Sparkles className="h-5 w-5 text-primary" />
+            )}
+            {inProjectChat && active && (
+              <ContextAvatar
+                projectName={active.projectName}
+                contextType={active.contextType}
+                className="size-7"
+              />
+            )}
+            <h2 className="min-w-0 truncate text-lg font-semibold">
+              {inAssistant
+                ? (assistant?.conversation.title ?? 'Temps assistant')
+                : inConversation
+                  ? (active?.title ?? 'AI chat')
+                  : picking
+                    ? 'New project chat'
+                    : 'AI assistant'}
+            </h2>
+          </div>
+          {inAssistant ? (
+            <p className="text-sm text-muted-foreground">
+              Acts with your own permissions
+            </p>
+          ) : inConversation ? (
+            <p className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
+              <span>{sourceLabel}</span>
+              {href && (
                 <button
                   type="button"
-                  onClick={
-                    inConversation ? backToList : () => setPicking(false)
-                  }
-                  className={cn(
-                    '-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
-                    isPage && 'lg:hidden'
-                  )}
-                  aria-label="Back to all conversations"
-                  title="All chats"
+                  onClick={() => goToSource(href)}
+                  className="inline-flex items-center gap-0.5 text-primary hover:underline"
                 >
-                  <ChevronLeft className="h-4 w-4" />
+                  View source
+                  <ExternalLink className="h-3 w-3" />
                 </button>
-              ) : (
-                <Sparkles className="h-5 w-5 text-primary" />
               )}
-              {inProjectChat && active && (
-                <ContextAvatar
-                  projectName={active.projectName}
-                  contextType={active.contextType}
-                  className="size-7"
-                />
-              )}
-              <h2 className="min-w-0 truncate text-lg font-semibold">
-                {inAssistant
-                  ? (assistant?.conversation.title ?? 'Temps assistant')
-                  : inConversation
-                    ? (active?.title ?? 'AI chat')
-                    : picking
-                      ? 'New project chat'
-                      : 'AI assistant'}
-              </h2>
-            </div>
-            {inAssistant ? (
-              <p className="text-sm text-muted-foreground">
-                Acts with your own permissions
-              </p>
-            ) : inConversation ? (
-              <p className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
-                <span>{sourceLabel}</span>
-                {href && (
-                  <button
-                    type="button"
-                    onClick={() => goToSource(href)}
-                    className="inline-flex items-center gap-0.5 text-primary hover:underline"
-                  >
-                    View source
-                    <ExternalLink className="h-3 w-3" />
-                  </button>
-                )}
-              </p>
-            ) : picking ? (
-              <p className="text-sm text-muted-foreground">
-                Choose a project to start a general chat about it.
-              </p>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                Resume any AI conversation across your projects, or start a new
-                chat for a project.
-              </p>
-            )}
-          </div>
-          <div className="flex shrink-0 items-center gap-0.5">
-            {!inConversation && !picking && (
-              <Button
-                size="sm"
-                onClick={startAssistant}
-                className={cn('mr-1 h-8 gap-1', isPage && 'lg:hidden')}
-                title="Ask Temps to inspect or change something"
-              >
-                <Sparkles className="h-4 w-4" />
-                <span className="hidden sm:inline">Ask Temps</span>
-              </Button>
-            )}
-            {!inConversation &&
-              !picking &&
-              (currentProject ? (
-                // On a project page: start a chat for it in one click, with a
-                // caret to pick a different project instead.
-                <div className="mr-1 flex items-center">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => startProjectChat(currentProject)}
-                    className="h-8 gap-1 rounded-r-none border-r-0"
-                    title={`New chat in ${currentProject.name}`}
-                  >
-                    <Plus className="h-4 w-4" />
-                    New chat
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={startPicking}
-                    className="h-8 rounded-l-none px-1.5"
-                    title="New chat in another project"
-                    aria-label="New chat in another project"
-                  >
-                    <ChevronDown className="h-4 w-4" />
-                  </Button>
-                </div>
-              ) : (
+            </p>
+          ) : picking ? (
+            <p className="text-sm text-muted-foreground">
+              Choose a project to start a general chat about it.
+            </p>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Resume any AI conversation across your projects, or start a new
+              chat for a project.
+            </p>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-0.5">
+          {!inConversation && !picking && (
+            <Button
+              size="sm"
+              onClick={startAssistant}
+              className={cn('mr-1 h-8 gap-1', isPage && 'lg:hidden')}
+              title="Ask Temps to inspect or change something"
+            >
+              <Sparkles className="h-4 w-4" />
+              <span className="hidden sm:inline">Ask Temps</span>
+            </Button>
+          )}
+          {!inConversation &&
+            !picking &&
+            (currentProject ? (
+              // On a project page: start a chat for it in one click, with a
+              // caret to pick a different project instead.
+              <div className="mr-1 flex items-center">
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={startPicking}
-                  className="mr-1 h-8 gap-1"
+                  onClick={() => startProjectChat(currentProject)}
+                  className="h-8 gap-1 rounded-r-none border-r-0"
+                  title={`New chat in ${currentProject.name}`}
                 >
                   <Plus className="h-4 w-4" />
                   New chat
                 </Button>
-              ))}
-            {!isPage && (
-              <button
-                type="button"
-                onClick={goFullScreen}
-                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                title="Open full screen"
-                aria-label="Open chat full screen"
-              >
-                <Maximize2 className="h-4 w-4" />
-              </button>
-            )}
-            {inAssistant && (
-              <button
-                type="button"
-                onClick={startAssistant}
-                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                title="New assistant chat"
-                aria-label="New assistant chat"
-              >
-                <Plus className="h-4 w-4" />
-              </button>
-            )}
-            {inProjectChat && active && (
-              <button
-                type="button"
-                onClick={() =>
-                  startProjectChat({
-                    id: active.projectId,
-                    slug: active.projectSlug,
-                    name: active.projectName ?? 'Project',
-                  })
-                }
-                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                title="New chat"
-                aria-label="New chat"
-              >
-                <Plus className="h-4 w-4" />
-              </button>
-            )}
-            {inProjectChat && (
-              <button
-                type="button"
-                onClick={resetConversation}
-                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                title="Reset — archive this chat and start a new blank one"
-                aria-label="Reset conversation"
-              >
-                <RotateCcw className="h-4 w-4" />
-              </button>
-            )}
-            {inConversation && activePublicId && (
-              <button
-                type="button"
-                onClick={() =>
-                  setPendingDelete({
-                    projectId: active?.projectId ?? null,
-                    publicId: activePublicId,
-                    title:
-                      active?.title ??
-                      assistant?.conversation.title ??
-                      'this chat',
-                  })
-                }
-                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
-                title="Delete this chat"
-                aria-label="Delete conversation"
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
-            )}
-            {!isPage && (
-              <button
-                type="button"
-                onClick={onClose}
-                className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                aria-label="Close AI assistant"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            )}
-          </div>
-        </div>
-
-        <div
-          className={cn(
-            'min-h-0 flex-1',
-            // Full screen: a centred reading column, like a focused chat app.
-            isPage && 'mx-auto w-full max-w-3xl px-4 pb-4 pt-3'
-          )}
-        >
-          {assistantStarting ? (
-            <AssistantStart
-              onStarted={handleAssistantStarted}
-              onNavigate={() => {
-                if (typeof window !== 'undefined' && window.innerWidth < 1024)
-                  onClose()
-              }}
-              cloudPath="/settings/cloud"
-              roomy={isPage}
-            />
-          ) : assistant ? (
-            <AssistantThread
-              key={assistant.conversation.public_id}
-              conversation={assistant.conversation}
-              firstMessage={assistant.firstMessage}
-              firstAttachments={assistant.firstAttachments}
-            />
-          ) : inProjectChat ? (
-            <DebugChatPanel
-              key={`${active!.contextType}:${active!.contextId}:${activePublicId ?? 'new'}:${resetKey}`}
-              projectId={active!.projectId}
-              conversationPublicId={activePublicId ?? undefined}
-              contextType={active!.contextType}
-              contextId={active!.contextId}
-              startPrompt={
-                active!.startPrompt ??
-                'Diagnose this and suggest concrete next steps.'
-              }
-              autoStart={active!.autoStart}
-              lazyCreate={active!.contextType === 'project'}
-              emptyHint="Ask anything about this project — deployments, logs, traces, and errors."
-              placeholder={
-                active!.contextType === 'project'
-                  ? 'Ask about this project…'
-                  : 'Ask a follow-up…'
-              }
-              onConversationChange={handleConversationChange}
-            />
-          ) : picking ? (
-            <ProjectPicker onSelect={startProjectChat} />
-          ) : isPage && conversations.length === 0 ? (
-            <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-              <MessageSquare className="size-8 text-muted-foreground" />
-              <div>
-                <p className="font-medium">No AI conversations yet</p>
-                <p className="mt-1 max-w-sm text-sm text-muted-foreground">
-                  Ask Temps to inspect or change your setup, or start a project
-                  chat to investigate deployments, logs, traces, and errors.
-                </p>
-              </div>
-              <div className="flex gap-2">
-                <Button size="sm" onClick={startAssistant}>
-                  <Sparkles className="mr-1.5 size-4" />
-                  Ask Temps
-                </Button>
                 <Button
                   size="sm"
                   variant="outline"
                   onClick={startPicking}
+                  className="h-8 rounded-l-none px-1.5"
+                  title="New chat in another project"
+                  aria-label="New chat in another project"
                 >
-                  <Plus className="mr-1.5 size-4" />
-                  Project chat
+                  <ChevronDown className="h-4 w-4" />
                 </Button>
               </div>
-            </div>
-          ) : (
-            <ConversationList
-              loading={loadingList}
-              conversations={conversations}
-              onOpen={openConversation}
-              onOpenSource={(c) => {
-                const h = sourceHref({
-                  contextType: c.context_type,
-                  contextId: c.context_id,
-                  projectSlug: c.project_slug ?? undefined,
-                })
-                if (h) goToSource(h)
-              }}
-              onRename={startRename}
-              onDelete={(c) =>
-                setPendingDelete({
-                  projectId: c.project_id ?? null,
-                  publicId: c.public_id,
-                  title:
-                    c.title ??
-                    `${metaFor(c.context_type).label} ${c.context_id}`,
+            ) : (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={startPicking}
+                className="mr-1 h-8 gap-1"
+              >
+                <Plus className="h-4 w-4" />
+                New chat
+              </Button>
+            ))}
+          {!isPage && (
+            <button
+              type="button"
+              onClick={goFullScreen}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              title="Open full screen"
+              aria-label="Open chat full screen"
+            >
+              <Maximize2 className="h-4 w-4" />
+            </button>
+          )}
+          {inAssistant && (
+            <button
+              type="button"
+              onClick={startAssistant}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              title="New assistant chat"
+              aria-label="New assistant chat"
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+          )}
+          {inProjectChat && active && (
+            <button
+              type="button"
+              onClick={() =>
+                startProjectChat({
+                  id: active.projectId,
+                  slug: active.projectSlug,
+                  name: active.projectName ?? 'Project',
                 })
               }
-            />
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              title="New chat"
+              aria-label="New chat"
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+          )}
+          {inProjectChat && (
+            <button
+              type="button"
+              onClick={resetConversation}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              title="Reset — archive this chat and start a new blank one"
+              aria-label="Reset conversation"
+            >
+              <RotateCcw className="h-4 w-4" />
+            </button>
+          )}
+          {inConversation && activePublicId && (
+            <button
+              type="button"
+              onClick={() =>
+                setPendingDelete({
+                  projectId: active?.projectId ?? null,
+                  publicId: activePublicId,
+                  title:
+                    active?.title ??
+                    assistant?.conversation.title ??
+                    'this chat',
+                })
+              }
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+              title="Delete this chat"
+              aria-label="Delete conversation"
+            >
+              <Trash2 className="h-4 w-4" />
+            </button>
+          )}
+          {!isPage && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              aria-label="Close AI assistant"
+            >
+              <X className="h-4 w-4" />
+            </button>
           )}
         </div>
-
-        <AlertDialog
-          open={pendingDelete !== null}
-          onOpenChange={(o) => !o && setPendingDelete(null)}
-        >
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Delete this chat?</AlertDialogTitle>
-              <AlertDialogDescription>
-                “{pendingDelete?.title}” will be removed from your list. This
-                can&apos;t be undone from here.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction
-                onClick={confirmDelete}
-                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              >
-                Delete
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
-
-        <Dialog
-          open={pendingRename !== null}
-          onOpenChange={(o) => !o && setPendingRename(null)}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Rename chat</DialogTitle>
-              <DialogDescription>
-                Give this conversation a name so it&apos;s easy to find later.
-              </DialogDescription>
-            </DialogHeader>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                void confirmRename()
-              }}
-            >
-              <Input
-                autoFocus
-                value={renameValue}
-                maxLength={200}
-                placeholder="e.g. Prod memory tuning"
-                onChange={(e) => setRenameValue(e.target.value)}
-              />
-              <DialogFooter className="mt-4">
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setPendingRename(null)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="submit"
-                  disabled={!renameValue.trim() || renaming}
-                >
-                  {renaming && <Loader2 className="h-4 w-4 animate-spin" />}
-                  Save
-                </Button>
-              </DialogFooter>
-            </form>
-          </DialogContent>
-        </Dialog>
       </div>
+
+      <div
+        className={cn(
+          'min-h-0 flex-1',
+          // Full screen: a centred reading column, like a focused chat app.
+          isPage && 'mx-auto w-full max-w-3xl px-4 pb-4 pt-3'
+        )}
+      >
+        {assistantStarting ? (
+          <AssistantStart
+            onStarted={handleAssistantStarted}
+            onNavigate={() => {
+              if (typeof window !== 'undefined' && window.innerWidth < 1024)
+                onClose()
+            }}
+            cloudPath="/settings/cloud"
+            roomy={isPage}
+          />
+        ) : assistant ? (
+          <AssistantThread
+            key={assistant.conversation.public_id}
+            conversation={assistant.conversation}
+            firstMessage={assistant.firstMessage}
+            firstAttachments={assistant.firstAttachments}
+          />
+        ) : inProjectChat ? (
+          <DebugChatPanel
+            key={`${active!.contextType}:${active!.contextId}:${activePublicId ?? 'new'}:${resetKey}`}
+            projectId={active!.projectId}
+            conversationPublicId={activePublicId ?? undefined}
+            contextType={active!.contextType}
+            contextId={active!.contextId}
+            startPrompt={
+              active!.startPrompt ??
+              'Diagnose this and suggest concrete next steps.'
+            }
+            autoStart={active!.autoStart}
+            lazyCreate={active!.contextType === 'project'}
+            emptyHint="Ask anything about this project — deployments, logs, traces, and errors."
+            placeholder={
+              active!.contextType === 'project'
+                ? 'Ask about this project…'
+                : 'Ask a follow-up…'
+            }
+            onConversationChange={handleConversationChange}
+          />
+        ) : picking ? (
+          <ProjectPicker onSelect={startProjectChat} />
+        ) : isPage && conversations.length === 0 ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+            <MessageSquare className="size-8 text-muted-foreground" />
+            <div>
+              <p className="font-medium">No AI conversations yet</p>
+              <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+                Ask Temps to inspect or change your setup, or start a project
+                chat to investigate deployments, logs, traces, and errors.
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Button size="sm" onClick={startAssistant}>
+                <Sparkles className="mr-1.5 size-4" />
+                Ask Temps
+              </Button>
+              <Button size="sm" variant="outline" onClick={startPicking}>
+                <Plus className="mr-1.5 size-4" />
+                Project chat
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <ConversationList
+            loading={loadingList}
+            conversations={conversations}
+            onOpen={openConversation}
+            onOpenSource={(c) => {
+              const h = sourceHref({
+                contextType: c.context_type,
+                contextId: c.context_id,
+                projectSlug: c.project_slug ?? undefined,
+              })
+              if (h) goToSource(h)
+            }}
+            onRename={startRename}
+            onDelete={(c) =>
+              setPendingDelete({
+                projectId: c.project_id ?? null,
+                publicId: c.public_id,
+                title:
+                  c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
+              })
+            }
+          />
+        )}
+      </div>
+
+      <AlertDialog
+        open={pendingDelete !== null}
+        onOpenChange={(o) => !o && setPendingDelete(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this chat?</AlertDialogTitle>
+            <AlertDialogDescription>
+              “{pendingDelete?.title}” will be removed from your list. This
+              can&apos;t be undone from here.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmDelete}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <Dialog
+        open={pendingRename !== null}
+        onOpenChange={(o) => !o && setPendingRename(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Rename chat</DialogTitle>
+            <DialogDescription>
+              Give this conversation a name so it&apos;s easy to find later.
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              void confirmRename()
+            }}
+          >
+            <Input
+              autoFocus
+              value={renameValue}
+              maxLength={200}
+              placeholder="e.g. Prod memory tuning"
+              onChange={(e) => setRenameValue(e.target.value)}
+            />
+            <DialogFooter className="mt-4">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setPendingRename(null)}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!renameValue.trim() || renaming}>
+                {renaming && <Loader2 className="h-4 w-4 animate-spin" />}
+                Save
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
+  )
+
+  if (!isPage) {
+    return <div className="flex h-full flex-col gap-3 p-4">{main}</div>
+  }
+
+  return (
+    <ResizablePanelGroup
+      orientation="horizontal"
+      className="h-full"
+      defaultLayout={defaultLayout}
+      onLayoutChanged={onLayoutChanged}
+    >
+      {/* Numbers are pixels in v4, strings are percentages: the list can grow
+          to 40% of the screen but never crowd out the conversation. Below `lg`
+          it is collapsed to nothing (see the effect above); on desktop
+          it stops at the minimum so it can't be dragged away. */}
+      <ResizablePanel
+        id="chats"
+        panelRef={sidebarRef}
+        defaultSize={288}
+        minSize={260}
+        maxSize="40"
+        collapsible={!isDesktop}
+        collapsedSize={0}
+        disabled={!isDesktop}
+        className="min-w-0"
+      >
+        {sidebar}
+      </ResizablePanel>
+      <ResizableHandle
+        withHandle
+        aria-label="Resize chat list"
+        className={isDesktop ? undefined : 'hidden'}
+      />
+      <ResizablePanel id="thread" minSize={isDesktop ? 360 : 0}>
+        {main}
+      </ResizablePanel>
+    </ResizablePanelGroup>
   )
 }
 
@@ -1224,7 +1276,7 @@ function ConversationList({
                   <span className="min-w-0 flex-1 truncate">
                     {c.project_name ?? ''}
                   </span>
-                  <span className="shrink-0">
+                  <span className="min-w-0 shrink truncate">
                     <TimeAgo date={c.last_activity_at} />
                   </span>
                 </div>

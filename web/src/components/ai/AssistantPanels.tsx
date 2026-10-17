@@ -489,19 +489,21 @@ export function AssistantStart({
   return (
     <div
       className={cn(
-        'flex h-full min-h-0 flex-col justify-end gap-4 p-5',
-        roomy && 'justify-center gap-8 p-6'
+        // `safe` alignment: when the content is taller than the viewport (a
+        // phone) it starts at the top and scrolls instead of being clipped.
+        'flex h-full min-h-0 flex-col gap-4 overflow-y-auto p-5 [justify-content:safe_flex-end]',
+        roomy && 'gap-8 p-4 [justify-content:safe_center] sm:p-6'
       )}
     >
       <div className={cn('space-y-2', roomy && 'space-y-4')}>
         <h2
           className={cn(
             'flex items-center gap-2 text-xl font-semibold tracking-tight',
-            roomy && 'gap-3 text-4xl'
+            roomy && 'gap-3 text-2xl sm:text-4xl'
           )}
         >
           <Sparkles
-            className={cn('size-5 text-primary', roomy && 'size-8')}
+            className={cn('size-5 text-primary', roomy && 'size-6 sm:size-8')}
             aria-hidden="true"
           />
           What should we get running?
@@ -509,7 +511,7 @@ export function AssistantStart({
         <p
           className={cn(
             'text-sm leading-6 text-muted-foreground',
-            roomy && 'text-lg leading-8'
+            roomy && 'text-base leading-7 sm:text-lg sm:leading-8'
           )}
         >
           Describe the outcome and Temps works out the steps, using the same API
