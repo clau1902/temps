@@ -1278,11 +1278,6 @@ impl From<crate::attachments::AttachmentError> for Problem {
                     .with_title("Attachment Too Large")
                     .with_detail(error.to_string())
             }
-            AttachmentError::Unsupported { .. } => {
-                problemdetails::new(StatusCode::UNSUPPORTED_MEDIA_TYPE)
-                    .with_title("Unsupported Attachment")
-                    .with_detail(error.to_string())
-            }
             AttachmentError::QuotaExceeded { .. }
             | AttachmentError::ModelCannotSeeImages { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
@@ -8191,7 +8186,7 @@ fn attachment_prompt_context(attachments: &[ChatAttachmentResponse]) -> Option<S
     post, tag = "AI Chat", path = "/ai/conversations/{public_id}/attachments",
     params(("public_id" = String, Path,)),
     request_body(content = ChatAttachmentUpload, content_type = "multipart/form-data"),
-    responses((status = 201, body = ChatAttachmentResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 409), (status = 413), (status = 415)),
+    responses((status = 201, body = ChatAttachmentResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 409), (status = 413)),
     security(("bearer_auth" = []))
 )]
 pub async fn upload_user_conversation_attachment(

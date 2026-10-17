@@ -26,6 +26,10 @@ pub struct Model {
     pub size_bytes: i64,
     #[serde(skip)]
     pub content: Vec<u8>,
+    /// For a PDF: the text layer read at upload (empty for a scan). `None` for
+    /// other kinds, and for a PDF that could not be read.
+    #[serde(skip)]
+    pub extracted_text: Option<String>,
     /// Set when a message that references the file is accepted.
     pub sent_at: Option<DBDateTime>,
     pub created_at: DBDateTime,

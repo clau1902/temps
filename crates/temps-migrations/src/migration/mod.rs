@@ -319,6 +319,7 @@ mod m20261008_000001_create_service_data_imports;
 mod m20261009_000001_unconfirm_legacy_worker_container_removals;
 mod m20261010_000001_create_ai_goals;
 mod m20261017_000001_create_ai_chat_attachments;
+mod m20261017_000002_add_text_to_ai_chat_attachments;
 
 pub struct Migrator;
 
@@ -709,6 +710,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261009_000001_unconfirm_legacy_worker_container_removals::Migration),
             Box::new(m20261010_000001_create_ai_goals::Migration),
             Box::new(m20261017_000001_create_ai_chat_attachments::Migration),
+            Box::new(m20261017_000002_add_text_to_ai_chat_attachments::Migration),
         ]
     }
 }
