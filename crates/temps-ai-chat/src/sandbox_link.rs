@@ -48,6 +48,7 @@ pub const SANDBOX_OFFERED_KEY: &str = "sandbox_offered_at";
 pub const SANDBOX_EXEC_TOOL: &str = "sandbox_exec";
 pub const SANDBOX_READ_TOOL: &str = "sandbox_read_file";
 pub const SANDBOX_WRITE_TOOL: &str = "sandbox_write_file";
+pub const SANDBOX_PREVIEW_TOOL: &str = "sandbox_preview";
 pub const SANDBOX_OFFER_TOOL: &str = "temps_offer_sandbox";
 pub const SANDBOX_CREATE_TOOL: &str = "temps_create_sandbox";
 
@@ -201,6 +202,94 @@ fn with_notice(notice: Option<String>, result: String) -> String {
     }
 }
 
+/// Services that publish a sandbox's port through someone else's network.
+/// Temps serves previews itself, so a command that fetches or starts one is
+/// refused. This is a guard on the common tools, not a security boundary.
+const EXTERNAL_EXPOSURE_TOOLS: &[&str] = &[
+    "cloudflared",
+    "trycloudflare",
+    "ngrok",
+    "localtunnel",
+    "loca.lt",
+    "untun",
+    "serveo",
+    "localhost.run",
+    "pinggy",
+    "tunnelto",
+    "bore.pub",
+];
+
+fn is_word_boundary(c: Option<char>) -> bool {
+    c.map(|c| !c.is_ascii_alphanumeric()).unwrap_or(true)
+}
+
+/// The third-party tunnel service a shell command uses, if any.
+pub fn third_party_exposure(command: &str) -> Option<&'static str> {
+    let lowered = command.to_ascii_lowercase();
+    for name in EXTERNAL_EXPOSURE_TOOLS {
+        let mut from = 0;
+        while let Some(found) = lowered[from..].find(name) {
+            let start = from + found;
+            let end = start + name.len();
+            let before = lowered[..start].chars().next_back();
+            let after = lowered[end..].chars().next();
+            if is_word_boundary(before) && is_word_boundary(after) {
+                return Some(name);
+            }
+            from = end;
+        }
+    }
+    if lowered.contains("tailscale funnel") {
+        return Some("tailscale funnel");
+    }
+    None
+}
+
+/// Where a port is listening inside the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenScope {
+    /// Nothing listens on the port.
+    Nothing,
+    /// Only on the loopback address: the preview cannot reach it.
+    LoopbackOnly,
+    /// On a non-loopback address: the preview can reach it.
+    Reachable,
+}
+
+/// Read a port's listener out of the text of `/proc/net/tcp` and
+/// `/proc/net/tcp6` (concatenated).
+pub fn listen_scope(proc_net_tcp: &str, port: u16) -> ListenScope {
+    let wanted = format!("{port:04X}");
+    let mut scope = ListenScope::Nothing;
+    for line in proc_net_tcp.lines() {
+        let columns: Vec<&str> = line.split_whitespace().collect();
+        // Column 3 is the socket state; 0A is LISTEN.
+        if columns.len() < 4 || columns[3] != "0A" {
+            continue;
+        }
+        let Some((address, listening_port)) = columns[1].rsplit_once(':') else {
+            continue;
+        };
+        if !listening_port.eq_ignore_ascii_case(&wanted) {
+            continue;
+        }
+        // /proc prints each 32-bit word little-endian: 127.0.0.1 is
+        // `0100007F`, ::1 is `00000000000000000000000001000000`, and a
+        // v4-mapped loopback ends the same way as the v4 one.
+        let loopback = address.eq_ignore_ascii_case("00000000000000000000000001000000")
+            || address.to_ascii_uppercase().ends_with("0100007F")
+            || (address.len() == 8 && address.to_ascii_uppercase().ends_with("7F"));
+        if loopback {
+            if scope == ListenScope::Nothing {
+                scope = ListenScope::LoopbackOnly;
+            }
+        } else {
+            scope = ListenScope::Reachable;
+        }
+    }
+    scope
+}
+
 /// Keep the end of `text` (errors and results come last), at most `max` bytes.
 fn cap_tail(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -265,6 +354,52 @@ struct WriteArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct PreviewArgs {
+    port: Option<u16>,
+}
+
+/// Separates the listener table from the HTTP status in the probe's output.
+const PROBE_SEPARATOR: &str = "---temps-probe---";
+
+/// The tool result for a preview check: the address, whether it will work,
+/// and what to do when it will not.
+fn preview_report(url: &str, port: u16, scope: ListenScope, status: Option<u16>) -> String {
+    let (ready, advice) = match (scope, status) {
+        (ListenScope::Nothing, _) => (
+            false,
+            format!(
+                "Nothing is listening on port {port} in the sandbox. Start the server in the \
+                 background (`nohup … &`) bound to 0.0.0.0, wait for it to finish starting, and \
+                 call this again."
+            ),
+        ),
+        (ListenScope::LoopbackOnly, _) => (
+            false,
+            format!(
+                "The server on port {port} listens only on localhost, so the preview cannot \
+                 reach it. Restart it bound to 0.0.0.0 (for example `-H 0.0.0.0` for Next.js or \
+                 `--host 0.0.0.0` for Vite)."
+            ),
+        ),
+        (ListenScope::Reachable, None) => (
+            false,
+            format!(
+                "Port {port} is open but the server did not answer an HTTP request. It may \
+                 still be starting: check its log, then call this again."
+            ),
+        ),
+        (ListenScope::Reachable, Some(code)) => (
+            true,
+            format!(
+                "The server answers on port {port} (HTTP {code}). Give the user this URL; it is \
+                 served by Temps, so no tunnel or outside service is needed."
+            ),
+        ),
+    };
+    json!({ "url": url, "ready": ready, "advice": advice }).to_string()
+}
+
+#[derive(Debug, Deserialize)]
 struct OfferArgs {
     reason: String,
 }
@@ -276,6 +411,7 @@ pub fn is_sandbox_tool(name: &str) -> bool {
         SANDBOX_EXEC_TOOL
             | SANDBOX_READ_TOOL
             | SANDBOX_WRITE_TOOL
+            | SANDBOX_PREVIEW_TOOL
             | SANDBOX_OFFER_TOOL
             | SANDBOX_CREATE_TOOL
     )
@@ -349,6 +485,22 @@ pub fn tools_for(
                         "executable": { "type": "boolean", "description": "Mark the file executable." }
                     },
                     "required": ["path", "content"]
+                }),
+            },
+            ChatTool {
+                name: SANDBOX_PREVIEW_TOOL.to_string(),
+                description: "Get the address the user opens in their browser to see a server \
+                    running in the sandbox, and check that the server is listening. Start the \
+                    server first, in the background and bound to 0.0.0.0. Always give the user \
+                    the URL this returns: it is served by Temps, so no tunnel or outside service \
+                    is ever needed."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "port": { "type": "integer", "description": "Port the server listens on inside the sandbox (1 to 65535)." }
+                    },
+                    "required": ["port"]
                 }),
             },
         ];
@@ -726,6 +878,10 @@ impl SandboxLinkService {
                 self.run_write(arguments, conversation_id, &link, &row.work_dir, user_id)
                     .await
             }
+            SANDBOX_PREVIEW_TOOL => {
+                self.run_preview(arguments, conversation_id, &link, user_id)
+                    .await
+            }
             other => format!("Unknown sandbox tool `{other}`."),
         };
         with_notice(notice, result)
@@ -1008,6 +1164,15 @@ impl SandboxLinkService {
         if args.command.trim().is_empty() {
             return format!("`{SANDBOX_EXEC_TOOL}` needs a non-empty command. Nothing ran.");
         }
+        if let Some(service) = third_party_exposure(&args.command) {
+            return format!(
+                "Nothing ran: `{service}` would publish the sandbox through a third party, and \
+                 Temps does not use one. Use `{SANDBOX_PREVIEW_TOOL}` with the server's port to \
+                 get the address the user opens (it is served by Temps), or deploy the code as a \
+                 Temps project to publish it. If the user asked for that service by name, tell \
+                 them this sandbox does not run it."
+            );
+        }
         let timeout = Duration::from_secs(
             args.timeout_secs
                 .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
@@ -1064,6 +1229,65 @@ impl SandboxLinkService {
                 .to_string()
             }
         }
+    }
+
+    async fn run_preview(
+        &self,
+        arguments: &str,
+        conversation_id: i64,
+        link: &SandboxLink,
+        user_id: i32,
+    ) -> String {
+        let args: PreviewArgs = match serde_json::from_str(arguments) {
+            Ok(args) => args,
+            Err(error) => {
+                return format!("`{SANDBOX_PREVIEW_TOOL}` needs {{\"port\": 3000}}: {error}.")
+            }
+        };
+        let Some(port) = args.port.filter(|port| *port >= 1) else {
+            return format!("`{SANDBOX_PREVIEW_TOOL}` needs a port between 1 and 65535.");
+        };
+        // One command answers both questions: where the port listens, and
+        // whether the server answers on it.
+        let probe = format!(
+            "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; echo '{PROBE_SEPARATOR}'; \
+             curl -s -m 5 -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}/ 2>/dev/null \
+             || curl -s -m 5 -o /dev/null -w '%{{http_code}}' 'http://[::1]:{port}/' 2>/dev/null; \
+             true"
+        );
+        let options = ExecOptions {
+            cmd: vec!["sh".to_string(), "-c".to_string(), probe],
+            env: Default::default(),
+            cwd: None,
+        };
+        let output = match tokio::time::timeout(
+            Duration::from_secs(20),
+            self.sandboxes.exec(&link.sandbox_id, user_id, options),
+        )
+        .await
+        {
+            Err(_) => {
+                return "Could not check the server: the sandbox did not answer within 20 seconds."
+                    .to_string()
+            }
+            Ok(Err(error)) => {
+                return self
+                    .tool_failure("Could not check the server", error, conversation_id, link)
+                    .await
+            }
+            Ok(Ok(result)) => result.stdout,
+        };
+        let (table, status) = output
+            .split_once(PROBE_SEPARATOR)
+            .unwrap_or((output.as_str(), ""));
+        let status = status.trim().parse::<u16>().ok().filter(|code| *code != 0);
+        let scope = listen_scope(table, port);
+        let url = self
+            .sandboxes
+            .preview_parts()
+            .await
+            .url_for(&link.sandbox_id, port);
+        preview_report(&url, port, scope, status)
     }
 
     async fn run_read(
@@ -1175,6 +1399,83 @@ mod tests {
         );
         assert_eq!(result, "Resumed.\n\n{\"exit_code\":0}");
         assert_eq!(with_notice(None, "ok".to_string()), "ok");
+    }
+
+    #[test]
+    fn third_party_tunnels_are_recognised() {
+        for command in [
+            "./cloudflared tunnel --url http://localhost:3100",
+            "curl -L -o cf https://github.com/cloudflare/cloudflared/releases/latest/download/x",
+            "npx -y untun@latest tunnel http://localhost:3000",
+            "ngrok http 3000",
+            "NGROK_AUTHTOKEN=x ngrok http 3000",
+            "npx localtunnel --port 3000",
+            "ssh -R 80:localhost:3000 serveo.net",
+            "ssh -R 80:localhost:3000 nokey@localhost.run",
+            "tailscale funnel 3000",
+        ] {
+            assert!(third_party_exposure(command).is_some(), "{command}");
+        }
+    }
+
+    #[test]
+    fn ordinary_commands_are_not_mistaken_for_tunnels() {
+        for command in [
+            "npm run dev -- -H 0.0.0.0 -p 3000",
+            "curl -s localhost:3000",
+            "git clone https://github.com/example/app && cd app && npm install",
+            "echo uptuning && ls",
+            "grep -r 'ngrokish' .",
+        ] {
+            assert_eq!(third_party_exposure(command), None, "{command}");
+        }
+    }
+
+    const PROC_TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 11 1 0000000000000000 100 0 0 10 0\n\
+   1: 00000000:1388 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12 1 0000000000000000 100 0 0 10 0\n\
+   2: 0300A8C0:2710 0100A8C0:C350 01 00000000:00000000 00:00000000 00000000  1000        0 13 1 0000000000000000 100 0 0 10 0\n\
+   3: 00000000000000000000000000000000:0C1C 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 14 1 0000000000000000 100 0 0 10 0\n\
+   4: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 15 1 0000000000000000 100 0 0 10 0\n";
+
+    #[test]
+    fn listen_scope_tells_loopback_from_reachable() {
+        // 3000 (0x0BB8) listens on 127.0.0.1 only.
+        assert_eq!(listen_scope(PROC_TCP, 3000), ListenScope::LoopbackOnly);
+        // 5000 (0x1388) on every IPv4 address.
+        assert_eq!(listen_scope(PROC_TCP, 5000), ListenScope::Reachable);
+        // 3100 (0x0C1C) on every IPv6 address.
+        assert_eq!(listen_scope(PROC_TCP, 3100), ListenScope::Reachable);
+        // 8080 (0x1F90) on ::1 only.
+        assert_eq!(listen_scope(PROC_TCP, 8080), ListenScope::LoopbackOnly);
+        // 10000 (0x2710) is an established connection, not a listener.
+        assert_eq!(listen_scope(PROC_TCP, 10000), ListenScope::Nothing);
+        assert_eq!(listen_scope(PROC_TCP, 9999), ListenScope::Nothing);
+        assert_eq!(listen_scope("", 3000), ListenScope::Nothing);
+    }
+
+    #[test]
+    fn preview_report_explains_every_failure_and_only_blesses_a_working_server() {
+        let url = "http://ws-abc-3000.localho.st:8080";
+        let ok: Value = serde_json::from_str(&preview_report(
+            url,
+            3000,
+            ListenScope::Reachable,
+            Some(200),
+        ))
+        .unwrap();
+        assert_eq!(ok["ready"], true);
+        assert_eq!(ok["url"], url);
+        for (scope, status, needle) in [
+            (ListenScope::Nothing, None, "Nothing is listening"),
+            (ListenScope::LoopbackOnly, Some(200), "only on localhost"),
+            (ListenScope::Reachable, None, "did not answer"),
+        ] {
+            let report: Value =
+                serde_json::from_str(&preview_report(url, 3000, scope, status)).unwrap();
+            assert_eq!(report["ready"], false);
+            assert!(report["advice"].as_str().unwrap().contains(needle));
+        }
     }
 
     fn link() -> SandboxLink {
@@ -1319,7 +1620,12 @@ mod tests {
         for may_create in [false, true] {
             assert_eq!(
                 names(tools_for(true, false, true, true, may_create)),
-                [SANDBOX_EXEC_TOOL, SANDBOX_READ_TOOL, SANDBOX_WRITE_TOOL]
+                [
+                    SANDBOX_EXEC_TOOL,
+                    SANDBOX_READ_TOOL,
+                    SANDBOX_WRITE_TOOL,
+                    SANDBOX_PREVIEW_TOOL
+                ]
             );
         }
     }
@@ -1343,6 +1649,7 @@ mod tests {
                     SANDBOX_EXEC_TOOL,
                     SANDBOX_READ_TOOL,
                     SANDBOX_WRITE_TOOL,
+                    SANDBOX_PREVIEW_TOOL,
                     SANDBOX_CREATE_TOOL
                 ]
             );

@@ -28,6 +28,7 @@ const SANDBOX_SCOPED_TOOL_NAMES = [
   'sandbox_exec',
   'sandbox_read_file',
   'sandbox_write_file',
+  'sandbox_preview',
 ]
 
 /**

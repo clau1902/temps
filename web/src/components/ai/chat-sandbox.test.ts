@@ -81,6 +81,7 @@ describe('isSandboxScopedTool', () => {
     expect(isSandboxScopedTool('sandbox_exec')).toBe(true)
     expect(isSandboxScopedTool('temps__sandbox_read_file')).toBe(true)
     expect(isSandboxScopedTool('sandbox_write_file')).toBe(true)
+    expect(isSandboxScopedTool('sandbox_preview')).toBe(true)
   })
 
   test('does not match other tools', () => {
