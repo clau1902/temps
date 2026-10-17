@@ -22,7 +22,12 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { getProjectOptions } from '@/api/client/@tanstack/react-query.gen'
+import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
+import { useQuery } from '@tanstack/react-query'
+import { ConversationSandboxChip } from './ConversationSandboxChip'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -136,13 +141,47 @@ function metaFor(contextType: string) {
  * overlaid in the corner. Shared by the conversation list and the open-chat
  * header so a chat looks the same in both places.
  */
+/**
+ * The project's logo as the project list shows it: the latest deployment's
+ * screenshot or favicon, then the service template's image, then the initial.
+ */
+function ProjectLogo({
+  projectId,
+  name,
+  className,
+}: {
+  projectId: number
+  name: string
+  className?: string
+}) {
+  const project = useQuery({
+    ...getProjectOptions({ path: { id: projectId } }),
+    retry: false,
+    staleTime: 60_000,
+  })
+  const hosted = project.data != null && project.data.source_type !== 'external'
+  const media = useLatestDeploymentMedia(hosted ? [projectId] : [])
+  const deployed = media.data?.projects?.[String(projectId)]
+  return (
+    <ProjectCardMedia
+      name={project.data?.name ?? name}
+      className={className}
+      deploymentUrl={deployed?.url}
+      screenshotLocation={deployed?.screenshot_location}
+      templateImageUrl={project.data?.service_template_image_url}
+    />
+  )
+}
+
 function ContextAvatar({
+  projectId,
   projectName,
   contextType,
   seed,
   className,
   badgeClassName,
 }: {
+  projectId?: number | null
   projectName?: string
   contextType: string
   /** Chat id. A projectless chat has no project to identify it, so it gets a
@@ -168,11 +207,19 @@ function ContextAvatar({
   }
   return (
     <div className="relative shrink-0">
-      <ProjectAvatar
-        name={projectName ?? label}
-        className={cn('size-8 rounded-md', className)}
-        fallbackClassName="rounded-md bg-primary/10 text-xs text-primary"
-      />
+      {projectId != null && projectName ? (
+        <ProjectLogo
+          projectId={projectId}
+          name={projectName}
+          className={cn('size-8', className)}
+        />
+      ) : (
+        <ProjectAvatar
+          name={projectName ?? label}
+          className={cn('size-8 rounded-md', className)}
+          fallbackClassName="rounded-md bg-primary/10 text-xs text-primary"
+        />
+      )}
       <span
         className={cn(
           'absolute -bottom-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border border-background bg-muted text-muted-foreground',
@@ -863,6 +910,7 @@ export function DockBody({
             )}
             {inProjectChat && active && (
               <ContextAvatar
+                projectId={active.projectId}
                 projectName={active.projectName}
                 contextType={active.contextType}
                 className="size-7 max-md:hidden"
@@ -1417,6 +1465,7 @@ function ConversationList({
               className="flex min-w-0 flex-1 items-center gap-3 px-2 py-2.5 text-left"
             >
               <ContextAvatar
+                projectId={c.project_id}
                 projectName={c.project_name ?? undefined}
                 contextType={c.context_type}
                 seed={c.public_id}
@@ -1425,26 +1474,27 @@ function ConversationList({
                 <div className="truncate text-sm font-medium">
                   {c.title ?? `${label} ${c.context_id}`}
                 </div>
-                {/* One identifier + time. Showing the context label *and* the
-                    project name *and* the timestamp left no room in a 320px
-                    rail: the name collapsed to zero width, leaving a stray
-                    "· ·" gap. The avatar badge already encodes the context
-                    type, so the project name replaces the label when present. */}
+                {/* The project (name; its logo is the avatar), the sandbox the
+                    chat is linked to, and the time. A context label such as
+                    "Assistant" said nothing the avatar did not. */}
                 <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+                  {c.project_name && (
+                    <span className="min-w-0 flex-1 truncate">
+                      {c.project_name}
+                    </span>
+                  )}
+                  {c.sandbox && (
+                    <ConversationSandboxChip
+                      name={c.sandbox.name}
+                      backend={c.sandbox.backend}
+                    />
+                  )}
                   <span
                     className={cn(
-                      'shrink-0 rounded px-1.5 py-px text-[10px] font-medium',
-                      c.project_name
-                        ? 'bg-muted text-muted-foreground'
-                        : chatTint(c.public_id).label
+                      'min-w-0 truncate',
+                      c.project_name ? 'shrink' : 'flex-1'
                     )}
                   >
-                    {label}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate">
-                    {c.project_name ?? ''}
-                  </span>
-                  <span className="min-w-0 shrink truncate">
                     <TimeAgo date={c.last_activity_at} />
                   </span>
                 </div>

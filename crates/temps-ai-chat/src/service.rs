@@ -1571,6 +1571,18 @@ pub struct ConversationWithProject {
     pub conversation: ai_conversations::Model,
     pub project_name: Option<String>,
     pub project_slug: Option<String>,
+    /// The caller's live sandbox linked to the chat, if any.
+    pub sandbox: Option<LinkedSandboxInfo>,
+}
+
+/// A linked sandbox as the conversation list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedSandboxInfo {
+    pub sandbox_id: String,
+    pub name: String,
+    /// Isolation backend (`docker`, `firecracker`, `microsandbox`); `None` on
+    /// sandboxes created before the backend was recorded.
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, sea_orm::FromQueryResult)]
@@ -3127,10 +3139,13 @@ impl ConversationService {
             .into_iter()
             .map(|p| (p.id, (p.name, p.slug)))
             .collect();
+        let mut sandboxes = self.linked_sandboxes(user_id, &convs).await?;
 
         Ok(convs
             .into_iter()
             .map(|c| {
+                let sandbox = crate::sandbox_link::link_from_metadata(c.metadata.as_ref())
+                    .and_then(|link| sandboxes.remove(&link.sandbox_id));
                 let info = c
                     .project_id
                     .and_then(|project_id| by_id.get(&project_id).cloned());
@@ -3145,8 +3160,48 @@ impl ConversationService {
                 ConversationWithProject {
                     project_name,
                     project_slug,
+                    sandbox,
                     conversation: c,
                 }
+            })
+            .collect())
+    }
+
+    /// The live sandboxes linked to a page of conversations, in one query.
+    /// Only sandboxes the caller owns are returned, so a stale or forged link
+    /// in a chat's metadata never names someone else's sandbox.
+    async fn linked_sandboxes(
+        &self,
+        user_id: i32,
+        conversations: &[ai_conversations::Model],
+    ) -> Result<HashMap<String, LinkedSandboxInfo>, ChatError> {
+        let mut ids: Vec<String> = conversations
+            .iter()
+            .filter_map(|c| crate::sandbox_link::link_from_metadata(c.metadata.as_ref()))
+            .map(|link| link.sandbox_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = temps_entities::sandboxes::Entity::find()
+            .filter(temps_entities::sandboxes::Column::PublicId.is_in(ids))
+            .filter(temps_entities::sandboxes::Column::UserId.eq(user_id))
+            .filter(temps_entities::sandboxes::Column::Status.ne("destroyed"))
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.public_id.clone(),
+                    LinkedSandboxInfo {
+                        sandbox_id: row.public_id,
+                        name: row.name,
+                        backend: row.backend,
+                    },
+                )
             })
             .collect())
     }

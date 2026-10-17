@@ -5202,6 +5202,22 @@ export type ConversationResponse = {
 };
 
 /**
+ * The sandbox a chat is linked to, as the conversation list shows it.
+ */
+export type ConversationSandboxResponse = {
+    /**
+     * Isolation backend: `docker`, `firecracker` or `microsandbox`. Absent
+     * for sandboxes created before the backend was recorded.
+     */
+    backend?: string | null;
+    name: string;
+    /**
+     * Public id of the sandbox (`sbx_…`).
+     */
+    sandbox_id: string;
+};
+
+/**
  * A conversation summary grouping related AI invocations.
  */
 export type ConversationSummary = {
@@ -12082,6 +12098,7 @@ export type GlobalConversationResponse = {
     project_name?: string | null;
     project_slug?: string | null;
     public_id: string;
+    sandbox?: ConversationSandboxResponse | null;
     status: string;
     title?: string | null;
     /**

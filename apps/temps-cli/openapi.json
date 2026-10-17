@@ -10983,6 +10983,30 @@
         ],
         "type": "object"
       },
+      "ConversationSandboxResponse": {
+        "description": "The sandbox a chat is linked to, as the conversation list shows it.",
+        "properties": {
+          "backend": {
+            "description": "Isolation backend: `docker`, `firecracker` or `microsandbox`. Absent\nfor sandboxes created before the backend was recorded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "description": "Public id of the sandbox (`sbx_…`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandbox_id",
+          "name"
+        ],
+        "type": "object"
+      },
       "ConversationSummary": {
         "description": "A conversation summary grouping related AI invocations.",
         "properties": {
@@ -25792,6 +25816,17 @@
           },
           "public_id": {
             "type": "string"
+          },
+          "sandbox": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConversationSandboxResponse",
+                "description": "The sandbox linked to this chat, when it is still running."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "status": {
             "type": "string"

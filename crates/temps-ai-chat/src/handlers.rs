@@ -628,6 +628,21 @@ pub struct GlobalConversationResponse {
     pub failure: Option<ChatFailureResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextWindowUsageResponse>,
+    /// The sandbox linked to this chat, when it is still running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<ConversationSandboxResponse>,
+}
+
+/// The sandbox a chat is linked to, as the conversation list shows it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConversationSandboxResponse {
+    /// Public id of the sandbox (`sbx_…`).
+    pub sandbox_id: String,
+    pub name: String,
+    /// Isolation backend: `docker`, `firecracker` or `microsandbox`. Absent
+    /// for sandboxes created before the backend was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -5673,6 +5688,11 @@ pub async fn list_all_conversations(
             turn_status: item.conversation.turn_status,
             failure,
             context_usage,
+            sandbox: item.sandbox.map(|sandbox| ConversationSandboxResponse {
+                sandbox_id: sandbox.sandbox_id,
+                name: sandbox.name,
+                backend: sandbox.backend,
+            }),
         });
     }
     Ok(Json(conversations))
@@ -10189,6 +10209,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         CreateThreadArtifactRequest,
         ConversationResponse,
         GlobalConversationResponse,
+        ConversationSandboxResponse,
         MessageResponse,
         ChatAttachmentResponse,
         ChatAttachmentReference,
@@ -11252,10 +11273,17 @@ mod tests {
             turn_status: conversation.turn_status,
             failure: None,
             context_usage: None,
+            sandbox: Some(ConversationSandboxResponse {
+                sandbox_id: "sbx_abc".to_string(),
+                name: "scratch".to_string(),
+                backend: Some("firecracker".to_string()),
+            }),
         };
 
         let value = serde_json::to_value(response).expect("response serializes");
         assert_eq!(value["turn_status"], "failed");
+        assert_eq!(value["sandbox"]["backend"], "firecracker");
+        assert_eq!(value["sandbox"]["sandbox_id"], "sbx_abc");
     }
 
     #[test]
