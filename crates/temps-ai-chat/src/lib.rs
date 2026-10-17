@@ -25,6 +25,7 @@ pub mod pending_actions;
 pub mod plugin;
 pub mod provider;
 pub mod providers;
+pub mod sandbox_deploy;
 pub mod sandbox_link;
 pub mod sandbox_link_handlers;
 mod sensitive;

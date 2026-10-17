@@ -334,6 +334,9 @@ impl TempsPlugin for AiChatPlugin {
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let old = context.get_plugin_state::<AppState>("ai_chat")?;
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        if let Some(deployer) = context.get_service::<dyn temps_core::SourceDropDeployer>() {
+            old.service.bind_source_drop_deployer(deployer);
+        }
         let app_state = Arc::new(AppState {
             service: old.service.clone(),
             db: old.db.clone(),

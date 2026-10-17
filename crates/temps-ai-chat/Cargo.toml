@@ -52,6 +52,8 @@ rustix = { version = "1.1.4", features = ["fs"] }
 nix = { version = "0.31", features = ["dir", "fs"] }
 walkdir = { workspace = true }
 zip = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
 # Text layer of uploaded PDFs; the parse is isolated (blocking pool, timeout,
 # panic guard) because the input is untrusted.
 pdf-extract = "0.12"

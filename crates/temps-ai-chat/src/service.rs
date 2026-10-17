@@ -1708,6 +1708,10 @@ pub struct ConversationService {
     /// row gives a harness a stable opaque preview identity; without it a raw
     /// Docker label cannot safely be turned into a browser URL.
     application_sandboxes: Option<Arc<temps_sandbox::SandboxService>>,
+    /// Deploys an archive of a chat sandbox's files as a project's source.
+    /// Bound after construction, because the deployments plugin registers it
+    /// later than this service is built (see `bind_source_drop_deployer`).
+    source_drop_deployer: std::sync::OnceLock<Arc<dyn temps_core::SourceDropDeployer>>,
     /// Shared application topology/resource authority. Production wiring uses
     /// the same instance as HTTP handlers so admission checks and topology
     /// mutations participate in one in-process serialization boundary.
@@ -2120,6 +2124,7 @@ impl ConversationService {
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
+            source_drop_deployer: Default::default(),
             application_service: None,
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(Mutex::new(HashMap::new())),
@@ -2702,6 +2707,12 @@ impl ConversationService {
     ) -> Self {
         self.application_sandboxes = Some(sandboxes);
         self
+    }
+
+    /// Bind the deployer once the deployments plugin has registered it. The
+    /// first binding wins; later calls are ignored.
+    pub fn bind_source_drop_deployer(&self, deployer: Arc<dyn temps_core::SourceDropDeployer>) {
+        let _ = self.source_drop_deployer.set(deployer);
     }
 
     pub fn with_application_service(
@@ -4478,8 +4489,11 @@ impl ConversationService {
             return None;
         }
         self.application_sandboxes.as_ref().map(|sandboxes| {
-            let service =
+            let mut service =
                 crate::sandbox_link::SandboxLinkService::new(self.db.clone(), sandboxes.clone());
+            if let Some(deployer) = self.source_drop_deployer.get() {
+                service = service.with_source_drop(deployer.clone());
+            }
             match self.write_support.as_ref() {
                 Some(ws) => service.with_audit(ws.audit.clone()),
                 None => service,
@@ -4516,6 +4530,9 @@ impl ConversationService {
             self.sandbox_link_for(conv).is_some(),
             may_exec,
             may_create,
+            may_exec
+                && self.source_drop_deployer.get().is_some()
+                && auth.has_permission(&Permission::DeploymentsCreate),
         )
     }
 
@@ -7291,6 +7308,22 @@ async fn dispatch_conversation_tool(
             call.name,
             temps_auth::permissions::Permission::GitRepositoriesRead
         )
+    } else if call.name == crate::sandbox_link::SANDBOX_DEPLOY_TOOL {
+        match &state.sandbox {
+            Some(sandbox) => {
+                dispatch_sandbox_deploy_tool(
+                    sandbox,
+                    &call.arguments,
+                    project_id,
+                    conversation_id,
+                    auth,
+                    project_access_checker,
+                    interactions,
+                )
+                .await
+            }
+            None => "Sandboxes are not available in this chat.".to_string(),
+        }
     } else if crate::sandbox_link::is_sandbox_tool(&call.name) {
         match &state.sandbox {
             Some(sandbox) => {
@@ -7353,6 +7386,97 @@ async fn dispatch_conversation_tool(
 /// Returns a readable string result that goes back to the model as the tool
 /// result — always, even on internal errors (never panics).
 #[allow(clippy::too_many_arguments)]
+/// Deploy the chat sandbox's files as a project's source (no Git). The files
+/// are packed first so the approval card can say what will be uploaded; the
+/// deployment itself runs only after the user approves it (automatically in the
+/// modes that approve changes), under the approver's own permissions.
+async fn dispatch_sandbox_deploy_tool(
+    sandbox: &crate::sandbox_link::SandboxLinkService,
+    arguments: &str,
+    chat_project_id: Option<i32>,
+    conversation_id: i64,
+    auth: &AuthContext,
+    project_access_checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+    interactions: Option<&PlatformInteractionExecutor>,
+) -> String {
+    use crate::sandbox_deploy::{authorize_deploy, SANDBOX_DEPLOY_TOOL};
+    let Some(interactions) = interactions else {
+        return format!(
+            "`{SANDBOX_DEPLOY_TOOL}` cannot ask for approval in this turn. Nothing was deployed."
+        );
+    };
+    let prepared = match sandbox
+        .prepare_deploy(arguments, conversation_id, auth)
+        .await
+    {
+        Ok(prepared) => prepared,
+        Err(message) => return message,
+    };
+    let project_id = prepared.args.project_id;
+    if let Err(message) =
+        authorize_deploy(auth, project_id, chat_project_id, project_access_checker).await
+    {
+        return message;
+    }
+    let request = temps_ai::streaming::PermissionRequest {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        kind: PermissionKind::ToolApproval,
+        tool_name: SANDBOX_DEPLOY_TOOL.to_string(),
+        input: serde_json::json!({
+            "operation": "deploy_sandbox_source",
+            "method": "POST",
+            "summary": prepared.summary(),
+            "project_id": project_id,
+            "parameters": {
+                "environment_id": prepared.args.environment_id,
+                "directory": prepared.directory,
+                "files": prepared.packed.files,
+                "left_out": prepared.packed.left_out,
+            },
+            "required_permission": temps_auth::permissions::Permission::DeploymentsCreate.to_string(),
+        }),
+    };
+    let resolution = match interactions(request).await {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            return format!(
+                "Approval to deploy to project {project_id} ended before it was resolved: \
+                 {error}. Nothing was deployed."
+            )
+        }
+    };
+    match resolution.decision {
+        PermissionDecision::AllowTool => {
+            // The approver may be a different user than the one who asked.
+            if let Err(message) = authorize_deploy(
+                &resolution.auth,
+                project_id,
+                chat_project_id,
+                project_access_checker,
+            )
+            .await
+            {
+                return message;
+            }
+            sandbox
+                .deploy_prepared(prepared, &resolution.auth, conversation_id, chat_project_id)
+                .await
+        }
+        PermissionDecision::DenyTool { reason } => format!(
+            "The user declined to deploy to project {project_id}{}. Nothing was deployed; \
+             acknowledge that and ask what they would like instead.",
+            reason
+                .as_deref()
+                .map(|reason| format!(": {}", redact_text(reason)))
+                .unwrap_or_default()
+        ),
+        _ => format!(
+            "The approval for deploying to project {project_id} was not granted. Nothing was \
+             deployed."
+        ),
+    }
+}
+
 async fn dispatch_write_tool(
     arguments: &str,
     project_id: Option<i32>,
@@ -10078,6 +10202,7 @@ mod tests {
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
+            source_drop_deployer: Default::default(),
             application_service: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -10516,6 +10641,7 @@ mod tests {
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
+            source_drop_deployer: Default::default(),
             application_service: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -11139,6 +11265,7 @@ mod tests {
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
+            source_drop_deployer: Default::default(),
             application_service: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -11157,6 +11284,7 @@ mod tests {
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
+            source_drop_deployer: Default::default(),
             application_service: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -11785,6 +11913,7 @@ mod tests {
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
+            source_drop_deployer: Default::default(),
             application_service: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),

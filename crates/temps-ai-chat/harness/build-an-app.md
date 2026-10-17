@@ -21,7 +21,13 @@ Use this when the user wants an app, site or service built or changed.
 4. To show it running, follow the `show-a-running-app` playbook.
 5. If a sandbox tool fails, tell the user what failed and why. Do not move the
    work somewhere else because of it.
-6. To publish it, use Temps and nothing else: commit the code to a repository
-   through the repository operations, then create a Temps project from it with
-   the matching preset. Temps builds it, serves it and gives it a domain and
-   TLS. Do not suggest another hosting platform.
+6. To publish it, use Temps and nothing else, and do not go through Git: the
+   files are already in the sandbox. Create a Temps project with
+   `source_type` `uploaded_source` (`static_files` for a prebuilt static site)
+   and the matching preset, then call `temps_deploy_sandbox_source` with its
+   `project_id` and the directory that holds the app. Temps packs the files
+   itself, leaves out `node_modules`, `.git`, `.env` files and credentials,
+   asks the user to approve, then builds and serves the app with a domain and
+   TLS. Never zip or upload files by hand. Put only variable names, never
+   values, in `.env.example`. Commit to a repository only when the user asks
+   to keep the code in one. Do not suggest another hosting platform.

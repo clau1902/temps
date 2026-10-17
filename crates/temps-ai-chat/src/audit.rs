@@ -128,6 +128,23 @@ pub struct AiSandboxServicesDisconnectedAudit {
     pub sandbox_id: String,
 }
 
+/// The files of a chat's sandbox were deployed as a project's source, with no
+/// Git repository. Records who approved it and how much was uploaded, never
+/// file names or contents.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSandboxSourceDeployedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    /// The project the chat belongs to, when it is a project chat.
+    pub chat_project_id: Option<i32>,
+    pub conversation_id: String,
+    pub sandbox_id: String,
+    pub environment_id: i32,
+    pub deployment_id: i32,
+    pub files: usize,
+    pub source_bytes: u64,
+}
+
 macro_rules! impl_audit_operation {
     ($type:ty, $op:expr) => {
         impl AuditOperation for $type {
@@ -356,6 +373,7 @@ impl_audit_operation!(
     AiSandboxServicesDisconnectedAudit,
     "ai.sandbox.services_disconnected"
 );
+impl_audit_operation!(AiSandboxSourceDeployedAudit, "ai.sandbox.source_deployed");
 impl_audit_operation!(AiActionConfirmedAudit, "ai.pending_action.confirmed");
 impl_audit_operation!(AiActionRejectedAudit, "ai.pending_action.rejected");
 impl_audit_operation!(

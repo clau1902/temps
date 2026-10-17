@@ -68,6 +68,7 @@ pub const SANDBOX_WRITE_TOOL: &str = "sandbox_write_file";
 pub const SANDBOX_PREVIEW_TOOL: &str = "sandbox_preview";
 pub const SANDBOX_OFFER_TOOL: &str = "temps_offer_sandbox";
 pub const SANDBOX_CREATE_TOOL: &str = "temps_create_sandbox";
+pub use crate::sandbox_deploy::SANDBOX_DEPLOY_TOOL;
 
 /// Most bytes of command output or file content handed back to the model.
 const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
@@ -413,7 +414,7 @@ fn cap_head(text: &str, max: usize) -> String {
 }
 
 /// Resolve a model-supplied path against the sandbox work dir.
-fn resolve_path(work_dir: &str, path: &str) -> String {
+pub(crate) fn resolve_path(work_dir: &str, path: &str) -> String {
     if path.starts_with('/') {
         path.to_string()
     } else {
@@ -502,6 +503,7 @@ pub fn is_sandbox_tool(name: &str) -> bool {
             | SANDBOX_PREVIEW_TOOL
             | SANDBOX_OFFER_TOOL
             | SANDBOX_CREATE_TOOL
+            | SANDBOX_DEPLOY_TOOL
     )
 }
 
@@ -520,6 +522,7 @@ pub fn tools_for(
     backend_available: bool,
     may_exec: bool,
     may_create: bool,
+    may_deploy: bool,
 ) -> Vec<ChatTool> {
     if !backend_available || !may_exec {
         return Vec::new();
@@ -593,6 +596,9 @@ pub fn tools_for(
                 }),
             },
         ];
+        if may_deploy {
+            tools.push(crate::sandbox_deploy::deploy_tool());
+        }
         if !linked {
             tools.push(create_tool());
         }
@@ -644,12 +650,23 @@ fn create_tool() -> ChatTool {
     }
 }
 
+/// A linked sandbox that is up and may be used for a tool call.
+pub(crate) struct ReadySandbox {
+    pub(crate) link: SandboxLink,
+    pub(crate) work_dir: String,
+    /// Set when the sandbox had to be woken; goes in front of the tool result.
+    pub(crate) notice: Option<String>,
+}
+
 /// Links a sandbox to a chat and runs the chat's scoped sandbox tools.
 #[derive(Clone)]
 pub struct SandboxLinkService {
     db: Arc<DatabaseConnection>,
-    sandboxes: Arc<SandboxService>,
-    audit: Option<Arc<dyn AuditLogger>>,
+    pub(crate) sandboxes: Arc<SandboxService>,
+    pub(crate) audit: Option<Arc<dyn AuditLogger>>,
+    /// Deploys an archive of the sandbox's files; absent on a server without
+    /// the deployments plugin.
+    pub(crate) source_drop: Option<Arc<dyn temps_core::SourceDropDeployer>>,
     /// Credentials resolved for recent commands, by sandbox and project set.
     /// Held in memory only.
     credentials: Arc<Mutex<HashMap<String, CachedCredentials>>>,
@@ -661,8 +678,15 @@ impl SandboxLinkService {
             db,
             sandboxes,
             audit: None,
+            source_drop: None,
             credentials: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Let the assistant deploy the sandbox's files as a project's source.
+    pub fn with_source_drop(mut self, deployer: Arc<dyn temps_core::SourceDropDeployer>) -> Self {
+        self.source_drop = Some(deployer);
+        self
     }
 
     /// Record sandboxes the assistant creates itself in the audit log.
@@ -1178,50 +1202,13 @@ impl SandboxLinkService {
                 Permission::SandboxesExec
             );
         }
-        let link = match self.current_link(conversation_id, user_id).await {
-            Ok(Some(link)) => link,
-            Ok(None) => {
-                return format!(
-                    "`{tool}` is not available: no sandbox is linked to this chat. Create one \
-                     with `{SANDBOX_CREATE_TOOL}` if you have it, otherwise offer one with \
-                     `{SANDBOX_OFFER_TOOL}`, when a shell step is really needed."
-                )
-            }
-            Err(error) => {
-                warn!(conversation_id, "could not read the sandbox link: {error}");
-                return format!(
-                    "`{tool}` failed: could not read this chat's sandbox link: {error}"
-                );
-            }
-        };
-        // Ownership and linkability are checked again on every call: the
-        // sandbox may have been destroyed or handed to a run since linking.
-        let row = match self
-            .sandboxes
-            .find_by_public_id(&link.sandbox_id, user_id)
-            .await
-        {
-            Ok(row) => row,
-            Err(_) => {
-                return format!(
-                    "The linked sandbox {} no longer exists. Ask the user to link another one.",
-                    link.sandbox_id
-                )
-            }
-        };
-        if let Some(reason) = linkability_problem(&row.name, row.agent_run_id, &row.status) {
-            return format!(
-                "The linked sandbox {} can no longer be used: {reason}.",
-                link.sandbox_id
-            );
-        }
-        let notice = if readiness(&row.status) == SandboxReadiness::Asleep {
-            match self.wake(conversation_id, &link, user_id).await {
-                Ok(notice) => Some(notice),
-                Err(message) => return message,
-            }
-        } else {
-            None
+        let ReadySandbox {
+            link,
+            work_dir,
+            notice,
+        } = match self.ready_sandbox(tool, conversation_id, user_id).await {
+            Ok(ready) => ready,
+            Err(message) => return message,
         };
         let result = match tool {
             SANDBOX_EXEC_TOOL => {
@@ -1231,7 +1218,7 @@ impl SandboxLinkService {
                             arguments,
                             conversation_id,
                             &link,
-                            &row.work_dir,
+                            &work_dir,
                             user_id,
                             &environment,
                         )
@@ -1241,11 +1228,11 @@ impl SandboxLinkService {
                 }
             }
             SANDBOX_READ_TOOL => {
-                self.run_read(arguments, conversation_id, &link, &row.work_dir, user_id)
+                self.run_read(arguments, conversation_id, &link, &work_dir, user_id)
                     .await
             }
             SANDBOX_WRITE_TOOL => {
-                self.run_write(arguments, conversation_id, &link, &row.work_dir, user_id)
+                self.run_write(arguments, conversation_id, &link, &work_dir, user_id)
                     .await
             }
             SANDBOX_PREVIEW_TOOL => {
@@ -1255,6 +1242,63 @@ impl SandboxLinkService {
             other => format!("Unknown sandbox tool `{other}`."),
         };
         with_notice(notice, result)
+    }
+
+    /// The chat's linked sandbox, checked and awake, or the complete tool
+    /// result that says why it is not. Ownership and linkability are checked
+    /// again on every call: the sandbox may have been destroyed or handed to a
+    /// run since linking.
+    pub(crate) async fn ready_sandbox(
+        &self,
+        tool: &str,
+        conversation_id: i64,
+        user_id: i32,
+    ) -> Result<ReadySandbox, String> {
+        let link = match self.current_link(conversation_id, user_id).await {
+            Ok(Some(link)) => link,
+            Ok(None) => {
+                return Err(format!(
+                    "`{tool}` is not available: no sandbox is linked to this chat. Create one \
+                     with `{SANDBOX_CREATE_TOOL}` if you have it, otherwise offer one with \
+                     `{SANDBOX_OFFER_TOOL}`, when a shell step is really needed."
+                ))
+            }
+            Err(error) => {
+                warn!(conversation_id, "could not read the sandbox link: {error}");
+                return Err(format!(
+                    "`{tool}` failed: could not read this chat's sandbox link: {error}"
+                ));
+            }
+        };
+        let row = match self
+            .sandboxes
+            .find_by_public_id(&link.sandbox_id, user_id)
+            .await
+        {
+            Ok(row) => row,
+            Err(_) => {
+                return Err(format!(
+                    "The linked sandbox {} no longer exists. Ask the user to link another one.",
+                    link.sandbox_id
+                ))
+            }
+        };
+        if let Some(reason) = linkability_problem(&row.name, row.agent_run_id, &row.status) {
+            return Err(format!(
+                "The linked sandbox {} can no longer be used: {reason}.",
+                link.sandbox_id
+            ));
+        }
+        let notice = if readiness(&row.status) == SandboxReadiness::Asleep {
+            Some(self.wake(conversation_id, &link, user_id).await?)
+        } else {
+            None
+        };
+        Ok(ReadySandbox {
+            link,
+            work_dir: row.work_dir,
+            notice,
+        })
     }
 
     /// Wake a sleeping linked sandbox. `Ok` is the notice that goes in front
@@ -1388,7 +1432,7 @@ impl SandboxLinkService {
 
     /// A sandbox tool failed. A sandbox that is gone is handled like one that
     /// cannot be woken; anything else is reported as it happened.
-    async fn tool_failure(
+    pub(crate) async fn tool_failure(
         &self,
         what: &str,
         error: SandboxError,
@@ -2140,7 +2184,7 @@ mod tests {
     fn a_linked_chat_gets_the_scoped_tools_and_no_offer() {
         for may_create in [false, true] {
             assert_eq!(
-                names(tools_for(true, false, true, true, may_create)),
+                names(tools_for(true, false, true, true, may_create, false)),
                 [
                     SANDBOX_EXEC_TOOL,
                     SANDBOX_READ_TOOL,
@@ -2152,12 +2196,27 @@ mod tests {
     }
 
     #[test]
+    fn deploying_the_sandbox_is_offered_only_to_a_caller_who_may_deploy() {
+        let with = names(tools_for(true, false, true, true, false, true));
+        assert!(with.contains(&SANDBOX_DEPLOY_TOOL.to_string()));
+        let without = names(tools_for(true, false, true, true, false, false));
+        assert!(!without.contains(&SANDBOX_DEPLOY_TOOL.to_string()));
+        // Usable in the same turn a sandbox is created.
+        let creating = names(tools_for(false, false, true, true, true, true));
+        assert!(creating.contains(&SANDBOX_DEPLOY_TOOL.to_string()));
+        // Never without a sandbox to read from, nor to a caller who cannot exec.
+        assert!(tools_for(true, false, true, false, false, true).is_empty());
+        assert!(!names(tools_for(false, false, true, true, false, true))
+            .contains(&SANDBOX_DEPLOY_TOOL.to_string()));
+    }
+
+    #[test]
     fn an_unlinked_chat_gets_only_the_offer_until_it_was_made() {
         assert_eq!(
-            names(tools_for(false, false, true, true, false)),
+            names(tools_for(false, false, true, true, false, false)),
             [SANDBOX_OFFER_TOOL]
         );
-        assert!(tools_for(false, true, true, true, false).is_empty());
+        assert!(tools_for(false, true, true, true, false, false).is_empty());
     }
 
     #[test]
@@ -2165,7 +2224,7 @@ mod tests {
         // Together, so the sandbox it creates is usable in the same turn.
         for offered in [false, true] {
             assert_eq!(
-                names(tools_for(false, offered, true, true, true)),
+                names(tools_for(false, offered, true, true, true, false)),
                 [
                     SANDBOX_EXEC_TOOL,
                     SANDBOX_READ_TOOL,
@@ -2181,10 +2240,10 @@ mod tests {
     #[test]
     fn no_backend_or_no_exec_permission_offers_nothing() {
         for may_create in [false, true] {
-            assert!(tools_for(true, false, false, true, may_create).is_empty());
-            assert!(tools_for(false, false, false, true, may_create).is_empty());
-            assert!(tools_for(true, false, true, false, may_create).is_empty());
-            assert!(tools_for(false, false, true, false, may_create).is_empty());
+            assert!(tools_for(true, false, false, true, may_create, false).is_empty());
+            assert!(tools_for(false, false, false, true, may_create, false).is_empty());
+            assert!(tools_for(true, false, true, false, may_create, false).is_empty());
+            assert!(tools_for(false, false, true, false, may_create, false).is_empty());
         }
     }
 

@@ -254,8 +254,8 @@ pub fn dispatch(arguments: &str) -> String {
 mod tests {
     use super::*;
     use crate::sandbox_link::{
-        SANDBOX_CREATE_TOOL, SANDBOX_EXEC_TOOL, SANDBOX_OFFER_TOOL, SANDBOX_PREVIEW_TOOL,
-        SANDBOX_READ_TOOL, SANDBOX_WRITE_TOOL,
+        SANDBOX_CREATE_TOOL, SANDBOX_DEPLOY_TOOL, SANDBOX_EXEC_TOOL, SANDBOX_OFFER_TOOL,
+        SANDBOX_PREVIEW_TOOL, SANDBOX_READ_TOOL, SANDBOX_WRITE_TOOL,
     };
 
     /// Tools a playbook may name. A playbook that mentions another one has
@@ -267,6 +267,7 @@ mod tests {
         SANDBOX_PREVIEW_TOOL,
         SANDBOX_CREATE_TOOL,
         SANDBOX_OFFER_TOOL,
+        SANDBOX_DEPLOY_TOOL,
         PLAYBOOK_TOOL,
         "temps_write",
         "temps",
