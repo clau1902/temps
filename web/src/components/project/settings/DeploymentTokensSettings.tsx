@@ -318,9 +318,7 @@ export function DeploymentTokensSettings({
                     <TableHead className="hidden md:table-cell">
                       Prefix
                     </TableHead>
-                    <TableHead className="hidden md:table-cell">
-                      Status
-                    </TableHead>
+                    <TableHead>Status</TableHead>
                     <TableHead className="hidden md:table-cell">
                       Last used
                     </TableHead>
@@ -336,7 +334,7 @@ export function DeploymentTokensSettings({
                       <TableCell className="hidden md:table-cell font-mono text-xs">
                         {token.token_prefix}…
                       </TableCell>
-                      <TableCell className="hidden md:table-cell">
+                      <TableCell>
                         <Badge
                           variant={token.is_active ? 'default' : 'secondary'}
                         >

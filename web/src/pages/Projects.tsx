@@ -28,6 +28,7 @@ import {
   AlertTriangle,
   ArrowRight,
   Boxes,
+  Download,
   ExternalLink,
   RefreshCw,
   X,
@@ -311,19 +312,57 @@ export function Projects() {
 
   const isLoading = groupsQuery.isLoading || servicesLoading || isPageOutOfRange
 
+  // Announcements and the onboarding checklist are secondary to the list.
+  // On a phone each one is a full card of its own, so stacked above the list
+  // they push every project off the first screen: below `md` they follow the
+  // list (and its pagination) instead. That reorder is CSS-only (`order` in
+  // the flex column below), so each card mounts exactly once and keeps its
+  // state (e.g. the selected onboarding step) across a rotate or resize.
+  const groupingHint = !grouped &&
+    groupsLoaded &&
+    renameNoticeDismissed &&
+    !normalizedProjectSearch &&
+    standaloneTotal >= 2 && (
+      <GroupingHint onCreate={() => setCreatingGroup(true)} />
+    )
+  const notices = serviceTotal > 0 && (
+    <div className="flex flex-col gap-4 sm:gap-6 max-md:order-last">
+      {!renameNoticeDismissed && (
+        <ServicesRenameNotice
+          onCreateProject={() => setCreatingGroup(true)}
+          onDismiss={dismissRenameNotice}
+        />
+      )}
+
+      <OnboardingNextStepCard />
+    </div>
+  )
+
   return (
-    <PageContainer innerClassName="space-y-6">
+    <PageContainer
+      className="max-sm:py-4"
+      innerClassName="flex flex-col gap-4 space-y-0 sm:gap-6"
+    >
       {/* Header */}
       <ProjectsHeader
         firstProject={!isLoading && !isError && isEmptyInstall}
         actions={
           <>
             {serviceTotal > 0 && <PlatformStrip />}
-            <Button variant="outline" onClick={() => setCreatingGroup(true)}>
+            <Button
+              variant="outline"
+              className="max-sm:flex-1"
+              onClick={() => setCreatingGroup(true)}
+            >
               <Boxes className="size-4" />
               New project
             </Button>
-            <CreateActionButton to="/projects/new" label="Create service" />
+            <CreateActionButton
+              to="/projects/new"
+              label="Create service"
+              className="max-sm:flex-1"
+            />
+            {serviceTotal > 0 && <PlatformMenuLink />}
           </>
         }
       />
@@ -335,14 +374,7 @@ export function Projects() {
       {/* Nothing here can be built or deployed until something can run it. */}
       <WorkerNodeRequiredBanner />
 
-      {serviceTotal > 0 && !renameNoticeDismissed && (
-        <ServicesRenameNotice
-          onCreateProject={() => setCreatingGroup(true)}
-          onDismiss={dismissRenameNotice}
-        />
-      )}
-
-      {serviceTotal > 0 && <OnboardingNextStepCard />}
+      {notices}
 
       {groupsQuery.isError && (
         <div
@@ -415,7 +447,7 @@ export function Projects() {
       {isLoading ? (
         <div
           role="status"
-          className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
+          className="grid gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-3"
           aria-label="Loading projects and services"
           aria-busy="true"
         >
@@ -447,14 +479,10 @@ export function Projects() {
         ) : null
       ) : (
         <>
-          {!grouped &&
-            groupsLoaded &&
-            renameNoticeDismissed &&
-            !normalizedProjectSearch &&
-            standaloneTotal >= 2 && (
-              <GroupingHint onCreate={() => setCreatingGroup(true)} />
-            )}
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {groupingHint && (
+            <div className="max-md:order-[9998]">{groupingHint}</div>
+          )}
+          <div className="grid gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-3">
             {listItems.map((item) =>
               item.kind === 'group' ? (
                 <ProjectGroupCard key={item.key} group={item.group} />
@@ -535,7 +563,7 @@ function ServicesRenameNotice({
   onDismiss: () => void
 }) {
   return (
-    <div className="flex flex-col gap-3 rounded-lg border px-4 py-3 sm:flex-row sm:items-center">
+    <div className="flex flex-col gap-3 rounded-lg border px-4 py-3 lg:flex-row lg:items-center">
       <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
         <Boxes className="size-4" />
       </div>
@@ -602,13 +630,8 @@ function ProjectsHeader({
  */
 function PlatformStrip() {
   return (
-    <div className="flex items-center gap-1 rounded-md border p-1">
-      {/* The label is the first thing to go when the header wraps on mobile —
-          the brand marks still carry the meaning, and every one of them has an
-          accessible name. */}
-      <span className="hidden px-1.5 text-xs text-muted-foreground sm:inline">
-        Migrate from
-      </span>
+    <div className="hidden items-center gap-1 rounded-md border p-1 sm:flex">
+      <span className="px-1.5 text-xs text-muted-foreground">Migrate from</span>
       {TOP_MIGRATION_SOURCES.map((p) => (
         <Link
           key={p.source}
@@ -633,12 +656,37 @@ function PlatformStrip() {
 }
 
 /**
+ * Phone form of {@link PlatformStrip}: five brand marks plus a label would
+ * take a row of the header on their own, so below `sm` the migration entry
+ * point is one icon button on the same row as the create actions. It opens the
+ * import wizard, which lists every platform.
+ */
+function PlatformMenuLink() {
+  return (
+    <Button
+      variant="outline"
+      size="icon"
+      className="sm:hidden"
+      asChild
+      title="Migrate from another platform"
+    >
+      <Link
+        to="/projects/import-wizard"
+        aria-label="Migrate from another platform"
+      >
+        <Download className="size-4" />
+      </Link>
+    </Button>
+  )
+}
+
+/**
  * Introduces grouping where the services are, before any project exists.
  * Shown only with two or more services, where grouping can do something.
  */
 function GroupingHint({ onCreate }: { onCreate: () => void }) {
   return (
-    <div className="flex flex-col gap-3 rounded-lg border px-4 py-3 sm:flex-row sm:items-center">
+    <div className="flex flex-col gap-3 rounded-lg border px-4 py-3 lg:flex-row lg:items-center">
       <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
         <Boxes className="size-4" />
       </div>

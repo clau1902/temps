@@ -123,7 +123,7 @@ export function Certificates() {
   )
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 px-4 sm:px-0">
       {/* Page header */}
       <div className="flex flex-col gap-1">
         <h1 className="text-2xl font-semibold tracking-tight">Certificates</h1>
