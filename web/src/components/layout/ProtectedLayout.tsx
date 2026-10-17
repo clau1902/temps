@@ -29,6 +29,7 @@ import {
 } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import type { LucideIcon } from 'lucide-react'
+import { AppLoadingScreen } from './AppLoadingScreen'
 
 type ErrorCategory = 'network' | 'timeout' | 'forbidden' | 'server'
 
@@ -210,14 +211,7 @@ export const ProtectedLayout = ({
   const loginElement = loginPage ?? <Login />
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-dvh">
-        <div className="text-center space-y-2">
-          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
-          <p className="text-sm text-muted-foreground">Loading...</p>
-        </div>
-      </div>
-    )
+    return <AppLoadingScreen />
   }
 
   if (error) {
