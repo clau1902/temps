@@ -43,6 +43,7 @@ const OP_CREATE_REPOSITORY: &str = "create_repository";
 const OP_LINK_SERVICE: &str = "link_service_to_project";
 
 /// Write operations whose executed result names a piece the chat made.
+#[cfg(test)]
 const CREATING_OPERATIONS: [&str; 3] = [OP_CREATE_PROJECT, OP_CREATE_SERVICE, OP_CREATE_REPOSITORY];
 
 /// Every operation read back: the creating ones plus [`OP_LINK_SERVICE`].

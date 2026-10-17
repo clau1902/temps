@@ -19,6 +19,10 @@ use sha2::{Digest, Sha256};
 
 use crate::externalsvc::postgres::PostgresService;
 use crate::externalsvc::scoped_resource_name;
+use crate::sandbox_engines::{SandboxAccessEngine, SandboxAccessRequest};
+use crate::services::{ExternalServiceError, ExternalServiceManager};
+use temps_entities::external_services;
+use tracing::info;
 
 /// The environment slot a sandbox occupies in a project's database naming.
 const SANDBOX_SCOPE: &str = "sandbox";
@@ -333,41 +337,213 @@ pub fn postgres_environment(
     if hosts.is_empty() {
         return env;
     }
-    let authority = hosts
-        .iter()
-        .map(|(host, port)| {
-            format!(
-                "{}:{port}",
-                crate::externalsvc::postgres_cluster::uri_host(host)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    // Several hosts only for a cluster, where the driver must find the
-    // writable one after a failover.
-    let attributes = if hosts.len() > 1 {
-        "?target_session_attrs=read-write"
-    } else {
-        ""
-    };
+    // One endpoint everywhere: the URL names the writable member, like
+    // `POSTGRES_HOST`/`POSTGRES_PORT`. A multi-host URL is understood by libpq
+    // alone; the common Node and Python drivers reject it. The variables are
+    // resolved again for every command, so a failover shows up in the next one.
+    let authority = format!(
+        "{}:{}",
+        crate::externalsvc::postgres_cluster::uri_host(&hosts[0].0),
+        hosts[0].1
+    );
     env.insert(
         "POSTGRES_URL".to_string(),
         format!(
-            "postgresql://{}:{}@{authority}/{database}{attributes}",
+            "postgresql://{}:{}@{authority}/{database}",
             urlencoding::encode(user),
             urlencoding::encode(password),
         ),
     );
-    env.insert(
-        "POSTGRES_HOST".to_string(),
-        hosts
-            .iter()
-            .map(|(host, _)| host.as_str())
-            .collect::<Vec<_>>()
-            .join(","),
-    );
+    // One endpoint, as a single `host` and `port` pair: a tool that reads
+    // these variables dials exactly this and nothing else. A cluster's
+    // members listen on different ports, so joining the hosts under one port
+    // would send some of them to a port nothing listens on. The caller puts
+    // the writable member first.
+    env.insert("POSTGRES_HOST".to_string(), hosts[0].0.clone());
     env.insert("POSTGRES_PORT".to_string(), hosts[0].1.to_string());
     env
+}
+
+/// PostgreSQL's sandbox access: a database and a role of the sandbox's own on
+/// a standalone service or on a cluster's primary.
+///
+/// Provisions on every call (the statements are idempotent), so a role whose
+/// administrator password changed, or a database dropped by hand, is repaired
+/// rather than handed out broken. The hosts are the database containers by
+/// name: the sandbox resolves them on its data network.
+pub struct PostgresSandboxAccess;
+
+#[async_trait::async_trait]
+impl SandboxAccessEngine for PostgresSandboxAccess {
+    fn service_types(&self) -> &'static [&'static str] {
+        &["postgres"]
+    }
+
+    async fn containers(
+        &self,
+        manager: &ExternalServiceManager,
+        service: &external_services::Model,
+    ) -> Result<Vec<String>, ExternalServiceError> {
+        if service.node_id.is_some() {
+            return Ok(Vec::new());
+        }
+        // Every local member, whatever its status now: one that is down when
+        // the sandbox connects is the primary after the next failover.
+        if service.topology == "cluster" {
+            let members = manager.get_service_members(service.id).await?;
+            return Ok(members
+                .into_iter()
+                .filter(|member| {
+                    member.node_id.is_none() && !crate::services::is_role_monitor(&member.role)
+                })
+                .map(|member| member.container_name)
+                .collect());
+        }
+        Ok(vec![service.container_name.clone().unwrap_or_else(|| {
+            crate::externalsvc::postgres::postgres_container_name(&service.name)
+        })])
+    }
+
+    async fn issue(
+        &self,
+        manager: &ExternalServiceManager,
+        request: SandboxAccessRequest<'_>,
+    ) -> Result<HashMap<String, String>, ExternalServiceError> {
+        let SandboxAccessRequest {
+            service,
+            project,
+            parameters,
+        } = request;
+        let service_id = service.id;
+        let param = |key: &str, default: &str| {
+            parameters
+                .get(key)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or(default)
+                .to_string()
+        };
+        let admin_user = param("username", "postgres");
+        let admin_password = param("password", "");
+        let plan =
+            SandboxDatabasePlan::new(service_id, &project.slug, &admin_user, &admin_password)
+                .map_err(|error| ExternalServiceError::SandboxAccessUnsupported {
+                    service_id,
+                    service_type: service.service_type.clone(),
+                    reason: error.to_string(),
+                })?;
+
+        let hosts = if service.topology == "cluster" {
+            let members = manager.get_service_members(service_id).await?;
+            let mut hosts: Vec<(String, u16)> = members
+                .iter()
+                .filter(|member| {
+                    !crate::services::is_role_monitor(&member.role)
+                        && member.status == "running"
+                        && member.node_id.is_none()
+                })
+                // A cluster member listens on its own stored port inside the
+                // container as well as on the host (the container publishes
+                // `port` to `port`), unlike a standalone service's 5432.
+                .map(|member| {
+                    let port = member
+                        .port
+                        .and_then(|port| u16::try_from(port).ok())
+                        .unwrap_or(5432);
+                    (member.container_name.clone(), port)
+                })
+                .collect();
+            if hosts.is_empty() {
+                return Err(ExternalServiceError::SandboxAccessUnsupported {
+                    service_id,
+                    service_type: service.service_type.clone(),
+                    reason: "no running data member of this cluster is on the control plane's \
+                             Docker network, which is the only place a sandbox can reach"
+                        .to_string(),
+                });
+            }
+            let (client, primary) = manager.connect_cluster_primary_client(service_id).await?;
+            crate::sandbox_access::apply(&client, &plan)
+                .await
+                .map_err(|error| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to provision the sandbox database on cluster {service_id}: {error}"
+                    ),
+                })?;
+            // The writable member first: `POSTGRES_HOST`/`POSTGRES_PORT` name
+            // one endpoint, and it should be the one that accepts writes now.
+            hosts.sort_by_key(|(container, _)| *container != primary);
+            hosts
+        } else {
+            if let crate::services::ServiceExecutionRoute::Remote(node_id) =
+                crate::services::service_execution_route(service.node_id)
+            {
+                return Err(ExternalServiceError::SandboxAccessUnsupported {
+                    service_id,
+                    service_type: service.service_type.clone(),
+                    reason: format!(
+                        "the service runs on node {node_id}, and a sandbox can only reach \
+                         services on the control plane"
+                    ),
+                });
+            }
+            let host = param("host", "localhost");
+            let port = parameters
+                .get("port")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| value.as_u64().map(|number| number.to_string()))
+                })
+                .unwrap_or_else(|| "5432".to_string());
+            let port_number: u16 =
+                port.parse()
+                    .map_err(|_| ExternalServiceError::ParameterValidationFailed {
+                        service_id,
+                        reason: format!("The service's port '{port}' is not a port number"),
+                    })?;
+            let (client, connection) = tokio_postgres::Config::new()
+                .host(&host)
+                .port(port_number)
+                .user(&admin_user)
+                .password(&admin_password)
+                .dbname("postgres")
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .connect(tokio_postgres::NoTls)
+                .await
+                .map_err(|error| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to connect to PostgreSQL service {} at {}:{} to provision the \
+                         sandbox database '{}': {}",
+                        service_id, host, port, plan.database, error
+                    ),
+                })?;
+            let driver = tokio::spawn(connection);
+            let applied = crate::sandbox_access::apply(&client, &plan).await;
+            drop(client);
+            driver.abort();
+            applied.map_err(|error| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to provision the sandbox database on service {service_id}: {error}"
+                ),
+            })?;
+            let container = service
+                .container_name
+                .clone()
+                .unwrap_or_else(|| format!("postgres-{}", service.name));
+            vec![(container, 5432)]
+        };
+
+        info!(
+            service_id,
+            project_id = project.id,
+            database = %plan.database,
+            role = %plan.role,
+            "Provisioned a sandbox database and scoped role"
+        );
+        Ok(plan.environment(&hosts))
+    }
 }
 
 #[cfg(test)]
@@ -516,14 +692,32 @@ mod tests {
     }
 
     #[test]
-    fn a_cluster_lists_every_member_and_asks_for_the_writable_one() {
+    fn a_cluster_url_names_only_the_writable_member() {
         let env = plan().environment(&[
-            ("postgres-main-1".to_string(), 5432),
-            ("postgres-main-2".to_string(), 5432),
+            ("postgres-main-2".to_string(), 6012),
+            ("postgres-main-1".to_string(), 6011),
         ]);
-        assert!(env["POSTGRES_URL"].contains("@postgres-main-1:5432,postgres-main-2:5432/"));
-        assert!(env["POSTGRES_URL"].ends_with("?target_session_attrs=read-write"));
-        assert_eq!(env["POSTGRES_HOST"], "postgres-main-1,postgres-main-2");
+        let url = &env["POSTGRES_URL"];
+        // One host: the common Node and Python drivers reject a host list.
+        assert!(
+            url.ends_with("@postgres-main-2:6012/shop_api_sandbox"),
+            "{url}"
+        );
+        assert!(!url.contains(','), "{url}");
+        assert!(!url.contains("target_session_attrs"), "{url}");
+    }
+
+    #[test]
+    fn host_and_port_name_one_endpoint_even_for_a_cluster() {
+        let env = plan().environment(&[
+            ("postgres-main-2".to_string(), 6012),
+            ("postgres-main-1".to_string(), 6011),
+        ]);
+        // The pair must be dialable as given: the first member's host with
+        // its own port, never a list of hosts under one port.
+        assert_eq!(env["POSTGRES_HOST"], "postgres-main-2");
+        assert_eq!(env["POSTGRES_PORT"], "6012");
+        assert!(!env["POSTGRES_HOST"].contains(','));
     }
 
     #[test]

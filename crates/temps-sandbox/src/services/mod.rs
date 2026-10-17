@@ -27,6 +27,5 @@ pub use sandbox_service::{
     is_managed_application_workspace_image, managed_application_workspace_image,
     ApplicationWorkspaceConfig, ApplicationWorkspaceSandbox, ApplicationWorkspaceUsage,
     CreateSandboxRequest, SandboxService, SandboxSource, SandboxSummary, ScopedRuntime,
-    SANDBOX_SCOPED_SERVICE_TYPES,
 };
 pub use snapshot_service::{SnapshotService, StorageSummary};

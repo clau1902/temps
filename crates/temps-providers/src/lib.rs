@@ -18,6 +18,8 @@ pub mod query_service;
 pub mod readiness;
 pub mod remote_service_client;
 pub mod sandbox_access;
+pub mod sandbox_engines;
+pub mod sandbox_s3;
 pub mod service_dns;
 pub mod services;
 pub use services::*;

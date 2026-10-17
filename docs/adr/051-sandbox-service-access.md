@@ -74,16 +74,42 @@ database and nothing else:
   the administrator password does. Provisioning is idempotent and re-syncs the
   role's password on every call.
 
-PostgreSQL ships first. Other service types report "not supported yet" for
-sandbox access rather than hand over their shared credentials (Redis: an ACL user
-limited to a key prefix; MongoDB: a user on one database; S3: a key restricted
-to the one bucket — each its own change).
+### 2b. One engine per service type
+
+The sandbox layer knows nothing about any one engine. A service type that can
+hand out a credential limited to a namespace of its own implements
+`SandboxAccessEngine` (`temps-providers/src/sandbox_engines.rs`) and is listed
+in `ENGINES`; supporting another type is that one implementation and one line.
+An engine answers two questions: which containers the sandbox must dial
+(`containers`), and the variables to run with (`issue`). Everything shared
+stays outside it: the link check, the data network, merging and redacting the
+variables, the audit trail.
+
+A type with no engine, a backend an engine does not cover, or a service on
+another node, is left out: it is neither reachable nor given the deployment's
+credentials. The variables an engine returns name one endpoint consistently
+(a `host` and `port` pair that can be dialled as given, and a `POSTGRES_URL`
+naming the same single writable member, because the common Node and Python
+drivers reject a multi-host URL). Variables are resolved again for every
+command, so a failover shows up in the next one.
+
+| Type | Namespace | Credential |
+|---|---|---|
+| PostgreSQL | database `<project>_sandbox` | role limited to it, derived password |
+| S3 / RustFS | bucket `<project>-sandbox` | temporary key from the service's STS `AssumeRole`, restricted by a session policy to that one bucket, valid for 12 hours and issued fresh for every command |
+
+The S3 key is never stored and expires by itself, so a leaked value stops
+working; the service's root key stays on the control plane, which also creates
+the bucket (the temporary key may use it, never create it). Redis (an ACL user
+limited to a key prefix), MongoDB (a user on one database) and MariaDB (a user
+granted one database) are each their own engine.
 
 ### 3. The network path is the existing data network
 
-No new container. A connected sandbox is attached to its per-sandbox internal
-data network (`synchronize_data_network`), which holds only the database
-containers of the services the user connected. The scoped credentials name
+No new container, and no forwarder: a forwarder would be one more process to
+secure and keep alive, while the network already isolates. A connected sandbox
+is attached to its per-sandbox internal data network, which holds only the
+containers each engine names for the services the user connected. The scoped credentials name
 those containers as hosts, on the container port, so the same names work
 inside the sandbox. A chat's connection set is a list of project ids; the
 network is rebuilt from it, so disconnecting also tears down open sockets
@@ -124,12 +150,19 @@ connect (an offer card, like the sandbox offer); it cannot connect on its own.
 3. **Surface:** the option at sandbox creation, the control on "Made here"
    service rows, the offer card, and a `connect-a-service` playbook that covers
    both environments.
-4. **Other service types**, and an opt-in move of production to scoped roles.
+4. **Other service types** (S3 done; each further type is one engine), and an
+   opt-in move of production to scoped roles.
+5. **Deploy from the sandbox:** `temps_deploy_sandbox_source` packs the
+   sandbox's files (without `node_modules`, `.git` or secrets) and deploys them
+   as an uploaded source, after the user approves, so a project needs no Git
+   repository to ship what the chat built.
 
 ## Consequences
 
-- Production behaviour does not change in phases 1 to 4, so nothing that runs
-  today is migrated.
+- Production behaviour does not change in phases 1 to 4, with one exception:
+  `runtime_environment` for an application-workspace sandbox now prefers the
+  scoped PostgreSQL credentials over the deployment's. Nothing that runs today
+  is migrated.
 - A sandbox database is real PostgreSQL on the user's cluster: it uses disk and
   connections, and survives the sandbox. It is named for the project, so a new
   chat on the same project continues with the same data.

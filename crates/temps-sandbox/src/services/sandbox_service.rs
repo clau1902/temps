@@ -3235,9 +3235,7 @@ impl SandboxService {
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
         let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
         let _workspace_mutation = self.lock_application_workspace(key).await;
-        let containers = self
-            .data_service_containers_of_types(project_ids, Some(SANDBOX_SCOPED_SERVICE_TYPES))
-            .await?;
+        let containers = self.scoped_service_containers(&row, project_ids).await?;
         let network_name = sandbox_data_network_name(&row.public_id)?;
         self.registry
             .configure_application_network(row.id, &row.public_id, &network_name, &containers)
@@ -3319,20 +3317,51 @@ impl SandboxService {
         Ok(runtime)
     }
 
+    /// The containers of the project services that can give a sandbox
+    /// credentials of its own, as each service's engine names them. A service
+    /// no engine covers contributes none, so it stays off the sandbox's network.
+    async fn scoped_service_containers(
+        &self,
+        row: &sandboxes::Model,
+        project_ids: &[i32],
+    ) -> Result<Vec<String>, SandboxError> {
+        if project_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let provider =
+            self.runtime_credentials
+                .as_ref()
+                .ok_or_else(|| SandboxError::Unavailable {
+                    reason: "runtime credential provider is not registered".to_string(),
+                })?;
+        let service_ids = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.is_in(project_ids.iter().copied()))
+            .order_by_asc(project_services::Column::ServiceId)
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|link| link.service_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut containers = Vec::new();
+        for service_id in service_ids {
+            let named = provider
+                .sandbox_access_containers(service_id)
+                .await
+                .map_err(|error| SandboxError::RuntimeCredentialsFailed {
+                    sandbox_id: row.public_id.clone(),
+                    service_id,
+                    reason: error.to_string(),
+                })?;
+            containers.extend(named);
+        }
+        containers.sort();
+        containers.dedup();
+        Ok(containers)
+    }
+
     async fn application_data_service_containers(
         &self,
         project_ids: &[i32],
-    ) -> Result<Vec<String>, SandboxError> {
-        self.data_service_containers_of_types(project_ids, None)
-            .await
-    }
-
-    /// Like [`Self::application_data_service_containers`], optionally limited
-    /// to services of the given types.
-    async fn data_service_containers_of_types(
-        &self,
-        project_ids: &[i32],
-        only_types: Option<&[&str]>,
     ) -> Result<Vec<String>, SandboxError> {
         let links = project_services::Entity::find()
             .filter(project_services::Column::ProjectId.is_in(project_ids.iter().copied()))
@@ -3350,12 +3379,6 @@ impl SandboxService {
                 .all(self.db.as_ref())
                 .await?
         };
-        let services = services
-            .into_iter()
-            .filter(|service| {
-                only_types.is_none_or(|types| types.contains(&service.service_type.as_str()))
-            })
-            .collect::<Vec<_>>();
         let service_ids = services
             .iter()
             .map(|service| service.id)
@@ -5116,9 +5139,6 @@ TEMPS_ASKPASS_EOF\n\
     }
 }
 
-/// Service types that can give a sandbox credentials of its own (ADR-051).
-pub const SANDBOX_SCOPED_SERVICE_TYPES: &[&str] = &["postgres"];
-
 /// What a sandbox was connected to, and the variables to run code with.
 #[derive(Default)]
 pub struct ScopedRuntime {
@@ -5622,11 +5642,6 @@ pub(crate) mod tests {
         assert!(shown.contains("POSTGRES_PASSWORD"));
         assert!(!shown.contains("s3cr3t-value"), "{shown}");
         assert!(shown.contains("skipped_service_ids"));
-    }
-
-    #[test]
-    fn only_postgres_has_sandbox_scoped_credentials_so_far() {
-        assert_eq!(SANDBOX_SCOPED_SERVICE_TYPES, &["postgres"]);
     }
 
     #[test]

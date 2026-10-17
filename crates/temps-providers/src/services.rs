@@ -601,7 +601,7 @@ fn cluster_member_port(base: u16, ordinal: i32) -> Option<u16> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServiceExecutionRoute {
+pub(crate) enum ServiceExecutionRoute {
     Local,
     Remote(i32),
 }
@@ -609,7 +609,7 @@ enum ServiceExecutionRoute {
 /// `external_services.node_id` is the ownership boundary: NULL means the
 /// control plane's Docker daemon, while a concrete ID means that worker's
 /// private daemon and network namespace.
-fn service_execution_route(node_id: Option<i32>) -> ServiceExecutionRoute {
+pub(crate) fn service_execution_route(node_id: Option<i32>) -> ServiceExecutionRoute {
     match node_id {
         Some(node_id) => ServiceExecutionRoute::Remote(node_id),
         None => ServiceExecutionRoute::Local,
@@ -707,7 +707,15 @@ pub enum ExternalServiceError {
     #[error("Service {service_id} is not linked to project {project_id}")]
     ServiceNotLinkedToProject { service_id: i32, project_id: i32 },
 
-    #[error("Service {service_id} ({service_type}) cannot give a sandbox its own credentials yet: {reason}")]
+    #[error("Service {service_id} ({service_type}) has no sandbox access engine: this type cannot give a sandbox credentials of its own yet")]
+    NoSandboxAccessEngine {
+        service_id: i32,
+        service_type: String,
+    },
+
+    #[error(
+        "Service {service_id} ({service_type}) cannot give a sandbox its own credentials: {reason}"
+    )]
     SandboxAccessUnsupported {
         service_id: i32,
         service_type: String,
@@ -1719,7 +1727,7 @@ pub(crate) fn classify_cluster_states(
     (HealthProbeStatus::Degraded, Some(message))
 }
 
-fn is_role_monitor(s: &str) -> bool {
+pub(crate) fn is_role_monitor(s: &str) -> bool {
     role_from_str(s) == Some(crate::ClusterRole::Monitor)
 }
 
@@ -7336,7 +7344,7 @@ echo "[restore] Pre-seed complete"
         Ok(Some(env_vars))
     }
 
-    async fn get_service_parameters(
+    pub(crate) async fn get_service_parameters(
         &self,
         service_id_val: i32,
     ) -> Result<HashMap<String, serde_json::Value>, ExternalServiceError> {
@@ -12667,30 +12675,30 @@ echo "[restore] Pre-seed complete"
             })
     }
 
-    /// Credentials for a sandbox to use a PostgreSQL service linked to
-    /// `project_id`: its own database and a role that can use only that
-    /// database (ADR-051). The deployment credentials are never returned.
+    /// Credentials for a sandbox to use `service_id_val`, a service linked to
+    /// `project_id`: a namespace of its own on the service and a credential
+    /// that reaches only that namespace (ADR-051). The deployment credentials
+    /// are never returned.
     ///
-    /// Provisions on every call (the statements are idempotent), so a role
-    /// whose administrator password changed, or a database dropped by hand,
-    /// is repaired rather than handed out broken. The hosts are the database
-    /// containers by name: the sandbox resolves them on its data network.
+    /// The engine for the service's type does the provisioning (see
+    /// [`crate::sandbox_engines`]); this method owns the checks every engine
+    /// shares. A type with no engine fails with
+    /// [`ExternalServiceError::NoSandboxAccessEngine`], which callers read as
+    /// "leave this service out", never as a reason to hand out the
+    /// deployment's credentials.
     pub async fn issue_sandbox_runtime_env(
         &self,
         service_id_val: i32,
         project_id: i32,
     ) -> Result<HashMap<String, String>, ExternalServiceError> {
-        use crate::sandbox_access::SandboxDatabasePlan;
-
         let service = self.get_service(service_id_val).await?;
-        if service.service_type != "postgres" {
-            return Err(ExternalServiceError::SandboxAccessUnsupported {
-                service_id: service_id_val,
-                service_type: service.service_type.clone(),
-                reason: "only PostgreSQL services can give a sandbox its own scoped credentials"
-                    .to_string(),
-            });
-        }
+        let engine =
+            crate::sandbox_engines::engine_for(&service.service_type).ok_or_else(|| {
+                ExternalServiceError::NoSandboxAccessEngine {
+                    service_id: service_id_val,
+                    service_type: service.service_type.clone(),
+                }
+            })?;
         let linked = project_services::Entity::find()
             .filter(
                 project_services::Column::ServiceId
@@ -12711,130 +12719,16 @@ echo "[restore] Pre-seed complete"
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
         let parameters = self.get_service_parameters(service_id_val).await?;
-        let param = |key: &str, default: &str| {
-            parameters
-                .get(key)
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.is_empty())
-                .unwrap_or(default)
-                .to_string()
-        };
-        let admin_user = param("username", "postgres");
-        let admin_password = param("password", "");
-        let plan =
-            SandboxDatabasePlan::new(service_id_val, &project.slug, &admin_user, &admin_password)
-                .map_err(|error| ExternalServiceError::SandboxAccessUnsupported {
-                service_id: service_id_val,
-                service_type: service.service_type.clone(),
-                reason: error.to_string(),
-            })?;
-
-        let hosts = if service.topology == "cluster" {
-            let members = self.get_service_members(service_id_val).await?;
-            let hosts: Vec<(String, u16)> = members
-                .iter()
-                .filter(|member| {
-                    !is_role_monitor(&member.role)
-                        && member.status == "running"
-                        && member.node_id.is_none()
-                })
-                // A cluster member listens on its own stored port inside the
-                // container as well as on the host (the container publishes
-                // `port` to `port`), unlike a standalone service's 5432.
-                .map(|member| {
-                    let port = member
-                        .port
-                        .and_then(|port| u16::try_from(port).ok())
-                        .unwrap_or(5432);
-                    (member.container_name.clone(), port)
-                })
-                .collect();
-            if hosts.is_empty() {
-                return Err(ExternalServiceError::SandboxAccessUnsupported {
-                    service_id: service_id_val,
-                    service_type: service.service_type.clone(),
-                    reason: "no running data member of this cluster is on the control plane's \
-                             Docker network, which is the only place a sandbox can reach"
-                        .to_string(),
-                });
-            }
-            let (client, _primary) = self.connect_cluster_primary_client(service_id_val).await?;
-            crate::sandbox_access::apply(&client, &plan)
-                .await
-                .map_err(|error| ExternalServiceError::InternalError {
-                    reason: format!(
-                        "Failed to provision the sandbox database on cluster {service_id_val}: {error}"
-                    ),
-                })?;
-            hosts
-        } else {
-            if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id)
-            {
-                return Err(ExternalServiceError::SandboxAccessUnsupported {
-                    service_id: service_id_val,
-                    service_type: service.service_type.clone(),
-                    reason: format!(
-                        "the service runs on node {node_id}, and a sandbox can only reach \
-                         services on the control plane"
-                    ),
-                });
-            }
-            let host = param("host", "localhost");
-            let port = parameters
-                .get("port")
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_string)
-                        .or_else(|| value.as_u64().map(|number| number.to_string()))
-                })
-                .unwrap_or_else(|| "5432".to_string());
-            let port_number: u16 =
-                port.parse()
-                    .map_err(|_| ExternalServiceError::ParameterValidationFailed {
-                        service_id: service_id_val,
-                        reason: format!("The service's port '{port}' is not a port number"),
-                    })?;
-            let (client, connection) = tokio_postgres::Config::new()
-                .host(&host)
-                .port(port_number)
-                .user(&admin_user)
-                .password(&admin_password)
-                .dbname("postgres")
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .connect(tokio_postgres::NoTls)
-                .await
-                .map_err(|error| ExternalServiceError::InternalError {
-                    reason: format!(
-                        "Failed to connect to PostgreSQL service {} at {}:{} to provision the \
-                         sandbox database '{}': {}",
-                        service_id_val, host, port, plan.database, error
-                    ),
-                })?;
-            let driver = tokio::spawn(connection);
-            let applied = crate::sandbox_access::apply(&client, &plan).await;
-            drop(client);
-            driver.abort();
-            applied.map_err(|error| ExternalServiceError::InternalError {
-                reason: format!(
-                    "Failed to provision the sandbox database on service {service_id_val}: {error}"
-                ),
-            })?;
-            let container = service
-                .container_name
-                .clone()
-                .unwrap_or_else(|| format!("postgres-{}", service.name));
-            vec![(container, 5432)]
-        };
-
-        info!(
-            service_id = service_id_val,
-            project_id,
-            database = %plan.database,
-            role = %plan.role,
-            "Provisioned a sandbox database and scoped role"
-        );
-        Ok(plan.environment(&hosts))
+        engine
+            .issue(
+                self,
+                crate::sandbox_engines::SandboxAccessRequest {
+                    service: &service,
+                    project: &project,
+                    parameters: &parameters,
+                },
+            )
+            .await
     }
 
     /// Run a standalone service's provider-authenticated health probe in the
@@ -15590,6 +15484,33 @@ impl temps_core::SandboxRuntimeCredentialsProvider for ExternalServiceManager {
             })
     }
 
+    async fn sandbox_access_containers(
+        &self,
+        service_id: i32,
+    ) -> Result<Vec<String>, temps_core::SandboxRuntimeCredentialsError> {
+        let service = self
+            .get_service(service_id)
+            .await
+            .map_err(|error| match error {
+                ExternalServiceError::ServiceNotFound { id } => {
+                    temps_core::SandboxRuntimeCredentialsError::ServiceNotFound { service_id: id }
+                }
+                other => temps_core::SandboxRuntimeCredentialsError::Provider {
+                    service_id,
+                    reason: other.to_string(),
+                },
+            })?;
+        let Some(engine) = crate::sandbox_engines::engine_for(&service.service_type) else {
+            return Ok(Vec::new());
+        };
+        engine.containers(self, &service).await.map_err(|error| {
+            temps_core::SandboxRuntimeCredentialsError::Provider {
+                service_id,
+                reason: error.to_string(),
+            }
+        })
+    }
+
     async fn issue_for_sandbox(
         &self,
         service_id: i32,
@@ -15608,20 +15529,17 @@ impl temps_core::SandboxRuntimeCredentialsProvider for ExternalServiceManager {
                     service_id,
                     project_id,
                 },
-                // Only a type with no scoped mechanism falls through to the
-                // caller's choice. A PostgreSQL service that cannot be
-                // reached (another node) is a failure, never a downgrade to
-                // the shared credentials.
-                ExternalServiceError::SandboxAccessUnsupported {
+                // Only a type with no engine falls through to the caller's
+                // choice. A service whose engine cannot reach it (another
+                // node) is a failure, never a downgrade to the shared
+                // credentials.
+                ExternalServiceError::NoSandboxAccessEngine {
                     service_id,
                     service_type,
-                    ..
-                } if service_type != "postgres" => {
-                    temps_core::SandboxRuntimeCredentialsError::NoScopedCredentials {
-                        service_id,
-                        service_type,
-                    }
-                }
+                } => temps_core::SandboxRuntimeCredentialsError::NoScopedCredentials {
+                    service_id,
+                    service_type,
+                },
                 other => temps_core::SandboxRuntimeCredentialsError::Provider {
                     service_id,
                     reason: other.to_string(),

@@ -20,6 +20,19 @@ pub trait SandboxRuntimeCredentialsProvider: Send + Sync {
         environment_id: i32,
     ) -> Result<HashMap<String, String>, SandboxRuntimeCredentialsError>;
 
+    /// The containers a sandbox must be able to dial to use `service_id`
+    /// with the credentials of [`Self::issue_for_sandbox`], by name on the
+    /// control plane's Docker daemon.
+    ///
+    /// Empty for a service no sandbox can use: a type with no engine, a
+    /// backend the engine does not cover, or a service on another node. The
+    /// caller puts exactly these on the sandbox's private network, so nothing
+    /// else of the service is reachable.
+    async fn sandbox_access_containers(
+        &self,
+        service_id: i32,
+    ) -> Result<Vec<String>, SandboxRuntimeCredentialsError>;
+
     /// Variables for a sandbox to use `service_id` as part of `project_id`,
     /// authenticating as a credential that reaches only a database of the
     /// sandbox's own (ADR-051), never the deployment's.
