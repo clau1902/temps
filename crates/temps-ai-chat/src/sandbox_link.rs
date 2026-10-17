@@ -165,9 +165,14 @@ pub fn link_from_metadata(metadata: Option<&Value>) -> Option<SandboxLink> {
 
 /// Whether a variable holds something that must not be shown.
 fn is_secret_variable(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    // A key prefix names where a sandbox may write; it is not a credential.
+    if name.ends_with("KEY_PREFIX") {
+        return false;
+    }
     ["PASSWORD", "SECRET", "TOKEN", "KEY", "URL"]
         .iter()
-        .any(|marker| name.to_ascii_uppercase().contains(marker))
+        .any(|marker| name.contains(marker))
 }
 
 /// Replace the secret values among `variables` that appear in `text`.
@@ -964,7 +969,7 @@ impl SandboxLinkService {
                 conversation_id: conversation.public_id.clone(),
                 message: format!(
                     "project {project_id} has no linked service that can give a sandbox \
-                     credentials of its own yet (PostgreSQL and S3 can). Link a database or a \
+                     credentials of its own yet (PostgreSQL, MariaDB, MongoDB, Redis and S3 can). Link a database or a \
                      bucket to the project first"
                 ),
             });
@@ -1014,7 +1019,7 @@ impl SandboxLinkService {
                 conversation_id: conversation.public_id.clone(),
                 message: format!(
                     "service {service_id} cannot give a sandbox credentials of its own: its type \
-                     is not supported yet (PostgreSQL and S3 are), or it does not run on this \
+                     is not supported yet (PostgreSQL, MariaDB, MongoDB, Redis and S3 are), or it does not run on this \
                      server"
                 ),
             });
@@ -1967,6 +1972,32 @@ mod tests {
         );
         assert_eq!(result, "Resumed.\n\n{\"exit_code\":0}");
         assert_eq!(with_notice(None, "ok".to_string()), "ok");
+    }
+
+    #[test]
+    fn every_credential_the_engines_return_is_redacted_and_the_key_prefix_is_not() {
+        for name in [
+            "REDIS_URL",
+            "REDIS_PASSWORD",
+            "MYSQL_URL",
+            "MYSQL_PASSWORD",
+            "MARIADB_PASSWORD",
+            "DATABASE_URL",
+            "MONGODB_URL",
+            "MONGODB_PASSWORD",
+            "AWS_SESSION_TOKEN",
+            "S3_SECRET_KEY",
+        ] {
+            assert!(is_secret_variable(name), "{name}");
+        }
+        assert!(!is_secret_variable("REDIS_KEY_PREFIX"));
+        assert!(!is_secret_variable("REDIS_USER"));
+        let variables = HashMap::from([
+            ("REDIS_KEY_PREFIX".to_string(), "sbx:shop:".to_string()),
+            ("REDIS_PASSWORD".to_string(), "hunter2hunter2".to_string()),
+        ]);
+        let shown = redact_secrets("sbx:shop:k hunter2hunter2", &variables);
+        assert_eq!(shown, "sbx:shop:k [redacted]");
     }
 
     #[test]

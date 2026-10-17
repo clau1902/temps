@@ -1372,7 +1372,7 @@ impl MariaDbService {
         )
     }
 
-    fn build_env_vars(
+    pub(crate) fn build_env_vars(
         host: &str,
         port: &str,
         database: &str,

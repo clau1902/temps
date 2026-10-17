@@ -97,12 +97,23 @@ command, so a failover shows up in the next one.
 |---|---|---|
 | PostgreSQL | database `<project>_sandbox` | role limited to it, derived password |
 | S3 / RustFS | bucket `<project>-sandbox` | temporary key from the service's STS `AssumeRole`, restricted by a session policy to that one bucket, valid for 12 hours and issued fresh for every command |
+| Redis | key prefix `sbx:<project>:` | ACL user (`reset on`, keys and channels `sbx:<project>:*`, `+@all -@admin -@dangerous`), derived password |
+| MariaDB | database `<project>_sandbox` | user granted that database only (underscores escaped in the grant, where `_` would otherwise be a wildcard), connection limit, derived password |
+| MongoDB | database `<project>_sandbox` | user defined in that database with `readWrite` on it and no other role, derived password |
 
 The S3 key is never stored and expires by itself, so a leaked value stops
 working; the service's root key stays on the control plane, which also creates
-the bucket (the temporary key may use it, never create it). Redis (an ACL user
-limited to a key prefix), MongoDB (a user on one database) and MariaDB (a user
-granted one database) are each their own engine.
+the bucket (the temporary key may use it, never create it). The other engines
+re-run their provisioning on every connect, so a user or grant changed by hand
+is put back, and derive passwords from the service's administrator secret, so
+nothing new is stored and a rotation reaches the sandbox on its next command.
+
+Redis has no per-sandbox database, so isolation is a key prefix and code in the
+sandbox must use `REDIS_KEY_PREFIX` (most clients have a `keyPrefix` option).
+`INFO` is denied with the rest of `@dangerous` because it reports every
+tenant's keyspace; clients that call it on connect (ioredis's ready check) need
+that check turned off. A Redis service with no password is refused: every
+client is the default user, so no sandbox could be limited.
 
 ### 3. The network path is the existing data network
 
