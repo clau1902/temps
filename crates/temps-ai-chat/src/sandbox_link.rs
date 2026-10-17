@@ -54,6 +54,10 @@ const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 120;
 const MAX_EXEC_TIMEOUT_SECS: u64 = 600;
 /// Idle lifetime of a sandbox created from a chat.
 const CREATED_SANDBOX_TIMEOUT_SECS: u64 = 3600;
+/// How long a request waits for a new sandbox to come up before it reports
+/// that it is still starting. The sandbox keeps starting and shows up in the
+/// user's sandbox list; only this request stops waiting.
+const CREATE_WAIT_SECS: u64 = 90;
 /// Prefix of the persistent per-user application workspace sandboxes.
 const APPLICATION_WORKSPACE_PREFIX: &str = "ai-application:";
 
@@ -403,18 +407,25 @@ impl SandboxLinkService {
             .chars()
             .take(48)
             .collect();
-        let row = self
-            .sandboxes
-            .create_sandbox(
-                user_id,
-                CreateSandboxRequest {
-                    name: Some(name),
-                    timeout_secs: Some(CREATED_SANDBOX_TIMEOUT_SECS),
-                    lifecycle: Some("workspace".to_string()),
-                    ..Default::default()
-                },
-            )
+        let creating = self.sandboxes.create_sandbox(
+            user_id,
+            CreateSandboxRequest {
+                name: Some(name),
+                timeout_secs: Some(CREATED_SANDBOX_TIMEOUT_SECS),
+                lifecycle: Some("workspace".to_string()),
+                ..Default::default()
+            },
+        );
+        let row = tokio::time::timeout(Duration::from_secs(CREATE_WAIT_SECS), creating)
             .await
+            .map_err(|_| SandboxLinkError::Sandbox {
+                conversation_id: conversation.public_id.clone(),
+                reason: format!(
+                    "the sandbox was still starting after {CREATE_WAIT_SECS} seconds. It keeps \
+                     starting in the background: link it from your sandbox list once it is \
+                     running, or check that this server's sandbox backend is healthy"
+                ),
+            })?
             .map_err(|error| SandboxLinkError::Sandbox {
                 conversation_id: conversation.public_id.clone(),
                 reason: format!("could not create a sandbox: {error}"),
@@ -574,9 +585,11 @@ impl SandboxLinkService {
     async fn dispatch_offer(&self, arguments: &str, conversation_id: i64) -> String {
         let args: OfferArgs = match serde_json::from_str(arguments) {
             Ok(args) => args,
-            Err(error) => return format!(
+            Err(error) => {
+                return format!(
                 "`{SANDBOX_OFFER_TOOL}` needs {{\"reason\": \"…\"}}: {error}. Nothing was offered."
-            ),
+            )
+            }
         };
         match self.mark_offered(conversation_id).await {
             Ok(true) => format!(

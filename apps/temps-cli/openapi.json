@@ -7390,6 +7390,49 @@
         ],
         "type": "object"
       },
+      "ChatSandboxStatus": {
+        "description": "What a chat can do with a sandbox, and the one it is linked to.",
+        "properties": {
+          "configured": {
+            "description": "Whether this chat can use a sandbox at all.",
+            "type": "boolean"
+          },
+          "linked": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SandboxLink",
+                "description": "The sandbox currently linked to the chat."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "offered": {
+            "description": "True once the assistant has asked the user to link a sandbox.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why it cannot, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path where the user can fix it, when there is one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured",
+          "offered"
+        ],
+        "type": "object"
+      },
       "CheckKind": {
         "description": "What a stored check does: HTTP checks call an issuer; local checks read\nexpiring items (certificates, SSH certificates, OpenPGP keys, kubeconfigs,\nJWTs) on this host and never transmit the value.",
         "enum": [
@@ -29824,6 +29867,23 @@
         ],
         "type": "object"
       },
+      "LinkSandboxRequest": {
+        "description": "Link an existing sandbox (`sandbox_id`) or create a new one (`create`).",
+        "properties": {
+          "create": {
+            "description": "Create a fresh sandbox for this chat instead.",
+            "type": "boolean"
+          },
+          "sandbox_id": {
+            "description": "Public id of one of the caller's own sandboxes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "LinkServiceRequest": {
         "properties": {
           "custom_database_name": {
@@ -45978,6 +46038,30 @@
           "preview_url_template",
           "lifecycle",
           "node_name"
+        ],
+        "type": "object"
+      },
+      "SandboxLink": {
+        "description": "The sandbox a chat is linked to, as stored.",
+        "properties": {
+          "linked_at": {
+            "description": "ISO 8601 time the link was made.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "description": "Display name of the sandbox when it was linked.",
+            "type": "string"
+          },
+          "sandbox_id": {
+            "description": "Public id of the sandbox (`sbx_…`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandbox_id",
+          "name",
+          "linked_at"
         ],
         "type": "object"
       },
@@ -65143,6 +65227,286 @@
           }
         ],
         "summary": "Restore a user-owned archived conversation.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/sandbox": {
+      "delete": {
+        "operationId": "unlink_chat_sandbox",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSandboxStatus"
+                }
+              }
+            },
+            "description": "Sandbox unlinked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Unlink the chat's sandbox. The sandbox itself is left running.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      },
+      "get": {
+        "operationId": "get_chat_sandbox",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSandboxStatus"
+                }
+              }
+            },
+            "description": "Sandbox status of the conversation"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether the chat can use a sandbox, and which one it is linked to.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      },
+      "post": {
+        "operationId": "link_chat_sandbox",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkSandboxRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSandboxStatus"
+                }
+              }
+            },
+            "description": "Sandbox linked"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Neither or both of sandbox_id and create were sent"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox cannot be linked"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Link a sandbox to the chat, or create one for it. Replaces any earlier link.",
         "tags": [
           "AI Chat"
         ],

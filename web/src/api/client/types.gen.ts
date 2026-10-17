@@ -3433,6 +3433,29 @@ export type ChatReadinessResponse = {
 };
 
 /**
+ * What a chat can do with a sandbox, and the one it is linked to.
+ */
+export type ChatSandboxStatus = {
+    /**
+     * Whether this chat can use a sandbox at all.
+     */
+    configured: boolean;
+    linked?: SandboxLink | null;
+    /**
+     * True once the assistant has asked the user to link a sandbox.
+     */
+    offered: boolean;
+    /**
+     * Why it cannot, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Console path where the user can fix it, when there is one.
+     */
+    setup_path?: string | null;
+};
+
+/**
  * What a stored check does: HTTP checks call an issuer; local checks read
  * expiring items (certificates, SSH certificates, OpenPGP keys, kubeconfigs,
  * JWTs) on this host and never transmit the value.
@@ -13962,6 +13985,20 @@ export type LinkApplicationProjectRequest = {
     project_id: number;
 };
 
+/**
+ * Link an existing sandbox (`sandbox_id`) or create a new one (`create`).
+ */
+export type LinkSandboxRequest = {
+    /**
+     * Create a fresh sandbox for this chat instead.
+     */
+    create?: boolean;
+    /**
+     * Public id of one of the caller's own sandboxes.
+     */
+    sandbox_id?: string | null;
+};
+
 export type LinkServiceRequest = {
     /**
      * Exact database name used when `database_provisioning_mode` is `custom`.
@@ -21714,6 +21751,24 @@ export type SandboxInner = {
     timeout: number;
     updatedAt: number;
     vcpus: number;
+};
+
+/**
+ * The sandbox a chat is linked to, as stored.
+ */
+export type SandboxLink = {
+    /**
+     * ISO 8601 time the link was made.
+     */
+    linked_at: string;
+    /**
+     * Display name of the sandbox when it was linked.
+     */
+    name: string;
+    /**
+     * Public id of the sandbox (`sbx_…`).
+     */
+    sandbox_id: string;
 };
 
 /**
@@ -30732,6 +30787,148 @@ export type RestoreUserConversationResponses = {
 };
 
 export type RestoreUserConversationResponse = RestoreUserConversationResponses[keyof RestoreUserConversationResponses];
+
+export type UnlinkChatSandboxData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox';
+};
+
+export type UnlinkChatSandboxErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type UnlinkChatSandboxError = UnlinkChatSandboxErrors[keyof UnlinkChatSandboxErrors];
+
+export type UnlinkChatSandboxResponses = {
+    /**
+     * Sandbox unlinked
+     */
+    200: ChatSandboxStatus;
+};
+
+export type UnlinkChatSandboxResponse = UnlinkChatSandboxResponses[keyof UnlinkChatSandboxResponses];
+
+export type GetChatSandboxData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox';
+};
+
+export type GetChatSandboxErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetChatSandboxError = GetChatSandboxErrors[keyof GetChatSandboxErrors];
+
+export type GetChatSandboxResponses = {
+    /**
+     * Sandbox status of the conversation
+     */
+    200: ChatSandboxStatus;
+};
+
+export type GetChatSandboxResponse = GetChatSandboxResponses[keyof GetChatSandboxResponses];
+
+export type LinkChatSandboxData = {
+    body: LinkSandboxRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox';
+};
+
+export type LinkChatSandboxErrors = {
+    /**
+     * Neither or both of sandbox_id and create were sent
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The sandbox cannot be linked
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type LinkChatSandboxError = LinkChatSandboxErrors[keyof LinkChatSandboxErrors];
+
+export type LinkChatSandboxResponses = {
+    /**
+     * Sandbox linked
+     */
+    200: ChatSandboxStatus;
+};
+
+export type LinkChatSandboxResponse = LinkChatSandboxResponses[keyof LinkChatSandboxResponses];
 
 export type StopUserTurnData = {
     body?: never;

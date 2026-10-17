@@ -63,6 +63,7 @@ import { DebugChatPanel } from './DebugChatPanel'
 import { DeploymentSidebar } from './DeploymentSidebar'
 import { ProjectReferencesProvider } from './ProjectReference'
 import type { ProjectRef } from './project-refs'
+import { ChatSandbox } from './ChatSandbox'
 import { GoalPanel, useChatGoals } from './GoalPanel'
 import { presentGoal, watchedDeployments } from './goal-presentation'
 import { useIsDesktop, useIsMobile } from '@/components/hooks/use-mobile'
@@ -805,6 +806,7 @@ export function AssistantThread({
             )}
           >
             <div className="flex shrink-0 items-center justify-end gap-2">
+              <ChatSandbox conversationPublicId={conversation.public_id} />
               <ChatSpend conversationPublicId={conversation.public_id} />
               {hasTabs && !workView && (
                 <Button

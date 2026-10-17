@@ -39,6 +39,8 @@ import {
   GeneratedServiceProposal,
   serviceProposalViewModel,
 } from '@/components/ai/GeneratedServiceProposal'
+import { SandboxOfferCard } from '@/components/ai/ChatSandbox'
+import { isSandboxOfferTool, offerReason } from '@/components/ai/chat-sandbox'
 import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard'
 import { GeneratedProjectCollection } from '@/components/ai/GeneratedProjectCollection'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
@@ -1652,6 +1654,12 @@ export function AssistantBody({
               projectId={projectId}
               tool={part.tool}
               onFix={onFix}
+            />
+          ) : isSandboxOfferTool(part.tool.name) && conversationPublicId ? (
+            <SandboxOfferCard
+              key={part.tool.id}
+              conversationPublicId={conversationPublicId}
+              reason={offerReason(part.tool.arguments)}
             />
           ) : (
             <ReadToolResultCard key={part.tool.id} tool={part.tool} />
