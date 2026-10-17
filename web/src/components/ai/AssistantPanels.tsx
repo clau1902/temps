@@ -45,6 +45,7 @@ import {
   setupPathFromProblem,
 } from './assistant-state'
 import { AssistantModelChip, AssistantModelSetup } from './AssistantModelPicker'
+import { enterSendsMessage } from './chat-page-state'
 import {
   useAssistantImageSupport,
   useNewChatModel,
@@ -64,7 +65,7 @@ import { ProjectReferencesProvider } from './ProjectReference'
 import type { ProjectRef } from './project-refs'
 import { GoalPanel, useChatGoals } from './GoalPanel'
 import { presentGoal, watchedDeployments } from './goal-presentation'
-import { useIsDesktop } from '@/components/hooks/use-mobile'
+import { useIsDesktop, useIsMobile } from '@/components/hooks/use-mobile'
 import {
   ResizableHandle,
   ResizablePanel,
@@ -370,6 +371,7 @@ export function AssistantStart({
   /** Full-screen sizing: larger type and controls, content centred. */
   roomy?: boolean
 }) {
+  const isMobile = useIsMobile()
   const status = useQuery({
     ...getAiProviderStatusOptions(),
     staleTime: 15_000,
@@ -554,12 +556,12 @@ export function AssistantStart({
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
-            // Enter sends, Shift+Enter breaks the line. Ignore Enter while an
-            // IME is composing so confirming a candidate never sends.
+            // Enter sends on a computer and breaks the line on a phone.
             if (
-              event.key === 'Enter' &&
-              !event.shiftKey &&
-              !event.nativeEvent.isComposing
+              enterSendsMessage(
+                { ...event, isComposing: event.nativeEvent.isComposing },
+                isMobile
+              )
             ) {
               event.preventDefault()
               submit(draft)

@@ -10,6 +10,7 @@ import {
   hasProjectScope,
   isChatComposerDisabled,
   CHAT_COMPOSER_COMPACT_MIN_HEIGHT,
+  enterSendsMessage,
   resolveChatComposerLayout,
   resolvePageChat,
 } from './chat-page-state'
@@ -129,5 +130,28 @@ describe('chat composer interruption', () => {
 
   test('does not submit an empty interruption', () => {
     expect(chatComposerSubmitAction('   ', true)).toBe('none')
+  })
+})
+
+describe('enterSendsMessage', () => {
+  const enter = { key: 'Enter', shiftKey: false }
+
+  test('sends on a computer', () => {
+    expect(enterSendsMessage(enter, false)).toBe(true)
+  })
+
+  test('shift+enter and other keys never send', () => {
+    expect(enterSendsMessage({ ...enter, shiftKey: true }, false)).toBe(false)
+    expect(enterSendsMessage({ key: 'a', shiftKey: false }, false)).toBe(false)
+  })
+
+  test('confirming an IME candidate never sends', () => {
+    expect(enterSendsMessage({ ...enter, isComposing: true }, false)).toBe(
+      false
+    )
+  })
+
+  test('is a new line on a phone', () => {
+    expect(enterSendsMessage(enter, true)).toBe(false)
   })
 })

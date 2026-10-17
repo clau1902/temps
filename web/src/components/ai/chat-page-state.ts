@@ -42,6 +42,24 @@ export function chatComposerSubmitAction(
   return streaming ? 'interrupt-and-send' : 'send'
 }
 
+/**
+ * Whether a key press in a composer sends the message. On a phone Enter is a
+ * new line (the soft keyboard has no Shift, and the send button is on screen);
+ * elsewhere Enter sends and Shift+Enter breaks the line. Enter while an IME is
+ * composing only confirms the candidate, so it never sends.
+ */
+export function enterSendsMessage(
+  event: { key: string; shiftKey: boolean; isComposing?: boolean },
+  mobile: boolean
+): boolean {
+  return (
+    !mobile &&
+    event.key === 'Enter' &&
+    !event.shiftKey &&
+    event.isComposing !== true
+  )
+}
+
 /** Clamp the growing composer while preserving an internal scroll escape hatch. */
 export function resolveChatComposerLayout(
   scrollHeight: number,

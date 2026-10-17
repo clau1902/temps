@@ -136,6 +136,7 @@ import {
   CHAT_COMPOSER_COMPACT_MIN_HEIGHT,
   CHAT_COMPOSER_MIN_HEIGHT,
   chatComposerSubmitAction,
+  enterSendsMessage,
   isChatComposerDisabled,
   resolveChatComposerLayout,
 } from './chat-page-state'
@@ -3749,7 +3750,12 @@ function DebugChatPanelBody({
             disabled={composerDisabled}
             className="min-h-10 resize-none md:min-h-[72px] overflow-y-hidden rounded-none border-0 shadow-none focus-visible:border-0 focus-visible:outline-none focus-visible:ring-0"
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
+              if (
+                enterSendsMessage(
+                  { ...e, isComposing: e.nativeEvent.isComposing },
+                  compactComposer
+                )
+              ) {
                 e.preventDefault()
                 submitComposer()
               }
