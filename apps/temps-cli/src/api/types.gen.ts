@@ -3508,6 +3508,11 @@ export type ChatSandboxStatus = {
      * Whether this chat can use a sandbox at all.
      */
     configured: boolean;
+    /**
+     * Projects whose services the linked sandbox is connected to: its
+     * commands run with credentials for a database of its own on each.
+     */
+    connected_projects: Array<number>;
     linked?: SandboxLink | null;
     /**
      * True once the assistant has asked the user to link a sandbox.
@@ -4512,6 +4517,16 @@ export type ComposeServicePreviewResponse = {
      * is only the optional host-side Docker port.
      */
     ports: Array<ComposePortMapping>;
+};
+
+/**
+ * Connect the chat's sandbox to the services of a project.
+ */
+export type ConnectProjectRequest = {
+    /**
+     * The project whose services the sandbox may use.
+     */
+    project_id: number;
 };
 
 /**
@@ -21402,6 +21417,29 @@ export type S3SourceResponse = {
     updated_at: number;
 };
 
+/**
+ * What connecting the sandbox to a project's services gave it.
+ */
+export type SandboxConnections = {
+    /**
+     * Services the sandbox can now reach.
+     */
+    connected_service_ids: Array<number>;
+    /**
+     * Projects the sandbox is now connected to.
+     */
+    project_ids: Array<number>;
+    /**
+     * Linked services left out because their type cannot give a sandbox
+     * credentials of its own yet.
+     */
+    skipped_service_ids: Array<number>;
+    /**
+     * Names (never values) of the variables commands now run with.
+     */
+    variable_names: Array<string>;
+};
+
 export type SandboxDomainResponse = {
     url: string;
 };
@@ -30673,6 +30711,114 @@ export type LinkChatSandboxResponses = {
 };
 
 export type LinkChatSandboxResponse = LinkChatSandboxResponses[keyof LinkChatSandboxResponses];
+
+export type ConnectChatSandboxProjectData = {
+    body: ConnectProjectRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/projects';
+};
+
+export type ConnectChatSandboxProjectErrors = {
+    /**
+     * The project has no service that can be connected
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type ConnectChatSandboxProjectError = ConnectChatSandboxProjectErrors[keyof ConnectChatSandboxProjectErrors];
+
+export type ConnectChatSandboxProjectResponses = {
+    /**
+     * Sandbox connected
+     */
+    200: SandboxConnections;
+};
+
+export type ConnectChatSandboxProjectResponse = ConnectChatSandboxProjectResponses[keyof ConnectChatSandboxProjectResponses];
+
+export type DisconnectChatSandboxProjectData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Project to disconnect
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/projects/{project_id}';
+};
+
+export type DisconnectChatSandboxProjectErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type DisconnectChatSandboxProjectError = DisconnectChatSandboxProjectErrors[keyof DisconnectChatSandboxProjectErrors];
+
+export type DisconnectChatSandboxProjectResponses = {
+    /**
+     * Sandbox disconnected
+     */
+    200: SandboxConnections;
+};
+
+export type DisconnectChatSandboxProjectResponse = DisconnectChatSandboxProjectResponses[keyof DisconnectChatSandboxProjectResponses];
 
 export type StopUserTurnData = {
     body?: never;
