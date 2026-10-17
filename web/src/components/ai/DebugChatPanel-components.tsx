@@ -48,6 +48,7 @@ import {
 import {
   isSandboxCreateTool,
   isSandboxOfferTool,
+  isSandboxScopedTool,
   offerReason,
 } from '@/components/ai/chat-sandbox'
 import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard'
@@ -1674,7 +1675,9 @@ export function AssistantBody({
               reason={offerReason(part.tool.arguments)}
               fromProject={fromProject}
             />
-          ) : isSandboxCreateTool(part.tool.name) && conversationPublicId ? (
+          ) : (isSandboxCreateTool(part.tool.name) ||
+              isSandboxScopedTool(part.tool.name)) &&
+            conversationPublicId ? (
             <Fragment key={part.tool.id}>
               <ReadToolResultCard tool={part.tool} />
               <SandboxStatusRefresher

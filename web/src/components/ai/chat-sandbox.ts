@@ -24,6 +24,23 @@ export function isSandboxCreateTool(name: string): boolean {
   )
 }
 
+const SANDBOX_SCOPED_TOOL_NAMES = [
+  'sandbox_exec',
+  'sandbox_read_file',
+  'sandbox_write_file',
+]
+
+/**
+ * The tools that run in the chat's linked sandbox. They can wake a sleeping
+ * sandbox or unlink one whose container is gone, so the sandbox control
+ * refreshes after each.
+ */
+export function isSandboxScopedTool(name: string): boolean {
+  return SANDBOX_SCOPED_TOOL_NAMES.some(
+    (scoped) => name === scoped || name.endsWith(`__${scoped}`)
+  )
+}
+
 /** The slice of a sandbox the picker needs. */
 export interface LinkableSandboxInput {
   id: string

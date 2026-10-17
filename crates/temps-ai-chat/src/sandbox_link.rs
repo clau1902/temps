@@ -31,6 +31,7 @@ use temps_auth::context::AuthContext;
 use temps_auth::permissions::Permission;
 use temps_core::{AuditContext, AuditLogger};
 use temps_entities::ai_conversations;
+use temps_sandbox::error::SandboxError;
 use temps_sandbox::services::{CreateSandboxRequest, ExecOptions};
 use temps_sandbox::SandboxService;
 use thiserror::Error;
@@ -62,6 +63,10 @@ const CREATED_SANDBOX_TIMEOUT_SECS: u64 = 3600;
 /// that it is still starting. The sandbox keeps starting and shows up in the
 /// user's sandbox list; only this request stops waiting.
 const CREATE_WAIT_SECS: u64 = 90;
+
+/// How long a tool call waits for a sleeping sandbox to wake before it tells
+/// the model and the user it did not.
+const RESUME_WAIT_SECS: u64 = 120;
 /// Prefix of the persistent per-user application workspace sandboxes.
 const APPLICATION_WORKSPACE_PREFIX: &str = "ai-application:";
 /// Context type of chats scoped to one project.
@@ -167,6 +172,33 @@ pub fn linkability_problem(
         return Some("it has been destroyed");
     }
     None
+}
+
+/// Whether a linked sandbox can take a command right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxReadiness {
+    /// Running: run the tool as is.
+    Ready,
+    /// Stopped ("sleeping"): wake it first, and say so.
+    Asleep,
+}
+
+/// Classify a sandbox row's status. Only an explicitly stopped sandbox needs
+/// waking; `destroyed` is rejected earlier by [`linkability_problem`].
+pub fn readiness(status: &str) -> SandboxReadiness {
+    if status == "stopped" {
+        SandboxReadiness::Asleep
+    } else {
+        SandboxReadiness::Ready
+    }
+}
+
+/// Put a notice for the user and the model in front of a tool result.
+fn with_notice(notice: Option<String>, result: String) -> String {
+    match notice {
+        Some(notice) => format!("{notice}\n\n{result}"),
+        None => result,
+    }
 }
 
 /// Keep the end of `text` (errors and results come last), at most `max` bytes.
@@ -467,10 +499,21 @@ impl SandboxLinkService {
     }
 
     /// Create a fresh sandbox for the chat and link it.
+    ///
+    /// The create runs in a detached task. It inserts the sandbox row before
+    /// the container exists, and a slow first image pull can outlast the wait
+    /// below (or the chat turn can be cancelled): dropping the future at that
+    /// point would leave a row with no container, which can never be resumed.
+    /// The task finishes the create and links the sandbox regardless, and the
+    /// caller only waits `CREATE_WAIT_SECS` for the answer.
+    ///
+    /// `assistant_reason` is `Some` when the model asked for the sandbox; the
+    /// task then audits it, so a slow create is audited too.
     pub async fn create_and_link(
         &self,
         conversation: &ai_conversations::Model,
         user_id: i32,
+        assistant_reason: Option<String>,
     ) -> Result<SandboxLink, SandboxLinkError> {
         let project_id = project_for_new_sandbox(conversation);
         let prefix = if project_id.is_some() {
@@ -482,31 +525,48 @@ impl SandboxLinkService {
             .chars()
             .take(48)
             .collect();
-        let creating = self.sandboxes.create_sandbox(
-            user_id,
-            CreateSandboxRequest {
-                name: Some(name),
-                timeout_secs: Some(CREATED_SANDBOX_TIMEOUT_SECS),
-                lifecycle: Some("workspace".to_string()),
-                project_id,
-                ..Default::default()
-            },
-        );
-        let row = tokio::time::timeout(Duration::from_secs(CREATE_WAIT_SECS), creating)
-            .await
-            .map_err(|_| SandboxLinkError::Sandbox {
+        let request = CreateSandboxRequest {
+            name: Some(name),
+            timeout_secs: Some(CREATED_SANDBOX_TIMEOUT_SECS),
+            lifecycle: Some("workspace".to_string()),
+            project_id,
+            ..Default::default()
+        };
+        let service = self.clone();
+        let target = conversation.clone();
+        let task = tokio::spawn(async move {
+            let row = service
+                .sandboxes
+                .create_sandbox(user_id, request)
+                .await
+                .map_err(|error| SandboxLinkError::Sandbox {
+                    conversation_id: target.public_id.clone(),
+                    reason: format!("could not create a sandbox: {error}"),
+                })?;
+            let link = service.store_link(&target, row.public_id, row.name).await?;
+            if let Some(reason) = assistant_reason {
+                service
+                    .audit_created(&target, user_id, &link.sandbox_id, &reason)
+                    .await;
+            }
+            Ok::<SandboxLink, SandboxLinkError>(link)
+        });
+        match tokio::time::timeout(Duration::from_secs(CREATE_WAIT_SECS), task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join_error)) => Err(SandboxLinkError::Sandbox {
+                conversation_id: conversation.public_id.clone(),
+                reason: format!("the sandbox creation stopped unexpectedly: {join_error}"),
+            }),
+            Err(_) => Err(SandboxLinkError::Sandbox {
                 conversation_id: conversation.public_id.clone(),
                 reason: format!(
-                    "the sandbox was still starting after {CREATE_WAIT_SECS} seconds. It keeps \
-                     starting in the background: link it from your sandbox list once it is \
-                     running, or check that this server's sandbox backend is healthy"
+                    "the sandbox was still starting after {CREATE_WAIT_SECS} seconds (the first \
+                     one pulls its image). It keeps starting in the background and is linked to \
+                     this chat automatically when it is ready: tell the user, then try the \
+                     sandbox tools again in a minute"
                 ),
-            })?
-            .map_err(|error| SandboxLinkError::Sandbox {
-                conversation_id: conversation.public_id.clone(),
-                reason: format!("could not create a sandbox: {error}"),
-            })?;
-        self.store_link(conversation, row.public_id, row.name).await
+            }),
+        }
     }
 
     async fn store_link(
@@ -645,21 +705,145 @@ impl SandboxLinkService {
                 link.sandbox_id
             );
         }
-        match tool {
+        let notice = if readiness(&row.status) == SandboxReadiness::Asleep {
+            match self.wake(conversation_id, &link, user_id).await {
+                Ok(notice) => Some(notice),
+                Err(message) => return message,
+            }
+        } else {
+            None
+        };
+        let result = match tool {
             SANDBOX_EXEC_TOOL => {
-                self.run_exec(arguments, &link, &row.work_dir, user_id)
+                self.run_exec(arguments, conversation_id, &link, &row.work_dir, user_id)
                     .await
             }
             SANDBOX_READ_TOOL => {
-                self.run_read(arguments, &link, &row.work_dir, user_id)
+                self.run_read(arguments, conversation_id, &link, &row.work_dir, user_id)
                     .await
             }
             SANDBOX_WRITE_TOOL => {
-                self.run_write(arguments, &link, &row.work_dir, user_id)
+                self.run_write(arguments, conversation_id, &link, &row.work_dir, user_id)
                     .await
             }
             other => format!("Unknown sandbox tool `{other}`."),
+        };
+        with_notice(notice, result)
+    }
+
+    /// Wake a sleeping linked sandbox. `Ok` is the notice that goes in front
+    /// of the tool result, which is how the user sees in the chat that it
+    /// happened; `Err` is the complete tool result for a sandbox that stayed
+    /// down.
+    async fn wake(
+        &self,
+        conversation_id: i64,
+        link: &SandboxLink,
+        user_id: i32,
+    ) -> Result<String, String> {
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(RESUME_WAIT_SECS),
+            self.sandboxes.resume_sandbox(&link.sandbox_id, user_id),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(_)) => {
+                let seconds = started.elapsed().as_secs();
+                info!(
+                    conversation_id,
+                    sandbox_id = %link.sandbox_id,
+                    seconds,
+                    "resumed the chat's sleeping sandbox"
+                );
+                Ok(format!(
+                    "Sandbox {} was asleep and has been resumed (took {seconds}s). Its files \
+                     are intact. Mention in one short sentence that you woke it.",
+                    link.name
+                ))
+            }
+            Ok(Err(SandboxError::NotFound { .. })) => {
+                Err(self.container_gone(conversation_id, link).await)
+            }
+            Ok(Err(error)) => {
+                warn!(
+                    conversation_id,
+                    sandbox_id = %link.sandbox_id,
+                    "could not resume the chat's sandbox: {error}"
+                );
+                Err(format!(
+                    "The linked sandbox {} is asleep and could not be resumed: {error}. Tell the \
+                     user, and that they can press Resume on the Sandboxes page. Do not move the \
+                     work to Git providers or other places because of this.",
+                    link.name
+                ))
+            }
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    sandbox_id = %link.sandbox_id,
+                    "the chat's sandbox did not resume within {RESUME_WAIT_SECS}s"
+                );
+                Err(format!(
+                    "The linked sandbox {} is asleep and did not resume within {RESUME_WAIT_SECS} \
+                     seconds, so the container runtime on this server may be unhealthy. Tell the \
+                     user, and that they can press Resume on the Sandboxes page and then ask \
+                     again. Do not move the work to Git providers or other places because of \
+                     this.",
+                    link.name
+                ))
+            }
         }
+    }
+
+    /// The sandbox row exists but its container does not, so it can never run
+    /// again. Unlink it, so the chat can get a working one, and say so.
+    async fn container_gone(&self, conversation_id: i64, link: &SandboxLink) -> String {
+        match ai_conversations::Entity::find_by_id(conversation_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(conversation)) => {
+                if let Err(error) = self.unlink(&conversation).await {
+                    warn!(
+                        conversation_id,
+                        "could not unlink a vanished sandbox: {error}"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!(
+                conversation_id,
+                "could not load the conversation to unlink a vanished sandbox: {error}"
+            ),
+        }
+        warn!(
+            conversation_id,
+            sandbox_id = %link.sandbox_id,
+            "the chat's sandbox has no container any more; unlinked it"
+        );
+        format!(
+            "The linked sandbox {} ({}) has no container on this server any more, so it cannot be \
+             resumed or used. It has been unlinked from this chat. Tell the user in one sentence \
+             and ask them to send their request again: a new sandbox is created for it. Do not \
+             move the work to Git providers or other places because of this.",
+            link.name, link.sandbox_id
+        )
+    }
+
+    /// A sandbox tool failed. A sandbox that is gone is handled like one that
+    /// cannot be woken; anything else is reported as it happened.
+    async fn tool_failure(
+        &self,
+        what: &str,
+        error: SandboxError,
+        conversation_id: i64,
+        link: &SandboxLink,
+    ) -> String {
+        if matches!(error, SandboxError::NotFound { .. }) {
+            return self.container_gone(conversation_id, link).await;
+        }
+        format!("{what}: {error}")
     }
 
     /// Create a sandbox for the chat on the model's request. The sandbox is
@@ -719,10 +903,11 @@ impl SandboxLinkService {
                 link.name, link.sandbox_id
             );
         }
-        match self.create_and_link(&conversation, user_id).await {
+        match self
+            .create_and_link(&conversation, user_id, Some(reason))
+            .await
+        {
             Ok(link) => {
-                self.audit_created(&conversation, user_id, &link.sandbox_id, &reason)
-                    .await;
                 let seeded = if project_for_new_sandbox(&conversation).is_some() {
                     "It starts as a clone of the project's repository."
                 } else {
@@ -807,6 +992,7 @@ impl SandboxLinkService {
     async fn run_exec(
         &self,
         arguments: &str,
+        conversation_id: i64,
         link: &SandboxLink,
         work_dir: &str,
         user_id: i32,
@@ -849,7 +1035,10 @@ impl SandboxLinkService {
                  `nohup … &` and check them with a second command.",
                 timeout.as_secs()
             ),
-            Ok(Err(error)) => format!("The command could not run: {error}"),
+            Ok(Err(error)) => {
+                self.tool_failure("The command could not run", error, conversation_id, link)
+                    .await
+            }
             Ok(Ok(result)) => {
                 info!(
                     sandbox_id = %link.sandbox_id,
@@ -870,6 +1059,7 @@ impl SandboxLinkService {
     async fn run_read(
         &self,
         arguments: &str,
+        conversation_id: i64,
         link: &SandboxLink,
         work_dir: &str,
         user_id: i32,
@@ -894,13 +1084,22 @@ impl SandboxLinkService {
                     error.as_bytes().len()
                 ),
             },
-            Err(error) => format!("Could not read {path}: {error}"),
+            Err(error) => {
+                self.tool_failure(
+                    &format!("Could not read {path}"),
+                    error,
+                    conversation_id,
+                    link,
+                )
+                .await
+            }
         }
     }
 
     async fn run_write(
         &self,
         arguments: &str,
+        conversation_id: i64,
         link: &SandboxLink,
         work_dir: &str,
         user_id: i32,
@@ -934,7 +1133,15 @@ impl SandboxLinkService {
             .await
         {
             Ok(()) => format!("Wrote {} bytes to {path}.", args.content.len()),
-            Err(error) => format!("Could not write {path}: {error}"),
+            Err(error) => {
+                self.tool_failure(
+                    &format!("Could not write {path}"),
+                    error,
+                    conversation_id,
+                    link,
+                )
+                .await
+            }
         }
     }
 }
@@ -943,6 +1150,22 @@ impl SandboxLinkService {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn only_a_stopped_sandbox_needs_waking() {
+        assert_eq!(readiness("stopped"), SandboxReadiness::Asleep);
+        assert_eq!(readiness("running"), SandboxReadiness::Ready);
+    }
+
+    #[test]
+    fn a_notice_goes_in_front_of_the_tool_result() {
+        let result = with_notice(
+            Some("Resumed.".to_string()),
+            "{\"exit_code\":0}".to_string(),
+        );
+        assert_eq!(result, "Resumed.\n\n{\"exit_code\":0}");
+        assert_eq!(with_notice(None, "ok".to_string()), "ok");
+    }
 
     fn link() -> SandboxLink {
         SandboxLink {

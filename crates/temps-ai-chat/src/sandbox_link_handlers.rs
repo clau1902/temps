@@ -242,7 +242,7 @@ pub async fn link_chat_sandbox(
                 project_access_guard!(auth, project_id, state.project_access_checker);
             }
             service
-                .create_and_link(&conversation, auth.user_id())
+                .create_and_link(&conversation, auth.user_id(), None)
                 .await?
         }
         _ => {

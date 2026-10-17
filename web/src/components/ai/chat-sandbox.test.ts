@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   isSandboxCreateTool,
+  isSandboxScopedTool,
   isSandboxOfferTool,
   linkableSandboxes,
   offerReason,
@@ -72,5 +73,18 @@ describe('offerReason', () => {
     expect(offerReason('{"reason":4}')).toBeNull()
     expect(offerReason('not json')).toBeNull()
     expect(offerReason('')).toBeNull()
+  })
+})
+
+describe('isSandboxScopedTool', () => {
+  test('matches the tools that run in the linked sandbox, bare or prefixed', () => {
+    expect(isSandboxScopedTool('sandbox_exec')).toBe(true)
+    expect(isSandboxScopedTool('temps__sandbox_read_file')).toBe(true)
+    expect(isSandboxScopedTool('sandbox_write_file')).toBe(true)
+  })
+
+  test('does not match other tools', () => {
+    expect(isSandboxScopedTool('temps_create_sandbox')).toBe(false)
+    expect(isSandboxScopedTool('temps')).toBe(false)
   })
 })
