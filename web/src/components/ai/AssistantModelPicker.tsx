@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useIsMobile } from '@/components/hooks/use-mobile'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -97,7 +98,7 @@ export function AssistantModelList({
       />
       <ul
         className={cn(
-          'max-h-72 space-y-1 overflow-y-auto pr-1',
+          'max-h-[min(18rem,calc(var(--radix-popover-content-available-height,100vh)-5rem))] space-y-1 overflow-y-auto pr-1',
           roomy && 'max-h-80'
         )}
         aria-label="Models"
@@ -300,6 +301,7 @@ export function AssistantModelChip({
   const models = useProviderModels(providerKeyId)
   const defaultModel = useEffectiveDefaultModel(key)
   const [open, setOpen] = useState(false)
+  const isMobile = useIsMobile()
 
   const label = modelDisplayName(models.options, value) ?? 'Loading…'
 
@@ -335,7 +337,14 @@ export function AssistantModelChip({
           />
         </Button>
       </PopoverTrigger>
-      <PopoverContent align="start" className="w-[min(32rem,90vw)] p-3">
+      <PopoverContent
+        align="start"
+        className="w-[min(32rem,calc(100vw-1rem))] p-3"
+        onOpenAutoFocus={(event) => {
+          // The keyboard would cover the list; search is one tap away.
+          if (isMobile) event.preventDefault()
+        }}
+      >
         <AssistantModelList
           providerKeyId={providerKeyId}
           value={value}
