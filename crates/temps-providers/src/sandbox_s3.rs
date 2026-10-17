@@ -316,7 +316,15 @@ fn is_rustfs_backed(
         Ok(value) => value,
         Err(_) => return false,
     };
+    // A legacy service still running the MinIO server is named and addressed
+    // differently (`minio-<name>`); dialling it as RustFS would reach nothing,
+    // so it is left out like any other type without an engine.
+    let runs_minio = parameters
+        .get("server")
+        .and_then(|server| server.as_str())
+        .is_some_and(|server| server.trim().eq_ignore_ascii_case("minio"));
     service.node_id.is_none()
+        && !runs_minio
         && ManagedS3BackendSelection::from_parameters(&value)
             .map(|selection| selection.backend == ManagedS3BackendKind::Rustfs)
             .unwrap_or(false)
@@ -588,6 +596,69 @@ fn truncate(text: &str) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn s3_service(node_id: Option<i32>) -> external_services::Model {
+        let now = Utc::now();
+        external_services::Model {
+            id: 2,
+            name: "files".to_string(),
+            service_type: "s3".to_string(),
+            topology: "standalone".to_string(),
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            node_id,
+            version: None,
+            slug: None,
+            config: None,
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+    }
+
+    fn parameters(pairs: &[(&str, &str)]) -> HashMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), serde_json::json!(value)))
+            .collect()
+    }
+
+    #[test]
+    fn only_a_local_rustfs_service_is_covered() {
+        let service = s3_service(None);
+        assert!(is_rustfs_backed(&service, &parameters(&[])));
+        assert!(is_rustfs_backed(
+            &service,
+            &parameters(&[("server", "rustfs")])
+        ));
+        // A legacy MinIO server is addressed differently: left out, not dialled
+        // as RustFS.
+        assert!(!is_rustfs_backed(
+            &service,
+            &parameters(&[("server", "minio")])
+        ));
+        assert!(!is_rustfs_backed(
+            &service,
+            &parameters(&[("server", " MinIO ")])
+        ));
+        assert!(!is_rustfs_backed(
+            &service,
+            &parameters(&[("backend", "garage")])
+        ));
+        // A service on another node is out of reach.
+        assert!(!is_rustfs_backed(&s3_service(Some(3)), &parameters(&[])));
+    }
 
     fn credentials() -> TemporaryCredentials {
         TemporaryCredentials {
