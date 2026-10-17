@@ -317,7 +317,7 @@ export function AssistantModelChip({
           size="sm"
           disabled={disabled}
           className={cn(
-            'h-8 min-w-0 max-w-full justify-between gap-2 px-2 font-normal text-muted-foreground hover:text-foreground',
+            'h-8 min-w-0 max-w-44 justify-between gap-2 px-2 font-normal md:max-w-full text-muted-foreground hover:text-foreground',
             roomy && 'h-9 text-sm'
           )}
           aria-label={`Model: ${label}. Change model for this chat`}

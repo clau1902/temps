@@ -9,6 +9,7 @@ import {
   createProjectChat,
   hasProjectScope,
   isChatComposerDisabled,
+  CHAT_COMPOSER_COMPACT_MIN_HEIGHT,
   resolveChatComposerLayout,
   resolvePageChat,
 } from './chat-page-state'
@@ -92,6 +93,15 @@ describe('resolveChatComposerLayout', () => {
       height: 72,
       overflowY: 'hidden',
     })
+  })
+
+  test('rests at one line on a phone', () => {
+    expect(
+      resolveChatComposerLayout(28, CHAT_COMPOSER_COMPACT_MIN_HEIGHT)
+    ).toEqual({ height: 40, overflowY: 'hidden' })
+    expect(
+      resolveChatComposerLayout(90, CHAT_COMPOSER_COMPACT_MIN_HEIGHT).height
+    ).toBe(90)
   })
 
   test('grows with multiline content', () => {

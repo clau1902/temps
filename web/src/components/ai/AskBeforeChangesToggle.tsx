@@ -35,7 +35,8 @@ export function AskBeforeChangesToggle({
         htmlFor="assistant-ask-before-changes"
         className="cursor-pointer text-xs font-normal text-muted-foreground"
       >
-        Ask before changes
+        <span className="md:hidden">Ask first</span>
+        <span className="hidden md:inline">Ask before changes</span>
       </Label>
     </div>
   )

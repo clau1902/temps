@@ -96,6 +96,7 @@ import {
   type SearchableSelectOption,
 } from '@/components/ui/searchable-select'
 import { cn } from '@/lib/utils'
+import { useIsMobile } from '@/components/hooks/use-mobile'
 import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { persistentWorkspaceStorageSupported } from '@/lib/platform-capabilities'
 import {
@@ -132,6 +133,8 @@ import {
   type ChatRuntimeSelection,
 } from './chat-runtime-options'
 import {
+  CHAT_COMPOSER_COMPACT_MIN_HEIGHT,
+  CHAT_COMPOSER_MIN_HEIGHT,
   chatComposerSubmitAction,
   isChatComposerDisabled,
   resolveChatComposerLayout,
@@ -2394,6 +2397,7 @@ function DebugChatPanelBody({
   }, [onConversationStatusInvalidated, projectId, publicId, userScoped])
 
   const composerRef = useRef<HTMLTextAreaElement>(null)
+  const compactComposer = useIsMobile()
   const composerDisabled =
     readOnly ||
     runtimeUpdateRequired ||
@@ -2419,7 +2423,12 @@ function DebugChatPanelBody({
 
     const resize = () => {
       textarea.style.height = '0px'
-      const layout = resolveChatComposerLayout(textarea.scrollHeight)
+      const layout = resolveChatComposerLayout(
+        textarea.scrollHeight,
+        compactComposer
+          ? CHAT_COMPOSER_COMPACT_MIN_HEIGHT
+          : CHAT_COMPOSER_MIN_HEIGHT
+      )
       textarea.style.height = `${layout.height}px`
       textarea.style.overflowY = layout.overflowY
     }
@@ -2435,7 +2444,7 @@ function DebugChatPanelBody({
     const observer = new ResizeObserver(resize)
     observer.observe(textarea)
     return () => observer.disconnect()
-  }, [input])
+  }, [input, compactComposer])
 
   // Every caller keys this component by the durable conversation id. Draft
   // hydration therefore happens in the state initializer above, while this
@@ -3736,9 +3745,9 @@ function DebugChatPanelBody({
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder={placeholder}
-            rows={2}
+            rows={compactComposer ? 1 : 2}
             disabled={composerDisabled}
-            className="min-h-[72px] resize-none overflow-y-hidden rounded-none border-0 shadow-none focus-visible:border-0 focus-visible:outline-none focus-visible:ring-0"
+            className="min-h-10 resize-none md:min-h-[72px] overflow-y-hidden rounded-none border-0 shadow-none focus-visible:border-0 focus-visible:outline-none focus-visible:ring-0"
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault()
@@ -3746,8 +3755,8 @@ function DebugChatPanelBody({
               }
             }}
           />
-          <div className="flex items-center justify-between gap-2 border-t px-2 py-1.5 sm:px-3 sm:py-2">
-            <div className="flex min-w-0 flex-wrap items-center gap-1">
+          <div className="flex items-center justify-between gap-2 border-t px-2 py-1 sm:px-3 sm:py-2">
+            <div className="flex min-w-0 flex-1 flex-nowrap items-center gap-0.5 overflow-x-auto [scrollbar-width:none] md:flex-wrap md:gap-1 md:overflow-visible [&::-webkit-scrollbar]:hidden [&>*]:shrink-0">
               {userScoped && publicId && (
                 <SessionDiagnostics key={publicId} publicId={publicId} />
               )}
@@ -3855,7 +3864,7 @@ function DebugChatPanelBody({
                     }
                   >
                     <SelectTrigger
-                      className="h-8 w-auto max-w-64 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
+                      className="h-8 w-auto max-w-28 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-64"
                       title={
                         publicId
                           ? 'Provider is fixed when a conversation is created'
@@ -3941,7 +3950,7 @@ function DebugChatPanelBody({
                           <Sparkles className="mr-1 h-3.5 w-3.5 shrink-0" />
                         }
                         title="Choose the model for the next turn"
-                        className="h-8 w-auto max-w-56 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
+                        className="h-8 w-auto max-w-32 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-56"
                       />
                     )}
 
@@ -3961,7 +3970,7 @@ function DebugChatPanelBody({
                         disabled={turnActive || starting}
                       >
                         <SelectTrigger
-                          className="h-8 w-auto max-w-40 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
+                          className="h-8 w-auto max-w-24 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-40"
                           title={
                             publicId
                               ? 'Choose the reasoning level for the next turn'
@@ -4003,7 +4012,7 @@ function DebugChatPanelBody({
                         }
                       >
                         <SelectTrigger
-                          className="h-8 w-auto max-w-48 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted"
+                          className="h-8 w-auto max-w-24 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-48"
                           title={
                             turnActive
                               ? 'Switch this running sandbox turn to Auto'
@@ -4060,7 +4069,7 @@ function DebugChatPanelBody({
                 onClick={stop}
                 size="icon"
                 variant="secondary"
-                className="rounded-full"
+                className="h-8 w-8 rounded-full md:h-9 md:w-9"
                 title="Stop generating"
                 aria-label="Stop generating"
               >
@@ -4077,7 +4086,7 @@ function DebugChatPanelBody({
                   (!publicId && providerOptions.length === 0)
                 }
                 size="icon"
-                className="rounded-full"
+                className="h-8 w-8 rounded-full md:h-9 md:w-9"
                 aria-label={
                   streaming ? 'Interrupt and send message' : 'Send message'
                 }

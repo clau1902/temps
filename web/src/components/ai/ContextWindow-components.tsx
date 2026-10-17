@@ -66,7 +66,13 @@ export function ContextWindow({
               />
             </svg>
           )}
-          {label}
+          <span
+            className={
+              percentage === null ? 'sr-only md:not-sr-only' : undefined
+            }
+          >
+            {label}
+          </span>
         </button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-80 space-y-4 p-4">

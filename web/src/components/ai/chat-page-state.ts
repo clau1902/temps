@@ -13,6 +13,8 @@ export function hasProjectScope<T extends { project_id?: number | null }>(
 }
 
 export const CHAT_COMPOSER_MIN_HEIGHT = 72
+/** One line of text: phones have no room for the two-line resting height. */
+export const CHAT_COMPOSER_COMPACT_MIN_HEIGHT = 40
 export const CHAT_COMPOSER_MAX_HEIGHT = 240
 
 export interface ChatComposerLayout {
@@ -42,11 +44,12 @@ export function chatComposerSubmitAction(
 
 /** Clamp the growing composer while preserving an internal scroll escape hatch. */
 export function resolveChatComposerLayout(
-  scrollHeight: number
+  scrollHeight: number,
+  minHeight: number = CHAT_COMPOSER_MIN_HEIGHT
 ): ChatComposerLayout {
   return {
     height: Math.min(
-      Math.max(scrollHeight, CHAT_COMPOSER_MIN_HEIGHT),
+      Math.max(scrollHeight, minHeight),
       CHAT_COMPOSER_MAX_HEIGHT
     ),
     overflowY: scrollHeight > CHAT_COMPOSER_MAX_HEIGHT ? 'auto' : 'hidden',
