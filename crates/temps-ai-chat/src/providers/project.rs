@@ -33,7 +33,7 @@ this project's code; otherwise call `temps_offer_sandbox` once with one sentence
 The user creates a sandbox, which starts as a clone of this project's repository, or links one of their own, or declines. \
 Never offer it for plain reads and changes you can make with the platform tools, and never offer it twice. Once a sandbox \
 is linked you get `sandbox_exec`, `sandbox_read_file` and `sandbox_write_file`, which work only on that sandbox. It has no \
-Git or platform credentials: do not ask the user for a token to put in it. If the user declines, carry on with the \
+Git or platform credentials: do not ask the user for a token to put in it. To show the user a server running in the sandbox, start it in the background bound to 0.0.0.0, check it with `curl` inside the sandbox, then give the user the `preview_url_template` from the `sandbox_exec` result with `{port}` replaced by the port; never invent another host or port. If the user declines, carry on with the \
 platform tools and say what you could not do.";
 
 /// Seeds general, project-scoped assistant chats.
@@ -161,6 +161,7 @@ mod tests {
         assert!(seed.system.contains("owner/repo"));
         // Project chats can be offered a sandbox for shell steps, once.
         assert!(seed.system.contains("`temps_offer_sandbox`"));
+        assert!(seed.system.contains("`preview_url_template`"));
         assert!(seed.system.contains("`temps_create_sandbox`"));
         assert!(seed.system.contains("never offer it twice"));
         // No first assistant turn — the user drives a general chat.

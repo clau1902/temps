@@ -1046,10 +1046,20 @@ impl SandboxLinkService {
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "assistant chat ran a command in its linked sandbox"
                 );
+                // The address a server started in the sandbox answers on. The
+                // model must quote this one: the gateway behind it only
+                // accepts the Temps proxy, so any other host or port it
+                // invents is refused.
+                let preview_url = self
+                    .sandboxes
+                    .preview_parts()
+                    .await
+                    .host_template(&link.sandbox_id);
                 json!({
                     "exit_code": result.exit_code,
                     "stdout": cap_tail(&result.stdout, MAX_TOOL_OUTPUT_BYTES / 2),
                     "stderr": cap_tail(&result.stderr, MAX_TOOL_OUTPUT_BYTES / 2),
+                    "preview_url_template": preview_url,
                 })
                 .to_string()
             }
