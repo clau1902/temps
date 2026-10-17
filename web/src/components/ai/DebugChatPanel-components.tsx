@@ -85,6 +85,7 @@ import {
 } from 'lucide-react'
 import {
   untrustedMarkdownImage,
+  untrustedMarkdownInlineUrl,
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -1555,6 +1556,7 @@ const markdownComponents: Components = {
   // with every other renderer of untrusted Markdown — see the module for why.
   ...untrustedMarkdownImage,
   ...untrustedMarkdownLink,
+  ...untrustedMarkdownInlineUrl,
 }
 
 /** Render one chunk of assistant prose as Markdown. */
