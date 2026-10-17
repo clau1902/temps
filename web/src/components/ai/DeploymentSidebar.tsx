@@ -21,11 +21,13 @@ import {
   FolderGit2,
   GitBranch,
   Layers,
+  Monitor,
   Rocket,
   X,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
+import { ChatPreviewTab } from './ChatPreviewTab'
 import { ChatResourcesTab } from './ChatResourcesTab'
 import { ProjectTab } from './ProjectTab'
 import type { ProjectRef } from './project-refs'
@@ -40,6 +42,9 @@ const MAX_TABS = 6
 
 /** The fixed tab that lists what the chat made. */
 const MADE_TAB = 'made'
+
+/** The fixed tab that shows the page the chat's sandbox is serving. */
+export const PREVIEW_TAB = 'preview'
 
 /** A tab beside the chat: a deployment it watches or a project the user opened. */
 export type SidebarTab =
@@ -340,7 +345,7 @@ export function DeploymentSidebar({
 
   const firstKey = conversationPublicId ? MADE_TAB : tabKey(tabs[0])
   const selectable = [
-    ...(conversationPublicId ? [MADE_TAB] : []),
+    ...(conversationPublicId ? [MADE_TAB, PREVIEW_TAB] : []),
     ...tabs.map(tabKey),
   ]
   return (
@@ -364,6 +369,12 @@ export function DeploymentSidebar({
               <TabsTrigger value={MADE_TAB} className="gap-1.5 text-xs">
                 <Layers className="size-3.5 shrink-0" />
                 Made here
+              </TabsTrigger>
+            )}
+            {conversationPublicId && (
+              <TabsTrigger value={PREVIEW_TAB} className="gap-1.5 text-xs">
+                <Monitor className="size-3.5 shrink-0" />
+                Preview
               </TabsTrigger>
             )}
             {tabs.map((tab) => (
@@ -408,6 +419,16 @@ export function DeploymentSidebar({
                 conversationPublicId={conversationPublicId}
                 onOpenProject={onOpenProject ?? (() => undefined)}
               />
+            </TabsContent>
+          )}
+          {conversationPublicId && (
+            // Kept mounted so switching tabs does not reload the app.
+            <TabsContent
+              value={PREVIEW_TAB}
+              forceMount
+              className="mt-0 h-full data-[state=inactive]:hidden"
+            >
+              <ChatPreviewTab conversationPublicId={conversationPublicId} />
             </TabsContent>
           )}
           {tabs.map((tab) => (

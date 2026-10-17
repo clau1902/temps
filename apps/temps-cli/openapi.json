@@ -7377,6 +7377,35 @@
         ],
         "type": "object"
       },
+      "ChatPreview": {
+        "description": "How to reach a page served from the chat's sandbox.",
+        "properties": {
+          "port": {
+            "description": "The port the assistant last confirmed serving a page, if it has.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "Address of that page, served by Temps.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url_template": {
+            "description": "Address for any port: `{port}` stands for the port number.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url_template"
+        ],
+        "type": "object"
+      },
       "ChatReadinessResponse": {
         "description": "What still has to be true before an AI chat can run a turn in this project.",
         "properties": {
@@ -7496,6 +7525,17 @@
           "offered": {
             "description": "True once the assistant has asked the user to link a sandbox.",
             "type": "boolean"
+          },
+          "preview": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ChatPreview",
+                "description": "Where the linked sandbox's apps are served, for the Preview tab."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "reason": {
             "description": "Why it cannot, when `configured` is false.",

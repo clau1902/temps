@@ -3422,6 +3422,24 @@ export type ChatMessage = {
 };
 
 /**
+ * How to reach a page served from the chat's sandbox.
+ */
+export type ChatPreview = {
+    /**
+     * The port the assistant last confirmed serving a page, if it has.
+     */
+    port?: number | null;
+    /**
+     * Address of that page, served by Temps.
+     */
+    url?: string | null;
+    /**
+     * Address for any port: `{port}` stands for the port number.
+     */
+    url_template: string;
+};
+
+/**
  * What still has to be true before an AI chat can run a turn in this project.
  */
 export type ChatReadinessResponse = {
@@ -3495,6 +3513,7 @@ export type ChatSandboxStatus = {
      * True once the assistant has asked the user to link a sandbox.
      */
     offered: boolean;
+    preview?: ChatPreview | null;
     /**
      * Why it cannot, when `configured` is false.
      */

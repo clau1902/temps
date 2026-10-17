@@ -9,6 +9,7 @@ import {
 } from '@/api/client'
 import {
   getAiProviderStatusOptions,
+  getChatSandboxOptions,
   getAiProviderStatusQueryKey,
   listProviderKeysQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -60,7 +61,7 @@ import {
 } from './attachment-previews'
 import { ChatSpend } from './ChatSpend'
 import { DebugChatPanel } from './DebugChatPanel'
-import { DeploymentSidebar } from './DeploymentSidebar'
+import { DeploymentSidebar, PREVIEW_TAB } from './DeploymentSidebar'
 import { resourceKeys, useChatResources } from './chat-resources'
 import { ProjectReferencesProvider } from './ProjectReference'
 import type { ProjectRef } from './project-refs'
@@ -758,6 +759,23 @@ export function AssistantThread({
     seenPieces.current = new Set(keys)
     if (seen && keys.some((piece) => !seen.has(piece))) setPanelOpen(true)
   }, [resources.data])
+  // The assistant confirming a page is being served shows it in the Preview
+  // tab; the port a chat already had when it was opened stays in the
+  // background.
+  const sandbox = useQuery(
+    getChatSandboxOptions({ path: { public_id: conversation.public_id } })
+  )
+  const previewPort = sandbox.data?.preview?.port ?? null
+  const seenPort = useRef<number | null | undefined>(undefined)
+  useEffect(() => {
+    if (!sandbox.data) return
+    const before = seenPort.current
+    seenPort.current = previewPort
+    if (before === undefined || previewPort === null || before === previewPort)
+      return
+    setFocus((current) => ({ key: PREVIEW_TAB, nonce: current.nonce + 1 }))
+    setPanelOpen(true)
+  }, [sandbox.data, previewPort])
   const panelRef = usePanelRef()
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
     id: 'assistant-deployment-split',

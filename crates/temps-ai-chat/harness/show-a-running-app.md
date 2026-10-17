@@ -14,7 +14,9 @@ sandbox.
    `nohup npm run dev -- -H 0.0.0.0 -p 3000 > /tmp/dev.log 2>&1 &`. A server
    bound to `localhost` cannot be reached from the preview.
 2. Call `sandbox_preview` with the port. It returns the address and checks that
-   the server is listening and answers HTTP.
+   the server is listening and answers HTTP. It also opens the page in the
+   chat's Preview tab beside the conversation, so call it every time you say a
+   page is running, even when you already know the address.
 3. When `ready` is true, give the user the `url` it returned. When it is false,
    do what `advice` says, then call it again. A dev server can need a few
    seconds to start.

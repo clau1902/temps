@@ -26,8 +26,8 @@ use utoipa::{OpenApi, ToSchema};
 use crate::audit::{AiSandboxLinkedAudit, AiSandboxUnlinkedAudit};
 use crate::handlers::{ensure_user_conversation_access, AppState};
 use crate::sandbox_link::{
-    context_supports_sandbox, link_from_metadata, project_for_new_sandbox, SandboxLink,
-    SandboxLinkError, SandboxLinkService,
+    context_supports_sandbox, link_from_metadata, preview_port_from_metadata,
+    project_for_new_sandbox, SandboxLink, SandboxLinkError, SandboxLinkService,
 };
 
 impl From<SandboxLinkError> for Problem {
@@ -71,6 +71,33 @@ pub struct ChatSandboxStatus {
     pub linked: Option<SandboxLink>,
     /// True once the assistant has asked the user to link a sandbox.
     pub offered: bool,
+    /// Where the linked sandbox's apps are served, for the Preview tab.
+    pub preview: Option<ChatPreview>,
+}
+
+/// How to reach a page served from the chat's sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ChatPreview {
+    /// The port the assistant last confirmed serving a page, if it has.
+    pub port: Option<u16>,
+    /// Address of that page, served by Temps.
+    pub url: Option<String>,
+    /// Address for any port: `{port}` stands for the port number.
+    pub url_template: String,
+}
+
+/// The preview of `link`, with the port the assistant last confirmed.
+fn preview_of(
+    parts: &temps_sandbox::services::PreviewUrlParts,
+    link: &SandboxLink,
+    metadata: Option<&serde_json::Value>,
+) -> ChatPreview {
+    let port = preview_port_from_metadata(metadata);
+    ChatPreview {
+        port,
+        url: port.map(|port| parts.url_for(&link.sandbox_id, port)),
+        url_template: parts.host_template(&link.sandbox_id),
+    }
 }
 
 /// Link an existing sandbox (`sandbox_id`) or create a new one (`create`).
@@ -132,6 +159,7 @@ fn status_of(
         setup_path: None,
         linked: link_from_metadata(metadata),
         offered: crate::sandbox_link::offered_in_metadata(metadata),
+        preview: None,
     }
 }
 
@@ -171,10 +199,15 @@ pub async fn get_chat_sandbox(
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
-    Ok(Json(status_of(
+    let mut status = status_of(
         availability(&state, &auth, &conversation.context_type),
         conversation.metadata.as_ref(),
-    )))
+    );
+    if let (Some(link), Some(sandboxes)) = (&status.linked, &state.application_sandboxes) {
+        let parts = sandboxes.preview_parts().await;
+        status.preview = Some(preview_of(&parts, link, conversation.metadata.as_ref()));
+    }
+    Ok(Json(status))
 }
 
 /// Link a sandbox to the chat, or create one for it. Replaces any earlier link.
@@ -272,6 +305,7 @@ pub async fn link_chat_sandbox(
         setup_path: None,
         linked: Some(link),
         offered: true,
+        preview: None,
     }))
 }
 
@@ -323,6 +357,7 @@ pub async fn unlink_chat_sandbox(
         setup_path: None,
         linked: None,
         offered: true,
+        preview: None,
     }))
 }
 
@@ -338,7 +373,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[derive(OpenApi)]
 #[openapi(
     paths(get_chat_sandbox, link_chat_sandbox, unlink_chat_sandbox),
-    components(schemas(ChatSandboxStatus, LinkSandboxRequest, SandboxLink))
+    components(schemas(ChatSandboxStatus, ChatPreview, LinkSandboxRequest, SandboxLink))
 )]
 pub struct SandboxLinkApiDoc;
 
@@ -378,6 +413,38 @@ mod tests {
             }),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn the_preview_names_the_confirmed_port_and_offers_a_template_for_any_other() {
+        let parts = temps_sandbox::services::PreviewUrlParts {
+            protocol: "http".into(),
+            domain: "example.test".into(),
+            port: Some(8080),
+        };
+        let link = SandboxLink {
+            sandbox_id: "sbx_deadbeef00001122".into(),
+            name: "scratch".into(),
+            linked_at: chrono::Utc::now(),
+        };
+        let confirmed = preview_of(
+            &parts,
+            &link,
+            Some(&json!({ "sandbox_preview_port": 3000 })),
+        );
+        assert_eq!(confirmed.port, Some(3000));
+        assert_eq!(
+            confirmed.url.as_deref(),
+            Some("http://ws-deadbeef00001122-3000.example.test:8080")
+        );
+        assert_eq!(
+            confirmed.url_template,
+            "http://ws-deadbeef00001122-{port}.example.test:8080"
+        );
+
+        let none = preview_of(&parts, &link, None);
+        assert!(none.port.is_none() && none.url.is_none());
+        assert!(none.url_template.contains("{port}"));
     }
 
     #[test]

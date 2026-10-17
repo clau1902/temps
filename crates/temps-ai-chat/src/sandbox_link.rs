@@ -42,6 +42,9 @@ use crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
 
 /// Key under `ai_conversations.metadata` that holds the link.
 pub const SANDBOX_LINK_KEY: &str = "sandbox_link";
+/// Key holding the last port the assistant confirmed serving a page in the
+/// linked sandbox. The chat's Preview tab shows it.
+pub const SANDBOX_PREVIEW_KEY: &str = "sandbox_preview_port";
 /// Key recording that the user has already been offered a sandbox in this chat.
 pub const SANDBOX_OFFERED_KEY: &str = "sandbox_offered_at";
 
@@ -145,6 +148,12 @@ pub struct SandboxLink {
 pub fn link_from_metadata(metadata: Option<&Value>) -> Option<SandboxLink> {
     let link = metadata?.get(SANDBOX_LINK_KEY)?;
     serde_json::from_value(link.clone()).ok()
+}
+
+/// The port the assistant last confirmed serving a page, if one is recorded.
+pub fn preview_port_from_metadata(metadata: Option<&Value>) -> Option<u16> {
+    let port = metadata?.get(SANDBOX_PREVIEW_KEY)?.as_u64()?;
+    u16::try_from(port).ok().filter(|port| *port >= 1)
 }
 
 pub(crate) fn offered_in_metadata(metadata: Option<&Value>) -> bool {
@@ -491,9 +500,10 @@ pub fn tools_for(
                 name: SANDBOX_PREVIEW_TOOL.to_string(),
                 description: "Get the address the user opens in their browser to see a server \
                     running in the sandbox, and check that the server is listening. Start the \
-                    server first, in the background and bound to 0.0.0.0. Always give the user \
-                    the URL this returns: it is served by Temps, so no tunnel or outside service \
-                    is ever needed."
+                    server first, in the background and bound to 0.0.0.0. Call this every time you \
+                    tell the user a page is running: it opens the page in the chat's Preview tab. \
+                    Always give the user the URL this returns: it is served by Temps, so no \
+                    tunnel or outside service is ever needed."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -738,6 +748,9 @@ impl SandboxLinkService {
         })?;
         self.merge_metadata_key(conversation, SANDBOX_LINK_KEY, &value)
             .await?;
+        // A port confirmed on the previous sandbox says nothing about this one.
+        self.remove_metadata_key(conversation, SANDBOX_PREVIEW_KEY)
+            .await?;
         info!(
             conversation_id = %conversation.public_id,
             sandbox_id = %link.sandbox_id,
@@ -752,6 +765,8 @@ impl SandboxLinkService {
         conversation: &ai_conversations::Model,
     ) -> Result<(), SandboxLinkError> {
         self.remove_metadata_key(conversation, SANDBOX_LINK_KEY)
+            .await?;
+        self.remove_metadata_key(conversation, SANDBOX_PREVIEW_KEY)
             .await?;
         info!(
             conversation_id = %conversation.public_id,
@@ -1225,6 +1240,11 @@ impl SandboxLinkService {
                     "stdout": cap_tail(&result.stdout, MAX_TOOL_OUTPUT_BYTES / 2),
                     "stderr": cap_tail(&result.stderr, MAX_TOOL_OUTPUT_BYTES / 2),
                     "preview_url_template": preview_url,
+                    "preview_note": format!(
+                        "To show the user a page, call `{SANDBOX_PREVIEW_TOOL}` with its port: it \
+                         checks the server and opens the page in the chat's Preview tab. Do not \
+                         fill in the template yourself."
+                    ),
                 })
                 .to_string()
             }
@@ -1287,7 +1307,32 @@ impl SandboxLinkService {
             .preview_parts()
             .await
             .url_for(&link.sandbox_id, port);
+        if scope == ListenScope::Reachable && status.is_some() {
+            self.remember_preview(conversation_id, port).await;
+        }
         preview_report(&url, port, scope, status)
+    }
+
+    /// Record the port the assistant just confirmed, for the Preview tab. The
+    /// tool result does not depend on it, so a failure is logged and dropped.
+    async fn remember_preview(&self, conversation_id: i64, port: u16) {
+        let conversation = match ai_conversations::Entity::find_by_id(conversation_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(conversation)) => conversation,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(conversation_id, port, error = %error, "could not load the chat to record its preview port");
+                return;
+            }
+        };
+        if let Err(error) = self
+            .merge_metadata_key(&conversation, SANDBOX_PREVIEW_KEY, &json!(port))
+            .await
+        {
+            warn!(conversation_id, port, error = %error, "could not record the chat's preview port");
+        }
     }
 
     async fn run_read(
@@ -1452,6 +1497,18 @@ mod tests {
         assert_eq!(listen_scope(PROC_TCP, 10000), ListenScope::Nothing);
         assert_eq!(listen_scope(PROC_TCP, 9999), ListenScope::Nothing);
         assert_eq!(listen_scope("", 3000), ListenScope::Nothing);
+    }
+
+    #[test]
+    fn the_recorded_preview_port_must_be_a_real_port() {
+        let port =
+            |value: Value| preview_port_from_metadata(Some(&json!({ SANDBOX_PREVIEW_KEY: value })));
+        assert_eq!(port(json!(3000)), Some(3000));
+        assert_eq!(port(json!(0)), None);
+        assert_eq!(port(json!(70000)), None);
+        assert_eq!(port(json!("3000")), None);
+        assert_eq!(preview_port_from_metadata(None), None);
+        assert_eq!(preview_port_from_metadata(Some(&json!({}))), None);
     }
 
     #[test]
