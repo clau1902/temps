@@ -42,6 +42,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../harness/build-an-app.md"),
     ),
     (
+        "connect-a-service.md",
+        include_str!("../harness/connect-a-service.md"),
+    ),
+    (
         "host-with-temps.md",
         include_str!("../harness/host-with-temps.md"),
     ),
@@ -337,6 +341,46 @@ mod tests {
         }
     }
 
+    /// The variable names the connect playbook promises are the ones the
+    /// service providers really hand to a deployment.
+    #[test]
+    fn connect_playbook_names_variables_the_providers_set() {
+        let providers: &[(&str, &str)] = &[
+            (
+                include_str!("../../temps-providers/src/externalsvc/postgres.rs"),
+                "POSTGRES_URL POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD",
+            ),
+            (
+                include_str!("../../temps-providers/src/externalsvc/redis.rs"),
+                "REDIS_URL REDIS_HOST REDIS_PORT REDIS_PASSWORD",
+            ),
+            (
+                include_str!("../../temps-providers/src/externalsvc/mongodb.rs"),
+                "MONGODB_HOST MONGODB_PORT MONGODB_DATABASE MONGODB_USERNAME MONGODB_PASSWORD",
+            ),
+            (
+                include_str!("../../temps-providers/src/externalsvc/s3.rs"),
+                "S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_REGION",
+            ),
+        ];
+        let playbook = all()
+            .iter()
+            .find(|playbook| playbook.name == "connect-a-service")
+            .expect("connect-a-service is embedded");
+        for (source, variables) in providers {
+            for variable in variables.split_whitespace() {
+                assert!(
+                    playbook.body.contains(variable),
+                    "the playbook does not mention {variable}"
+                );
+                assert!(
+                    source.contains(&format!("\"{variable}\"")),
+                    "{variable} is promised but no provider sets it"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_index_lists_only_what_applies() {
         let with_sandbox = applicable("assistant", &[SANDBOX_EXEC_TOOL, SANDBOX_PREVIEW_TOOL]);
@@ -344,10 +388,11 @@ mod tests {
         assert!(names.contains(&"show-a-running-app"));
         assert!(names.contains(&"build-an-app"));
         assert!(names.contains(&"host-with-temps"));
+        assert!(names.contains(&"connect-a-service"));
 
         let without = applicable("assistant", &[]);
         let names: Vec<&str> = without.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["host-with-temps"]);
+        assert_eq!(names, ["connect-a-service", "host-with-temps"]);
 
         // A chat type a playbook does not list never sees it.
         assert!(applicable("deployment", &[SANDBOX_EXEC_TOOL, SANDBOX_PREVIEW_TOOL]).is_empty());
