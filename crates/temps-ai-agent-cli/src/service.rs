@@ -8817,6 +8817,7 @@ mod tests {
                 content: "hello".into(),
                 tool_calls: None,
                 tool_call_id: None,
+                images: Vec::new(),
             }],
             ..Default::default()
         };

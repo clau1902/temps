@@ -2781,6 +2781,7 @@ impl ConversationService {
                 Some(metadata),
                 None,
                 Vec::new(),
+                Vec::new(),
                 None,
                 auth,
                 &request_metadata,
@@ -3900,6 +3901,10 @@ impl ConversationService {
         user_metadata: Option<serde_json::Value>,
         attachment_context: Option<&str>,
         sandbox_attachments: Vec<temps_ai::SandboxAttachment>,
+        // Images the user attached to THIS message, already checked against the
+        // chat's model. They ride on the in-memory user message only; the stored
+        // row keeps the attachment reference, never the bytes.
+        message_images: Vec<temps_ai::ChatImage>,
         // Optional client-supplied description of what the user is currently
         // viewing in the console (the page/entity). It is NOT persisted and NOT
         // shown in history — it's prepended to the user's message in-memory for
@@ -4141,6 +4146,14 @@ impl ConversationService {
                         persisted_attachment_prompt_context(m.metadata.as_ref(), &conv.public_id)
                     {
                         content = format!("{context}\n\n{content}");
+                    } else if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+                        // Assistant files are not mounted anywhere and are not
+                        // resent, so the model is only told that they existed.
+                        if let Some(note) =
+                            crate::attachments::earlier_attachment_note(m.metadata.as_ref())
+                        {
+                            content = format!("{note}\n\n{content}");
+                        }
                     }
                 }
                 ChatMessage {
@@ -4221,6 +4234,15 @@ impl ConversationService {
                 .find(|message| message.role == "user")
             {
                 last_user.content = format!("{attachments}\n\n{}", last_user.content);
+            }
+        }
+        if !message_images.is_empty() {
+            if let Some(last_user) = messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.role == "user")
+            {
+                last_user.images = message_images;
             }
         }
 
@@ -5897,6 +5919,7 @@ impl ConversationService {
                     content: round_text,
                     tool_calls: Some(round_calls.clone()),
                     tool_call_id: None,
+                    images: Vec::new(),
                 });
                 for (call_index, tc) in round_calls.iter().enumerate() {
                     // Route the ADR-024 `temps` CLI tool to the API-tools provider;

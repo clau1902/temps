@@ -309,6 +309,18 @@ fn message_to_json(m: &ChatMessage) -> serde_json::Value {
             "tool_calls": calls,
         });
     }
+    if !m.images.is_empty() {
+        // OpenAI content parts. Every gateway adapter translates `image_url`
+        // data URLs into its provider's native image block.
+        let mut parts = vec![serde_json::json!({ "type": "text", "text": m.content })];
+        parts.extend(m.images.iter().map(|image| {
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": image.data_url() },
+            })
+        }));
+        return serde_json::json!({ "role": m.role, "content": parts });
+    }
     serde_json::json!({ "role": m.role, "content": m.content })
 }
 
@@ -1470,6 +1482,7 @@ mod tests {
                 arguments: "{}".into(),
             }]),
             tool_call_id: None,
+            images: Vec::new(),
         };
         let j = message_to_json(&asst);
         assert_eq!(j["role"], "assistant");
@@ -1483,6 +1496,31 @@ mod tests {
         assert_eq!(j["role"], "user");
         assert_eq!(j["content"], "hi");
         assert!(j.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn user_images_become_openai_content_parts_with_data_urls() {
+        let message = ChatMessage {
+            images: vec![temps_ai::ChatImage {
+                media_type: "image/png".into(),
+                base64: "aGVsbG8=".into(),
+            }],
+            ..ChatMessage::user("what is this?")
+        };
+        let j = message_to_json(&message);
+        assert_eq!(j["role"], "user");
+        assert_eq!(j["content"][0]["type"], "text");
+        assert_eq!(j["content"][0]["text"], "what is this?");
+        assert_eq!(j["content"][1]["type"], "image_url");
+        assert_eq!(
+            j["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+
+        // The payload never reaches a log line through Debug.
+        let rendered = format!("{message:?}");
+        assert!(!rendered.contains("aGVsbG8="), "{rendered}");
+        assert!(rendered.contains("base64_len"));
     }
 
     /// When no BYOK provider key resolves a model but the instance has an active

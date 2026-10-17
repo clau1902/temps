@@ -85,6 +85,8 @@ pub struct AppState {
     pub applications: Arc<ApplicationService>,
     /// Goals the assistant is watching for each chat.
     pub goals: Arc<crate::goals::GoalService>,
+    /// Files and images attached to assistant chats, which have no workspace.
+    pub assistant_attachments: Arc<crate::attachments::AssistantAttachmentService>,
     pub project_service: Arc<temps_projects::ProjectService>,
     /// Derives the durable, Temps-owned directory mounted into an application
     /// harness sandbox. This never accepts a browser-supplied host path.
@@ -1257,6 +1259,47 @@ impl From<ChatError> for Problem {
                 problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
                     .with_title("Permission Decision Mismatch")
                     .with_detail(e.to_string())
+            }
+        }
+    }
+}
+
+impl From<crate::attachments::AttachmentError> for Problem {
+    fn from(error: crate::attachments::AttachmentError) -> Self {
+        use crate::attachments::AttachmentError;
+        match error {
+            AttachmentError::Empty { .. }
+            | AttachmentError::TooMany { .. }
+            | AttachmentError::Duplicate { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Attachment")
+                .with_detail(error.to_string()),
+            AttachmentError::TooLarge { .. } | AttachmentError::TooMuchText { .. } => {
+                problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Attachment Too Large")
+                    .with_detail(error.to_string())
+            }
+            AttachmentError::Unsupported { .. } => {
+                problemdetails::new(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+                    .with_title("Unsupported Attachment")
+                    .with_detail(error.to_string())
+            }
+            AttachmentError::QuotaExceeded { .. } | AttachmentError::ModelCannotSeeImages { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title(match &error {
+                        AttachmentError::ModelCannotSeeImages { .. } => {
+                            "Model Cannot Read Images"
+                        }
+                        _ => "Attachment Quota Reached",
+                    })
+                    .with_detail(error.to_string())
+            }
+            AttachmentError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Attachment Not Found")
+                .with_detail(error.to_string()),
+            AttachmentError::Database { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
             }
         }
     }
@@ -7697,6 +7740,7 @@ pub async fn send_message(
             None,
             None,
             Vec::new(),
+            Vec::new(),
             page_context,
             &auth,
             &metadata,
@@ -7828,19 +7872,32 @@ pub async fn send_user_message(
             req.ai_permission_mode.as_deref(),
         )
         .await?;
-    let attachments =
-        resolve_chat_attachments(&state, &auth, &conversation, &req.attachments).await?;
+    let ResolvedAttachments {
+        responses: attachments,
+        context: attachment_context,
+        sandbox: sandbox_attachments,
+        images: message_images,
+    } = if conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+        resolve_assistant_attachments(&state, &conversation, &req.attachments).await?
+    } else {
+        let attachments =
+            resolve_chat_attachments(&state, &auth, &conversation, &req.attachments).await?;
+        ResolvedAttachments {
+            context: attachment_prompt_context(&attachments),
+            sandbox: attachments
+                .iter()
+                .map(|attachment| temps_ai::SandboxAttachment {
+                    name: attachment.name.clone(),
+                    bytes: Arc::from(attachment.contents.clone()),
+                    is_image: attachment.is_image,
+                })
+                .collect(),
+            responses: attachments,
+            images: Vec::new(),
+        }
+    };
     let attachment_metadata =
         (!attachments.is_empty()).then(|| serde_json::json!({ "attachments": attachments }));
-    let attachment_context = attachment_prompt_context(&attachments);
-    let sandbox_attachments = attachments
-        .iter()
-        .map(|attachment| temps_ai::SandboxAttachment {
-            name: attachment.name.clone(),
-            bytes: Arc::from(attachment.contents.clone()),
-            is_image: attachment.is_image,
-        })
-        .collect();
     let page_context = req
         .page_context
         .as_deref()
@@ -7860,6 +7917,7 @@ pub async fn send_user_message(
             attachment_metadata,
             attachment_context.as_deref(),
             sandbox_attachments,
+            message_images,
             page_context,
             &auth,
             &metadata,
@@ -7878,6 +7936,13 @@ pub async fn send_user_message(
             );
         }
         return Err(error.into());
+    }
+    if conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+        let ids: Vec<String> = req.attachments.iter().map(|a| a.id.clone()).collect();
+        state
+            .assistant_attachments
+            .mark_sent(conversation.id, &ids)
+            .await;
     }
     info!(
         component = "ai_turn_timing",
@@ -8046,6 +8111,67 @@ async fn resolve_chat_attachments(
     Ok(attachments)
 }
 
+/// Everything a send needs from the files a message refers to.
+struct ResolvedAttachments {
+    responses: Vec<ChatAttachmentResponse>,
+    context: Option<String>,
+    sandbox: Vec<temps_ai::SandboxAttachment>,
+    images: Vec<temps_ai::ChatImage>,
+}
+
+/// Resolve the files of an assistant message from the database store, and
+/// refuse images the chat's model cannot read. Text files are quoted into the
+/// prompt; images travel as image parts. Nothing is mounted in a sandbox.
+async fn resolve_assistant_attachments(
+    state: &AppState,
+    conversation: &ai_conversations::Model,
+    references: &[ChatAttachmentReference],
+) -> Result<ResolvedAttachments, Problem> {
+    let references: Vec<(String, String)> = references
+        .iter()
+        .map(|reference| (reference.id.clone(), reference.name.clone()))
+        .collect();
+    let loaded = state
+        .assistant_attachments
+        .load_for_message(conversation.id, &references)
+        .await?;
+    if loaded.is_empty() {
+        return Ok(ResolvedAttachments {
+            responses: Vec::new(),
+            context: None,
+            sandbox: Vec::new(),
+            images: Vec::new(),
+        });
+    }
+    let support = state
+        .assistant_attachments
+        .image_support(&conversation.ai_provider, Some(&conversation.ai_model))
+        .await;
+    crate::attachments::ensure_images_readable(&loaded, support, &conversation.ai_model)?;
+    let context = crate::attachments::prompt_context(&loaded)?;
+    let responses = loaded
+        .iter()
+        .map(|attachment| ChatAttachmentResponse {
+            id: attachment.public_id.clone(),
+            name: attachment.name.clone(),
+            mime_type: attachment.mime_type.clone(),
+            size_bytes: attachment.bytes.len() as u64,
+            sandbox_path: String::new(),
+            is_image: matches!(
+                attachment.kind,
+                crate::attachments::AttachmentKind::Image { .. }
+            ),
+            contents: Vec::new(),
+        })
+        .collect();
+    Ok(ResolvedAttachments {
+        responses,
+        context,
+        sandbox: Vec::new(),
+        images: crate::attachments::chat_images(&loaded),
+    })
+}
+
 fn attachment_prompt_context(attachments: &[ChatAttachmentResponse]) -> Option<String> {
     if attachments.is_empty() {
         return None;
@@ -8066,7 +8192,7 @@ fn attachment_prompt_context(attachments: &[ChatAttachmentResponse]) -> Option<S
     post, tag = "AI Chat", path = "/ai/conversations/{public_id}/attachments",
     params(("public_id" = String, Path,)),
     request_body(content = ChatAttachmentUpload, content_type = "multipart/form-data"),
-    responses((status = 201, body = ChatAttachmentResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413)),
+    responses((status = 201, body = ChatAttachmentResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 409), (status = 413), (status = 415)),
     security(("bearer_auth" = []))
 )]
 pub async fn upload_user_conversation_attachment(
@@ -8077,28 +8203,35 @@ pub async fn upload_user_conversation_attachment(
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<ChatAttachmentResponse>), Problem> {
     permission_guard!(auth, ProjectsRead);
-    permission_guard!(auth, SandboxesWrite);
     deny_deployment_token!(auth);
     let conversation = state
         .service
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_mutation_access(&state, &auth, &conversation).await?;
-    ensure_application_conversation_permission(
-        &state,
-        &auth,
-        &conversation,
-        &Permission::SandboxesWrite,
-    )
-    .await?;
-    ensure_application_conversation_permission(
-        &state,
-        &auth,
-        &conversation,
-        &Permission::ProjectsWrite,
-    )
-    .await?;
-    let workspace_id = conversation_workspace_id(&state, &auth, &conversation).await?;
+    // Assistant chats keep their files in the database and never touch a
+    // sandbox, so they need no sandbox permission; every other chat does.
+    let assistant = conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
+    let workspace_id = if assistant {
+        None
+    } else {
+        permission_guard!(auth, SandboxesWrite);
+        ensure_application_conversation_permission(
+            &state,
+            &auth,
+            &conversation,
+            &Permission::SandboxesWrite,
+        )
+        .await?;
+        ensure_application_conversation_permission(
+            &state,
+            &auth,
+            &conversation,
+            &Permission::ProjectsWrite,
+        )
+        .await?;
+        Some(conversation_workspace_id(&state, &auth, &conversation).await?)
+    };
 
     let field = multipart
         .next_field()
@@ -8155,6 +8288,32 @@ pub async fn upload_user_conversation_attachment(
             ));
     }
 
+    let Some(workspace_id) = workspace_id else {
+        let stored = state
+            .assistant_attachments
+            .store(conversation.id, &name, bytes.to_vec())
+            .await?;
+        state
+            .audit(&ConversationAttachmentUploadedAudit {
+                context: audit_context(&auth, &metadata),
+                conversation_id: conversation.public_id.clone(),
+                attachment_id: stored.public_id.clone(),
+                size_bytes: stored.size_bytes as u64,
+            })
+            .await;
+        return Ok((
+            StatusCode::CREATED,
+            Json(ChatAttachmentResponse {
+                id: stored.public_id,
+                name: stored.name,
+                is_image: stored.mime_type.starts_with("image/"),
+                mime_type: stored.mime_type,
+                size_bytes: stored.size_bytes as u64,
+                sandbox_path: String::new(),
+                contents: Vec::new(),
+            }),
+        ));
+    };
     let attachment_id = format!("att_{}", uuid::Uuid::new_v4().simple());
     state
         .application_workspaces
@@ -8207,13 +8366,20 @@ pub async fn get_user_conversation_attachment(
     Query(query): Query<ChatAttachmentContentQuery>,
 ) -> Result<Response, Problem> {
     permission_guard!(auth, ProjectsRead);
-    permission_guard!(auth, SandboxesRead);
     deny_deployment_token!(auth);
     let conversation = state
         .service
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    if conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+        let stored = state
+            .assistant_attachments
+            .read(conversation.id, &attachment_id)
+            .await?;
+        return attachment_http_response(&stored.name, &stored.mime_type, stored.content);
+    }
+    permission_guard!(auth, SandboxesRead);
     let workspace_id = conversation_workspace_id(&state, &auth, &conversation).await?;
     let name = sanitized_attachment_name(Some(&query.name));
     if name != query.name {
@@ -8233,8 +8399,18 @@ pub async fn get_user_conversation_attachment(
         )
         .await?;
     let mime_type = attachment_mime_type(&name, None);
+    attachment_http_response(&name, &mime_type, bytes)
+}
+
+/// Serve stored attachment bytes. Only the four image types the chat accepts
+/// are shown inline; everything else downloads, and nothing is sniffed.
+fn attachment_http_response(
+    name: &str,
+    mime_type: &str,
+    bytes: Vec<u8>,
+) -> Result<Response, Problem> {
     let safe_inline_image = matches!(
-        mime_type.as_str(),
+        mime_type,
         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
     );
     let disposition = if safe_inline_image {
@@ -8245,7 +8421,7 @@ pub async fn get_user_conversation_attachment(
     let mut response = Response::new(Body::from(bytes));
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(&mime_type).map_err(|error| {
+        HeaderValue::from_str(mime_type).map_err(|error| {
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Invalid Attachment Content Type")
                 .with_detail(format!(

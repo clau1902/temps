@@ -11,6 +11,7 @@
 //! foundation; the AI is injected as `Arc<dyn AiService>`.
 
 pub mod applications;
+pub mod attachments;
 pub mod audit;
 pub mod git_bindings;
 pub mod git_bindings_handlers;

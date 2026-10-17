@@ -101,6 +101,11 @@ impl TempsPlugin for AiChatPlugin {
             let goals = Arc::new(crate::goals::GoalService::new(db.clone()));
             context.register_service(goals.clone());
 
+            let assistant_attachments = Arc::new(
+                crate::attachments::AssistantAttachmentService::new(db.clone()),
+            );
+            context.register_service(assistant_attachments.clone());
+
             let applications = Arc::new(crate::ApplicationService::new(db.clone()));
             context.register_service(applications.clone());
 
@@ -287,6 +292,7 @@ impl TempsPlugin for AiChatPlugin {
                 pending_actions,
                 applications,
                 goals,
+                assistant_attachments,
                 project_service,
                 application_workspaces,
                 config_service,
@@ -335,6 +341,7 @@ impl TempsPlugin for AiChatPlugin {
             pending_actions: old.pending_actions.clone(),
             applications: old.applications.clone(),
             goals: old.goals.clone(),
+            assistant_attachments: old.assistant_attachments.clone(),
             project_service: old.project_service.clone(),
             application_workspaces: old.application_workspaces.clone(),
             config_service: old.config_service.clone(),
