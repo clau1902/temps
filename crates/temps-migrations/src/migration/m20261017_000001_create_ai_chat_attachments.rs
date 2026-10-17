@@ -54,7 +54,11 @@ impl MigrationTrait for Migration {
                             .big_integer()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(AiChatAttachments::Content).binary().not_null())
+                    .col(
+                        ColumnDef::new(AiChatAttachments::Content)
+                            .binary()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(AiChatAttachments::SentAt).timestamp_with_time_zone())
                     .col(
                         ColumnDef::new(AiChatAttachments::CreatedAt)

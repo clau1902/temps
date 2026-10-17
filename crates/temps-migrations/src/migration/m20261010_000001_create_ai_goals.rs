@@ -36,7 +36,11 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .unique_key(),
                     )
-                    .col(ColumnDef::new(AiGoals::ConversationId).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(AiGoals::ConversationId)
+                            .big_integer()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(AiGoals::OwnerUserId).integer().not_null())
                     .col(ColumnDef::new(AiGoals::Title).string_len(200).not_null())
                     .col(
@@ -44,7 +48,11 @@ impl MigrationTrait for Migration {
                             .string_len(200)
                             .not_null(),
                     )
-                    .col(ColumnDef::new(AiGoals::CheckParams).json_binary().not_null())
+                    .col(
+                        ColumnDef::new(AiGoals::CheckParams)
+                            .json_binary()
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(AiGoals::SuccessPath)
                             .string_len(200)
