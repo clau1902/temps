@@ -981,8 +981,14 @@ pub(crate) fn extract_type_and_enum(schema: Option<&RefOr<Schema>>) -> (String, 
 }
 
 fn extract_schema_type_and_enum(schema: &Schema) -> (String, Vec<String>) {
-    let Schema::Object(obj) = schema else {
-        return ("string".to_string(), vec![]);
+    let obj = match schema {
+        Schema::Object(obj) => obj,
+        // A list field (`Vec<T>`) is its own schema kind, not an object.
+        // Reporting it as a string made the CLI keep `--files '[...]'` as
+        // opaque text, which the validator accepted and the API then refused
+        // ("invalid type: string ..., expected a sequence").
+        Schema::Array(_) => return ("array".to_string(), vec![]),
+        _ => return ("string".to_string(), vec![]),
     };
 
     let ty = schema_type_to_string(&obj.schema_type);
@@ -1644,6 +1650,87 @@ mod tests {
         assert!(service_type.required);
         assert_eq!(service_type.ty, "string");
         assert_eq!(service_type.enum_values, vec!["postgres", "redis"]);
+    }
+
+    /// A list-of-objects body field (`files` of `commit_repository_files`) must
+    /// be typed `array`. Typed `string`, the CLI kept the model's JSON as text
+    /// and the API rejected it as "expected a sequence".
+    #[test]
+    fn write_allowlist_types_a_list_body_field_as_an_array() {
+        use utoipa::openapi::{
+            path::{HttpMethod, OperationBuilder, PathItem, PathsBuilder},
+            request_body::RequestBodyBuilder,
+            schema::{ArrayBuilder, ComponentsBuilder},
+            ContentBuilder, OpenApiBuilder,
+        };
+
+        let file = ObjectBuilder::new()
+            .property(
+                "path",
+                ObjectBuilder::new().schema_type(SchemaType::Type(Type::String)),
+            )
+            .required("path")
+            .build();
+        let request = ObjectBuilder::new()
+            .property(
+                "files",
+                ArrayBuilder::new().items(RefOr::Ref(utoipa::openapi::Ref::from_schema_name(
+                    "CommitFile",
+                ))),
+            )
+            .required("files")
+            .property(
+                "message",
+                ObjectBuilder::new().schema_type(SchemaType::Type(Type::String)),
+            )
+            .build();
+        let api = OpenApiBuilder::new()
+            .paths(
+                PathsBuilder::new()
+                    .path(
+                        "/commits",
+                        PathItem::new(
+                            HttpMethod::Post,
+                            OperationBuilder::new()
+                                .operation_id(Some("commit_files"))
+                                .request_body(Some(
+                                    RequestBodyBuilder::new()
+                                        .content(
+                                            "application/json",
+                                            ContentBuilder::new()
+                                                .schema(Some(RefOr::Ref(
+                                                    utoipa::openapi::Ref::from_schema_name(
+                                                        "CommitRequest",
+                                                    ),
+                                                )))
+                                                .build(),
+                                        )
+                                        .build(),
+                                ))
+                                .build(),
+                        ),
+                    )
+                    .build(),
+            )
+            .components(Some(
+                ComponentsBuilder::new()
+                    .schema("CommitFile", file)
+                    .schema("CommitRequest", request)
+                    .build(),
+            ))
+            .build();
+
+        let index = ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["commit_files"]);
+        let op = index.get("commit_files").expect("commit_files");
+        let files = op.params.iter().find(|p| p.name == "files").expect("files");
+        assert_eq!(files.ty, "array");
+        assert!(files.required);
+        let message = op
+            .params
+            .iter()
+            .find(|p| p.name == "message")
+            .expect("message");
+        assert_eq!(message.ty, "string");
     }
 
     #[test]
