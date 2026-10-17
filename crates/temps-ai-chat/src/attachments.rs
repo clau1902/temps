@@ -49,7 +49,9 @@ const ATTACHMENT_ID_PREFIX: &str = "att_";
 pub enum AttachmentError {
     #[error("Attachment '{name}' is empty")]
     Empty { name: String },
-    #[error("Attachment '{name}' is {size_bytes} bytes; the limit for {kind} is {limit_bytes} bytes")]
+    #[error(
+        "Attachment '{name}' is {size_bytes} bytes; the limit for {kind} is {limit_bytes} bytes"
+    )]
     TooLarge {
         name: String,
         size_bytes: usize,
@@ -88,7 +90,9 @@ pub enum AttachmentError {
          quoted into one message. Attach fewer or smaller files"
     )]
     TooMuchText { bytes: usize, limit_bytes: usize },
-    #[error("Database error while handling attachments of conversation {conversation_id}: {source}")]
+    #[error(
+        "Database error while handling attachments of conversation {conversation_id}: {source}"
+    )]
     Database {
         conversation_id: i64,
         #[source]
@@ -193,8 +197,7 @@ pub fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
         Some("image/jpeg")
     } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         Some("image/gif")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
-    {
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
         Some("image/webp")
     } else {
         None
@@ -360,7 +363,12 @@ impl AssistantAttachmentService {
         let held_bytes: Option<Option<i64>> = ai_chat_attachments::Entity::find()
             .select_only()
             .column_as(
-                sea_orm::sea_query::Expr::col(ai_chat_attachments::Column::SizeBytes).sum(),
+                // Postgres sums BIGINT into NUMERIC, which does not decode as
+                // an i64; cast it back down.
+                sea_orm::sea_query::SimpleExpr::from(sea_orm::sea_query::Func::cast_as(
+                    sea_orm::sea_query::Expr::col(ai_chat_attachments::Column::SizeBytes).sum(),
+                    sea_orm::sea_query::Alias::new("BIGINT"),
+                )),
                 "total",
             )
             .filter(ai_chat_attachments::Column::ConversationId.eq(conversation_id))
@@ -614,7 +622,10 @@ mod tests {
 
         for binary in [&b"%PDF-1.7\x00\x01"[..], &[0x80, 0x81, 0x82][..]] {
             let error = classify("doc.pdf", binary).unwrap_err();
-            assert!(matches!(error, AttachmentError::Unsupported { .. }), "{error}");
+            assert!(
+                matches!(error, AttachmentError::Unsupported { .. }),
+                "{error}"
+            );
             assert!(error.to_string().contains("doc.pdf"));
         }
 
@@ -636,9 +647,8 @@ mod tests {
 
     #[test]
     fn image_support_follows_the_catalogue() {
-        let modalities = |items: &[&str]| -> Vec<String> {
-            items.iter().map(|item| item.to_string()).collect()
-        };
+        let modalities =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|item| item.to_string()).collect() };
         assert_eq!(
             ImageSupport::from_input_modalities(&modalities(&["text", "image"])),
             ImageSupport::Yes
@@ -663,7 +673,10 @@ mod tests {
             "vendor/text-only",
         )
         .unwrap_err();
-        assert!(matches!(error, AttachmentError::ModelCannotSeeImages { .. }));
+        assert!(matches!(
+            error,
+            AttachmentError::ModelCannotSeeImages { .. }
+        ));
         assert!(error.to_string().contains("vendor/text-only"));
         assert!(error.to_string().contains("shot.png"));
 
@@ -707,10 +720,7 @@ mod tests {
     #[test]
     fn too_much_text_in_one_message_is_refused() {
         let chunk = vec![b'x'; MAX_TEXT_ATTACHMENT_BYTES];
-        let attachments = [
-            loaded("a.txt", &chunk),
-            loaded("b.txt", &chunk),
-        ];
+        let attachments = [loaded("a.txt", &chunk), loaded("b.txt", &chunk)];
         let error = prompt_context(&attachments).unwrap_err();
         assert!(matches!(error, AttachmentError::TooMuchText { .. }));
     }
