@@ -112,6 +112,7 @@ import {
   ASSISTANT_CONTEXT_TYPE,
   saveLastAssistantModel,
 } from './assistant-state'
+import { useAssistantImageSupport } from './assistant-model-hooks'
 import {
   chatDraftStorageKey,
   chatHarnessProviderOptions,
@@ -151,6 +152,12 @@ import {
   projectCollectionFromTool,
 } from './tool-result-presentation'
 import {
+  ASSISTANT_ATTACHMENT_LIMITS,
+  WORKSPACE_ATTACHMENT_LIMITS,
+  assistantAttachTitle,
+  assistantAttachmentAccept,
+  assistantImageError,
+  attachHint,
   attachmentSelectionError,
   createPendingAttachment,
   revokeAttachmentPreviews,
@@ -1966,13 +1973,15 @@ function DebugChatPanelBody({
 }: DebugChatPanelProps) {
   const chatDetail = useChatDetail()
   const platformFeatures = usePlatformFeatures()
-  // The server refuses attachments on assistant chats (they have no
-  // workspace to store them in), so the control says so instead of offering an
-  // upload that can only fail.
-  const attachmentsSupportedHere = contextType !== ASSISTANT_CONTEXT_TYPE
+  // Assistant chats keep their files in the database, so they do not need
+  // persistent workspace storage; images additionally depend on the model.
+  const isAssistantChat = contextType === ASSISTANT_CONTEXT_TYPE
   const persistentAttachments =
-    attachmentsSupportedHere &&
+    isAssistantChat ||
     persistentWorkspaceStorageSupported(platformFeatures.data)
+  const attachmentLimits = isAssistantChat
+    ? ASSISTANT_ATTACHMENT_LIMITS
+    : WORKSPACE_ATTACHMENT_LIMITS
   const paths = chatApiPaths(userScoped, projectId)
   const base = paths.conversations
   const ctxId = String(contextId)
@@ -2015,6 +2024,10 @@ function DebugChatPanelBody({
       thinkingOptionId: null,
       permissionModeId: null,
     })
+  const modelImageSupport = useAssistantImageSupport(
+    isAssistantChat,
+    runtimeSelection.modelId
+  )
   const selectedProvider = runtimeSelection.providerId
   const selectedProviderOption = providerOptions.find(
     (provider) => provider.id === selectedProvider
@@ -2678,10 +2691,15 @@ function DebugChatPanelBody({
       }
       const selected = Array.from(files)
       if (selected.length === 0) return
-      const selectionError = attachmentSelectionError(
-        selected,
-        pendingAttachmentsRef.current.length
-      )
+      const selectionError =
+        attachmentSelectionError(
+          selected,
+          pendingAttachmentsRef.current.length,
+          attachmentLimits
+        ) ??
+        (isAssistantChat
+          ? assistantImageError(selected, modelImageSupport)
+          : null)
       if (selectionError) {
         setError(
           localChatFailure(
@@ -2740,7 +2758,14 @@ function DebugChatPanelBody({
       attachmentUploadLock.current = false
       if (attachmentInputRef.current) attachmentInputRef.current.value = ''
     },
-    [persistentAttachments, publicId, userScoped]
+    [
+      attachmentLimits,
+      isAssistantChat,
+      modelImageSupport,
+      persistentAttachments,
+      publicId,
+      userScoped,
+    ]
   )
 
   const removePendingAttachment = useCallback((id: string) => {
@@ -3643,8 +3668,7 @@ function DebugChatPanelBody({
         >
           {userScoped && publicId && persistentAttachments && (
             <p className="px-3 pt-2 text-xs text-muted-foreground">
-              Attach, drop, or paste images and files · up to 8 files, 20 MB
-              each
+              {attachHint(isAssistantChat, modelImageSupport, attachmentLimits)}
             </p>
           )}
           {(pendingAttachments.length > 0 || attachmentUploads > 0) && (
@@ -3695,6 +3719,11 @@ function DebugChatPanelBody({
                 ref={attachmentInputRef}
                 type="file"
                 multiple
+                accept={
+                  isAssistantChat
+                    ? assistantAttachmentAccept(modelImageSupport)
+                    : undefined
+                }
                 disabled={!persistentAttachments}
                 className="sr-only"
                 onChange={(event) => void uploadAttachments(event.target.files)}
@@ -3709,13 +3738,17 @@ function DebugChatPanelBody({
                   !userScoped ||
                   !publicId ||
                   attachmentUploads > 0 ||
-                  pendingAttachments.length >= 8
+                  pendingAttachments.length >= attachmentLimits.maxFiles
                 }
                 onClick={() => attachmentInputRef.current?.click()}
                 aria-label="Attach files or images"
                 title={
-                  !attachmentsSupportedHere
-                    ? 'The Temps assistant can\u2019t take files or images yet. Describe what you see, or paste the relevant text.'
+                  isAssistantChat
+                    ? assistantAttachTitle(
+                        modelImageSupport,
+                        attachmentLimits,
+                        Boolean(publicId)
+                      )
                     : platformFeatures.data === undefined
                       ? 'Loading file attachment capabilities'
                       : !persistentAttachments

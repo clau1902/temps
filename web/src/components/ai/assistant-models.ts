@@ -70,6 +70,23 @@ export function lacksToolCalling(option: AssistantModelOption): boolean {
   return option.details.supports_tools === false
 }
 
+/**
+ * Whether the catalogue says a model reads images. `unknown` is a catalogue
+ * that lists no input modalities; the model is given the benefit of the doubt
+ * and the server has the final say.
+ */
+export type ImageSupport = 'yes' | 'no' | 'unknown'
+
+export function imageSupport(
+  details: AssistantModelDetails | null | undefined
+): ImageSupport {
+  const modalities = details?.input_modalities ?? []
+  if (modalities.length === 0) return 'unknown'
+  return modalities.some((modality) => modality.toLowerCase() === 'image')
+    ? 'yes'
+    : 'no'
+}
+
 const MODALITY_LABELS: Record<string, string> = {
   text: 'Text',
   image: 'Image',

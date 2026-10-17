@@ -9,6 +9,7 @@ import {
   formatContextLength,
   formatModalities,
   formatPricePerMillion,
+  imageSupport,
   lacksToolCalling,
   modelDisplayName,
   type AssistantModelRow,
@@ -165,5 +166,20 @@ describe('modelDisplayName', () => {
     expect(modelDisplayName(options, 'a/one')).toBe('One')
     expect(modelDisplayName(options, 'x/other')).toBe('x/other')
     expect(modelDisplayName(options, null)).toBeNull()
+  })
+})
+
+describe('imageSupport', () => {
+  it('follows the catalogue input modalities', () => {
+    expect(imageSupport({ input_modalities: ['text', 'image'] })).toBe('yes')
+    expect(imageSupport({ input_modalities: ['TEXT', 'Image'] })).toBe('yes')
+    expect(imageSupport({ input_modalities: ['text'] })).toBe('no')
+  })
+
+  it('gives a model the catalogue is silent about the benefit of the doubt', () => {
+    expect(imageSupport({ input_modalities: [] })).toBe('unknown')
+    expect(imageSupport({})).toBe('unknown')
+    expect(imageSupport(null)).toBe('unknown')
+    expect(imageSupport(undefined)).toBe('unknown')
   })
 })

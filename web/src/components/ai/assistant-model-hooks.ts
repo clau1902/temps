@@ -12,18 +12,23 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback, useMemo, useState } from 'react'
-import { assistantModelOptions } from './assistant-models'
+import {
+  assistantModelOptions,
+  imageSupport,
+  type ImageSupport,
+} from './assistant-models'
 import {
   loadLastAssistantModel,
   saveLastAssistantModel,
 } from './assistant-state'
 
 /** The gateway key the assistant runs on: the active OpenRouter key if there is one. */
-export function useAssistantProviderKey() {
+export function useAssistantProviderKey(enabled = true) {
   const keys = useQuery({
     ...listProviderKeysOptions(),
     staleTime: 15_000,
     retry: false,
+    enabled,
   })
   const active = (keys.data ?? []).filter((key) => key.is_active)
   const key = active.find((item) => item.provider === 'openrouter') ?? active[0]
@@ -43,6 +48,22 @@ export function useProviderModels(providerKeyId: number | null) {
     [detail.data?.models]
   )
   return { ...detail, options }
+}
+
+/**
+ * Whether the model a chat runs on reads images, per the provider catalogue.
+ * Only queries when `enabled` (an assistant chat); other chats never need it.
+ */
+export function useAssistantImageSupport(
+  enabled: boolean,
+  modelId: string | null
+): ImageSupport {
+  const { key } = useAssistantProviderKey(enabled)
+  const models = useProviderModels(enabled ? (key?.id ?? null) : null)
+  return useMemo(() => {
+    if (!enabled || !modelId) return 'unknown'
+    return imageSupport(models.options.find((m) => m.id === modelId)?.details)
+  }, [enabled, modelId, models.options])
 }
 
 /** Persist the model new assistant chats start on for this key. */
