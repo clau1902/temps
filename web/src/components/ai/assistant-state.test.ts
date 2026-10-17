@@ -133,10 +133,20 @@ describe('ask before changes', () => {
 })
 
 describe('last assistant model', () => {
-  const original = globalThis.window
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'window')
+
+  // Defined rather than assigned: another test file in the same run can leave
+  // `window` read-only, and plain assignment then throws.
+  const setWindow = (value: unknown) =>
+    Object.defineProperty(globalThis, 'window', {
+      value,
+      configurable: true,
+      writable: true,
+    })
 
   afterEach(() => {
-    globalThis.window = original
+    if (original) Object.defineProperty(globalThis, 'window', original)
+    else Reflect.deleteProperty(globalThis, 'window')
   })
 
   function fakeWindow(storage: Record<string, string> | 'throws') {
@@ -156,7 +166,7 @@ describe('last assistant model', () => {
               storage[key] = value
             },
           }
-    globalThis.window = { localStorage } as unknown as typeof window
+    setWindow({ localStorage })
   }
 
   test('remembers the model a chat was last given', () => {
