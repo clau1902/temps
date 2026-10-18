@@ -4998,7 +4998,7 @@ export type ContainerDetailResponse = {
     /**
      * Port inside the container
      */
-    container_port: number;
+    container_port?: number | null;
     /**
      * CPU limit in whole cores (e.g. 1.0). None when no limit is configured.
      */
@@ -5026,6 +5026,9 @@ export type ContainerDetailResponse = {
      * When the container exited (Docker's FinishedAt). None while running.
      */
     finished_at?: string | null;
+    health_checked_at?: string | null;
+    health_detail?: string | null;
+    health_state: string;
     /**
      * Port on the host machine
      */
@@ -5102,6 +5105,7 @@ export type ContainerHistoryListResponse = {
 export type ContainerInfoResponse = {
     container_id: string;
     container_name: string;
+    container_port?: number | null;
     /**
      * CPU limit in whole cores (e.g. 1.0). None when no limit is configured.
      */
@@ -5124,6 +5128,9 @@ export type ContainerInfoResponse = {
      * When the container exited (Docker's FinishedAt). None while running.
      */
     finished_at?: string | null;
+    health_checked_at?: string | null;
+    health_detail?: string | null;
+    health_state?: string;
     image_name: string;
     /**
      * Node name where this container is running. None for local (single-node) deployments.
@@ -7818,6 +7825,7 @@ export type DeploymentConfig = {
      * If not specified, will be auto-detected from Docker image or default to 3000
      */
     exposedPort?: number | null;
+    health?: HealthCheckConfig | null;
     /**
      * How long, in seconds, a new container may take to start and pass its
      * readiness check before the deployment fails. Covers apps that boot
@@ -13377,6 +13385,44 @@ export type HasTracesResponse = {
 /**
  * Health check configuration
  */
+export type HealthCheckConfig = {
+    /**
+     * Argument vector executed directly inside the container (no implicit shell).
+     */
+    command?: Array<string>;
+    /**
+     * Interval between health checks in seconds (default: 30)
+     */
+    interval?: number;
+    /**
+     * HTTP path for health checks
+     */
+    path?: string;
+    /**
+     * Number of consecutive failures before marking unhealthy (default: 3)
+     */
+    retries?: number;
+    /**
+     * Continuous running window for a process probe, in seconds.
+     */
+    stable_for?: number;
+    /**
+     * Expected HTTP status code (default: 200)
+     */
+    status?: number;
+    /**
+     * Timeout for health check requests in seconds (default: 5)
+     */
+    timeout?: number;
+    /**
+     * Probe kind. Unset selects HTTP for a declared port, process otherwise.
+     */
+    type?: string | null;
+};
+
+/**
+ * Health check configuration
+ */
 export type HealthCheckConfiguration = {
     /**
      * HTTP path to check (if applicable)
@@ -16428,6 +16474,10 @@ export type MonitorResponse = {
     environment_id?: number | null;
     id: number;
     is_active: boolean;
+    /**
+     * Temps-managed HTTP monitor; independent monitors remain visible for workers.
+     */
+    is_managed: boolean;
     monitor_type: string;
     monitor_url: string;
     name: string;
@@ -23101,6 +23151,15 @@ export type RunnerWork = {
     token: string;
 };
 
+export type RuntimeCoverage = {
+    availability_percent?: number | null;
+    coverage_percent?: number | null;
+    excluded_seconds: number;
+    healthy_seconds: number;
+    unhealthy_seconds: number;
+    unknown_seconds: number;
+};
+
 /**
  * Live connection variables for a service in one environment.
  *
@@ -23115,6 +23174,60 @@ export type RuntimeCredentialsResponse = {
     variables: {
         [key: string]: string;
     };
+};
+
+export type RuntimeHealthBucket = {
+    bucket_at: string;
+    coverage: RuntimeCoverage;
+};
+
+export type RuntimeHealthPolicy = {
+    enabled: boolean;
+    paused: boolean;
+    required_healthy?: number | null;
+};
+
+export type RuntimeHealthSummary = {
+    configured: boolean;
+    coverage: RuntimeCoverage;
+    environment_id: number;
+    history: Array<RuntimeHealthBucket>;
+    policy: RuntimeHealthPolicy;
+    portless?: boolean | null;
+    probe?: RuntimeProbeDisplay | null;
+    reason: string;
+    replicas: Array<RuntimeReplicaHealth>;
+    state: string;
+};
+
+export type RuntimeProbeDisplay = {
+    description: string;
+    desired_replicas: number;
+    failure_threshold: number;
+    interval_seconds: number;
+    kind: string;
+    recovery_threshold: number;
+    required_healthy: number;
+    source: string;
+    timeout_seconds: number;
+    unavailable_reason?: string | null;
+};
+
+export type RuntimeReplicaHealth = {
+    checked_at?: string | null;
+    reason: string;
+    replica_id: number;
+    state: string;
+};
+
+/**
+ * Small project-wide classification feed. The console requests detailed
+ * history only for its selected environment, not for every preview at once.
+ */
+export type RuntimeWorkloadMetadata = {
+    configured: boolean;
+    environment_id: number;
+    portless?: boolean | null;
 };
 
 /**
@@ -28517,7 +28630,11 @@ export type UpdateDeploymentConfigRequest = {
      * opted into rather than triggered by cluster topology.
      */
     crossArchitectureBuilds?: boolean | null;
+    /**
+     * Null clears the port override; omitted leaves it unchanged.
+     */
     exposedPort?: number | null;
+    health?: HealthCheckConfig | null;
     /**
      * How long, in seconds (30-3600), a new deployment's containers may take
      * to start and pass their readiness check before the deployment fails.
@@ -28672,6 +28789,8 @@ export type UpdateEnvironmentSettingsRequest = {
      * regardless of this setting, so ACME HTTP-01 validation always completes.
      */
     force_https?: boolean | null;
+    health?: HealthCheckConfig | null;
+    health_check_timeout_seconds?: number | null;
     /**
      * Seconds of inactivity before stopping containers (60-86400). Default: 300.
      */
@@ -63091,6 +63210,99 @@ export type TestEnvironmentIpAccessResponses = {
 
 export type TestEnvironmentIpAccessResponse = TestEnvironmentIpAccessResponses[keyof TestEnvironmentIpAccessResponses];
 
+export type GetRuntimeHealthData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/runtime-health';
+};
+
+export type GetRuntimeHealthErrors = {
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Environment read permission required
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type GetRuntimeHealthError = GetRuntimeHealthErrors[keyof GetRuntimeHealthErrors];
+
+export type GetRuntimeHealthResponses = {
+    200: RuntimeHealthSummary;
+};
+
+export type GetRuntimeHealthResponse = GetRuntimeHealthResponses[keyof GetRuntimeHealthResponses];
+
+export type UpdateRuntimeHealthData = {
+    body: RuntimeHealthPolicy;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/runtime-health';
+};
+
+export type UpdateRuntimeHealthErrors = {
+    /**
+     * Invalid monitoring policy
+     */
+    400: ProblemDetails;
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Environment write permission required
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateRuntimeHealthError = UpdateRuntimeHealthErrors[keyof UpdateRuntimeHealthErrors];
+
+export type UpdateRuntimeHealthResponses = {
+    /**
+     * Monitoring policy saved
+     */
+    204: void;
+};
+
+export type UpdateRuntimeHealthResponse = UpdateRuntimeHealthResponses[keyof UpdateRuntimeHealthResponses];
+
 export type ListAlertRulesData = {
     body?: never;
     path: {
@@ -66721,6 +66933,45 @@ export type RevenueMetricsSummaryResponses = {
 };
 
 export type RevenueMetricsSummaryResponse = RevenueMetricsSummaryResponses[keyof RevenueMetricsSummaryResponses];
+
+export type GetProjectRuntimeHealthData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/runtime-health';
+};
+
+export type GetProjectRuntimeHealthErrors = {
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Environment read permission required
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectRuntimeHealthError = GetProjectRuntimeHealthErrors[keyof GetProjectRuntimeHealthErrors];
+
+export type GetProjectRuntimeHealthResponses = {
+    200: Array<RuntimeWorkloadMetadata>;
+};
+
+export type GetProjectRuntimeHealthResponse = GetProjectRuntimeHealthResponses[keyof GetProjectRuntimeHealthResponses];
 
 export type ListProjectSecretsData = {
     body?: never;

@@ -2949,6 +2949,7 @@ impl BuildImageJob {
         let build_context_dir = &image_output.build_context;
         if let Some(temps_config) = self.load_temps_config(build_context_dir)? {
             if let Some(health) = &temps_config.health {
+                context.set_output(&self.job_id, "health", health)?;
                 context.set_output(&self.job_id, "health_check_path", &health.path)?;
                 context.set_output(&self.job_id, "health_check_timeout", health.timeout)?;
             }
@@ -5033,6 +5034,26 @@ mod tests {
 
         assert!(!created.exists());
         assert_eq!(std::fs::read_to_string(appended).unwrap(), "original\n");
+    }
+
+    #[tokio::test]
+    async fn a_portless_repository_dockerfile_is_not_given_a_web_preset_port() {
+        let original = "FROM alpine:3.21\nCMD [\"sleep\", \"3600\"]\n";
+        let (dir, repo, context, _logs) = worker_checkout(&[("Dockerfile", original)]);
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("worker:latest".into())
+            .preset(StoredPreset::Go)
+            .build(Arc::new(RecordingImageBuilder::default()))
+            .unwrap();
+        let dockerfile = dir.path().join("Dockerfile");
+        let generated = job
+            .ensure_dockerfile(&context, &repo.repo_dir, &dockerfile, &repo.repo_dir)
+            .await
+            .unwrap();
+        assert!(!generated.generated);
+        assert_eq!(std::fs::read_to_string(dockerfile).unwrap(), original);
     }
 
     /// Issue #1344: the generated Vite Dockerfile for a worker build declares

@@ -10260,7 +10260,10 @@
           "container_port": {
             "description": "Port inside the container",
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "cpu_limit_cores": {
             "description": "CPU limit in whole cores (e.g. 1.0). None when no limit is configured.",
@@ -10318,6 +10321,21 @@
               "string",
               "null"
             ]
+          },
+          "health_checked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "health_detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "health_state": {
+            "type": "string"
           },
           "host_port": {
             "description": "Port on the host machine",
@@ -10409,7 +10427,7 @@
           "deployment_id",
           "created_at",
           "deployed_at",
-          "container_port",
+          "health_state",
           "environment_variables"
         ],
         "type": "object"
@@ -10510,6 +10528,13 @@
           "container_name": {
             "type": "string"
           },
+          "container_port": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "cpu_limit_cores": {
             "description": "CPU limit in whole cores (e.g. 1.0). None when no limit is configured.",
             "format": "double",
@@ -10551,6 +10576,21 @@
               "string",
               "null"
             ]
+          },
+          "health_checked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "health_detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "health_state": {
+            "type": "string"
           },
           "image_name": {
             "type": "string"
@@ -16117,6 +16157,17 @@
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthCheckConfig",
+                "description": "Deploy-time probe; environment overrides project, repository config overrides both."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "healthCheckTimeoutSeconds": {
@@ -28381,6 +28432,68 @@
         ],
         "type": "object"
       },
+      "HealthCheckConfig": {
+        "description": "Health check configuration",
+        "properties": {
+          "command": {
+            "default": [],
+            "description": "Argument vector executed directly inside the container (no implicit shell).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "interval": {
+            "default": 30,
+            "description": "Interval between health checks in seconds (default: 30)",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "default": "/",
+            "description": "HTTP path for health checks",
+            "type": "string"
+          },
+          "retries": {
+            "default": 3,
+            "description": "Number of consecutive failures before marking unhealthy (default: 3)",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stable_for": {
+            "default": 15,
+            "description": "Continuous running window for a process probe, in seconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "default": 200,
+            "description": "Expected HTTP status code (default: 200)",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "timeout": {
+            "default": 5,
+            "description": "Timeout for health check requests in seconds (default: 5)",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": {
+            "default": null,
+            "description": "Probe kind. Unset selects HTTP for a declared port, process otherwise.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "HealthCheckConfiguration": {
         "description": "Health check configuration",
         "properties": {
@@ -35135,6 +35248,10 @@
           "is_active": {
             "type": "boolean"
           },
+          "is_managed": {
+            "description": "Temps-managed HTTP monitor; independent monitors remain visible for workers.",
+            "type": "boolean"
+          },
           "monitor_type": {
             "type": "string"
           },
@@ -35162,6 +35279,7 @@
           }
         },
         "required": [
+          "is_managed",
           "id",
           "project_id",
           "name",
@@ -48530,6 +48648,47 @@
         ],
         "type": "object"
       },
+      "RuntimeCoverage": {
+        "properties": {
+          "availability_percent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "coverage_percent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "excluded_seconds": {
+            "format": "double",
+            "type": "number"
+          },
+          "healthy_seconds": {
+            "format": "double",
+            "type": "number"
+          },
+          "unhealthy_seconds": {
+            "format": "double",
+            "type": "number"
+          },
+          "unknown_seconds": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "healthy_seconds",
+          "unhealthy_seconds",
+          "unknown_seconds",
+          "excluded_seconds"
+        ],
+        "type": "object"
+      },
       "RuntimeCredentialsResponse": {
         "description": "Live connection variables for a service in one environment.\n\nEvery value is plaintext — this is the response of the audited issuance\nendpoint, not of the masked bulk read. Callers must treat it as a\ncredential: do not log it, do not cache it, do not put it in an error.",
         "properties": {
@@ -48546,6 +48705,218 @@
         },
         "required": [
           "variables"
+        ],
+        "type": "object"
+      },
+      "RuntimeHealthBucket": {
+        "properties": {
+          "bucket_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/RuntimeCoverage"
+          }
+        },
+        "required": [
+          "bucket_at",
+          "coverage"
+        ],
+        "type": "object"
+      },
+      "RuntimeHealthPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "paused": {
+            "type": "boolean"
+          },
+          "required_healthy": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "enabled",
+          "paused"
+        ],
+        "type": "object"
+      },
+      "RuntimeHealthSummary": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/RuntimeCoverage"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeHealthBucket"
+            },
+            "type": "array"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/RuntimeHealthPolicy"
+          },
+          "portless": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "probe": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeProbeDisplay"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "replicas": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeReplicaHealth"
+            },
+            "type": "array"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "configured",
+          "state",
+          "reason",
+          "policy",
+          "coverage",
+          "replicas",
+          "history"
+        ],
+        "type": "object"
+      },
+      "RuntimeProbeDisplay": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "desired_replicas": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failure_threshold": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "interval_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "recovery_threshold": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "required_healthy": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unavailable_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "source",
+          "description",
+          "interval_seconds",
+          "timeout_seconds",
+          "failure_threshold",
+          "recovery_threshold",
+          "desired_replicas",
+          "required_healthy"
+        ],
+        "type": "object"
+      },
+      "RuntimeReplicaHealth": {
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "replica_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "replica_id",
+          "state",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "RuntimeWorkloadMetadata": {
+        "description": "Small project-wide classification feed. The console requests detailed\nhistory only for its selected environment, not for every preview at once.",
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "portless": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "environment_id",
+          "configured"
         ],
         "type": "object"
       },
@@ -59905,10 +60276,21 @@
             ]
           },
           "exposedPort": {
+            "description": "Null clears the port override; omitted leaves it unchanged.",
             "format": "int32",
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthCheckConfig"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "healthCheckTimeoutSeconds": {
@@ -60212,6 +60594,24 @@
             "description": "Per-environment HTTP→HTTPS redirect override (tri-state):\n- absent → leave the current override unchanged\n- JSON `null` → clear the override (inherit the proxy default, which\n  redirects only when the host has an active TLS certificate)\n- `true` → always redirect plain HTTP to HTTPS for this environment,\n  even when no local certificate exists (TLS terminated upstream)\n- `false` → never redirect this environment, even when a certificate does\n  exist\n\nRequests under `/.well-known/acme-challenge/` are never redirected\nregardless of this setting, so ACME HTTP-01 validation always completes.",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HealthCheckConfig",
+                "description": "Deploy-time probe override. Null restores project inheritance; omitted leaves it unchanged."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "health_check_timeout_seconds": {
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -116210,7 +116610,6 @@
             "description": "Internal server error"
           }
         },
-        "summary": "Update environment settings",
         "tags": [
           "Projects"
         ]
@@ -118127,6 +118526,190 @@
           "Project IP Access"
         ],
         "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/runtime-health": {
+      "get": {
+        "operationId": "get_runtime_health",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeHealthSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment read permission required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Runtime health"
+        ]
+      },
+      "put": {
+        "operationId": "update_runtime_health",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeHealthPolicy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Monitoring policy saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid monitoring policy"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment write permission required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Runtime health"
+        ]
       }
     },
     "/projects/{project_id}/error-alert-rules": {
@@ -124024,6 +124607,85 @@
           "Revenue"
         ],
         "x-maturity": "experimental"
+      }
+    },
+    "/projects/{project_id}/runtime-health": {
+      "get": {
+        "operationId": "get_project_runtime_health",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RuntimeWorkloadMetadata"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment read permission required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Runtime health"
+        ]
       }
     },
     "/projects/{project_id}/secrets": {

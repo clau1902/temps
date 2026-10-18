@@ -40,6 +40,8 @@ pub type LogCallback =
 
 pub mod docker;
 pub mod image_scan;
+pub mod runtime_health;
+mod runtime_health_coordination;
 /// Host-level Docker socket grant (ADR 045).
 ///
 /// Re-exported from `temps-core`, where the type lives so the agent, the
@@ -230,6 +232,16 @@ pub enum BuilderError {
 
 #[derive(Error, Debug)]
 pub enum DeployerError {
+    #[error("Exec in container {container_id} failed: {reason}")]
+    ExecFailed {
+        container_id: String,
+        reason: String,
+    },
+    #[error("Exec in container {container_id} exceeded its {timeout_secs}s timeout")]
+    ExecTimeout {
+        container_id: String,
+        timeout_secs: u64,
+    },
     #[error("Deployment failed: {0}")]
     DeploymentFailed(String),
 
@@ -1099,11 +1111,44 @@ pub trait ImageBuilder: Send + Sync {
 }
 
 /// Trait for deploying and managing containers
+/// Maximum combined health-command output retained in memory or health_detail.
+pub const MAX_EXEC_OUTPUT_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecResult {
+    pub exit_code: i64,
+    pub output: String,
+    pub truncated: bool,
+}
+
+/// Append bytes without retaining workload-controlled, unbounded output.
+pub(crate) fn append_exec_output(output: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    let remaining = MAX_EXEC_OUTPUT_BYTES.saturating_sub(output.len());
+    output.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+    bytes.len() > remaining
+}
+
+pub(crate) fn exec_output_string(output: &[u8]) -> String {
+    let mut result = String::from_utf8_lossy(output).into_owned();
+    while result.len() > MAX_EXEC_OUTPUT_BYTES {
+        result.pop();
+    }
+    result
+}
+
 #[async_trait]
 pub trait ContainerDeployer: Send + Sync {
     /// Deploy a container from an image
     async fn deploy_container(&self, request: DeployRequest)
         -> Result<DeployResult, DeployerError>;
+
+    /// Execute an argument vector in this container, with bounded time and output.
+    async fn exec_in_container(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> Result<ExecResult, DeployerError>;
 
     /// Start a stopped container
     async fn start_container(&self, container_id: &str) -> Result<(), DeployerError>;
@@ -2062,5 +2107,27 @@ CMD ["echo", "Hello from container"]
             ),
             "{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod health_probe_output_tests {
+    use super::*;
+
+    #[test]
+    fn health_probe_output_is_bounded_across_frames_and_utf8_boundaries() {
+        let mut bytes = Vec::new();
+        assert!(!append_exec_output(&mut bytes, b"ready"));
+        assert!(append_exec_output(
+            &mut bytes,
+            &vec![b'x'; MAX_EXEC_OUTPUT_BYTES]
+        ));
+        assert_eq!(bytes.len(), MAX_EXEC_OUTPUT_BYTES);
+        assert!(append_exec_output(&mut bytes, b"discarded"));
+        assert_eq!(exec_output_string(&bytes).len(), MAX_EXEC_OUTPUT_BYTES);
+        let invalid_utf8 = vec![0xff; MAX_EXEC_OUTPUT_BYTES];
+        let text = exec_output_string(&invalid_utf8);
+        assert!(text.len() <= MAX_EXEC_OUTPUT_BYTES);
+        assert!(text.is_char_boundary(text.len()));
     }
 }
