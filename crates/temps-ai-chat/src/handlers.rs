@@ -7934,6 +7934,28 @@ pub async fn send_user_message(
     } else {
         let attachments =
             resolve_chat_attachments(&state, &auth, &conversation, &req.attachments).await?;
+        // A gateway model has no sandbox to read the files from, so it gets
+        // the images as image parts as well. Host adapters stage the files
+        // and read them natively, so they must not get a second copy.
+        let images = if conversation
+            .ai_provider
+            .starts_with(crate::service::GATEWAY_PROVIDER_PREFIX)
+            && attachments.iter().any(|attachment| attachment.is_image)
+        {
+            let support = state
+                .assistant_attachments
+                .image_support(&conversation.ai_provider, Some(&conversation.ai_model))
+                .await;
+            crate::attachments::workspace_chat_images(
+                attachments
+                    .iter()
+                    .map(|attachment| (attachment.name.as_str(), attachment.contents.as_slice())),
+                support,
+                &conversation.ai_model,
+            )?
+        } else {
+            Vec::new()
+        };
         ResolvedAttachments {
             context: attachment_prompt_context(&attachments),
             sandbox: attachments
@@ -7945,7 +7967,7 @@ pub async fn send_user_message(
                 })
                 .collect(),
             responses: attachments,
-            images: Vec::new(),
+            images,
         }
     };
     let attachment_metadata =

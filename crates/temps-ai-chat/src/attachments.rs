@@ -337,6 +337,39 @@ pub fn chat_images(attachments: &[LoadedAttachment]) -> Vec<ChatImage> {
         .collect()
 }
 
+/// Images among the files a workspace chat uploaded, as the image parts a
+/// gateway model reads. The files stay in the sandbox for its tools; this only
+/// lets the model see the pixels too. An image is recognised by its bytes, not
+/// its name, and one over [`MAX_ATTACHMENT_BYTES`] is left out (the model is
+/// still told it exists, as a file). A model whose catalogue says it cannot
+/// read images refuses the message rather than silently dropping the image.
+pub fn workspace_chat_images<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+    support: ImageSupport,
+    model: &str,
+) -> Result<Vec<ChatImage>, AttachmentError> {
+    let mut images = Vec::new();
+    for (name, bytes) in files {
+        let Some(media_type) = image_media_type(bytes) else {
+            continue;
+        };
+        if support == ImageSupport::No {
+            return Err(AttachmentError::ModelCannotSeeImages {
+                model: model.to_string(),
+                name: name.to_string(),
+            });
+        }
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            continue;
+        }
+        images.push(ChatImage {
+            media_type: media_type.to_string(),
+            base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+    }
+    Ok(images)
+}
+
 /// The text of an attachment that goes into the prompt, if it has any.
 fn quoted_text(attachment: &LoadedAttachment) -> Option<std::borrow::Cow<'_, str>> {
     match attachment.kind {
@@ -959,6 +992,58 @@ mod tests {
             ImageSupport::from_input_modalities(&[]),
             ImageSupport::Unknown
         );
+    }
+
+    #[test]
+    fn workspace_images_become_image_parts_by_content() {
+        let renamed = b"just text, not an image";
+        let images = workspace_chat_images(
+            [("shot.png", PNG), ("notes.png", renamed.as_slice())],
+            ImageSupport::Yes,
+            "vendor/model",
+        )
+        .unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        assert_eq!(
+            images[0].base64,
+            base64::engine::general_purpose::STANDARD.encode(PNG)
+        );
+    }
+
+    #[test]
+    fn workspace_images_are_refused_by_a_text_only_model() {
+        let error =
+            workspace_chat_images([("shot.png", PNG)], ImageSupport::No, "vendor/text-only")
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            AttachmentError::ModelCannotSeeImages { ref name, .. } if name == "shot.png"
+        ));
+        // A message with no image is fine for any model.
+        assert!(workspace_chat_images(
+            [("notes.txt", b"hello".as_slice())],
+            ImageSupport::No,
+            "vendor/text-only"
+        )
+        .unwrap()
+        .is_empty());
+        // A model the catalogue is silent about gets the benefit of the doubt.
+        assert_eq!(
+            workspace_chat_images([("shot.png", PNG)], ImageSupport::Unknown, "m")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn oversized_workspace_images_stay_in_the_sandbox() {
+        let mut big = PNG.to_vec();
+        big.resize(MAX_ATTACHMENT_BYTES + 1, 0);
+        let images =
+            workspace_chat_images([("big.png", big.as_slice())], ImageSupport::Yes, "m").unwrap();
+        assert!(images.is_empty());
     }
 
     #[test]

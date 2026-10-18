@@ -7067,7 +7067,7 @@ fn tool_result_is_productive(result: &str) -> bool {
 }
 
 /// Provider-id prefix of AI-gateway providers (`gateway_key:<provider key id>`).
-const GATEWAY_PROVIDER_PREFIX: &str = "gateway_key:";
+pub(crate) const GATEWAY_PROVIDER_PREFIX: &str = "gateway_key:";
 
 /// Tool-call rounds one assistant turn may take. Far below the generic
 /// anti-spin ceiling because the assistant is a conversational surface: a user
