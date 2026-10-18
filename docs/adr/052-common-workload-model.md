@@ -252,6 +252,62 @@ a project environment or a sandbox) replaces the two connect components during
 phase 3, and shows an onboarding state, not a missing control, when a feature
 is not configured.
 
+## Migration and rollback
+
+The risk in this ADR is not the new code, it is changing what running
+deployments and existing sandboxes do. The rules below are constraints on how
+every phase is built, and a phase that cannot meet them is split or dropped.
+
+**Principles**
+
+1. **Expand, then contract, in separate releases.** A schema change adds
+   (a table, a nullable or defaulted column) and nothing reads it until a later
+   change. Nothing is dropped or renamed in the release that introduces its
+   replacement. Every migration ships a working down migration.
+2. **The old path stays authoritative until the new one is proven.** A new
+   resolver, assembler or reconciler first runs next to the old one, compares
+   results and logs differences (`shadow`), and only then takes over
+   (`enforce`). The mode is a column on the row it governs (environment,
+   sandbox, node), changed through the API and audit-logged, never an
+   environment variable.
+3. **Existing isolation is never removed by this ADR.** The per-sandbox
+   internal network, the egress proxy and the metadata-egress table all stay
+   under the new rules. Rules add a second barrier; they replace none.
+4. **Existing deployments change nothing by default.** Environments get
+   `network_policy_mode = open`; deployments keep `Administrator` credentials;
+   `Baked` delivery is untouched. A deployment only changes behaviour when
+   someone turns a setting on for that environment.
+5. **No user data moves.** Linking, unlinking and rule changes never create,
+   copy, rename or drop a database, bucket or key. Removing a link removes
+   access only (as in ADR-051).
+6. **Mixed versions are normal.** Workers upgrade after the control plane, and
+   sometimes weeks later. Every new field is optional and ignored when
+   unknown, a worker advertises what it supports in its heartbeat, and the
+   control plane falls back to the old call when a worker does not. Old worker
+   endpoints are removed no earlier than two releases after the replacement
+   ships.
+
+**Per phase**
+
+| Phase | Schema | Behaviour change for existing workloads | Proof before it merges | Rollback |
+|---|---|---|---|---|
+| 1. Types and engine | none | none | a golden test per service type: the variable map the new engine builds for `Administrator` equals what `get_runtime_env_vars` builds today, key for key; the sandbox engines' existing tests pass untouched | revert the commit |
+| 2. Variable assembly, `sh.temps.kind` | none | none; containers created earlier lack the label, and every consumer treats a missing label as `deployment` or by its existing sandbox marker, so nothing restarts | the same golden comparison for the assembled variable set (precedence, secret files, redaction) | stop writing the label; consumers already tolerate its absence |
+| 3. Network rules | one new table, empty; one defaulted column on environments and on sandboxes | none for deployments (`open`). Sandboxes keep today's structural isolation; rules only add the cross-node path, which does not exist yet | an upgrade test: restore a database from the previous release with projects, links and sandboxes, run the migration, assert no row changed and no container was touched; a shadow-mode run on real links showing the ruleset it would install; a test that a restricted workload cannot reach an unlinked service | set the mode back to `off` (rules stop being installed and the table is ignored); down migration drops the table and columns |
+| 4. Placement and worker API | none | none; new endpoints sit beside the old, used only for workers that advertise them | a mixed-version test (new control plane, old worker) that deploys and runs a sandbox | stop advertising the capability; the control plane returns to the old calls |
+| 5. Scoped deployment credentials | one defaulted column on environments | none until an operator enables it for one environment | a preflight that creates the scoped role and connects as it before anything is switched; the environment keeps the administrator credentials until that succeeds | flip the column back; the scoped role is left in place and unused, no data is touched |
+
+**The table merge is not part of these phases.** `project_services` and
+`sandbox_services` stay as they are. If phase 3 shows that one owner is needed,
+it is done as its own change: create the new table, dual-write both, backfill
+idempotently, switch reads behind a mode column, and drop the old tables no
+earlier than the following release. Until then there is no migration of link
+data at all.
+
+**What this ADR will not do.** It does not change a default for an existing
+environment, switch a deployment's credentials, remove an endpoint in the
+release that adds its replacement, or move or copy user data.
+
 ## Consequences
 
 **Positive**
