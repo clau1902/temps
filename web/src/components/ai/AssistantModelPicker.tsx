@@ -200,7 +200,12 @@ export function ModelVendorTabs({
     <div
       role="tablist"
       aria-label="Filter models by vendor"
-      className={cn('flex flex-wrap gap-1', searching && 'opacity-50')}
+      className={cn(
+        // One swipeable row on a phone, where wrapped tabs would eat the list;
+        // wrapped on larger screens, where every tab is visible at once.
+        'flex gap-1 overflow-x-auto [scrollbar-width:none] sm:flex-wrap sm:overflow-visible [&::-webkit-scrollbar]:hidden',
+        searching && 'opacity-50'
+      )}
     >
       <VendorTabButton
         label="All"
@@ -242,7 +247,7 @@ function VendorTabButton({
       aria-selected={active}
       onClick={onClick}
       className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors hover:bg-accent',
+        'inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors hover:bg-accent',
         active
           ? 'border-border bg-muted font-medium text-foreground'
           : 'border-transparent text-muted-foreground'
@@ -305,12 +310,12 @@ function ModelRow({
             ) : null}
           </span>
           {option.name !== option.id ? (
-            <span className="block truncate font-mono text-xs text-muted-foreground">
+            <span className="hidden truncate font-mono text-xs text-muted-foreground sm:block">
               {option.id}
             </span>
           ) : null}
           {facts.length > 0 ? (
-            <span className="mt-0.5 block text-xs text-muted-foreground">
+            <span className="mt-0.5 line-clamp-2 text-xs text-muted-foreground sm:line-clamp-none">
               {facts.join(' · ')}
             </span>
           ) : null}
