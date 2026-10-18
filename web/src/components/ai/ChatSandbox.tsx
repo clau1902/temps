@@ -31,6 +31,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { linkableSandboxes, sandboxButtonLabel } from './chat-sandbox'
+import { useChatSandboxWake } from './chat-sandbox-wake'
 import { projectRefOf, useChatResources } from './chat-resources'
 import {
   ConnectSandboxButton,
@@ -393,6 +394,7 @@ export function ChatSandbox({
   const status = useQuery(
     getChatSandboxOptions({ path: { public_id: conversationPublicId } })
   )
+  const wake = useChatSandboxWake(conversationPublicId)
   const label = sandboxButtonLabel(status.data)
   const linked = Boolean(status.data?.linked)
 
@@ -405,12 +407,16 @@ export function ChatSandbox({
           size="sm"
           className="h-8 max-w-44 gap-1.5"
           title={
-            linked
-              ? 'The sandbox linked to this chat'
-              : 'Give this chat a sandbox to run commands in'
+            wake.phase === 'waking'
+              ? 'Waking the sandbox linked to this chat'
+              : linked
+                ? 'The sandbox linked to this chat'
+                : 'Give this chat a sandbox to run commands in'
           }
         >
-          {linked ? (
+          {wake.phase === 'waking' ? (
+            <Loader2 className="size-4 shrink-0 animate-spin" />
+          ) : linked ? (
             <Check className="size-4 shrink-0 text-emerald-600 dark:text-emerald-300" />
           ) : (
             <SquareTerminal className="size-4 shrink-0" />

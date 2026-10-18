@@ -3501,6 +3501,11 @@ export type ChatResourcesResponse = {
 };
 
 /**
+ * Whether a linked sandbox's compute is running.
+ */
+export type ChatSandboxRuntime = 'running' | 'asleep';
+
+/**
  * What a chat can do with a sandbox, and the one it is linked to.
  */
 export type ChatSandboxStatus = {
@@ -3528,6 +3533,7 @@ export type ChatSandboxStatus = {
      * Why it cannot, when `configured` is false.
      */
     reason?: string | null;
+    runtime?: ChatSandboxRuntime | null;
     /**
      * Console path where the user can fix it, when there is one.
      */
@@ -30962,6 +30968,56 @@ export type DisconnectChatSandboxServiceResponses = {
 };
 
 export type DisconnectChatSandboxServiceResponse = DisconnectChatSandboxServiceResponses[keyof DisconnectChatSandboxServiceResponses];
+
+export type WakeChatSandboxData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/wake';
+};
+
+export type WakeChatSandboxErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * The sandbox could not be started
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type WakeChatSandboxError = WakeChatSandboxErrors[keyof WakeChatSandboxErrors];
+
+export type WakeChatSandboxResponses = {
+    /**
+     * Sandbox running
+     */
+    200: ChatSandboxStatus;
+};
+
+export type WakeChatSandboxResponse = WakeChatSandboxResponses[keyof WakeChatSandboxResponses];
 
 export type StopUserTurnData = {
     body?: never;

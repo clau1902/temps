@@ -100,6 +100,15 @@ pub struct AiSandboxLinkedAudit {
     pub created: bool,
 }
 
+/// A chat's sleeping sandbox was started again, by the console or the assistant.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSandboxWokenAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub sandbox_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AiSandboxUnlinkedAudit {
     pub context: AuditContext,
@@ -369,6 +378,7 @@ impl_audit_operation!(AiGoalCancelledAudit, "ai.goal.cancelled");
 impl_audit_operation!(AiGoalRetriedAudit, "ai.goal.retried");
 impl_audit_operation!(AiSandboxLinkedAudit, "ai.sandbox.linked");
 impl_audit_operation!(AiSandboxUnlinkedAudit, "ai.sandbox.unlinked");
+impl_audit_operation!(AiSandboxWokenAudit, "ai.sandbox.woken");
 impl_audit_operation!(
     AiSandboxServicesConnectedAudit,
     "ai.sandbox.services_connected"

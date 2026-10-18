@@ -1105,14 +1105,26 @@ impl SandboxLinkService {
         })
     }
 
+    /// Start the chat's sandbox if it is asleep, so the console can have it up
+    /// before anything asks for it. `Ok(true)` when it was woken, `Ok(false)`
+    /// when it was already running.
+    pub async fn wake_linked(
+        &self,
+        conversation: &ai_conversations::Model,
+        user_id: i32,
+    ) -> Result<bool, SandboxLinkError> {
+        let link = self.linked_sandbox(conversation)?;
+        self.wake_if_asleep(conversation, &link, user_id).await
+    }
+
     /// Wake the sandbox before changing what it is connected to: a sleeping
-    /// container has no network to attach to.
+    /// container has no network to attach to. Says whether it had to.
     async fn wake_if_asleep(
         &self,
         conversation: &ai_conversations::Model,
         link: &SandboxLink,
         user_id: i32,
-    ) -> Result<(), SandboxLinkError> {
+    ) -> Result<bool, SandboxLinkError> {
         let row = self
             .sandboxes
             .find_by_public_id(&link.sandbox_id, user_id)
@@ -1128,8 +1140,9 @@ impl SandboxLinkService {
                     conversation_id: conversation.public_id.clone(),
                     reason,
                 })?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// What the sandbox is now linked to, read fresh from its links.
@@ -1406,6 +1419,22 @@ impl SandboxLinkService {
             self.sandboxes.resume_sandbox(&link.sandbox_id, user_id),
         )
         .await;
+        // Another caller (the console, or the turn's own warm-up) may have
+        // started it first and made this resume lose the status check. The
+        // sandbox is up, which is all this caller wanted.
+        let outcome = match outcome {
+            Ok(Err(error)) if !matches!(error, SandboxError::NotFound { .. }) => {
+                match self
+                    .sandboxes
+                    .find_by_public_id(&link.sandbox_id, user_id)
+                    .await
+                {
+                    Ok(row) if row.status == "running" => Ok(Ok(row)),
+                    _ => Ok(Err(error)),
+                }
+            }
+            other => other,
+        };
         match outcome {
             Ok(Ok(_)) => {
                 let seconds = started.elapsed().as_secs();

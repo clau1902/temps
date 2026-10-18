@@ -23,15 +23,17 @@ use temps_core::{
 };
 use utoipa::{OpenApi, ToSchema};
 
+use temps_entities::ai_conversations;
+
 use crate::audit::{
     AiSandboxLinkedAudit, AiSandboxServicesConnectedAudit, AiSandboxServicesDisconnectedAudit,
-    AiSandboxUnlinkedAudit,
+    AiSandboxUnlinkedAudit, AiSandboxWokenAudit,
 };
 use crate::handlers::{ensure_user_conversation_access, AppState};
 use crate::sandbox_link::{
     context_supports_sandbox, link_from_metadata, preview_port_from_metadata,
-    project_for_new_sandbox, ConnectedService, SandboxConnections, SandboxLink, SandboxLinkError,
-    SandboxLinkService,
+    project_for_new_sandbox, readiness, ConnectedService, SandboxConnections, SandboxLink,
+    SandboxLinkError, SandboxLinkService, SandboxReadiness,
 };
 
 impl From<SandboxLinkError> for Problem {
@@ -77,12 +79,35 @@ pub struct ChatSandboxStatus {
     pub offered: bool,
     /// Where the linked sandbox's apps are served, for the Preview tab.
     pub preview: Option<ChatPreview>,
+    /// Whether the linked sandbox's compute is up. `None` when nothing is
+    /// linked or the sandbox could not be read.
+    pub runtime: Option<ChatSandboxRuntime>,
     /// Projects whose services the linked sandbox is connected to: its
     /// commands run with credentials for a database of its own on each.
     pub connected_projects: Vec<i32>,
     /// Every service the linked sandbox is connected to, whether or not it was
     /// connected through a project.
     pub connected_services: Vec<ConnectedService>,
+}
+
+/// Whether a linked sandbox's compute is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatSandboxRuntime {
+    /// Up: commands and the preview work.
+    Running,
+    /// Stopped after sitting idle. Its files are intact; waking it starts the
+    /// container again, which `POST .../sandbox/wake` does.
+    Asleep,
+}
+
+impl ChatSandboxRuntime {
+    fn of_status(status: &str) -> Self {
+        match readiness(status) {
+            SandboxReadiness::Ready => Self::Running,
+            SandboxReadiness::Asleep => Self::Asleep,
+        }
+    }
 }
 
 /// Connect the chat's sandbox to one service.
@@ -188,6 +213,7 @@ fn status_of(
         linked: link_from_metadata(metadata),
         offered: crate::sandbox_link::offered_in_metadata(metadata),
         preview: None,
+        runtime: None,
         connected_projects: project_ids_of(connected),
         connected_services: connected.to_vec(),
     }
@@ -209,6 +235,46 @@ fn link_service(state: &AppState, conversation_id: &str) -> Result<SandboxLinkSe
                 conversation_id: conversation_id.to_string(),
             })?;
     Ok(SandboxLinkService::new(state.db.clone(), sandboxes))
+}
+
+/// The chat's sandbox status, read fresh: what it can use, what is linked, how
+/// to reach its apps, and whether its compute is up.
+async fn sandbox_status(
+    state: &AppState,
+    auth: &temps_auth::context::AuthContext,
+    conversation: &ai_conversations::Model,
+) -> ChatSandboxStatus {
+    let linked = link_from_metadata(conversation.metadata.as_ref());
+    let connected = match (&linked, &state.application_sandboxes) {
+        (Some(link), Some(sandboxes)) => sandboxes
+            .linked_services(auth.user_id(), &link.sandbox_id)
+            .await
+            .map(|links| links.iter().map(ConnectedService::from).collect())
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    conversation_id = %conversation.public_id,
+                    sandbox_id = %link.sandbox_id,
+                    "could not read the sandbox's service links: {error}"
+                );
+                Vec::new()
+            }),
+        _ => Vec::new(),
+    };
+    let mut status = status_of(
+        availability(state, auth, &conversation.context_type),
+        conversation.metadata.as_ref(),
+        &connected,
+    );
+    if let (Some(link), Some(sandboxes)) = (&status.linked, &state.application_sandboxes) {
+        let parts = sandboxes.preview_parts().await;
+        status.preview = Some(preview_of(&parts, link, conversation.metadata.as_ref()));
+        status.runtime = sandboxes
+            .find_by_public_id(&link.sandbox_id, auth.user_id())
+            .await
+            .ok()
+            .map(|row| ChatSandboxRuntime::of_status(&row.status));
+    }
+    status
 }
 
 /// Whether the chat can use a sandbox, and which one it is linked to.
@@ -236,32 +302,7 @@ pub async fn get_chat_sandbox(
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
-    let linked = link_from_metadata(conversation.metadata.as_ref());
-    let connected = match (&linked, &state.application_sandboxes) {
-        (Some(link), Some(sandboxes)) => sandboxes
-            .linked_services(auth.user_id(), &link.sandbox_id)
-            .await
-            .map(|links| links.iter().map(ConnectedService::from).collect())
-            .unwrap_or_else(|error| {
-                tracing::warn!(
-                    conversation_id = %conversation.public_id,
-                    sandbox_id = %link.sandbox_id,
-                    "could not read the sandbox's service links: {error}"
-                );
-                Vec::new()
-            }),
-        _ => Vec::new(),
-    };
-    let mut status = status_of(
-        availability(&state, &auth, &conversation.context_type),
-        conversation.metadata.as_ref(),
-        &connected,
-    );
-    if let (Some(link), Some(sandboxes)) = (&status.linked, &state.application_sandboxes) {
-        let parts = sandboxes.preview_parts().await;
-        status.preview = Some(preview_of(&parts, link, conversation.metadata.as_ref()));
-    }
-    Ok(Json(status))
+    Ok(Json(sandbox_status(&state, &auth, &conversation).await))
 }
 
 /// Link a sandbox to the chat, or create one for it. Replaces any earlier link.
@@ -360,9 +401,62 @@ pub async fn link_chat_sandbox(
         linked: Some(link),
         offered: true,
         preview: None,
+        runtime: None,
         connected_projects: Vec::new(),
         connected_services: Vec::new(),
     }))
+}
+
+/// Start the chat's sandbox if it went to sleep, so the preview and the
+/// assistant's next command find it up. Does nothing when it is already
+/// running.
+#[utoipa::path(
+    post, tag = "AI Chat", path = "/ai/conversations/{public_id}/sandbox/wake",
+    params(("public_id" = String, Path, description = "Conversation public id")),
+    responses(
+        (status = 200, description = "Sandbox running", body = ChatSandboxStatus),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Conversation or sandbox not found", body = ProblemDetails),
+        (status = 409, description = "The chat has no linked sandbox", body = ProblemDetails),
+        (status = 500, description = "The sandbox could not be started", body = ProblemDetails),
+        (status = 503, description = "This server has no sandbox backend", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn wake_chat_sandbox(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(public_id): Path<String>,
+) -> Result<Json<ChatSandboxStatus>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    permission_guard!(auth, SandboxesExec);
+    deny_deployment_token!(auth);
+    let conversation = state
+        .service
+        .get_owned_by_public_id(auth.user_id(), &public_id)
+        .await?;
+    ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    let service = link_service(&state, &conversation.public_id)?;
+    let woken = service.wake_linked(&conversation, auth.user_id()).await?;
+    if woken {
+        if let Some(link) = link_from_metadata(conversation.metadata.as_ref()) {
+            state
+                .audit(&AiSandboxWokenAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    project_id: conversation.project_id,
+                    conversation_id: conversation.public_id.clone(),
+                    sandbox_id: link.sandbox_id,
+                })
+                .await;
+        }
+    }
+    Ok(Json(sandbox_status(&state, &auth, &conversation).await))
 }
 
 /// Unlink the chat's sandbox. The sandbox itself is left running.
@@ -414,6 +508,7 @@ pub async fn unlink_chat_sandbox(
         linked: None,
         offered: true,
         preview: None,
+        runtime: None,
         connected_projects: Vec::new(),
         connected_services: Vec::new(),
     }))
@@ -684,6 +779,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
                 .delete(unlink_chat_sandbox),
         )
         .route(
+            "/ai/conversations/{public_id}/sandbox/wake",
+            axum::routing::post(wake_chat_sandbox),
+        )
+        .route(
             "/ai/conversations/{public_id}/sandbox/projects",
             axum::routing::post(connect_chat_sandbox_project),
         )
@@ -707,6 +806,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_chat_sandbox,
         link_chat_sandbox,
         unlink_chat_sandbox,
+        wake_chat_sandbox,
         connect_chat_sandbox_project,
         disconnect_chat_sandbox_project,
         connect_chat_sandbox_service,
@@ -714,6 +814,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     ),
     components(schemas(
         ChatSandboxStatus,
+        ChatSandboxRuntime,
         ChatPreview,
         LinkSandboxRequest,
         SandboxLink,
@@ -760,6 +861,22 @@ mod tests {
                 conversation_id: "conv_1".into()
             }),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn only_a_stopped_sandbox_reports_as_asleep() {
+        assert_eq!(
+            ChatSandboxRuntime::of_status("stopped"),
+            ChatSandboxRuntime::Asleep
+        );
+        assert_eq!(
+            ChatSandboxRuntime::of_status("running"),
+            ChatSandboxRuntime::Running
+        );
+        assert_eq!(
+            serde_json::to_value(ChatSandboxRuntime::Asleep).ok(),
+            Some(serde_json::json!("asleep"))
         );
     }
 

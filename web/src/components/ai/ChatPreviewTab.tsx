@@ -9,6 +9,7 @@ import { useQuery } from '@tanstack/react-query'
 import { ExternalLink, Monitor, RefreshCw } from 'lucide-react'
 import { useEffect, useState, type FormEvent } from 'react'
 import { canEmbed, parsePort, previewUrlFor } from './chat-preview'
+import { useChatSandboxWake } from './chat-sandbox-wake'
 
 function PreviewOnboarding({ reason }: { reason: string }) {
   return (
@@ -19,6 +20,46 @@ function PreviewOnboarding({ reason }: { reason: string }) {
         {reason} Try &ldquo;Create a landing page for a barber shop&rdquo;: the
         page opens here once it is running.
       </p>
+    </div>
+  )
+}
+
+/** The sandbox stopped while idle: it is being started, or could not be. */
+export function SandboxWaking({
+  error,
+  onRetry,
+}: {
+  error: string | null
+  onRetry: () => void
+}) {
+  if (error !== null) {
+    return (
+      <div
+        role="alert"
+        className="flex flex-col items-center gap-2 p-6 text-center"
+      >
+        <Monitor className="size-7 text-muted-foreground" aria-hidden />
+        <p className="text-sm font-medium">The sandbox could not be started</p>
+        <p className="max-w-xs text-sm text-muted-foreground">{error}</p>
+        <Button type="button" size="sm" variant="outline" onClick={onRetry}>
+          Try again
+        </Button>
+      </div>
+    )
+  }
+  return (
+    <div
+      className="space-y-3 p-4"
+      role="status"
+      aria-label="Waking the sandbox"
+    >
+      <p className="text-sm font-medium">Waking this chat&rsquo;s sandbox</p>
+      <p className="text-sm text-muted-foreground">
+        It stopped after sitting idle. Its files are intact; the preview opens
+        as soon as it is up.
+      </p>
+      <Skeleton className="h-8 w-full" />
+      <Skeleton className="h-64 w-full" />
     </div>
   )
 }
@@ -35,6 +76,7 @@ export function ChatPreviewTab({
   const status = useQuery(
     getChatSandboxOptions({ path: { public_id: conversationPublicId } })
   )
+  const wake = useChatSandboxWake(conversationPublicId)
   const confirmed = status.data?.preview?.port ?? null
   const [port, setPort] = useState<number | null>(confirmed)
   const [draft, setDraft] = useState(confirmed ? String(confirmed) : '')
@@ -72,6 +114,10 @@ export function ChatPreviewTab({
     return (
       <PreviewOnboarding reason="This chat has no sandbox yet. When the assistant builds something, it runs in one." />
     )
+  }
+
+  if (wake.phase !== 'ready') {
+    return <SandboxWaking error={wake.error} onRetry={wake.retry} />
   }
 
   const url = port === null ? null : previewUrlFor(preview.url_template, port)

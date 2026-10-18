@@ -7504,6 +7504,14 @@
         ],
         "type": "object"
       },
+      "ChatSandboxRuntime": {
+        "description": "Whether a linked sandbox's compute is running.",
+        "enum": [
+          "running",
+          "asleep"
+        ],
+        "type": "string"
+      },
       "ChatSandboxStatus": {
         "description": "What a chat can do with a sandbox, and the one it is linked to.",
         "properties": {
@@ -7557,6 +7565,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "runtime": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ChatSandboxRuntime",
+                "description": "Whether the linked sandbox's compute is up. `None` when nothing is\nlinked or the sandbox could not be read."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "setup_path": {
@@ -66323,6 +66342,104 @@
           }
         ],
         "summary": "Stop the chat's sandbox using one service. Its data is left as it is.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/sandbox/wake": {
+      "post": {
+        "operationId": "wake_chat_sandbox",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSandboxStatus"
+                }
+              }
+            },
+            "description": "Sandbox running"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The chat has no linked sandbox"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox could not be started"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Start the chat's sandbox if it went to sleep, so the preview and the\nassistant's next command find it up. Does nothing when it is already\nrunning.",
         "tags": [
           "AI Chat"
         ],

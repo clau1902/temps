@@ -4501,6 +4501,30 @@ impl ConversationService {
         })
     }
 
+    /// Start the chat's sandbox in the background if it went to sleep, so it is
+    /// already up by the time the model runs its first command instead of the
+    /// turn waiting on it. Best effort: a sandbox that stays down is reported
+    /// by the tool call that needs it.
+    fn warm_linked_sandbox(&self, conv: &ai_conversations::Model, user_id: i32) {
+        let Some(service) = self.sandbox_link_for(conv) else {
+            return;
+        };
+        let conv = conv.clone();
+        tokio::spawn(async move {
+            match service.wake_linked(&conv, user_id).await {
+                Ok(true) => tracing::info!(
+                    conversation_id = %conv.public_id,
+                    "woke the chat's sandbox at the start of the turn"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    conversation_id = %conv.public_id,
+                    "could not wake the chat's sandbox at the start of the turn: {error}"
+                ),
+            }
+        });
+    }
+
     /// Shell tools for the sandbox linked to this chat, or the one-time offer
     /// to link one when none is.
     ///
@@ -4523,6 +4547,9 @@ impl ConversationService {
         if may_create && crate::sandbox_link::project_for_new_sandbox(conv).is_some() {
             may_create =
                 project_repo_tools_allowed(auth, conv.project_id, project_access_checker).await;
+        }
+        if may_exec && crate::sandbox_link::link_from_metadata(metadata).is_some() {
+            self.warm_linked_sandbox(conv, auth.user_id());
         }
         crate::sandbox_link::tools_for(
             crate::sandbox_link::link_from_metadata(metadata).is_some(),
