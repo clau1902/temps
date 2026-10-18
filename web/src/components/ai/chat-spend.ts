@@ -41,3 +41,38 @@ export function formatTokens(tokens: number): string {
   if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(1)}k`
   return `${(tokens / 1_000_000).toFixed(1)}M`
 }
+
+/** The slice of the usage response the context readout needs. */
+export interface ChatContextInput {
+  tokens: number
+  window?: number | null
+}
+
+/** How full the model's context is, from 0 to 1, or `null` without a window. */
+export function contextShare(context: ChatContextInput): number | null {
+  if (!context.window || context.window <= 0) return null
+  return Math.min(1, Math.max(0, context.tokens / context.window))
+}
+
+/** Where a chat stands against its model's window, for colour and advice. */
+export type ContextLevel = 'ok' | 'high' | 'critical'
+
+const HIGH_SHARE = 0.6
+const CRITICAL_SHARE = 0.85
+
+export function contextLevel(context: ChatContextInput): ContextLevel {
+  const share = contextShare(context)
+  if (share === null || share < HIGH_SHARE) return 'ok'
+  return share < CRITICAL_SHARE ? 'high' : 'critical'
+}
+
+/** "38.5k of 1.0M tokens (4%)", or just "38.5k tokens" without a window. */
+export function contextLabel(context: ChatContextInput): string {
+  const share = contextShare(context)
+  if (share === null || !context.window) {
+    return `${formatTokens(context.tokens)} tokens`
+  }
+  const percent =
+    share > 0 && share < 0.01 ? '<1' : String(Math.round(share * 100))
+  return `${formatTokens(context.tokens)} of ${formatTokens(context.window)} tokens (${percent}%)`
+}

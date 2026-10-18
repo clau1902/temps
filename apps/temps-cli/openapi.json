@@ -10809,6 +10809,33 @@
         ],
         "type": "object"
       },
+      "ConversationContext": {
+        "description": "How much of the model's context the chat fills right now: the prompt size\nof its latest request, which is the whole conversation, the system framing\nand the tool definitions as the model last saw them.",
+        "properties": {
+          "model": {
+            "description": "Model of that request.",
+            "type": "string"
+          },
+          "tokens": {
+            "description": "Prompt tokens of the latest request, as the provider counted them.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "window": {
+            "description": "The model's context window in tokens, when its catalogue lists one.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model",
+          "tokens"
+        ],
+        "type": "object"
+      },
       "ConversationDetailResponse": {
         "allOf": [
           {
@@ -11289,6 +11316,17 @@
             "description": "Requests made with the user's own provider key rather than the\nplatform's, which Temps does not bill.",
             "format": "int64",
             "type": "integer"
+          },
+          "context": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConversationContext",
+                "description": "The chat's current context size. `None` before the first request, or\nwhen it could not be read: the spend above does not depend on it."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "cost_microcents": {
             "description": "Estimated cost in microcents (1/10000 of a cent), summed over the\nrequests that have a known price.",

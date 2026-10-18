@@ -5227,6 +5227,26 @@ export type ControlApplicationWorkspaceRequest = {
     snapshot_id?: string | null;
 };
 
+/**
+ * How much of the model's context the chat fills right now: the prompt size
+ * of its latest request, which is the whole conversation, the system framing
+ * and the tool definitions as the model last saw them.
+ */
+export type ConversationContext = {
+    /**
+     * Model of that request.
+     */
+    model: string;
+    /**
+     * Prompt tokens of the latest request, as the provider counted them.
+     */
+    tokens: number;
+    /**
+     * The model's context window in tokens, when its catalogue lists one.
+     */
+    window?: number | null;
+};
+
 export type ConversationDetailResponse = ConversationResponse & {
     /**
      * Turns oldest-first. The `system` seed message is omitted (internal).
@@ -5363,6 +5383,7 @@ export type ConversationUsage = {
      * platform's, which Temps does not bill.
      */
     byok_requests: number;
+    context?: ConversationContext | null;
     /**
      * Estimated cost in microcents (1/10000 of a cent), summed over the
      * requests that have a known price.

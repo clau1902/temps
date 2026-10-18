@@ -13,8 +13,12 @@
 //! logged at zero cost, and is counted in `unpriced_requests` so the total is
 //! never presented as complete when it is not.
 
-use sea_orm::{DatabaseBackend, DatabaseConnection, DbErr, FromQueryResult, Statement};
+use sea_orm::{
+    ColumnTrait, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
+    QueryFilter, QueryOrder, QuerySelect, Statement,
+};
 use serde::Serialize;
+use temps_entities::ai_provider_models;
 use utoipa::ToSchema;
 
 /// Most distinct models reported for one chat. A chat switches models rarely;
@@ -30,6 +34,23 @@ pub struct ModelSpend {
     pub output_tokens: i64,
     /// Estimated cost in microcents (1/10000 of a cent), as logged.
     pub cost_microcents: i64,
+}
+
+/// Catalogue rows read to find one model's context window. A model is listed
+/// once per provider that serves it; the newest row with a window wins.
+const WINDOW_LOOKUP_ROWS: u64 = 8;
+
+/// How much of the model's context the chat fills right now: the prompt size
+/// of its latest request, which is the whole conversation, the system framing
+/// and the tool definitions as the model last saw them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ConversationContext {
+    /// Model of that request.
+    pub model: String,
+    /// Prompt tokens of the latest request, as the provider counted them.
+    pub tokens: i64,
+    /// The model's context window in tokens, when its catalogue lists one.
+    pub window: Option<i64>,
 }
 
 /// What one conversation has cost so far.
@@ -48,6 +69,15 @@ pub struct ConversationUsage {
     /// platform's, which Temps does not bill.
     pub byok_requests: i64,
     pub models: Vec<ModelSpend>,
+    /// The chat's current context size. `None` before the first request, or
+    /// when it could not be read: the spend above does not depend on it.
+    pub context: Option<ConversationContext>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct LatestRequestRow {
+    model: String,
+    input_tokens: i64,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -102,7 +132,72 @@ pub async fn conversation_usage(
     .all(db)
     .await?;
 
-    Ok(summarize(rows))
+    let mut usage = summarize(rows);
+    // The context readout is a convenience beside the spend; a failure to read
+    // it is logged and leaves the spend intact.
+    usage.context = match current_context(db, conversation_id, user_id).await {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::warn!(
+                conversation_id,
+                "could not read the chat's context size: {error}"
+            );
+            None
+        }
+    };
+    Ok(usage)
+}
+
+/// The prompt size of the chat's latest model request, with its model's window.
+/// Only the main tool loop counts (`chat.<kind>.tools[.final]`): a title or a
+/// permission check is a small side request that says nothing about the
+/// conversation's size.
+async fn current_context(
+    db: &DatabaseConnection,
+    conversation_id: i64,
+    user_id: i32,
+) -> Result<Option<ConversationContext>, DbErr> {
+    let latest = LatestRequestRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"SELECT model, input_tokens
+           FROM ai_usage_logs
+           WHERE conversation_id = $1
+             AND user_id = $2
+             AND input_tokens > 0
+             AND EXISTS (SELECT 1 FROM unnest(tags) AS tag WHERE tag LIKE 'chat.%.tools%')
+           ORDER BY timestamp DESC, id DESC
+           LIMIT 1"#,
+        [conversation_id.to_string().into(), user_id.into()],
+    ))
+    .one(db)
+    .await?;
+    let Some(latest) = latest else {
+        return Ok(None);
+    };
+    let rows = ai_provider_models::Entity::find()
+        .filter(ai_provider_models::Column::ModelId.eq(latest.model.as_str()))
+        .filter(ai_provider_models::Column::Metadata.is_not_null())
+        .order_by_desc(ai_provider_models::Column::UpdatedAt)
+        .limit(WINDOW_LOOKUP_ROWS)
+        .all(db)
+        .await?;
+    let window = rows
+        .iter()
+        .filter_map(|row| row.metadata.as_ref())
+        .find_map(window_from_metadata);
+    Ok(Some(ConversationContext {
+        model: latest.model,
+        tokens: latest.input_tokens,
+        window,
+    }))
+}
+
+/// A catalogue entry's `context_length`, when it is a positive whole number.
+fn window_from_metadata(metadata: &serde_json::Value) -> Option<i64> {
+    metadata
+        .get("context_length")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|window| *window > 0)
 }
 
 fn summarize(rows: Vec<ModelRow>) -> ConversationUsage {
@@ -114,6 +209,7 @@ fn summarize(rows: Vec<ModelRow>) -> ConversationUsage {
         unpriced_requests: 0,
         byok_requests: 0,
         models: Vec::with_capacity(rows.len()),
+        context: None,
     };
     for row in rows {
         usage.requests = usage.requests.saturating_add(row.requests);
@@ -225,5 +321,125 @@ mod tests {
 
         let error = conversation_usage(&db, 42, 7).await.expect_err("must fail");
         assert!(error.to_string().contains("connection reset"));
+    }
+
+    fn latest_row(model: &str, input_tokens: i64) -> BTreeMap<String, sea_orm::Value> {
+        BTreeMap::from([
+            ("model".to_string(), model.into()),
+            ("input_tokens".to_string(), input_tokens.into()),
+        ])
+    }
+
+    fn catalogue_row(model: &str, metadata: serde_json::Value) -> ai_provider_models::Model {
+        let now = chrono::Utc::now();
+        ai_provider_models::Model {
+            id: 1,
+            provider_key_id: 1,
+            model_id: model.to_string(),
+            display_name: model.to_string(),
+            source: "discovered".to_string(),
+            is_available: true,
+            is_enabled: true,
+            owned_by: None,
+            metadata: Some(metadata),
+            last_seen_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_context_is_the_latest_request_with_its_models_window() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row("vendor/large", 3, 9_000, 0, 0)]])
+            .append_query_results([vec![latest_row("vendor/large", 38_500)]])
+            .append_query_results([vec![catalogue_row(
+                "vendor/large",
+                serde_json::json!({ "context_length": 200_000 }),
+            )]])
+            .into_connection();
+
+        let usage = conversation_usage(&db, 42, 7).await.expect("usage");
+
+        assert_eq!(
+            usage.context,
+            Some(ConversationContext {
+                model: "vendor/large".to_string(),
+                tokens: 38_500,
+                window: Some(200_000),
+            })
+        );
+        assert_eq!(usage.cost_microcents, 9_000);
+    }
+
+    #[tokio::test]
+    async fn a_model_without_a_listed_window_still_reports_its_tokens() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row("vendor/large", 1, 100, 0, 0)]])
+            .append_query_results([vec![latest_row("vendor/large", 1_200)]])
+            .append_query_results([vec![catalogue_row("vendor/large", serde_json::json!({}))]])
+            .into_connection();
+
+        let usage = conversation_usage(&db, 42, 7).await.expect("usage");
+
+        let context = usage.context.expect("context");
+        assert_eq!(context.tokens, 1_200);
+        assert_eq!(context.window, None);
+    }
+
+    #[tokio::test]
+    async fn a_chat_with_no_tool_loop_request_has_no_context_yet() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row("vendor/large", 1, 100, 0, 0)]])
+            .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()])
+            .into_connection();
+
+        let usage = conversation_usage(&db, 42, 7).await.expect("usage");
+
+        assert_eq!(usage.context, None);
+        assert_eq!(usage.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn the_context_query_only_counts_the_main_loop_for_this_owner() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()])
+            .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()])
+            .into_connection();
+
+        conversation_usage(&db, 42, 7).await.expect("usage");
+
+        let sql = format!("{:?}", db.into_transaction_log());
+        assert!(sql.contains("chat.%.tools%"), "side requests are excluded");
+        assert!(sql.contains("ORDER BY timestamp DESC"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_context_read_leaves_the_spend_intact() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row("vendor/large", 2, 500, 0, 0)]])
+            .append_query_errors([DbErr::Custom("connection reset".to_string())])
+            .into_connection();
+
+        let usage = conversation_usage(&db, 42, 7).await.expect("usage");
+
+        assert_eq!(usage.context, None);
+        assert_eq!(usage.cost_microcents, 500);
+    }
+
+    #[test]
+    fn a_window_is_a_positive_whole_number_in_the_catalogue_entry() {
+        use serde_json::json;
+        assert_eq!(
+            window_from_metadata(&json!({ "context_length": 1_000_000 })),
+            Some(1_000_000)
+        );
+        assert_eq!(window_from_metadata(&json!({ "context_length": 0 })), None);
+        assert_eq!(window_from_metadata(&json!({ "context_length": -5 })), None);
+        assert_eq!(
+            window_from_metadata(&json!({ "context_length": "200000" })),
+            None
+        );
+        assert_eq!(window_from_metadata(&json!({})), None);
     }
 }
