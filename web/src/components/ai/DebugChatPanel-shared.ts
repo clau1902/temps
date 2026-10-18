@@ -322,6 +322,14 @@ export function clearResolvedPermissionParts(
   }))
 }
 
+/** Whether two ISO timestamps name the same instant, to the millisecond. */
+function sameInstant(a?: string, b?: string): boolean {
+  if (!a || !b) return false
+  const left = Date.parse(a)
+  const right = Date.parse(b)
+  return !Number.isNaN(left) && left === right
+}
+
 export function appendLiveUserTurn(
   messages: ChatMessage[],
   user: {
@@ -334,6 +342,21 @@ export function appendLiveUserTurn(
   if (
     user.turn_id &&
     messages.some((message) => message.client_turn_id === user.turn_id)
+  ) {
+    return messages
+  }
+  // A snapshot refresh can land before this echo and replace the optimistic
+  // turn with the stored one, which carries no turn id. The echo is stamped
+  // with the stored message's own creation time, so the same text at the same
+  // instant is that message, not a second send.
+  if (
+    messages.some(
+      (message) =>
+        message.role === 'user' &&
+        message.server_cursor !== undefined &&
+        message.content === user.content &&
+        sameInstant(message.created_at, user.created_at)
+    )
   ) {
     return messages
   }

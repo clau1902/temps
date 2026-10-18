@@ -516,6 +516,58 @@ describe('live connection state', () => {
     ).toHaveLength(2)
   })
 
+  test('does not repeat a user turn a snapshot already stored', () => {
+    // The refreshed history replaced the optimistic turn before the echo came.
+    const stored = [
+      {
+        server_cursor: 'cursor-271',
+        role: 'user',
+        content: 'and use a sidebar for that please',
+        created_at: '2026-10-18T17:54:09.545100Z',
+      },
+    ]
+    expect(
+      appendLiveUserTurn(stored, {
+        content: 'and use a sidebar for that please',
+        created_at: '2026-10-18T17:54:09.545100+00:00',
+        turn_id: 'turn-2',
+      })
+    ).toBe(stored)
+  })
+
+  test('still appends the same words sent again later', () => {
+    const stored = [
+      {
+        server_cursor: 'cursor-1',
+        role: 'user',
+        content: 'continue',
+        created_at: '2026-10-18T17:54:09.545Z',
+      },
+    ]
+    expect(
+      appendLiveUserTurn(stored, {
+        content: 'continue',
+        created_at: '2026-10-18T17:59:41.002Z',
+        turn_id: 'turn-3',
+      })
+    ).toHaveLength(3)
+    // An unsaved local message is not the stored one, even at the same time.
+    const local = [
+      {
+        role: 'user',
+        content: 'continue',
+        created_at: '2026-10-18T17:54:09.545Z',
+      },
+    ]
+    expect(
+      appendLiveUserTurn(local, {
+        content: 'continue',
+        created_at: '2026-10-18T17:54:09.545Z',
+        turn_id: 'turn-4',
+      })
+    ).toHaveLength(3)
+  })
+
   test('preserves attachment metadata on a live user turn', () => {
     const messages = appendLiveUserTurn([], {
       content: '',
