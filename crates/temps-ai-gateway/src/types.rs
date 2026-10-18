@@ -101,6 +101,11 @@ pub struct ContentPart {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_url: Option<serde_json::Value>,
+    /// Prompt-cache breakpoint for providers that cache explicitly, e.g.
+    /// `{"type": "ephemeral"}`. Everything up to and including this part is
+    /// cacheable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -123,9 +128,24 @@ pub struct ChatCompletionChoice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UsageInfo {
+    /// The whole prompt, including any part served from the provider's cache.
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// How the prompt split between fresh and cached tokens, when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// The cached share of a prompt. Both counts are parts of `prompt_tokens`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PromptTokensDetails {
+    /// Tokens read from the provider's prompt cache.
+    #[serde(default)]
+    pub cached_tokens: i64,
+    /// Tokens written to the provider's prompt cache by this request.
+    #[serde(default)]
+    pub cache_write_tokens: i64,
 }
 
 // ============================================================================
@@ -229,6 +249,12 @@ pub struct ModelDetails {
     /// USD per one million output (completion) tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_price_per_million: Option<f64>,
+    /// USD per one million input tokens read from the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_price_per_million: Option<f64>,
+    /// USD per one million input tokens written to the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_price_per_million: Option<f64>,
     /// Whether the catalogue lists tool calling. The Temps assistant needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_tools: Option<bool>,
@@ -279,6 +305,12 @@ impl ModelDetails {
             output_modalities: strings(architecture.and_then(|a| a.get("output_modalities"))),
             input_price_per_million: per_million(pricing.and_then(|p| p.get("prompt"))),
             output_price_per_million: per_million(pricing.and_then(|p| p.get("completion"))),
+            cache_read_price_per_million: per_million(
+                pricing.and_then(|p| p.get("input_cache_read")),
+            ),
+            cache_write_price_per_million: per_million(
+                pricing.and_then(|p| p.get("input_cache_write")),
+            ),
             supports_tools: supported.map(|params| {
                 params
                     .iter()

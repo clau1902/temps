@@ -467,6 +467,7 @@ async fn create_response(
                             200,
                             false,
                             is_byok,
+                            crate::types::PromptTokensDetails::default(),
                             &ai_context,
                         )
                         .await

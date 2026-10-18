@@ -12,7 +12,7 @@ use temps_entities::{ai_provider_models, ai_usage_logs};
 use utoipa::ToSchema;
 
 use crate::error::AiGatewayError;
-use crate::types::ModelDetails;
+use crate::types::{ModelDetails, PromptTokensDetails};
 
 /// How many catalogue rows for one model id are inspected for a price. The
 /// same model can be listed under several provider keys; the newest entries
@@ -20,8 +20,14 @@ use crate::types::ModelDetails;
 const PRICE_LOOKUP_ROWS: u64 = 5;
 
 /// USD per million tokens is numerically the same as microcents per token
-/// (1 USD = 1,000,000 microcents), so a request costs
-/// `input_tokens * input_price + output_tokens * output_price` microcents.
+/// (1 USD = 1,000,000 microcents). A request costs fresh input at the input
+/// price, cached input at the cache-read price, cache writes at the
+/// cache-write price, and output at the output price.
+///
+/// `input_tokens` is the whole prompt, so the cached parts are carved out of
+/// it rather than added to it. A catalogue that publishes no cache price
+/// prices those tokens as ordinary input: that overstates a cache hit but
+/// never hides spend.
 ///
 /// Returns `None` when the catalogue publishes no price for the model, so the
 /// caller can tell "unpriced" from "free".
@@ -29,14 +35,25 @@ pub(crate) fn cost_microcents_from_details(
     details: &ModelDetails,
     input_tokens: i64,
     output_tokens: i64,
+    cache: PromptTokensDetails,
 ) -> Option<i64> {
     let input_price = details.input_price_per_million?;
     let output_price = details.output_price_per_million?;
     if !input_price.is_finite() || !output_price.is_finite() {
         return None;
     }
-    let cost =
-        input_tokens.max(0) as f64 * input_price + output_tokens.max(0) as f64 * output_price;
+    let usable = |price: Option<f64>| price.filter(|p| p.is_finite()).unwrap_or(input_price);
+    let read_price = usable(details.cache_read_price_per_million);
+    let write_price = usable(details.cache_write_price_per_million);
+
+    let input_tokens = input_tokens.max(0);
+    let read = cache.cached_tokens.clamp(0, input_tokens);
+    let write = cache.cache_write_tokens.clamp(0, input_tokens - read);
+    let fresh = input_tokens - read - write;
+    let cost = fresh as f64 * input_price
+        + read as f64 * read_price
+        + write as f64 * write_price
+        + output_tokens.max(0) as f64 * output_price;
     // Saturate rather than wrap on an absurd product.
     Some(cost.round().clamp(0.0, i64::MAX as f64) as i64)
 }
@@ -97,6 +114,10 @@ pub struct UsageLogEntry {
     pub model: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Part of `input_tokens` read from the provider's prompt cache.
+    pub cache_read_tokens: i64,
+    /// Part of `input_tokens` written to the provider's prompt cache.
+    pub cache_write_tokens: i64,
     pub latency_ms: i32,
     pub estimated_cost_microcents: i64,
     pub status: i16,
@@ -233,6 +254,8 @@ struct UsageLogRow {
     model: Option<String>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
     latency_ms: Option<i32>,
     estimated_cost_microcents: Option<i64>,
     status: Option<i16>,
@@ -301,6 +324,7 @@ impl UsageService {
             status,
             is_streaming,
             is_byok,
+            PromptTokensDetails::default(),
             &AiRequestContext::default(),
         )
         .await
@@ -319,6 +343,7 @@ impl UsageService {
         status: i16,
         is_streaming: bool,
         is_byok: bool,
+        cache: PromptTokensDetails,
         context: &AiRequestContext,
     ) -> Result<(), AiGatewayError> {
         self.log_usage_on_connection(
@@ -333,6 +358,7 @@ impl UsageService {
             status,
             is_streaming,
             is_byok,
+            cache,
             context,
         )
         .await
@@ -347,6 +373,7 @@ impl UsageService {
         model: &str,
         input_tokens: i64,
         output_tokens: i64,
+        cache: PromptTokensDetails,
     ) -> i64 {
         if input_tokens <= 0 && output_tokens <= 0 {
             return 0;
@@ -364,7 +391,7 @@ impl UsageService {
                 .filter_map(|row| row.metadata)
                 .filter_map(|metadata| serde_json::from_value::<ModelDetails>(metadata).ok())
                 .find_map(|details| {
-                    cost_microcents_from_details(&details, input_tokens, output_tokens)
+                    cost_microcents_from_details(&details, input_tokens, output_tokens, cache)
                 })
                 .unwrap_or(0),
             Err(error) => {
@@ -390,6 +417,7 @@ impl UsageService {
         status: i16,
         is_streaming: bool,
         is_byok: bool,
+        cache: PromptTokensDetails,
         context: &AiRequestContext,
     ) -> Result<(), AiGatewayError> {
         // Callers do not price what they log: they pass zero. Price it here,
@@ -400,7 +428,7 @@ impl UsageService {
         let estimated_cost_microcents = if estimated_cost_microcents > 0 || is_byok {
             estimated_cost_microcents
         } else {
-            self.estimate_cost_microcents(connection, model, input_tokens, output_tokens)
+            self.estimate_cost_microcents(connection, model, input_tokens, output_tokens, cache)
                 .await
         };
         let record = ai_usage_logs::ActiveModel {
@@ -410,6 +438,8 @@ impl UsageService {
             model: Set(model.to_string()),
             input_tokens: Set(input_tokens),
             output_tokens: Set(output_tokens),
+            cache_read_tokens: Set(cache.cached_tokens.clamp(0, input_tokens.max(0))),
+            cache_write_tokens: Set(cache.cache_write_tokens.clamp(0, input_tokens.max(0))),
             latency_ms: Set(latency_ms),
             estimated_cost_microcents: Set(estimated_cost_microcents),
             status: Set(status),
@@ -739,6 +769,8 @@ impl UsageService {
                 model,
                 input_tokens,
                 output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
                 latency_ms,
                 estimated_cost_microcents,
                 status,
@@ -852,6 +884,8 @@ impl UsageService {
                 model,
                 input_tokens,
                 output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
                 latency_ms,
                 estimated_cost_microcents,
                 status,
@@ -1023,6 +1057,8 @@ fn usage_log_from_row(r: UsageLogRow) -> UsageLogEntry {
         model: r.model.unwrap_or_default(),
         input_tokens: r.input_tokens.unwrap_or(0),
         output_tokens: r.output_tokens.unwrap_or(0),
+        cache_read_tokens: r.cache_read_tokens.unwrap_or(0),
+        cache_write_tokens: r.cache_write_tokens.unwrap_or(0),
         latency_ms: r.latency_ms.unwrap_or(0),
         estimated_cost_microcents: r.estimated_cost_microcents.unwrap_or(0),
         status: r.status.unwrap_or(0),
@@ -1058,21 +1094,87 @@ mod tests {
         // $3 / $15 per million tokens: 1,000 in + 200 out = $0.003 + $0.003.
         let details = priced(Some(3.0), Some(15.0));
         assert_eq!(
-            cost_microcents_from_details(&details, 1_000, 200),
+            cost_microcents_from_details(&details, 1_000, 200, PromptTokensDetails::default()),
             Some(6_000)
         );
         // 6,000 microcents is $0.006.
         assert_eq!(6_000.0 / 1_000_000.0, 0.006);
     }
 
+    fn cached(read: i64, write: i64) -> PromptTokensDetails {
+        PromptTokensDetails {
+            cached_tokens: read,
+            cache_write_tokens: write,
+        }
+    }
+
+    #[test]
+    fn cached_input_is_priced_at_the_cache_rate_and_carved_out_of_the_prompt() {
+        // $3 in / $15 out, $0.30 cache read, $3.75 cache write per million.
+        let details = ModelDetails {
+            cache_read_price_per_million: Some(0.3),
+            cache_write_price_per_million: Some(3.75),
+            ..priced(Some(3.0), Some(15.0))
+        };
+        // 10,000-token prompt: 8,000 cached, 1,000 written, 1,000 fresh; 200 out.
+        // 1,000*3 + 8,000*0.3 + 1,000*3.75 + 200*15 = 3,000+2,400+3,750+3,000.
+        assert_eq!(
+            cost_microcents_from_details(&details, 10_000, 200, cached(8_000, 1_000)),
+            Some(12_150)
+        );
+        // Uncached, the same prompt costs 10,000*3 + 3,000.
+        assert_eq!(
+            cost_microcents_from_details(&details, 10_000, 200, cached(0, 0)),
+            Some(33_000)
+        );
+    }
+
+    #[test]
+    fn a_catalogue_without_cache_prices_charges_cached_tokens_as_input() {
+        let details = priced(Some(3.0), Some(15.0));
+        assert_eq!(
+            cost_microcents_from_details(&details, 10_000, 0, cached(8_000, 1_000)),
+            cost_microcents_from_details(&details, 10_000, 0, cached(0, 0)),
+        );
+    }
+
+    #[test]
+    fn cache_counts_larger_than_the_prompt_cannot_make_the_cost_negative_or_exceed_it() {
+        let details = ModelDetails {
+            cache_read_price_per_million: Some(0.3),
+            cache_write_price_per_million: Some(3.75),
+            ..priced(Some(3.0), Some(15.0))
+        };
+        // Claims 9,000 read + 9,000 written out of a 1,000-token prompt: the
+        // read share is capped at the prompt, nothing is left to write.
+        assert_eq!(
+            cost_microcents_from_details(&details, 1_000, 0, cached(9_000, 9_000)),
+            Some(300)
+        );
+        assert_eq!(
+            cost_microcents_from_details(&details, 1_000, 0, cached(-5, -5)),
+            Some(3_000)
+        );
+    }
+
     #[test]
     fn a_model_without_a_published_price_is_unpriced_not_free() {
         assert_eq!(
-            cost_microcents_from_details(&priced(None, None), 1_000, 200),
+            cost_microcents_from_details(
+                &priced(None, None),
+                1_000,
+                200,
+                PromptTokensDetails::default()
+            ),
             None
         );
         assert_eq!(
-            cost_microcents_from_details(&priced(Some(3.0), None), 1_000, 200),
+            cost_microcents_from_details(
+                &priced(Some(3.0), None),
+                1_000,
+                200,
+                PromptTokensDetails::default()
+            ),
             None
         );
     }
@@ -1080,7 +1182,12 @@ mod tests {
     #[test]
     fn a_free_model_is_priced_at_zero() {
         assert_eq!(
-            cost_microcents_from_details(&priced(Some(0.0), Some(0.0)), 5_000, 500),
+            cost_microcents_from_details(
+                &priced(Some(0.0), Some(0.0)),
+                5_000,
+                500,
+                PromptTokensDetails::default()
+            ),
             Some(0)
         );
     }
@@ -1088,13 +1195,26 @@ mod tests {
     #[test]
     fn negative_tokens_and_non_finite_prices_cannot_produce_a_negative_or_wild_cost() {
         let details = priced(Some(3.0), Some(15.0));
-        assert_eq!(cost_microcents_from_details(&details, -50, -50), Some(0));
         assert_eq!(
-            cost_microcents_from_details(&priced(Some(f64::NAN), Some(1.0)), 10, 10),
+            cost_microcents_from_details(&details, -50, -50, PromptTokensDetails::default()),
+            Some(0)
+        );
+        assert_eq!(
+            cost_microcents_from_details(
+                &priced(Some(f64::NAN), Some(1.0)),
+                10,
+                10,
+                PromptTokensDetails::default()
+            ),
             None
         );
         assert_eq!(
-            cost_microcents_from_details(&priced(Some(f64::MAX), Some(f64::MAX)), i64::MAX, 1),
+            cost_microcents_from_details(
+                &priced(Some(f64::MAX), Some(f64::MAX)),
+                i64::MAX,
+                1,
+                PromptTokensDetails::default()
+            ),
             Some(i64::MAX)
         );
     }
@@ -1139,7 +1259,13 @@ mod tests {
             .into_connection();
 
         let cost = service()
-            .estimate_cost_microcents(&db, "vendor/model", 1_000, 200)
+            .estimate_cost_microcents(
+                &db,
+                "vendor/model",
+                1_000,
+                200,
+                PromptTokensDetails::default(),
+            )
             .await;
 
         assert_eq!(cost, 6_000);
@@ -1152,7 +1278,13 @@ mod tests {
             .into_connection();
 
         let cost = service()
-            .estimate_cost_microcents(&db, "vendor/unknown", 1_000, 200)
+            .estimate_cost_microcents(
+                &db,
+                "vendor/unknown",
+                1_000,
+                200,
+                PromptTokensDetails::default(),
+            )
             .await;
 
         assert_eq!(cost, 0);
@@ -1165,7 +1297,13 @@ mod tests {
             .into_connection();
 
         let cost = service()
-            .estimate_cost_microcents(&db, "vendor/model", 1_000, 200)
+            .estimate_cost_microcents(
+                &db,
+                "vendor/model",
+                1_000,
+                200,
+                PromptTokensDetails::default(),
+            )
             .await;
 
         assert_eq!(cost, 0);
@@ -1177,7 +1315,7 @@ mod tests {
         // zero here proves it returned early either way.
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let cost = service()
-            .estimate_cost_microcents(&db, "vendor/model", 0, 0)
+            .estimate_cost_microcents(&db, "vendor/model", 0, 0, PromptTokensDetails::default())
             .await;
         assert_eq!(cost, 0);
     }
@@ -1325,6 +1463,8 @@ mod tests {
             model: Some("claude-sonnet-4-6".to_string()),
             input_tokens: Some(100),
             output_tokens: Some(50),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
             latency_ms: Some(500),
             estimated_cost_microcents: Some(10),
             status: Some(200),
@@ -1341,6 +1481,7 @@ mod tests {
         assert_eq!(entry.tags, vec!["agent:support", "env:prod"]);
         assert_eq!(entry.request_id, Some("req_abc".to_string()));
         assert_eq!(entry.trace_id, Some("trace_xyz".to_string()));
+        assert_eq!((entry.cache_read_tokens, entry.cache_write_tokens), (0, 0));
     }
 
     #[test]
@@ -1352,6 +1493,8 @@ mod tests {
             model: Some("gpt-4o".to_string()),
             input_tokens: Some(100),
             output_tokens: Some(50),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
             latency_ms: Some(200),
             estimated_cost_microcents: Some(5),
             status: Some(200),
@@ -1398,6 +1541,8 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             input_tokens: 100,
             output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             latency_ms: 500,
             estimated_cost_microcents: 10,
             status: 200,
@@ -1424,6 +1569,8 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             input_tokens: 100,
             output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             latency_ms: 500,
             estimated_cost_microcents: 10,
             status: 200,

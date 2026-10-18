@@ -1327,6 +1327,7 @@ mod tests {
         let parts = chat_response(Some(MessageContent::Parts(vec![
             crate::types::ContentPart {
                 r#type: "text".to_string(),
+                cache_control: None,
                 text: Some("ignored".to_string()),
                 image_url: None,
             },

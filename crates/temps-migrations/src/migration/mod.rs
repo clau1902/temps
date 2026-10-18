@@ -321,6 +321,7 @@ mod m20261010_000001_create_ai_goals;
 mod m20261017_000001_create_ai_chat_attachments;
 mod m20261017_000002_add_text_to_ai_chat_attachments;
 mod m20261017_000003_create_sandbox_services;
+mod m20261018_000001_add_cache_tokens_to_ai_usage_logs;
 
 pub struct Migrator;
 
@@ -713,6 +714,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261017_000001_create_ai_chat_attachments::Migration),
             Box::new(m20261017_000002_add_text_to_ai_chat_attachments::Migration),
             Box::new(m20261017_000003_create_sandbox_services::Migration),
+            Box::new(m20261018_000001_add_cache_tokens_to_ai_usage_logs::Migration),
         ]
     }
 }

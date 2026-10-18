@@ -348,11 +348,7 @@ impl AnthropicProvider {
                 },
                 finish_reason,
             }],
-            usage: Some(UsageInfo {
-                prompt_tokens: response.usage.input_tokens,
-                completion_tokens: response.usage.output_tokens,
-                total_tokens: response.usage.input_tokens + response.usage.output_tokens,
-            }),
+            usage: Some(response.usage.to_usage_info()),
         }
     }
 
@@ -498,6 +494,7 @@ impl AnthropicProvider {
                         prompt_tokens: 0,
                         completion_tokens: u.get("output_tokens")?.as_i64()?,
                         total_tokens: u.get("output_tokens")?.as_i64()?,
+                        prompt_tokens_details: None,
                     })
                 });
 
@@ -799,8 +796,33 @@ struct AnthropicResponse {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
+    /// Fresh input only: Anthropic reports cache reads and writes separately.
     input_tokens: i64,
     output_tokens: i64,
+    #[serde(default)]
+    cache_read_input_tokens: i64,
+    #[serde(default)]
+    cache_creation_input_tokens: i64,
+}
+
+impl AnthropicUsage {
+    /// OpenAI semantics: `prompt_tokens` is the whole prompt, so the cached
+    /// parts Anthropic reports on their own are added back in.
+    fn to_usage_info(&self) -> UsageInfo {
+        let prompt_tokens =
+            self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens;
+        UsageInfo {
+            prompt_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: prompt_tokens + self.output_tokens,
+            prompt_tokens_details: (self.cache_read_input_tokens > 0
+                || self.cache_creation_input_tokens > 0)
+                .then_some(PromptTokensDetails {
+                    cached_tokens: self.cache_read_input_tokens,
+                    cache_write_tokens: self.cache_creation_input_tokens,
+                }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1045,11 +1067,13 @@ mod tests {
                 content: Some(MessageContent::Parts(vec![
                     ContentPart {
                         r#type: "text".to_string(),
+                        cache_control: None,
                         text: Some("What's in this image?".to_string()),
                         image_url: None,
                     },
                     ContentPart {
                         r#type: "image_url".to_string(),
+                        cache_control: None,
                         text: None,
                         image_url: Some(serde_json::json!({
                             "url": "data:image/png;base64,iVBORw0KGgo="
@@ -1105,6 +1129,8 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 20,
                 output_tokens: 15,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
         };
 
@@ -1149,6 +1175,8 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 10,
                 output_tokens: 8,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             },
         };
 

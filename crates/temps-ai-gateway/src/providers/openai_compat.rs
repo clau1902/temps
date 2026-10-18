@@ -370,6 +370,9 @@ impl AiProvider for OpenAiCompatProvider {
         if self.info.id == "openai" {
             sanitize_openai_request(&mut req);
         }
+        if super::prompt_cache::uses_explicit_prompt_cache(self.info.id, &req.model) {
+            super::prompt_cache::mark_cache_breakpoints(&mut req.messages);
+        }
 
         let response = self
             .client
@@ -423,6 +426,9 @@ impl AiProvider for OpenAiCompatProvider {
 
         if self.info.id == "openai" {
             sanitize_openai_request(&mut req);
+        }
+        if super::prompt_cache::uses_explicit_prompt_cache(self.info.id, &req.model) {
+            super::prompt_cache::mark_cache_breakpoints(&mut req.messages);
         }
 
         // Inject stream_options.include_usage so the final chunk includes token counts

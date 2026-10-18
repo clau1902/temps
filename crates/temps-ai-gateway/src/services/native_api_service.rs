@@ -1083,6 +1083,7 @@ impl NativeApiService {
                 200,
                 false,
                 record.provider_key_id.is_none(),
+                crate::types::PromptTokensDetails::default(),
                 &context,
             )
             .await?;
@@ -1734,6 +1735,8 @@ mod tests {
                 .unwrap(),
         );
         let log = temps_entities::ai_usage_logs::Model {
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             id: 1,
             timestamp: chrono::Utc::now(),
             user_id: Some(4),

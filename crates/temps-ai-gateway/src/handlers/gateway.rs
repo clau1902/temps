@@ -109,7 +109,7 @@ fn extract_responses_usage_from_sse_line(line: &str) -> Option<(i64, i64)> {
 #[cfg(test)]
 fn extract_line(line: &str, kind: UsageKind) -> Option<(i64, i64)> {
     let mut parser = SseUsage::new(kind);
-    parser.push(line.as_bytes(), |_, _| {});
+    parser.push(line.as_bytes(), |_, _, _| {});
     parser.finish_line()
 }
 
@@ -134,16 +134,22 @@ pub(crate) fn wrap_stream_with_usage_tracking(
 
     let prompt_tokens = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let completion_tokens = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let cache_read_tokens = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let cache_write_tokens = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let pt = prompt_tokens.clone();
     let ct = completion_tokens.clone();
+    let cr = cache_read_tokens.clone();
+    let cw = cache_write_tokens.clone();
     let mapped = async_stream::stream! {
         let mut inner = inner;
         let mut parser = SseUsage::new(usage_kind);
         while let Some(result) = inner.next().await {
             if let Ok(ref bytes) = result {
-                parser.push(bytes, |input, output| {
+                parser.push(bytes, |input, output, cache| {
                     pt.store(input, std::sync::atomic::Ordering::Relaxed);
                     ct.store(output, std::sync::atomic::Ordering::Relaxed);
+                    cr.store(cache.cached_tokens, std::sync::atomic::Ordering::Relaxed);
+                    cw.store(cache.cache_write_tokens, std::sync::atomic::Ordering::Relaxed);
                 });
             }
             yield result;
@@ -151,20 +157,29 @@ pub(crate) fn wrap_stream_with_usage_tracking(
         // Providers normally terminate SSE lines with LF. Retain accounting
         // for a complete final JSON event even when the last LF is omitted.
         if let Some((input, output)) = parser.finish_line() {
+            let cache = parser.cache();
             pt.store(input, std::sync::atomic::Ordering::Relaxed);
             ct.store(output, std::sync::atomic::Ordering::Relaxed);
+            cr.store(cache.cached_tokens, std::sync::atomic::Ordering::Relaxed);
+            cw.store(cache.cache_write_tokens, std::sync::atomic::Ordering::Relaxed);
         }
     };
 
     // When the stream ends, log usage
     let pt_final = prompt_tokens;
     let ct_final = completion_tokens;
+    let cr_final = cache_read_tokens;
+    let cw_final = cache_write_tokens;
 
     let with_cleanup = StreamWithCleanup {
         inner: Box::pin(mapped),
         on_drop: Some(Box::new(move || {
             let input = pt_final.load(std::sync::atomic::Ordering::Relaxed);
             let output = ct_final.load(std::sync::atomic::Ordering::Relaxed);
+            let cache = PromptTokensDetails {
+                cached_tokens: cr_final.load(std::sync::atomic::Ordering::Relaxed),
+                cache_write_tokens: cw_final.load(std::sync::atomic::Ordering::Relaxed),
+            };
             let latency_ms = start.elapsed().as_millis() as i32;
 
             if input > 0 || output > 0 {
@@ -181,6 +196,7 @@ pub(crate) fn wrap_stream_with_usage_tracking(
                             200,
                             true, // streaming
                             is_byok,
+                            cache,
                             &ai_context,
                         )
                         .await
@@ -517,6 +533,7 @@ async fn chat_completions(
                     let provider_clone = provider_id.to_string();
                     let input = usage.prompt_tokens;
                     let output = usage.completion_tokens;
+                    let cache = usage.prompt_tokens_details.unwrap_or_default();
                     let latency_ms = latency.as_millis() as i32;
                     let is_byok = cred_type == CredentialType::Byok;
                     let ctx = ai_context.clone();
@@ -533,6 +550,7 @@ async fn chat_completions(
                                 200,
                                 false, // non-streaming path
                                 is_byok,
+                                cache,
                                 &ctx,
                             )
                             .await
@@ -728,6 +746,7 @@ async fn embeddings(
                             200,
                             false,
                             is_byok,
+                            PromptTokensDetails::default(),
                             &ctx,
                         )
                         .await
@@ -916,6 +935,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                prompt_tokens_details: None,
             }),
         };
 
@@ -1242,6 +1262,8 @@ mod tests {
                 }
                 let db = Arc::new(
                     mock.append_query_results([vec![ai_usage_logs::Model {
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
                         id: 1,
                         timestamp: chrono::Utc::now(),
                         user_id: Some(42),
@@ -1306,8 +1328,11 @@ mod tests {
                 let values = &statement.values.as_ref().expect("insert bindings").0;
                 assert_eq!(values[4], sea_orm::Value::BigInt(Some(74122)));
                 assert_eq!(values[5], sea_orm::Value::BigInt(Some(32989)));
-                assert_eq!(values[9], sea_orm::Value::Bool(Some(true)));
-                assert_eq!(values[10], sea_orm::Value::Bool(Some(is_byok)));
+                // Cache read and write follow the token counts.
+                assert_eq!(values[6], sea_orm::Value::BigInt(Some(0)));
+                assert_eq!(values[7], sea_orm::Value::BigInt(Some(0)));
+                assert_eq!(values[11], sea_orm::Value::Bool(Some(true)));
+                assert_eq!(values[12], sea_orm::Value::Bool(Some(is_byok)));
             }
         }
     }
