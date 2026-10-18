@@ -115,6 +115,7 @@ import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { persistentWorkspaceStorageSupported } from '@/lib/platform-capabilities'
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -1726,6 +1727,115 @@ export function AssistantBody({
   )
 }
 
+/**
+ * One transcript entry.
+ *
+ * Memoized because a streamed token replaces only the trailing message in the
+ * list: every earlier row keeps its identity, so without this each token would
+ * re-render, and re-parse the markdown of, the whole conversation. Callers must
+ * therefore pass stable callbacks, and `streaming`-only props (`activityLabel`,
+ * `turnStartedAt`) only to the row that is streaming.
+ *
+ * Settled rows opt into `content-visibility: auto` (see globals.css) so the
+ * browser skips layout and paint for the ones scrolled out of view. The
+ * streaming row is excluded: its height changes every token.
+ */
+export const TranscriptRow = memo(function TranscriptRow({
+  message: m,
+  streaming,
+  activityLabel,
+  turnStartedAt,
+  publicId,
+  userScoped,
+  projectId,
+  fromProject,
+  attachmentsBase,
+  onFix,
+  onPermissionResolved,
+}: {
+  message: ChatMessage
+  streaming: boolean
+  activityLabel: string
+  turnStartedAt?: string | null
+  publicId: string | null
+  userScoped: boolean
+  projectId?: number
+  fromProject: boolean
+  attachmentsBase?: string
+  onFix: (text: string) => void
+  onPermissionResolved: () => void
+}) {
+  // A completed assistant turn with nothing extracted (e.g. the CLI's only
+  // action was a tool call CLI-chat can't bridge — ADR-038) renders as truly
+  // nothing, not an empty styled bubble: the padded, rounded `bg-muted` wrapper
+  // below has no way to look "empty" once it exists, so skip the whole message
+  // instead of leaving a blank gray bar in the transcript that reads as an
+  // answer with no text.
+  if (m.role === 'assistant' && assistantParts(m).length === 0 && !streaming) {
+    return null
+  }
+  const settled = streaming ? '' : ' chat-transcript-row'
+  if (m.role === 'user') {
+    return (
+      <div
+        className={`group flex flex-col items-end gap-0.5${settled}`}
+        data-testid="transcript-row-user"
+      >
+        <div className="flex max-w-[85%] flex-col gap-2 rounded-2xl rounded-tr-sm bg-primary px-3.5 py-2.5 text-sm text-primary-foreground">
+          <ChatAttachments
+            attachments={m.attachments ?? []}
+            contentBase={attachmentsBase}
+          />
+          {m.content && <div className="whitespace-pre-wrap">{m.content}</div>}
+        </div>
+        <div className="flex items-center gap-1 px-1">
+          {m.created_at && (
+            <TimeAgo
+              date={m.created_at}
+              className="text-[10px] text-muted-foreground"
+            />
+          )}
+          <MessageCopyButton text={messageCopyText(m)} />
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div
+      className={`group flex items-start${settled}`}
+      data-testid="transcript-row-assistant"
+    >
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="min-w-0 space-y-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
+          <AssistantBody
+            message={m}
+            streaming={streaming}
+            activityLabel={activityLabel}
+            turnStartedAt={turnStartedAt}
+            conversationPublicId={publicId}
+            userScoped={userScoped}
+            projectId={projectId}
+            fromProject={fromProject}
+            onFix={onFix}
+            onPermissionResolved={onPermissionResolved}
+          />
+        </div>
+        {assistantParts(m).length > 0 && (
+          <div className="flex items-center gap-1 px-1">
+            {m.created_at && (
+              <TimeAgo
+                date={m.created_at}
+                className="text-[10px] text-muted-foreground"
+              />
+            )}
+            <MessageCopyButton text={messageCopyText(m)} />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+})
+
 /** Backoff schedule for WS reconnects — bounded, no thundering herd. */
 const WS_RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000, 15000]
 
@@ -3282,6 +3392,20 @@ function DebugChatPanelBody({
     onConversationChange?.(publicId)
   }, [publicId, onConversationChange])
 
+  // Transcript rows are memoized, so the callbacks handed to them must keep
+  // their identity across renders. They read the latest `send`/`pollForReply`
+  // through a ref instead of closing over them.
+  const transcriptActions = useRef({ send, pollForReply })
+  useLayoutEffect(() => {
+    transcriptActions.current = { send, pollForReply }
+  }, [send, pollForReply])
+  const fixFromTranscript = useCallback((text: string) => {
+    void transcriptActions.current.send(text)
+  }, [])
+  const permissionResolvedInTranscript = useCallback(() => {
+    transcriptActions.current.pollForReply()
+  }, [])
+
   const visible = messages.filter((m) => m.role !== 'system')
   const busy = turnActive || starting
   // A turn in flight either from this tab's own send() or observed live from
@@ -3308,12 +3432,14 @@ function DebugChatPanelBody({
           className="h-full space-y-4 overflow-y-auto pt-4 pr-1"
         >
           {loadingEarlierMessages && (
-            <div
-              className="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground"
-              role="status"
-            >
-              <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-              Loading earlier messages…
+            <div className="space-y-4" role="status">
+              <span className="sr-only">Loading earlier messages…</span>
+              <div className="flex items-start gap-2.5" aria-hidden="true">
+                <Skeleton className="h-16 flex-1 rounded-2xl rounded-tl-sm" />
+              </div>
+              <div className="flex justify-end" aria-hidden="true">
+                <Skeleton className="h-9 w-2/3 rounded-2xl rounded-tr-sm" />
+              </div>
             </div>
           )}
 
@@ -3413,22 +3539,9 @@ function DebugChatPanelBody({
           )}
 
           {visible.map((m, i) => {
-            const isTrailing = i === visible.length - 1
-            // A completed assistant turn with nothing extracted (e.g. the CLI's
-            // only action was a tool call CLI-chat can't bridge — ADR-038)
-            // renders as truly nothing, not an empty styled bubble: the padded,
-            // rounded `bg-muted` wrapper below has no way to look "empty" once
-            // it exists, so skip the whole message instead of leaving a blank
-            // gray bar in the transcript that reads as an answer with no text.
-            if (
-              m.role === 'assistant' &&
-              assistantParts(m).length === 0 &&
-              !(liveTurn && isTrailing)
-            ) {
-              return null
-            }
-            return m.role === 'user' ? (
-              <div
+            const streaming = liveTurn && i === visible.length - 1
+            return (
+              <TranscriptRow
                 key={
                   m.server_cursor ??
                   (m.client_turn_id
@@ -3436,70 +3549,22 @@ function DebugChatPanelBody({
                     : undefined) ??
                   `${m.created_at ?? 'message'}-${i}`
                 }
-                className="group flex flex-col items-end gap-0.5"
-              >
-                <div className="flex max-w-[85%] flex-col gap-2 rounded-2xl rounded-tr-sm bg-primary px-3.5 py-2.5 text-sm text-primary-foreground">
-                  <ChatAttachments
-                    attachments={m.attachments ?? []}
-                    contentBase={
-                      userScoped && publicId
-                        ? `${base}/${publicId}/attachments`
-                        : undefined
-                    }
-                  />
-                  {m.content && (
-                    <div className="whitespace-pre-wrap">{m.content}</div>
-                  )}
-                </div>
-                <div className="flex items-center gap-1 px-1">
-                  {m.created_at && (
-                    <TimeAgo
-                      date={m.created_at}
-                      className="text-[10px] text-muted-foreground"
-                    />
-                  )}
-                  <MessageCopyButton text={messageCopyText(m)} />
-                </div>
-              </div>
-            ) : (
-              <div
-                key={
-                  m.server_cursor ??
-                  (m.client_turn_id
-                    ? `${m.client_turn_id}:${m.role}`
-                    : undefined) ??
-                  `${m.created_at ?? 'message'}-${i}`
+                message={m}
+                streaming={streaming}
+                activityLabel={streaming ? activityLabel : ''}
+                turnStartedAt={streaming ? turnStartedAt : undefined}
+                publicId={publicId}
+                userScoped={userScoped}
+                projectId={projectId}
+                fromProject={contextType === 'project'}
+                attachmentsBase={
+                  userScoped && publicId
+                    ? `${base}/${publicId}/attachments`
+                    : undefined
                 }
-                className="group flex items-start"
-              >
-                <div className="min-w-0 flex-1 space-y-1">
-                  <div className="min-w-0 space-y-2 rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5">
-                    <AssistantBody
-                      message={m}
-                      streaming={liveTurn && isTrailing}
-                      activityLabel={activityLabel}
-                      turnStartedAt={turnStartedAt}
-                      conversationPublicId={publicId}
-                      userScoped={userScoped}
-                      projectId={projectId}
-                      fromProject={contextType === 'project'}
-                      onFix={(text) => void send(text)}
-                      onPermissionResolved={pollForReply}
-                    />
-                  </div>
-                  {assistantParts(m).length > 0 && (
-                    <div className="flex items-center gap-1 px-1">
-                      {m.created_at && (
-                        <TimeAgo
-                          date={m.created_at}
-                          className="text-[10px] text-muted-foreground"
-                        />
-                      )}
-                      <MessageCopyButton text={messageCopyText(m)} />
-                    </div>
-                  )}
-                </div>
-              </div>
+                onFix={fixFromTranscript}
+                onPermissionResolved={permissionResolvedInTranscript}
+              />
             )
           })}
 

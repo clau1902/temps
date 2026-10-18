@@ -609,3 +609,12 @@ body {
   color: color-mix(in oklch, var(--muted-foreground) 40%, transparent);
   user-select: none;
 }
+
+/* Settled chat transcript rows: the browser skips layout and paint for the ones
+   scrolled out of view, so a very long conversation costs about what its visible
+   screenful costs. `auto` remembers each row's real height once it has rendered,
+   so the scrollbar does not jump as rows come into view. */
+.chat-transcript-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 96px;
+}
