@@ -3383,6 +3383,60 @@ impl ConversationService {
         }
     }
 
+    /// Start summarizing the conversation's older turns when the history the
+    /// next turn would replay has grown past the threshold.
+    ///
+    /// Runs in the background: the summary is written by a cheap model and
+    /// takes effect from the next turn, so this turn is never delayed by it and
+    /// a failed summary only means the history keeps growing until the next try.
+    async fn compact_in_background_if_needed(
+        &self,
+        conv: &ai_conversations::Model,
+        history: &[ai_messages::Model],
+        summary: Option<&crate::compaction::Summary>,
+    ) {
+        let replayed = crate::compaction::replayed_bytes(history, summary);
+        if replayed < crate::compaction::MIN_TRIGGER_BYTES {
+            return;
+        }
+        let window = match crate::usage::context_window(self.db.as_ref(), &conv.ai_model).await {
+            Ok(window) => window,
+            Err(error) => {
+                tracing::warn!(
+                    conversation_id = conv.id,
+                    model = %conv.ai_model,
+                    %error,
+                    "could not read the model's context window to decide whether to compact"
+                );
+                None
+            }
+        };
+        if !crate::compaction::should_compact(replayed, window) {
+            return;
+        }
+        let ai = self.ai.clone();
+        let db = self.db.clone();
+        let conv = conv.clone();
+        tokio::spawn(async move {
+            match crate::compaction::compact_conversation(&ai, &db, &conv).await {
+                Ok(_) | Err(crate::compaction::CompactionError::InProgress { .. }) => {}
+                Err(error) => tracing::warn!(
+                    conversation_id = conv.id,
+                    %error,
+                    "could not summarize the conversation history"
+                ),
+            }
+        });
+    }
+
+    /// Summarize the conversation's older turns now, at the user's request.
+    pub async fn compact_now(
+        &self,
+        conv: &ai_conversations::Model,
+    ) -> Result<crate::compaction::CompactionOutcome, crate::compaction::CompactionError> {
+        crate::compaction::compact_conversation(&self.ai, &self.db, conv).await
+    }
+
     /// All turns of a conversation, oldest first.
     pub async fn messages(
         &self,
@@ -4212,9 +4266,20 @@ impl ConversationService {
                 .await;
             });
         }
+        // A long chat is replayed as its running summary plus the messages
+        // after it, so the model's context stops growing with every turn. The
+        // full transcript stays stored and on screen.
+        let summary = crate::compaction::latest_summary(&history);
+        let summarized_through = summary.as_ref().map_or(0, |s| s.through_message_id);
+        self.compact_in_background_if_needed(&conv, &history, summary.as_ref())
+            .await;
         let mut messages: Vec<ChatMessage> = history
             .iter()
-            .filter(|m| matches!(m.role.as_str(), "system" | "user" | "assistant"))
+            .filter(|m| {
+                m.role == "system"
+                    || (matches!(m.role.as_str(), "user" | "assistant")
+                        && m.id > summarized_through)
+            })
             .map(|m| {
                 let mut content = m.content.clone();
                 // The current turn is injected below from the already resolved
@@ -4262,16 +4327,17 @@ impl ConversationService {
 
         // Bound after the system framing is refreshed so the omission notice
         // below is not overwritten by it.
-        if conv.context_type == "assistant" {
-            let dropped = bound_history_for_model(&mut messages, ASSISTANT_MAX_HISTORY_BYTES);
-            if dropped > 0 {
-                tracing::info!(
-                    conversation_id = conv.id,
-                    dropped,
-                    budget_bytes = ASSISTANT_MAX_HISTORY_BYTES,
-                    "bounded assistant conversation history for the model"
-                );
-            }
+        // Summarizing keeps this rare; it stays as the hard backstop for a
+        // chat whose summary could not be written, and covers every chat kind.
+        let dropped = bound_history_for_model(&mut messages, CHAT_MAX_HISTORY_BYTES);
+        if dropped > 0 {
+            tracing::info!(
+                conversation_id = conv.id,
+                context_type = %conv.context_type,
+                dropped,
+                budget_bytes = CHAT_MAX_HISTORY_BYTES,
+                "bounded conversation history for the model"
+            );
         }
 
         // Append the read-only API catalogue (the "API map") to the system
@@ -4288,6 +4354,17 @@ impl ConversationService {
                     }
                     None => messages.insert(0, ChatMessage::system(appendix)),
                 }
+            }
+        }
+
+        if let Some(summary) = summary.as_ref() {
+            let section = crate::compaction::summary_section(&summary.text);
+            match messages.iter_mut().find(|m| m.role == "system") {
+                Some(sys) => {
+                    sys.content.push_str("\n\n");
+                    sys.content.push_str(&section);
+                }
+                None => messages.insert(0, ChatMessage::system(section)),
             }
         }
 
@@ -4432,6 +4509,7 @@ impl ConversationService {
             }
         }
         log_phase("prompt_context_built");
+        log_prompt_composition(&conv, &messages, &tools);
 
         // Persist the assistant row before execution starts. Live WebSocket
         // events are only a notification channel; this draft is the
@@ -7005,8 +7083,9 @@ const ASSISTANT_MAX_ROUNDS: usize = 24;
 /// parallel calls; each is a replayed API request plus a transcript entry.
 const ASSISTANT_MAX_CALLS_PER_ROUND: usize = 8;
 /// Largest transcript, in bytes of message content, replayed to the model on
-/// a new turn of an assistant conversation.
-const ASSISTANT_MAX_HISTORY_BYTES: usize = 128 * 1024;
+/// a new turn of any conversation. Summarizing (`compaction`) normally keeps a
+/// chat well under this; it is the backstop when no summary could be written.
+const CHAT_MAX_HISTORY_BYTES: usize = 128 * 1024;
 /// Marker the over-cap result starts with; also registered as an unproductive
 /// result so a model that keeps exceeding the cap is stopped.
 const TOOL_CALL_CAP_REJECTION: &str = "Not executed:";
@@ -7032,6 +7111,41 @@ fn tool_call_cap_message(cap: usize) -> String {
         "{TOOL_CALL_CAP_REJECTION} at most {cap} tool calls run per step. Make fewer, more \
          targeted calls (or one call per step) and repeat this one if it is still needed."
     )
+}
+
+/// Where a turn's prompt bytes go, so the fixed part (system framing and tool
+/// schemas, resent on every model call) can be told apart from the part that
+/// grows with the conversation. Bytes, not tokens: tokenisers differ per model,
+/// and the ratio between the three is what matters.
+fn log_prompt_composition(
+    conv: &temps_entities::ai_conversations::Model,
+    messages: &[ChatMessage],
+    tools: &[ChatTool],
+) {
+    let system_bytes: usize = messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .map(|m| m.content.len())
+        .sum();
+    let history_bytes: usize = messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| m.content.len())
+        .sum();
+    let tool_schema_bytes: usize = tools
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
+        .sum();
+    tracing::info!(
+        conversation_id = conv.id,
+        context_type = %conv.context_type,
+        system_bytes,
+        tool_schema_bytes,
+        tool_count = tools.len(),
+        history_bytes,
+        history_messages = messages.iter().filter(|m| m.role != "system").count(),
+        "assembled chat prompt"
+    );
 }
 
 /// Keep a long conversation inside the model's context by dropping its oldest
@@ -7083,7 +7197,8 @@ fn bound_history_for_model(messages: &mut Vec<ChatMessage>, budget: usize) -> us
 }
 
 /// Replace the oldest tool results with a stub once the carried-forward
-/// transcript grows past `budget` bytes.
+/// transcript grows past `budget` bytes, and keep stubbing until it is down to
+/// half of that.
 ///
 /// Every tool result is replayed to the model on every subsequent round, so a
 /// long task re-sends everything it has ever read — the transcript, not the
@@ -7091,11 +7206,19 @@ fn bound_history_for_model(messages: &mut Vec<ChatMessage>, budget: usize) -> us
 /// raising the round cap just moves the failure from "stopped early" to "blew
 /// the context window", which is worse because it is not explained.
 ///
+/// Trimming down to half the budget, rather than to just under it, is what
+/// keeps the prompt cache useful: a provider caches the prompt up to the first
+/// byte that differs from the previous request, so trimming a little on every
+/// round would rewrite the middle of the prompt every round, while trimming a
+/// lot once leaves the next several rounds with an identical prefix.
+///
 /// The messages are kept in place with their `tool_call_id` intact — providers
 /// reject a tool_calls block whose answers have gone missing — and only the
 /// content is replaced, so the model still sees that the call happened and what
-/// it was.
+/// it was. The results of the latest round, the ones the model is answering
+/// right now, are never stubbed.
 fn trim_carried_tool_results(messages: &mut [ChatMessage], budget: usize) {
+    const STUB: &str = "[earlier tool result dropped to stay within the context budget — re-run the command if you still need it]";
     let total: usize = messages
         .iter()
         .filter(|m| m.role == "tool")
@@ -7105,15 +7228,23 @@ fn trim_carried_tool_results(messages: &mut [ChatMessage], budget: usize) {
         return;
     }
 
+    // The trailing run of tool messages is the latest round's results.
+    let protected_from = messages
+        .iter()
+        .rposition(|m| m.role != "tool")
+        .map_or(0, |index| index + 1);
+
     // Drop oldest-first: recent results are what the model is reasoning about
     // right now, and the older ones have usually been summarised into its own
     // prose already.
-    let mut over = total - budget;
-    for m in messages.iter_mut().filter(|m| m.role == "tool") {
+    let mut over = total - budget / 2;
+    for m in messages[..protected_from]
+        .iter_mut()
+        .filter(|m| m.role == "tool")
+    {
         if over == 0 {
             break;
         }
-        const STUB: &str = "[earlier tool result dropped to stay within the context budget — re-run the command if you still need it]";
         if m.content.len() <= STUB.len() {
             continue;
         }
@@ -8657,13 +8788,32 @@ mod tests {
         assert!(missing_backtest("create_alert --metric_name x", &seen).is_some());
     }
 
+    fn assistant_msg(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn carried_bytes(messages: &[ChatMessage]) -> usize {
+        messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.len())
+            .sum()
+    }
+
     #[test]
     fn carried_tool_results_are_trimmed_oldest_first() {
         let big = "x".repeat(1000);
         let mut messages = vec![
             ChatMessage::system("seed"),
+            assistant_msg("round 1"),
             ChatMessage::tool("a".to_string(), big.clone()),
+            assistant_msg("round 2"),
             ChatMessage::tool("b".to_string(), big.clone()),
+            assistant_msg("round 3"),
             ChatMessage::tool("c".to_string(), big.clone()),
         ];
 
@@ -8671,20 +8821,53 @@ mod tests {
 
         // Structure is preserved — a provider rejects a tool_calls block whose
         // answers have vanished, so messages are stubbed in place, never removed.
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[1].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("a"));
 
         // Oldest went first; the newest result — what the model is actually
         // reasoning about — survives intact.
-        assert!(messages[1].content.contains("dropped"));
-        assert_eq!(messages[3].content, big);
+        assert!(messages[2].content.contains("dropped"));
+        assert!(messages[4].content.contains("dropped"));
+        assert_eq!(messages[6].content, big);
+        assert!(carried_bytes(&messages) <= 1500);
+    }
 
-        let carried: usize = messages
-            .iter()
-            .filter(|m| m.role == "tool")
-            .map(|m| m.content.len())
-            .sum();
-        assert!(carried <= 1500, "still over budget: {carried}");
+    #[test]
+    fn trimming_goes_below_the_budget_so_the_next_rounds_keep_a_stable_prefix() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![ChatMessage::system("seed")];
+        for id in ["a", "b", "c", "d", "e", "f"] {
+            messages.push(assistant_msg("call"));
+            messages.push(ChatMessage::tool(id.to_string(), big.clone()));
+        }
+
+        // Over a 5000-byte budget by one result: trims down to ~2500, not 5000.
+        trim_carried_tool_results(&mut messages, 5000);
+        let after_first = carried_bytes(&messages);
+        assert!(after_first <= 2500 + 1000, "left {after_first} bytes");
+
+        // The next round's result fits without touching anything older.
+        let before = messages.clone();
+        messages.push(assistant_msg("call"));
+        messages.push(ChatMessage::tool("g".to_string(), big.clone()));
+        trim_carried_tool_results(&mut messages, 5000);
+        for (now, then) in messages.iter().zip(&before) {
+            assert_eq!(now.content, then.content);
+        }
+    }
+
+    #[test]
+    fn the_latest_round_of_results_is_never_stubbed() {
+        let big = "x".repeat(4000);
+        let mut messages = vec![
+            ChatMessage::system("seed"),
+            assistant_msg("one round, three calls"),
+            ChatMessage::tool("a".to_string(), big.clone()),
+            ChatMessage::tool("b".to_string(), big.clone()),
+            ChatMessage::tool("c".to_string(), big.clone()),
+        ];
+        trim_carried_tool_results(&mut messages, 1000);
+        assert!(messages[2..].iter().all(|m| m.content == big));
     }
 
     #[test]

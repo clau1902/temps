@@ -15,6 +15,8 @@ pub mod attachments;
 pub mod audit;
 pub mod chat_resources;
 pub mod chat_resources_handlers;
+pub mod compaction;
+pub mod compaction_handlers;
 pub mod git_bindings;
 pub mod git_bindings_handlers;
 pub mod goals;

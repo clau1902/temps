@@ -109,6 +109,18 @@ pub struct AiSandboxWokenAudit {
     pub sandbox_id: String,
 }
 
+/// A chat's older messages were folded into its running summary. Records how
+/// many, never what they said.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiConversationCompactedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub folded_messages: usize,
+    pub kept_messages: usize,
+    pub summary_model: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AiSandboxUnlinkedAudit {
     pub context: AuditContext,
@@ -376,6 +388,7 @@ pub struct AiActionTransitionFailedAudit {
 impl_audit_operation!(AiGoalHealStartedAudit, "ai.goal.heal_started");
 impl_audit_operation!(AiGoalCancelledAudit, "ai.goal.cancelled");
 impl_audit_operation!(AiGoalRetriedAudit, "ai.goal.retried");
+impl_audit_operation!(AiConversationCompactedAudit, "ai.conversation.compacted");
 impl_audit_operation!(AiSandboxLinkedAudit, "ai.sandbox.linked");
 impl_audit_operation!(AiSandboxUnlinkedAudit, "ai.sandbox.unlinked");
 impl_audit_operation!(AiSandboxWokenAudit, "ai.sandbox.woken");

@@ -18,7 +18,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Statement,
 };
 use serde::Serialize;
-use temps_entities::ai_provider_models;
+use temps_entities::{ai_messages, ai_provider_models};
 use utoipa::ToSchema;
 
 /// Most distinct models reported for one chat. A chat switches models rarely;
@@ -72,6 +72,10 @@ pub struct ConversationUsage {
     /// The chat's current context size. `None` before the first request, or
     /// when it could not be read: the spend above does not depend on it.
     pub context: Option<ConversationContext>,
+    /// Earlier messages folded into the chat's running summary, so the model
+    /// no longer sees them word for word. `0` when the chat was never compacted
+    /// or the count could not be read.
+    pub summarized_messages: i64,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -145,6 +149,16 @@ pub async fn conversation_usage(
             None
         }
     };
+    usage.summarized_messages = match summarized_messages(db, conversation_id).await {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::warn!(
+                conversation_id,
+                "could not read how many messages the chat has summarized: {error}"
+            );
+            0
+        }
+    };
     Ok(usage)
 }
 
@@ -174,22 +188,53 @@ async fn current_context(
     let Some(latest) = latest else {
         return Ok(None);
     };
-    let rows = ai_provider_models::Entity::find()
-        .filter(ai_provider_models::Column::ModelId.eq(latest.model.as_str()))
-        .filter(ai_provider_models::Column::Metadata.is_not_null())
-        .order_by_desc(ai_provider_models::Column::UpdatedAt)
-        .limit(WINDOW_LOOKUP_ROWS)
-        .all(db)
-        .await?;
-    let window = rows
-        .iter()
-        .filter_map(|row| row.metadata.as_ref())
-        .find_map(window_from_metadata);
+    let window = context_window(db, &latest.model).await?;
     Ok(Some(ConversationContext {
         model: latest.model,
         tokens: latest.input_tokens,
         window,
     }))
+}
+
+/// The context window, in tokens, the catalogue lists for `model`.
+///
+/// A model is listed once per provider that serves it; the newest row that
+/// carries a window wins. `None` when no row says.
+pub(crate) async fn context_window(
+    db: &DatabaseConnection,
+    model: &str,
+) -> Result<Option<i64>, DbErr> {
+    let rows = ai_provider_models::Entity::find()
+        .filter(ai_provider_models::Column::ModelId.eq(model))
+        .filter(ai_provider_models::Column::Metadata.is_not_null())
+        .order_by_desc(ai_provider_models::Column::UpdatedAt)
+        .limit(WINDOW_LOOKUP_ROWS)
+        .all(db)
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| row.metadata.as_ref())
+        .find_map(window_from_metadata))
+}
+
+/// Messages folded into the chat's running summary so far, `0` when it has
+/// never been compacted.
+async fn summarized_messages(db: &DatabaseConnection, conversation_id: i64) -> Result<i64, DbErr> {
+    let row = ai_messages::Entity::find()
+        .filter(ai_messages::Column::ConversationId.eq(conversation_id))
+        .filter(ai_messages::Column::Role.eq(crate::compaction::SUMMARY_ROLE))
+        .order_by_desc(ai_messages::Column::Id)
+        .one(db)
+        .await?;
+    Ok(row
+        .and_then(|row| row.metadata)
+        .and_then(|metadata| {
+            metadata
+                .get("folded_total")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .unwrap_or(0)
+        .max(0))
 }
 
 /// A catalogue entry's `context_length`, when it is a positive whole number.
@@ -210,6 +255,7 @@ fn summarize(rows: Vec<ModelRow>) -> ConversationUsage {
         byok_requests: 0,
         models: Vec::with_capacity(rows.len()),
         context: None,
+        summarized_messages: 0,
     };
     for row in rows {
         usage.requests = usage.requests.saturating_add(row.requests);
