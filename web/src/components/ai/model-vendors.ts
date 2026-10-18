@@ -99,6 +99,28 @@ export function modelVendor(modelId: string): ModelVendor {
   return { key: slug, name: titleCase(slug) || slug, logo: null }
 }
 
+/**
+ * The vendors people reach for first, in order. Tabs and the model list follow
+ * it, then everyone else by how many models they list. The catalogue carries no
+ * popularity or release date, so this is an editorial list: reorder it here.
+ */
+const VENDOR_RANK = [
+  'anthropic',
+  'openai',
+  'google',
+  'xai',
+  'deepseek',
+  'mistral',
+  'meta',
+  'qwen',
+] as const
+
+/** Position of a vendor in [`VENDOR_RANK`]; unranked vendors sort after it. */
+export function vendorRank(key: string): number {
+  const index = (VENDOR_RANK as readonly string[]).indexOf(key)
+  return index === -1 ? VENDOR_RANK.length : index
+}
+
 /** A vendor tab: who, and how many of the listed models are theirs. */
 export interface VendorTab {
   key: string
@@ -114,7 +136,7 @@ export const OTHER_VENDORS_KEY = '__others'
 export const MAX_VENDOR_TABS = 8
 
 /**
- * Tabs for the picker, biggest vendor first. Past [`MAX_VENDOR_TABS`] the long
+ * Tabs for the picker, the best-known vendors first, then the biggest. Past [`MAX_VENDOR_TABS`] the long
  * tail folds into one "More" tab so the row stays scannable; search still finds
  * any model in every tab.
  */
@@ -130,7 +152,9 @@ export function vendorTabs(
   }
   const sorted = [...byKey.values()].sort(
     (left, right) =>
-      right.count - left.count || left.name.localeCompare(right.name)
+      vendorRank(left.key) - vendorRank(right.key) ||
+      right.count - left.count ||
+      left.name.localeCompare(right.name)
   )
   if (sorted.length <= MAX_VENDOR_TABS) return sorted
   const shown = sorted.slice(0, MAX_VENDOR_TABS)
@@ -160,4 +184,76 @@ export function filterByVendorTab(
     return options.filter((option) => !shown.has(modelVendor(option.id).key))
   }
   return options.filter((option) => modelVendor(option.id).key === tabKey)
+}
+
+const naturalOrder = new Intl.Collator('en', { numeric: true })
+
+/** Newest-looking first: higher version numbers sort ahead of lower ones. */
+function newestFirst(left: string, right: string): number {
+  return naturalOrder.compare(right, left)
+}
+
+/**
+ * Model families worth showing before the catalogue's several hundred entries.
+ * Each pattern names a family, not a version: the newest match is chosen, so a
+ * release does not need an edit here.
+ */
+const FEATURED_FAMILIES: readonly RegExp[] = [
+  /^anthropic\/claude-opus/,
+  /^anthropic\/claude-sonnet/,
+  /^anthropic\/claude-haiku/,
+  /^openai\/gpt-[\d.]+$/,
+  /^openai\/gpt-[\d.]+-mini$/,
+  /^google\/gemini-[\d.]+-pro$/,
+  /^google\/gemini-[\d.]+-flash$/,
+  /^x-ai\/grok-[\d.]+$/,
+  /^deepseek\/deepseek-/,
+  /^mistralai\/mistral-large/,
+  /^qwen\/qwen[\d.]*-(max|plus)/,
+]
+
+/** Variants that are previews, aliases or specialised, not a family's flagship. */
+function isFlagshipCandidate(id: string): boolean {
+  return !/[:~]|preview|exp(erimental)?\b|latest|-(thinking|search|image|audio|tts|codex|oss|lite)\b/.test(
+    id
+  )
+}
+
+/**
+ * The models to pin at the top: the newest of each featured family, only among
+ * those the provider actually lists and that can call tools.
+ */
+export function featuredModels(
+  options: readonly AssistantModelOption[]
+): AssistantModelOption[] {
+  const usable = options.filter(
+    (option) =>
+      isFlagshipCandidate(option.id) && option.details.supports_tools !== false
+  )
+  const featured: AssistantModelOption[] = []
+  for (const family of FEATURED_FAMILIES) {
+    const match = usable
+      .filter((option) => family.test(option.id))
+      .sort((left, right) => newestFirst(left.id, right.id))[0]
+    if (match && !featured.includes(match)) featured.push(match)
+  }
+  return featured
+}
+
+/**
+ * Catalogue order for browsing: best-known vendors first, newest version first
+ * within a vendor. Alphabetical put "AI21" ahead of every model anyone uses.
+ */
+export function orderByPopularity(
+  options: readonly AssistantModelOption[]
+): AssistantModelOption[] {
+  return [...options].sort((left, right) => {
+    const a = modelVendor(left.id)
+    const b = modelVendor(right.id)
+    return (
+      vendorRank(a.key) - vendorRank(b.key) ||
+      a.name.localeCompare(b.name) ||
+      newestFirst(left.id, right.id)
+    )
+  })
 }

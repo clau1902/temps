@@ -31,8 +31,10 @@ import {
 } from './assistant-models'
 import { ModelVendorLogo } from './ModelVendorLogo'
 import {
+  featuredModels,
   filterByVendorTab,
   modelVendor,
+  orderByPopularity,
   OTHER_VENDORS_KEY,
   vendorTabs,
   type VendorTab,
@@ -61,17 +63,39 @@ export function AssistantModelList({
   const models = useProviderModels(providerKeyId)
   const [query, setQuery] = useState('')
   const [tabKey, setTabKey] = useState<string | null>(null)
-  const tabs = useMemo(() => vendorTabs(models.options), [models.options])
+  const ordered = useMemo(
+    () => orderByPopularity(models.options),
+    [models.options]
+  )
+  const tabs = useMemo(() => vendorTabs(ordered), [ordered])
   // A search looks across every vendor; the tabs only narrow the browsing.
   const visible = useMemo(
     () =>
       filterAssistantModels(
-        query.trim()
-          ? models.options
-          : filterByVendorTab(models.options, tabKey, tabs),
+        query.trim() ? ordered : filterByVendorTab(ordered, tabKey, tabs),
         query
       ),
-    [models.options, query, tabKey, tabs]
+    [ordered, query, tabKey, tabs]
+  )
+  // The popular group leads the unfiltered list; a tab or a search is already
+  // a narrower question than "what do people use".
+  const popular = useMemo(
+    () => (tabKey === null && !query.trim() ? featuredModels(ordered) : []),
+    [ordered, tabKey, query]
+  )
+  const rest = useMemo(
+    () => visible.filter((option) => !popular.includes(option)),
+    [visible, popular]
+  )
+  const renderRow = (option: AssistantModelOption) => (
+    <ModelRow
+      key={option.id}
+      option={option}
+      selected={option.id === value}
+      isDefault={option.id === defaultModelId}
+      disabled={disabled}
+      onSelect={() => onChange(option.id)}
+    />
   )
 
   if (models.isPending && providerKeyId !== null) {
@@ -126,19 +150,30 @@ export function AssistantModelList({
             No model matches “{query.trim()}”.
           </li>
         ) : (
-          visible.map((option) => (
-            <ModelRow
-              key={option.id}
-              option={option}
-              selected={option.id === value}
-              isDefault={option.id === defaultModelId}
-              disabled={disabled}
-              onSelect={() => onChange(option.id)}
-            />
-          ))
+          <>
+            {popular.length > 0 ? (
+              <ModelGroupHeading>Popular</ModelGroupHeading>
+            ) : null}
+            {popular.map(renderRow)}
+            {popular.length > 0 ? (
+              <ModelGroupHeading>All models</ModelGroupHeading>
+            ) : null}
+            {rest.map(renderRow)}
+          </>
         )}
       </ul>
     </div>
+  )
+}
+
+function ModelGroupHeading({ children }: { children: string }) {
+  return (
+    <li
+      role="presentation"
+      className="px-3 pb-1 pt-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground"
+    >
+      {children}
+    </li>
   )
 }
 
