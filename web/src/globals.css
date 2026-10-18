@@ -530,7 +530,42 @@ body {
   animation: ai-activity-shimmer 1.4s linear infinite;
 }
 
+/* First-paint screen (InitialLoadScreen): the mark breathes and a segment
+   sweeps across the track. The reduced-motion block below swaps the sweep for
+   a slow full-bar fade, since a motionless bar looks like a hung load. */
+@keyframes initial-load-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+
+@keyframes initial-load-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.initial-load-mark {
+  animation: initial-load-pulse 1.6s ease-in-out infinite;
+}
+
+.initial-load-bar {
+  animation: initial-load-slide 1.2s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .initial-load-bar {
+    width: 100%;
+    animation: initial-load-pulse 2s ease-in-out infinite;
+  }
+
   .log-fresh-line,
   .ai-activity-pixel,
   .ai-activity-shimmer {
