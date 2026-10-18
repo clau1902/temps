@@ -23,11 +23,13 @@ import {
   Layers,
   Monitor,
   Rocket,
+  SquareTerminal,
   X,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { ChatPreviewTab } from './ChatPreviewTab'
+import { ChatTerminalTab } from './ChatTerminalTab'
 import { ChatResourcesTab } from './ChatResourcesTab'
 import { ProjectTab } from './ProjectTab'
 import type { ProjectRef } from './project-refs'
@@ -45,6 +47,7 @@ const MADE_TAB = 'made'
 
 /** The fixed tab that shows the page the chat's sandbox is serving. */
 export const PREVIEW_TAB = 'preview'
+const TERMINAL_TAB = 'terminal'
 
 /** A tab beside the chat: a deployment it watches or a project the user opened. */
 export type SidebarTab =
@@ -345,16 +348,17 @@ export function DeploymentSidebar({
 
   const firstKey = conversationPublicId ? MADE_TAB : tabKey(tabs[0])
   const selectable = [
-    ...(conversationPublicId ? [MADE_TAB, PREVIEW_TAB] : []),
+    ...(conversationPublicId ? [MADE_TAB, PREVIEW_TAB, TERMINAL_TAB] : []),
     ...tabs.map(tabKey),
   ]
+  const current = selectable.includes(selected) ? selected : firstKey
   return (
     <aside
       aria-label="Working tabs"
       className="flex h-full min-h-0 min-w-0 flex-col bg-background"
     >
       <Tabs
-        value={selectable.includes(selected) ? selected : firstKey}
+        value={current}
         onValueChange={setSelected}
         className="flex min-h-0 flex-1 flex-col"
       >
@@ -375,6 +379,12 @@ export function DeploymentSidebar({
               <TabsTrigger value={PREVIEW_TAB} className="gap-1.5 text-xs">
                 <Monitor className="size-3.5 shrink-0" />
                 Preview
+              </TabsTrigger>
+            )}
+            {conversationPublicId && (
+              <TabsTrigger value={TERMINAL_TAB} className="gap-1.5 text-xs">
+                <SquareTerminal className="size-3.5 shrink-0" />
+                Terminal
               </TabsTrigger>
             )}
             {tabs.map((tab) => (
@@ -429,6 +439,19 @@ export function DeploymentSidebar({
               className="mt-0 h-full data-[state=inactive]:hidden"
             >
               <ChatPreviewTab conversationPublicId={conversationPublicId} />
+            </TabsContent>
+          )}
+          {conversationPublicId && (
+            // Kept mounted so the shell survives switching tabs.
+            <TabsContent
+              value={TERMINAL_TAB}
+              forceMount
+              className="mt-0 h-full data-[state=inactive]:hidden"
+            >
+              <ChatTerminalTab
+                conversationPublicId={conversationPublicId}
+                active={current === TERMINAL_TAB}
+              />
             </TabsContent>
           )}
           {tabs.map((tab) => (
