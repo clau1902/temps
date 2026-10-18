@@ -3,40 +3,34 @@
 
 import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { ModelVendorTabs } from './AssistantModelPicker'
+import { ModelVendorSelect } from './AssistantModelPicker'
 import { ModelVendorLogo } from './ModelVendorLogo'
 
-const tabs = [
+const vendors = [
   { key: 'google', name: 'Google', logo: 'google.svg', count: 44 },
   { key: 'qwen', name: 'Qwen', logo: null, count: 43 },
 ]
 
-test('the tabs show the vendors with their marks and counts, All selected', () => {
+test('the filter is one control that says what it filters', () => {
   const markup = renderToStaticMarkup(
-    <ModelVendorTabs
-      tabs={tabs}
+    <ModelVendorSelect
+      vendors={vendors}
       total={87}
-      selected={null}
-      searching={false}
-      onSelect={() => {}}
+      value={null}
+      onChange={() => {}}
     />
   )
-  expect(markup).toContain('role="tablist"')
-  expect(markup).toContain('All')
-  expect(markup).toContain('87')
-  expect(markup).toContain('/ai-agents/google.svg')
-  expect(markup).toContain('Qwen')
-  expect(markup.match(/aria-selected="true"/g)).toHaveLength(1)
+  expect(markup).toContain('aria-label="Filter models by vendor"')
+  expect(markup).toContain('role="combobox"')
 })
 
-test('a single vendor needs no tabs', () => {
+test('a single vendor needs no filter', () => {
   const markup = renderToStaticMarkup(
-    <ModelVendorTabs
-      tabs={tabs.slice(0, 1)}
+    <ModelVendorSelect
+      vendors={vendors.slice(0, 1)}
       total={44}
-      selected={null}
-      searching={false}
-      onSelect={() => {}}
+      value={null}
+      onChange={() => {}}
     />
   )
   expect(markup).toBe('')

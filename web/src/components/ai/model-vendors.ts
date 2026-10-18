@@ -121,69 +121,64 @@ export function vendorRank(key: string): number {
   return index === -1 ? VENDOR_RANK.length : index
 }
 
-/** A vendor tab: who, and how many of the listed models are theirs. */
-export interface VendorTab {
+/** A vendor the list can be narrowed to, and how many listed models are theirs. */
+export interface VendorOption {
   key: string
   name: string
   logo: string | null
   count: number
 }
 
-/** Key of the tab that holds every vendor not given a tab of its own. */
-export const OTHER_VENDORS_KEY = '__others'
-
-/** Vendor tabs shown before the rest are folded into one. */
-export const MAX_VENDOR_TABS = 8
-
 /**
- * Tabs for the picker, the best-known vendors first, then the biggest. Past [`MAX_VENDOR_TABS`] the long
- * tail folds into one "More" tab so the row stays scannable; search still finds
- * any model in every tab.
+ * Vendors for the picker's filter: the best-known first, then the biggest.
+ * Every vendor is listed; a dropdown holds the long tail that a row of tabs
+ * could not.
  */
-export function vendorTabs(
+export function vendorOptions(
   options: readonly AssistantModelOption[]
-): VendorTab[] {
-  const byKey = new Map<string, VendorTab>()
+): VendorOption[] {
+  const byKey = new Map<string, VendorOption>()
   for (const option of options) {
     const vendor = modelVendor(option.id)
-    const tab = byKey.get(vendor.key)
-    if (tab) tab.count += 1
+    const entry = byKey.get(vendor.key)
+    if (entry) entry.count += 1
     else byKey.set(vendor.key, { ...vendor, count: 1 })
   }
-  const sorted = [...byKey.values()].sort(
+  return [...byKey.values()].sort(
     (left, right) =>
       vendorRank(left.key) - vendorRank(right.key) ||
       right.count - left.count ||
       left.name.localeCompare(right.name)
   )
-  if (sorted.length <= MAX_VENDOR_TABS) return sorted
-  const shown = sorted.slice(0, MAX_VENDOR_TABS)
-  const rest = sorted.slice(MAX_VENDOR_TABS)
-  return [
-    ...shown,
-    {
-      key: OTHER_VENDORS_KEY,
-      name: 'More',
-      logo: null,
-      count: rest.reduce((total, tab) => total + tab.count, 0),
-    },
-  ]
 }
 
-/** The options of one tab; every option when `tabKey` is `null`. */
-export function filterByVendorTab(
+/** The options of one vendor; every option when `vendorKey` is `null`. */
+export function filterByVendor(
   options: readonly AssistantModelOption[],
-  tabKey: string | null,
-  tabs: readonly VendorTab[]
+  vendorKey: string | null
 ): AssistantModelOption[] {
-  if (tabKey === null) return [...options]
-  if (tabKey === OTHER_VENDORS_KEY) {
-    const shown = new Set(
-      tabs.filter((tab) => tab.key !== OTHER_VENDORS_KEY).map((tab) => tab.key)
-    )
-    return options.filter((option) => !shown.has(modelVendor(option.id).key))
-  }
-  return options.filter((option) => modelVendor(option.id).key === tabKey)
+  if (vendorKey === null) return [...options]
+  return options.filter((option) => modelVendor(option.id).key === vendorKey)
+}
+
+function squash(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, '')
+}
+
+/**
+ * The model's name without the vendor's name in front of it. Catalogues title
+ * models "Anthropic: Claude Opus 5.5"; beside the vendor's logo the prefix says
+ * the same thing twice and costs a third of a phone-width row.
+ */
+export function shortModelName(name: string, modelId: string): string {
+  const colon = name.indexOf(': ')
+  if (colon <= 0) return name
+  const prefix = squash(name.slice(0, colon))
+  const slug = squash(modelId.replace(/^~/, '').split('/')[0] ?? '')
+  const vendor = squash(modelVendor(modelId).name)
+  const rest = name.slice(colon + 2).trim()
+  if (rest && (prefix === vendor || prefix === slug)) return rest
+  return name
 }
 
 const naturalOrder = new Intl.Collator('en', { numeric: true })

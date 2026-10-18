@@ -10,6 +10,13 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
@@ -32,12 +39,12 @@ import {
 import { ModelVendorLogo } from './ModelVendorLogo'
 import {
   featuredModels,
-  filterByVendorTab,
+  filterByVendor,
   modelVendor,
   orderByPopularity,
-  OTHER_VENDORS_KEY,
-  vendorTabs,
-  type VendorTab,
+  shortModelName,
+  vendorOptions,
+  type VendorOption,
 } from './model-vendors'
 
 /**
@@ -62,26 +69,21 @@ export function AssistantModelList({
 }) {
   const models = useProviderModels(providerKeyId)
   const [query, setQuery] = useState('')
-  const [tabKey, setTabKey] = useState<string | null>(null)
+  const [vendorKey, setVendorKey] = useState<string | null>(null)
   const ordered = useMemo(
     () => orderByPopularity(models.options),
     [models.options]
   )
-  const tabs = useMemo(() => vendorTabs(ordered), [ordered])
-  // A search looks across every vendor; the tabs only narrow the browsing.
+  const vendors = useMemo(() => vendorOptions(ordered), [ordered])
   const visible = useMemo(
-    () =>
-      filterAssistantModels(
-        query.trim() ? ordered : filterByVendorTab(ordered, tabKey, tabs),
-        query
-      ),
-    [ordered, query, tabKey, tabs]
+    () => filterAssistantModels(filterByVendor(ordered, vendorKey), query),
+    [ordered, vendorKey, query]
   )
-  // The popular group leads the unfiltered list; a tab or a search is already
+  // The popular group leads the unfiltered list; a vendor or a search is already
   // a narrower question than "what do people use".
   const popular = useMemo(
-    () => (tabKey === null && !query.trim() ? featuredModels(ordered) : []),
-    [ordered, tabKey, query]
+    () => (vendorKey === null && !query.trim() ? featuredModels(ordered) : []),
+    [ordered, vendorKey, query]
   )
   const rest = useMemo(
     () => visible.filter((option) => !popular.includes(option)),
@@ -123,21 +125,27 @@ export function AssistantModelList({
 
   return (
     <div className="space-y-2">
-      <Input
-        value={query}
-        onChange={(event) => setQuery(event.target.value)}
-        placeholder={`Search ${models.options.length} models…`}
-        aria-label="Search models"
-        className={cn(roomy && 'h-11 text-base md:text-base')}
-        disabled={disabled}
-      />
-      <ModelVendorTabs
-        tabs={tabs}
-        total={models.options.length}
-        selected={query.trim() ? null : tabKey}
-        searching={query.trim().length > 0}
-        onSelect={setTabKey}
-      />
+      <div className="flex gap-2">
+        <Input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder={`Search ${models.options.length} models…`}
+          aria-label="Search models"
+          className={cn(
+            'min-w-0 flex-1',
+            roomy && 'h-11 text-base md:text-base'
+          )}
+          disabled={disabled}
+        />
+        <ModelVendorSelect
+          vendors={vendors}
+          total={models.options.length}
+          value={vendorKey}
+          onChange={setVendorKey}
+          disabled={disabled}
+          roomy={roomy}
+        />
+      </div>
       <ul
         className={cn(
           'max-h-[min(18rem,calc(var(--radix-popover-content-available-height,100vh)-5rem))] space-y-1 overflow-y-auto pr-1',
@@ -177,86 +185,59 @@ function ModelGroupHeading({ children }: { children: string }) {
   )
 }
 
-/**
- * Vendor tabs above the list, so the model of a given maker is a click away
- * instead of a scroll through several hundred. Hidden behind the search: a query
- * already spans every vendor.
- */
-export function ModelVendorTabs({
-  tabs,
-  total,
-  selected,
-  searching,
-  onSelect,
-}: {
-  tabs: readonly VendorTab[]
-  total: number
-  selected: string | null
-  searching: boolean
-  onSelect: (key: string | null) => void
-}) {
-  if (tabs.length < 2) return null
-  return (
-    <div
-      role="tablist"
-      aria-label="Filter models by vendor"
-      className={cn(
-        // One swipeable row on a phone, where wrapped tabs would eat the list;
-        // wrapped on larger screens, where every tab is visible at once.
-        'flex gap-1 overflow-x-auto [scrollbar-width:none] sm:flex-wrap sm:overflow-visible [&::-webkit-scrollbar]:hidden',
-        searching && 'opacity-50'
-      )}
-    >
-      <VendorTabButton
-        label="All"
-        count={total}
-        active={selected === null}
-        onClick={() => onSelect(null)}
-      />
-      {tabs.map((tab) => (
-        <VendorTabButton
-          key={tab.key}
-          label={tab.name}
-          count={tab.count}
-          logo={tab.key === OTHER_VENDORS_KEY ? undefined : tab}
-          active={selected === tab.key}
-          onClick={() => onSelect(tab.key)}
-        />
-      ))}
-    </div>
-  )
-}
+/** Value of the "every vendor" item: a Select item cannot be an empty string. */
+const ALL_VENDORS = '__all'
 
-function VendorTabButton({
-  label,
-  count,
-  logo,
-  active,
-  onClick,
+/**
+ * Narrows the list to one vendor. A dropdown rather than tabs: it fits a phone,
+ * and it holds every vendor, not just the handful a row could show.
+ */
+export function ModelVendorSelect({
+  vendors,
+  total,
+  value,
+  onChange,
+  disabled,
+  roomy,
 }: {
-  label: string
-  count: number
-  logo?: Pick<VendorTab, 'name' | 'logo'>
-  active: boolean
-  onClick: () => void
+  vendors: readonly VendorOption[]
+  total: number
+  value: string | null
+  onChange: (key: string | null) => void
+  disabled?: boolean
+  roomy?: boolean
 }) {
+  if (vendors.length < 2) return null
   return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={onClick}
-      className={cn(
-        'inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors hover:bg-accent',
-        active
-          ? 'border-border bg-muted font-medium text-foreground'
-          : 'border-transparent text-muted-foreground'
-      )}
+    <Select
+      value={value ?? ALL_VENDORS}
+      onValueChange={(next) => onChange(next === ALL_VENDORS ? null : next)}
+      disabled={disabled}
     >
-      {logo ? <ModelVendorLogo vendor={logo} size={14} /> : null}
-      {label}
-      <span className="tabular-nums opacity-60">{count}</span>
-    </button>
+      <SelectTrigger
+        aria-label="Filter models by vendor"
+        className={cn(
+          'w-36 shrink-0 gap-1.5 sm:w-44',
+          roomy && 'h-11 text-base'
+        )}
+      >
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={ALL_VENDORS}>
+          All vendors <span className="tabular-nums opacity-60">{total}</span>
+        </SelectItem>
+        {vendors.map((vendor) => (
+          <SelectItem key={vendor.key} value={vendor.key}>
+            <span className="flex items-center gap-2">
+              <ModelVendorLogo vendor={vendor} size={16} />
+              {vendor.name}
+              <span className="tabular-nums opacity-60">{vendor.count}</span>
+            </span>
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   )
 }
 
@@ -290,7 +271,9 @@ function ModelRow({
         <ModelVendorLogo vendor={vendor} size={20} className="mt-0.5" />
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <span className="truncate text-sm font-medium">{option.name}</span>
+            <span className="truncate text-sm font-medium">
+              {shortModelName(option.name, option.id)}
+            </span>
             {isDefault ? (
               <Badge
                 variant="secondary"
@@ -437,7 +420,8 @@ export function AssistantModelChip({
   const [open, setOpen] = useState(false)
   const isMobile = useIsMobile()
 
-  const label = modelDisplayName(models.options, value) ?? 'Loading…'
+  const fullName = modelDisplayName(models.options, value)
+  const label = fullName && value ? shortModelName(fullName, value) : 'Loading…'
 
   const choose = (modelId: string) => {
     setOpen(false)
