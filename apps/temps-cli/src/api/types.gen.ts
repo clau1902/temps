@@ -4393,6 +4393,32 @@ export type CommitListResponse = {
 };
 
 /**
+ * What "Compact now" did.
+ */
+export type CompactConversationResponse = {
+    /**
+     * Whether older messages were folded into the summary by this request.
+     */
+    compacted: boolean;
+    /**
+     * Messages folded into the summary by this request.
+     */
+    folded_messages: number;
+    /**
+     * Messages the model still sees word for word after the summary.
+     */
+    kept_messages: number;
+    /**
+     * The model that wrote the summary, when one did.
+     */
+    model?: string | null;
+    /**
+     * Why nothing was compacted, when `compacted` is false.
+     */
+    reason?: string | null;
+};
+
+/**
  * Comparator for static/forecast threshold detectors. Serializes to the
  * keyword forms `gt|gte|lt|lte` (NOT the SQL operators used by
  * `temps-monitoring::compare`).
@@ -5154,6 +5180,12 @@ export type ContainerStatsSample = {
 };
 
 export type ContentPart = {
+    /**
+     * Prompt-cache breakpoint for providers that cache explicitly, e.g.
+     * `{"type": "ephemeral"}`. Everything up to and including this part is
+     * cacheable.
+     */
+    cache_control?: unknown;
     image_url?: unknown;
     text?: string | null;
     type: string;
@@ -5393,6 +5425,12 @@ export type ConversationUsage = {
     models: Array<ModelSpend>;
     output_tokens: number;
     requests: number;
+    /**
+     * Earlier messages folded into the chat's running summary, so the model
+     * no longer sees them word for word. `0` when the chat was never compacted
+     * or the count could not be read.
+     */
+    summarized_messages: number;
     /**
      * Requests that used tokens but were logged at zero cost because the
      * model has no known price. When this is not zero, the cost is a floor.
@@ -15331,6 +15369,14 @@ export type ModelCatalogSource = 'live' | 'cache' | 'stale_cache' | 'bootstrap';
  */
 export type ModelDetails = {
     /**
+     * USD per one million input tokens read from the provider's prompt cache.
+     */
+    cache_read_price_per_million?: number | null;
+    /**
+     * USD per one million input tokens written to the provider's prompt cache.
+     */
+    cache_write_price_per_million?: number | null;
+    /**
      * Maximum context window in tokens.
      */
     context_length?: number | null;
@@ -19155,6 +19201,20 @@ export type PromoteDeploymentRequest = {
      * Target environment ID to promote the deployment to
      */
     target_environment_id: number;
+};
+
+/**
+ * The cached share of a prompt. Both counts are parts of `prompt_tokens`.
+ */
+export type PromptTokensDetails = {
+    /**
+     * Tokens written to the provider's prompt cache by this request.
+     */
+    cache_write_tokens?: number;
+    /**
+     * Tokens read from the provider's prompt cache.
+     */
+    cached_tokens?: number;
 };
 
 export type PropertyBreakdownItem = {
@@ -27425,11 +27485,23 @@ export type UsageFilter = {
 
 export type UsageInfo = {
     completion_tokens: number;
+    /**
+     * The whole prompt, including any part served from the provider's cache.
+     */
     prompt_tokens: number;
+    prompt_tokens_details?: PromptTokensDetails | null;
     total_tokens: number;
 };
 
 export type UsageLogEntry = {
+    /**
+     * Part of `input_tokens` read from the provider's prompt cache.
+     */
+    cache_read_tokens: number;
+    /**
+     * Part of `input_tokens` written to the provider's prompt cache.
+     */
+    cache_write_tokens: number;
     conversation_id?: string | null;
     estimated_cost_microcents: number;
     id: number;
@@ -30309,6 +30381,56 @@ export type GetUserConversationAttachmentResponses = {
 };
 
 export type GetUserConversationAttachmentResponse = GetUserConversationAttachmentResponses[keyof GetUserConversationAttachmentResponses];
+
+export type CompactConversationData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/compact';
+};
+
+export type CompactConversationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat is already being compacted
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * The summary model failed
+     */
+    502: ProblemDetails;
+};
+
+export type CompactConversationError = CompactConversationErrors[keyof CompactConversationErrors];
+
+export type CompactConversationResponses = {
+    /**
+     * Compaction finished, or there was nothing to compact
+     */
+    200: CompactConversationResponse;
+};
+
+export type CompactConversationResponse2 = CompactConversationResponses[keyof CompactConversationResponses];
 
 export type GetUserConversationDiagnosticsData = {
     body?: never;

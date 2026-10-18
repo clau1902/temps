@@ -3,7 +3,7 @@
 
 import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { ContextMeter } from './ChatSpend'
+import { CompactSection, ContextMeter } from './ChatSpend'
 
 test('the meter shows the tokens against the window', () => {
   const markup = renderToStaticMarkup(
@@ -32,4 +32,30 @@ test('a model without a listed window shows tokens and no bar', () => {
   )
   expect(markup).toContain('1.2k tokens')
   expect(markup).not.toContain('role="progressbar"')
+})
+
+test('compacting is offered on a chat that was never summarized', () => {
+  const markup = renderToStaticMarkup(
+    <CompactSection
+      summarizedMessages={0}
+      pending={false}
+      onCompact={() => {}}
+    />
+  )
+  expect(markup).toContain('Compact now')
+  expect(markup).toContain('Long chats are summarized automatically')
+  expect(markup).not.toContain('disabled=""')
+})
+
+test('a summarized chat says how much was folded, and a running compaction is disabled', () => {
+  const markup = renderToStaticMarkup(
+    <CompactSection
+      summarizedMessages={14}
+      pending={true}
+      onCompact={() => {}}
+    />
+  )
+  expect(markup).toContain('14 earlier messages are summarized')
+  expect(markup).toContain('Compacting…')
+  expect(markup).toContain('disabled=""')
 })

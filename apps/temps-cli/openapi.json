@@ -9066,6 +9066,45 @@
         ],
         "type": "object"
       },
+      "CompactConversationResponse": {
+        "description": "What \"Compact now\" did.",
+        "properties": {
+          "compacted": {
+            "description": "Whether older messages were folded into the summary by this request.",
+            "type": "boolean"
+          },
+          "folded_messages": {
+            "description": "Messages folded into the summary by this request.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kept_messages": {
+            "description": "Messages the model still sees word for word after the summary.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "model": {
+            "description": "The model that wrote the summary, when one did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why nothing was compacted, when `compacted` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "compacted",
+          "folded_messages",
+          "kept_messages"
+        ],
+        "type": "object"
+      },
       "Comparator": {
         "description": "Comparator for static/forecast threshold detectors. Serializes to the\nkeyword forms `gt|gte|lt|lte` (NOT the SQL operators used by\n`temps-monitoring::compare`).",
         "enum": [
@@ -10615,6 +10654,9 @@
       },
       "ContentPart": {
         "properties": {
+          "cache_control": {
+            "description": "Prompt-cache breakpoint for providers that cache explicitly, e.g.\n`{\"type\": \"ephemeral\"}`. Everything up to and including this part is\ncacheable."
+          },
           "image_url": {},
           "text": {
             "type": [
@@ -11351,6 +11393,11 @@
             "format": "int64",
             "type": "integer"
           },
+          "summarized_messages": {
+            "description": "Earlier messages folded into the chat's running summary, so the model\nno longer sees them word for word. `0` when the chat was never compacted\nor the count could not be read.",
+            "format": "int64",
+            "type": "integer"
+          },
           "unpriced_requests": {
             "description": "Requests that used tokens but were logged at zero cost because the\nmodel has no known price. When this is not zero, the cost is a floor.",
             "format": "int64",
@@ -11364,7 +11411,8 @@
           "cost_microcents",
           "unpriced_requests",
           "byok_requests",
-          "models"
+          "models",
+          "summarized_messages"
         ],
         "type": "object"
       },
@@ -33152,6 +33200,22 @@
       "ModelDetails": {
         "description": "What a provider's model catalogue says about one model, kept so a user can\nchoose between models without leaving the console. Every field is optional\nbecause catalogues differ: OpenRouter publishes all of them, others few.",
         "properties": {
+          "cache_read_price_per_million": {
+            "description": "USD per one million input tokens read from the provider's prompt cache.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cache_write_price_per_million": {
+            "description": "USD per one million input tokens written to the provider's prompt cache.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "context_length": {
             "description": "Maximum context window in tokens.",
             "format": "int64",
@@ -41040,6 +41104,22 @@
         "required": [
           "target_environment_id"
         ],
+        "type": "object"
+      },
+      "PromptTokensDetails": {
+        "description": "The cached share of a prompt. Both counts are parts of `prompt_tokens`.",
+        "properties": {
+          "cache_write_tokens": {
+            "description": "Tokens written to the provider's prompt cache by this request.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "cached_tokens": {
+            "description": "Tokens read from the provider's prompt cache.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "PropertyBreakdownItem": {
@@ -58860,8 +58940,20 @@
             "type": "integer"
           },
           "prompt_tokens": {
+            "description": "The whole prompt, including any part served from the provider's cache.",
             "format": "int64",
             "type": "integer"
+          },
+          "prompt_tokens_details": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PromptTokensDetails",
+                "description": "How the prompt split between fresh and cached tokens, when the provider says."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "total_tokens": {
             "format": "int64",
@@ -58877,6 +58969,16 @@
       },
       "UsageLogEntry": {
         "properties": {
+          "cache_read_tokens": {
+            "description": "Part of `input_tokens` read from the provider's prompt cache.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "cache_write_tokens": {
+            "description": "Part of `input_tokens` written to the provider's prompt cache.",
+            "format": "int64",
+            "type": "integer"
+          },
           "conversation_id": {
             "type": [
               "string",
@@ -58948,6 +59050,8 @@
           "model",
           "input_tokens",
           "output_tokens",
+          "cache_read_tokens",
+          "cache_write_tokens",
           "latency_ms",
           "estimated_cost_microcents",
           "status",
@@ -65018,6 +65122,104 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/compact": {
+      "post": {
+        "operationId": "compact_conversation",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompactConversationResponse"
+                }
+              }
+            },
+            "description": "Compaction finished, or there was nothing to compact"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The chat is already being compacted"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The summary model failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Summarize the chat's older messages now. The full transcript stays on\nscreen; only what the model is sent on later turns shrinks.",
         "tags": [
           "AI Chat"
         ],

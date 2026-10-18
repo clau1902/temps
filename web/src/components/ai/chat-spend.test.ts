@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { formatSpend, formatTokens, spendLabel } from './chat-spend'
+import {
+  compactResultMessage,
+  formatSpend,
+  formatTokens,
+  spendLabel,
+  summarizedLabel,
+} from './chat-spend'
 
 describe('formatSpend', () => {
   test('converts microcents to dollars', () => {
@@ -61,5 +67,41 @@ describe('formatTokens', () => {
     expect(formatTokens(999)).toBe('999')
     expect(formatTokens(1234)).toBe('1.2k')
     expect(formatTokens(2_500_000)).toBe('2.5M')
+  })
+})
+
+describe('compactResultMessage', () => {
+  test('says how many messages were folded', () => {
+    expect(
+      compactResultMessage({ compacted: true, folded_messages: 12 })
+    ).toContain('Summarized 12 earlier messages')
+    expect(
+      compactResultMessage({ compacted: true, folded_messages: 1 })
+    ).toContain('Summarized 1 earlier message.')
+  })
+
+  test('explains why nothing happened', () => {
+    expect(
+      compactResultMessage({
+        compacted: false,
+        folded_messages: 0,
+        reason: 'Too few messages.',
+      })
+    ).toBe('Too few messages.')
+    expect(
+      compactResultMessage({ compacted: false, folded_messages: 0 })
+    ).toBe('Nothing to compact yet.')
+  })
+})
+
+describe('summarizedLabel', () => {
+  test('is silent for a chat that was never compacted', () => {
+    expect(summarizedLabel(0)).toBeNull()
+    expect(summarizedLabel(-3)).toBeNull()
+  })
+
+  test('counts the summarized messages', () => {
+    expect(summarizedLabel(1)).toContain('1 earlier message is summarized')
+    expect(summarizedLabel(20)).toContain('20 earlier messages are summarized')
   })
 })

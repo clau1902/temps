@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { ConversationUsage } from '@/api/client'
-import { getUserConversationUsageOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  compactConversationMutation,
+  getUserConversationUsageOptions,
+  getUserConversationUsageQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import {
   Popover,
@@ -10,16 +14,20 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useQuery } from '@tanstack/react-query'
+import { getErrorMessage } from '@/utils/errorHandling'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
-import { Coins } from 'lucide-react'
+import { Coins, Shrink } from 'lucide-react'
+import { toast } from 'sonner'
 import {
+  compactResultMessage,
   contextLabel,
   contextLevel,
   contextShare,
   formatSpend,
   formatTokens,
   spendLabel,
+  summarizedLabel,
 } from './chat-spend'
 
 /** A chat is quiet between turns; this keeps the figure fresh while one runs. */
@@ -72,10 +80,91 @@ export function ContextMeter({
   )
 }
 
-function SpendBreakdown({ usage }: { usage: ConversationUsage }) {
+/**
+ * Summarizing the chat's older messages is automatic past a size, but the
+ * button is always here so the user can do it earlier, and the line above it
+ * says when it already happened.
+ */
+export function CompactSection({
+  summarizedMessages,
+  pending,
+  onCompact,
+}: {
+  summarizedMessages: number
+  pending: boolean
+  onCompact: () => void
+}) {
+  const summarized = summarizedLabel(summarizedMessages)
+  return (
+    <div className="space-y-1.5">
+      <p className="text-xs text-muted-foreground">
+        {summarized ??
+          'Long chats are summarized automatically. Compact now to shrink what the model reads, and what each reply costs, before that.'}
+      </p>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="h-8 gap-1.5"
+        disabled={pending}
+        onClick={onCompact}
+      >
+        <Shrink className="size-4" />
+        {pending ? 'Compacting…' : 'Compact now'}
+      </Button>
+    </div>
+  )
+}
+
+function CompactControl({
+  conversationPublicId,
+  summarizedMessages,
+}: {
+  conversationPublicId: string
+  summarizedMessages: number
+}) {
+  const queryClient = useQueryClient()
+  const compact = useMutation({
+    ...compactConversationMutation(),
+    onSuccess: (result) => {
+      toast.success(compactResultMessage(result))
+      void queryClient.invalidateQueries({
+        queryKey: getUserConversationUsageQueryKey({
+          path: { public_id: conversationPublicId },
+        }),
+      })
+    },
+    onError: (error) => {
+      toast.error('Could not compact this chat', {
+        description: getErrorMessage(error),
+      })
+    },
+  })
+  return (
+    <CompactSection
+      summarizedMessages={summarizedMessages}
+      pending={compact.isPending}
+      onCompact={() =>
+        compact.mutate({ path: { public_id: conversationPublicId } })
+      }
+    />
+  )
+}
+
+function SpendBreakdown({
+  usage,
+  conversationPublicId,
+}: {
+  usage: ConversationUsage
+  conversationPublicId: string
+}) {
   return (
     <div className="space-y-3 text-sm">
       {usage.context && <ContextMeter context={usage.context} />}
+      <CompactControl
+        conversationPublicId={conversationPublicId}
+        summarizedMessages={usage.summarized_messages}
+      />
       <div>
         <p className="font-medium">What this chat has cost</p>
         <p className="text-xs text-muted-foreground">
@@ -174,7 +263,10 @@ export function ChatSpend({
       </PopoverTrigger>
       <PopoverContent align="end" className="w-80">
         {usage.data ? (
-          <SpendBreakdown usage={usage.data} />
+          <SpendBreakdown
+            usage={usage.data}
+            conversationPublicId={conversationPublicId}
+          />
         ) : (
           <p className="text-sm text-muted-foreground">
             The spend for this chat could not be loaded. It will retry on its

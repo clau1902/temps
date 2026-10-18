@@ -76,3 +76,25 @@ export function contextLabel(context: ChatContextInput): string {
     share > 0 && share < 0.01 ? '<1' : String(Math.round(share * 100))
   return `${formatTokens(context.tokens)} of ${formatTokens(context.window)} tokens (${percent}%)`
 }
+
+/** What "Compact now" reported, as the API returns it. */
+export interface CompactResultInput {
+  compacted: boolean
+  folded_messages: number
+  reason?: string | null
+}
+
+/** One line for the toast after "Compact now". */
+export function compactResultMessage(result: CompactResultInput): string {
+  if (!result.compacted) {
+    return result.reason ?? 'Nothing to compact yet.'
+  }
+  const count = result.folded_messages
+  return `Summarized ${count} earlier ${count === 1 ? 'message' : 'messages'}. The full chat stays on screen; later replies cost less.`
+}
+
+/** "12 earlier messages are summarized for the model", or `null` for none. */
+export function summarizedLabel(summarized: number): string | null {
+  if (summarized <= 0) return null
+  return `${summarized} earlier ${summarized === 1 ? 'message is' : 'messages are'} summarized for the model; the full chat stays on screen.`
+}
