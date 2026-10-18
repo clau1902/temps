@@ -13,13 +13,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
-import {
-  Check,
-  ChevronsUpDown,
-  Cpu,
-  Loader2,
-  TriangleAlert,
-} from 'lucide-react'
+import { Check, ChevronsUpDown, Loader2, TriangleAlert } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import {
   useAssistantProviderKey,
@@ -35,6 +29,14 @@ import {
   modelDisplayName,
   type AssistantModelOption,
 } from './assistant-models'
+import { ModelVendorLogo } from './ModelVendorLogo'
+import {
+  filterByVendorTab,
+  modelVendor,
+  OTHER_VENDORS_KEY,
+  vendorTabs,
+  type VendorTab,
+} from './model-vendors'
 
 /**
  * Searchable list of the key's models. Each row shows what goes in and out and
@@ -58,9 +60,18 @@ export function AssistantModelList({
 }) {
   const models = useProviderModels(providerKeyId)
   const [query, setQuery] = useState('')
+  const [tabKey, setTabKey] = useState<string | null>(null)
+  const tabs = useMemo(() => vendorTabs(models.options), [models.options])
+  // A search looks across every vendor; the tabs only narrow the browsing.
   const visible = useMemo(
-    () => filterAssistantModels(models.options, query),
-    [models.options, query]
+    () =>
+      filterAssistantModels(
+        query.trim()
+          ? models.options
+          : filterByVendorTab(models.options, tabKey, tabs),
+        query
+      ),
+    [models.options, query, tabKey, tabs]
   )
 
   if (models.isPending && providerKeyId !== null) {
@@ -96,6 +107,13 @@ export function AssistantModelList({
         className={cn(roomy && 'h-11 text-base md:text-base')}
         disabled={disabled}
       />
+      <ModelVendorTabs
+        tabs={tabs}
+        total={models.options.length}
+        selected={query.trim() ? null : tabKey}
+        searching={query.trim().length > 0}
+        onSelect={setTabKey}
+      />
       <ul
         className={cn(
           'max-h-[min(18rem,calc(var(--radix-popover-content-available-height,100vh)-5rem))] space-y-1 overflow-y-auto pr-1',
@@ -124,6 +142,87 @@ export function AssistantModelList({
   )
 }
 
+/**
+ * Vendor tabs above the list, so the model of a given maker is a click away
+ * instead of a scroll through several hundred. Hidden behind the search: a query
+ * already spans every vendor.
+ */
+export function ModelVendorTabs({
+  tabs,
+  total,
+  selected,
+  searching,
+  onSelect,
+}: {
+  tabs: readonly VendorTab[]
+  total: number
+  selected: string | null
+  searching: boolean
+  onSelect: (key: string | null) => void
+}) {
+  if (tabs.length < 2) return null
+  return (
+    <div
+      role="tablist"
+      aria-label="Filter models by vendor"
+      className={cn(
+        'flex gap-1 overflow-x-auto pb-1',
+        searching && 'opacity-50'
+      )}
+    >
+      <VendorTabButton
+        label="All"
+        count={total}
+        active={selected === null}
+        onClick={() => onSelect(null)}
+      />
+      {tabs.map((tab) => (
+        <VendorTabButton
+          key={tab.key}
+          label={tab.name}
+          count={tab.count}
+          logo={tab.key === OTHER_VENDORS_KEY ? undefined : tab}
+          active={selected === tab.key}
+          onClick={() => onSelect(tab.key)}
+        />
+      ))}
+    </div>
+  )
+}
+
+function VendorTabButton({
+  label,
+  count,
+  logo,
+  active,
+  onClick,
+}: {
+  label: string
+  count: number
+  logo?: Pick<VendorTab, 'name' | 'logo'>
+  active: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+      className={cn(
+        'inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors hover:bg-accent',
+        active
+          ? 'border-border bg-muted font-medium text-foreground'
+          : 'border-transparent text-muted-foreground'
+      )}
+    >
+      {logo ? <ModelVendorLogo vendor={logo} size={14} /> : null}
+      {label}
+      <span className="tabular-nums opacity-60">{count}</span>
+    </button>
+  )
+}
+
 function ModelRow({
   option,
   selected,
@@ -138,6 +237,7 @@ function ModelRow({
   onSelect: () => void
 }) {
   const facts = describeModel(option)
+  const vendor = modelVendor(option.id)
   return (
     <li>
       <button
@@ -157,6 +257,7 @@ function ModelRow({
           )}
           aria-hidden="true"
         />
+        <ModelVendorLogo vendor={vendor} size={20} className="mt-0.5" />
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="truncate text-sm font-medium">{option.name}</span>
@@ -326,7 +427,9 @@ export function AssistantModelChip({
           title="The model for this chat"
         >
           <span className="flex min-w-0 items-center gap-2">
-            <Cpu className="size-4 shrink-0" aria-hidden="true" />
+            {value ? (
+              <ModelVendorLogo vendor={modelVendor(value)} size={18} />
+            ) : null}
             <span className="truncate font-medium text-foreground">
               {label}
             </span>
