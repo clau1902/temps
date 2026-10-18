@@ -3,6 +3,8 @@
 
 import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 import { useQueryClient } from '@tanstack/react-query'
+import { FOCUS_COMPOSER_HINT } from './assistant-view'
+import { useFocusComposerShortcut } from './useFocusComposerShortcut'
 import { invalidateChatResources } from './chat-resources'
 import {
   ChatDetailContext,
@@ -2557,6 +2559,7 @@ function DebugChatPanelBody({
   }, [onConversationStatusInvalidated, projectId, publicId, userScoped])
 
   const composerRef = useRef<HTMLTextAreaElement>(null)
+  useFocusComposerShortcut(composerRef)
   const compactComposer = useIsMobile()
   const composerDisabled =
     readOnly ||
@@ -3860,7 +3863,11 @@ function DebugChatPanelBody({
             autoFocus
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={placeholder}
+            placeholder={
+              compactComposer || !placeholder
+                ? placeholder
+                : `${placeholder}${FOCUS_COMPOSER_HINT}`
+            }
             rows={compactComposer ? 1 : 2}
             disabled={composerDisabled}
             className="min-h-10 resize-none md:min-h-[72px] overflow-y-hidden rounded-none border-0 shadow-none focus-visible:border-0 focus-visible:outline-none focus-visible:ring-0"

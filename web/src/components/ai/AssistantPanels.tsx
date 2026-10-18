@@ -39,6 +39,8 @@ import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { FOCUS_COMPOSER_HINT } from './assistant-view'
+import { useFocusComposerShortcut } from './useFocusComposerShortcut'
 import {
   ASSISTANT_CONTEXT_TYPE,
   ASSISTANT_EXAMPLE_PROMPTS,
@@ -391,6 +393,7 @@ export function AssistantStart({
   const [created, setCreated] = useState<ConversationResponse | null>(null)
   const uploaded = useRef(new Map<File, OpeningAttachment>())
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  useFocusComposerShortcut(inputRef)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const newChatModel = useNewChatModel()
   const imageSupport = useAssistantImageSupport(true, newChatModel.model)
@@ -570,7 +573,7 @@ export function AssistantStart({
               submit(draft)
             }
           }}
-          placeholder="Describe what you want to set up or change…"
+          placeholder={`Describe what you want to set up or change…${isMobile ? '' : FOCUS_COMPOSER_HINT}`}
           aria-label="Message the Temps assistant"
           disabled={start.isPending}
           maxLength={8000}

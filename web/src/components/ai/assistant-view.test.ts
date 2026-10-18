@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   ASSISTANT_VIEW_STORAGE_KEY,
+  isFocusComposerShortcut,
   isSwitcherShortcut,
   parseAssistantView,
   readAssistantView,
@@ -66,5 +67,54 @@ describe('isSwitcherShortcut', () => {
       false
     )
     expect(isSwitcherShortcut(press({ metaKey: true, key: 'j' }))).toBe(false)
+  })
+})
+
+describe('isFocusComposerShortcut', () => {
+  const press = (over: Record<string, unknown> = {}) => ({
+    key: '/',
+    metaKey: false,
+    ctrlKey: false,
+    altKey: false,
+    isComposing: false,
+    defaultPrevented: false,
+    target: { tagName: 'BODY' } as unknown as EventTarget,
+    ...over,
+  })
+  const at = (target: Record<string, unknown>) =>
+    press({ target: target as unknown as EventTarget })
+
+  test('is a bare slash on the page', () => {
+    expect(isFocusComposerShortcut(press())).toBe(true)
+    expect(isFocusComposerShortcut(press({ target: null }))).toBe(true)
+  })
+
+  test('is not a slash typed into a field', () => {
+    expect(isFocusComposerShortcut(at({ tagName: 'TEXTAREA' }))).toBe(false)
+    expect(isFocusComposerShortcut(at({ tagName: 'input' }))).toBe(false)
+    expect(isFocusComposerShortcut(at({ tagName: 'SELECT' }))).toBe(false)
+    expect(
+      isFocusComposerShortcut(at({ tagName: 'DIV', isContentEditable: true }))
+    ).toBe(false)
+  })
+
+  test('leaves focus alone inside a dialog or menu', () => {
+    expect(
+      isFocusComposerShortcut(at({ tagName: 'BUTTON', closest: () => ({}) }))
+    ).toBe(false)
+    expect(
+      isFocusComposerShortcut(at({ tagName: 'BUTTON', closest: () => null }))
+    ).toBe(true)
+  })
+
+  test('ignores chords, compositions and handled keys', () => {
+    expect(isFocusComposerShortcut(press({ metaKey: true }))).toBe(false)
+    expect(isFocusComposerShortcut(press({ ctrlKey: true }))).toBe(false)
+    expect(isFocusComposerShortcut(press({ altKey: true }))).toBe(false)
+    expect(isFocusComposerShortcut(press({ isComposing: true }))).toBe(false)
+    expect(isFocusComposerShortcut(press({ defaultPrevented: true }))).toBe(
+      false
+    )
+    expect(isFocusComposerShortcut(press({ key: 'k' }))).toBe(false)
   })
 })

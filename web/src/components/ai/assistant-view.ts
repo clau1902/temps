@@ -63,3 +63,52 @@ export function isSwitcherShortcut(
     !event.shiftKey
   )
 }
+
+/** What a keydown's target needs to be asked: is this a place you type? */
+interface ShortcutTarget {
+  tagName?: string
+  isContentEditable?: boolean
+  closest?: (selector: string) => unknown
+}
+
+/** Whether keystrokes aimed at `target` are text being typed, or a dialog's. */
+function swallowsTyping(target: unknown): boolean {
+  if (!target || typeof target !== 'object') return false
+  const element = target as ShortcutTarget
+  const tag = element.tagName?.toUpperCase()
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  if (element.isContentEditable) return true
+  // Focus inside a dialog or menu belongs to it; "/" must not pull it away.
+  return Boolean(element.closest?.('[role="dialog"], [role="menu"]'))
+}
+
+/**
+ * Whether a keydown is a bare "/" that should focus the message box: no
+ * ⌘/Ctrl/Alt, not part of an IME composition, not already handled, and not
+ * aimed at somewhere you are typing. Shift is allowed because "/" needs it on
+ * many keyboard layouts.
+ */
+export function isFocusComposerShortcut(
+  event: Pick<
+    KeyboardEvent,
+    | 'key'
+    | 'metaKey'
+    | 'ctrlKey'
+    | 'altKey'
+    | 'isComposing'
+    | 'defaultPrevented'
+  > & { target: EventTarget | null }
+): boolean {
+  return (
+    event.key === '/' &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.isComposing &&
+    !event.defaultPrevented &&
+    !swallowsTyping(event.target)
+  )
+}
+
+/** Appended to a composer's placeholder so the shortcut can be found. */
+export const FOCUS_COMPOSER_HINT = ' (press / to focus)'
