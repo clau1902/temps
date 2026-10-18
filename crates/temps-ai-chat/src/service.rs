@@ -7136,6 +7136,11 @@ fn log_prompt_composition(
         .iter()
         .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
         .sum();
+    tracing::debug!(
+        conversation_id = conv.id,
+        sections = %system_section_sizes(messages),
+        "system prompt sections"
+    );
     tracing::info!(
         conversation_id = conv.id,
         context_type = %conv.context_type,
@@ -7146,6 +7151,37 @@ fn log_prompt_composition(
         history_messages = messages.iter().filter(|m| m.role != "system").count(),
         "assembled chat prompt"
     );
+}
+
+/// The system prompt's size by markdown heading, largest first, as
+/// `heading=bytes` pairs. Shows which part of the fixed prefix is worth
+/// shrinking without printing the prompt itself.
+fn system_section_sizes(messages: &[ChatMessage]) -> String {
+    let mut sections: Vec<(String, usize)> = Vec::new();
+    for message in messages.iter().filter(|m| m.role == "system") {
+        for line in message.content.split_inclusive('\n') {
+            if line.starts_with('#') {
+                let title: String = line
+                    .trim_start_matches('#')
+                    .trim()
+                    .chars()
+                    .take(48)
+                    .collect();
+                sections.push((title, 0));
+            } else if let Some(last) = sections.last_mut() {
+                last.1 += line.len();
+            } else {
+                sections.push(("(preamble)".to_string(), line.len()));
+            }
+        }
+    }
+    sections.sort_by(|a, b| b.1.cmp(&a.1));
+    sections
+        .iter()
+        .take(12)
+        .map(|(title, bytes)| format!("{title}={bytes}"))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Keep a long conversation inside the model's context by dropping its oldest
@@ -8854,6 +8890,16 @@ mod tests {
         for (now, then) in messages.iter().zip(&before) {
             assert_eq!(now.content, then.content);
         }
+    }
+
+    #[test]
+    fn system_sections_are_reported_largest_first() {
+        let messages = vec![
+            ChatMessage::system("intro\n## Small\nab\n## Large\nabcdefghijkl\n"),
+            user_msg("ignored"),
+        ];
+        let sizes = system_section_sizes(&messages);
+        assert_eq!(sizes, "Large=13 | (preamble)=6 | Small=3");
     }
 
     #[test]
