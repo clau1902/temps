@@ -165,10 +165,7 @@ export function ModelVendorTabs({
     <div
       role="tablist"
       aria-label="Filter models by vendor"
-      className={cn(
-        'flex gap-1 overflow-x-auto pb-1',
-        searching && 'opacity-50'
-      )}
+      className={cn('flex flex-wrap gap-1', searching && 'opacity-50')}
     >
       <VendorTabButton
         label="All"
@@ -210,7 +207,7 @@ function VendorTabButton({
       aria-selected={active}
       onClick={onClick}
       className={cn(
-        'inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors hover:bg-accent',
+        'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors hover:bg-accent',
         active
           ? 'border-border bg-muted font-medium text-foreground'
           : 'border-transparent text-muted-foreground'
@@ -246,17 +243,10 @@ function ModelRow({
         disabled={disabled}
         aria-pressed={selected}
         className={cn(
-          'flex w-full items-start gap-3 rounded-md border border-transparent px-3 py-2 text-left transition-colors hover:bg-accent disabled:opacity-50',
+          'flex w-full items-start gap-2.5 rounded-md border border-transparent px-3 py-2 text-left transition-colors hover:bg-accent disabled:opacity-50',
           selected && 'border-border bg-muted'
         )}
       >
-        <Check
-          className={cn(
-            'mt-0.5 size-4 shrink-0',
-            selected ? 'opacity-100' : 'opacity-0'
-          )}
-          aria-hidden="true"
-        />
         <ModelVendorLogo vendor={vendor} size={20} className="mt-0.5" />
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -290,6 +280,9 @@ function ModelRow({
             </span>
           ) : null}
         </span>
+        {selected ? (
+          <Check className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+        ) : null}
       </button>
     </li>
   )
