@@ -1584,6 +1584,39 @@ fn trusted_primary_member<'a>(
     Some(member)
 }
 
+/// One-line summary of what the monitor reports for each data node, for the
+/// error raised when no trustworthy primary can be picked from it: e.g.
+/// `orders-1=primary (unhealthy, 45s since report), orders-2=secondary`.
+fn describe_monitor_states(health: &ClusterHealthReport) -> String {
+    if health.members.is_empty() {
+        return "no registered data nodes".to_string();
+    }
+    health
+        .members
+        .iter()
+        .map(|member| {
+            let mut notes = Vec::new();
+            if member.health != 1 {
+                notes.push("unhealthy".to_string());
+            }
+            if member.seconds_since_report >= 30 {
+                notes.push(format!("{}s since report", member.seconds_since_report));
+            }
+            if notes.is_empty() {
+                format!("{}={}", member.nodename, member.reported_state)
+            } else {
+                format!(
+                    "{}={} ({})",
+                    member.nodename,
+                    member.reported_state,
+                    notes.join(", ")
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse a raw role string (TEXT column / spec) into the typed enum.
 /// Returns `None` for unknown values; callers should use the
 /// classification helpers below for `is_monitor()` / `is_data_member()`
@@ -7016,33 +7049,55 @@ echo "[restore] Pre-seed complete"
         &self,
         service_id: i32,
     ) -> Result<Option<(String, String, u16)>, ExternalServiceError> {
+        let Some(primary) = self.get_cluster_primary_member(service_id).await? else {
+            return Ok(None);
+        };
+        self.stored_member_endpoint(service_id, &primary)
+            .await
+            .map(|(host, port)| Some((primary.container_name.clone(), host, port)))
+    }
+
+    /// The member of an HA PostgreSQL cluster that pg_auto_failover currently
+    /// reports as its healthy, writable primary.
+    ///
+    /// Returns `Ok(None)` when the service is not a cluster, and an error when
+    /// it is one but no single primary can be trusted right now (monitor
+    /// unreachable, failover in progress, stale reports).
+    ///
+    /// The primary is whichever node the monitor calls primary, never what
+    /// `service_members.role` says: that column holds `replica` for every
+    /// data node, so a lookup by stored role finds no primary at all, and
+    /// before the rework it lagged behind every failover.
+    pub async fn get_cluster_primary_member(
+        &self,
+        service_id: i32,
+    ) -> Result<Option<ServiceMemberInfo>, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
         if service.topology != "cluster" {
             return Ok(None);
         }
 
-        // The primary is whichever node pg_auto_failover currently calls
-        // primary, not whatever `service_members.role` happens to say.
-        // Using the stored role here would have produced the same lag
-        // bug the UI hit — Browse Data and other callers would dial a
-        // freshly-demoted node post-failover.
         let members = self.get_service_members(service_id).await?;
         let health = self.cluster_health(&service).await;
-        let primary = healthy_writable_primary_nodename(&health)
-            .and_then(|nodename| trusted_primary_member(&members, nodename));
-
-        if let Some(primary) = primary {
-            self.stored_member_endpoint(service_id, primary)
-                .await
-                .map(|(host, port)| Some((primary.container_name.clone(), host, port)))
-        } else {
-            Err(ExternalServiceError::InternalError {
-                reason: format!(
-                    "Cluster service {} has no unique healthy, recently reporting primary data node",
-                    service_id
-                ),
-            })
+        if let Some(primary) = healthy_writable_primary_nodename(&health)
+            .and_then(|nodename| trusted_primary_member(&members, nodename))
+        {
+            return Ok(Some(primary.clone()));
         }
+
+        let reason = match &health.monitor_error {
+            Some(monitor_error) => format!(
+                "Cluster service {} '{}' has no known primary: its pg_auto_failover monitor could not be read: {}",
+                service_id, service.name, monitor_error
+            ),
+            None => format!(
+                "Cluster service {} '{}' has no unique healthy, recently reporting primary data node (monitor reports: {})",
+                service_id,
+                service.name,
+                describe_monitor_states(&health)
+            ),
+        };
+        Err(ExternalServiceError::InternalError { reason })
     }
 
     /// Connect to an HA PostgreSQL cluster's current primary as its
@@ -16175,6 +16230,28 @@ mod tests {
             members: vec![cluster_member_health("orders-2", "wait_primary")],
         };
         assert!(healthy_writable_primary_nodename(&unreachable).is_none());
+    }
+
+    /// When no primary can be trusted, the error says what the monitor saw,
+    /// so a failed backup explains itself instead of claiming the cluster
+    /// simply has no primary.
+    #[test]
+    fn monitor_state_summary_names_each_node_and_why_it_was_not_trusted() {
+        let mut stale_primary = cluster_member_health("orders-1", "primary");
+        stale_primary.health = 0;
+        stale_primary.seconds_since_report = 45;
+        let report = health_report(vec![
+            stale_primary,
+            cluster_member_health("orders-2", "secondary"),
+        ]);
+        assert_eq!(
+            describe_monitor_states(&report),
+            "orders-1=primary (unhealthy, 45s since report), orders-2=secondary"
+        );
+        assert_eq!(
+            describe_monitor_states(&health_report(vec![])),
+            "no registered data nodes"
+        );
     }
 
     /// #1385: a replica removed while its provisioning task was still

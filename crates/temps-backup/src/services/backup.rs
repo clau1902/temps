@@ -4514,16 +4514,21 @@ SELECT cp.id
             )?;
             let container = if let Some(service) = service.as_ref() {
                 Some(if deletion_engine == WalgDeletionEngine::PostgresCluster {
-                    temps_entities::service_members::Entity::find()
-                        .filter(temps_entities::service_members::Column::ServiceId.eq(service_id))
-                        .filter(temps_entities::service_members::Column::Role.eq("primary"))
-                        .filter(temps_entities::service_members::Column::Status.eq("running"))
-                        .one(&transaction)
-                        .await?
+                    // The monitor knows the primary; `service_members.role`
+                    // is `replica` for every data node.
+                    self.external_service_manager
+                        .get_cluster_primary_member(service_id)
+                        .await
+                        .map_err(|e| {
+                            BackupError::ExternalService(format!(
+                                "Cannot delete WAL-G cluster backup {}: {}",
+                                backup.backup_id, e
+                            ))
+                        })?
                         .ok_or_else(|| {
                             BackupError::Validation(format!(
-                                "WAL-G cluster backup {} has no running primary",
-                                backup.backup_id
+                                "WAL-G cluster backup {} belongs to service {}, which is not a PostgreSQL cluster",
+                                backup.backup_id, service_id
                             ))
                         })?
                         .container_name
