@@ -12,6 +12,9 @@ pub mod m20260921_000003_detection_retry;
 pub mod m20260921_000004_credential_catalog;
 pub mod m20261002_000001_secret_checks_and_history;
 
+mod m20261019_000001_cron_monitors;
+pub mod m20261019_000002_reconcile_error_group_counts;
+mod m20261019_000003_cron_monitor_management;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -705,6 +708,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20261007_000002_restore_runs_cancellation::Migration),
             Box::new(m20261008_000001_create_service_data_imports::Migration),
             Box::new(m20261009_000001_unconfirm_legacy_worker_container_removals::Migration),
+            Box::new(m20261019_000001_cron_monitors::Migration),
+            Box::new(m20261019_000002_reconcile_error_group_counts::Migration),
+            Box::new(m20261019_000003_cron_monitor_management::Migration),
         ]
     }
 }

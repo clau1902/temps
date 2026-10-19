@@ -22,44 +22,41 @@ impl SentryProvider {
     }
 }
 
-#[async_trait]
-impl ErrorProvider for SentryProvider {
-    fn name(&self) -> &'static str {
-        "sentry"
-    }
+/// Fully validated dispatch result. No writes happen until every supported item
+/// has been decoded. Unsupported names are collapsed to the fixed ItemType set.
+pub struct ParsedSentryEnvelope {
+    pub events: Vec<ParsedErrorEvent>,
+    pub logs: Vec<temps_otel::types::LogRecord>,
+    pub spans: Vec<temps_otel::types::SpanRecord>,
+    pub metrics: Vec<temps_otel::types::MetricPoint>,
+    pub replay: Option<crate::sentry::replay::ReplaySegment>,
+    pub check_ins: Vec<temps_monitoring::cron_monitors::MonitorCheckIn>,
+    pub unsupported: std::collections::BTreeMap<&'static str, usize>,
+}
 
-    async fn authenticate(
-        &self,
-        project_id: i32,
-        credentials: &str,
-    ) -> Result<AuthContext, ProviderError> {
-        let dsn = self
-            .dsn_service
-            .validate_dsn(project_id, credentials)
-            .await
-            .map_err(|e| ProviderError::Authentication(e.to_string()))?;
-
-        Ok(AuthContext {
-            project_id: dsn.project_id,
-            environment_id: dsn.environment_id,
-            deployment_id: dsn.deployment_id,
-            rate_limit_per_minute: dsn.rate_limit_per_minute,
-        })
-    }
-
-    async fn parse_events(
+impl SentryProvider {
+    pub fn parse_envelope(
         &self,
         payload: &[u8],
         auth: &AuthContext,
-    ) -> Result<Vec<ParsedErrorEvent>, ProviderError> {
+    ) -> Result<ParsedSentryEnvelope, ProviderError> {
         // Parse Sentry envelope
-        let envelope =
-            Envelope::from_slice(payload).map_err(|e| ProviderError::Parsing(e.to_string()))?;
+        let envelope = Envelope::parse_for_ingestion(payload)
+            .map_err(|e| ProviderError::Parsing(e.to_string()))?;
 
         let mut parsed_events = Vec::new();
+        let mut logs = Vec::new();
+        let mut check_ins = Vec::new();
+        let mut unsupported = std::collections::BTreeMap::new();
+        let mut saw_logs = false;
+        let mut saw_metrics = false;
+        let mut spans = Vec::new();
+        let mut metrics = Vec::new();
+        let mut replay_event = None;
+        let mut replay_recording = None;
 
         // Process each item in the envelope
-        for item in envelope.items() {
+        for (header, item) in envelope.items_with_headers() {
             match item {
                 EnvelopeItem::Event(event) => {
                     // Extract event ID first
@@ -96,30 +93,173 @@ impl ErrorProvider for SentryProvider {
                         error_data,
                     });
                 }
-                EnvelopeItem::Session(_) => {
-                    tracing::debug!("Sentry session item (not yet implemented)");
+                EnvelopeItem::Log(payload) => {
+                    if saw_logs {
+                        return Err(ProviderError::Validation(
+                            "Only one log item is allowed per envelope".into(),
+                        ));
+                    }
+                    saw_logs = true;
+                    logs = crate::sentry::logs::decode_logs(header, payload, auth)
+                        .map_err(ProviderError::LogBatch)?;
                 }
-                EnvelopeItem::SessionAggregates(_) => {
-                    tracing::debug!("Sentry session aggregates item (not yet implemented)");
+                EnvelopeItem::Unsupported(payload)
+                    if matches!(
+                        header.ty,
+                        crate::sentry::envelope::ItemType::Transaction
+                            | crate::sentry::envelope::ItemType::Span
+                    ) =>
+                {
+                    let streamed = header.ty == crate::sentry::envelope::ItemType::Span
+                        && header.content_type.as_deref()
+                            == Some("application/vnd.sentry.items.span.v2+json");
+                    if !streamed
+                        && (header
+                            .content_type
+                            .as_deref()
+                            .is_some_and(|v| v != "application/json")
+                            || header.item_count.is_some_and(|n| n != 1))
+                    {
+                        return Err(ProviderError::Validation(
+                            "Unsupported trace content type or count".into(),
+                        ));
+                    }
+                    let records = if streamed {
+                        crate::sentry::traces::streamed(header, payload, auth)
+                    } else if header.ty == crate::sentry::envelope::ItemType::Transaction {
+                        crate::sentry::traces::transaction(payload, auth)
+                    } else {
+                        crate::sentry::traces::standalone(payload, auth).map(|s| vec![s])
+                    }
+                    .map_err(|_| ProviderError::Validation("Invalid Sentry trace".into()))?;
+                    if spans.len() + records.len() > 1000 {
+                        return Err(ProviderError::Validation(
+                            "At most 1000 spans per envelope".into(),
+                        ));
+                    }
+                    spans.extend(records);
                 }
-                EnvelopeItem::ClientReport(_) => {
-                    tracing::debug!("Sentry client report item (not yet implemented)");
+                EnvelopeItem::Unsupported(payload)
+                    if header.ty == crate::sentry::envelope::ItemType::TraceMetric =>
+                {
+                    if saw_metrics {
+                        return Err(ProviderError::Validation(
+                            "Only one trace_metric batch per envelope".into(),
+                        ));
+                    }
+                    saw_metrics = true;
+                    metrics = crate::sentry::metrics::decode(header, payload, auth)
+                        .map_err(|_| ProviderError::Validation("Invalid Sentry metrics".into()))?;
                 }
-                EnvelopeItem::Span(_) => {
-                    tracing::debug!("Sentry span item (not yet implemented)");
+                EnvelopeItem::Unsupported(payload)
+                    if header.ty == crate::sentry::envelope::ItemType::ReplayEvent =>
+                {
+                    if replay_event.replace(*payload).is_some() {
+                        return Err(ProviderError::Validation(
+                            "Only one replay segment per envelope".into(),
+                        ));
+                    }
                 }
-                EnvelopeItem::Transaction(_) => {
-                    tracing::debug!("Sentry transaction item (not yet implemented)");
+                EnvelopeItem::Unsupported(payload)
+                    if header.ty == crate::sentry::envelope::ItemType::ReplayRecording =>
+                {
+                    if replay_recording.replace(*payload).is_some() {
+                        return Err(ProviderError::Validation(
+                            "Only one replay recording per envelope".into(),
+                        ));
+                    }
+                }
+                EnvelopeItem::Unsupported(payload)
+                    if matches!(header.ty, crate::sentry::envelope::ItemType::CheckIn) =>
+                {
+                    if header
+                        .content_type
+                        .as_deref()
+                        .is_some_and(|v| v != "application/json")
+                        || header.item_count.is_some_and(|count| count != 1)
+                    {
+                        return Err(ProviderError::Validation(
+                            "Unsupported check-in content type or count".into(),
+                        ));
+                    }
+                    if check_ins.len() >= 100 {
+                        return Err(ProviderError::Validation(
+                            "At most 100 check-ins per envelope".into(),
+                        ));
+                    }
+                    check_ins.push(
+                        crate::sentry::check_ins::decode(payload)
+                            .map_err(|e| ProviderError::Validation(e.to_string()))?,
+                    );
+                }
+                _ => {
+                    *unsupported.entry(header.ty.name()).or_insert(0) += 1;
                 }
             }
         }
 
-        // An envelope containing only unmapped item types (client_report, session,
-        // session aggregates, span, transaction) is not an error — real Sentry
-        // relays accept these and return 200. Erroring here made every
-        // client_report-only envelope (which SDKs send periodically to report
-        // dropped/sampled events) look like a transport failure in SDK logs.
-        Ok(parsed_events)
+        let replay = match (replay_event, replay_recording) {
+            (None, None) => None,
+            // Native/video replay is not rrweb. Keep the paired metadata
+            // unsupported too, without rejecting other valid envelope items.
+            (Some(_), None) if unsupported.contains_key("replay_video") => {
+                *unsupported.entry("replay_event").or_insert(0) += 1;
+                None
+            }
+            (Some(event), Some(recording)) => Some(
+                crate::sentry::replay::decode(event, recording, auth).map_err(|_| {
+                    ProviderError::Validation("Invalid browser replay segment".into())
+                })?,
+            ),
+            _ => {
+                return Err(ProviderError::Validation(
+                    "Replay metadata and recording must be paired".into(),
+                ))
+            }
+        };
+        Ok(ParsedSentryEnvelope {
+            spans,
+            metrics,
+            replay,
+            events: parsed_events,
+            logs,
+            check_ins,
+            unsupported,
+        })
+    }
+}
+
+#[async_trait]
+impl ErrorProvider for SentryProvider {
+    fn name(&self) -> &'static str {
+        "sentry"
+    }
+
+    async fn authenticate(
+        &self,
+        project_id: i32,
+        credentials: &str,
+    ) -> Result<AuthContext, ProviderError> {
+        let dsn = self
+            .dsn_service
+            .validate_dsn(project_id, credentials)
+            .await
+            .map_err(|e| ProviderError::Authentication(e.to_string()))?;
+
+        Ok(AuthContext {
+            project_id: dsn.project_id,
+            environment_id: dsn.environment_id,
+            deployment_id: dsn.deployment_id,
+            rate_limit_per_minute: dsn.rate_limit_per_minute,
+        })
+    }
+
+    async fn parse_events(
+        &self,
+        payload: &[u8],
+        auth: &AuthContext,
+    ) -> Result<Vec<ParsedErrorEvent>, ProviderError> {
+        Ok(self.parse_envelope(payload, auth)?.events)
     }
 
     async fn parse_json_event(
@@ -151,5 +291,33 @@ impl ErrorProvider for SentryProvider {
             raw_event: event_json,
             error_data,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn unsupported_mobile_video_does_not_block_native_telemetry() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let provider = SentryProvider::new(Arc::new(DSNService::new(db)));
+        let auth = AuthContext {
+            project_id: 41,
+            environment_id: None,
+            deployment_id: None,
+            rate_limit_per_minute: None,
+        };
+        let mut bytes=b"{}\n{\"type\":\"replay_event\"}\n{\"platform\":\"cocoa\"}\n{\"type\":\"replay_video\",\"length\":3}\n".to_vec();
+        bytes.extend_from_slice(b"\0\xff\n\n");
+        bytes.extend_from_slice(br#"{"type":"log","item_count":1,"content_type":"application/vnd.sentry.items.log+json"}
+{"items":[{"timestamp":1790000000,"level":"info","body":"Synthetic mixed log","trace_id":"11111111111111111111111111111111"}]}
+"#);
+        let parsed = provider.parse_envelope(&bytes, &auth).unwrap();
+        assert_eq!(parsed.logs.len(), 1);
+        assert!(parsed.replay.is_none());
+        assert_eq!(parsed.unsupported.get("replay_video"), Some(&1));
+        assert_eq!(parsed.unsupported.get("replay_event"), Some(&1));
     }
 }

@@ -79,7 +79,7 @@ Uptime monitors with status timelines, plus alerts for deploy failures, runtime 
 
 ### Error Tracking — Sentry-compatible
 
-Drop-in Sentry replacement: point the official Sentry SDK at your Temps DSN and get error groups, stack traces with source context, and alerts. No per-event pricing.
+Point supported official Sentry SDKs at your Temps DSN to ingest errors, structured logs, traces, metrics, web replay, and cron check-ins into native Temps services. Use Temps APIs and UI to query and manage them. See the [versioned compatibility contract](docs/features/error-tracking/page.mdx#sentry-compatibility) for verified SDK scenarios and unsupported features. No per-event pricing.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">

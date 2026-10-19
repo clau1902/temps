@@ -5467,6 +5467,12 @@ export type CreateConversationRequest = {
     context_type: string;
 };
 
+export type CreateCronMonitor = {
+    config: MonitorConfig;
+    environment_id?: number | null;
+    slug: string;
+};
+
 export type CreateDsnRequest = {
     base_url?: string | null;
     deployment_id?: number | null;
@@ -6522,6 +6528,55 @@ export type CronInfo = {
     project_id: number;
     schedule: string;
     updated_at: string;
+};
+
+export type CronMonitorList = {
+    items: Array<CronMonitorView>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type CronMonitorRun = {
+    check_in_id: string;
+    deadline_at?: string | null;
+    deployment_id?: number | null;
+    duration?: number | null;
+    environment?: string | null;
+    finished_at?: string | null;
+    id: number;
+    monitor_id: number;
+    release?: string | null;
+    span_id?: string | null;
+    started_at: string;
+    status: string;
+    trace_id?: string | null;
+};
+
+export type CronMonitorRunList = {
+    items: Array<CronMonitorRun>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type CronMonitorView = {
+    alarm_id?: number | null;
+    config?: MonitorConfig | null;
+    /**
+     * Editing the configuration in Temps makes it authoritative over SDK config.
+     */
+    configuration_source: string;
+    consecutive_failures: number;
+    consecutive_successes: number;
+    enabled: boolean;
+    environment_id?: number | null;
+    id: number;
+    last_check_in_at?: string | null;
+    next_expected_at?: string | null;
+    project_id: number;
+    slug: string;
+    status: string;
 };
 
 /**
@@ -15050,6 +15105,15 @@ export type ModelUsage = {
     total_tokens: number;
 };
 
+export type MonitorConfig = {
+    checkin_margin?: number;
+    failure_issue_threshold?: number;
+    max_runtime?: number;
+    recovery_threshold?: number;
+    schedule: MonitorSchedule;
+    timezone?: string;
+};
+
 export type MonitorResponse = {
     check_interval_seconds: number;
     check_path?: string | null;
@@ -15069,6 +15133,15 @@ export type MonitorResponse = {
     next_check_at?: string | null;
     project_id: number;
     updated_at: string;
+};
+
+export type MonitorSchedule = {
+    type: 'crontab';
+    value: string;
+} | {
+    type: 'interval';
+    unit: string;
+    value: number;
 };
 
 export type MonitorStatus = {
@@ -26171,6 +26244,11 @@ export type UpdateComposeSecurityRequest = {
 
 export type UpdateConfigBody = {
     config?: ProviderConfig | null;
+};
+
+export type UpdateCronMonitor = {
+    config?: MonitorConfig | null;
+    enabled?: boolean | null;
 };
 
 export type UpdateCustomDomainRequest = {
@@ -54837,6 +54915,340 @@ export type UpdateAutomaticDeployResponses = {
 };
 
 export type UpdateAutomaticDeployResponse = UpdateAutomaticDeployResponses[keyof UpdateAutomaticDeployResponses];
+
+export type ListCronMonitorsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/cron-monitors';
+};
+
+export type ListCronMonitorsErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type ListCronMonitorsResponses = {
+    /**
+     * Success
+     */
+    200: CronMonitorList;
+};
+
+export type ListCronMonitorsResponse = ListCronMonitorsResponses[keyof ListCronMonitorsResponses];
+
+export type CreateCronMonitorData = {
+    body: CreateCronMonitor;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/cron-monitors';
+};
+
+export type CreateCronMonitorErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type CreateCronMonitorResponses = {
+    /**
+     * Success
+     */
+    201: CronMonitorView;
+};
+
+export type CreateCronMonitorResponse = CreateCronMonitorResponses[keyof CreateCronMonitorResponses];
+
+export type DeleteCronMonitorData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/cron-monitors/{monitor_id}';
+};
+
+export type DeleteCronMonitorErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type DeleteCronMonitorResponses = {
+    /**
+     * Success
+     */
+    204: void;
+};
+
+export type DeleteCronMonitorResponse = DeleteCronMonitorResponses[keyof DeleteCronMonitorResponses];
+
+export type GetCronMonitorData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/cron-monitors/{monitor_id}';
+};
+
+export type GetCronMonitorErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type GetCronMonitorResponses = {
+    /**
+     * Success
+     */
+    200: CronMonitorView;
+};
+
+export type GetCronMonitorResponse = GetCronMonitorResponses[keyof GetCronMonitorResponses];
+
+export type UpdateCronMonitorData = {
+    body: UpdateCronMonitor;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/cron-monitors/{monitor_id}';
+};
+
+export type UpdateCronMonitorErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type UpdateCronMonitorResponses = {
+    /**
+     * Success
+     */
+    200: CronMonitorView;
+};
+
+export type UpdateCronMonitorResponse = UpdateCronMonitorResponses[keyof UpdateCronMonitorResponses];
+
+export type ListCronMonitorRunsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/cron-monitors/{monitor_id}/runs';
+};
+
+export type ListCronMonitorRunsErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type ListCronMonitorRunsResponses = {
+    /**
+     * Success
+     */
+    200: CronMonitorRunList;
+};
+
+export type ListCronMonitorRunsResponse = ListCronMonitorRunsResponses[keyof ListCronMonitorRunsResponses];
 
 export type ListCustomDomainsForProjectData = {
     body?: never;

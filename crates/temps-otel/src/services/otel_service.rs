@@ -977,8 +977,25 @@ impl OtelService {
 
     /// Ingest log records.
     ///
-    /// Routes ERROR/WARN to DB for fast search, archives all to S3.
+    /// Stores all severities in queryable storage and attempts S3 archival.
+    /// The legacy native transport acknowledges receipt even if the DB fails;
+    /// adapters requiring durable confirmation use `ingest_logs_confirmed`.
     pub async fn ingest_logs(&self, records: Vec<LogRecord>) -> Result<u64, OtelError> {
+        self.ingest_logs_inner(records, false).await
+    }
+
+    /// Require queryable storage confirmation, using the same retry, archival,
+    /// routing and diagnostics as native ingestion. Compatibility transports must
+    /// not acknowledge a dropped batch as stored. Archival is still attempted.
+    pub async fn ingest_logs_confirmed(&self, records: Vec<LogRecord>) -> Result<u64, OtelError> {
+        self.ingest_logs_inner(records, true).await
+    }
+
+    async fn ingest_logs_inner(
+        &self,
+        records: Vec<LogRecord>,
+        require_confirmation: bool,
+    ) -> Result<u64, OtelError> {
         let count = records.len() as u64;
         self.stats.logs_received.fetch_add(count, Ordering::Relaxed);
 
@@ -1000,11 +1017,11 @@ impl OtelService {
         })
         .await;
 
-        match db_result {
+        match &db_result {
             Ok(stored) => {
                 self.stats
                     .logs_stored_db
-                    .fetch_add(stored, Ordering::Relaxed);
+                    .fetch_add(*stored, Ordering::Relaxed);
             }
             Err(e) => {
                 self.stats
@@ -1012,7 +1029,7 @@ impl OtelService {
                     .fetch_add(db_count, Ordering::Relaxed);
                 self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
                 error!(db_count, error = %e, "Failed to store log records in DB");
-                self.record_ingest_failure("logs", &e).await;
+                self.record_ingest_failure("logs", e).await;
             }
         }
 
@@ -1029,6 +1046,15 @@ impl OtelService {
             }
         }
 
+        if require_confirmation {
+            let stored = db_result?;
+            if stored != count {
+                return Err(OtelError::Validation {
+                    message: format!("log storage confirmed {stored} of {count} records; batch may be partially stored"),
+                });
+            }
+            return Ok(stored);
+        }
         Ok(count)
     }
 
@@ -1345,6 +1371,50 @@ mod tests {
     use crate::ingest::decode;
     use crate::test_support::{self, MockOtelStorage};
     use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_logs_use_native_retries_archival_and_failure_accounting() {
+        let log = LogRecord {
+            project_id: 1,
+            deployment_id: None,
+            resource: ResourceInfo::default(),
+            timestamp: chrono::Utc::now(),
+            observed_timestamp: chrono::Utc::now(),
+            severity: LogSeverity::Info,
+            severity_text: "info".into(),
+            body: "Synthetic log".into(),
+            trace_id: None,
+            span_id: None,
+            attributes: Default::default(),
+        };
+        for (kind, attempts, succeeds) in [
+            (StorageErrorKind::ClickHouseSchema, None, false),
+            (StorageErrorKind::ClickHouseNetwork, Some(1), true),
+            (StorageErrorKind::ClickHouseNetwork, None, false),
+        ] {
+            let mock = MockOtelStorage::new();
+            *mock.fail_store_logs.lock().unwrap() = Some("synthetic storage failure".into());
+            *mock.fail_store_logs_kind.lock().unwrap() = Some(kind);
+            *mock.fail_store_logs_times.lock().unwrap() = attempts;
+            let (svc, storage) = make_service(mock);
+            let result = svc.ingest_logs_confirmed(vec![log.clone()]).await;
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(storage.stored_archived_logs().len(), 1);
+            assert_eq!(storage.stored_logs().len(), usize::from(succeeds));
+            assert_eq!(svc.pipeline_stats().logs_received, 1);
+            assert_eq!(svc.pipeline_stats().logs_stored_db, u64::from(succeeds));
+            assert_eq!(svc.pipeline_stats().logs_dropped, u64::from(!succeeds));
+            if !succeeds {
+                assert_eq!(storage.recorded_ingest_errors().len(), 1);
+            }
+            if kind == StorageErrorKind::ClickHouseSchema {
+                assert_eq!(storage.store_logs_call_count(), 1);
+            }
+            if succeeds {
+                assert_eq!(storage.store_logs_call_count(), 2);
+            }
+        }
+    }
 
     fn linked_cloud() -> (tempfile::TempDir, Arc<temps_cloud_client::CloudLink>) {
         let directory = tempfile::tempdir().unwrap();

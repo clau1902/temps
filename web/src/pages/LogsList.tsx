@@ -94,6 +94,7 @@ export default function LogsList({ project }: LogsListProps) {
   // Trace correlation: when arriving from a trace, `?trace=<id>` pins the filter.
   const traceId = searchParams.get('trace') || ''
   const [page, setPage] = useState(1)
+  const [queryClock, setQueryClock] = useState(Date.now)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
   const debouncedService = useDebounce(service, 300)
@@ -135,9 +136,9 @@ export default function LogsList({ project }: LogsListProps) {
   ])
 
   const { startTime, endTime } = useMemo(() => {
-    const range = resolveTimeRange(timeRange)
+    const range = resolveTimeRange(timeRange, queryClock)
     return { startTime: range.from, endTime: range.to }
-  }, [timeRange])
+  }, [timeRange, queryClock])
 
   const { data, isLoading, isFetching, refetch } = useQuery({
     ...queryLogsOptions({
@@ -200,14 +201,19 @@ export default function LogsList({ project }: LogsListProps) {
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Logs</h2>
           <p className="text-sm text-muted-foreground">
-            Structured logs from your application via OpenTelemetry
+            Structured application logs from OpenTelemetry and Sentry SDKs
           </p>
         </div>
         <Button
           aria-label="Refresh"
           variant="ghost"
           size="icon"
-          onClick={() => refetch()}
+          onClick={() => {
+            setQueryClock(Date.now())
+            setPage(1)
+            // Absolute windows and trace filters keep the same query key.
+            if (traceId || timeRange.startsWith('custom:')) void refetch()
+          }}
           disabled={isFetching}
         >
           <RefreshCw
@@ -250,7 +256,10 @@ export default function LogsList({ project }: LogsListProps) {
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
             <TimeRangeFilter
               value={timeRange}
-              onChange={setTimeRange}
+              onChange={(value) => {
+                setQueryClock(Date.now())
+                setTimeRange(value)
+              }}
               disabled={!!traceId}
             />
 

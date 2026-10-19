@@ -44,6 +44,7 @@ import { ProjectPageNotFound } from '@/components/project/ProjectPageNotFound'
 import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
+import CronMonitors from './CronMonitors'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
@@ -553,6 +554,10 @@ export function ProjectDetail() {
               />
               <Route path="metrics/*" element={<Metrics project={project} />} />
               <Route
+                path="cron-jobs/*"
+                element={<CronMonitors project={project} />}
+              />
+              <Route
                 path="monitors"
                 element={<ProjectMonitors project={project} />}
               />
@@ -814,6 +819,10 @@ export function ProjectDetail() {
               <Route
                 path="ai-crawlers"
                 element={<ProjectAiCrawlers project={project} />}
+              />
+              <Route
+                path="cron-jobs/*"
+                element={<CronMonitors project={project} />}
               />
               <Route
                 path="monitors"

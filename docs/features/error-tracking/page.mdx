@@ -17,7 +17,7 @@ export const sections = [
 
 # Error Tracking
 
-Temps includes Sentry-compatible error tracking built-in. Use your existing Sentry SDKs without code changes, and own your error data. {{ className: 'lead' }}
+Temps includes Sentry-compatible error tracking built-in. Point supported official Sentry SDKs at a Temps DSN to send errors and telemetry into native Temps services. {{ className: 'lead' }}
 
 ---
 
@@ -53,7 +53,7 @@ Track, debug, and resolve errors in production with enterprise-grade error track
 
 <Properties>
   <Property name="Drop-In Replacement">
-    Works with official Sentry SDKs (JavaScript, Python, Go, PHP, Ruby, etc.)
+    Official JavaScript SDK scenarios are verified against pinned versions. Other SDKs require their own end-to-end validation; see the compatibility contract below.
   </Property>
   <Property name="Smart Grouping">
     AI-powered error clustering groups similar errors automatically
@@ -77,62 +77,60 @@ Track, debug, and resolve errors in production with enterprise-grade error track
 
 ## Sentry Compatibility {{ anchor: true, id: 'sentry-compatibility' }}
 
-Temps implements the complete Sentry protocol, allowing you to use official Sentry SDKs without modification.
+Temps adapts supported Sentry SDK ingestion payloads to the existing Temps data model and services. Browse and manage the results through Temps APIs and console pages. This does not provide Sentry's issue, organization, alert-rule, or other management APIs.
 
-### Supported Features
+### Verified SDK contract
 
-<Properties>
-  <Property name="Envelope Ingestion">
-    Full Sentry envelope protocol support (v7+)
-  </Property>
-  <Property name="Error Events">
-    Exception tracking with stack traces
-  </Property>
-  <Property name="Transaction Events">
-    Performance monitoring integration
-  </Property>
-  <Property name="Breadcrumbs">
-    Event trail leading up to errors
-  </Property>
-  <Property name="User Context">
-    User identification and metadata
-  </Property>
-  <Property name="Tags & Metadata">
-    Custom tagging and context
-  </Property>
-  <Property name="Releases">
-    Track errors by release version
-  </Property>
-</Properties>
+Compatibility is defined by SDK version and scenario, rather than a percentage:
 
-### Compatibility Matrix
+| Official SDK | Pinned upstream source | Verified scenarios |
+| --- | --- | --- |
+| `@sentry/node@10.17.0` | [eb6e2946](https://github.com/getsentry/sentry-javascript/tree/eb6e2946eb45583dd4c02ec92f8912e5bad51943) | Exceptions, messages, structured logs, transaction spans, check-ins; direct and DSN-authenticated tunnel ingestion |
+| `@sentry/node@11.8.0` | [c6492ef7](https://github.com/getsentry/sentry-javascript/tree/c6492ef78c7bfb97931e43075763ce84ee8fda7e) | Errors, logs, streamed spans, counter/gauge/distribution metrics, check-ins, mixed envelopes and trace linkage |
+| `@sentry/browser@11.8.0` in Chromium | [c6492ef7](https://github.com/getsentry/sentry-javascript/tree/c6492ef78c7bfb97931e43075763ce84ee8fda7e) | Logs, spans, metrics, compressed and plain web replay; direct and DSN-authenticated tunnel ingestion; desktop and phone viewport playback |
 
-<Row>
-  <Col>
-    **Fully Supported SDKs**
-    - @sentry/browser (JavaScript)
-    - @sentry/react (React)
-    - @sentry/nextjs (Next.js)
-    - @sentry/node (Node.js)
-    - @sentry/python (Python)
-    - @sentry/go (Go)
-    - @sentry/php (PHP)
-    - @sentry/ruby (Ruby)
-    - @sentry/java (Java)
-    - @sentry/dotnet (.NET)
-  </Col>
-  <Col>
-    **Supported Platforms**
-    - Web browsers
-    - Node.js servers
-    - React Native
-    - Electron
-    - Mobile apps (iOS, Android)
-    - Desktop apps
-    - Serverless functions
-    - Docker containers
-  </Col>
-</Row>
+These checks use synthetic applications, real HTTP endpoints, native storage queries and console inspection. They do not establish compatibility with every integration in these SDKs, other SDK versions, React Native, Cocoa, Android, native binaries, or a customer's production application. Node 10.17.0 supplies log trace IDs in the verified scenario but omits the active parent span attribute; Node 11.8.0 supplies both.
+
+### Signal and product coverage
+
+“Adapted” means ingestion feeds an existing native service. “Native extension” identifies additional Temps behavior. “Outstanding” means there is no verified compatibility contract for that capability.
+
+| Area | Contract and native destination | Limits or outstanding work |
+| --- | --- | --- |
+| DSN and transport | Adapted: project-scoped public DSNs, gzip, byte-length envelope framing, mixed items and authenticated tunnels | Public DSNs are write-only. OTLP and management endpoints still require server authentication. |
+| Errors, messages and stacks | Adapted: native error events, groups and stack details | Symbolication depends on available native source artifacts; native crash decoding is separate. |
+| Breadcrumbs, users, tags and contexts | Adapted: error detail payload and native metadata | Not every context field becomes a separately indexed native column. |
+| Fingerprints and grouping | Adapted: native fingerprints and grouping; concurrent insertion and counts reconciled | Sentry grouping algorithm parity and grouping configuration APIs are not provided. |
+| Issue APIs and triage | Existing native error list, detail and resolution APIs/UI | Sentry issue APIs are not implemented. |
+| Alert APIs and alerts | Existing Temps alert rules and alarms; cron health feeds native alarms | Sentry alert APIs are not implemented. Delivery requires a configured provider; external delivery was not verified in the synthetic run. |
+| Debug ID source maps and artifact bundles | Existing native release/source-map path remains available | Modern Debug ID artifact-bundle ingestion and resolution are outstanding. |
+| Releases | Adapted: release identity on errors, logs, spans, metrics and check-ins | A release label does not create a Sentry release-management API, deploy history, or release-health dashboard. |
+| Tracing | Adapted: transaction events and version-2 batched span items become native spans | Other span versions and Sentry performance product parity are outstanding. |
+| Structured logs | Adapted: version-1/2 batched `log` items become native telemetry logs | Typed attributes are preserved as source metadata; native attribute search remains string-based. |
+| Metrics | Adapted: version-1/2 batched `trace_metric` items become native metric points | Counters are delta monotonic sums; each distribution observation is a delta histogram. Legacy StatsD, cumulative inputs and future versions are unsupported. |
+| Replay | Adapted: paired web replay metadata and rrweb recording segments become native visitors and replays | No Temps analytics SDK required. Mobile/video replay is unsupported; technical custom events still have generic timeline labels. |
+| Cron monitoring | Native extension: SDK check-ins, interval/crontab schedules, missed-run and timeout detection, native management and run history | Temps observes the existing scheduler; it does not execute jobs. See [Cron monitoring](/docs/monitoring#cron-monitoring). |
+| Release health | Outstanding | Session/aggregate-session payloads, crash-free rates and adoption need separate product work. |
+| Profiles | Outstanding | Profiling payloads, storage, aggregation and flamegraphs need separate product work. |
+| Feedback | Outstanding | No verified Sentry feedback ingestion contract. |
+| Attachments | Outstanding | Binary framing is supported; attachment storage and attachment APIs are not. |
+| Minidumps and native crashes | Outstanding | Native crash parsing, symbols and processing need separate product work. |
+| CSP and NEL reports | Outstanding | No verified security-report or network-error-report ingestion contract. |
+| Client outcomes | Outstanding | Client reports are counted as unsupported; they do not populate native outcomes analytics. |
+
+### Framing, failures and fidelity
+
+The envelope reader handles explicit byte lengths, implicit newline termination, EOF, empty bodies, binary content and multiline payloads. Unknown item types are skipped within the same size/count limits and reported through bounded `x-temps-sentry-unsupported-items` and `x-temps-sentry-unsupported-types` response headers. Skipped items are never counted as stored. A successful envelope response alone does not establish signal support.
+
+The HTTP body limit remains 2 MiB compressed and 10 MiB decompressed. Envelope and item headers are limited to 8 KiB, with at most 1,000 items. Telemetry batches are bounded to 1,000 records and 128 attributes per record. Each envelope accepts at most one log batch, one metric batch, 100 check-ins, and one paired replay segment. Span items can combine up to 1,000 spans in total. Repeated log/metric batches or replay segment pairs are rejected even when their framing is valid. Native quotas, ingest permits, retention, cloud routing and consent apply. Replay decoding has its own bounded segment/session limits.
+
+Supported items are decoded and validated before writes. Storage then proceeds through native domain services, without a cross-domain transaction. Receipt headers such as `x-temps-sentry-logs-stored`, `x-temps-sentry-spans-stored`, `x-temps-sentry-metrics-stored` and `x-temps-sentry-check-ins-stored` report confirmed progress. Capacity/quota failures return 429; transient telemetry storage failures return 503 with `Retry-After`; permanent failures are not acknowledged as success. Retrying a partially stored mixed envelope can duplicate errors, logs, spans or metric observations. Check-in IDs and replay segment identities provide their own bounded deduplication; there is no envelope-wide exactly-once guarantee.
+
+Native log attributes are strings. The reserved `temps.sentry.attributes` JSON attribute preserves original declared types and numeric text; `temps.sentry.timestamp` and `temps.sentry.severity_number` preserve timestamp and severity fidelity. Template arguments, release/environment metadata and trace/span linkage remain available through native records. Database timestamps may resolve to microseconds, and native metric aggregation uses floating-point values; preserved source text does not make native numeric queries exact for every integer or decimal.
+
+Version-2 automatic IP/user-agent inference is unsupported. For the verified JavaScript 11.8.0 setup, use `dataCollection: { userInfo: false }`. This is distinct from choosing which explicitly supplied user fields to send. SDKs can still emit other unsupported items by default; disable unused features such as client reports where appropriate.
+
+The wire baselines are the official [envelope](https://develop.sentry.dev/sdk/foundations/envelopes/), [structured log](https://develop.sentry.dev/sdk/telemetry/logs/) and [metric](https://develop.sentry.dev/sdk/telemetry/metrics/) specifications, interpreted against the pinned SDK revisions above.
 
 ---
 

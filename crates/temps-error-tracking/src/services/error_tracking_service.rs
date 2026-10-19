@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
+use sea_orm::{DatabaseConnection, EntityTrait};
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_entities::{environments, error_groups, projects};
@@ -142,31 +142,14 @@ impl ErrorTrackingService {
             || error_data.user_email.is_some()
             || error_data.visitor_id.is_some();
 
-        // Check if a group already exists for this fingerprint (before ingestion)
-        // Capture the pre-ingestion status for regression detection
-        let fingerprint = self.ingestion.generate_fingerprint(&error_data);
-        let existing_group_id = self
-            .ingestion
-            .find_group_by_fingerprint_public(&fingerprint, error_data.project_id)
-            .await;
-
-        // Capture pre-ingestion status so regression detection works correctly
-        // (ingestion doesn't change status, but we need the status before any re-open)
-        let pre_ingestion_status = if let Some(gid) = existing_group_id {
-            self.load_group(gid)
-                .await
-                .map(|g| g.status.clone())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
         let project_id = error_data.project_id;
-        let group_id = self.ingestion.process_error_event(error_data).await?;
+        let outcome = self.ingestion.process_with_outcome(error_data).await?;
+        let group_id = outcome.group_id;
+        let pre_ingestion_status = outcome.previous_status;
 
         // Evaluate alert rules (fire-and-forget, don't fail the ingestion)
         if let Some(group) = self.load_group(group_id).await {
-            let is_new_group = existing_group_id.is_none();
+            let is_new_group = outcome.created;
             let is_regression =
                 pre_ingestion_status == "resolved" || pre_ingestion_status == "ignored";
 
@@ -178,18 +161,8 @@ impl ErrorTrackingService {
                 is_regression
             );
 
-            // Re-open the group if it was resolved/ignored (regression)
-            if is_regression {
-                tracing::info!(
-                    "Regression detected: group {} was '{}', re-opening to 'unresolved'",
-                    group_id,
-                    pre_ingestion_status
-                );
-                if let Err(e) = self.reopen_group(group_id).await {
-                    tracing::error!("Failed to re-open group {}: {}", group_id, e);
-                }
-            }
-
+            // Ingestion reopens regressions in the same transaction as the
+            // event and count, so concurrent requests cannot each claim one.
             let notifications = if is_new_group {
                 self.alerts
                     .evaluate_new_group(&group, has_user_context)
@@ -398,20 +371,6 @@ impl ErrorTrackingService {
         }
 
         Ok(event)
-    }
-
-    /// Re-open a resolved/ignored error group back to unresolved (regression)
-    async fn reopen_group(&self, group_id: i32) -> Result<(), ErrorTrackingError> {
-        let group = error_groups::Entity::find_by_id(group_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ErrorTrackingError::GroupNotFound)?;
-
-        let mut update: error_groups::ActiveModel = group.into();
-        update.status = Set("unresolved".to_string());
-        update.updated_at = Set(chrono::Utc::now());
-        update.update(self.db.as_ref()).await?;
-        Ok(())
     }
 
     /// Enrich alert notifications with project/environment names for better emails

@@ -74,6 +74,9 @@ pub struct ApiDoc;
 #[derive(Clone)]
 pub struct AppState {
     pub sentry_provider: Arc<SentryProvider>,
+    pub session_replay_service: Arc<temps_analytics_session_replay::services::SessionReplayService>,
+    pub otel_service: Arc<temps_otel::OtelService>,
+    pub cron_monitor_service: Arc<temps_monitoring::cron_monitors::CronMonitorService>,
     pub error_tracking_service: Arc<ErrorTrackingService>,
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
     pub ip_address_service: Option<Arc<IpAddressService>>,
@@ -88,6 +91,32 @@ pub struct AppState {
     /// this is a separate injection rather than an accessor on the provider.
     pub dsn_service: Arc<DSNService>,
     pub rate_limiter: IngestRateLimiter,
+}
+
+/// Share native OTel concurrency admission *before* Axum buffers the body.
+struct SentryIngestPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for SentryIngestPermit {
+    type Rejection = Response;
+    async fn from_request_parts(
+        _parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        state
+            .otel_service
+            .try_acquire_ingest_permit()
+            .map(|permit| Self { _permit: permit })
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "1")],
+                    "Ingest capacity exhausted",
+                )
+                    .into_response()
+            })
+    }
 }
 
 /// Maximum compressed body size for Sentry ingest routes (2 MiB).
@@ -137,6 +166,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     tag = "sentry-ingestor"
 )]
 async fn ingest_sentry_event(
+    _permit: SentryIngestPermit,
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<i32>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -253,6 +283,7 @@ async fn ingest_sentry_event(
     tag = "sentry-ingestor"
 )]
 async fn ingest_sentry_envelope(
+    _permit: SentryIngestPermit,
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<i32>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -316,7 +347,7 @@ async fn ingest_sentry_envelope(
     let peer = connect_info.map(|ext| ext.0 .0);
     let client_ip = temps_auth::resolve_client_ip(&headers, peer);
 
-    process_parsed_envelope(&state, &auth, &decompressed_body, &client_ip).await
+    process_parsed_envelope(&state, &auth, &decompressed_body, &client_ip, true).await
 }
 
 /// Ingest a browser-tunneled Sentry envelope.
@@ -389,6 +420,7 @@ async fn ingest_sentry_envelope(
     tag = "sentry-ingestor"
 )]
 async fn ingest_tunneled_envelope(
+    _permit: SentryIngestPermit,
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<temps_core::RequestMetadata>,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -477,7 +509,7 @@ async fn ingest_tunneled_envelope(
         };
 
         let client_ip = temps_auth::resolve_client_ip(&headers, peer);
-        return process_parsed_envelope(&state, &auth, &decompressed_body, &client_ip).await;
+        return process_parsed_envelope(&state, &auth, &decompressed_body, &client_ip, true).await;
     }
 
     // ── Path 2: no explicit credential ──────────────────────────────────
@@ -548,6 +580,7 @@ async fn ingest_tunneled_envelope(
     };
 
     let embedded = resolve_embedded_envelope_dsn(&state, &headers, &decompressed_body).await;
+    let dsn_authenticated = embedded.is_some();
 
     let auth = match embedded {
         Some(dsn) => auth_from_dsn(&dsn),
@@ -616,7 +649,14 @@ async fn ingest_tunneled_envelope(
 
     let client_ip = temps_auth::resolve_client_ip(&headers, peer);
 
-    process_parsed_envelope(&state, &auth, &decompressed_body, &client_ip).await
+    process_parsed_envelope(
+        &state,
+        &auth,
+        &decompressed_body,
+        &client_ip,
+        dsn_authenticated,
+    )
+    .await
 }
 
 /// 429 with the `Retry-After` a client needs to back off sensibly.
@@ -975,26 +1015,106 @@ async fn process_parsed_envelope(
     auth: &AuthContext,
     decompressed_body: &Bytes,
     client_ip: &str,
+    dsn_authenticated: bool,
 ) -> Response {
-    // Parse envelope using the provider
-    let parsed_events = match state
+    // Decode and validate all supported items before any durable writes.
+    let batch = match state
         .sentry_provider
-        .parse_events(decompressed_body, auth)
-        .await
+        .parse_envelope(decompressed_body, auth)
     {
-        Ok(events) => events,
-        Err(e) => {
-            tracing::error!(
-                "Failed to parse envelope for project {}: {:?}",
-                auth.project_id,
-                e
-            );
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        Ok(batch) => batch,
+        Err(crate::providers::ProviderError::LogBatch(error)) => {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+        Err(_) => {
+            tracing::warn!(project_id = auth.project_id, "Invalid Sentry envelope");
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid or unsupported Sentry envelope",
+            )
+                .into_response();
         }
     };
-
+    let has_telemetry = !batch.logs.is_empty()
+        || !batch.check_ins.is_empty()
+        || !batch.spans.is_empty()
+        || !batch.metrics.is_empty()
+        || batch.replay.is_some();
+    if has_telemetry && !dsn_authenticated {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "A valid Sentry DSN is required for telemetry",
+        )
+            .into_response();
+    }
+    let unsupported = batch.unsupported.values().sum::<usize>();
+    let unsupported_types = batch
+        .unsupported
+        .keys()
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",");
+    if unsupported > 0 {
+        tracing::debug!(project_id = auth.project_id, unsupported_items = unsupported, types = %unsupported_types, "Sentry items unsupported; none stored");
+    }
+    if has_telemetry {
+        if let Err(error) = state.otel_service.check_rate_limit(auth.project_id) {
+            return log_ingest_error(error, 0, unsupported, &unsupported_types);
+        }
+        if let Err(error) = state.otel_service.check_quota(auth.project_id).await {
+            return log_ingest_error(error, 0, unsupported, &unsupported_types);
+        }
+    }
+    let check_ins = if batch.check_ins.is_empty() {
+        temps_monitoring::cron_monitors::CheckInIngestResult::default()
+    } else {
+        match state
+            .cron_monitor_service
+            .ingest_report(
+                auth.project_id,
+                auth.environment_id,
+                auth.deployment_id,
+                batch.check_ins,
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                use temps_monitoring::cron_monitors::CronMonitorError;
+                let retryable = error.is_retryable();
+                let status = match error {
+                    CronMonitorError::Invalid(_) => StatusCode::BAD_REQUEST,
+                    CronMonitorError::NotFound { .. } | CronMonitorError::ScopeNotFound { .. } => {
+                        StatusCode::NOT_FOUND
+                    }
+                    CronMonitorError::Conflict => StatusCode::CONFLICT,
+                    CronMonitorError::Limit => StatusCode::TOO_MANY_REQUESTS,
+                    CronMonitorError::Database(_) if retryable => StatusCode::SERVICE_UNAVAILABLE,
+                    CronMonitorError::Database(_)
+                    | CronMonitorError::StoredConfiguration { .. }
+                    | CronMonitorError::Alarm(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                return envelope_outcome(status, 0, 0, unsupported, &unsupported_types);
+            }
+        }
+    };
+    let with_check_ins = |mut response: Response| {
+        if let Ok(value) = http::HeaderValue::from_str(&check_ins.accepted.to_string()) {
+            response
+                .headers_mut()
+                .insert("x-temps-sentry-check-ins-stored", value);
+        }
+        if let Ok(value) = http::HeaderValue::from_str(&check_ins.pending_configuration.to_string())
+        {
+            response
+                .headers_mut()
+                .insert("x-temps-sentry-check-ins-pending-config", value);
+        }
+        response
+    };
+    let mut errors_stored = 0;
     // Store each event using the error tracking service
-    for mut event in parsed_events {
+    for mut event in batch.events {
         // Enrich with IP geolocation and visitor correlation
         enrich_error_event(
             &mut event.error_data,
@@ -1004,22 +1124,26 @@ async fn process_parsed_envelope(
         )
         .await;
 
-        if let Err(e) = state
+        if state
             .error_tracking_service
             .process_error_event(event.error_data)
             .await
+            .is_err()
         {
-            tracing::error!("Failed to store event {}: {:?}", event.event_id, e);
-            // Shared by the DSN-authenticated AND the credential-free tunnel
-            // path — never echo `e` (a `DbErr` Display leaks table/column/
-            // constraint names) to a caller that reached this with no auth
-            // at all.
-            return (
+            tracing::error!(
+                project_id = auth.project_id,
+                error_class = "error_storage",
+                "Failed to store Sentry error event"
+            );
+            return with_check_ins(envelope_outcome(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error".to_string(),
-            )
-                .into_response();
+                errors_stored,
+                0,
+                unsupported,
+                &unsupported_types,
+            ));
         }
+        errors_stored += 1;
 
         // Once-per-instance: "error tracking is in use here". report_once is
         // idempotent and durably deduped, so no per-request flag is needed —
@@ -1033,7 +1157,218 @@ async fn process_parsed_envelope(
         );
     }
 
-    StatusCode::OK.into_response()
+    let mut domains = DomainReceipts::default();
+    if !batch.spans.is_empty() {
+        match state.otel_service.ingest_spans(batch.spans).await {
+            Ok(n) => domains.spans = n,
+            Err(error) => {
+                return domains.apply(with_check_ins(log_ingest_error(
+                    error,
+                    errors_stored,
+                    unsupported,
+                    &unsupported_types,
+                )))
+            }
+        }
+    }
+    if !batch.metrics.is_empty() {
+        match state.otel_service.ingest_metrics(batch.metrics).await {
+            Ok(n) => domains.metrics = n,
+            Err(error) => {
+                return domains.apply(with_check_ins(log_ingest_error(
+                    error,
+                    errors_stored,
+                    unsupported,
+                    &unsupported_types,
+                )))
+            }
+        }
+    }
+    if let Some(replay) = batch.replay {
+        let store = async {
+            state
+                .session_replay_service
+                .initialize_session(
+                    &replay.session_id,
+                    replay.metadata,
+                    auth.project_id,
+                    auth.environment_id,
+                    auth.deployment_id,
+                    client_ip,
+                )
+                .await?;
+            state
+                .session_replay_service
+                .add_decoded_session_events(
+                    auth.project_id,
+                    &replay.session_id,
+                    replay.events,
+                    &format!("sentry-segment-{}", replay.segment_id),
+                    replay.segment_id,
+                )
+                .await
+        }
+        .await;
+        match store {
+            Ok(n) => {
+                domains.replay_segments = 1;
+                domains.replay_events = n as u64;
+            }
+            Err(error) => {
+                use temps_analytics_session_replay::services::SessionReplayError;
+                let status = match error {
+                    SessionReplayError::VisitorCreationRateLimited { .. }
+                    | SessionReplayError::BatchTooLarge {
+                        unit: "session events",
+                        ..
+                    } => StatusCode::TOO_MANY_REQUESTS,
+                    SessionReplayError::BatchTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+                    SessionReplayError::CrossProjectAccess { .. } => StatusCode::NOT_FOUND,
+                    SessionReplayError::Database(db) => {
+                        let otel = temps_otel::OtelError::Database(db);
+                        if otel.is_transient() {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }
+                    _ => StatusCode::BAD_REQUEST,
+                };
+                return domains.apply(with_check_ins(envelope_outcome(
+                    status,
+                    errors_stored,
+                    0,
+                    unsupported,
+                    &unsupported_types,
+                )));
+            }
+        }
+    }
+    let logs_stored = if batch.logs.is_empty() {
+        0
+    } else {
+        match state.otel_service.ingest_logs_confirmed(batch.logs).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                return domains.apply(with_check_ins(log_ingest_error(
+                    error,
+                    errors_stored,
+                    unsupported,
+                    &unsupported_types,
+                )))
+            }
+        }
+    };
+    tracing::debug!(
+        project_id = auth.project_id,
+        errors_stored,
+        logs_stored,
+        unsupported_items = unsupported,
+        "Sentry envelope processed"
+    );
+    let mut response = domains.apply(with_check_ins(envelope_outcome(
+        StatusCode::OK,
+        errors_stored,
+        logs_stored,
+        unsupported,
+        &unsupported_types,
+    )));
+    if check_ins.pending_configuration > 0 {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        *response.body_mut()=axum::body::Body::from("Check-ins stored; include monitor_config on a check-in to enable missed-run and timeout detection.");
+    }
+    response
+}
+
+#[derive(Default)]
+struct DomainReceipts {
+    spans: u64,
+    metrics: u64,
+    replay_segments: u64,
+    replay_events: u64,
+}
+impl DomainReceipts {
+    fn apply(&self, mut response: Response) -> Response {
+        for (name, count) in [
+            ("x-temps-sentry-spans-stored", self.spans),
+            ("x-temps-sentry-metrics-stored", self.metrics),
+            (
+                "x-temps-sentry-replay-segments-accepted",
+                self.replay_segments,
+            ),
+            ("x-temps-sentry-replay-events-stored", self.replay_events),
+        ] {
+            if let Ok(value) = http::HeaderValue::from_str(&count.to_string()) {
+                response.headers_mut().insert(name, value);
+            }
+        }
+        response
+    }
+}
+
+/// Counts confirm durable domain records or check-in updates, not decoded items.
+/// Idempotent check-in replays acknowledge the existing run; these are not unique
+/// row counts. On failure a backend may have committed more than it confirmed.
+/// Retrying a mixed envelope can duplicate errors/logs; envelopes have no shared
+/// idempotency key or cross-domain transaction.
+fn envelope_outcome(
+    status: StatusCode,
+    errors: u64,
+    logs: u64,
+    unsupported: usize,
+    types: &str,
+) -> Response {
+    let mut response = (
+        status,
+        [
+            ("x-temps-sentry-spans-stored", "0".to_string()),
+            ("x-temps-sentry-metrics-stored", "0".to_string()),
+            ("x-temps-sentry-replay-segments-accepted", "0".to_string()),
+            ("x-temps-sentry-replay-events-stored", "0".to_string()),
+            ("x-temps-sentry-errors-stored", errors.to_string()),
+            ("x-temps-sentry-logs-stored", logs.to_string()),
+            ("x-temps-sentry-check-ins-stored", "0".to_string()),
+            ("x-temps-sentry-check-ins-pending-config", "0".to_string()),
+            ("x-temps-sentry-unsupported-items", unsupported.to_string()),
+            ("x-temps-sentry-unsupported-types", types.to_string()),
+        ],
+    )
+        .into_response();
+    if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, http::HeaderValue::from_static("60"));
+    }
+    response
+}
+
+fn log_ingest_error(
+    error: temps_otel::OtelError,
+    errors: u64,
+    unsupported: usize,
+    types: &str,
+) -> Response {
+    use temps_otel::OtelError;
+    let status = match &error {
+        OtelError::RateLimitExceeded { .. } | OtelError::QuotaExceeded { .. } => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+        OtelError::IngestSaturated { .. } | OtelError::StorageMigrating { .. } => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        OtelError::Validation { .. } => StatusCode::BAD_REQUEST,
+        _ if error.is_transient() => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    tracing::warn!(
+        error_class = error.error_class(),
+        confirmed_errors = errors,
+        "Sentry telemetry ingestion failed"
+    );
+    envelope_outcome(status, errors, 0, unsupported, types)
 }
 
 /// Maximum decompressed size to prevent decompression bombs (10 MB)
@@ -1207,6 +1542,1305 @@ mod tests {
     use temps_database::test_utils::TestDatabase;
     use temps_entities::preset::Preset;
 
+    struct ConformanceNotifications;
+    #[async_trait::async_trait]
+    impl temps_core::notifications::NotificationService for ConformanceNotifications {
+        async fn send_notification(
+            &self,
+            _: temps_core::notifications::NotificationData,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            Ok(())
+        }
+        async fn send_email(
+            &self,
+            _: temps_core::notifications::EmailMessage,
+        ) -> Result<(), temps_core::notifications::NotificationError> {
+            Ok(())
+        }
+        async fn is_configured(
+            &self,
+        ) -> Result<bool, temps_core::notifications::NotificationError> {
+            Ok(false)
+        }
+    }
+    struct ConformanceQueue;
+    #[async_trait::async_trait]
+    impl temps_core::JobQueue for ConformanceQueue {
+        async fn send(&self, _: temps_core::Job) -> Result<(), temps_core::jobs::QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            panic!("unused by conformance alarm service")
+        }
+    }
+    async fn conformance_test_context() -> Option<TestContext> {
+        match TestDatabase::with_migrations().await {
+            Ok(db) => Some(create_test_context_with_db(db).await),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!(
+                    "Sentry ingestion integration test not run: container runtime unavailable"
+                );
+                None
+            }
+            Err(error) => panic!("Sentry conformance database setup failed: {error}"),
+        }
+    }
+
+    fn synthetic_log_envelope() -> Bytes {
+        Bytes::from_static(br#"{}
+{"type":"log","item_count":1,"content_type":"application/vnd.sentry.items.log+json"}
+{"items":[{"timestamp":1790000000.123456789,"level":"info","body":"Synthetic native log","trace_id":"11111111111111111111111111111111","span_id":"2222222222222222","attributes":{"service.name":{"type":"string","value":"synthetic-service"},"synthetic.large":{"type":"integer","value":9007199254740993}}}]}
+"#)
+    }
+
+    fn native_log_query(project_id: i32) -> temps_otel::types::LogQuery {
+        temps_otel::types::LogQuery {
+            project_id,
+            severity: None,
+            service_name: None,
+            search: None,
+            trace_id: None,
+            start_time: None,
+            end_time: None,
+            limit: Some(100),
+            offset: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn check_ins_validate_before_writes_and_retry_after_storage_failure() {
+        use sea_orm::ConnectionTrait;
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let app = configure_routes().with_state(ctx.app_state.clone());
+        let server = TestServer::new(app);
+        let payload = serde_json::json!({"check_in_id":"cccccccccccccccccccccccccccccccc","monitor_slug":"synthetic-retry","status":"ok","monitor_config":{"schedule":{"type":"interval","value":5,"unit":"minute"}}});
+        let make_envelope =
+            |payload: &serde_json::Value| format!("{{}}\n{{\"type\":\"check_in\"}}\n{payload}\n");
+        let url = format!("/{}/envelope/", ctx.project_id);
+        // Missing/invalid DSNs cannot create native monitors.
+        let unauth = server.post(&url).text(make_envelope(&payload)).await;
+        assert_eq!(unauth.status_code(), StatusCode::UNAUTHORIZED);
+        let auth = HeaderValue::from_str(&format!(
+            "Sentry sentry_key={},sentry_version=7",
+            ctx.dsn_key
+        ))
+        .unwrap();
+        let mut invalid = payload.clone();
+        invalid["monitor_config"]["timezone"] = "invalid".into();
+        let response = server
+            .post(&url)
+            .add_header(HeaderName::from_static("x-sentry-auth"), auth.clone())
+            .text(make_envelope(&invalid))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        assert!(ctx
+            .app_state
+            .cron_monitor_service
+            .list(ctx.project_id, 100, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        // Mutate only this test's isolated schema. A failed transaction cannot
+        // acknowledge a check-in; retrying after storage recovers persists once.
+        ctx._db
+            .connection()
+            .execute_unprepared(
+                "ALTER TABLE cron_monitors RENAME TO synthetic_unavailable_monitors",
+            )
+            .await
+            .unwrap();
+        let failed = server
+            .post(&url)
+            .add_header(HeaderName::from_static("x-sentry-auth"), auth.clone())
+            .text(make_envelope(&payload))
+            .await;
+        assert_eq!(failed.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(failed.header("retry-after"), "60");
+        ctx._db
+            .connection()
+            .execute_unprepared(
+                "ALTER TABLE synthetic_unavailable_monitors RENAME TO cron_monitors",
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let response = server
+                .post(&url)
+                .add_header(HeaderName::from_static("x-sentry-auth"), auth.clone())
+                .text(make_envelope(&payload))
+                .await;
+            assert_eq!(response.status_code(), StatusCode::OK);
+            assert_eq!(response.header("x-temps-sentry-check-ins-stored"), "1");
+            assert_eq!(response.header("x-temps-sentry-unsupported-items"), "0");
+        }
+        let monitors = ctx
+            .app_state
+            .cron_monitor_service
+            .list(ctx.project_id, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(
+            ctx.app_state
+                .cron_monitor_service
+                .runs(ctx.project_id, monitors[0].id, 100, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        ctx._db.connection().execute_unprepared("ALTER TABLE cron_monitor_runs ADD CONSTRAINT synthetic_reject CHECK(false) NOT VALID").await.unwrap();
+        let mut rejected = payload.clone();
+        rejected["check_in_id"] = "d".repeat(32).into();
+        let permanent = server
+            .post(&url)
+            .add_header(HeaderName::from_static("x-sentry-auth"), auth.clone())
+            .text(make_envelope(&rejected))
+            .await;
+        assert_eq!(permanent.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!permanent.headers().contains_key("retry-after"));
+        assert_eq!(permanent.header("x-temps-sentry-check-ins-stored"), "0");
+        ctx._db
+            .connection()
+            .execute_unprepared("ALTER TABLE cron_monitor_runs DROP CONSTRAINT synthetic_reject")
+            .await
+            .unwrap();
+        let mut completion = payload.clone();
+        completion.as_object_mut().unwrap().remove("monitor_config");
+        completion["monitor_slug"] = "synthetic-reversed".into();
+        completion["check_in_id"] = "e".repeat(32).into();
+        let response = server
+            .post(&url)
+            .add_header(HeaderName::from_static("x-sentry-auth"), auth.clone())
+            .text(make_envelope(&completion))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(
+            response.header("x-temps-sentry-check-ins-pending-config"),
+            "1"
+        );
+        assert!(response.text().contains("monitor_config"));
+        let mut start = payload.clone();
+        start["monitor_slug"] = "synthetic-reversed".into();
+        start["check_in_id"] = "e".repeat(32).into();
+        start["status"] = "in_progress".into();
+        let response = server
+            .post(&url)
+            .add_header(HeaderName::from_static("x-sentry-auth"), auth.clone())
+            .text(make_envelope(&start))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(
+            response.header("x-temps-sentry-check-ins-pending-config"),
+            "0"
+        );
+        let configured = ctx
+            .app_state
+            .cron_monitor_service
+            .list(ctx.project_id, 100, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.slug == "synthetic-reversed")
+            .unwrap();
+        assert!(!configured.config.is_null());
+        assert_eq!(configured.status, "ok");
+        let runs = ctx
+            .app_state
+            .cron_monitor_service
+            .runs(ctx.project_id, configured.id, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        let oversized = format!(
+            "{{}}\n{}",
+            (0..101)
+                .map(|_| format!("{{\"type\":\"check_in\"}}\n{payload}\n"))
+                .collect::<String>()
+        );
+        let response = server
+            .post(&url)
+            .add_header(HeaderName::from_static("x-sentry-auth"), auth)
+            .text(oversized)
+            .await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn structured_logs_reach_native_storage_and_query_with_ownership_and_outcomes() {
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let response = server
+            .post(&format!(
+                "/{}/envelope/?sentry_key={}",
+                ctx.project_id, ctx.dsn_key
+            ))
+            .bytes(synthetic_log_envelope())
+            .await;
+        response.assert_status_ok();
+        assert_eq!(response.header("x-temps-sentry-logs-stored"), "1");
+        let logs = ctx
+            .app_state
+            .otel_service
+            .query_logs(native_log_query(ctx.project_id))
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].body, "Synthetic native log");
+        assert_eq!(logs[0].attributes["synthetic.large"], "9007199254740993");
+        assert_eq!(
+            logs[0].attributes["temps.sentry.timestamp"],
+            "1790000000.123456789"
+        );
+        assert!(logs[0].attributes["temps.sentry.attributes"].contains("9007199254740993"));
+        assert_eq!(
+            logs[0].trace_id.as_deref(),
+            Some("11111111111111111111111111111111")
+        );
+        assert_eq!(logs[0].span_id.as_deref(), Some("2222222222222222"));
+        assert!(ctx
+            .app_state
+            .otel_service
+            .query_logs(native_log_query(ctx.project_id + 1))
+            .await
+            .unwrap()
+            .is_empty());
+        server
+            .post(&format!(
+                "/{}/envelope/?sentry_key={}",
+                ctx.project_id + 1,
+                ctx.dsn_key
+            ))
+            .bytes(synthetic_log_envelope())
+            .await
+            .assert_status_unauthorized();
+        let unknown = server
+            .post(&format!(
+                "/{}/envelope/?sentry_key={}",
+                ctx.project_id, ctx.dsn_key
+            ))
+            .bytes(Bytes::from_static(
+                b"{}\n{\"type\":\"future_123\",\"length\":3}\n\xff\x00\n",
+            ))
+            .await;
+        unknown.assert_status_ok();
+        assert_eq!(unknown.header("x-temps-sentry-logs-stored"), "0");
+        assert_eq!(unknown.header("x-temps-sentry-unsupported-items"), "1");
+        assert_eq!(
+            unknown.header("x-temps-sentry-unsupported-types"),
+            "unknown"
+        );
+        ctx.route_table
+            .insert_route_for_test("synthetic.example", test_route_info(ctx.project.clone()));
+        let tunnel = TestServer::new(configure_tunnel_test_router(ctx.app_state.clone()));
+        tunnel
+            .post(SENTRY_TUNNEL_ROUTE_PATH)
+            .add_header(
+                HeaderName::from_static("host"),
+                HeaderValue::from_static("synthetic.example"),
+            )
+            .add_header(
+                HeaderName::from_static("origin"),
+                HeaderValue::from_static("https://synthetic.example"),
+            )
+            .bytes(synthetic_log_envelope())
+            .await
+            .assert_status_unauthorized();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shared_ingest_permits_reject_before_body_buffering() {
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let permits: Vec<_> = (0..8)
+            .map(|_| {
+                ctx.app_state
+                    .otel_service
+                    .try_acquire_ingest_permit()
+                    .unwrap()
+            })
+            .collect();
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let response = server
+            .post(&format!(
+                "/{}/envelope/?sentry_key={}",
+                ctx.project_id, ctx.dsn_key
+            ))
+            .bytes(Bytes::from(vec![b'x'; SENTRY_INGEST_BODY_LIMIT + 1]))
+            .await;
+        response.assert_status_service_unavailable();
+        assert_eq!(response.header("retry-after"), "1");
+        drop(permits);
+        server
+            .post(&format!(
+                "/{}/envelope/?sentry_key={}",
+                ctx.project_id, ctx.dsn_key
+            ))
+            .bytes(synthetic_log_envelope())
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn log_scope_comes_from_a_valid_dsn_environment_and_deployment() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployments, environments, upstream_config::UpstreamList};
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let (other_project, _) = create_second_project_with_dsn(&ctx).await;
+        let mut env_ids = Vec::new();
+        for project_id in [ctx.project_id, ctx.project_id, other_project] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let env = environments::ActiveModel {
+                project_id: Set(project_id),
+                name: Set(format!("Synthetic {id}")),
+                slug: Set(id.clone()),
+                subdomain: Set(id),
+                host: Set("synthetic.example".into()),
+                upstreams: Set(UpstreamList::default()),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(ctx._db.connection())
+            .await
+            .unwrap();
+            env_ids.push(env.id);
+        }
+        let mut deployment_ids = Vec::new();
+        for (environment_id, project_id) in [
+            (env_ids[0], ctx.project_id),
+            (env_ids[1], ctx.project_id),
+            (env_ids[2], other_project),
+        ] {
+            let deployment = deployments::ActiveModel {
+                project_id: Set(project_id),
+                environment_id: Set(environment_id),
+                slug: Set(uuid::Uuid::new_v4().to_string()),
+                state: Set("completed".into()),
+                metadata: Set(Some(deployments::DeploymentMetadata::default())),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(ctx._db.connection())
+            .await
+            .unwrap();
+            deployment_ids.push(deployment.id);
+        }
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        for (environment, deployment, expected) in [
+            (Some(env_ids[0]), Some(deployment_ids[0]), StatusCode::OK),
+            (Some(env_ids[2]), None, StatusCode::UNAUTHORIZED),
+            (None, Some(deployment_ids[2]), StatusCode::UNAUTHORIZED),
+            (
+                Some(env_ids[0]),
+                Some(deployment_ids[1]),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(env_ids[0]),
+                Some(deployment_ids[2]),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let dsn = ctx
+                .app_state
+                .dsn_service
+                .generate_project_dsn(ctx.project_id, environment, deployment, None, "localhost")
+                .await
+                .unwrap();
+            let check_in = serde_json::json!({"check_in_id":"e".repeat(32),"monitor_slug":"synthetic-ownership","status":"ok","environment":"synthetic-client-environment","project_id":other_project,"monitor_config":{"schedule":{"type":"interval","value":1,"unit":"hour"}}});
+            let mut envelope = synthetic_log_envelope().to_vec();
+            envelope
+                .extend_from_slice(format!("{{\"type\":\"check_in\"}}\n{check_in}\n").as_bytes());
+            let response = server
+                .post(&format!(
+                    "/{}/envelope/?sentry_key={}",
+                    ctx.project_id, dsn.public_key
+                ))
+                .bytes(Bytes::from(envelope))
+                .await;
+            assert_eq!(response.status_code(), expected);
+        }
+        let logs = ctx
+            .app_state
+            .otel_service
+            .query_logs(native_log_query(ctx.project_id))
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].deployment_id, Some(deployment_ids[0]));
+        assert_eq!(
+            logs[0].attributes["temps.sentry.environment_id"],
+            env_ids[0].to_string()
+        );
+        let monitors = ctx
+            .app_state
+            .cron_monitor_service
+            .list(ctx.project_id, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(monitors[0].environment_id, Some(env_ids[0]));
+        let runs = ctx
+            .app_state
+            .cron_monitor_service
+            .runs(ctx.project_id, monitors[0].id, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].deployment_id, Some(deployment_ids[0]));
+        assert_eq!(
+            runs[0].environment.as_deref(),
+            Some("synthetic-client-environment")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn telemetry_adapters_validate_before_writes_and_report_partial_failures() {
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let path = format!("/{}/envelope/?sentry_key={}", ctx.project_id, ctx.dsn_key);
+        let envelope=Bytes::from_static(br#"{}
+{"type":"span"}
+{"trace_id":"11111111111111111111111111111111","span_id":"2222222222222222","start_timestamp":1790000000,"timestamp":1790000001,"description":"Synthetic span"}
+{"type":"trace_metric","item_count":1,"content_type":"application/vnd.sentry.items.trace-metric+json"}
+{"items":[{"timestamp":1790000000,"trace_id":"11111111111111111111111111111111","span_id":"2222222222222222","name":"synthetic.requests","type":"counter","value":3}]}
+{"type":"log","item_count":1,"content_type":"application/vnd.sentry.items.log+json"}
+{"items":[{"timestamp":1790000000,"trace_id":"11111111111111111111111111111111","body":"Synthetic linked log","level":"info"}]}
+"#);
+        use sea_orm::ConnectionTrait;
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        for scenario in ["invalid", "permanent", "transient", "recover"] {
+            if scenario == "permanent" {
+                ctx._db.connection().execute_unprepared("ALTER TABLE otel_metrics ADD CONSTRAINT synthetic_reject_metric CHECK(false) NOT VALID").await.unwrap();
+            }
+            if scenario == "transient" || scenario == "recover" {
+                ctx._db
+                    .connection()
+                    .execute_unprepared("CREATE SEQUENCE synthetic_retry_sequence")
+                    .await
+                    .unwrap();
+                let condition = if scenario == "recover" {
+                    "nextval('synthetic_retry_sequence')=1"
+                } else {
+                    "nextval('synthetic_retry_sequence')>0"
+                };
+                ctx._db.connection().execute_unprepared(&format!("CREATE FUNCTION synthetic_metric_retry() RETURNS trigger AS $$ BEGIN IF {condition} THEN RAISE EXCEPTION 'synthetic storage failure' USING ERRCODE='40001'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql")).await.unwrap();
+                ctx._db.connection().execute_unprepared("CREATE TRIGGER synthetic_retry BEFORE INSERT ON otel_metrics FOR EACH ROW EXECUTE FUNCTION synthetic_metric_retry()").await.unwrap();
+            }
+            let body = if scenario == "invalid" {
+                Bytes::from(String::from_utf8(envelope.to_vec()).unwrap().replacen("\"item_count\":1,\"content_type\":\"application/vnd.sentry.items.trace-metric+json\"","\"item_count\":2,\"content_type\":\"application/vnd.sentry.items.trace-metric+json\"",1))
+            } else {
+                envelope.clone()
+            };
+            let response = server.post(&path).bytes(body).await;
+            if scenario == "invalid" {
+                response.assert_status_bad_request();
+                assert_eq!(
+                    ctx.app_state.otel_service.pipeline_stats().spans_received,
+                    0
+                );
+                continue;
+            }
+            assert_eq!(response.header("x-temps-sentry-spans-stored"), "1");
+            if scenario == "recover" {
+                response.assert_status_ok();
+                assert_eq!(response.header("x-temps-sentry-metrics-stored"), "1");
+                assert_eq!(response.header("x-temps-sentry-logs-stored"), "1");
+                let row = ctx
+                    ._db
+                    .connection()
+                    .query_one(sea_orm::Statement::from_string(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "SELECT last_value FROM synthetic_retry_sequence",
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row.try_get::<i64>("", "last_value").unwrap(), 2);
+            } else {
+                assert_eq!(response.header("x-temps-sentry-metrics-stored"), "0");
+                assert_eq!(response.header("x-temps-sentry-logs-stored"), "0");
+                if scenario == "transient" {
+                    response.assert_status_service_unavailable();
+                    assert_eq!(response.header("retry-after"), "60");
+                } else {
+                    response.assert_status_internal_server_error();
+                }
+            }
+            if scenario == "permanent" {
+                ctx._db
+                    .connection()
+                    .execute_unprepared(
+                        "ALTER TABLE otel_metrics DROP CONSTRAINT synthetic_reject_metric",
+                    )
+                    .await
+                    .unwrap();
+            }
+            if scenario == "transient" || scenario == "recover" {
+                ctx._db
+                    .connection()
+                    .execute_unprepared("DROP TRIGGER synthetic_retry ON otel_metrics")
+                    .await
+                    .unwrap();
+                ctx._db
+                    .connection()
+                    .execute_unprepared("DROP FUNCTION synthetic_metric_retry()")
+                    .await
+                    .unwrap();
+                ctx._db
+                    .connection()
+                    .execute_unprepared("DROP SEQUENCE synthetic_retry_sequence")
+                    .await
+                    .unwrap();
+            }
+        }
+        let logs = ctx
+            .app_state
+            .otel_service
+            .query_logs(native_log_query(ctx.project_id))
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        let buckets = ctx
+            .app_state
+            .otel_service
+            .query_metrics(temps_otel::types::MetricQuery {
+                project_id: ctx.project_id,
+                metric_name: Some("synthetic.requests".into()),
+                aggregation: temps_otel::types::MetricAggregation::Sum,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(buckets.iter().map(|b| b.value).sum::<f64>(), 3.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn official_sdk_traces_metrics_and_replay_reach_native_queries() {
+        use sea_orm::ConnectionTrait;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use temps_otel::types::{MetricAggregation, MetricQuery, TraceQuery};
+        let Ok(entry) = std::env::var("TEMPS_SENTRY_SIGNALS_SDK") else {
+            eprintln!("Signal conformance not run: TEMPS_SENTRY_SIGNALS_SDK unset");
+            return;
+        };
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let router = Router::new()
+            .nest("/api", configure_routes())
+            .layer(axum::middleware::from_fn(inject_test_request_metadata))
+            .with_state(ctx.app_state.clone());
+        let server = TestServer::builder().http_transport().build(router);
+        let base = server.server_address().unwrap();
+        let dsn = format!(
+            "http://{}@{}/{}",
+            ctx.dsn_key,
+            base.authority(),
+            ctx.project_id
+        );
+        let tunnel = format!("{base}api{SENTRY_TUNNEL_ROUTE_PATH}");
+        let modes: &[&str] = if entry.contains("/browser/") {
+            &["replay", "replay-uncompressed", "replay-tunnel"]
+        } else {
+            &["traces", "traces-tunnel"]
+        };
+        for mode in modes {
+            let output = tokio::process::Command::new("bun")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../scripts/sentry-signals-conformance.mjs"
+                ))
+                .args([entry.as_str(), dsn.as_str(), mode, tunnel.as_str()])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Official SDK scenario {mode} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if mode.starts_with("replay") {
+                let browser_trace = report["trace_id"].as_str().unwrap();
+                let browser_spans = ctx
+                    .app_state
+                    .otel_service
+                    .get_trace(ctx.project_id, browser_trace)
+                    .await
+                    .unwrap();
+                assert_eq!(browser_spans.len(), 2);
+                let browser_root = browser_spans
+                    .iter()
+                    .find(|s| s.name == "Synthetic browser root")
+                    .unwrap();
+                let browser_child = browser_spans
+                    .iter()
+                    .find(|s| s.name == "Synthetic browser child")
+                    .unwrap();
+                assert_eq!(
+                    browser_child.parent_span_id.as_deref(),
+                    Some(browser_root.span_id.as_str())
+                );
+                assert_eq!(
+                    browser_root.resource.service_version.as_deref(),
+                    Some("synthetic-release-1")
+                );
+                let browser_metric = ctx
+                    .app_state
+                    .otel_service
+                    .query_metrics(MetricQuery {
+                        project_id: ctx.project_id,
+                        metric_name: Some("synthetic.browser.requests".into()),
+                        aggregation: MetricAggregation::Sum,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert!(browser_metric.iter().any(|b| b.value >= 1.0));
+                let replay_id = report["replay_id"].as_str().unwrap();
+                let session_id = format!("sentry-{}-0-0-{replay_id}", ctx.project_id);
+                let session = temps_entities::session_replay_sessions::Entity::find()
+                    .filter(
+                        temps_entities::session_replay_sessions::Column::SessionReplayId
+                            .eq(&session_id),
+                    )
+                    .one(ctx._db.connection())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(session.project_id, ctx.project_id);
+                let playback = ctx
+                    .app_state
+                    .session_replay_service
+                    .get_session_replay(session.id)
+                    .await
+                    .unwrap();
+                assert!(!playback.events.is_empty());
+                assert!(
+                    playback
+                        .session
+                        .viewport_width
+                        .is_some_and(|width| width > 0),
+                    "the late snapshot must fill native viewport metadata"
+                );
+                assert!(
+                    playback.events.iter().any(|e| e.event_type == Some(2)),
+                    "rrweb full snapshot must reach native playback"
+                );
+                assert!(playback
+                    .events
+                    .iter()
+                    .all(|e| e.data.get("_temps_source_order").is_none()));
+                assert!(playback
+                    .events
+                    .windows(2)
+                    .all(|w| w[0].timestamp <= w[1].timestamp));
+                let markers = temps_entities::session_replay_ingest_batches::Entity::find()
+                    .filter(
+                        temps_entities::session_replay_ingest_batches::Column::SessionId
+                            .eq(session.id),
+                    )
+                    .all(ctx._db.connection())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    markers.len() as u64,
+                    report["segments"].as_u64().unwrap(),
+                    "retries must not duplicate segment markers"
+                );
+                assert_eq!(
+                    playback.events.len(),
+                    markers
+                        .iter()
+                        .map(|b| b.event_count as usize)
+                        .sum::<usize>(),
+                    "retries must not duplicate rrweb events"
+                );
+                assert!(playback
+                    .events
+                    .iter()
+                    .any(|e| e.data.pointer("/data/payload/release")
+                        == Some(&serde_json::json!("synthetic-release-1"))));
+                let visitor = temps_entities::visitor::Entity::find_by_id(session.visitor_id)
+                    .one(ctx._db.connection())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(visitor.visitor_id.starts_with("sentry-"));
+                // A different project cannot append to the native recording.
+                assert!(ctx
+                    .app_state
+                    .session_replay_service
+                    .add_decoded_session_events(
+                        ctx.project_id + 1,
+                        &session_id,
+                        vec![serde_json::json!({"type":5,"timestamp":1790000000000_i64,"data":{}})],
+                        "synthetic-foreign",
+                        0
+                    )
+                    .await
+                    .is_err());
+                // Permanent storage failure rolls the native marker back; retry
+                // must subsequently store the segment, without duplicate rows.
+                ctx._db.connection().execute_unprepared("ALTER TABLE session_replay_events ADD CONSTRAINT synthetic_reject_replay CHECK(false) NOT VALID").await.unwrap();
+                let segment = vec![
+                    serde_json::json!({"type":5,"timestamp":1790000000000_i64,"data":{"tag":"synthetic"}}),
+                ];
+                assert!(ctx
+                    .app_state
+                    .session_replay_service
+                    .add_decoded_session_events(
+                        ctx.project_id,
+                        &session_id,
+                        segment.clone(),
+                        "synthetic-retry",
+                        999
+                    )
+                    .await
+                    .is_err());
+                ctx._db
+                    .connection()
+                    .execute_unprepared(
+                        "ALTER TABLE session_replay_events DROP CONSTRAINT synthetic_reject_replay",
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ctx.app_state
+                        .session_replay_service
+                        .add_decoded_session_events(
+                            ctx.project_id,
+                            &session_id,
+                            segment.clone(),
+                            "synthetic-retry",
+                            999
+                        )
+                        .await
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    ctx.app_state
+                        .session_replay_service
+                        .add_decoded_session_events(
+                            ctx.project_id,
+                            &session_id,
+                            segment,
+                            "synthetic-retry",
+                            999
+                        )
+                        .await
+                        .unwrap(),
+                    0
+                );
+                for sequence in [998_u32, 997] {
+                    ctx.app_state.session_replay_service.add_decoded_session_events(ctx.project_id,&session_id,vec![serde_json::json!({"type":5,"timestamp":1790000000000_i64,"data":{"tag":"synthetic-order","payload":sequence}})],&format!("synthetic-order-{sequence}"),sequence).await.unwrap();
+                }
+                let playback = ctx
+                    .app_state
+                    .session_replay_service
+                    .get_session_replay(session.id)
+                    .await
+                    .unwrap();
+                let order: Vec<_> = playback
+                    .events
+                    .iter()
+                    .filter(|e| {
+                        e.data
+                            .pointer("/data/tag")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("synthetic-order")
+                    })
+                    .map(|e| {
+                        e.data
+                            .pointer("/data/payload")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap()
+                    })
+                    .collect();
+                assert_eq!(
+                    order,
+                    vec![997, 998],
+                    "equal timestamps must follow source segment order, not arrival order"
+                );
+            } else {
+                let trace = report["trace_id"].as_str().unwrap();
+                let spans = ctx
+                    .app_state
+                    .otel_service
+                    .query_spans(TraceQuery {
+                        project_id: ctx.project_id,
+                        trace_id: Some(trace.into()),
+                        limit: Some(100),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(spans.len(), 2);
+                let root = spans.iter().find(|s| s.name == "Synthetic root").unwrap();
+                let child = spans.iter().find(|s| s.name == "Synthetic child").unwrap();
+                assert_eq!(child.parent_span_id.as_deref(), Some(root.span_id.as_str()));
+                assert_eq!(
+                    root.resource.service_version.as_deref(),
+                    Some("synthetic-release-1")
+                );
+                assert_eq!(
+                    child.resource.deployment_environment.as_deref(),
+                    Some("synthetic-test")
+                );
+                let logs = ctx
+                    .app_state
+                    .otel_service
+                    .query_logs(temps_otel::types::LogQuery {
+                        project_id: ctx.project_id,
+                        trace_id: Some(trace.into()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(logs.len(), 1);
+                if report["metrics"].as_u64().unwrap() > 0 {
+                    let sum = ctx
+                        .app_state
+                        .otel_service
+                        .query_metrics(MetricQuery {
+                            project_id: ctx.project_id,
+                            metric_name: Some("synthetic.requests".into()),
+                            aggregation: MetricAggregation::Sum,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    assert!(sum.iter().any(|b| b.value >= 5.0));
+                    let distribution = ctx
+                        .app_state
+                        .otel_service
+                        .query_metrics(MetricQuery {
+                            project_id: ctx.project_id,
+                            metric_name: Some("synthetic.duration".into()),
+                            aggregation: MetricAggregation::Quantile(0.95),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    assert!(distribution
+                        .iter()
+                        .any(|b| b.value >= 12.5 && b.value <= 25.0));
+                    // Full-fidelity columns must retain units, delta semantics
+                    // and exemplars as well as the chart's scalar aggregates.
+                    let rows=ctx._db.connection().query_all(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,"SELECT unit,temporality,exemplars FROM otel_metrics WHERE project_id=$1 AND metric_name='synthetic.duration' AND exemplars @> jsonb_build_array(jsonb_build_object('trace_id',$2::text))",[ctx.project_id.into(),trace.into()])).await.unwrap();
+                    assert!(!rows.is_empty());
+                    for row in rows {
+                        assert_eq!(row.try_get::<String>("", "unit").unwrap(), "millisecond");
+                        assert_eq!(row.try_get::<String>("", "temporality").unwrap(), "delta");
+                        let exemplars: serde_json::Value = row.try_get("", "exemplars").unwrap();
+                        assert!(exemplars
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|e| e["trace_id"] == trace));
+                    }
+                }
+                // No transaction should be stored as an error issue.
+                let events = temps_entities::error_events::Entity::find()
+                    .filter(temps_entities::error_events::Column::ProjectId.eq(ctx.project_id))
+                    .all(ctx._db.connection())
+                    .await
+                    .unwrap();
+                assert!(events.iter().any(|e| e
+                    .data
+                    .as_ref()
+                    .is_some_and(|v| v.to_string().contains(trace))));
+            }
+            eprintln!(
+                "Verified official SDK {} scenario {mode} -> native query",
+                report["sdk"]
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn official_sdk_ingestion_reaches_native_queries_and_reports_unsupported() {
+        // Explicit opt-in supplies a temporary installation, never customer data.
+        // Run separately for each pinned SDK entry point. Absence is a reported
+        // live conformance blocker, never proof of SDK compatibility.
+        let Ok(entry) = std::env::var("TEMPS_SENTRY_CONFORMANCE_SDK") else {
+            eprintln!("SDK conformance not run: TEMPS_SENTRY_CONFORMANCE_SDK is not set");
+            return;
+        };
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let router = Router::new()
+            .nest("/api", configure_routes())
+            .layer(axum::middleware::from_fn(inject_test_request_metadata))
+            .with_state(ctx.app_state.clone());
+        let server = TestServer::builder().http_transport().build(router);
+        let base = server.server_address().unwrap();
+        let dsn = format!(
+            "http://{}@{}/{id}",
+            ctx.dsn_key,
+            base.authority(),
+            id = ctx.project_id
+        );
+        let modes: &[&str] = if entry.contains("/browser/") {
+            &["browser", "browser-tunnel", "browser-auto"]
+        } else if std::env::var("TEMPS_SENTRY_CONFORMANCE_SUITE").as_deref() == Ok("signals") {
+            &["errors", "errors-tunnel", "cron", "cron-tunnel", "signals"]
+        } else {
+            &["direct", "tunnel", "mixed"]
+        };
+        let alarms = temps_monitoring::AlarmService::new(
+            ctx._db.connection_arc(),
+            Arc::new(ConformanceNotifications),
+            Arc::new(ConformanceQueue),
+        );
+        for &mode in modes {
+            let errors_before = error_event_project_ids(&ctx).await.len();
+            let logs_before = ctx
+                .app_state
+                .otel_service
+                .query_logs(native_log_query(ctx.project_id))
+                .await
+                .unwrap()
+                .len();
+            let output = tokio::process::Command::new("bun")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../scripts/sentry-log-conformance.mjs"
+                ))
+                .args([
+                    entry.as_str(),
+                    dsn.as_str(),
+                    mode,
+                    &format!("{}api{}", base, SENTRY_TUNNEL_ROUTE_PATH),
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "synthetic SDK {mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            ctx.app_state
+                .cron_monitor_service
+                .sync_alarms(&alarms)
+                .await
+                .unwrap();
+            if mode.starts_with("errors") || mode.starts_with("cron") || mode == "signals" {
+                let event_ids = summary["events"].as_array().unwrap();
+                let all_events = temps_entities::error_events::Entity::find()
+                    .filter(temps_entities::error_events::Column::ProjectId.eq(ctx.project_id))
+                    .all(ctx._db.connection())
+                    .await
+                    .unwrap();
+                assert_eq!(all_events.len(), errors_before + event_ids.len());
+                let new_events: Vec<_> = all_events
+                    .iter()
+                    .filter(|event| {
+                        event
+                            .data
+                            .as_ref()
+                            .is_some_and(|data| event_ids.contains(&data["sentry"]["event_id"]))
+                    })
+                    .collect();
+                assert_eq!(
+                    new_events.len(),
+                    event_ids.len(),
+                    "every SDK event ID must reach native storage"
+                );
+                let all_logs = ctx
+                    .app_state
+                    .otel_service
+                    .query_logs(native_log_query(ctx.project_id))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    all_logs.len(),
+                    logs_before + summary["logs"].as_u64().unwrap() as usize
+                );
+                if mode.starts_with("errors") {
+                    let exceptions: Vec<_> = new_events
+                        .iter()
+                        .filter(|event| event.exception_type == "TypeError")
+                        .collect();
+                    assert_eq!(exceptions.len(), 2);
+                    assert_eq!(
+                        exceptions[0].error_group_id, exceptions[1].error_group_id,
+                        "concurrent matching SDK errors must share a native group"
+                    );
+                    let group = ctx
+                        .app_state
+                        .error_tracking_service
+                        .get_error_group(exceptions[0].error_group_id, ctx.project_id)
+                        .await
+                        .unwrap();
+                    let group_events = all_events
+                        .iter()
+                        .filter(|event| event.error_group_id == group.id)
+                        .count();
+                    assert_eq!(
+                        group.total_count as usize, group_events,
+                        "native counts must equal stored events"
+                    );
+                    for event in &new_events {
+                        let native = ctx
+                            .app_state
+                            .error_tracking_service
+                            .get_error_event(event.id, event.error_group_id, ctx.project_id)
+                            .await
+                            .unwrap();
+                        let raw = &native.data.as_ref().unwrap()["sentry"];
+                        assert_eq!(raw["user"]["id"], "synthetic-user");
+                        assert_eq!(raw["user"]["email"], "synthetic@example.invalid");
+                        assert_eq!(
+                            raw["contexts"]["synthetic"]["operation"],
+                            "synthetic-operation"
+                        );
+                        assert_eq!(raw["fingerprint"][0], "synthetic-fingerprint");
+                        assert_eq!(raw["release"], "synthetic-release-1");
+                        assert_eq!(raw["environment"], "synthetic-test");
+                        assert!(raw["breadcrumbs"]["values"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|crumb| crumb["message"] == "Synthetic breadcrumb"));
+                        assert!(raw["tags"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tag| tag[0] == "synthetic.mode" && tag[1] == mode));
+                    }
+                    assert!(new_events
+                        .iter()
+                        .any(|event| event.data.as_ref().unwrap()["sentry"]["logentry"]
+                            ["formatted"]
+                            == "Synthetic SDK message"));
+                    for event in exceptions {
+                        assert_eq!(
+                            event.exception_value.as_deref(),
+                            Some("Synthetic repeated failure")
+                        );
+                        let raw = &event.data.as_ref().unwrap()["sentry"];
+                        let frames = raw["exception"]["values"][0]["stacktrace"]["frames"]
+                            .as_array()
+                            .unwrap();
+                        assert!(!frames.is_empty());
+                        assert!(frames
+                            .iter()
+                            .all(|frame| frame["filename"] == "synthetic:///application.mjs"));
+                    }
+                    eprintln!("SDK {} {mode}: 3 gzip events, native reads, concurrent grouping and exact counts verified", summary["sdk"]);
+                    continue;
+                }
+                if mode.starts_with("cron") {
+                    assert_eq!(summary["check_ins"], 7);
+                    let monitors = ctx
+                        .app_state
+                        .cron_monitor_service
+                        .list(ctx.project_id, 100, 0)
+                        .await
+                        .unwrap();
+                    assert_eq!(monitors.len(), 4);
+                    for descriptor in summary["runs"].as_array().unwrap() {
+                        let monitor = monitors
+                            .iter()
+                            .find(|m| m.slug == descriptor["slug"].as_str().unwrap())
+                            .unwrap();
+                        let runs = ctx
+                            .app_state
+                            .cron_monitor_service
+                            .runs(ctx.project_id, monitor.id, 100, 0)
+                            .await
+                            .unwrap();
+                        let run = runs
+                            .iter()
+                            .find(|r| r.check_in_id == descriptor["id"].as_str().unwrap())
+                            .unwrap();
+                        assert_eq!(run.status, descriptor["status"].as_str().unwrap());
+                        assert_eq!(run.duration, descriptor["duration"].as_f64());
+                        assert_eq!(run.trace_id.as_deref(), descriptor["trace_id"].as_str());
+                        assert_eq!(run.span_id.as_deref(), descriptor["span_id"].as_str());
+                        assert_eq!(run.release.as_deref(), Some("synthetic-release-1"));
+                        assert_eq!(run.environment.as_deref(), Some("synthetic-test"));
+                    }
+                    let (native_alarms, total) = alarms
+                        .list_alarms(
+                            Some(ctx.project_id),
+                            temps_monitoring::AlarmFilters {
+                                alarm_type: Some(temps_monitoring::AlarmType::CronJobFailed),
+                                status: Some(temps_monitoring::AlarmStatus::Firing),
+                                ..Default::default()
+                            },
+                            1,
+                            20,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        total, 2,
+                        "SDK failure and heartbeat must reach native alarms"
+                    );
+                    for alarm in native_alarms {
+                        assert_eq!(
+                            alarm.metadata.as_ref().unwrap()["latest_run"]["status"],
+                            "error"
+                        );
+                    }
+                    eprintln!(
+                        "SDK {} {mode}: 7 check-ins verified in native monitors, run history and alarm queries",
+                        summary["sdk"]
+                    );
+                    continue;
+                }
+                assert_eq!(summary["check_ins"], 1);
+                let mixed = ctx
+                    .app_state
+                    .cron_monitor_service
+                    .list(ctx.project_id, 100, 0)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.slug == "synthetic-mixed")
+                    .unwrap();
+                let run = ctx
+                    .app_state
+                    .cron_monitor_service
+                    .runs(ctx.project_id, mixed.id, 100, 0)
+                    .await
+                    .unwrap()
+                    .remove(0);
+                assert_eq!(run.check_in_id, summary["runs"][0]["id"].as_str().unwrap());
+                assert_eq!(run.status, "ok");
+                assert_eq!(
+                    run.trace_id.as_deref(),
+                    summary["runs"][0]["trace_id"].as_str()
+                );
+                assert_eq!(new_events.len(), 1);
+                assert_eq!(
+                    new_events[0].trace_id_indexed.as_deref(),
+                    summary["trace_id"].as_str()
+                );
+            }
+            let mut query = native_log_query(ctx.project_id);
+            query.trace_id = Some(summary["trace_id"].as_str().unwrap().to_owned());
+            let logs = ctx.app_state.otel_service.query_logs(query).await.unwrap();
+            if mode == "browser-auto" {
+                assert!(logs.is_empty(), "unsupported inference must not write logs");
+                eprintln!("SDK 11.8.0 browser-auto: rejected 400 with no native logs");
+                continue;
+            }
+            assert_eq!(
+                logs.len(),
+                2,
+                "{mode}: SDK -> HTTP -> native storage -> trace query"
+            );
+            assert_eq!(
+                logs[0].resource.service_version.as_deref(),
+                Some("synthetic-release-1")
+            );
+            assert!(logs
+                .iter()
+                .all(|log| log.attributes["synthetic.mode"] == mode));
+            assert!(logs
+                .iter()
+                .any(|log| log.attributes.contains_key("sentry.message.template")));
+            if mode == "mixed" {
+                let events = temps_entities::error_events::Entity::find()
+                    .filter(
+                        temps_entities::error_events::Column::TraceIdIndexed
+                            .eq(summary["trace_id"].as_str().unwrap()),
+                    )
+                    .all(ctx._db.connection())
+                    .await
+                    .unwrap();
+                assert_eq!(events.len(), 1, "error and logs must share the trace");
+            }
+            eprintln!(
+                "SDK {} {mode}: 2 logs confirmed by native trace query",
+                summary["sdk"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rejects_logs_before_writes_and_reports_mixed_storage_failure() {
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let path = format!("/{}/envelope/?sentry_key={}", ctx.project_id, ctx.dsn_key);
+        let mut mixed = b"{\"event_id\":\"11111111111111111111111111111111\"}\n{\"type\":\"event\"}\n{\"level\":\"error\",\"message\":\"Synthetic mixed failure\",\"platform\":\"other\"}\n".to_vec();
+        mixed.extend_from_slice(&synthetic_log_envelope()[3..]);
+        let invalid = String::from_utf8(mixed.clone())
+            .unwrap()
+            .replace("\"item_count\":1", "\"item_count\":2");
+        server
+            .post(&path)
+            .bytes(Bytes::from(invalid))
+            .await
+            .assert_status_bad_request();
+        assert_eq!(ctx.app_state.otel_service.pipeline_stats().logs_received, 0);
+        assert!(error_event_project_ids(&ctx).await.is_empty());
+
+        // Prime native quota cache, then fail only this test's isolated log
+        // table. Error writes remain healthy, demonstrating partial ingestion.
+        ctx.app_state
+            .otel_service
+            .check_quota(ctx.project_id)
+            .await
+            .unwrap();
+        ctx._db
+            .execute_sql("DROP TABLE otel_log_events CASCADE")
+            .await
+            .unwrap();
+        let response = server.post(&path).bytes(Bytes::from(mixed)).await;
+        response.assert_status_internal_server_error();
+        assert_eq!(response.header("x-temps-sentry-errors-stored"), "1");
+        assert_eq!(response.header("x-temps-sentry-logs-stored"), "0");
+        assert_eq!(ctx.app_state.otel_service.pipeline_stats().logs_dropped, 1);
+    }
+
+    #[test]
+    fn retry_statuses_and_partial_counts_do_not_echo_storage_errors() {
+        let error = temps_otel::OtelError::Storage {
+            kind: temps_otel::error::StorageErrorKind::ClickHouseNetwork,
+            message: "SECRET_SYNTHETIC_STORAGE_PAYLOAD".into(),
+        };
+        let response = log_ingest_error(error, 1, 2, "unknown");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "60");
+        assert_eq!(response.headers()["x-temps-sentry-errors-stored"], "1");
+        assert_eq!(response.headers()["x-temps-sentry-logs-stored"], "0");
+    }
+
     // Mock audit logger for tests
     #[derive(Clone)]
     struct MockAuditLogger;
@@ -1262,13 +2896,14 @@ mod tests {
     }
 
     async fn create_test_context() -> TestContext {
+        create_test_context_with_db(TestDatabase::with_migrations().await.unwrap()).await
+    }
+
+    async fn create_test_context_with_db(db: TestDatabase) -> TestContext {
         use sea_orm::ActiveModelTrait;
         use sea_orm::Set;
         use temps_entities::projects;
         use uuid::Uuid;
-
-        // Create a test database with migrations
-        let db = TestDatabase::with_migrations().await.unwrap();
 
         // Create a test project with all required fields (use unique slug per test)
         let unique_slug = format!("test-project-{}", Uuid::new_v4());
@@ -1309,6 +2944,28 @@ mod tests {
 
         let app_state = Arc::new(AppState {
             sentry_provider,
+            session_replay_service: Arc::new(
+                temps_analytics_session_replay::services::SessionReplayService::new(
+                    db.connection_arc(),
+                ),
+            ),
+            otel_service: Arc::new(temps_otel::OtelService::new(
+                Arc::new(temps_otel::storage::timescaledb::TimescaleDbStorage::new(
+                    db.connection_arc(),
+                    None,
+                )),
+                Arc::new(temps_otel::ingest::auth::OtelAuthService::new(
+                    db.connection_arc(),
+                )),
+                Arc::new(temps_otel::ingest::rate_limit::RateLimiter::new(
+                    10000,
+                    std::time::Duration::from_secs(60),
+                )),
+                8,
+            )),
+            cron_monitor_service: Arc::new(
+                temps_monitoring::cron_monitors::CronMonitorService::new(db.connection_arc()),
+            ),
             error_tracking_service,
             audit_service,
             ip_address_service: None,

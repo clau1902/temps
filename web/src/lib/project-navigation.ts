@@ -50,6 +50,11 @@ export const PROJECT_SECTION_LINKS: Partial<
   monitoring: [
     { title: 'Metrics', url: 'metrics', aliases: ['dashboards'] },
     { title: 'Uptime', url: 'monitors' },
+    {
+      title: 'Cron jobs',
+      url: 'cron-jobs',
+      keywords: ['schedule', 'check-ins', 'missed', 'timeout'],
+    },
     { title: 'Alert rules', url: 'errors/alert-rules' },
   ],
   analytics: [
@@ -195,6 +200,7 @@ const EXTERNAL_PROJECT_PAGES = [
   'telemetry-logs',
   'metrics',
   'monitors',
+  'cron-jobs',
   'settings/general',
   'settings/telemetry',
 ] as const

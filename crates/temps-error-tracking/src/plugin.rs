@@ -6,7 +6,8 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use temps_core::plugin::{
-    PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
+    PluginContext, PluginError, PluginRoutes, RequiredService, ServiceRegistrationContext,
+    TempsPlugin,
 };
 use temps_core::{Job, JobQueue, JobReceiver};
 use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
@@ -84,6 +85,14 @@ impl Default for ErrorTrackingPlugin {
 impl TempsPlugin for ErrorTrackingPlugin {
     fn name(&self) -> &'static str {
         "error-tracking"
+    }
+
+    fn required_services(&self) -> Vec<RequiredService> {
+        vec![
+            RequiredService::of::<temps_otel::OtelService>(),
+            RequiredService::of::<temps_analytics_session_replay::services::SessionReplayService>(),
+            RequiredService::of::<temps_monitoring::cron_monitors::CronMonitorService>(),
+        ]
     }
 
     fn register_services<'a>(
@@ -446,6 +455,13 @@ impl TempsPlugin for ErrorTrackingPlugin {
 
         let sentry_state = Arc::new(crate::sentry::handlers::AppState {
             sentry_provider: sentry_provider.clone(),
+            // Routes are built after all service registration, including OTel.
+            session_replay_service: context
+                .require_service::<temps_analytics_session_replay::services::SessionReplayService>(
+            ),
+            otel_service: context.require_service::<temps_otel::OtelService>(),
+            cron_monitor_service: context
+                .require_service::<temps_monitoring::cron_monitors::CronMonitorService>(),
             error_tracking_service: error_tracking_service.clone(),
             audit_service: audit_service.clone(),
             ip_address_service,

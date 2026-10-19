@@ -49,6 +49,8 @@ describe('flat project navigation', () => {
       'request-logs/42': 'logs',
       'telemetry-logs': 'logs',
       'dashboards/custom': 'monitoring',
+      'cron-jobs/12': 'monitoring',
+      'cron-jobs/new': 'monitoring',
       observe: 'project',
     } as const))
       expect(resolveProjectPrimaryRoute(path)).toBe(section)

@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use chrono::Utc;
+use arc_swap::ArcSwapOption;
+use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -111,22 +112,55 @@ pub fn extract_message_from_raw(raw: Option<&serde_json::Value>) -> Option<Strin
     None
 }
 
+#[derive(FromQueryResult)]
+struct ErrorChunkRange {
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+}
+
+pub(super) struct IngestedError {
+    pub group_id: i32,
+    pub created: bool,
+    pub previous_status: String,
+}
+
+fn is_transaction_abort(error: &ErrorTrackingError) -> bool {
+    use sea_orm::{sqlx::Error as SqlxError, DbErr, RuntimeErr};
+    match error {
+        ErrorTrackingError::Database(
+            DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(error)))
+            | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(error))),
+        ) => matches!(error.code().as_deref(), Some("40P01" | "40001")),
+        _ => false,
+    }
+}
+
 /// Service for ingesting and processing error events
 pub struct ErrorIngestionService {
     db: Arc<DatabaseConnection>,
     tokenizer: Arc<dyn Tokenizer>,
+    // One lock-free range per service/database, never a per-project/key cache.
+    chunk_range: ArcSwapOption<ErrorChunkRange>,
 }
 
 impl ErrorIngestionService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         // Use HashTokenizer with vocab_size=10000 for production
         let tokenizer = Arc::new(HashTokenizer::new(10000)) as Arc<dyn Tokenizer>;
-        Self { db, tokenizer }
+        Self {
+            db,
+            tokenizer,
+            chunk_range: ArcSwapOption::empty(),
+        }
     }
 
     /// Create with custom tokenizer
     pub fn with_tokenizer(db: Arc<DatabaseConnection>, tokenizer: Arc<dyn Tokenizer>) -> Self {
-        Self { db, tokenizer }
+        Self {
+            db,
+            tokenizer,
+            chunk_range: ArcSwapOption::empty(),
+        }
     }
 
     /// Create an embedding from error message
@@ -145,47 +179,148 @@ impl ErrorIngestionService {
         &self,
         error_data: CreateErrorEventData,
     ) -> Result<i32, ErrorTrackingError> {
-        // 1. Generate fingerprint for exact matching
+        Ok(self.process_with_outcome(error_data).await?.group_id)
+    }
+
+    pub(super) async fn process_with_outcome(
+        &self,
+        error_data: CreateErrorEventData,
+    ) -> Result<IngestedError, ErrorTrackingError> {
         let fingerprint = self.generate_fingerprint(&error_data);
-
-        // 2. Try to find existing group by fingerprint (fast path)
-        if let Some(group_id) = self
-            .find_group_by_fingerprint(&fingerprint, error_data.project_id)
-            .await?
-        {
-            self.create_error_event(&error_data, group_id, &fingerprint)
-                .await?;
-            self.increment_group_count(group_id).await?;
-            return Ok(group_id);
-        }
-
-        // 3. Try vector similarity search (fallback). The lookup must embed
-        // the same text a group is created from (see `group_type_and_message`),
-        // otherwise the vectors never match. The embedding only covers the
-        // message, so the lookup is also restricted to the same exception
-        // type: `TypeError: x is not a function` and `RangeError: x is not a
-        // function` embed identically but are different errors.
-        let (exception_type, exception_value) = group_type_and_message(&error_data);
-        let embedding_text = exception_value.unwrap_or_else(|| exception_type.clone());
-
-        if let Some(embedding) = self.create_embedding(&embedding_text) {
-            if let Some(similar_group_id) = self
-                .find_similar_group_by_embedding(&embedding, error_data.project_id, &exception_type)
-                .await?
-            {
-                self.create_error_event(&error_data, similar_group_id, &fingerprint)
-                    .await?;
-                self.increment_group_count(similar_group_id).await?;
-                return Ok(similar_group_id);
+        let mut attempt = 0;
+        loop {
+            let result = self.process_once(&error_data, &fingerprint).await;
+            match &result {
+                Err(error) if attempt < 4 && is_transaction_abort(error) => {
+                    // Timescale's first-chunk FK creation can deadlock concurrent
+                    // group inserts. PostgreSQL explicitly aborted this entire
+                    // transaction, so retrying cannot duplicate an event/count.
+                    // Connection/unknown-commit failures are never retried here.
+                    self.chunk_range.store(None);
+                    let delay = 50 * (1u64 << attempt) + u64::from(fingerprint.as_bytes()[0] % 17);
+                    attempt += 1;
+                    tracing::debug!(attempt, "Retrying aborted error ingestion transaction");
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                _ => return result,
             }
         }
+    }
 
-        // 4. Create new error group if no similar group found
-        let group_id = self.create_error_group(&error_data, &fingerprint).await?;
-        self.create_error_event(&error_data, group_id, &fingerprint)
+    async fn process_once(
+        &self,
+        error_data: &CreateErrorEventData,
+        fingerprint: &str,
+    ) -> Result<IngestedError, ErrorTrackingError> {
+        let event_time = Utc::now();
+        let tx = self.db.begin().await?;
+        // Acquire the cold-chunk gate BEFORE group/FK writes. Timescale clones
+        // child FKs during chunk creation and needs parent table locks.
+        let refresh_chunk = self.enter_chunk_gate(&tx, event_time).await?;
+        // A transaction-scoped PostgreSQL lock works across instances, releases
+        // on rollback, and allocates no application-side per-fingerprint state.
+        // Hash collisions only serialize unrelated fingerprints, never merge them.
+        tx.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
+            [fingerprint.into(), i64::from(error_data.project_id).into()],
+        ))
+        .await?;
+        let existing = self
+            .find_group_by_fingerprint_on(&tx, fingerprint, error_data.project_id)
             .await?;
+        let mut created = false;
+        let group_id = if let Some(id) = existing {
+            id
+        } else {
+            let (exception_type, exception_value) = group_type_and_message(error_data);
+            let text = exception_value.unwrap_or_else(|| exception_type.clone());
+            let similar = if let Some(embedding) = self.create_embedding(&text) {
+                self.find_similar_group_by_embedding_on(
+                    &tx,
+                    &embedding,
+                    error_data.project_id,
+                    &exception_type,
+                )
+                .await?
+            } else {
+                None
+            };
+            match similar {
+                Some(id) => id,
+                None => {
+                    created = true;
+                    self.create_error_group_on(&tx, error_data, fingerprint, event_time)
+                        .await?
+                }
+            }
+        };
+        let previous_status: String = tx
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT status FROM error_groups WHERE id=$1 FOR UPDATE",
+                [group_id.into()],
+            ))
+            .await?
+            .ok_or(ErrorTrackingError::GroupNotFound)?
+            .try_get("", "status")?;
+        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "INSERT INTO error_group_fingerprints(project_id,fingerprint_hash,error_group_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+            [error_data.project_id.into(),fingerprint.into(),group_id.into()])).await?;
+        self.create_error_event_on(&tx, error_data, group_id, fingerprint, event_time)
+            .await?;
+        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "UPDATE error_groups SET total_count = total_count + 1, last_seen = GREATEST(last_seen, $2), updated_at = NOW(), status = CASE WHEN status IN ('resolved','ignored') THEN 'unresolved' ELSE status END WHERE id = $1",
+            [group_id.into(),event_time.into()])).await?;
+        let observed_chunk = if refresh_chunk {
+            Self::lookup_chunk(&tx, event_time).await?
+        } else {
+            None
+        };
+        tx.commit().await?;
+        if let Some(range) = observed_chunk {
+            self.chunk_range.store(Some(Arc::new(range)));
+        }
+        Ok(IngestedError {
+            group_id,
+            created,
+            previous_status,
+        })
+    }
 
-        Ok(group_id)
+    // error_events also hash-partitions on id. A time range is warm only
+    // after every space partition exists; one chunk alone is insufficient.
+    async fn lookup_chunk<C: ConnectionTrait>(
+        db: &C,
+        at: DateTime<Utc>,
+    ) -> Result<Option<ErrorChunkRange>, ErrorTrackingError> {
+        Ok(ErrorChunkRange::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT range_start,range_end FROM timescaledb_information.chunks WHERE hypertable_schema=current_schema() AND hypertable_name='error_events' AND range_start <= $1 AND range_end > $1 GROUP BY range_start,range_end HAVING count(*) >= COALESCE((SELECT max(num_partitions) FROM timescaledb_information.dimensions WHERE hypertable_schema=current_schema() AND hypertable_name='error_events'),1) LIMIT 1",[at.into()])).one(db).await?)
+    }
+
+    async fn enter_chunk_gate<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        at: DateTime<Utc>,
+    ) -> Result<bool, ErrorTrackingError> {
+        if self
+            .chunk_range
+            .load()
+            .as_ref()
+            .is_some_and(|range| at >= range.range_start && at < range.range_end)
+        {
+            return Ok(false);
+        }
+        if let Some(range) = Self::lookup_chunk(db, at).await? {
+            self.chunk_range.store(Some(Arc::new(range)));
+            return Ok(false);
+        }
+        // Shared across projects and processes, scoped to this schema. Cold
+        // contenders wait without holding parent/group write locks. Steady-state
+        // requests use the single cached range and never pay this query/lock.
+        db.execute(Statement::from_string(DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || '.temps.error_events.chunk',0))")).await?;
+        Ok(true)
     }
 
     /// Generate a fingerprint for error matching
@@ -331,10 +466,29 @@ impl ErrorIngestionService {
         fingerprint: &str,
         project_id: i32,
     ) -> Result<Option<i32>, ErrorTrackingError> {
+        self.find_group_by_fingerprint_on(self.db.as_ref(), fingerprint, project_id)
+            .await
+    }
+
+    async fn find_group_by_fingerprint_on<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        fingerprint: &str,
+        project_id: i32,
+    ) -> Result<Option<i32>, ErrorTrackingError> {
+        if let Some(row)=db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT error_group_id FROM error_group_fingerprints WHERE project_id=$1 AND fingerprint_hash=$2",
+            [project_id.into(),fingerprint.into()])).await? {
+            return Ok(Some(row.try_get("","error_group_id")?));
+        }
+        // Legacy fingerprints not yet indexed are resolved once and cached by
+        // process_error_event. The lowest group ID keeps future events stable
+        // without merging historical issues or changing their triage state.
         let result = error_events::Entity::find()
             .filter(error_events::Column::FingerprintHash.eq(fingerprint))
             .filter(error_events::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
+            .order_by_asc(error_events::Column::ErrorGroupId)
+            .one(db)
             .await?;
 
         Ok(result.map(|event| event.error_group_id))
@@ -347,8 +501,9 @@ impl ErrorIngestionService {
     ///
     /// Only searches unresolved and assigned groups (excludes resolved and ignored)
     /// of the same `error_type`: the embedding is built from the message alone.
-    async fn find_similar_group_by_embedding(
+    async fn find_similar_group_by_embedding_on<C: ConnectionTrait>(
         &self,
+        db: &C,
         embedding: &error_groups::PgVector,
         project_id: i32,
         error_type: &str,
@@ -401,7 +556,7 @@ impl ErrorIngestionService {
                     error_type.into(),
                 ],
             ))
-            .one(self.db.as_ref())
+            .one(db)
             .await?;
 
         if let Some(group) = &result {
@@ -415,10 +570,12 @@ impl ErrorIngestionService {
     }
 
     /// Create a new error group with embedding
-    async fn create_error_group(
+    async fn create_error_group_on<C: ConnectionTrait>(
         &self,
+        db: &C,
         error_data: &CreateErrorEventData,
         _fingerprint: &str,
+        event_time: DateTime<Utc>,
     ) -> Result<i32, ErrorTrackingError> {
         let (exception_type, exception_value) = group_type_and_message(error_data);
 
@@ -442,30 +599,32 @@ impl ErrorIngestionService {
             error_type: Set(exception_type.clone()),
             message_template: Set(Some(exception_value.clone())),
             embedding: Set(embedding),
-            first_seen: Set(Utc::now()),
-            last_seen: Set(Utc::now()),
-            total_count: Set(1),
+            first_seen: Set(event_time),
+            last_seen: Set(event_time),
+            total_count: Set(0),
             status: Set("unresolved".to_string()),
             assigned_to: Set(None),
             project_id: Set(error_data.project_id),
             environment_id: Set(error_data.environment_id),
             deployment_id: Set(error_data.deployment_id),
             visitor_id: Set(error_data.visitor_id),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
+            created_at: Set(event_time),
+            updated_at: Set(event_time),
             ..Default::default()
         };
 
-        let group = new_group.insert(self.db.as_ref()).await?;
+        let group = new_group.insert(db).await?;
         Ok(group.id)
     }
 
     /// Create an error event within a group
-    async fn create_error_event(
+    async fn create_error_event_on<C: ConnectionTrait>(
         &self,
+        db: &C,
         error_data: &CreateErrorEventData,
         group_id: i32,
         fingerprint: &str,
+        event_time: DateTime<Utc>,
     ) -> Result<i64, ErrorTrackingError> {
         // Use raw Sentry event if available, otherwise build from individual fields
         let data_json = if let Some(raw_sentry) = &error_data.raw_sentry_event {
@@ -598,7 +757,7 @@ impl ErrorIngestionService {
         let new_event = error_events::ActiveModel {
             error_group_id: Set(group_id),
             fingerprint_hash: Set(fingerprint.to_string()),
-            timestamp: Set(Utc::now()),
+            timestamp: Set(event_time),
             exception_type: Set(event_exception_type),
             exception_value: Set(event_exception_value),
             source: Set(error_data.source.clone()),
@@ -613,24 +772,8 @@ impl ErrorIngestionService {
             ..Default::default()
         };
 
-        let event = new_event.insert(self.db.as_ref()).await?;
+        let event = new_event.insert(db).await?;
         Ok(event.id)
-    }
-
-    /// Increment error count for a group
-    async fn increment_group_count(&self, group_id: i32) -> Result<(), ErrorTrackingError> {
-        let group = error_groups::Entity::find_by_id(group_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ErrorTrackingError::GroupNotFound)?;
-
-        let mut group_update: error_groups::ActiveModel = group.into();
-        group_update.total_count = Set(group_update.total_count.unwrap() + 1);
-        group_update.last_seen = Set(Utc::now());
-        group_update.updated_at = Set(Utc::now());
-        group_update.update(self.db.as_ref()).await?;
-
-        Ok(())
     }
 }
 
@@ -688,6 +831,152 @@ mod tests {
             project_id,
             ..Default::default()
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn concurrent_distinct_groups_survive_first_timescale_chunk_creation() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let first = create_test_project(&db).await;
+        let second = create_test_project(&db).await;
+        let service = Arc::new(ErrorIngestionService::new(db.clone()));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..8 {
+            let service = service.clone();
+            tasks.spawn(async move {
+                let mut data = create_test_error_data(if index % 2 == 0 { first } else { second });
+                data.exception_type = Some(format!("SyntheticType{index}"));
+                service.process_error_event(data).await.unwrap()
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        let groups = error_groups::Entity::find().all(db.as_ref()).await.unwrap();
+        assert_eq!(groups.len(), 8);
+        assert!(groups.iter().all(|group| group.total_count == 1));
+        assert_eq!(
+            error_events::Entity::find()
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            8
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn concurrent_first_and_repeated_events_have_one_group_and_exact_count() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let project = create_test_project(&db).await;
+        let other_project = create_test_project(&db).await;
+        let service = Arc::new(ErrorIngestionService::new(db.clone()));
+        let mut created_count = 0;
+        let mut regressions = 0;
+        for wave in 0..2 {
+            if wave == 1 {
+                db.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE error_groups SET status='resolved' WHERE project_id=$1",
+                    [project.into()],
+                ))
+                .await
+                .unwrap();
+            }
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..24 {
+                let service = service.clone();
+                tasks.spawn(async move {
+                    service
+                        .process_with_outcome(create_test_error_data(project))
+                        .await
+                        .unwrap()
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                let outcome = result.unwrap();
+                if outcome.created {
+                    created_count += 1;
+                }
+                if outcome.previous_status == "resolved" {
+                    regressions += 1;
+                }
+            }
+        }
+        assert_eq!(
+            created_count, 1,
+            "only the transaction creating the group owns its new-issue outcome"
+        );
+        assert_eq!(
+            regressions, 1,
+            "only one concurrent event reopens a resolved issue"
+        );
+        let groups = error_groups::Entity::find()
+            .filter(error_groups::Column::ProjectId.eq(project))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].total_count, 48);
+        assert_eq!(
+            error_events::Entity::find()
+                .filter(error_events::Column::ErrorGroupId.eq(groups[0].id))
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            48
+        );
+        let isolated = service
+            .process_error_event(create_test_error_data(other_project))
+            .await
+            .unwrap();
+        assert_ne!(isolated, groups[0].id);
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE error_groups SET total_count=2 WHERE id=$1",
+            [groups[0].id.into()],
+        ))
+        .await
+        .unwrap();
+        use temps_migrations::MigrationTrait;
+        temps_migrations::ReconcileErrorGroupCountsMigration
+            .up(&temps_migrations::SchemaManager::new(db.as_ref()))
+            .await
+            .unwrap();
+        assert_eq!(
+            error_groups::Entity::find_by_id(groups[0].id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .total_count,
+            48
+        );
+        // A failed event insert rolls back both its new group and its counter.
+        let mut invalid = create_test_error_data(project);
+        invalid.exception_type = Some("RollbackSyntheticError".into());
+        invalid.raw_sentry_event =
+            Some(serde_json::json!({"message":"invalid \u{0000} JSONB text"}));
+        assert!(service.process_error_event(invalid).await.is_err());
+        assert_eq!(
+            error_groups::Entity::find()
+                .filter(error_groups::Column::ProjectId.eq(project))
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            error_groups::Entity::find_by_id(groups[0].id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .total_count,
+            48
+        );
     }
 
     #[tokio::test]

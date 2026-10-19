@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/sheet'
 import {
   Activity,
+  Clock3,
   BarChart3,
   ScrollText,
   GitFork,
@@ -55,6 +56,7 @@ const sectionIcons: Record<string, LucideIcon> = {
   'ai-gateway?tab=activity': Bot,
   metrics: Gauge,
   monitors: Activity,
+  'cron-jobs': Clock3,
   'errors/alert-rules': Bell,
   analytics: BarChart3,
   'analytics/visitors': Users,
