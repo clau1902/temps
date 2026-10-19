@@ -1825,9 +1825,9 @@ impl Default for ObservabilityRetentionSettings {
 /// Bounds every [`AnalyticsRetentionSettings`] window is validated against.
 pub const MIN_ANALYTICS_RETENTION_DAYS: u32 = 1;
 pub const MAX_ANALYTICS_RETENTION_DAYS: u32 = 3650;
-/// Default for [`AnalyticsRetentionSettings::events_days`]: the window the
-/// initial schema installs on the `events` hypertable.
-pub const DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS: u32 = 90;
+/// Default for [`AnalyticsRetentionSettings::events_days`]. Retention
+/// reconciliation also updates the historical schema's shorter policy.
+pub const DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS: u32 = 365;
 /// Default for [`AnalyticsRetentionSettings::unreferenced_ip_days`].
 pub const DEFAULT_UNREFERENCED_IP_RETENTION_DAYS: u32 = 30;
 
@@ -1854,16 +1854,17 @@ pub const IP_REFERENCE_SLACK_DAYS: u32 = 1;
 /// record exists.
 ///
 /// `None` on an optional window means "keep" -- the behaviour before the
-/// setting existed -- so upgrading never starts deleting data on its own,
-/// except for the unreferenced-IP cleanup, which only drops cache rows that
-/// nothing points at.
+/// setting existed. Events have a required window (365 days by default),
+/// including the ClickHouse copy on upgrade. The unreferenced-IP cleanup
+/// defaults to 30 days and only drops cache rows that nothing points at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct AnalyticsRetentionSettings {
     /// Retain analytics events (page views, custom events) for this many
-    /// days. Applied as the TimescaleDB retention policy of the `events`
-    /// hypertable. ClickHouse-backed analytics keep their own storage TTL.
-    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    /// days. Applied to the TimescaleDB events policy and, when configured,
+    /// the ClickHouse events TTL. Reconciled hourly and after ClickHouse
+    /// migrations. ClickHouse expiry follows asynchronous background merges.
+    #[schema(minimum = 1, maximum = 3650, example = 365)]
     pub events_days: u32,
 
     /// Retain captured error events for this many days. `null` keeps them
@@ -1872,9 +1873,11 @@ pub struct AnalyticsRetentionSettings {
     pub error_events_days: Option<u32>,
 
     /// Delete visitors that have not been seen for this many days. Their
-    /// events, proxy logs and error events stay (until their own retention
-    /// ends) but are no longer linked to a visitor; session replays of the
-    /// visitor are deleted with it. `null` keeps visitors indefinitely.
+    /// session replays are deleted with them. With ClickHouse enabled, their
+    /// project-scoped events are deleted from both databases; failures leave
+    /// visitors for retry. With PostgreSQL only, events are detached and kept.
+    /// Proxy logs and error events keep their own retention. This is not
+    /// erasure of all visitor data. `null` keeps visitors indefinitely.
     #[schema(minimum = 1, maximum = 3650, nullable = true, example = 425)]
     pub visitor_days: Option<u32>,
 
@@ -3479,7 +3482,7 @@ mod tests {
             "external_url": "https://paas.example.com"
         }));
 
-        assert_eq!(parsed.analytics_retention.events_days, 90);
+        assert_eq!(parsed.analytics_retention.events_days, 365);
         // Upgrading must not start deleting visitors or error events.
         assert_eq!(parsed.analytics_retention.visitor_days, None);
         assert_eq!(parsed.analytics_retention.error_events_days, None);
@@ -3502,6 +3505,28 @@ mod tests {
 
         let again = AppSettings::from_json(parsed.to_json());
         assert_eq!(again.analytics_retention, parsed.analytics_retention);
+    }
+
+    #[test]
+    fn analytics_event_default_applies_only_when_the_window_is_missing() {
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({"visitor_days": 425}),
+        ] {
+            let settings: AnalyticsRetentionSettings = serde_json::from_value(data).unwrap();
+            assert_eq!(settings.events_days, 365);
+        }
+        for days in [1, 90, 365, 730, 3650] {
+            let saved: AnalyticsRetentionSettings =
+                serde_json::from_value(serde_json::json!({"events_days": days})).unwrap();
+            assert_eq!(
+                saved.events_days, days,
+                "saved windows must not be overwritten"
+            );
+            let reloaded: AnalyticsRetentionSettings =
+                serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
+            assert_eq!(reloaded.events_days, days);
+        }
     }
 
     #[test]
