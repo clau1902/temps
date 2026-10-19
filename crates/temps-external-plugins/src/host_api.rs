@@ -264,6 +264,23 @@ impl RouterHostApi {
                     (Some(role), None)
                 };
 
+                // Same owner ceiling `ApiKeyService::validate_api_key` applies:
+                // a key never exceeds what its owner holds right now.
+                let owner_role = temps_auth::current_owner_role(self.db.as_ref(), user_id)
+                    .await
+                    .map_err(|e| {
+                        ChannelError::new(
+                            ChannelErrorCode::Internal,
+                            format!(
+                                "Failed to resolve the current role of user {user_id} while \
+                                 redeeming an actor token for API key {key_id} for plugin \
+                                 '{plugin}': {e}"
+                            ),
+                        )
+                    })?;
+                let (role, permissions) =
+                    temps_auth::cap_api_key_grant(role, permissions, &owner_role);
+
                 Ok(AuthContext::new_api_key(
                     user,
                     role,
@@ -544,6 +561,7 @@ mod tests {
             mfa_pending: false,
             step_up_expires_at: None,
             mfa_pending_origin: None,
+            mfa_failed_attempts: 0,
         }
     }
 
@@ -772,12 +790,21 @@ mod tests {
         }
     }
 
+    /// Result row for the owner's current admin-grant count.
+    fn owner_admin_grants(count: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([(
+            "num_items".to_string(),
+            sea_orm::Value::BigInt(Some(count)),
+        )])
+    }
+
     #[tokio::test]
     async fn valid_restricted_api_key_reconstructs_narrowed_permissions() {
         let crypto = crypto();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![user()]])
             .append_query_results([vec![api_key(None)]])
+            .append_query_results([vec![owner_admin_grants(0)]])
             .into_connection();
         let (api, db) = api_with_database(db, crypto.clone());
         let call = actor_call(crypto.as_ref(), ActorPrincipal::ApiKey { key_id: 9 });
@@ -799,6 +826,30 @@ mod tests {
         drop(api);
         let sql = transaction_sql(db);
         assert!(sql.contains("\"api_keys\".\"is_active\" ="), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn admin_api_key_is_capped_once_its_owner_is_no_longer_admin() {
+        let crypto = crypto();
+        let mut key = api_key(None);
+        key.role_type = "admin".to_string();
+        key.permissions = None;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![user()]])
+            .append_query_results([vec![key]])
+            .append_query_results([vec![owner_admin_grants(0)]])
+            .into_connection();
+        let (api, _db) = api_with_database(db, crypto.clone());
+        let call = actor_call(crypto.as_ref(), ActorPrincipal::ApiKey { key_id: 9 });
+
+        let auth = api
+            .resolve_actor(TEST_PLUGIN, &call)
+            .await
+            .expect("the key still resolves to its owner");
+
+        assert_eq!(auth.user_id_opt(), Some(42));
+        assert_ne!(auth.effective_role, Role::Admin);
+        assert!(!auth.has_permission(&Permission::UsersWrite));
     }
 
     #[tokio::test]

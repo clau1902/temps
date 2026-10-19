@@ -36726,6 +36726,10 @@ export type VerifyMfaChallengeErrors = {
      */
     401: unknown;
     /**
+     * Second factor locked after repeated wrong codes
+     */
+    429: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -73638,6 +73642,10 @@ export type DisableMfaErrors = {
      */
     403: unknown;
     /**
+     * Second factor locked after repeated wrong codes
+     */
+    429: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -73712,6 +73720,10 @@ export type VerifyAndEnableMfaErrors = {
      */
     403: unknown;
     /**
+     * MFA is already enabled for this account
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -73746,6 +73758,10 @@ export type ChangePasswordSelfErrors = {
      * Account has no password set (SSO only)
      */
     403: unknown;
+    /**
+     * Second factor locked after repeated wrong codes
+     */
+    429: unknown;
     /**
      * Internal server error
      */
