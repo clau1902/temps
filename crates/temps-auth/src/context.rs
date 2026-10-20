@@ -17,6 +17,37 @@ pub struct DeploymentTokenInfo {
     pub token_name: String,
 }
 
+/// The standard permissions that stand behind a deployment-token permission.
+///
+/// This is the inverse of the mapping in [`AuthContext::has_permission`]: a
+/// token holding `permission` can do what these standard permissions allow, so
+/// whoever hands it out must hold all of them. `FullAccess` expands to every
+/// other token permission. `EventsWrite` is not checked anywhere today, so
+/// nothing stands behind it.
+pub fn standard_permissions_behind(permission: &DeploymentTokenPermission) -> Vec<Permission> {
+    use DeploymentTokenPermission as Token;
+    match permission {
+        Token::VisitorsEnrich => vec![Permission::AnalyticsWrite],
+        Token::EmailsSend => vec![Permission::EmailsSend],
+        Token::AnalyticsRead => vec![Permission::AnalyticsRead],
+        Token::EventsWrite => vec![],
+        Token::ErrorsRead => vec![Permission::ErrorTrackingRead],
+        Token::AiGatewayExecute => vec![Permission::AiGatewayExecute],
+        Token::FlagsRead => vec![Permission::FlagsRead],
+        Token::BlobRead => vec![Permission::BlobRead],
+        Token::BlobWrite => vec![Permission::BlobWrite],
+        Token::BlobDelete => vec![Permission::BlobDelete],
+        Token::KvRead => vec![Permission::KvRead],
+        Token::KvWrite => vec![Permission::KvWrite],
+        Token::KvDelete => vec![Permission::KvDelete],
+        Token::FullAccess => Token::all()
+            .iter()
+            .filter(|each| **each != Token::FullAccess)
+            .flat_map(standard_permissions_behind)
+            .collect(),
+    }
+}
+
 // Simplified user schema for OpenAPI documentation
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserSchema {
@@ -245,6 +276,21 @@ impl AuthContext {
             return permissions.contains(permission);
         }
         false
+    }
+
+    /// The first standard permission this principal lacks that is needed to
+    /// hand `permission` to a deployment token, or `None` when the grant is
+    /// within its own permissions.
+    ///
+    /// A deployment token must never carry more than the principal that
+    /// created or edited it, the same ceiling API keys have.
+    pub fn missing_permission_to_grant(
+        &self,
+        permission: &DeploymentTokenPermission,
+    ) -> Option<Permission> {
+        standard_permissions_behind(permission)
+            .into_iter()
+            .find(|required| !self.has_permission(required))
     }
 
     pub fn has_role(&self, role: &Role) -> bool {
@@ -540,5 +586,136 @@ mod tests {
         let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AnalyticsRead]);
         assert!(ctx.is_scoped_to_project(7));
         assert!(!ctx.is_scoped_to_project(8));
+    }
+
+    fn test_user() -> users::Model {
+        let now = chrono::Utc::now();
+        users::Model {
+            id: 42,
+            name: "Test User".to_string(),
+            email: "user42@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn user_role_cannot_grant_token_permissions_it_does_not_hold() {
+        let user = AuthContext::new_session(test_user(), Role::User);
+        for denied in [
+            DeploymentTokenPermission::VisitorsEnrich,
+            DeploymentTokenPermission::BlobDelete,
+            DeploymentTokenPermission::KvDelete,
+            DeploymentTokenPermission::FullAccess,
+        ] {
+            assert!(
+                user.missing_permission_to_grant(&denied).is_some(),
+                "a user must not be able to grant {}",
+                denied.as_str()
+            );
+        }
+        assert_eq!(
+            user.missing_permission_to_grant(&DeploymentTokenPermission::VisitorsEnrich),
+            Some(Permission::AnalyticsWrite)
+        );
+    }
+
+    #[test]
+    fn user_role_can_grant_token_permissions_it_holds() {
+        let user = AuthContext::new_session(test_user(), Role::User);
+        for allowed in [
+            DeploymentTokenPermission::AnalyticsRead,
+            DeploymentTokenPermission::EmailsSend,
+            DeploymentTokenPermission::ErrorsRead,
+            DeploymentTokenPermission::EventsWrite,
+            DeploymentTokenPermission::AiGatewayExecute,
+            DeploymentTokenPermission::FlagsRead,
+            DeploymentTokenPermission::BlobRead,
+            DeploymentTokenPermission::BlobWrite,
+            DeploymentTokenPermission::KvRead,
+            DeploymentTokenPermission::KvWrite,
+        ] {
+            assert_eq!(
+                user.missing_permission_to_grant(&allowed),
+                None,
+                "a user holds what {} needs",
+                allowed.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn admin_can_grant_every_token_permission() {
+        let admin = AuthContext::new_session(test_user(), Role::Admin);
+        for permission in DeploymentTokenPermission::all() {
+            assert_eq!(
+                admin.missing_permission_to_grant(&permission),
+                None,
+                "an admin holds what {} needs",
+                permission.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn custom_api_key_can_grant_only_the_permissions_it_holds() {
+        let key = AuthContext::new_api_key(
+            test_user(),
+            None,
+            Some(vec![Permission::BlobRead, Permission::KvRead]),
+            "ci".to_string(),
+            7,
+        );
+        assert_eq!(
+            key.missing_permission_to_grant(&DeploymentTokenPermission::BlobRead),
+            None
+        );
+        assert_eq!(
+            key.missing_permission_to_grant(&DeploymentTokenPermission::BlobWrite),
+            Some(Permission::BlobWrite)
+        );
+        assert!(key
+            .missing_permission_to_grant(&DeploymentTokenPermission::FullAccess)
+            .is_some());
+    }
+
+    #[test]
+    fn grant_requirements_match_what_a_token_can_use() {
+        // Every token permission that gates something must map to the standard
+        // permission `has_permission` accepts for it, so the ceiling cannot
+        // drift from the mapping tokens are checked against. `errors:read` and
+        // `events:write` are not checked anywhere, so they are left out.
+        for permission in DeploymentTokenPermission::all() {
+            if matches!(
+                permission,
+                DeploymentTokenPermission::FullAccess
+                    | DeploymentTokenPermission::ErrorsRead
+                    | DeploymentTokenPermission::EventsWrite
+            ) {
+                continue;
+            }
+            let token = deployment_token_ctx(7, vec![permission.clone()]);
+            for required in standard_permissions_behind(&permission) {
+                assert!(
+                    token.has_permission(&required),
+                    "a {} token should satisfy {}",
+                    permission.as_str(),
+                    required
+                );
+            }
+        }
     }
 }
