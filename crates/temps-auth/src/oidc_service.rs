@@ -311,6 +311,26 @@ impl OidcService {
         }
     }
 
+    /// Test hook: record that discovery already happened for `provider`, so
+    /// the login start routes run without reaching an issuer.
+    #[cfg(test)]
+    pub(crate) async fn seed_discovery_for_test(
+        &self,
+        provider: &oidc_providers::Model,
+        metadata: CoreProviderMetadata,
+        client_secret: &str,
+    ) {
+        self.discovery_cache.lock().await.insert(
+            provider.id,
+            CachedClient {
+                metadata,
+                client_secret: client_secret.to_string(),
+                client_secret_ciphertext: provider.client_secret_encrypted.clone(),
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
     pub async fn list_enabled_providers(&self) -> Result<Vec<OidcProviderSummary>, OidcError> {
         let providers = oidc_providers::Entity::find()
             .filter(oidc_providers::Column::Enabled.eq(true))

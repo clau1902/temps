@@ -59,9 +59,21 @@ const LOGIN_BINDING_COOKIE_PATH: &str = "/";
 /// it. Derived from the attempt's `state`, so logins started in several tabs
 /// at once each keep their own cookie. It is a hash, so the name carries no
 /// part of the `state` itself.
-fn login_binding_cookie_name(state: &str) -> String {
+///
+/// Over https the name carries the `__Host-` prefix, which browsers only
+/// accept from the exact host that is serving the console: with `Secure`,
+/// `Path=/` and no `Domain`, an app deployed on a sibling subdomain cannot
+/// plant a cookie of this name (encryption stops a cookie being altered, not
+/// being copied from another login). Over plain http browsers refuse that
+/// prefix, so the unprefixed name is used there.
+fn login_binding_cookie_name(state: &str, secure: bool) -> String {
     let digest = Sha256::digest(state.as_bytes());
-    format!("oidc_login_{}", hex::encode(&digest[..8]))
+    let prefix = if secure {
+        "__Host-oidc_login_"
+    } else {
+        "oidc_login_"
+    };
+    format!("{prefix}{}", hex::encode(&digest[..8]))
 }
 
 fn login_binding_cookie_builder(
@@ -95,18 +107,22 @@ fn login_binding_cookie(
     let sealed = crypto
         .encrypt(state)
         .map_err(|error| format!("failed to seal login binding cookie: {error}"))?;
-    let cookie = login_binding_cookie_builder(login_binding_cookie_name(state), sealed, secure)
-        .max_age(cookie::time::Duration::minutes(LOGIN_STATE_TTL_MINUTES))
-        .build();
+    let cookie =
+        login_binding_cookie_builder(login_binding_cookie_name(state, secure), sealed, secure)
+            .max_age(cookie::time::Duration::minutes(LOGIN_STATE_TTL_MINUTES))
+            .build();
     cookie_header_value(&cookie)
 }
 
 /// `Set-Cookie` that removes the binding cookie of the login attempt `state`.
 fn clear_login_binding_cookie(state: &str, secure: bool) -> Result<HeaderValue, String> {
-    let cookie =
-        login_binding_cookie_builder(login_binding_cookie_name(state), String::new(), secure)
-            .max_age(cookie::time::Duration::ZERO)
-            .build();
+    let cookie = login_binding_cookie_builder(
+        login_binding_cookie_name(state, secure),
+        String::new(),
+        secure,
+    )
+    .max_age(cookie::time::Duration::ZERO)
+    .build();
     cookie_header_value(&cookie)
 }
 
@@ -116,8 +132,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// True when the request carries the cookie that was set when the login
 /// attempt `state` started, and that cookie was sealed for exactly this `state`.
-fn login_is_bound_to_browser(crypto: &CookieCrypto, headers: &HeaderMap, state: &str) -> bool {
-    let name = login_binding_cookie_name(state);
+fn login_is_bound_to_browser(
+    crypto: &CookieCrypto,
+    headers: &HeaderMap,
+    state: &str,
+    secure: bool,
+) -> bool {
+    let name = login_binding_cookie_name(state, secure);
     headers
         .get_all(COOKIE)
         .iter()
@@ -309,9 +330,12 @@ pub async fn oidc_callback(
     // callback link, and without this check another browser that follows it
     // would be signed in as them (login CSRF, OAuth 2.0 Security BCP).
     let unbound = match (&query.code, &query.state) {
-        (Some(_), Some(candidate)) => {
-            !login_is_bound_to_browser(&state.cookie_crypto, &headers, candidate)
-        }
+        (Some(_), Some(candidate)) => !login_is_bound_to_browser(
+            &state.cookie_crypto,
+            &headers,
+            candidate,
+            metadata.is_secure,
+        ),
         _ => false,
     };
 
@@ -1206,7 +1230,12 @@ mod login_binding_tests {
         let crypto = crypto();
         let set = login_binding_cookie(&crypto, "state-one", false).unwrap();
         let headers = request_with(&[sent_back(&set)]);
-        assert!(login_is_bound_to_browser(&crypto, &headers, "state-one"));
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
     }
 
     #[test]
@@ -1215,10 +1244,16 @@ mod login_binding_tests {
         assert!(!login_is_bound_to_browser(
             &crypto,
             &HeaderMap::new(),
-            "state-one"
+            "state-one",
+            false
         ));
         let unrelated = request_with(&["session=abc".to_string(), "theme=dark".to_string()]);
-        assert!(!login_is_bound_to_browser(&crypto, &unrelated, "state-one"));
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &unrelated,
+            "state-one",
+            false
+        ));
     }
 
     #[test]
@@ -1228,8 +1263,18 @@ mod login_binding_tests {
         let crypto = crypto();
         let other = login_binding_cookie(&crypto, "state-two", false).unwrap();
         let headers = request_with(&[sent_back(&other)]);
-        assert!(login_is_bound_to_browser(&crypto, &headers, "state-two"));
-        assert!(!login_is_bound_to_browser(&crypto, &headers, "state-one"));
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-two",
+            false
+        ));
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
     }
 
     #[test]
@@ -1240,26 +1285,41 @@ mod login_binding_tests {
         let sealed_for_two = crypto.encrypt("state-two").unwrap();
         let forged = format!(
             "{}={}",
-            login_binding_cookie_name("state-one"),
+            login_binding_cookie_name("state-one", false),
             sealed_for_two
         );
         let headers = request_with(&[forged]);
-        assert!(!login_is_bound_to_browser(&crypto, &headers, "state-one"));
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
     }
 
     #[test]
     fn a_tampered_or_foreign_value_is_refused() {
         let crypto = crypto();
-        let name = login_binding_cookie_name("state-one");
+        let name = login_binding_cookie_name("state-one", false);
         for value in ["", "not-sealed", "state-one", "AAAA"] {
             let headers = request_with(&[format!("{name}={value}")]);
-            assert!(!login_is_bound_to_browser(&crypto, &headers, "state-one"));
+            assert!(!login_is_bound_to_browser(
+                &crypto,
+                &headers,
+                "state-one",
+                false
+            ));
         }
         // Sealed under a different key (another instance, or an attacker).
         let other = CookieCrypto::new("fedcba9876543210fedcba9876543210").unwrap();
         let foreign = other.encrypt("state-one").unwrap();
         let headers = request_with(&[format!("{name}={foreign}")]);
-        assert!(!login_is_bound_to_browser(&crypto, &headers, "state-one"));
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
     }
 
     #[test]
@@ -1269,21 +1329,41 @@ mod login_binding_tests {
         let second = sent_back(&login_binding_cookie(&crypto, "state-two", false).unwrap());
         assert_ne!(first.split('=').next(), second.split('=').next());
         let headers = request_with(&[format!("{first}; {second}")]);
-        assert!(login_is_bound_to_browser(&crypto, &headers, "state-one"));
-        assert!(login_is_bound_to_browser(&crypto, &headers, "state-two"));
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-two",
+            false
+        ));
         // HTTP/2 clients may send each cookie in its own header.
         let split = request_with(&[first, second]);
-        assert!(login_is_bound_to_browser(&crypto, &split, "state-one"));
-        assert!(login_is_bound_to_browser(&crypto, &split, "state-two"));
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &split,
+            "state-one",
+            false
+        ));
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &split,
+            "state-two",
+            false
+        ));
     }
 
     #[test]
     fn the_cookie_name_does_not_reveal_the_state() {
-        let name = login_binding_cookie_name("a-very-recognisable-state-value");
+        let name = login_binding_cookie_name("a-very-recognisable-state-value", false);
         assert!(name.starts_with("oidc_login_"));
         assert!(!name.contains("recognisable"));
         assert_eq!(name.len(), "oidc_login_".len() + 16);
-        assert_ne!(name, login_binding_cookie_name("another-state"));
+        assert_ne!(name, login_binding_cookie_name("another-state", false));
     }
 
     #[test]
@@ -1313,7 +1393,10 @@ mod login_binding_tests {
         let clear = clear_login_binding_cookie("state-one", true).unwrap();
         let text = clear.to_str().unwrap();
         assert!(
-            text.starts_with(&format!("{}=;", login_binding_cookie_name("state-one"))),
+            text.starts_with(&format!(
+                "{}=;",
+                login_binding_cookie_name("state-one", true)
+            )),
             "{text}"
         );
         assert!(text.contains("Max-Age=0"), "{text}");
@@ -1325,6 +1408,48 @@ mod login_binding_tests {
             text.contains("SameSite=Lax") && text.contains("Secure"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn over_https_the_cookie_is_host_only_and_a_planted_one_is_ignored() {
+        let crypto = crypto();
+        let set = login_binding_cookie(&crypto, "state-one", true).unwrap();
+        let text = set.to_str().unwrap();
+        // Browsers enforce these together for a `__Host-` cookie, which is what
+        // keeps an app on a sibling subdomain from setting one.
+        assert!(text.starts_with("__Host-oidc_login_"), "{text}");
+        assert!(text.contains("Secure") && text.contains("Path=/"), "{text}");
+        assert!(!text.contains("Domain"), "{text}");
+        let headers = request_with(&[sent_back(&set)]);
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            true
+        ));
+
+        // A sibling app can set an unprefixed cookie holding a sealed value it
+        // copied from its own login. It must not count over https.
+        let planted = format!(
+            "{}={}",
+            login_binding_cookie_name("state-one", false),
+            crypto.encrypt("state-one").unwrap()
+        );
+        let headers = request_with(&[planted]);
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            true
+        ));
+    }
+
+    #[test]
+    fn over_http_the_name_has_no_host_prefix() {
+        // Browsers refuse the `__Host-` prefix without `Secure`.
+        let plain = login_binding_cookie_name("state-one", false);
+        assert!(plain.starts_with("oidc_login_"), "{plain}");
+        assert_ne!(plain, login_binding_cookie_name("state-one", true));
     }
 
     #[test]
@@ -1345,9 +1470,15 @@ mod login_binding_http_tests {
     use crate::oidc_types::CreateOidcProviderRequest;
     use axum::{body::Body, http::Request, routing::get};
     use chrono::Utc;
+    use openidconnect::core::{
+        CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreResponseType, CoreSubjectIdentifierType,
+    };
+    use openidconnect::{
+        AuthUrl, EmptyAdditionalProviderMetadata, IssuerUrl, JsonWebKeySetUrl, ResponseTypes,
+    };
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::oidc_login_states;
+    use temps_entities::{oidc_login_states, oidc_providers};
     use tower::ServiceExt;
 
     struct Fixture {
@@ -1356,38 +1487,71 @@ mod login_binding_http_tests {
         app: Router,
     }
 
-    async fn fixture(pending_states: &[&str]) -> Option<Fixture> {
-        let db = match TestDatabase::with_migrations().await {
-            Ok(db) => db,
+    async fn test_db() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(db) => Some(db),
             Err(error)
                 if temps_database::test_utils::is_container_runtime_unavailable(
                     &error.to_string(),
                 ) =>
             {
                 println!("Docker not available, skipping test: {error}");
-                return None;
+                None
             }
             Err(error) => panic!("test database setup failed: {error}"),
-        };
+        }
+    }
+
+    fn discovery_metadata(issuer: &str) -> CoreProviderMetadata {
+        CoreProviderMetadata::new(
+            IssuerUrl::new(issuer.to_string()).unwrap(),
+            AuthUrl::new(format!("{issuer}/authorize")).unwrap(),
+            JsonWebKeySetUrl::new(format!("{issuer}/jwks")).unwrap(),
+            vec![ResponseTypes::new(vec![CoreResponseType::Code])],
+            vec![CoreSubjectIdentifierType::Public],
+            vec![CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256],
+            EmptyAdditionalProviderMetadata {},
+        )
+    }
+
+    fn provider_request(name: &str, issuer: &str, enabled: bool) -> CreateOidcProviderRequest {
+        CreateOidcProviderRequest {
+            name: name.to_string(),
+            issuer_url: issuer.to_string(),
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            scopes: "openid email profile".to_string(),
+            jit_provisioning: true,
+            enabled,
+            template: "generic".to_string(),
+            group_claim: "groups".to_string(),
+            role_claim: "roles".to_string(),
+            default_role: "user".to_string(),
+            trust_idp_email: false,
+        }
+    }
+
+    fn router(state: &Arc<AuthState>) -> Router {
+        Router::new()
+            .route("/auth/oidc/login/{slug}", get(start_oidc_login_by_slug))
+            .route("/auth/oidc/cloud/login", get(start_managed_cloud_login))
+            .route("/auth/oidc/callback", get(oidc_callback))
+            .layer(axum::middleware::from_fn(insert_request_metadata))
+            .with_state(state.clone())
+    }
+
+    async fn fixture(pending_states: &[&str]) -> Option<Fixture> {
+        let db = test_db().await?;
         let state = auth_state(db.db.clone());
         // Disabled, so a callback that passes the binding check stops right
         // after consuming its state instead of reaching out to an issuer.
         let provider = state
             .oidc_service
-            .create_provider(CreateOidcProviderRequest {
-                name: "Binding Test".to_string(),
-                issuer_url: "https://issuer.example.com".to_string(),
-                client_id: "client".to_string(),
-                client_secret: "secret".to_string(),
-                scopes: "openid email profile".to_string(),
-                jit_provisioning: true,
-                enabled: false,
-                template: "generic".to_string(),
-                group_claim: "groups".to_string(),
-                role_claim: "roles".to_string(),
-                default_role: "user".to_string(),
-                trust_idp_email: false,
-            })
+            .create_provider(provider_request(
+                "Binding Test",
+                "https://issuer.example.com",
+                false,
+            ))
             .await
             .expect("create provider");
         for pending in pending_states {
@@ -1404,10 +1568,7 @@ mod login_binding_http_tests {
             .await
             .expect("insert login state");
         }
-        let app = Router::new()
-            .route("/auth/oidc/callback", get(oidc_callback))
-            .layer(axum::middleware::from_fn(insert_request_metadata))
-            .with_state(state.clone());
+        let app = router(&state);
         Some(Fixture {
             _db: db,
             state,
@@ -1429,13 +1590,21 @@ mod login_binding_http_tests {
         }
     }
 
-    /// `(status, Location, Set-Cookie values)` of a callback request.
     async fn callback(
         app: &Router,
         query: &str,
         cookie: Option<&str>,
     ) -> (StatusCode, String, Vec<String>) {
-        let mut request = Request::builder().uri(format!("/auth/oidc/callback?{query}"));
+        get_path(app, &format!("/auth/oidc/callback?{query}"), cookie).await
+    }
+
+    /// `(status, Location, Set-Cookie values)` of a GET request.
+    async fn get_path(
+        app: &Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String, Vec<String>) {
+        let mut request = Request::builder().uri(uri);
         if let Some(cookie) = cookie {
             request = request.header(COOKIE, cookie);
         }
@@ -1468,7 +1637,7 @@ mod login_binding_http_tests {
     }
 
     fn clears_binding_cookie(set_cookies: &[String], state: &str) -> bool {
-        let name = login_binding_cookie_name(state);
+        let name = login_binding_cookie_name(state, false);
         set_cookies
             .iter()
             .any(|cookie| cookie.starts_with(&format!("{name}=;")) && cookie.contains("Max-Age=0"))
@@ -1484,7 +1653,7 @@ mod login_binding_http_tests {
             let set = login_binding_cookie(crypto, "state-two", false).unwrap();
             set.to_str().unwrap().split(';').next().unwrap().to_string()
         };
-        let tampered = format!("{}=AAAA", login_binding_cookie_name("state-one"));
+        let tampered = format!("{}=AAAA", login_binding_cookie_name("state-one", false));
 
         let attempts = [
             ("no cookie", None),
@@ -1553,6 +1722,117 @@ mod login_binding_http_tests {
         let (_, location, _) =
             callback(&fixture.app, "code=abc&state=state-one", Some(&cookie)).await;
         assert!(location.contains("reason=state_invalid"), "{location}");
+    }
+
+    fn query_param(url: &str, key: &str) -> String {
+        let query = url.split_once('?').expect("a query string").1;
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key} in {url}"))
+            .to_string()
+    }
+
+    /// Both real start routes, with the `state` they actually issue.
+    #[tokio::test]
+    async fn both_start_routes_bind_the_login_to_the_browser_that_started_it() {
+        let Some(db) = test_db().await else {
+            return;
+        };
+        let state = auth_state(db.db.clone());
+        let service = &state.oidc_service;
+        let ordinary = service
+            .create_provider(provider_request(
+                "Start Test",
+                "https://issuer.example.com",
+                true,
+            ))
+            .await
+            .unwrap();
+        let managed = service
+            .upsert_managed_cloud_provider(crate::oidc_service::ManagedCloudOidcConfig {
+                issuer: "https://cloud.example.com".to_string(),
+                client_id: "cloud-client".to_string(),
+                client_secret: "cloud-secret".to_string(),
+            })
+            .await
+            .unwrap();
+        service
+            .seed_discovery_for_test(
+                &ordinary,
+                discovery_metadata("https://issuer.example.com"),
+                "secret",
+            )
+            .await;
+        service
+            .seed_discovery_for_test(
+                &managed,
+                discovery_metadata("https://cloud.example.com"),
+                "cloud-secret",
+            )
+            .await;
+        let fixture = Fixture {
+            _db: db,
+            app: router(&state),
+            state: state.clone(),
+        };
+
+        let slug = crate::oidc_types::derive_provider_slug(ordinary.id, &ordinary.name);
+        let routes = [
+            (
+                format!("/auth/oidc/login/{slug}"),
+                "https://issuer.example.com/authorize",
+                ordinary.id,
+            ),
+            (
+                "/auth/oidc/cloud/login".to_string(),
+                "https://cloud.example.com/authorize",
+                managed.id,
+            ),
+        ];
+        for (path, authorize, provider_id) in routes {
+            let (status, location, set_cookies) = get_path(&fixture.app, &path, None).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "{path}");
+            assert!(location.starts_with(authorize), "{path}: {location}");
+            let login_state = query_param(&location, "state");
+            assert!(is_pending(&fixture, &login_state).await, "{path}");
+
+            assert_eq!(set_cookies.len(), 1, "{path}: {set_cookies:?}");
+            let cookie = set_cookies[0].split(';').next().unwrap().to_string();
+            assert!(
+                cookie.starts_with(&login_binding_cookie_name(&login_state, false)),
+                "{path}: {cookie}"
+            );
+
+            // Another browser (no cookie) follows this login's callback.
+            let query = format!("code=abc&state={login_state}");
+            let (_, location, _) = callback(&fixture.app, &query, None).await;
+            assert!(
+                location.contains("reason=state_invalid"),
+                "{path}: {location}"
+            );
+            assert!(is_pending(&fixture, &login_state).await, "{path}");
+
+            // The browser that started it. The provider is switched off first
+            // so that, once the binding passes, the login stops without
+            // reaching an issuer.
+            let mut row: oidc_providers::ActiveModel =
+                oidc_providers::Entity::find_by_id(provider_id)
+                    .one(fixture._db.db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into();
+            row.enabled = Set(false);
+            row.update(fixture._db.db.as_ref()).await.unwrap();
+            let (status, location, _) = callback(&fixture.app, &query, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{path}");
+            assert!(
+                !location.contains("reason=state_invalid"),
+                "{path}: {location}"
+            );
+            assert!(!is_pending(&fixture, &login_state).await, "{path}");
+        }
     }
 
     #[tokio::test]
