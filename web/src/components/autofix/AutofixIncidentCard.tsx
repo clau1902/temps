@@ -263,7 +263,7 @@ export function IncidentPanel({
               <Button variant="outline" size="sm" asChild>
                 <Link to={`/chat?chat=${incident.conversation_id}`}>
                   <MessageSquare className="h-4 w-4" />
-                  <span className="ml-2 hidden sm:inline">Open chat</span>
+                  <span className="ml-2 max-sm:sr-only">Open chat</span>
                 </Link>
               </Button>
             )}
@@ -461,7 +461,10 @@ function TimelineEntry({ event }: { event: AutofixEventResponse }) {
           <summary className="cursor-pointer text-muted-foreground">
             Output
           </summary>
-          <pre className="mt-1 max-h-48 overflow-auto rounded bg-muted p-2">
+          <pre
+            tabIndex={0}
+            className="mt-1 max-h-48 overflow-auto rounded bg-muted p-2"
+          >
             {output}
           </pre>
         </details>

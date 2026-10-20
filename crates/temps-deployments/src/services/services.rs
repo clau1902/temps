@@ -52,6 +52,43 @@ pub struct ResolvedContainerResourceLimits {
     pub memory_limit: Option<i32>,
 }
 
+fn resolve_reused_health(
+    build_outputs: Option<&serde_json::Value>,
+    environment: Option<&temps_entities::deployment_config::DeploymentConfig>,
+    project: Option<&temps_entities::deployment_config::DeploymentConfig>,
+) -> Result<Option<temps_core::repo_config::HealthCheckConfig>, DeploymentError> {
+    let repo_health = build_outputs.and_then(|outputs| outputs.get("health"));
+    let health = if let Some(value) = repo_health {
+        Some(
+            serde_json::from_value::<temps_core::repo_config::HealthCheckConfig>(value.clone())
+                .map_err(|error| {
+                    DeploymentError::InvalidInput(format!(
+                        "Cannot reuse image health configuration: {error}"
+                    ))
+                })?,
+        )
+    } else {
+        environment
+            .and_then(|config| config.health.clone())
+            .or_else(|| project.and_then(|config| config.health.clone()))
+    };
+    if let Some(health) = &health {
+        health.validate().map_err(|reason| {
+            DeploymentError::InvalidInput(format!(
+                "Cannot reuse image health configuration: {reason}"
+            ))
+        })?;
+    }
+    Ok(health)
+}
+
+/// Runtime inspection paired with the persisted deployment health and port state.
+#[derive(Debug)]
+pub struct EnvironmentContainer {
+    pub info: temps_deployer::ContainerInfo,
+    pub row: temps_entities::deployment_containers::Model,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContainerPresentationContext {
     pub node_names: HashMap<i32, String>,
@@ -233,6 +270,16 @@ pub enum DeploymentError {
         source_deployment_id: i32,
     },
 
+    /// The project's app runs outside Temps (`hosting: external`), so Temps
+    /// does not create deployments for it. `reason` is the operator-facing
+    /// explanation, which already names the project and how to change it.
+    #[error("Project {project_id} ('{project_name}') is hosted externally: {reason}")]
+    ProjectHostedExternally {
+        project_id: i32,
+        project_name: String,
+        reason: String,
+    },
+
     #[error(transparent)]
     EnvironmentResolution(#[from] super::env_resolver::DeploymentEnvResolutionError),
 
@@ -248,6 +295,18 @@ impl From<sea_orm::DbErr> for DeploymentError {
                 reason: error.to_string(),
             },
         }
+    }
+}
+
+/// Whether a project's hosting allows Temps to deploy it.
+fn hosting_deploy_check(project: &projects::Model) -> Result<(), DeploymentError> {
+    match project.hosting.deploy_refusal(&project.name) {
+        Some(reason) => Err(DeploymentError::ProjectHostedExternally {
+            project_id: project.id,
+            project_name: project.name.clone(),
+            reason,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -442,11 +501,18 @@ async fn deployment_asset_origin(
 struct ReuseImageProvenance {
     source: crate::jobs::DeployImageSource,
     expected_identity: Option<crate::jobs::ExpectedImageIdentity>,
+    /// The workers holding the reused image, when the origin built it on
+    /// workers and the control plane cannot serve it itself.
+    worker_build: Option<crate::jobs::ReusedWorkerBuild>,
 }
 
 impl ReuseImageProvenance {
     fn apply(&self, job: crate::jobs::DeployImageJob) -> crate::jobs::DeployImageJob {
         let job = job.with_image_source(self.source);
+        let job = match &self.worker_build {
+            Some(worker_build) => job.with_reused_worker_build(worker_build.clone()),
+            None => job,
+        };
         match &self.expected_identity {
             Some(expected) => job.with_expected_image_identity(expected.clone()),
             None => job,
@@ -1550,14 +1616,12 @@ impl DeploymentService {
     }
 
     /// List all containers for a specific environment.
-    /// Returns container info paired with the optional node_id each container runs on.
-    /// Returns (ContainerInfo, node_id, service_name) for each container
+    /// Includes persisted port and deploy-time health state for each inspection.
     pub async fn list_environment_containers(
         &self,
         project_id: i32,
         environment_id: i32,
-    ) -> Result<Vec<(temps_deployer::ContainerInfo, Option<i32>, Option<String>)>, DeploymentError>
-    {
+    ) -> Result<Vec<EnvironmentContainer>, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
 
         // Verify project exists and is a server-type project
@@ -1603,7 +1667,6 @@ impl DeploymentService {
         let mut container_infos = Vec::new();
         for db_container in db_containers {
             let node_id = db_container.node_id;
-            let service_name = db_container.service_name.clone();
 
             let deployer = match self.deployer_for_node(node_id).await {
                 Ok(d) => d,
@@ -1620,7 +1683,10 @@ impl DeploymentService {
                 .get_container_info(&db_container.container_id)
                 .await
             {
-                Ok(info) => container_infos.push((info, node_id, service_name)),
+                Ok(info) => container_infos.push(EnvironmentContainer {
+                    info,
+                    row: db_container,
+                }),
                 Err(e) => {
                     warn!(
                         "Failed to get info for container {} on node {:?}: {}",
@@ -1812,20 +1878,38 @@ impl DeploymentService {
         Ok(deployment)
     }
 
+    /// Most recent deployment of a project, or `None` when the project exists
+    /// but has never been deployed (a normal state, not an error).
+    ///
+    /// A project that does not exist (or was soft-deleted) is a
+    /// [`DeploymentError::NotFound`] naming the project, so callers can tell
+    /// "nothing deployed yet" apart from "wrong project id".
     pub async fn get_last_deployment(
         &self,
         project_id: i32,
-    ) -> Result<Deployment, DeploymentError> {
-        let deployment_with_pipeline = deployments::Entity::find()
+    ) -> Result<Option<Deployment>, DeploymentError> {
+        // Check the project first: a soft-deleted project keeps its deployment
+        // rows, and must read as "not found" rather than returning them.
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Err(DeploymentError::NotFound(format!(
+                "project {} not found",
+                project_id
+            )));
+        }
+
+        let Some(deployment) = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
-                DeploymentError::NotFound(format!("project {} not found", project_id))
-            })?;
-
-        let deployment = deployment_with_pipeline;
+        else {
+            return Ok(None);
+        };
 
         // Check if this deployment is current for any environment
         let is_current = environments::Entity::find()
@@ -1843,9 +1927,10 @@ impl DeploymentService {
             .get(&deployment.environment_id)
             .cloned();
 
-        Ok(self
-            .map_db_deployment_to_deployment(deployment, is_current, environment)
-            .await)
+        Ok(Some(
+            self.map_db_deployment_to_deployment(deployment, is_current, environment)
+                .await,
+        ))
     }
 
     pub async fn get_deployment(
@@ -2649,6 +2734,32 @@ impl DeploymentService {
         Ok(())
     }
 
+    /// Refuse to create a deployment for a project whose app runs outside
+    /// Temps (`hosting: external`).
+    ///
+    /// A project that no longer exists is let through: the operation that
+    /// follows reports the missing project with its own context.
+    pub async fn ensure_project_hosted_locally(
+        &self,
+        project_id: i32,
+    ) -> Result<(), DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, project_id, "Could not load project before deploying");
+                DeploymentError::DatabaseError {
+                    reason: format!(
+                        "Could not load project {project_id} to check where it is hosted: {error}"
+                    ),
+                }
+            })?;
+        match project {
+            Some(project) => hosting_deploy_check(&project),
+            None => Ok(()),
+        }
+    }
+
     /// Where the image reused by a rollback or promotion lives (and so how a
     /// remote worker obtains it), and which image the reuse is bound to.
     ///
@@ -2713,10 +2824,91 @@ impl DeploymentService {
             _ => None,
         };
 
+        let worker_build = self
+            .reused_worker_build(project.id, origin_deployment_id, image_name)
+            .await?;
+
         Ok(ReuseImageProvenance {
             source,
             expected_identity,
+            worker_build,
         })
+    }
+
+    /// What the origin deployment's build recorded about the workers holding
+    /// `image_name`, for a rollback/promotion that must reach those workers.
+    ///
+    /// Used for a mixed-architecture worker build always -- the control
+    /// plane never holds its other architectures -- for any worker build
+    /// when this control plane runs no workloads, since it then has no copy
+    /// of the image to stream from, and for a build whose node reported the
+    /// image's configuration, which was therefore not copied back. A
+    /// full-profile control plane keeps streaming a single-architecture
+    /// image from its own copy when the build reported none, as before.
+    async fn reused_worker_build(
+        &self,
+        project_id: i32,
+        origin_deployment_id: i32,
+        image_name: &str,
+    ) -> Result<Option<crate::jobs::ReusedWorkerBuild>, DeploymentError> {
+        use temps_entities::deployment_jobs;
+        // Only a build of this project's own deployment says where its image lives.
+        let origin_in_project = deployments::Entity::find_by_id(origin_deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !origin_in_project {
+            return Ok(None);
+        }
+        let build_outputs = deployment_jobs::Entity::find()
+            .filter(deployment_jobs::Column::DeploymentId.eq(origin_deployment_id))
+            .filter(deployment_jobs::Column::JobType.eq("BuildImageJob"))
+            .filter(deployment_jobs::Column::Outputs.is_not_null())
+            .order_by_desc(deployment_jobs::Column::Id)
+            .one(self.db.as_ref())
+            .await?
+            .and_then(|job| job.outputs);
+        let Some(worker_build) = build_outputs.and_then(|outputs| {
+            crate::jobs::ReusedWorkerBuild::from_build_outputs(&outputs, image_name)
+        }) else {
+            return Ok(None);
+        };
+        let control_plane_has_no_copy = self
+            .node_scheduler
+            .get()
+            .is_some_and(|scheduler| !scheduler.local_workloads_enabled());
+        // A build whose node reported the image's configuration was not
+        // copied back to the control plane, so its worker is the source.
+        let control_plane_was_not_given_a_copy = worker_build.image_config.is_some();
+        Ok((worker_build.is_per_architecture()
+            || control_plane_has_no_copy
+            || control_plane_was_not_given_a_copy)
+            .then_some(worker_build))
+    }
+
+    /// Repository health travels with the reused image. Target environment settings
+    /// retain their usual precedence over project defaults when no repo probe exists.
+    async fn reused_image_health(
+        &self,
+        origin_deployment_id: i32,
+        environment: &environments::Model,
+        project: &projects::Model,
+    ) -> Result<Option<temps_core::repo_config::HealthCheckConfig>, DeploymentError> {
+        use temps_entities::deployment_jobs;
+        let outputs = deployment_jobs::Entity::find()
+            .filter(deployment_jobs::Column::DeploymentId.eq(origin_deployment_id))
+            .filter(deployment_jobs::Column::JobType.eq("BuildImageJob"))
+            .filter(deployment_jobs::Column::Outputs.is_not_null())
+            .order_by_desc(deployment_jobs::Column::Id)
+            .one(self.db.as_ref())
+            .await?
+            .and_then(|job| job.outputs);
+        resolve_reused_health(
+            outputs.as_ref(),
+            environment.deployment_config.as_ref(),
+            project.deployment_config.as_ref(),
+        )
     }
 
     async fn configure_reuse_deploy_builder(
@@ -2737,6 +2929,15 @@ impl DeploymentService {
 
         let environment_config = environment.deployment_config.as_ref();
         let project_config = project.deployment_config.as_ref();
+        builder = builder.health_check_timeout_secs(
+            temps_entities::deployment_config::resolve_health_check_timeout_seconds(
+                environment_config
+                    .and_then(|config| config.health_check_timeout_seconds)
+                    .or_else(|| {
+                        project_config.and_then(|config| config.health_check_timeout_seconds)
+                    }),
+            ),
+        );
         if let Some(target_nodes) = environment_config
             .and_then(|config| config.configured_target_nodes().map(<[i32]>::to_vec))
             .or_else(|| {
@@ -3599,6 +3800,7 @@ impl DeploymentService {
                     .service_name(rollback_slug.clone())
                     .health_check_path(None)
                     .health_check_path_override(rollback_health_check_path)
+                    .health(self.reused_image_health(rollback_asset_origin.deployment_id, &environment, &project).await?)
                     .command(rollback_command)
                     .replicas(rollback_replicas)
                     .port(exposed_port)
@@ -4199,6 +4401,7 @@ impl DeploymentService {
                     .audit_logger(self.audit_logger.get().cloned())
                     .job_id("deploy_container".to_string())
                     .build_job_id("external-image".to_string())
+                    .health(self.reused_image_health(promotion_asset_origin.deployment_id, &target_env, &project).await?)
                     .target(crate::jobs::DeploymentTarget::Docker {
                         registry_url: "local".to_string(),
                         network: Some(temps_core::NETWORK_NAME.to_string()),
@@ -6255,17 +6458,17 @@ impl DeploymentService {
 impl temps_monitoring::ContainerRuntimeResolver for DeploymentService {
     async fn resolve_runtime(
         &self,
-        node_id: i32,
+        node_id: Option<i32>,
     ) -> Result<
         Arc<dyn temps_deployer::ContainerDeployer>,
         temps_monitoring::ContainerRuntimeResolutionError,
     > {
-        self.deployer_for_node(Some(node_id))
-            .await
-            .map_err(|error| temps_monitoring::ContainerRuntimeResolutionError {
+        self.deployer_for_node(node_id).await.map_err(|error| {
+            temps_monitoring::ContainerRuntimeResolutionError {
                 node_id,
                 reason: error.to_string(),
-            })
+            }
+        })
     }
 }
 
@@ -6472,11 +6675,63 @@ mod tests {
                 tags: vec![image_name.to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 
         fn get_native_platform(&self) -> String {
             "linux/amd64".to_string()
+        }
+    }
+
+    #[test]
+    fn health_probe_reuse_preserves_repo_probe_and_target_setting_precedence() {
+        use temps_core::repo_config::HealthCheckConfig;
+        use temps_entities::deployment_config::DeploymentConfig;
+        let exec = HealthCheckConfig {
+            probe_type: Some("exec".into()),
+            command: vec!["check-worker".into()],
+            ..Default::default()
+        };
+        let project = DeploymentConfig {
+            health: Some(exec.clone()),
+            ..Default::default()
+        };
+        let environment = DeploymentConfig {
+            health: Some(HealthCheckConfig {
+                probe_type: Some("process".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_reused_health(None, None, Some(&project)).unwrap(),
+            Some(exec.clone())
+        );
+        assert_eq!(
+            resolve_reused_health(None, Some(&environment), Some(&project)).unwrap(),
+            environment.health
+        );
+        assert_eq!(
+            resolve_reused_health(
+                Some(&serde_json::json!({"health":exec})),
+                Some(&environment),
+                Some(&project)
+            )
+            .unwrap(),
+            Some(exec)
+        );
+        for health in [
+            serde_json::json!({"type":"typo"}),
+            serde_json::json!({"type":"exec","command":[]}),
+            serde_json::json!("malformed"),
+        ] {
+            assert!(resolve_reused_health(
+                Some(&serde_json::json!({"health":health})),
+                None,
+                Some(&project)
+            )
+            .is_err());
         }
     }
 
@@ -6590,6 +6845,7 @@ mod tests {
         ContainerDeployer {}
         #[async_trait::async_trait]
         impl temps_deployer::ContainerDeployer for ContainerDeployer {
+            async fn exec_in_container(&self, container_id: &str, command: Vec<String>, timeout: std::time::Duration) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError>;
             async fn deploy_container(&self, request: temps_deployer::DeployRequest) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError>;
             async fn start_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
             async fn stop_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
@@ -6779,6 +7035,62 @@ mod tests {
                 .expect("read the sibling deployment"),
             "persisting one deployment's mount must not affect a sibling deployment's row"
         );
+    }
+
+    /// The hosting check used by rollback and promotion: it lives in the
+    /// service so the handlers never read the project row themselves.
+    #[tokio::test]
+    async fn externally_hosted_projects_are_refused_before_a_deployment_is_created() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                println!("Docker unavailable; skipping: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to prepare test database: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment) = setup_test_data(&db)
+            .await
+            .expect("create deployment fixtures");
+        let service = create_deployment_service_for_test(db.clone());
+
+        assert!(
+            service
+                .ensure_project_hosted_locally(project.id)
+                .await
+                .is_ok(),
+            "a hosted project may be deployed"
+        );
+        // A missing project is left for the operation itself to report.
+        assert!(service
+            .ensure_project_hosted_locally(project.id + 10_000)
+            .await
+            .is_ok());
+
+        let mut external: projects::ActiveModel = project.clone().into();
+        external.hosting = Set(temps_entities::types::Hosting::External);
+        external
+            .update(db.as_ref())
+            .await
+            .expect("mark the project external");
+
+        match service.ensure_project_hosted_locally(project.id).await {
+            Err(DeploymentError::ProjectHostedExternally {
+                project_id,
+                project_name,
+                reason,
+            }) => {
+                assert_eq!(project_id, project.id);
+                assert_eq!(project_name, project.name);
+                assert!(reason.contains(&project.name), "{reason}");
+            }
+            other => panic!("expected ProjectHostedExternally, got {other:?}"),
+        }
     }
 
     struct NoopLogWriter;
@@ -7876,6 +8188,7 @@ mod tests {
             labels: Set(serde_json::json!({})),
             capacity: Set(serde_json::json!({})),
             dns_resolver_consecutive_failures: Set(0),
+            build_limits: Set(None),
             public_ingress_enabled: Set(false),
             public_ingress_unsupported_reasons: Set(serde_json::json!([])),
             created_at: Set(Utc::now()),
@@ -8191,7 +8504,7 @@ mod tests {
             deployment_id: Set(target_deployment.id),
             container_id: Set("container-rollback-target".to_string()),
             container_name: Set("app-rollback-target".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:target".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -8221,7 +8534,7 @@ mod tests {
             deployment_id: Set(current_deployment.id),
             container_id: Set("container-rollback-current".to_string()),
             container_name: Set("app-rollback-current".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:current".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9120,7 +9433,7 @@ mod tests {
             deployment_id: Set(target_deployment.id),
             container_id: Set("container-rollback-stopped-target".to_string()),
             container_name: Set("app-rollback-stopped-target".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:target".to_string())),
             status: Set(Some("stopped".to_string())),
             created_at: Set(now),
@@ -9156,7 +9469,7 @@ mod tests {
             deployment_id: Set(current_deployment.id),
             container_id: Set("container-rollback-stopped-current".to_string()),
             container_name: Set("app-rollback-stopped-current".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:current".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9442,6 +9755,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_last_deployment_distinguishes_empty_project_from_missing_project(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping get_last_deployment integration test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let service = create_deployment_service_for_test(db.clone());
+
+        // Project with a deployment -> Some(latest).
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+        let last = service
+            .get_last_deployment(project.id)
+            .await?
+            .expect("project with a deployment must return it");
+        assert_eq!(last.id, deployment.id);
+
+        // Project that exists but was never deployed -> Ok(None).
+        let empty_project = projects::ActiveModel {
+            name: Set("Never Deployed".to_string()),
+            slug: Set("never-deployed".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo-empty".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        assert!(service
+            .get_last_deployment(empty_project.id)
+            .await?
+            .is_none());
+
+        // A soft-deleted project keeps its deployment rows but reads as not found.
+        let mut deleted: projects::ActiveModel = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await?
+            .expect("project exists")
+            .into();
+        deleted.is_deleted = Set(true);
+        deleted.update(db.as_ref()).await?;
+        let result = service.get_last_deployment(project.id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {} not found", project.id)
+        ));
+
+        // Unknown project -> NotFound naming the project.
+        let missing_id = empty_project.id + 10_000;
+        let result = service.get_last_deployment(missing_id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {missing_id} not found")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_deployment_not_found() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
@@ -9660,7 +10036,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-123".to_string()),
             container_name: Set("test-container-1".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9673,7 +10049,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-456".to_string()),
             container_name: Set("test-container-2".to_string()),
-            container_port: Set(5432),
+            container_port: Set(Some(5432)),
             image_name: Set(Some("postgres:15".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9741,7 +10117,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("valid-container-id".to_string()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -9813,7 +10189,7 @@ mod tests {
             deployment_id: Set(failed_deployment.id),
             container_id: Set("retained-failed-container".to_string()),
             container_name: Set("temps-retained-app-1".to_string()),
-            container_port: Set(80),
+            container_port: Set(Some(80)),
             image_name: Set(Some("nginx:alpine".to_string())),
             status: Set(Some("retained:running".to_string())),
             service_name: Set(Some("app".to_string())),
@@ -10018,7 +10394,7 @@ mod tests {
                 deployment_id: Set(deployment_two.id),
                 container_id: Set(container_id.to_string()),
                 container_name: Set(format!("test-container-{}", idx + 2)),
-                container_port: Set(8080),
+                container_port: Set(Some(8080)),
                 image_name: Set(Some("nginx:latest".to_string())),
                 status: Set(Some("stopped".to_string())),
                 created_at: Set(now + chrono::Duration::seconds(idx as i64 + 1)),
@@ -10236,7 +10612,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-789".to_string()),
             container_name: Set("test-container-3".to_string()),
-            container_port: Set(9090),
+            container_port: Set(Some(9090)),
             image_name: Set(Some("redis:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10313,7 +10689,7 @@ mod tests {
                 deployment_id: Set(deployment.id),
                 container_id: Set(format!("container-{}", i * 100)),
                 container_name: Set(format!("test-container-{}", i)),
-                container_port: Set(8000 + i),
+                container_port: Set(Some(8000 + i)),
                 image_name: Set(Some("nginx:latest".to_string())),
                 status: Set(Some("running".to_string())),
                 created_at: Set(now),
@@ -10413,7 +10789,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-123".to_string()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10518,7 +10894,7 @@ mod tests {
             deployment_id: Set(deployment1.id),
             container_id: Set("container-v1".to_string()),
             container_name: Set("app-container-v1".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("app:v1".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10531,7 +10907,7 @@ mod tests {
             deployment_id: Set(deployment2.id),
             container_id: Set("container-v2".to_string()),
             container_name: Set("app-container-v2".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("app:v2".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10544,7 +10920,7 @@ mod tests {
             deployment_id: Set(deployment3.id),
             container_id: Set("container-v3".to_string()),
             container_name: Set("app-container-v3".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("app:v3".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -10693,7 +11069,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-123".to_string()),
             container_name: Set("test-container-1".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -11588,6 +11964,180 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(DeploymentError::NotFound(_))));
+        Ok(())
+    }
+
+    async fn insert_build_outputs(
+        db: &temps_database::DbConnection,
+        deployment_id: i32,
+        outputs: serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{deployment_jobs, types::JobStatus};
+        deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment_id),
+            job_id: Set("build_image".to_string()),
+            job_type: Set("BuildImageJob".to_string()),
+            name: Set("Build Image".to_string()),
+            status: Set(JobStatus::Success),
+            log_id: Set(format!("build-{deployment_id}.log")),
+            outputs: Set(Some(outputs)),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        Ok(())
+    }
+
+    /// A rollback or promotion of a mixed-architecture worker build reuses
+    /// each architecture's image from the worker that built it, so every
+    /// replica again runs the image of its own node's architecture. A
+    /// single-architecture worker build on a control plane that holds its own
+    /// copy keeps the existing single-tag path, and outputs of another tag are
+    /// never applied.
+    #[tokio::test]
+    async fn rollback_reuses_each_architecture_from_the_worker_that_built_it(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+        insert_build_outputs(
+            &db,
+            deployment.id,
+            serde_json::json!({
+                "image_tag": "app-1:latest",
+                "image_id": "sha256:amd",
+                "builder_node_id": 4,
+                "image_tags_by_platform": {
+                    "linux/amd64": "app-1:latest",
+                    "linux/arm64": "app-1:latest-arm64"
+                },
+                "builder_node_ids_by_platform": { "linux/amd64": 4, "linux/arm64": 5 },
+                "image_ids_by_platform": { "linux/amd64": "sha256:amd", "linux/arm64": "sha256:arm" }
+            }),
+        )
+        .await?;
+        let service = create_deployment_service_for_test(db.clone());
+
+        let reused = service
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:latest")
+            .await?
+            .expect("a per-architecture build is always reused from its workers");
+        assert_eq!(reused.builder_node_id, Some(4));
+        assert_eq!(reused.image_id.as_deref(), Some("sha256:amd"));
+        assert_eq!(
+            reused.builder_node_ids_by_platform,
+            HashMap::from([
+                ("linux/amd64".to_string(), 4),
+                ("linux/arm64".to_string(), 5)
+            ])
+        );
+        assert_eq!(
+            reused
+                .image_tags_by_platform
+                .get("linux/arm64")
+                .map(String::as_str),
+            Some("app-1:latest-arm64")
+        );
+        assert_eq!(
+            reused
+                .image_ids_by_platform
+                .get("linux/arm64")
+                .map(String::as_str),
+            Some("sha256:arm")
+        );
+        assert!(service
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:other")
+            .await?
+            .is_none());
+        // Another project's deployment never lends its build to this one.
+        assert!(service
+            .reused_worker_build(deployment.project_id + 1000, deployment.id, "app-1:latest")
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollback_of_a_single_worker_build_needs_the_workers_only_without_a_local_copy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+        insert_build_outputs(
+            &db,
+            deployment.id,
+            serde_json::json!({
+                "image_tag": "app-1:latest",
+                "image_id": "sha256:arm",
+                "builder_node_id": 5,
+                "image_tags_by_platform": { "linux/arm64": "app-1:latest" }
+            }),
+        )
+        .await?;
+
+        // Full profile: the control plane copied the image when it was built.
+        let full = create_deployment_service_for_test(db.clone());
+        full.set_node_scheduler(Arc::new(crate::services::NodeScheduler::new(Arc::new(
+            crate::services::NodeService::new(db.clone()),
+        ))));
+        assert!(full
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:latest")
+            .await?
+            .is_none());
+
+        // Control-plane profile: there is no local copy, so the worker is the source.
+        let control_plane = create_deployment_service_for_test(db.clone());
+        control_plane.set_node_scheduler(Arc::new(
+            crate::services::NodeScheduler::new(Arc::new(crate::services::NodeService::new(
+                db.clone(),
+            )))
+            .with_local_workloads_enabled(false),
+        ));
+        let reused = control_plane
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:latest")
+            .await?
+            .expect("the worker is the only source of the image");
+        assert_eq!(reused.builder_node_id, Some(5));
+        assert!(!reused.is_per_architecture());
+        Ok(())
+    }
+
+    /// A node that reported the image's configuration was not asked to send
+    /// the image back, so even a full-profile control plane has no copy: the
+    /// reuse must name the worker and carry the reported ports.
+    #[tokio::test]
+    async fn rollback_of_a_build_that_was_not_copied_back_uses_the_worker_and_its_ports(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+        insert_build_outputs(
+            &db,
+            deployment.id,
+            serde_json::json!({
+                "image_tag": "app-1:latest",
+                "image_id": "sha256:arm",
+                "builder_node_id": 5,
+                "image_tags_by_platform": { "linux/arm64": "app-1:latest" },
+                "image_config": { "exposed_ports": [8080], "working_dir": "/app" }
+            }),
+        )
+        .await?;
+        let full = create_deployment_service_for_test(db.clone());
+        full.set_node_scheduler(Arc::new(crate::services::NodeScheduler::new(Arc::new(
+            crate::services::NodeService::new(db.clone()),
+        ))));
+
+        let reused = full
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:latest")
+            .await?
+            .expect("the worker is the only holder of an image that was not copied back");
+
+        assert_eq!(reused.builder_node_id, Some(5));
+        assert_eq!(
+            reused.image_config.map(|config| config.exposed_ports),
+            Some(vec![8080])
+        );
         Ok(())
     }
 }

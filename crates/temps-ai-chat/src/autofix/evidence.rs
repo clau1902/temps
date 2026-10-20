@@ -42,8 +42,12 @@ impl AgentReport {
     /// Root cause and fix as one paragraph for the incident summary.
     pub fn summary(&self) -> Option<String> {
         let parts: Vec<String> = [
-            self.root_cause.as_deref().map(|text| format!("Root cause: {}", text.trim())),
-            self.fix_summary.as_deref().map(|text| format!("Fix: {}", text.trim())),
+            self.root_cause
+                .as_deref()
+                .map(|text| format!("Root cause: {}", text.trim())),
+            self.fix_summary
+                .as_deref()
+                .map(|text| format!("Fix: {}", text.trim())),
         ]
         .into_iter()
         .flatten()
@@ -270,8 +274,14 @@ pub const MAX_SCORE: i16 = 5;
 /// below it, so each score is a statement about the evidence, not a sum.
 pub const LEVELS: [(i16, &str); 5] = [
     (1, "The fix passes the agent's reproduction"),
-    (2, "The crash reproduces at the deployed source and the fix makes it pass"),
-    (3, "The fix is small and changes a file from the stack trace"),
+    (
+        2,
+        "The crash reproduces at the deployed source and the fix makes it pass",
+    ),
+    (
+        3,
+        "The fix is small and changes a file from the stack trace",
+    ),
     (4, "The project's test command passes"),
     (5, "Replaying the crashing request is clean"),
 ];
@@ -371,7 +381,10 @@ pub fn assess(evidence: &Evidence) -> Assessment {
         outcome: None,
     });
 
-    let suite = evidence.suite_after_fix.as_ref().map(CommandOutcome::passed);
+    let suite = evidence
+        .suite_after_fix
+        .as_ref()
+        .map(CommandOutcome::passed);
     signals.push(Signal {
         key: "suite_passes".into(),
         label: "Project test command passes".into(),
@@ -501,7 +514,8 @@ mod tests {
 
     #[test]
     fn numstat_keeps_new_paths_and_binary_files() {
-        let changes = parse_numstat("3\t1\tsrc/a.ts\n-\t-\tlogo.png\n2\t2\tsrc/{old => new}.ts\n\n");
+        let changes =
+            parse_numstat("3\t1\tsrc/a.ts\n-\t-\tlogo.png\n2\t2\tsrc/{old => new}.ts\n\n");
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0], change("src/a.ts", 3, 1));
         assert_eq!(changes[1].added, None);
@@ -536,7 +550,10 @@ mod tests {
             &["webpack://app/./app/api/tip/route.ts".into()],
             &changes
         ));
-        assert!(touches_stack(&["/srv/app/api/tip/route.ts".into()], &changes));
+        assert!(touches_stack(
+            &["/srv/app/api/tip/route.ts".into()],
+            &changes
+        ));
         assert!(!touches_stack(&["app/page.tsx".into()], &changes));
     }
 

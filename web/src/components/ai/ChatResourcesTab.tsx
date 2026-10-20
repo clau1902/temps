@@ -33,7 +33,7 @@ const KIND_ICONS: Record<ChatResourceKind, LucideIcon> = {
 }
 
 const STATUS_TONES: Record<string, string> = {
-  running: 'text-emerald-600 dark:text-emerald-400',
+  running: 'text-emerald-700 dark:text-emerald-400',
   failed: 'text-destructive',
   error: 'text-destructive',
 }

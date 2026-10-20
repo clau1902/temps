@@ -43,7 +43,7 @@ export function ContextMeter({
   const share = contextShare(context)
   const level = contextLevel(context)
   return (
-    <div className="space-y-2" aria-label="Context size">
+    <div className="space-y-2" role="group" aria-label="Context size">
       <div className="flex items-baseline justify-between gap-3">
         <p className="font-medium">Context window</p>
         {share !== null && (
@@ -79,7 +79,7 @@ export function ContextMeter({
         instructions and the tools.
       </p>
       {level !== 'ok' && (
-        <p className="text-xs text-amber-600 dark:text-amber-300">
+        <p className="text-xs text-amber-700 dark:text-amber-300">
           A long chat costs more with every message, because all of it is sent
           again. Start a new chat for an unrelated task.
         </p>
@@ -219,7 +219,7 @@ function SpendBreakdown({
         </ul>
       )}
       {usage.unpriced_requests > 0 && (
-        <p className="text-xs text-amber-600 dark:text-amber-300">
+        <p className="text-xs text-amber-700 dark:text-amber-300">
           {usage.unpriced_requests}{' '}
           {usage.unpriced_requests === 1 ? 'request has' : 'requests have'} no
           known price, so the total is a minimum.

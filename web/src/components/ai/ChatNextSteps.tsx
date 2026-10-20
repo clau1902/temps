@@ -132,6 +132,7 @@ export function NextStepsChips({
   return (
     <div
       className="flex flex-wrap gap-2 pl-1"
+      role="group"
       aria-label="Suggested next steps"
     >
       {suggestions.map((suggestion) => (
@@ -382,7 +383,7 @@ export function ChatSuggestionControl({
             'h-8 w-8 rounded-full',
             settings.data.mode === 'off'
               ? 'text-muted-foreground'
-              : 'text-amber-600 dark:text-amber-300'
+              : 'text-amber-700 dark:text-amber-300'
           )}
           aria-label={`Next-step suggestions: ${suggestionModeSummary(settings.data.mode)}`}
           title={suggestionModeSummary(settings.data.mode)}

@@ -723,7 +723,13 @@ mod tests {
         let file = std::fs::File::open(packed.archive.path()).expect("archive opens");
         let mut zip = zip::ZipArchive::new(file).expect("valid zip");
         let mut names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).expect("entry").name().to_string())
+            .map(|i| {
+                zip.by_index(i)
+                    .expect("entry")
+                    .name()
+                    .expect("utf-8 entry name")
+                    .into_owned()
+            })
             .collect();
         names.sort();
         names

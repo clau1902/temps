@@ -71,6 +71,15 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Who terminates TLS for this installation. Skipping eager provisioning via
+/// `--skip-ssl` remains independent: auto mode can still issue on demand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum TlsMode {
+    #[default]
+    Auto,
+    External,
+}
+
 #[derive(Args)]
 pub struct SetupCommand {
     /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
@@ -93,6 +102,10 @@ pub struct SetupCommand {
     /// For automation, provide a secure password to avoid interactive prompts
     #[arg(long, env = "TEMPS_ADMIN_PASSWORD")]
     pub admin_password: Option<String>,
+
+    /// Read the admin password from a file instead of passing it on the command line
+    #[arg(long, conflicts_with = "admin_password")]
+    pub admin_password_file: Option<PathBuf>,
 
     /// Wildcard domain pattern for SSL certificate (e.g., "*.app.example.com")
     /// When omitted, defaults to a sslip.io domain generated from the
@@ -180,6 +193,11 @@ pub struct SetupCommand {
     /// Skip SSL certificate provisioning (useful for testing or when using external certificates)
     #[arg(long, default_value = "false")]
     pub skip_ssl: bool,
+
+    /// TLS owner: auto keeps certificate provisioning/on-demand TLS; external
+    /// serves HTTP behind a tunnel or reverse proxy and disables on-demand TLS
+    #[arg(long, value_enum, default_value = "auto")]
+    pub tls_mode: TlsMode,
 
     /// Skip DNS A record creation (useful when managing DNS externally)
     #[arg(long, default_value = "false")]
@@ -1317,6 +1335,7 @@ async fn update_app_settings(
     preview_domain: &str,
     external_url: Option<&str>,
     letsencrypt_email: Option<&str>,
+    tls_mode: TlsMode,
 ) -> anyhow::Result<()> {
     use chrono::Utc;
 
@@ -1348,7 +1367,7 @@ async fn update_app_settings(
         }
     }
 
-    configure_on_demand_tls(&mut app_settings, preview_domain);
+    configure_on_demand_tls(&mut app_settings, preview_domain, tls_mode);
 
     // Mark setup as complete so the web onboarding wizard knows to skip
     // itself — prevents the "Configure Base Domain" wall from appearing
@@ -1356,10 +1375,14 @@ async fn update_app_settings(
     app_settings.setup_complete = true;
 
     let now = Utc::now();
-    let settings_json = existing
+    let mut settings_json = existing
         .as_ref()
         .map(|r| app_settings.to_json_merged(&r.data))
         .unwrap_or_else(|| app_settings.to_json());
+    // Bootstrap-owned metadata is kept outside the mutable AppSettings API.
+    // Its merged writes preserve this decision; both proxy entry points load
+    // it once at startup, so external TLS adds no request-time settings reads.
+    settings_json["external_tls"] = serde_json::json!(tls_mode == TlsMode::External);
 
     if let Some(existing_model) = existing {
         // Update existing settings. Merge, don't replace — re-running `temps
@@ -1447,24 +1470,30 @@ fn normalize_acme_contact_email(email: &str) -> Option<String> {
     Some(normalized)
 }
 
-/// Configure on-demand HTTP-01 TLS only when certificate issuance can work.
+/// Enable on-demand HTTP-01 TLS whenever the preview domain is a public zone.
 ///
-/// A public zone without an ACME contact is not a partially configured state:
-/// every issuance is guaranteed to fail. Keep the feature disabled until setup
-/// has persisted a contact, and clear stale state when setup is re-run in local
-/// mode or without one.
-fn configure_on_demand_tls(app_settings: &mut AppSettings, preview_domain: &str) {
+/// Setup turns it on for every install that can be reached by Let's Encrypt and
+/// records the zone, so stable environment URLs not covered by a wildcard
+/// certificate get HTTPS without a further step. A loopback or private zone is
+/// not reachable for the HTTP-01 challenge, so setup clears any stale state when
+/// it is re-run in local mode.
+///
+/// The ACME contact email is deliberately not a precondition: it can be set
+/// after setup (`letsencrypt.email`) and is resolved on every issuance, so the
+/// feature starts working without a restart. Until then issuance fails with a
+/// clear "no ACME contact email configured" error, and the proxy warns at boot.
+fn configure_on_demand_tls(
+    app_settings: &mut AppSettings,
+    preview_domain: &str,
+    tls_mode: TlsMode,
+) {
     let zone = preview_domain.trim();
-    let has_acme_contact = app_settings
-        .letsencrypt
-        .email
-        .as_deref()
-        .and_then(normalize_acme_contact_email)
-        .is_some();
     let sslip_ip_is_public =
         sslip_ipv4_from_zone(zone).is_none_or(|address| validate_ipv4(&address).is_ok());
-    let can_issue =
-        !zone.is_empty() && !is_loopback_zone(zone) && sslip_ip_is_public && has_acme_contact;
+    let can_issue = tls_mode == TlsMode::Auto
+        && !zone.is_empty()
+        && !is_loopback_zone(zone)
+        && sslip_ip_is_public;
 
     app_settings.on_demand_tls.enabled = can_issue;
     app_settings.on_demand_tls.zone = can_issue.then(|| zone.to_ascii_lowercase());
@@ -1552,6 +1581,66 @@ fn is_loopback_zone(zone: &str) -> bool {
 }
 
 impl SetupCommand {
+    fn resolve_installation_inputs(&mut self) -> anyhow::Result<()> {
+        if let Some(path) = &self.admin_password_file {
+            let password = fs::read_to_string(path).map_err(|error| {
+                anyhow::anyhow!(
+                    "Cannot read admin password file '{}': {}",
+                    path.display(),
+                    error
+                )
+            })?;
+            let password = password.trim_end_matches(['\r', '\n']);
+            if password.chars().count() < 8 || password.chars().any(char::is_control) {
+                anyhow::bail!(
+                    "Admin password file must contain one password of at least 8 characters without control characters"
+                );
+            }
+            self.admin_password = Some(password.to_string());
+        }
+        if self.tls_mode == TlsMode::External {
+            if self.wildcard_domain.is_none() || self.external_url.is_none() {
+                anyhow::bail!("--tls-mode external requires --wildcard-domain and --external-url; configure the public hostname separately from the HTTP origin");
+            }
+            if self.wildcard_domain_cert.is_some() || self.wildcard_domain_key.is_some() {
+                anyhow::bail!("--tls-mode external cannot import a certificate; TLS is managed by the reverse proxy");
+            }
+            let domain = self.wildcard_domain.as_deref().unwrap_or_default();
+            let domain = domain.strip_prefix("*.").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--wildcard-domain must start with *. (for example *.apps.example.com)"
+                )
+            })?;
+            if domain.is_empty()
+                || domain.len() > 253
+                || !domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+            {
+                anyhow::bail!("--wildcard-domain must be a hostname such as *.apps.example.com");
+            }
+            let external_url = self.external_url.as_deref().unwrap_or_default();
+            let url = url::Url::parse(external_url)
+                .map_err(|error| anyhow::anyhow!("Invalid --external-url: {}", error))?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || !matches!(url.path(), "" | "/")
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                anyhow::bail!("--external-url must be an HTTP or HTTPS origin URL with a hostname and no credentials, path, query or fragment");
+            }
+            self.skip_ssl = true;
+        }
+        Ok(())
+    }
+
     fn apply_auto_defaults(&mut self) {
         self.non_interactive = true;
         self.skip_ssl = true;
@@ -1599,6 +1688,7 @@ impl SetupCommand {
     }
 
     pub fn execute(mut self) -> anyhow::Result<()> {
+        self.resolve_installation_inputs()?;
         print_header();
 
         debug!("Starting Temps setup");
@@ -2190,6 +2280,7 @@ impl SetupCommand {
                 &preview_domain,
                 self.external_url.as_deref(),
                 self.letsencrypt_email.as_deref(),
+                self.tls_mode,
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2316,6 +2407,7 @@ impl SetupCommand {
                 &preview_domain,
                 self.external_url.as_deref(),
                 self.letsencrypt_email.as_deref(),
+                self.tls_mode,
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2532,6 +2624,7 @@ impl SetupCommand {
                 &preview_domain,
                 self.external_url.as_deref(),
                 self.letsencrypt_email.as_deref(),
+                self.tls_mode,
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2574,6 +2667,7 @@ impl SetupCommand {
                 &preview_domain,
                 self.external_url.as_deref(),
                 self.letsencrypt_email.as_deref(),
+                self.tls_mode,
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -3021,6 +3115,7 @@ impl SetupCommand {
             &preview_domain,
             self.external_url.as_deref(),
             self.letsencrypt_email.as_deref(),
+            self.tls_mode,
         ))?;
         print_success(&format!(
             "Preview domain set to: {}",
@@ -3415,33 +3510,228 @@ mod tests {
     }
 
     #[test]
-    fn on_demand_tls_requires_a_public_zone_and_acme_contact() {
+    fn on_demand_tls_is_enabled_for_a_public_zone_without_waiting_for_a_contact() {
         let mut settings = AppSettings::default();
+        assert!(settings.letsencrypt.email.is_none());
 
-        configure_on_demand_tls(&mut settings, "1-1-1-1.sslip.io");
-        assert!(!settings.on_demand_tls.enabled);
-        assert_eq!(settings.on_demand_tls.zone, None);
-
-        settings.letsencrypt.email = Some("not-an-email".to_string());
-        configure_on_demand_tls(&mut settings, "1-1-1-1.sslip.io");
-        assert!(!settings.on_demand_tls.enabled);
-        assert_eq!(settings.on_demand_tls.zone, None);
-
-        settings.letsencrypt.email = Some("certs@example.com".to_string());
-        configure_on_demand_tls(&mut settings, " 1-1-1-1.SSLIP.IO ");
+        configure_on_demand_tls(&mut settings, " 1-1-1-1.SSLIP.IO ", TlsMode::Auto);
         assert!(settings.on_demand_tls.enabled);
         assert_eq!(
             settings.on_demand_tls.zone.as_deref(),
             Some("1-1-1-1.sslip.io")
         );
 
-        configure_on_demand_tls(&mut settings, "127-0-0-1.sslip.io");
+        settings.letsencrypt.email = Some("certs@example.com".to_string());
+        configure_on_demand_tls(&mut settings, "apps.example.com", TlsMode::Auto);
+        assert!(settings.on_demand_tls.enabled);
+        assert_eq!(
+            settings.on_demand_tls.zone.as_deref(),
+            Some("apps.example.com")
+        );
+
+        configure_on_demand_tls(&mut settings, "127-0-0-1.sslip.io", TlsMode::Auto);
         assert!(!settings.on_demand_tls.enabled);
         assert_eq!(settings.on_demand_tls.zone, None);
 
-        configure_on_demand_tls(&mut settings, "192-168-1-10.sslip.io");
+        configure_on_demand_tls(&mut settings, "192-168-1-10.sslip.io", TlsMode::Auto);
         assert!(!settings.on_demand_tls.enabled);
         assert_eq!(settings.on_demand_tls.zone, None);
+
+        configure_on_demand_tls(&mut settings, "localhost", TlsMode::Auto);
+        assert!(!settings.on_demand_tls.enabled);
+    }
+
+    #[test]
+    fn external_tls_clears_existing_on_demand_issuance() {
+        let mut settings = AppSettings {
+            console_force_https: Some(true),
+            ..Default::default()
+        };
+        configure_on_demand_tls(&mut settings, "apps.example.com", TlsMode::Auto);
+        assert!(settings.on_demand_tls.enabled);
+        configure_on_demand_tls(&mut settings, "apps.example.com", TlsMode::External);
+        let stored = AppSettings::from_json(settings.to_json());
+        assert!(!stored.on_demand_tls.enabled);
+        assert_eq!(stored.on_demand_tls.zone, None);
+        // The installation-wide origin gate suppresses redirects in external
+        // mode without erasing the operator's preference for a later auto run.
+        assert_eq!(stored.console_force_https, Some(true));
+    }
+
+    #[test]
+    fn external_tls_preserves_custom_domain_and_public_https_url() {
+        let mut command = parse_setup(&[
+            "--tls-mode",
+            "external",
+            "--wildcard-domain",
+            "*.apps.example.com",
+            "--external-url",
+            "https://manager.example.com",
+            "--skip-dns-records",
+            "--admin-email",
+            "admin@example.com",
+        ]);
+        command.resolve_installation_inputs().unwrap();
+        assert!(command.skip_ssl);
+        assert!(command.skip_dns_records);
+        assert!(command.server_ip.is_none());
+        assert!(command.dns_provider.is_none());
+        assert_eq!(
+            command.wildcard_domain.as_deref(),
+            Some("*.apps.example.com")
+        );
+        assert_eq!(
+            command.external_url.as_deref(),
+            Some("https://manager.example.com")
+        );
+    }
+
+    #[test]
+    fn skip_ssl_keeps_on_demand_tls_separate_from_external_mode() {
+        let command = parse_setup(&["--skip-ssl"]);
+        assert_eq!(command.tls_mode, TlsMode::Auto);
+    }
+
+    #[test]
+    fn external_tls_rejects_incomplete_configuration_before_setup() {
+        let mut command = parse_setup(&["--tls-mode", "external"]);
+        assert!(command
+            .resolve_installation_inputs()
+            .unwrap_err()
+            .to_string()
+            .contains("requires --wildcard-domain and --external-url"));
+    }
+
+    #[test]
+    fn admin_password_file_preserves_spaces_and_removes_line_ending() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin-password");
+        fs::write(&path, " test password with spaces \r\n").unwrap();
+        let mut command = parse_setup(&["--admin-password-file", path.to_str().unwrap()]);
+        command.resolve_installation_inputs().unwrap();
+        assert_eq!(
+            command.admin_password.as_deref(),
+            Some(" test password with spaces ")
+        );
+        fs::write(&path, "").unwrap();
+        assert!(command.resolve_installation_inputs().is_err());
+    }
+
+    #[test]
+    fn external_tls_rejects_domains_without_a_wildcard_prefix() {
+        for domain in ["apps.example.com", "*apps.example.com", "*."] {
+            let mut command = parse_setup(&[
+                "--tls-mode",
+                "external",
+                "--wildcard-domain",
+                domain,
+                "--external-url",
+                "https://manager.example.com",
+            ]);
+            assert!(command.resolve_installation_inputs().is_err(), "{domain}");
+            assert!(!command.skip_ssl);
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_persists_external_tls_and_clears_it_when_returning_to_auto() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        for (mode, enabled) in [(TlsMode::External, true), (TlsMode::Auto, false)] {
+            let now = chrono::Utc::now();
+            let row = settings::Model {
+                id: 1,
+                data: serde_json::json!({
+                    "external_tls": !enabled,
+                    "admin_gate": {"enabled": true},
+                }),
+                created_at: now,
+                updated_at: now,
+            };
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row.clone()], [row]])
+                .into_connection();
+            update_app_settings(
+                &db,
+                "apps.example.com",
+                Some("https://manager.example.com"),
+                None,
+                mode,
+            )
+            .await
+            .expect("save TLS settings");
+            let writes = db.into_transaction_log();
+            let update = writes
+                .iter()
+                .flat_map(|transaction| transaction.statements())
+                .find(|statement| statement.sql.starts_with("UPDATE "))
+                .expect("settings update");
+            let saved = update
+                .values
+                .as_ref()
+                .expect("bound settings values")
+                .0
+                .iter()
+                .find_map(|value| match value {
+                    sea_orm::sea_query::Value::Json(Some(data)) => Some(data.as_ref()),
+                    _ => None,
+                })
+                .expect("bound settings JSON");
+            assert_eq!(saved["external_tls"], serde_json::json!(enabled));
+            assert_eq!(saved["admin_gate"]["enabled"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn admin_password_file_requires_eight_unicode_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin-password");
+        for (password, accepted) in [("éééé", false), ("🐙🐙", false), ("éééééééé", true)]
+        {
+            fs::write(&path, password).unwrap();
+            let mut command = parse_setup(&["--admin-password-file", path.to_str().unwrap()]);
+            assert_eq!(command.resolve_installation_inputs().is_ok(), accepted);
+        }
+    }
+
+    #[test]
+    fn external_tls_rejects_imported_certs_and_invalid_origins() {
+        for extra in [
+            vec!["--wildcard-domain-cert", "/unused/cert.pem"],
+            vec!["--external-url", "ftp://manager.example.com"],
+            vec![
+                "--external-url",
+                "https://user:password@manager.example.com",
+            ],
+            vec!["--external-url", "https://manager.example.com/subpath"],
+            vec!["--wildcard-domain", "*.invalid..example.com"],
+        ] {
+            let mut args = vec![
+                "--tls-mode",
+                "external",
+                "--wildcard-domain",
+                "*.apps.example.com",
+                "--external-url",
+                "https://manager.example.com",
+            ];
+            // Replace rather than repeat a clap argument.
+            if let Some(index) = args.iter().position(|arg| *arg == extra[0]) {
+                args[index + 1] = extra[1];
+            } else {
+                args.extend(extra);
+            }
+            let mut command = parse_setup(&args);
+            assert!(command.resolve_installation_inputs().is_err());
+        }
+    }
+
+    #[test]
+    fn password_file_rejects_multiline_and_missing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin-password");
+        let mut command = parse_setup(&["--admin-password-file", path.to_str().unwrap()]);
+        assert!(command.resolve_installation_inputs().is_err());
+        fs::write(&path, "first password\nsecond password").unwrap();
+        assert!(command.resolve_installation_inputs().is_err());
     }
 
     #[test]

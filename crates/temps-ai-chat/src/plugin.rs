@@ -341,6 +341,7 @@ impl TempsPlugin for AiChatPlugin {
                     .get_service::<temps_sandbox::services::SnapshotService>(),
                 source_drop_deployer: context.get_service::<dyn temps_core::SourceDropDeployer>(),
                 project_access_checker: None,
+                application_terminal: None,
             });
             context.register_plugin_state("ai_chat", app_state);
 
@@ -395,9 +396,9 @@ impl TempsPlugin for AiChatPlugin {
                                 // A lagging receiver skips what it missed:
                                 // an incident not opened automatically can
                                 // still be started by hand.
-                                Err(error) => tracing::warn!(
-                                    "autofix missed error-group jobs: {error}"
-                                ),
+                                Err(error) => {
+                                    tracing::warn!("autofix missed error-group jobs: {error}")
+                                }
                             }
                         }
                     });
@@ -437,6 +438,22 @@ impl TempsPlugin for AiChatPlugin {
         if let Some(deployer) = context.get_service::<dyn temps_core::SourceDropDeployer>() {
             old.service.bind_source_drop_deployer(deployer);
         }
+        // The sandbox terminal bridge only reads `sandbox_service`; the rest
+        // is the plugin's own wiring. Resolved here, not at registration,
+        // because the sensitive-action policy is registered by another plugin.
+        let application_terminal = old
+            .application_sandboxes
+            .as_ref()
+            .zip(context.get_service::<dyn temps_core::SensitiveActionAuthorizer>())
+            .map(|(sandbox_service, sensitive_action_authorizer)| {
+                Arc::new(temps_sandbox::handlers::SandboxAppState {
+                    sandbox_service: sandbox_service.clone(),
+                    snapshot_service: None,
+                    project_access_checker: project_access_checker.clone(),
+                    audit_service: None,
+                    sensitive_action_authorizer,
+                })
+            });
         let app_state = Arc::new(AppState {
             service: old.service.clone(),
             db: old.db.clone(),
@@ -459,6 +476,7 @@ impl TempsPlugin for AiChatPlugin {
                 .get_service::<dyn temps_core::SourceDropDeployer>()
                 .or_else(|| old.source_drop_deployer.clone()),
             project_access_checker,
+            application_terminal,
         });
         let model_relay = context.require_service::<temps_ai_agent_cli::SandboxModelRelayService>();
         let router = handlers::configure_routes()

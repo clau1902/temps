@@ -276,7 +276,7 @@ function DiagramList({
                     </span>
                   )}
                   {changes?.changed.has(component.id) && (
-                    <span className="ml-1.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                    <span className="ml-1.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
                       changed
                     </span>
                   )}

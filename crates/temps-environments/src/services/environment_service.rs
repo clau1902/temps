@@ -1045,8 +1045,8 @@ impl EnvironmentService {
         if let Some(memory_limit) = settings.memory_limit {
             deployment_config.memory_limit = memory_limit;
         }
-        if settings.exposed_port.is_some() {
-            deployment_config.exposed_port = settings.exposed_port;
+        if let Some(exposed_port) = settings.exposed_port {
+            deployment_config.exposed_port = exposed_port;
         }
         if let Some(replicas) = settings.replicas {
             deployment_config.replicas = replicas;
@@ -1128,6 +1128,12 @@ impl EnvironmentService {
             deployment_config.max_concurrent_connections = max_concurrent_connections;
         }
 
+        if let Some(health) = settings.health {
+            deployment_config.health = health;
+        }
+        if let Some(timeout) = settings.health_check_timeout_seconds {
+            deployment_config.health_check_timeout_seconds = Some(timeout);
+        }
         // Validate the deployment config
         deployment_config.validate().map_err(|e| {
             EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
@@ -1487,12 +1493,36 @@ impl EnvironmentService {
 
         let new_domain = environment_domains::ActiveModel {
             environment_id: Set(environment.id),
-            domain: Set(normalized),
+            domain: Set(normalized.clone()),
             created_at: Set(chrono::Utc::now()),
             ..Default::default()
         };
 
-        Ok(new_domain.insert(self.db.as_ref()).await?)
+        // A hostname attached to a status page (#1412) is reserved for it;
+        // checked and claimed under the shared hostname lock.
+        let txn = self.db.begin().await?;
+        let inserted = async {
+            temps_entities::status_page_domains::lock_hostname_claim(&txn, &normalized).await?;
+            if temps_entities::status_page_domains::attached_hostname_conflict(&txn, &normalized)
+                .await?
+            {
+                return Err(EnvironmentError::InvalidInput(format!(
+                    "Domain '{normalized}' is attached to a status page; remove it there first"
+                )));
+            }
+            Ok(new_domain.insert(&txn).await?)
+        }
+        .await;
+        match inserted {
+            Ok(domain) => {
+                txn.commit().await?;
+                Ok(domain)
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
     }
 
     pub async fn delete_environment_domain(
@@ -2013,6 +2043,8 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
                     branch: Some("main".to_string()),
                     cpu_request: None,
                     cpu_limit: None,
@@ -2120,6 +2152,8 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
                     branch: None,
                     cpu_request: None,
                     cpu_limit: None,
@@ -2177,6 +2211,8 @@ mod tests {
     /// can set exactly the one field it is about.
     fn empty_settings_request() -> crate::handlers::UpdateEnvironmentSettingsRequest {
         crate::handlers::UpdateEnvironmentSettingsRequest {
+            health: None,
+            health_check_timeout_seconds: None,
             branch: None,
             cpu_request: None,
             cpu_limit: None,
@@ -2204,6 +2240,77 @@ mod tests {
             websocket_idle_timeout_seconds: None,
             max_concurrent_connections: None,
             password: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_environment_override_can_be_preserved_replaced_and_cleared() {
+        use temps_core::repo_config::HealthCheckConfig;
+        use temps_entities::deployment_config::DeploymentConfig;
+        let original = HealthCheckConfig {
+            probe_type: Some("exec".into()),
+            command: vec!["check-worker".into()],
+            ..Default::default()
+        };
+        let replacement = HealthCheckConfig {
+            probe_type: Some("process".into()),
+            ..Default::default()
+        };
+        for (change, expected) in [
+            (None, Some(original.clone())),
+            (Some(Some(replacement.clone())), Some(replacement)),
+            (Some(None), None),
+        ] {
+            let current = environments::Model {
+                deployment_config: Some(DeploymentConfig {
+                    health: Some(original.clone()),
+                    ..Default::default()
+                }),
+                ..env_for_ceiling_test()
+            };
+            let updated = environments::Model {
+                deployment_config: Some(DeploymentConfig {
+                    health: expected.clone(),
+                    ..Default::default()
+                }),
+                ..current.clone()
+            };
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![current]])
+                    .append_query_results([vec![updated]])
+                    .append_exec_results([MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = service_with_ceilings(db.clone(), Default::default());
+            let result = service
+                .update_environment_settings(
+                    10,
+                    1,
+                    crate::handlers::UpdateEnvironmentSettingsRequest {
+                        health: change,
+                        ..empty_settings_request()
+                    },
+                    temps_core::CeilingEnforcement::Bypass,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.deployment_config.unwrap().health, expected);
+            drop(service);
+            let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+            // Check the UPDATE payload rather than only the canned mock reply.
+            match expected {
+                Some(health) => {
+                    assert!(log.contains(health.probe_type.as_deref().unwrap()), "{log}")
+                }
+                None => assert!(
+                    !log.contains("check-worker") && !log.contains("stable_for"),
+                    "{log}"
+                ),
+            }
         }
     }
 
@@ -2292,6 +2399,8 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
@@ -2341,6 +2450,8 @@ mod tests {
                 10,
                 1,
                 crate::handlers::UpdateEnvironmentSettingsRequest {
+                    health: None,
+                    health_check_timeout_seconds: None,
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
@@ -2526,6 +2637,7 @@ mod tests {
             "enable_preview_environments": false, "preview_envs_on_demand": false,
             "preview_envs_idle_timeout_seconds": 300, "preview_envs_wake_timeout_seconds": 30,
             "source_type": source_type, "project_type": temps_entities::types::ProjectType::Server,
+            "hosting": "hosted",
             "cross_project_trace_sharing": true,
             "cloud_telemetry_fidelity": "metered", "cloud_telemetry_attribute_allowlist": [],
             "cloud_telemetry_write_mode": "local", "cloud_analytics_write_mode": "local"
@@ -2858,6 +2970,8 @@ mod tests {
         target_nodes: Vec<i32>,
     ) -> crate::handlers::UpdateEnvironmentSettingsRequest {
         crate::handlers::UpdateEnvironmentSettingsRequest {
+            health: None,
+            health_check_timeout_seconds: None,
             branch: None,
             cpu_request: None,
             cpu_limit: None,

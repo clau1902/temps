@@ -185,6 +185,7 @@ export function AutofixSettingsCard({ projectId }: { projectId: number }) {
               </p>
             </div>
             <Switch
+              aria-label="Pause autofix"
               checked={cap.settings.paused}
               disabled={pause.isPending}
               onCheckedChange={(paused) =>

@@ -22,13 +22,15 @@ export function ProjectTab({ projectId }: { projectId: number }) {
   const project = useQuery(getProjectOptions({ path: { id: projectId } }))
   const latest = useQuery({
     ...getLastDeploymentOptions({ path: { id: projectId } }),
-    // A project that never deployed answers with an error; that is a state,
-    // not something to retry.
+    // A project that never deployed answers `deployment: null`.
+    select: (data) => data.deployment ?? null,
     retry: false,
-    refetchInterval: (query) =>
-      query.state.data && isActiveDeploymentStatus(query.state.data.status)
+    refetchInterval: (query) => {
+      const deployment = query.state.data?.deployment
+      return deployment && isActiveDeploymentStatus(deployment.status)
         ? 3000
-        : false,
+        : false
+    },
   })
 
   if (project.isPending) {

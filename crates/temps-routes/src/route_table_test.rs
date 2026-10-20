@@ -347,6 +347,92 @@ mod route_table_tests {
         Ok(())
     }
 
+    /// ADR-051: the public ingress hostname is a platform host. A project
+    /// route on it would swallow every third-party callback, so it is dropped
+    /// on load exactly like a route on the console hostname, and the proxy can
+    /// identify the host from the snapshot alone.
+    #[tokio::test]
+    async fn test_route_table_reserves_public_ingress_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::{ActiveModelBehavior, EntityTrait};
+        use temps_core::AppSettings;
+        use temps_entities::settings;
+
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        let app_settings = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            public_ingress_url: Some("https://hooks.example.com".to_string()),
+            ..Default::default()
+        };
+        settings::Entity::insert(settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            ..settings::ActiveModel::new()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(settings::Column::Id)
+                .update_column(settings::Column::Data)
+                .to_owned(),
+        )
+        .exec(test_db.db.as_ref())
+        .await?;
+
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("test.example.com")
+            .await?;
+        test_db
+            .create_deployment_container(deployment.id, 9011, Some(9011))
+            .await?;
+
+        for domain in ["hooks.example.com", "app.example.com", "*.example.com"] {
+            project_custom_domains::ActiveModel {
+                domain: Set(domain.to_string()),
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                status: Set("active".to_string()),
+                redirect_to: Set(None),
+                status_code: Set(None),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await?;
+        }
+
+        let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
+        route_table.load_routes().await?;
+
+        assert!(
+            route_table.get_route("hooks.example.com").is_none(),
+            "public ingress hostname must not be routed to a project"
+        );
+        assert!(
+            route_table.get_route_by_host("hooks.example.com").is_none(),
+            "public ingress hostname must also be protected from wildcard fallback"
+        );
+        assert!(route_table
+            .resolve_route_for_sni("hooks.example.com")
+            .is_none());
+        assert!(route_table.is_reserved_hostname("hooks.example.com"));
+        assert!(route_table.is_public_ingress_hostname("hooks.example.com"));
+        assert!(route_table.owns_hostname("hooks.example.com"));
+
+        // The console hostname stays reserved but is not the ingress host:
+        // pinning it to the public-only surface would lock the console out.
+        assert!(route_table.is_reserved_hostname("console.example.com"));
+        assert!(!route_table.is_public_ingress_hostname("console.example.com"));
+
+        assert!(
+            route_table.get_route("app.example.com").is_some(),
+            "ordinary custom domains must still route"
+        );
+        assert!(!route_table.is_public_ingress_hostname("app.example.com"));
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_route_table_with_redirect() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await?;
@@ -559,7 +645,7 @@ mod route_table_tests {
         // Update container to different port
         use temps_entities::deployment_containers;
         let mut container: deployment_containers::ActiveModel = container.into();
-        container.container_port = Set(9999);
+        container.container_port = Set(Some(9999));
         container.host_port = Set(Some(9999));
         let _container = container.update(test_db.db.as_ref()).await?;
 
@@ -665,7 +751,7 @@ mod route_table_tests {
             deployment_id: Set(deployment.id),
             container_id: Set(format!("test-container-stopped-{}", deployment.id)),
             container_name: Set(format!("test-container-stopped-{}", deployment.id)),
-            container_port: Set(9500),
+            container_port: Set(Some(9500)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("stopped".to_string())),
             deployed_at: Set(chrono::Utc::now()),
@@ -716,7 +802,7 @@ mod route_table_tests {
             deployment_id: Set(deployment.id),
             container_id: Set(format!("test-container-running-{}", deployment.id)),
             container_name: Set(format!("test-container-running-{}", deployment.id)),
-            container_port: Set(9600),
+            container_port: Set(Some(9600)),
             host_port: Set(Some(9600)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("running".to_string())),
@@ -729,7 +815,7 @@ mod route_table_tests {
             deployment_id: Set(deployment.id),
             container_id: Set(format!("test-container-nullstatus-{}", deployment.id)),
             container_name: Set(format!("test-container-nullstatus-{}", deployment.id)),
-            container_port: Set(9601),
+            container_port: Set(Some(9601)),
             host_port: Set(Some(9601)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(None),
@@ -742,7 +828,7 @@ mod route_table_tests {
             deployment_id: Set(deployment.id),
             container_id: Set(format!("test-container-stopped-{}", deployment.id)),
             container_name: Set(format!("test-container-stopped-{}", deployment.id)),
-            container_port: Set(9602),
+            container_port: Set(Some(9602)),
             host_port: Set(Some(9602)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("stopped".to_string())),

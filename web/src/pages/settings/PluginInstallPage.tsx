@@ -54,7 +54,6 @@ export function PluginInstallPage() {
   usePageTitle(plugin ? `Install ${plugin.title}` : 'Install plugin')
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Settings', href: '/settings' },
       { label: 'Plugins', href: '/settings/plugins' },
       { label: 'Review & install' },
     ])
@@ -270,7 +269,7 @@ export function PluginInstallPage() {
                   onSensitiveError={handleSensitiveActionError}
                   onPendingChange={setPending}
                   onClearSelection={() => navigate('/settings/plugins')}
-                  onInstalled={() => navigate('/settings/plugins')}
+                  onInstalled={() => navigate('/settings/plugins?tab=running')}
                 />
               </section>
             ) : (

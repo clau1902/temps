@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { containerWorkload } from './container-workload'
 import { ContainerInfoResponse, ProjectResponse } from '@/api/client'
 import {
   getContainerMetricsOptions,
@@ -14,7 +15,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { ResourceStat, fmtBytes, fmtPercent } from '@temps-sdk/ds'
+import { ResourceStat, Status, fmtBytes, fmtPercent } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import {
   Box,
@@ -165,7 +166,7 @@ function ContainerRow({
             {statusText}
           </span>
         </div>
-        <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-500 dark:text-neutral-400">
+        <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-600 dark:text-neutral-400">
           <code className="font-mono truncate max-w-[24rem]">
             {container.image_name}
           </code>
@@ -175,20 +176,46 @@ function ContainerRow({
               {container.node_name}
             </span>
           )}
-          {container.created_at && (
+          {containerWorkload(container) === 'worker' && (
+            <span
+              className="inline-flex items-center gap-2"
+              title={
+                container.health_detail ??
+                'Deploy-time health; runtime probing is not enabled'
+              }
+            >
+              Background worker
+              <Status
+                tone={
+                  container.health_state === 'healthy'
+                    ? 'ok'
+                    : container.health_state === 'unhealthy'
+                      ? 'error'
+                      : 'idle'
+                }
+                label={container.health_state || 'unknown'}
+              />
+              <span>at deploy</span>
+            </span>
+          )}
+          {container.container_port != null && container.created_at && (
             <UptimeInline createdAt={container.created_at} />
           )}
           {running && metrics && (
             <>
               <ResourceStat
                 icon={Cpu}
-                value={formatCpuUsage(metrics.cpu_percent, metrics.cpu_limit_cores)}
+                value={formatCpuUsage(
+                  metrics.cpu_percent,
+                  metrics.cpu_limit_cores
+                )}
               />
               <ResourceStat
                 icon={HardDrive}
                 value={fmtBytes(metrics.memory_bytes)}
                 limit={
-                  (metrics.memory_limit_bytes ?? 0) > 0 && metrics.memory_percent != null
+                  (metrics.memory_limit_bytes ?? 0) > 0 &&
+                  metrics.memory_percent != null
                     ? ` / ${fmtPercent(metrics.memory_percent / 100, 0)}`
                     : undefined
                 }
@@ -243,7 +270,7 @@ function ContainerRow({
             <button
               type="button"
               aria-label="Container actions"
-              className="inline-flex size-8 items-center justify-center rounded-md text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
+              className="inline-flex size-8 items-center justify-center rounded-md text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
             >
               <MoreHorizontal className="size-4" aria-hidden="true" />
             </button>
@@ -258,7 +285,7 @@ function ContainerRow({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onSelect={() => onAction?.('stop')}
-                  className="text-red-600 focus:text-red-600 dark:text-red-400 dark:focus:text-red-400"
+                  className="text-red-700 focus:text-red-600 dark:text-red-400 dark:focus:text-red-400"
                 >
                   <Square className="mr-2 size-4" aria-hidden="true" />
                   Stop

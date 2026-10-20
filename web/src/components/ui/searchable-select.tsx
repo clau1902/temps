@@ -6,6 +6,7 @@ import { Check, ChevronsUpDown } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import { useIsMobile } from '@/components/hooks/use-mobile'
+import { fieldValueName } from '@/components/ui/accessible-name'
 import { Button } from '@/components/ui/button'
 import {
   Command,
@@ -50,6 +51,13 @@ interface SearchableSelectProps {
   icon?: React.ReactNode
   /** Native title attribute on the trigger button (tooltip on hover). */
   title?: string
+  /**
+   * What the field is ("Project", "Event type"). A combobox button takes its
+   * accessible name from the author, never from its text, so without this the
+   * trigger can only be announced by its current value. The name keeps the
+   * visible text in it ("Project: All projects") so voice control still works.
+   */
+  label?: string
 }
 
 export function SearchableSelect({
@@ -65,6 +73,7 @@ export function SearchableSelect({
   searchMode = 'fuzzy',
   icon,
   title,
+  label,
 }: SearchableSelectProps) {
   const [open, setOpen] = React.useState(false)
   const isMobile = useIsMobile()
@@ -93,6 +102,7 @@ export function SearchableSelect({
           variant="outline"
           role="combobox"
           aria-expanded={open}
+          aria-label={fieldValueName(label, selected?.label ?? placeholder)}
           disabled={disabled}
           title={title}
           className={cn(

@@ -741,6 +741,7 @@ export function AssistantStart({
           add a detail (the repository URL, the bucket) before they make sense. */}
       <div
         className={cn('flex flex-wrap gap-2', roomy && 'gap-3')}
+        role="group"
         aria-label="Suggestions"
       >
         {ASSISTANT_EXAMPLE_PROMPTS.map((prompt) => (

@@ -24,13 +24,13 @@ use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::audit::{
-    AiBlueprintBindingChangedAudit, AiBlueprintVersionCreatedAudit,
-    AiBlueprintVersionDecidedAudit, AiChatWorkspaceJoinedAudit, AiChatWorkspaceLeftAudit,
+    AiBlueprintBindingChangedAudit, AiBlueprintVersionCreatedAudit, AiBlueprintVersionDecidedAudit,
+    AiChatWorkspaceJoinedAudit, AiChatWorkspaceLeftAudit,
 };
 use crate::blueprint::{
     AppRole, AppRuntime, BlueprintDocument, BlueprintError, BlueprintVersionResponse,
-    ClientSurface, Component, ComponentBinding, ComponentKind, ComponentLive, DataEngine,
-    Decision, Flow, FlowKind, LiveStatus, VersionStatus,
+    ClientSurface, Component, ComponentBinding, ComponentKind, ComponentLive, DataEngine, Decision,
+    Flow, FlowKind, LiveStatus, VersionStatus,
 };
 use crate::handlers::{
     authorized_application_for_permissions, ensure_user_conversation_access, AppState,
@@ -47,11 +47,10 @@ impl From<WorkspaceChatError> for Problem {
                     .with_title("Invalid Workspace Request")
                     .with_detail(error.to_string())
             }
-            WorkspaceChatError::WorkspaceNotFound { .. } | WorkspaceChatError::NoWorkspace { .. } => {
-                problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("Workspace Not Found")
-                    .with_detail(error.to_string())
-            }
+            WorkspaceChatError::WorkspaceNotFound { .. }
+            | WorkspaceChatError::NoWorkspace { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Workspace Not Found")
+                .with_detail(error.to_string()),
             WorkspaceChatError::Application { source, .. } => Problem::from(source),
             WorkspaceChatError::Blueprint(source) => Problem::from(source),
             WorkspaceChatError::Database { .. } => {
@@ -109,7 +108,10 @@ fn audit_context(auth: &AuthContext, metadata: &RequestMetadata) -> AuditContext
 
 async fn audit(state: &AppState, entry: &dyn AuditOperation) {
     if let Err(error) = state.audit_service.create_audit_log(entry).await {
-        tracing::error!("Failed to create audit log for {}: {error}", entry.operation_type());
+        tracing::error!(
+            "Failed to create audit log for {}: {error}",
+            entry.operation_type()
+        );
     }
 }
 
@@ -605,7 +607,15 @@ pub async fn accept_blueprint_version(
 ) -> Result<Json<BlueprintResponse>, Problem> {
     permission_guard!(auth, ProjectsWrite);
     deny_deployment_token!(auth);
-    decide(&state, &auth, &metadata, &public_id, version, Decision::Accept).await
+    decide(
+        &state,
+        &auth,
+        &metadata,
+        &public_id,
+        version,
+        Decision::Accept,
+    )
+    .await
 }
 
 /// Reject a proposed version. The accepted version, if any, stays.
@@ -633,7 +643,15 @@ pub async fn reject_blueprint_version(
 ) -> Result<Json<BlueprintResponse>, Problem> {
     permission_guard!(auth, ProjectsWrite);
     deny_deployment_token!(auth);
-    decide(&state, &auth, &metadata, &public_id, version, Decision::Reject).await
+    decide(
+        &state,
+        &auth,
+        &metadata,
+        &public_id,
+        version,
+        Decision::Reject,
+    )
+    .await
 }
 
 async fn change_binding(
@@ -733,7 +751,15 @@ pub async fn bind_blueprint_component(
         project_id: request.project_id,
         service_id: request.service_id,
     };
-    change_binding(&state, &auth, &metadata, &public_id, &component_id, Some(binding)).await
+    change_binding(
+        &state,
+        &auth,
+        &metadata,
+        &public_id,
+        &component_id,
+        Some(binding),
+    )
+    .await
 }
 
 /// Remove a part's binding. The project or service itself is untouched.
@@ -850,12 +876,19 @@ mod tests {
     fn an_invalid_document_is_a_bad_request_listing_every_problem() {
         let problem = Problem::from(BlueprintError::Invalid {
             application_id: 4,
-            problems: vec!["the summary is empty".into(), "the design has no parts".into()],
+            problems: vec![
+                "the summary is empty".into(),
+                "the design has no parts".into(),
+            ],
         });
         assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
         assert!(detail(&problem).contains("workspace 4"));
         assert_eq!(
-            problem.body.get("problems").and_then(|p| p.as_array()).map(Vec::len),
+            problem
+                .body
+                .get("problems")
+                .and_then(|p| p.as_array())
+                .map(Vec::len),
             Some(2)
         );
     }

@@ -50,9 +50,9 @@ import {
 } from './goal-presentation'
 
 const TONE_CLASSES: Record<GoalTone, string> = {
-  working: 'text-sky-600 dark:text-sky-300',
-  good: 'text-emerald-600 dark:text-emerald-300',
-  attention: 'text-amber-600 dark:text-amber-300',
+  working: 'text-sky-700 dark:text-sky-300',
+  good: 'text-emerald-700 dark:text-emerald-300',
+  attention: 'text-amber-700 dark:text-amber-300',
   bad: 'text-destructive',
   muted: 'text-muted-foreground',
 }

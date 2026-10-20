@@ -2498,6 +2498,7 @@ mod tests {
             context_id: "ctx".to_string(),
             title: None,
             status: "active".to_string(),
+            kind: "ai".to_string(),
             created_by: 7,
             metadata: None,
             created_at: now,

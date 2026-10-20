@@ -1035,6 +1035,7 @@ mod tests {
             context_id: "ctx_1".to_string(),
             title: None,
             status: "active".to_string(),
+            kind: "ai".to_string(),
             created_by: 1,
             metadata: None,
             created_at: now,

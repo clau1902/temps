@@ -4,10 +4,10 @@
 use super::AuthState;
 use crate::audit::{
     AdminPasswordResetAudit, ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit,
-    LoginFailedAudit, LogoutAudit, MfaDisabledAudit, MfaEnabledAudit, MfaVerificationFailedAudit,
-    MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit,
-    StepUpVerificationAudit, UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit,
-    UserUpdatedAudit,
+    LoginFailedAudit, LogoutAudit, MfaDisabledAudit, MfaEnabledAudit, MfaSetupStartedAudit,
+    MfaVerificationFailedAudit, MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit,
+    RoleRemovedAudit, StepUpVerificationAudit, UpdatedFields, UserCreatedAudit, UserDeletedAudit,
+    UserRestoredAudit, UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 pub use temps_core::AuditContext;
-use temps_core::{problemdetails, RequestMetadata};
+use temps_core::RequestMetadata;
 use temps_entities::types::RoleType;
 use tracing::{debug, error, info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -152,6 +152,35 @@ async fn record_pending_login(
             login_method, "Failed to record pending login audit event: {}", error
         );
     }
+}
+
+/// Response for a second-factor attempt refused because the account is in a
+/// lockout window. Deliberately says nothing about whether the code was
+/// right: it was not evaluated.
+fn mfa_locked_problem(retry_after_seconds: i64) -> Problem {
+    temps_core::error_builder::ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+        .type_("https://temps.sh/probs/mfa-locked")
+        .title("Too Many Verification Attempts")
+        .detail(format!(
+            "Too many incorrect verification codes. Try again in {} seconds.",
+            retry_after_seconds
+        ))
+        .value("error_code", "MFA_LOCKED")
+        .value("retry_after_seconds", retry_after_seconds)
+        .build()
+}
+
+/// Response for a sign-in challenge that can no longer be completed: it is
+/// missing, expired, or was discarded after too many wrong codes. Unlike
+/// [`invalid_mfa_problem`] it is not retryable with another code, so the
+/// `MFA_CHALLENGE_ENDED` code tells the client to restart sign-in.
+fn mfa_challenge_ended_problem(title: &str, detail: &str) -> Problem {
+    temps_core::error_builder::ErrorBuilder::new(StatusCode::UNAUTHORIZED)
+        .type_("https://temps.sh/probs/mfa-challenge-ended")
+        .title(title)
+        .detail(detail)
+        .value("error_code", "MFA_CHALLENGE_ENDED")
+        .build()
 }
 
 fn invalid_mfa_problem() -> Problem {
@@ -290,6 +319,7 @@ pub async fn logout(
         (status = 204, description = "MFA verification successful"),
         (status = 401, description = "Invalid MFA code"),
         (status = 400, description = "Invalid request"),
+        (status = 429, description = "Second factor locked after repeated wrong codes"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Authentication"
@@ -323,11 +353,10 @@ pub async fn verify_mfa_challenge(
                 "missing_session_cookie",
             )
             .await;
-            return Err(problem_new(StatusCode::UNAUTHORIZED)
-                .with_title("MFA Session Required")
-                .with_detail(
-                    "No MFA session found. Please log in first to start the MFA verification flow.",
-                ));
+            return Err(mfa_challenge_ended_problem(
+                "MFA Session Required",
+                "No MFA session found. Please log in first to start the MFA verification flow.",
+            ));
         }
     };
 
@@ -343,9 +372,10 @@ pub async fn verify_mfa_challenge(
             )
             .await;
             tracing::error!("Failed to decrypt MFA session cookie: {}", error);
-            return Err(problem_new(StatusCode::UNAUTHORIZED)
-                .with_title("MFA Session Expired")
-                .with_detail("Your MFA session has expired or is invalid. Please log in again."));
+            return Err(mfa_challenge_ended_problem(
+                "MFA Session Expired",
+                "Your MFA session has expired or is invalid. Please log in again.",
+            ));
         }
     };
 
@@ -495,7 +525,23 @@ pub async fn verify_mfa_challenge(
                 "invalid_or_expired_session",
             )
             .await;
-            Err(invalid_mfa_problem())
+            Err(mfa_challenge_ended_problem(
+                "MFA Session Expired",
+                "Your MFA session has expired or is invalid. Please log in again.",
+            ))
+        }
+        Err(crate::auth_service::MfaChallengeError::ChallengeExhausted { user_id }) => {
+            record_mfa_rejection(
+                auth_state.as_ref(),
+                &metadata,
+                Some(user_id),
+                "challenge_exhausted",
+            )
+            .await;
+            Err(mfa_challenge_ended_problem(
+                "Too Many Incorrect Codes",
+                "Too many incorrect verification codes for this sign-in attempt. Sign in again with your password to get a new verification step.",
+            ))
         }
         Err(crate::auth_service::MfaChallengeError::InvalidCode { user_id }) => {
             record_mfa_rejection(
@@ -506,6 +552,13 @@ pub async fn verify_mfa_challenge(
             )
             .await;
             Err(invalid_mfa_problem())
+        }
+        Err(crate::auth_service::MfaChallengeError::LockedOut {
+            user_id,
+            retry_after_seconds,
+        }) => {
+            record_mfa_rejection(auth_state.as_ref(), &metadata, Some(user_id), "locked_out").await;
+            Err(mfa_locked_problem(retry_after_seconds))
         }
         Err(error) => {
             error!("MFA verification infrastructure failed: {}", error);
@@ -590,6 +643,7 @@ pub async fn verify_step_up(
         Err(crate::StepUpError::SessionRequired) => (false, Some("session_required")),
         Err(crate::StepUpError::MfaNotConfigured { .. }) => (false, Some("mfa_not_configured")),
         Err(crate::StepUpError::InvalidCode { .. }) => (false, Some("invalid_code")),
+        Err(crate::StepUpError::LockedOut { .. }) => (false, Some("locked_out")),
         Err(crate::StepUpError::UserNotFound { .. }) => (false, Some("user_not_found")),
         Err(crate::StepUpError::SessionNotFound { .. }) => (false, Some("session_not_found")),
         Err(crate::StepUpError::Verification { .. }) => (false, Some("verification_failed")),
@@ -622,6 +676,10 @@ pub async fn verify_step_up(
                 .value("error_code", "STEP_UP_CODE_INVALID")
                 .build())
         }
+        Err(crate::StepUpError::LockedOut {
+            retry_after_seconds,
+            ..
+        }) => Err(mfa_locked_problem(retry_after_seconds)),
         Err(crate::StepUpError::SessionNotFound { .. })
         | Err(crate::StepUpError::UserNotFound { .. }) => {
             Err(temps_core::error_builder::unauthorized()
@@ -1324,6 +1382,24 @@ pub async fn login(
                             }),
                         ))
                     }
+                    Err(crate::auth_service::AuthError::MfaRequired { .. }) => {
+                        // MFA was enabled after this request checked the
+                        // password; the next sign-in gets the MFA challenge.
+                        record_login_failure(
+                            state.as_ref(),
+                            &metadata,
+                            Some(user.id),
+                            &login_email,
+                            "password",
+                            "mfa_enabled_during_login",
+                        )
+                        .await;
+                        Err(problem_new(StatusCode::UNAUTHORIZED)
+                            .with_title("Sign In Again")
+                            .with_detail(
+                                "Two-factor authentication was just enabled for this account. Sign in again to complete the verification step.",
+                            ))
+                    }
                     Err(crate::auth_service::AuthError::PasswordChangeRequired { .. }) => {
                         // An admin reset flagged the account after this
                         // request verified the (now replaced) password.
@@ -1858,6 +1934,10 @@ impl From<UserServiceError> for Problem {
                     .with_title("Invalid Current Password")
                     .with_detail("The current password you entered is incorrect.")
             }
+            UserServiceError::MfaLocked {
+                retry_after_seconds,
+                ..
+            } => mfa_locked_problem(retry_after_seconds),
             UserServiceError::PasswordResetOnDeletedUser { user_id } => {
                 problem_new(StatusCode::CONFLICT)
                     .with_title("User Deleted")
@@ -2654,6 +2734,46 @@ async fn reset_user_password(
         .into_response())
 }
 
+/// Authorize a self-service MFA request (`/users/me/mfa/*`) and return the
+/// caller's own user row.
+///
+/// Enrolling, confirming and removing a second factor on your *own* account is
+/// not a user-management operation, so it must not depend on `users:write`:
+/// that permission is an admin capability, and gating self-service MFA on it
+/// locked every `User`-role account out of the 2FA setup the console offers
+/// them. The only requirement is that the caller is the account holder, proven
+/// by an interactive session.
+///
+/// Machine credentials are refused even though API keys and CLI tokens carry
+/// the owner's user row: MFA enrollment is a human, interactive ceremony
+/// (password re-entry, an authenticator app, recovery codes shown once), and a
+/// leaked non-interactive credential must not be able to bind an attacker's
+/// authenticator to the owner's account or tamper with an existing factor.
+///
+/// The target account is always the authenticated user's id taken from the
+/// session, never from the request, so a caller can only ever touch their own
+/// factor. Acting on *other* users stays behind the admin permissions on the
+/// `/users/{user_id}/...` routes.
+fn require_self_service_mfa_user(
+    auth: &AuthContext,
+) -> Result<&temps_entities::users::Model, Problem> {
+    match (&auth.source, auth.user.as_ref()) {
+        (crate::context::AuthSource::Session { .. }, Some(user)) => Ok(user),
+        (crate::context::AuthSource::Session { .. }, None)
+        | (crate::context::AuthSource::CliToken { .. }, _)
+        | (crate::context::AuthSource::ApiKey { .. }, _)
+        | (crate::context::AuthSource::DeploymentToken { .. }, _) => {
+            Err(problem_new(StatusCode::FORBIDDEN)
+                .with_title("Interactive Session Required")
+                .with_detail(
+                    "Managing multi-factor authentication requires a signed-in user session. \
+                     API keys, CLI tokens and deployment tokens cannot enroll, confirm or \
+                     remove MFA.",
+                ))
+        }
+    }
+}
+
 #[utoipa::path(
     tag = "Users",
     post,
@@ -2663,6 +2783,7 @@ async fn reset_user_password(
         (status = 200, description = "MFA setup data", body = MfaSetupResponse),
         (status = 400, description = "Current password is required but was not provided"),
         (status = 401, description = "Unauthorized or current password is incorrect"),
+        (status = 403, description = "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"),
         (status = 409, description = "MFA is already enabled; verify and disable it before re-enrollment"),
         (status = 500, description = "Internal server error")
     ),
@@ -2673,14 +2794,32 @@ async fn reset_user_password(
 async fn setup_mfa(
     State(app_state): State<Arc<AuthState>>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<SetupMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
+    // Self-service: authenticated session only, acting on the caller's own
+    // account (see `require_self_service_mfa_user`).
+    let user = require_self_service_mfa_user(&auth)?;
 
     let setup_data = app_state
         .user_service
-        .setup_mfa(auth.user_id(), req.current_password.as_deref())
+        .setup_mfa(user.id, req.current_password.as_deref())
         .await?;
+
+    // Starting enrollment replaces the account's pending MFA secret, so it is
+    // a write. Neither the secret nor the recovery codes are ever audited.
+    let mfa_audit = MfaSetupStartedAudit {
+        context: AuditContext {
+            user_id: user.id,
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        username: user.name.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&mfa_audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
     Ok(Json(MfaSetupResponse {
         secret_key: setup_data.secret_key,
         qr_code: setup_data.qr_code,
@@ -2699,6 +2838,7 @@ async fn setup_mfa(
         (status = 400, description = "Validation error (weak password, same as current, MFA missing)"),
         (status = 401, description = "Current password incorrect or MFA code invalid"),
         (status = 403, description = "Account has no password set (SSO only)"),
+        (status = 429, description = "Second factor locked after repeated wrong codes"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2775,6 +2915,10 @@ async fn change_password_self(
             crate::auth_service::AuthError::InvalidMfaCode => problem_new(StatusCode::UNAUTHORIZED)
                 .with_title("Invalid MFA Code")
                 .with_detail("The MFA code you entered is incorrect or expired."),
+            crate::auth_service::AuthError::MfaLockedOut {
+                retry_after_seconds,
+                ..
+            } => mfa_locked_problem(retry_after_seconds),
             crate::auth_service::AuthError::SamePassword => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("Same Password")
                 .with_detail("The new password must be different from the current one."),
@@ -2804,7 +2948,9 @@ async fn change_password_self(
     responses(
         (status = 204, description = "MFA verified and enabled"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"),
         (status = 400, description = "Invalid code"),
+        (status = 409, description = "MFA is already enabled for this account"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -2817,22 +2963,17 @@ async fn verify_and_enable_mfa(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<VerifyMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-
-    // Require a user for this endpoint (deployment tokens not allowed)
-    let user = auth.require_user().map_err(|msg| {
-        problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("User Required")
-            .with_detail(msg)
-    })?;
+    // Self-service: authenticated session only, acting on the caller's own
+    // account (see `require_self_service_mfa_user`).
+    let user = require_self_service_mfa_user(&auth)?;
 
     app_state
         .user_service
-        .verify_and_enable_mfa(auth.user_id(), &req.code)
+        .verify_and_enable_mfa(user.id, &req.code, auth.session_id())
         .await?;
     // Create audit log
     let audit_context = AuditContext {
-        user_id: auth.user_id(),
+        user_id: user.id,
         ip_address: Some(metadata.ip_address.to_string()),
         user_agent: metadata.user_agent.as_str().to_string(),
     };
@@ -2857,7 +2998,9 @@ async fn verify_and_enable_mfa(
     responses(
         (status = 204, description = "MFA disabled"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"),
         (status = 400, description = "Invalid verification code"),
+        (status = 429, description = "Second factor locked after repeated wrong codes"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -2870,23 +3013,18 @@ async fn disable_mfa(
     Extension(metadata): Extension<RequestMetadata>,
     Json(req): Json<DisableMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersWrite);
-
-    // Require a user for this endpoint (deployment tokens not allowed)
-    let user = auth.require_user().map_err(|msg| {
-        problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("User Required")
-            .with_detail(msg)
-    })?;
+    // Self-service: authenticated session only, acting on the caller's own
+    // account (see `require_self_service_mfa_user`).
+    let user = require_self_service_mfa_user(&auth)?;
 
     // First verify code and then disable MFA
     app_state
         .user_service
-        .verify_and_disable_mfa(auth.user_id(), &req.code)
+        .verify_and_disable_mfa(user.id, &req.code)
         .await?;
     // Create audit log
     let audit_context = AuditContext {
-        user_id: auth.user_id(),
+        user_id: user.id,
         ip_address: Some(metadata.ip_address.to_string()),
         user_agent: metadata.user_agent.as_str().to_string(),
     };
@@ -3697,6 +3835,297 @@ mod tests {
         }
     }
 
+    // ---- Self-service MFA (`/users/me/mfa/*`) -------------------------------
+    //
+    // These endpoints used to be guarded by `users:write`, an admin capability
+    // the `User` role lacks, so ordinary accounts could not enroll the 2FA the
+    // console offers them. They now require only an interactive session of the
+    // account being changed.
+
+    mod self_service_mfa {
+        use super::*;
+        use crate::context::AuthContext;
+        use crate::types::{DisableMfaRequest, SetupMfaRequest, VerifyMfaRequest};
+        use temps_entities::deployment_tokens::DeploymentTokenPermission;
+
+        use super::super::{disable_mfa, reset_user_password, setup_mfa, verify_and_enable_mfa};
+
+        const SECRET_BASE32: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+        fn user_row(id: i32) -> users::Model {
+            test_user(id)
+        }
+
+        fn cli_token_auth() -> AuthContext {
+            AuthContext::new_cli_token(test_user(1), Role::Admin)
+        }
+
+        fn deployment_token_auth() -> AuthContext {
+            AuthContext::new_deployment_token(
+                7,
+                None,
+                None,
+                123,
+                "ci-token".to_string(),
+                vec![DeploymentTokenPermission::AnalyticsRead],
+            )
+        }
+
+        /// Every non-interactive principal, including ones holding `users:write`
+        /// and the admin role, which used to sail through the old guard.
+        fn machine_principals() -> Vec<(&'static str, AuthContext)> {
+            vec![
+                (
+                    "api key with users:write",
+                    api_key_auth(None, Some(vec![Permission::UsersWrite])),
+                ),
+                ("admin api key", api_key_auth(Some(Role::Admin), None)),
+                ("cli token", cli_token_auth()),
+                ("deployment token", deployment_token_auth()),
+            ]
+        }
+
+        fn current_totp_code(secret_base32: &str) -> String {
+            use totp_rs::{Algorithm, Builder};
+            let decoded =
+                base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret_base32)
+                    .expect("valid base32 secret");
+            Builder::new()
+                .with_algorithm(Algorithm::SHA1)
+                .with_digits(6)
+                .with_skew(1)
+                .with_step_duration(30)
+                .with_secret(decoded)
+                .build()
+                .expect("totp builds")
+                .generate_current()
+                .to_string()
+        }
+
+        #[test]
+        fn the_user_role_does_not_hold_users_write() {
+            // Documents the premise of the bug: gating self-service MFA on
+            // `users:write` excludes every plain account.
+            assert!(!Role::User.has_permission(&Permission::UsersWrite));
+            assert!(!Role::Reader.has_permission(&Permission::UsersWrite));
+        }
+
+        #[tokio::test]
+        async fn user_and_admin_sessions_can_start_enrollment_for_themselves() {
+            for (role, user_id) in [(Role::User, 5), (Role::Admin, 6), (Role::Reader, 7)] {
+                let audit = Arc::new(RecordingAuditLogger::default());
+                let row = user_row(user_id);
+                let db = MockDatabase::new(DatabaseBackend::Postgres)
+                    // initial lookup, locked re-read, then the UPDATE ... RETURNING
+                    .append_query_results([vec![row.clone()], vec![row.clone()], vec![row]])
+                    // reset of the replaced secret's accepted TOTP step
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    }])
+                    .into_connection();
+                let state = auth_state_with_audit(db, audit.clone());
+
+                let result = setup_mfa(
+                    State(state),
+                    RequireAuth(AuthContext::new_session(test_user(user_id), role.clone())),
+                    Extension(request_metadata()),
+                    Json(SetupMfaRequest {
+                        current_password: None,
+                    }),
+                )
+                .await;
+
+                assert!(
+                    result.is_ok(),
+                    "{role} session must be able to enroll MFA for itself"
+                );
+                let events = audit.events();
+                assert_eq!(events.len(), 1, "enrollment start is audited once");
+                assert_eq!(events[0].operation_type, "MFA_SETUP_STARTED");
+                assert_eq!(events[0].user_id, Some(user_id));
+                let serialized = events[0].data.to_string();
+                assert!(
+                    !serialized.contains("recovery") && !serialized.contains("secret"),
+                    "audit payload must not carry credentials: {serialized}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn user_role_session_can_confirm_enrollment_with_a_valid_code() {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let mut pending = user_row(5);
+            pending.mfa_secret = Some(SECRET_BASE32.to_string());
+            let mut enabled = pending.clone();
+            enabled.mfa_enabled = true;
+            // Lock the user, read the (empty) guard, upsert it, persist
+            // `mfa_enabled`, then revoke the user's other sessions.
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![pending]])
+                .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
+                .append_query_results([vec![enabled]])
+                .append_exec_results([
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 2,
+                    },
+                ])
+                .into_connection();
+            let state = auth_state_with_audit(db, audit.clone());
+
+            let result = verify_and_enable_mfa(
+                State(state),
+                RequireAuth(AuthContext::new_session(test_user(5), Role::User)),
+                Extension(request_metadata()),
+                Json(VerifyMfaRequest {
+                    code: current_totp_code(SECRET_BASE32),
+                }),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "User-role session must be able to enable MFA"
+            );
+            let events = audit.events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].operation_type, "MFA_ENABLED");
+            assert_eq!(events[0].user_id, Some(5));
+        }
+
+        #[tokio::test]
+        async fn a_wrong_code_still_fails_for_the_account_holder() {
+            let mut pending = user_row(5);
+            pending.mfa_secret = Some(SECRET_BASE32.to_string());
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![pending]])
+                .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
+                .into_connection();
+            let state = auth_state_with_audit(db, Arc::new(NoopAuditLogger));
+
+            let result = verify_and_enable_mfa(
+                State(state),
+                RequireAuth(AuthContext::new_session(test_user(5), Role::User)),
+                Extension(request_metadata()),
+                Json(VerifyMfaRequest {
+                    code: "000000".to_string(),
+                }),
+            )
+            .await;
+
+            // Authorization passed; the TOTP check is what rejects it.
+            let problem = expect_problem(result, "an invalid code must not enable MFA");
+            assert_ne!(problem.status_code, StatusCode::FORBIDDEN);
+            assert_ne!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        #[tokio::test]
+        async fn machine_credentials_cannot_manage_mfa() {
+            for (label, auth) in machine_principals() {
+                // An empty mock database: any attempt to reach the service
+                // would surface as a 500, so a 403 proves the guard ran first.
+                let state = || {
+                    auth_state_with_audit(
+                        MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+                        Arc::new(NoopAuditLogger),
+                    )
+                };
+
+                let setup = setup_mfa(
+                    State(state()),
+                    RequireAuth(auth.clone()),
+                    Extension(request_metadata()),
+                    Json(SetupMfaRequest {
+                        current_password: None,
+                    }),
+                )
+                .await;
+                assert_problem_status(
+                    expect_problem(setup, &format!("{label} must not start MFA enrollment")),
+                    StatusCode::FORBIDDEN,
+                );
+
+                let verify = verify_and_enable_mfa(
+                    State(state()),
+                    RequireAuth(auth.clone()),
+                    Extension(request_metadata()),
+                    Json(VerifyMfaRequest {
+                        code: "123456".to_string(),
+                    }),
+                )
+                .await;
+                assert_problem_status(
+                    expect_problem(verify, &format!("{label} must not enable MFA")),
+                    StatusCode::FORBIDDEN,
+                );
+
+                let disable = disable_mfa(
+                    State(state()),
+                    RequireAuth(auth.clone()),
+                    Extension(request_metadata()),
+                    Json(DisableMfaRequest {
+                        code: "123456".to_string(),
+                    }),
+                )
+                .await;
+                assert_problem_status(
+                    expect_problem(disable, &format!("{label} must not disable MFA")),
+                    StatusCode::FORBIDDEN,
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_user_role_session_cannot_use_admin_endpoints_on_another_account() {
+            let session = || AuthContext::new_session(test_user(5), Role::User);
+
+            let reset = reset_user_password(
+                State(admin_owner_state()),
+                RequireAuth(session()),
+                Extension(request_metadata()),
+                Path(2),
+            )
+            .await;
+            assert_problem_status(
+                expect_problem(reset, "User role must not reset another user's password"),
+                StatusCode::FORBIDDEN,
+            );
+
+            let update = update_user(
+                State(admin_owner_state()),
+                RequireAuth(session()),
+                Extension(request_metadata()),
+                Path(2),
+                Json(UpdateUserRequest {
+                    email: Some("changed@example.com".to_string()),
+                    name: None,
+                }),
+            )
+            .await;
+            assert_problem_status(
+                expect_problem(update, "User role must not edit another account"),
+                StatusCode::FORBIDDEN,
+            );
+
+            let delete = delete_user(
+                State(admin_owner_state()),
+                RequireAuth(session()),
+                Extension(request_metadata()),
+                Path(2),
+            )
+            .await;
+            assert_problem_status(
+                expect_problem(delete, "User role must not delete another account"),
+                StatusCode::FORBIDDEN,
+            );
+        }
+    }
+
     /// Regression test for the CI/CD panic
     /// `Overlapping method route. Handler for "GET /auth/oidc/login/{slug}" already exists`
     ///
@@ -3961,5 +4390,300 @@ mod tests {
         assert!(!summary.slug.is_empty());
         // Slug must carry the hash suffix (separated by '-')
         assert!(summary.slug.contains('-'));
+    }
+
+    /// Second-factor hardening driven through the real routes and the
+    /// production session middleware.
+    mod mfa_http {
+        use crate::http_test_support::{
+            auth_state, insert_user, mfa_challenge_cookie, router, send, send_with_headers,
+            session_cookie,
+        };
+        use crate::mfa_guard::test_support::{code_at, new_secret};
+        use argon2::PasswordHasher;
+        use axum::http::StatusCode;
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::users;
+
+        async fn test_db() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => Some(db),
+                Err(error)
+                    if temps_database::test_utils::is_container_runtime_unavailable(
+                        &error.to_string(),
+                    ) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    None
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            }
+        }
+
+        /// A user with a stored TOTP secret and, optionally, recovery codes.
+        async fn mfa_user(
+            db: &DatabaseConnection,
+            mfa_enabled: bool,
+            recovery_codes: &[&str],
+        ) -> (users::Model, String) {
+            let user = insert_user(db, &format!("mfa-{}@example.com", uuid::Uuid::new_v4())).await;
+            let secret = new_secret();
+            let hashes: Vec<String> = recovery_codes
+                .iter()
+                .map(|code| {
+                    argon2::Argon2::default()
+                        .hash_password(code.as_bytes())
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            let mut update: users::ActiveModel = user.into();
+            update.mfa_secret = Set(Some(secret.clone()));
+            update.mfa_enabled = Set(mfa_enabled);
+            update.mfa_recovery_codes = Set(Some(serde_json::to_string(&hashes).unwrap()));
+            (update.update(db).await.unwrap(), secret)
+        }
+
+        /// A six-digit code that is not valid anywhere in the current window.
+        fn wrong_code(secret: &str) -> String {
+            let now = Utc::now();
+            let valid: Vec<String> = [-30, 0, 30]
+                .iter()
+                .map(|offset| code_at(secret, now + chrono::Duration::seconds(*offset)))
+                .collect();
+            (0..1_000_000)
+                .map(|n| format!("{n:06}"))
+                .find(|candidate| !valid.contains(candidate))
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn enabling_mfa_signs_out_every_other_session() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, secret) = mfa_user(&db, false, &[]).await;
+            let enrolling = session_cookie(&state, user.id).await;
+            let other = session_cookie(&state, user.id).await;
+            for cookie in [&enrolling, &other] {
+                let (status, body) =
+                    send(&app, "GET", "/user/me", Some(("cookie", cookie)), None).await;
+                assert_eq!(status, StatusCode::OK, "before enrolment: {body}");
+            }
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/users/me/mfa/verify",
+                Some(("cookie", &enrolling)),
+                Some(serde_json::json!({ "code": code_at(&secret, Utc::now()) })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "enable MFA: {body}");
+
+            let (status, _) = send(&app, "GET", "/user/me", Some(("cookie", &other)), None).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a session that predates MFA must be signed out"
+            );
+            let (status, body) =
+                send(&app, "GET", "/user/me", Some(("cookie", &enrolling)), None).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the enrolling session stays: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn recovery_code_completes_sign_in_exactly_once() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, _) = mfa_user(&db, true, &["482915", "730264"]).await;
+            let code = serde_json::json!({ "code": "482915" });
+
+            let first = mfa_challenge_cookie(&state, user.id).await;
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                Some(("cookie", &first)),
+                Some(code.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "first use: {body}");
+
+            let second = mfa_challenge_cookie(&state, user.id).await;
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                Some(("cookie", &second)),
+                Some(code),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a recovery code is single use: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn totp_code_cannot_complete_two_sign_ins() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, secret) = mfa_user(&db, true, &[]).await;
+            let code = serde_json::json!({ "code": code_at(&secret, Utc::now()) });
+
+            let mut statuses = Vec::new();
+            for _ in 0..2 {
+                let challenge = mfa_challenge_cookie(&state, user.id).await;
+                let (status, _) = send(
+                    &app,
+                    "POST",
+                    "/auth/verify-mfa",
+                    Some(("cookie", &challenge)),
+                    Some(code.clone()),
+                )
+                .await;
+                statuses.push(status);
+            }
+            assert_eq!(statuses, [StatusCode::NO_CONTENT, StatusCode::UNAUTHORIZED]);
+        }
+
+        #[tokio::test]
+        async fn exhausted_challenge_tells_the_client_to_sign_in_again() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, secret) = mfa_user(&db, true, &[]).await;
+            let challenge = mfa_challenge_cookie(&state, user.id).await;
+            let wrong = serde_json::json!({ "code": wrong_code(&secret) });
+
+            for attempt in 1..crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+                let (status, body) = send(
+                    &app,
+                    "POST",
+                    "/auth/verify-mfa",
+                    Some(("cookie", &challenge)),
+                    Some(wrong.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {attempt}");
+                assert!(
+                    body.get("error_code").is_none(),
+                    "attempt {attempt} can still be retried with another code: {body}"
+                );
+            }
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                Some(("cookie", &challenge)),
+                Some(wrong),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["error_code"], "MFA_CHALLENGE_ENDED", "{body}");
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                Some(("cookie", &challenge)),
+                Some(serde_json::json!({ "code": code_at(&secret, Utc::now()) })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(
+                body["error_code"], "MFA_CHALLENGE_ENDED",
+                "a discarded challenge must send the user back to sign in: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn rotating_client_addresses_does_not_escape_the_per_user_lockout() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, secret) = mfa_user(&db, true, &[]).await;
+            let wrong = serde_json::json!({ "code": wrong_code(&secret) });
+
+            // Every request comes from a new address, so the per-IP limiter
+            // never engages; a fresh challenge replaces each discarded one.
+            let mut address = 0;
+            let mut challenge = mfa_challenge_cookie(&state, user.id).await;
+            for attempt in 1..=crate::mfa_guard::USER_LOCKOUT_THRESHOLD {
+                address += 1;
+                let forwarded = format!("198.51.100.{address}");
+                let (status, body) = send_with_headers(
+                    &app,
+                    "POST",
+                    "/auth/verify-mfa",
+                    &[("cookie", &challenge), ("x-forwarded-for", &forwarded)],
+                    Some(wrong.clone()),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "attempt {attempt}: {body}"
+                );
+                if attempt % crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE == 0 {
+                    let (status, _) = send_with_headers(
+                        &app,
+                        "POST",
+                        "/auth/verify-mfa",
+                        &[
+                            ("cookie", &challenge),
+                            ("x-forwarded-for", "198.51.100.250"),
+                        ],
+                        Some(serde_json::json!({ "code": code_at(&secret, Utc::now()) })),
+                    )
+                    .await;
+                    assert_eq!(
+                        status,
+                        StatusCode::UNAUTHORIZED,
+                        "an exhausted challenge must not accept even the right code"
+                    );
+                    challenge = mfa_challenge_cookie(&state, user.id).await;
+                }
+            }
+
+            let fresh = mfa_challenge_cookie(&state, user.id).await;
+            let (status, body) = send_with_headers(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                &[("cookie", &fresh), ("x-forwarded-for", "203.0.113.7")],
+                Some(serde_json::json!({ "code": code_at(&secret, Utc::now()) })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+            assert_eq!(body["error_code"], "MFA_LOCKED");
+            assert!(body["retry_after_seconds"].as_i64().unwrap() > 0);
+        }
     }
 }

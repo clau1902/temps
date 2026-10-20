@@ -54,8 +54,8 @@ export function ChatProjectsLink({
 function SingleProjectLink({ project }: { project: ProjectRef }) {
   const latest = useQuery({
     ...getLastDeploymentOptions({ path: { id: project.id } }),
-    // A project that never deployed answers with an error; that is a state,
-    // not something to retry.
+    // A project that never deployed answers `deployment: null`.
+    select: (data) => data.deployment ?? null,
     retry: false,
     staleTime: 30_000,
   })

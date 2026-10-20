@@ -892,7 +892,9 @@ jobs:
         if: github.ref == 'refs/heads/main' && steps.nextest-seed.outputs.publish-current == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: temps-nextest-target-seed-v2
+          # Lockfile/rustc-fingerprinted, so a dependency bump publishes a new
+          # seed instead of waiting for the old one to near expiry.
+          name: ${{ steps.nextest-seed.outputs.seed-name }}
           path: nextest-target-seed.tar.zst
           compression-level: 0
           retention-days: 7
@@ -952,7 +954,7 @@ jobs:
               package(temps-audit) or package(temps-analytics-performance))
               and kind(=lib)
           - group: unit-b
-            # `not (temps-git and *_real_api)`: those six tests call the live
+            # `not (temps-git and *_real_api)`: those tests call the live
             # github.com / gitlab.com REST APIs unauthenticated, so they share
             # a per-IP rate limit with every other job on the runner fleet.
             # They only tolerate `RateLimitExceeded`, but a throttled provider

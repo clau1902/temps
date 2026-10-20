@@ -26,13 +26,13 @@ const RUN_STATE_STYLES: Record<
   },
   finished: {
     Icon: CircleCheck,
-    className: 'text-emerald-600 dark:text-emerald-400',
+    className: 'text-emerald-700 dark:text-emerald-400',
   },
   error: { Icon: CircleAlert, className: 'text-destructive' },
   stopped: { Icon: CircleStop, className: 'text-muted-foreground' },
   interrupted: {
     Icon: CircleAlert,
-    className: 'text-amber-600 dark:text-amber-400',
+    className: 'text-amber-700 dark:text-amber-400',
   },
 }
 

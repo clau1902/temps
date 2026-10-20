@@ -693,6 +693,7 @@ impl WorkloadImporter for DockerImporter {
             memory_limit: None,
             source_type: temps_entities::source_type::SourceType::Git,
             template_slug: None,
+            hosting: Default::default(),
         };
 
         let project = project_service
@@ -815,7 +816,7 @@ impl WorkloadImporter for DockerImporter {
                 deployment_id: Set(deployment.id),
                 container_id: Set(plan.source_id.clone()),
                 container_name: Set(container_name.clone()),
-                container_port: Set(port_mapping.container_port as i32),
+                container_port: Set(Some(port_mapping.container_port as i32)),
                 host_port: Set(port_mapping.host_port.map(|p| p as i32)),
                 image_name: Set(Some(plan.deployment.image.clone())),
                 status: Set(Some("running".to_string())),

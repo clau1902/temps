@@ -14,11 +14,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::build_protocol::{
+    dockerfile_build_arg_names, dockerfile_reads_build_arg, is_worker_build_arg_name,
     validate_archive_path, BuildEvent, BuildFailureKind, BuildSpec, DockerIgnore,
-    BUILD_PROTOCOL_VERSION, CACHE_MOUNT_NAMESPACE_ARG, MAX_BUILD_CONTEXT_BYTES,
-    MAX_BUILD_CONTEXT_ENTRIES, MAX_BUILD_EVENT_BYTES, WORKSPACE_ROOT_IGNORE_MARKER,
+    CACHE_MOUNT_NAMESPACE_ARG, MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES,
+    MAX_BUILD_EVENT_BYTES, MAX_BUILD_SPEC_BYTES, WORKSPACE_ROOT_IGNORE_MARKER,
 };
 
+use crate::image_scan::{
+    ImageScanReport, ImageScanRequest, MAX_SCAN_FINDINGS, MAX_SCAN_REPORT_BYTES,
+};
 use crate::{
     BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ContainerDeployer,
     ContainerInfo, ContainerStats, DeployRequest, DeployResult, DeployerError, ImageBuilder,
@@ -33,9 +37,20 @@ const IMAGE_IMPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// same reason as [`IMAGE_IMPORT_REQUEST_TIMEOUT`] — the control plane should
 /// see the worker's own timeout response rather than a client-side cutoff.
 const IMAGE_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
-const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// Longest a worker build request stays open: the agent's 30-minute window to
+/// admit the build and receive its context (the queue wait is part of it),
+/// then a fresh 30-minute build deadline that starts once the build holds a
+/// slot, plus a minute so the agent's own timeout answer arrives before this
+/// client gives up. A build that queued must not lose build time to the time
+/// it spent queued.
+pub const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(61 * 60);
 /// Slightly exceeds the worker's 30-minute export deadline.
 const IMAGE_EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// A node scan waits for an image-operation slot, then runs the scanner;
+/// the request outlasts both of the agent's deadlines.
+const IMAGE_SCAN_REQUEST_TIMEOUT: Duration = crate::image_scan::SCAN_REQUEST_TIMEOUT;
+/// How often a busy build node is asked again whether a slot is free.
+const BUILD_CAPACITY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Longest agent error body quoted back into a deployment log.
 const MAX_AGENT_ERROR_BYTES: usize = 4 * 1024;
 
@@ -43,15 +58,25 @@ async fn bounded_agent_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     operation: &str,
 ) -> Result<T, BuilderError> {
+    bounded_json(response, operation, MAX_BUILD_EVENT_BYTES).await
+}
+
+/// Read a JSON response body of at most `limit` bytes, stopping as soon as
+/// the limit is crossed rather than buffering what a node chooses to send.
+async fn bounded_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+    limit: usize,
+) -> Result<T, BuilderError> {
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             BuilderError::Other(format!("{operation}: response stream failed: {error}"))
         })?;
-        if body.len().saturating_add(chunk.len()) > MAX_BUILD_EVENT_BYTES {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Err(BuilderError::ResourceLimitExceeded(format!(
-                "{operation}: response exceeds {MAX_BUILD_EVENT_BYTES} bytes"
+                "{operation}: response exceeds {limit} bytes"
             )));
         }
         body.extend_from_slice(&chunk);
@@ -290,7 +315,7 @@ fn read_ignore_file(root: &Path, relative: &Path) -> Result<String, BuilderError
     Ok(contents)
 }
 
-fn prepare_build_context(
+pub fn prepare_build_context(
     request: &BuildRequest,
 ) -> Result<(tempfile::NamedTempFile, BuildSpec), BuilderError> {
     if !request.cache_from.is_empty() {
@@ -344,61 +369,59 @@ fn prepare_build_context(
             "Worker build Dockerfile must be a regular file".into(),
         ));
     }
-    // The planner includes every resolved environment value in build_args,
-    // including credentials, even when a Dockerfile does not use them. Do not
-    // transfer any of those values to a worker. An ARG that would receive one
-    // of them needs an explicit credential-handling design before remote
-    // builds can preserve the local builder's semantics safely; an ARG that
-    // receives none (its default, or empty) builds identically without them.
-    if !request.build_args.is_empty() || !request.build_args_buildkit.is_empty() {
+    // Build-argument values travel to the worker inside the spec, over the
+    // node's authenticated build channel. Which values may leave the control
+    // plane at all is the caller's decision -- `BuildImageJob` never passes a
+    // value marked secret or a platform credential to a worker builder. Here
+    // a worker additionally receives only what its Dockerfile can read, so no
+    // value crosses that the build has no use for.
+    let mut supplied = request.build_args.clone();
+    supplied.extend(
+        request
+            .build_args_buildkit
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    // The cache namespace is derived by the control plane per project,
+    // environment and ref, and keeps builds of different projects on the
+    // same worker from reading or poisoning each other's cache mounts. It is
+    // BuildKit's own argument, so it has its own field.
+    let cache_namespace = supplied.remove(CACHE_MOUNT_NAMESPACE_ARG);
+    let build_args = if supplied.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
         let contents =
             std::fs::read_to_string(root.join(&dockerfile)).map_err(BuilderError::IoError)?;
-        let Some(declared) = dockerfile_build_arg_names(&contents) else {
-            return Err(BuilderError::InvalidContext(format!(
-                "Worker builds cannot use the ARG instructions in '{}': a declaration spans \
-                 several lines or names a variable reference, so it cannot be confirmed that \
-                 no build-argument value would be lost. Declare one ARG per line, or build on \
-                 the control plane",
-                dockerfile.display()
-            )));
-        };
-        let lost: std::collections::BTreeSet<&str> = request
-            .build_args
-            .keys()
-            .chain(request.build_args_buildkit.keys())
-            .map(String::as_str)
-            .filter(|supplied| {
-                declared
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(supplied))
-            })
-            .collect();
-        if !lost.is_empty() {
-            // Names only: the values are exactly what must not leave here.
-            return Err(BuilderError::InvalidContext(format!(
-                "Worker builds cannot pass build-argument values yet, but '{}' declares ARG {} \
-                 for a project variable that the build would silently lose. Build on the \
-                 control plane, or remove the ARG",
-                dockerfile.display(),
-                lost.into_iter().collect::<Vec<_>>().join(", ")
-            )));
+        match dockerfile_build_arg_names(&contents) {
+            Some(declared) => supplied
+                .into_iter()
+                .filter(|(name, _)| dockerfile_reads_build_arg(&declared, name))
+                .collect(),
+            // An ARG names a variable reference, so which values it reads
+            // cannot be told here; the caller has already limited them to
+            // values that may leave the control plane.
+            None => supplied.into_iter().collect(),
         }
+    };
+    if let Some(name) = build_args
+        .keys()
+        .find(|name| !is_worker_build_arg_name(name))
+    {
+        // Names only: the values are exactly what must not be quoted.
+        return Err(BuilderError::InvalidContext(format!(
+            "Worker builds cannot pass build argument '{}': it is not a valid ARG name, or is \
+             a BUILDKIT_* argument a worker sets itself. Rename the variable, or build on the \
+             control plane",
+            name.escape_debug()
+        )));
     }
-    // The cache namespace is the one argument a worker receives: it is
-    // derived by the control plane per project, environment and ref, carries
-    // no project variable, and keeps builds of different projects on the same
-    // worker from reading or poisoning each other's cache mounts.
-    let cache_namespace = request
-        .build_args
-        .get(CACHE_MOUNT_NAMESPACE_ARG)
-        .or_else(|| request.build_args_buildkit.get(CACHE_MOUNT_NAMESPACE_ARG))
-        .cloned();
     let spec = BuildSpec {
-        version: BUILD_PROTOCOL_VERSION,
+        version: BuildSpec::version_for(&build_args),
         image_name: request.image_name.clone(),
         dockerfile: dockerfile.to_string_lossy().into_owned(),
         platform: request.platform.clone(),
         cache_namespace,
+        build_args,
     };
     spec.validate().map_err(BuilderError::InvalidContext)?;
     let archive_file = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
@@ -428,55 +451,6 @@ fn prepare_build_context(
         )));
     }
     Ok((archive_file, spec))
-}
-
-/// The names a Dockerfile declares with `ARG` (or `ONBUILD ARG`), or `None`
-/// when a declaration cannot be read with certainty.
-///
-/// Conservative: false positives only refuse a build, while a missed ARG
-/// could change its result after we intentionally discard all arguments.
-/// Every physical line is treated as a possible instruction, so a
-/// continuation or heredoc line that happens to start with `ARG` only adds
-/// names. A declaration continued onto another line (either escape
-/// character) or naming a `$` reference is not read at all: `None`.
-fn dockerfile_build_arg_names(contents: &str) -> Option<std::collections::BTreeSet<String>> {
-    let mut names = std::collections::BTreeSet::new();
-    for line in contents.trim_start_matches('\u{feff}').lines() {
-        let mut words = line.split_whitespace();
-        let Some(instruction) = words.next() else {
-            continue;
-        };
-        if instruction.starts_with('#') {
-            continue;
-        }
-        let declares = instruction.eq_ignore_ascii_case("ARG")
-            || (instruction.eq_ignore_ascii_case("ONBUILD")
-                && words
-                    .next()
-                    .is_some_and(|word| word.eq_ignore_ascii_case("ARG")));
-        if !declares {
-            continue;
-        }
-        let line = line.trim_end();
-        if line.ends_with('\\') || line.ends_with('`') {
-            return None;
-        }
-        let mut declared_any = false;
-        for word in words {
-            // `NAME=default`; a quoted default containing spaces only adds
-            // spurious names, never hides one.
-            let name = word.split('=').next().unwrap_or_default();
-            if name.is_empty() || name.contains('$') {
-                return None;
-            }
-            names.insert(name.to_string());
-            declared_any = true;
-        }
-        if !declared_any {
-            return None;
-        }
-    }
-    Some(names)
 }
 
 async fn dispatch_build_event(
@@ -509,15 +483,21 @@ async fn dispatch_build_event(
 /// reason `import_image` below builds its own request rather than sharing a
 /// DTO type), so this struct only needs to serialize to the JSON body the
 /// agent handler already deserializes.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RemotePullCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// **Never logged or included in error messages.**
+    // Published as a credential, but a `String` here: this struct is
+    // serialized to the agent, and `SecretString` serializes as a mask.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<temps_core::secret_string::SecretString>)]
     pub password: Option<String>,
     /// **Never logged or included in error messages.**
+    // Published as a credential, but a `String` here: this struct is
+    // serialized to the agent, and `SecretString` serializes as a mask.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<temps_core::secret_string::SecretString>)]
     pub identity_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_address: Option<String>,
@@ -569,6 +549,9 @@ pub struct RemoteNodeDeployer {
     /// filled in from the agent's health endpoint with
     /// [`Self::refresh_platform`].
     platform: std::sync::Arc<std::sync::OnceLock<String>>,
+    build_limits: crate::build_protocol::BuildLimits,
+    build_limits_version: u64,
+    runtime_health_mtls: bool,
 }
 
 impl RemoteNodeDeployer {
@@ -593,6 +576,9 @@ impl RemoteNodeDeployer {
             node_name,
             client,
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build_limits: Default::default(),
+            build_limits_version: 0,
+            runtime_health_mtls: false,
         })
     }
 
@@ -625,6 +611,7 @@ impl RemoteNodeDeployer {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .use_rustls_tls()
+            .redirect(reqwest::redirect::Policy::none())
             .identity(identity)
             .add_root_certificate(ca)
             .tls_built_in_root_certs(false)
@@ -642,7 +629,143 @@ impl RemoteNodeDeployer {
             node_name,
             client,
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build_limits: Default::default(),
+            build_limits_version: 0,
+            runtime_health_mtls: true,
         })
+    }
+
+    /// Runtime probes require the pinned-CA mTLS constructor. Never inherit
+    /// the legacy agent client's installation-wide insecure TLS opt-in.
+    pub async fn runtime_health_request<T: serde::de::DeserializeOwned>(
+        &self,
+        action: &str,
+        body: Option<&impl serde::Serialize>,
+    ) -> Result<T, DeployerError> {
+        if !self.runtime_health_mtls
+            || !self.agent_url.starts_with("https://")
+            || !matches!(action, "" | "report")
+        {
+            return Err(DeployerError::NetworkError("Runtime health requires a mutually authenticated worker and a supported protocol action".into()));
+        }
+        let url = format!(
+            "{}/agent/runtime-health{}{}",
+            self.agent_url.trim_end_matches('/'),
+            if action.is_empty() { "" } else { "/" },
+            action
+        );
+        let builder = if let Some(body) = body {
+            self.client.post(url).json(body)
+        } else {
+            self.client.get(url)
+        };
+        let response = builder
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| {
+                DeployerError::NetworkError("Runtime health management request failed".into())
+            })?;
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > 65_536)
+        {
+            return Err(DeployerError::NetworkError(
+                "Worker runtime health protocol is unavailable or rejected the request".into(),
+            ));
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| {
+                DeployerError::NetworkError("Worker runtime health response was interrupted".into())
+            })?;
+            if bytes.len() + chunk.len() > 65_536 {
+                return Err(DeployerError::NetworkError(
+                    "Worker runtime health response exceeded its bound".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| {
+            DeployerError::NetworkError("Worker runtime health response is invalid".into())
+        })
+    }
+
+    pub async fn runtime_health_revoke(
+        &self,
+        request: &temps_runtime_health::host::RevokeRequest,
+    ) -> Result<(), DeployerError> {
+        if !self.runtime_health_mtls || !self.agent_url.starts_with("https://") {
+            return Err(DeployerError::NetworkError(
+                "Runtime health requires a mutually authenticated worker".into(),
+            ));
+        }
+        let response = self
+            .client
+            .post(format!(
+                "{}/agent/runtime-health/revoke",
+                self.agent_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.token)
+            .json(request)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| DeployerError::NetworkError("Runtime health revocation failed".into()))?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(DeployerError::NetworkError(
+                "Worker did not acknowledge runtime health revocation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn runtime_health_authorize(
+        &self,
+        request: &temps_runtime_health::host::LeaseRequest,
+    ) -> Result<(), DeployerError> {
+        if !self.runtime_health_mtls || !self.agent_url.starts_with("https://") {
+            return Err(DeployerError::NetworkError(
+                "Runtime health requires a mutually authenticated worker".into(),
+            ));
+        }
+        let response = self
+            .client
+            .post(format!(
+                "{}/agent/runtime-health/authorize",
+                self.agent_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.token)
+            .json(request)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| {
+                DeployerError::NetworkError("Runtime health authorization failed".into())
+            })?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(DeployerError::NetworkError(
+                "Worker rejected runtime health authorization".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn with_build_limits_version(mut self, version: u64) -> Self {
+        self.build_limits_version = version;
+        self
+    }
+    pub fn with_build_limits(mut self, limits: crate::build_protocol::BuildLimits) -> Self {
+        self.build_limits = limits;
+        self
+    }
+
+    pub fn build_queue_wait(&self) -> Duration {
+        Duration::from_secs(u64::from(self.build_limits.queue_wait_seconds))
     }
 
     /// Record the node's container platform, as stored on its `nodes` row.
@@ -1044,6 +1167,38 @@ pub struct RemoteExecResult {
 
 #[async_trait]
 impl ContainerDeployer for RemoteNodeDeployer {
+    async fn exec_in_container(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> Result<crate::ExecResult, DeployerError> {
+        let result = tokio::time::timeout(
+            timeout,
+            self.agent_post::<_, RemoteExecResult>(
+                &format!("/agent/containers/{container_id}/health-exec"),
+                &serde_json::json!({ "command": command, "timeout_seconds": timeout.as_secs().max(1) }),
+            ),
+        )
+        .await
+        .map_err(|_| DeployerError::ExecTimeout {
+            container_id: container_id.to_string(),
+            timeout_secs: timeout.as_secs(),
+        })??;
+        let exit_code = result.exit_code.ok_or_else(|| DeployerError::ExecFailed {
+            container_id: container_id.to_string(),
+            reason: "worker returned no exec exit code; upgrade the worker agent".to_string(),
+        })?;
+        let mut output = Vec::with_capacity(crate::MAX_EXEC_OUTPUT_BYTES);
+        let mut truncated = crate::append_exec_output(&mut output, result.stdout.as_bytes());
+        truncated |= crate::append_exec_output(&mut output, result.stderr.as_bytes());
+        Ok(crate::ExecResult {
+            exit_code,
+            output: crate::exec_output_string(&output),
+            truncated,
+        })
+    }
+
     async fn deploy_container(
         &self,
         request: DeployRequest,
@@ -1175,8 +1330,156 @@ impl ContainerDeployer for RemoteNodeDeployer {
     }
 }
 
+/// Whether a build node has a free build slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildCapacity {
+    /// A slot is free, so a build starts at once.
+    Free,
+    /// The node did not say (an agent that predates the report, or one that
+    /// did not answer). Callers proceed: a build then reports its own failure.
+    Unknown,
+    /// Every slot stayed taken for the whole wait, so a build would queue.
+    Busy,
+}
+
+/// Poll `probe` (the node's free build slots, `None` when unknown) every
+/// `interval` until a slot is free or `max_wait` has passed. Returns the
+/// outcome and how long it waited.
+///
+/// `max_wait` bounds the whole call, probes included: once a probe has seen
+/// the node busy, a later probe still in flight when the window runs out is
+/// dropped and the node is reported busy. The first probe is always allowed
+/// to answer (it is what tells busy from unknown, so a zero window still
+/// checks once), bounded only by the probe's own timeout.
+pub async fn wait_for_free_build_slot<F, Fut>(
+    mut probe: F,
+    max_wait: Duration,
+    interval: Duration,
+) -> (BuildCapacity, Duration)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<u32>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut seen_busy = false;
+    loop {
+        let answer = if seen_busy {
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            match tokio::time::timeout(remaining, probe()).await {
+                Ok(answer) => answer,
+                Err(_) => return (BuildCapacity::Busy, started.elapsed()),
+            }
+        } else {
+            probe().await
+        };
+        match answer {
+            None => return (BuildCapacity::Unknown, started.elapsed()),
+            Some(free) if free > 0 => return (BuildCapacity::Free, started.elapsed()),
+            Some(_) => seen_busy = true,
+        }
+        let waited = started.elapsed();
+        if waited >= max_wait {
+            return (BuildCapacity::Busy, waited);
+        }
+        tokio::time::sleep(interval.min(max_wait - waited)).await;
+    }
+}
+
+impl RemoteNodeDeployer {
+    /// Wait up to `max_wait` for this node to have a free build slot.
+    ///
+    /// The agent queues builds itself; this lets the caller decide what to do
+    /// with a node that stays busy (build elsewhere) before a context is
+    /// archived and uploaded to it.
+    pub async fn wait_for_build_capacity(&self, max_wait: Duration) -> (BuildCapacity, Duration) {
+        #[derive(Deserialize)]
+        struct HealthSlots {
+            #[serde(default)]
+            build_slots_available: Option<u32>,
+            #[serde(default)]
+            build_concurrency_limit: Option<u32>,
+        }
+        wait_for_free_build_slot(
+            || async {
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.agent_get::<HealthSlots>("/agent/health"),
+                )
+                .await
+                {
+                    Ok(Ok(health)) => {
+                        match (health.build_slots_available, health.build_concurrency_limit) {
+                            // A settings change must not wait for a build to update
+                            // the agent before that build can pass this probe.
+                            (Some(free), Some(limit)) => Some(
+                                u32::from(self.build_limits.concurrency)
+                                    .saturating_sub(limit.saturating_sub(free)),
+                            ),
+                            (free, None) => free,
+                            (None, Some(_)) => None,
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => None,
+                }
+            },
+            max_wait,
+            BUILD_CAPACITY_POLL_INTERVAL,
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl ImageBuilder for RemoteNodeDeployer {
+    async fn fetch_registry_image(
+        &self,
+        reference: &str,
+        tag: &str,
+        credentials: Option<RemotePullCredentials>,
+    ) -> Result<(), BuilderError> {
+        #[derive(Serialize)]
+        struct Request<'a> {
+            reference: &'a str,
+            tag: &'a str,
+            credentials: Option<RemotePullCredentials>,
+        }
+        let response = self
+            .client
+            .post(format!("{}/agent/images/fetch", self.agent_url))
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_IMPORT_REQUEST_TIMEOUT)
+            .json(&Request {
+                reference,
+                tag,
+                credentials,
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Registry transfer on node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = agent_error_detail(response).await;
+            return Err(BuilderError::Other(format!(
+                "Registry transfer on node '{}' returned HTTP {status}: {detail}",
+                self.node_name
+            )));
+        }
+        let response: AgentResponse<bool> =
+            bounded_agent_json(response, "Registry transfer").await?;
+        if !response.success || response.data != Some(true) {
+            return Err(BuilderError::Other(format!(
+                "Registry transfer on node '{}' did not confirm success",
+                self.node_name
+            )));
+        }
+        Ok(())
+    }
+
     async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
         self.build_image_with_callback(BuildRequestWithCallback {
             request,
@@ -1193,6 +1496,30 @@ impl ImageBuilder for RemoteNodeDeployer {
             request,
             log_callback,
         } = request;
+        if self.build_limits != crate::build_protocol::BuildLimits::default() {
+            #[derive(Deserialize)]
+            struct Support {
+                #[serde(default)]
+                build_limits_supported: bool,
+            }
+            let supported = matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.agent_get::<Support>("/agent/health")
+                )
+                .await,
+                Ok(Ok(Support {
+                    build_limits_supported: true
+                }))
+            );
+            if let Some(callback) = &log_callback {
+                callback(if supported {
+                    format!("Builder '{}': concurrency {}, queue wait {}s, build deadline {}s", self.node_name, self.build_limits.concurrency, self.build_limits.queue_wait_seconds, self.build_limits.build_timeout_seconds)
+                } else {
+                    format!("Builder '{}' has not confirmed custom limit support; an older agent retains fixed limits. Upgrade its Temps agent to enforce this node's settings", self.node_name)
+                }).await;
+            }
+        }
         let node_name = self.node_name.clone();
         let (archive, spec) = tokio::task::spawn_blocking(move || prepare_build_context(&request))
             .await
@@ -1218,6 +1545,15 @@ impl ImageBuilder for RemoteNodeDeployer {
         let spec_json = serde_json::to_string(&spec).map_err(|error| {
             BuilderError::Other(format!("Cannot encode worker build spec: {error}"))
         })?;
+        if spec_json.len() > MAX_BUILD_SPEC_BYTES {
+            return Err(BuilderError::ResourceLimitExceeded(format!(
+                "Worker build spec for node '{}' is {} bytes, more than the {} bytes a worker \
+                 accepts; reduce the size of the build-argument values",
+                self.node_name,
+                spec_json.len(),
+                MAX_BUILD_SPEC_BYTES
+            )));
+        }
         let form = reqwest::multipart::Form::new()
             .text("spec", spec_json)
             .part("context", context);
@@ -1226,7 +1562,27 @@ impl ImageBuilder for RemoteNodeDeployer {
             .client
             .post(&url)
             .bearer_auth(&self.token)
-            .timeout(IMAGE_BUILD_REQUEST_TIMEOUT)
+            .header("x-temps-build-concurrency", self.build_limits.concurrency)
+            .header("x-temps-build-limits-version", self.build_limits_version)
+            .header(
+                "x-temps-build-queue-seconds",
+                self.build_limits.queue_wait_seconds,
+            )
+            .header(
+                "x-temps-build-timeout-seconds",
+                self.build_limits.build_timeout_seconds,
+            )
+            // Older agents ignore the new headers and retain fixed deadlines.
+            // Keep their transport allowance while newer agents enforce shorter
+            // configured deadlines themselves.
+            .timeout(
+                Duration::from_secs(
+                    1800 + u64::from(self.build_limits.queue_wait_seconds)
+                        + u64::from(self.build_limits.build_timeout_seconds)
+                        + 60,
+                )
+                .max(IMAGE_BUILD_REQUEST_TIMEOUT),
+            )
             .multipart(form)
             .send()
             .await
@@ -1241,8 +1597,24 @@ impl ImageBuilder for RemoteNodeDeployer {
         if !response.status().is_success() {
             let status = response.status();
             let detail = agent_error_detail(response).await;
+            // An agent that predates build arguments refuses version 2.
+            let upgrade = if detail.contains("Unsupported worker build protocol version") {
+                ". This worker runs an older Temps agent that cannot receive build arguments; \
+                 upgrade Temps on the worker"
+            } else {
+                ""
+            };
+            // The agent answers 503 when no build slot became free within its
+            // queue window. Nothing was built, which is what lets a caller
+            // that can build elsewhere do so.
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                return Err(BuilderError::Busy(format!(
+                    "Worker '{}' had no free build slot (HTTP {status}): {detail}",
+                    self.node_name
+                )));
+            }
             return Err(BuilderError::Other(format!(
-                "Worker '{}' refused image build (HTTP {status}): {detail}",
+                "Worker '{}' refused image build (HTTP {status}): {detail}{upgrade}",
                 self.node_name
             )));
         }
@@ -1465,6 +1837,73 @@ impl ImageBuilder for RemoteNodeDeployer {
         })))
     }
 
+    async fn scan_image_vulnerabilities(
+        &self,
+        image_name: &str,
+        expected_image_id: Option<&str>,
+    ) -> Result<Option<ImageScanReport>, BuilderError> {
+        let response = self
+            .client
+            .post(format!("{}/agent/images/scan", self.agent_url))
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_SCAN_REQUEST_TIMEOUT)
+            .json(&ImageScanRequest {
+                image: image_name.to_string(),
+                expected_image_id: expected_image_id.map(str::to_string),
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot scan image '{image_name}' on node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            // An agent that predates the endpoint answers with the router's
+            // empty 404 or 405. A node that has the endpoint but not the
+            // image answers 404 with a problem body, which is a real failure.
+            let is_problem = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("json"));
+            let route_missing = matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            ) && !is_problem;
+            let detail = agent_error_detail(response).await;
+            if route_missing {
+                tracing::debug!(
+                    node = %self.node_name,
+                    "Node does not serve /agent/images/scan (HTTP {status}); scanning locally"
+                );
+                return Ok(None);
+            }
+            return Err(match status {
+                reqwest::StatusCode::NOT_FOUND => BuilderError::ImageNotFound(format!(
+                    "Node '{}' has no image '{image_name}' to scan: {detail}",
+                    self.node_name
+                )),
+                _ => BuilderError::Other(format!(
+                    "Node '{}' could not scan image '{image_name}' (HTTP {status}): {detail}",
+                    self.node_name
+                )),
+            });
+        }
+        let operation = format!("Scan image '{image_name}' on node '{}'", self.node_name);
+        let report: ImageScanReport =
+            bounded_json(response, &operation, MAX_SCAN_REPORT_BYTES).await?;
+        if report.findings.len() > MAX_SCAN_FINDINGS {
+            return Err(BuilderError::ResourceLimitExceeded(format!(
+                "{operation}: report lists {} findings, more than the {MAX_SCAN_FINDINGS} limit",
+                report.findings.len()
+            )));
+        }
+        Ok(Some(report))
+    }
+
     /// Extract from an image that lives on this worker.
     ///
     /// The worker only streams the raw archive; it is unpacked here under the
@@ -1675,98 +2114,121 @@ mod tests {
         }
     }
 
+    /// Issue #1344: a Dockerfile's `ARG` receives its value on a worker,
+    /// exactly as `docker build --build-arg` would give it locally. Only the
+    /// values the Dockerfile reads are sent, in the spec and nowhere else.
     #[test]
-    fn worker_build_refuses_dockerfile_arg_with_sensitive_arguments() {
-        let source = tempfile::tempdir().expect("source");
-        std::fs::write(
-            source.path().join("Dockerfile"),
-            "FROM scratch\nARG TOKEN\n",
-        )
-        .expect("Dockerfile");
-        let mut request = context_request(source.path(), None);
-        request
-            .build_args
-            .insert("TOKEN".into(), "must-not-transfer".into());
-        match prepare_build_context(&request) {
-            Err(BuilderError::InvalidContext(message)) => {
-                assert!(message.contains("Worker builds cannot"), "{message}");
-                assert!(message.contains("ARG TOKEN"), "{message}");
-                assert!(!message.contains("must-not-transfer"));
-            }
-            other => panic!("expected InvalidContext, got {:?}", other.map(|_| ())),
-        }
-        assert!(dockerfile_build_arg_names("FROM base\nONBUILD ARG TOKEN\n")
-            .expect("parsed")
-            .contains("TOKEN"));
-    }
-
-    /// An ARG that no supplied value targets builds identically without the
-    /// discarded arguments, so the worker accepts it -- including the
-    /// generated form and a pinned default -- and still transfers no value.
-    #[test]
-    fn worker_build_accepts_dockerfile_args_that_receive_no_value() {
+    fn worker_build_transfers_values_the_dockerfile_declares() {
         let source = tempfile::tempdir().expect("source");
         std::fs::write(
             source.path().join("Dockerfile"),
             "# syntax=docker/dockerfile:1\nARG NODE_VERSION=22\nFROM node:${NODE_VERSION}\n\
-             arg BUILD_LABEL\nRUN echo build \\\n  ARG unrelated\n",
+             ARG API_URL \\\n    BUILD_LABEL=local\nONBUILD ARG LATER\n\
+             RUN echo \"$API_URL\" > /api-url\n",
         )
         .expect("Dockerfile");
+        std::fs::write(source.path().join("app"), "hello").expect("app");
         let mut request = context_request(source.path(), None);
+        for (name, value) in [
+            ("API_URL", "https://api.example.test/v1"),
+            ("BUILD_LABEL", "synthetic-label"),
+            ("UNREAD_RUNTIME_VALUE", "must-not-transfer"),
+            (CACHE_MOUNT_NAMESPACE_ARG, "ns-app-main"),
+        ] {
+            request.build_args.insert(name.into(), value.into());
+        }
         request
-            .build_args
-            .insert("TEMPS_API_TOKEN".into(), "must-not-transfer".into());
-        request
-            .build_args
-            .insert("BUILDKIT_CACHE_MOUNT_NS".into(), "namespace".into());
+            .build_args_buildkit
+            .insert("LATER".into(), "from-buildkit-map".into());
+
         let (archive, spec) = prepare_build_context(&request).expect("accepted");
+        assert_eq!(
+            spec.version,
+            crate::build_protocol::BUILD_PROTOCOL_VERSION_BUILD_ARGS
+        );
+        assert_eq!(spec.cache_namespace.as_deref(), Some("ns-app-main"));
+        assert_eq!(
+            spec.build_args,
+            std::collections::BTreeMap::from([
+                (
+                    "API_URL".to_string(),
+                    "https://api.example.test/v1".to_string()
+                ),
+                ("BUILD_LABEL".to_string(), "synthetic-label".to_string()),
+                ("LATER".to_string(), "from-buildkit-map".to_string()),
+            ])
+        );
+        spec.validate().expect("a worker accepts the spec");
         let spec_json = serde_json::to_string(&spec).expect("serialize spec");
-        assert!(!spec_json.contains("must-not-transfer"));
+        assert!(!spec_json.contains("must-not-transfer"), "{spec_json}");
+        // Values travel in the spec only, never in the uploaded context.
         let mut tar = tar::Archive::new(archive.reopen().expect("reopen archive"));
         for entry in tar.entries().expect("entries") {
             let mut entry = entry.expect("entry");
             let mut body = String::new();
             use std::io::Read;
             entry.read_to_string(&mut body).expect("entry body");
-            assert!(!body.contains("must-not-transfer"));
+            for value in ["api.example.test", "synthetic-label", "must-not-transfer"] {
+                assert!(!body.contains(value), "context carries '{value}'");
+            }
         }
-
-        // Case differences and buildkit arguments still count as a lost value.
-        std::fs::write(
-            source.path().join("Dockerfile"),
-            "FROM scratch\nARG temps_api_token\n",
-        )
-        .expect("Dockerfile");
-        assert!(matches!(
-            prepare_build_context(&request),
-            Err(BuilderError::InvalidContext(_))
-        ));
-        let mut buildkit = context_request(source.path(), None);
-        buildkit
-            .build_args_buildkit
-            .insert("TEMPS_API_TOKEN".into(), "must-not-transfer".into());
-        assert!(matches!(
-            prepare_build_context(&buildkit),
-            Err(BuilderError::InvalidContext(_))
-        ));
     }
 
+    /// A value whose Dockerfile does not read it stays on the control plane,
+    /// and a build with no value to send still speaks protocol v1, so a worker
+    /// that has not been upgraded keeps building it.
     #[test]
-    fn dockerfile_build_arg_names_reads_only_what_it_can_confirm() {
-        let names = |contents: &str| {
-            dockerfile_build_arg_names(contents).map(|names| names.into_iter().collect::<Vec<_>>())
-        };
-        assert_eq!(names("FROM scratch\n"), Some(vec![]));
-        assert_eq!(
-            names("\u{feff}ARG A=1 B\n  arg\tC=\"x y\"\n# ARG COMMENTED\nRUN echo ARG\n"),
-            Some(vec!["A".into(), "B".into(), "C".into(), "y\"".into()])
+    fn worker_build_sends_no_value_the_dockerfile_does_not_read() {
+        let source = tempfile::tempdir().expect("source");
+        // ARG names are case-sensitive: `temps_api_token` does not read
+        // `TEMPS_API_TOKEN`. A continued RUN line is not an ARG.
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nARG temps_api_token\nRUN echo build \\\n  ARG UNRELATED\n",
+        )
+        .expect("Dockerfile");
+        for buildkit in [false, true] {
+            let mut request = context_request(source.path(), None);
+            let args = if buildkit {
+                &mut request.build_args_buildkit
+            } else {
+                &mut request.build_args
+            };
+            args.insert("TEMPS_API_TOKEN".into(), "must-not-transfer".into());
+            args.insert("UNRELATED".into(), "must-not-transfer".into());
+            let (_archive, spec) = prepare_build_context(&request).expect("accepted");
+            assert!(spec.build_args.is_empty());
+            assert_eq!(spec.version, crate::build_protocol::BUILD_PROTOCOL_VERSION);
+            let spec_json = serde_json::to_string(&spec).expect("serialize spec");
+            assert!(!spec_json.contains("must-not-transfer"), "{spec_json}");
+            assert!(!spec_json.contains("build_args"), "{spec_json}");
+        }
+    }
+
+    /// BuildKit's own arguments change how a worker builds (its frontend
+    /// image, cache export), so they are refused by name before anything is
+    /// uploaded, and the refusal never quotes the value.
+    #[test]
+    fn worker_build_refuses_buildkit_and_invalid_argument_names() {
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nARG BUILDKIT_SYNTAX\n",
+        )
+        .expect("Dockerfile");
+        let mut request = context_request(source.path(), None);
+        request.build_args.insert(
+            "BUILDKIT_SYNTAX".into(),
+            "registry.example.test/frontend".into(),
         );
-        // A continued declaration could hide a name on the next line.
-        assert_eq!(names("ARG A \\\n  B\n"), None);
-        assert_eq!(names("# escape=`\nARG A `\n  B\n"), None);
-        // A referenced name cannot be resolved here.
-        assert_eq!(names("ARG ${NAME}\n"), None);
-        assert_eq!(names("ARG\n"), None);
+        match prepare_build_context(&request) {
+            Err(BuilderError::InvalidContext(message)) => {
+                assert!(message.starts_with("Worker builds cannot"), "{message}");
+                assert!(message.contains("BUILDKIT_SYNTAX"), "{message}");
+                assert!(!message.contains("registry.example.test"), "{message}");
+            }
+            other => panic!("expected InvalidContext, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[cfg(unix)]
@@ -1821,8 +2283,8 @@ mod tests {
         }
     }
 
-    /// The control plane's cache namespace is the only build argument a
-    /// worker receives; every other value stays on the control plane.
+    /// The control plane's cache namespace always reaches the worker, in its
+    /// own field; a value the Dockerfile does not read stays here.
     #[test]
     fn worker_build_spec_carries_only_the_cache_namespace() {
         let dir = tempfile::tempdir().unwrap();
@@ -2033,9 +2495,10 @@ mod tests {
     async fn spawn_one_shot_agent(
         status_line: &'static str,
         content_type: &'static str,
-        body: &'static [u8],
+        body: &[u8],
     ) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body = body.to_vec();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock agent");
@@ -2060,7 +2523,7 @@ mod tests {
                 body.len()
             );
             stream.write_all(head.as_bytes()).await.expect("write head");
-            stream.write_all(body).await.expect("write body");
+            stream.write_all(&body).await.expect("write body");
             let _ = stream.shutdown().await;
             String::from_utf8_lossy(&request).to_string()
         });
@@ -2246,6 +2709,279 @@ mod tests {
             .contains("authorization: bearer test-token"));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_build_slot_returns_as_soon_as_one_frees() {
+        let answers = std::sync::Mutex::new(vec![Some(0), Some(0), Some(1)].into_iter());
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                let next = answers.lock().unwrap().next().flatten();
+                async move { next }
+            },
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Free);
+        assert_eq!(waited, Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_stays_busy_is_reported_busy_after_the_whole_window() {
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Some(0) }
+            },
+            Duration::from_secs(12),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        assert_eq!(waited, Duration::from_secs(12));
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_final_probe_cannot_stretch_the_wait_past_its_window() {
+        // First probe answers busy at once; the second starts at 5s and
+        // would only answer at 14s, past the 12s window.
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let (capacity, waited) = wait_for_free_build_slot(
+            || {
+                let n = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n > 0 {
+                        tokio::time::sleep(Duration::from_secs(9)).await;
+                    }
+                    Some(0)
+                }
+            },
+            Duration::from_secs(12),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        assert_eq!(waited, Duration::from_secs(12));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_does_not_report_capacity_is_never_waited_on() {
+        let (capacity, waited) = wait_for_free_build_slot(
+            || async { None },
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(capacity, BuildCapacity::Unknown);
+        assert_eq!(waited, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn wait_for_build_capacity_reads_the_health_report() {
+        let (url, server) = spawn_one_shot_agent(
+            "200 OK",
+            "application/json",
+            br#"{"success":true,"data":{"cpu_percent":1.0,"build_slots_available":0},"error":null}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let (capacity, _) = remote.wait_for_build_capacity(Duration::ZERO).await;
+
+        assert_eq!(capacity, BuildCapacity::Busy);
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /agent/health "), "{request}");
+    }
+
+    #[tokio::test]
+    async fn capacity_probe_applies_changed_limits_before_the_next_build() {
+        for (reported_cap, free, requested_cap, expected) in [
+            (1, 0, 2, BuildCapacity::Free),
+            (3, 1, 1, BuildCapacity::Busy),
+            (3, 1, 3, BuildCapacity::Free),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "success": true,
+                "data": {"build_slots_available": free, "build_concurrency_limit": reported_cap},
+                "error": null,
+            }))
+            .unwrap();
+            let (url, server) = spawn_one_shot_agent("200 OK", "application/json", &body).await;
+            let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder".into())
+                .unwrap()
+                .with_build_limits(crate::build_protocol::BuildLimits {
+                    concurrency: requested_cap,
+                    ..Default::default()
+                });
+            let (capacity, _) = remote.wait_for_build_capacity(Duration::ZERO).await;
+            assert_eq!(
+                capacity, expected,
+                "reported={reported_cap}, free={free}, requested={requested_cap}"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_build_capacity_treats_an_older_agent_as_unknown() {
+        let (url, _server) = spawn_one_shot_agent(
+            "200 OK",
+            "application/json",
+            br#"{"success":true,"data":{"cpu_percent":1.0,"platform":"linux/amd64"},"error":null}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let (capacity, _) = remote
+            .wait_for_build_capacity(Duration::from_secs(60))
+            .await;
+
+        assert_eq!(capacity, BuildCapacity::Unknown);
+    }
+
+    #[tokio::test]
+    async fn inspection_from_an_older_agent_reports_no_image_config() {
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", br#"{"id":"sha256:test","architecture":"arm64","os":"linux","platform":"linux/arm64","size_bytes":1,"tags":["app:1"],"created":null,"working_dir":null}"#).await;
+        let remote = RemoteNodeDeployer::new(url, "test-token".into(), "builder".into()).unwrap();
+        let info = remote.inspect_image("app:1").await.unwrap();
+        assert!(
+            info.config.is_none(),
+            "an agent that does not report the config must read as unknown, not as empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_carries_the_image_config_the_node_reports() {
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", br#"{"id":"sha256:test","architecture":"arm64","os":"linux","platform":"linux/arm64","size_bytes":1,"tags":["app:1"],"created":null,"working_dir":"/app","config":{"exposed_ports":[8080],"user":"app","env":["A=1"],"entrypoint":["/app/server"]}}"#).await;
+        let remote = RemoteNodeDeployer::new(url, "test-token".into(), "builder".into()).unwrap();
+        let info = remote.inspect_image("app:1").await.unwrap();
+        let config = info.config.expect("reported");
+        assert_eq!(config.exposed_ports, vec![8080]);
+        assert_eq!(config.user.as_deref(), Some("app"));
+        assert_eq!(config.entrypoint, vec!["/app/server".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_posts_the_expected_image_id_to_the_owning_node() {
+        let body = serde_json::to_vec(&ImageScanReport {
+            image_id: "sha256:built".into(),
+            scanner: "trivy".into(),
+            scanner_version: Some("0.58.1".into()),
+            findings: Vec::new(),
+        })
+        .unwrap();
+        let body: &'static [u8] = Box::leak(body.into_boxed_slice());
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/json", body).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let report = remote
+            .scan_image_vulnerabilities("app:1", Some("sha256:built"))
+            .await
+            .unwrap()
+            .expect("the node scanned");
+
+        assert_eq!(report.scanner_version.as_deref(), Some("0.58.1"));
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /agent/images/scan "), "{request}");
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer node-token"));
+        assert!(request.contains(r#""image":"app:1""#), "{request}");
+        assert!(
+            request.contains(r#""expected_image_id":"sha256:built""#),
+            "{request}"
+        );
+    }
+
+    /// An agent that predates the endpoint answers with the router's bare
+    /// 404: the caller must scan another way, not report a failed scan.
+    #[tokio::test]
+    async fn scan_against_an_agent_without_the_endpoint_is_not_an_error() {
+        let (url, _server) = spawn_one_shot_agent("404 Not Found", "text/plain", b"").await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let outcome = remote.scan_image_vulnerabilities("app:1", None).await;
+
+        assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+    }
+
+    /// A node that serves the endpoint but lacks the image is a real answer.
+    #[tokio::test]
+    async fn scan_of_an_image_the_node_lacks_is_image_not_found() {
+        let (url, _server) = spawn_one_shot_agent(
+            "404 Not Found",
+            "application/problem+json",
+            br#"{"title":"Image not found","status":404,"detail":"Image 'app:1' is not present on this node"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let error = remote
+            .scan_image_vulnerabilities("app:1", None)
+            .await
+            .expect_err("missing image");
+
+        assert!(matches!(error, BuilderError::ImageNotFound(_)), "{error}");
+        assert!(error.to_string().contains("builder-1"), "{error}");
+    }
+
+    /// A node that now serves a different image under the tag is refused.
+    #[tokio::test]
+    async fn scan_identity_conflict_is_an_error_naming_the_node() {
+        let (url, _server) = spawn_one_shot_agent(
+            "409 Conflict",
+            "application/problem+json",
+            br#"{"title":"Image identity mismatch","status":409,"detail":"tag names another image"}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let error = remote
+            .scan_image_vulnerabilities("app:1", Some("sha256:built"))
+            .await
+            .expect_err("identity conflict");
+
+        assert!(matches!(error, BuilderError::Other(_)), "{error}");
+        assert!(error.to_string().contains("409"), "{error}");
+    }
+
+    /// A node cannot make the control plane buffer or store an arbitrary
+    /// number of findings.
+    #[tokio::test]
+    async fn scan_report_over_the_finding_limit_is_refused() {
+        let finding = serde_json::json!({
+            "vulnerability_id": "CVE-2000-0001",
+            "package_name": "p",
+            "installed_version": "1",
+            "severity": "LOW",
+            "title": "t",
+        });
+        let body = serde_json::to_vec(&serde_json::json!({
+            "image_id": "sha256:built",
+            "scanner": "trivy",
+            "findings": vec![finding; MAX_SCAN_FINDINGS + 1],
+        }))
+        .unwrap();
+        let body: &'static [u8] = Box::leak(body.into_boxed_slice());
+        let (url, _server) = spawn_one_shot_agent("200 OK", "application/json", body).await;
+        let remote = RemoteNodeDeployer::new(url, "node-token".into(), "builder-1".into()).unwrap();
+
+        let error = remote
+            .scan_image_vulnerabilities("app:1", None)
+            .await
+            .expect_err("too many findings");
+
+        assert!(
+            matches!(error, BuilderError::ResourceLimitExceeded(_)),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn export_image_stream_maps_missing_image_to_image_not_found() {
         let (url, _server) = spawn_one_shot_agent(
@@ -2290,6 +3026,45 @@ mod tests {
             message.contains("absent from the uploaded context"),
             "{message}"
         );
+    }
+
+    /// A worker with no free build slot refuses with 503 before building
+    /// anything. That is a distinct, typed answer so a caller that can build
+    /// elsewhere may, instead of failing the deployment.
+    #[tokio::test]
+    async fn worker_build_with_no_free_slot_is_a_typed_busy_refusal() {
+        let (url, _server) = spawn_one_shot_agent(
+            "503 Service Unavailable",
+            "application/problem+json",
+            br#"{"title":"Image operation unavailable","status":503,"detail":"Builder is busy: no build slot became free within 600s"}"#,
+        )
+        .await;
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".into(), "builder-1".into()).expect("deployer");
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+
+        let error = deployer
+            .build_image(context_request(source.path(), None))
+            .await
+            .expect_err("agent was busy");
+
+        match error {
+            BuilderError::Busy(message) => {
+                assert!(message.contains("builder-1"), "{message}");
+                assert!(message.contains("Builder is busy"), "{message}");
+            }
+            other => panic!("expected Busy, got {other}"),
+        }
+    }
+
+    /// The agent may spend up to 30 minutes admitting a build (the queue wait
+    /// is part of that window) and then 30 more building it; the client must
+    /// not cut the request off before the worker's own deadlines.
+    #[test]
+    fn worker_build_request_outlasts_admission_plus_build() {
+        let admission_and_build = Duration::from_secs(2 * 30 * 60);
+        assert!(IMAGE_BUILD_REQUEST_TIMEOUT > admission_and_build);
     }
 
     #[test]
@@ -2593,8 +3368,10 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A refused build argument is refused before the deployer contacts the
+    /// worker at all (the agent address here is unroutable).
     #[tokio::test]
-    async fn test_worker_build_rejects_unreviewed_build_arguments() {
+    async fn test_worker_build_refuses_invalid_build_argument_before_upload() {
         let deployer = RemoteNodeDeployer::new(
             "https://10.100.0.2:3100".to_string(),
             "token".to_string(),
@@ -2604,7 +3381,7 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         std::fs::write(
             source.path().join("Dockerfile"),
-            "FROM scratch\nARG TOKEN\n",
+            "FROM scratch\nARG BUILDKIT_INLINE_CACHE\n",
         )
         .unwrap();
         let result = deployer
@@ -2613,7 +3390,10 @@ mod tests {
                 image_name: "test:latest".to_string(),
                 context_path: source.path().to_path_buf(),
                 dockerfile_path: None,
-                build_args: std::collections::HashMap::from([("TOKEN".into(), "secret".into())]),
+                build_args: std::collections::HashMap::from([(
+                    "BUILDKIT_INLINE_CACHE".into(),
+                    "1".into(),
+                )]),
                 build_args_buildkit: std::collections::HashMap::new(),
                 platform: None,
                 log_path: source.path().join("build.log"),
@@ -2994,5 +3774,64 @@ mod tests {
             }
             other => panic!("Expected NetworkError, got {:?}", other),
         }
+    }
+    #[tokio::test]
+    async fn health_probe_remote_exec_passes_arguments_and_bounds_captured_output() {
+        let body: &'static [u8] = Box::leak(serde_json::to_vec(&serde_json::json!({"success": true, "data": { "exit_code": 0, "stdout": "x".repeat(8192), "stderr": "error context" }, "error": null})).unwrap().into_boxed_slice());
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/json", body).await;
+        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+        let result = remote
+            .exec_in_container(
+                "worker-container",
+                vec!["redis-cli".into(), "ping".into()],
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.truncated);
+        assert_eq!(result.output.len(), crate::MAX_EXEC_OUTPUT_BYTES);
+        let request = server.await.unwrap();
+        assert!(request.contains("/agent/containers/worker-container/health-exec"));
+        assert!(request.contains("redis-cli"));
+        assert!(request.contains("timeout_seconds"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_remote_exec_requires_an_exit_code_and_times_out() {
+        let (url, server) = spawn_one_shot_agent(
+            "200 OK",
+            "application/json",
+            br#"{"success":true,"data":{"exit_code":null,"stdout":"","stderr":""},"error":null}"#,
+        )
+        .await;
+        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+        assert!(remote
+            .exec_in_container(
+                "worker-container",
+                vec!["check".into()],
+                std::time::Duration::from_secs(2)
+            )
+            .await
+            .is_err());
+        server.await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let remote = RemoteNodeDeployer::new(url, "token".into(), "worker".into()).unwrap();
+        assert!(matches!(
+            remote
+                .exec_in_container(
+                    "worker-container",
+                    vec!["check".into()],
+                    std::time::Duration::from_millis(20)
+                )
+                .await,
+            Err(DeployerError::ExecTimeout { .. })
+        ));
+        server.abort();
     }
 }

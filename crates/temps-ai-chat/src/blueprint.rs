@@ -354,7 +354,9 @@ pub enum BlueprintError {
         reason: String,
     },
 
-    #[error("Database error while {operation} the blueprint of workspace {application_id}: {source}")]
+    #[error(
+        "Database error while {operation} the blueprint of workspace {application_id}: {source}"
+    )]
     Database {
         application_id: i64,
         operation: &'static str,
@@ -430,7 +432,13 @@ fn check_component(problems: &mut Vec<String>, component: &Component) {
             "{who}: the id must be a lowercase slug of at most {MAX_ID_CHARS} characters, starting with a letter (for example `orders-worker`)"
         ));
     }
-    check_text(problems, &format!("{who} name"), &component.name, MAX_NAME_CHARS, true);
+    check_text(
+        problems,
+        &format!("{who} name"),
+        &component.name,
+        MAX_NAME_CHARS,
+        true,
+    );
     check_text(
         problems,
         &format!("{who} purpose"),
@@ -446,13 +454,48 @@ fn check_component(problems: &mut Vec<String>, component: &Component) {
         }
     };
     let kind = component.kind;
-    has(component.surface.is_some(), "surface", kind == ComponentKind::Client, &mut misplaced);
-    has(component.role.is_some(), "role", kind == ComponentKind::App, &mut misplaced);
-    has(component.stack.is_some(), "stack", kind == ComponentKind::App, &mut misplaced);
-    has(component.runtime.is_some(), "runtime", kind == ComponentKind::App, &mut misplaced);
-    has(component.image.is_some(), "image", kind == ComponentKind::App, &mut misplaced);
-    has(component.engine.is_some(), "engine", kind == ComponentKind::Data, &mut misplaced);
-    has(!component.holds.is_empty(), "holds", kind == ComponentKind::Data, &mut misplaced);
+    has(
+        component.surface.is_some(),
+        "surface",
+        kind == ComponentKind::Client,
+        &mut misplaced,
+    );
+    has(
+        component.role.is_some(),
+        "role",
+        kind == ComponentKind::App,
+        &mut misplaced,
+    );
+    has(
+        component.stack.is_some(),
+        "stack",
+        kind == ComponentKind::App,
+        &mut misplaced,
+    );
+    has(
+        component.runtime.is_some(),
+        "runtime",
+        kind == ComponentKind::App,
+        &mut misplaced,
+    );
+    has(
+        component.image.is_some(),
+        "image",
+        kind == ComponentKind::App,
+        &mut misplaced,
+    );
+    has(
+        component.engine.is_some(),
+        "engine",
+        kind == ComponentKind::Data,
+        &mut misplaced,
+    );
+    has(
+        !component.holds.is_empty(),
+        "holds",
+        kind == ComponentKind::Data,
+        &mut misplaced,
+    );
     has(
         component.provider.is_some(),
         "provider",
@@ -482,7 +525,13 @@ fn check_component(problems: &mut Vec<String>, component: &Component) {
                 ));
             }
             match component.stack.as_deref() {
-                Some(stack) => check_text(problems, &format!("{who} stack"), stack, MAX_NAME_CHARS, true),
+                Some(stack) => check_text(
+                    problems,
+                    &format!("{who} stack"),
+                    stack,
+                    MAX_NAME_CHARS,
+                    true,
+                ),
                 None => problems.push(format!(
                     "{who} is an app and needs a `stack`, for example \"Next.js\" or \"Bun + Hono\""
                 )),
@@ -494,9 +543,13 @@ fn check_component(problems: &mut Vec<String>, component: &Component) {
                 (Some(AppRuntime::Image), None) => problems.push(format!(
                     "{who} runs an image, so it needs the `image`, for example \"nats:2.10\""
                 )),
-                (Some(AppRuntime::Image), Some(image)) => {
-                    check_text(problems, &format!("{who} image"), image, MAX_LABEL_CHARS, true)
-                }
+                (Some(AppRuntime::Image), Some(image)) => check_text(
+                    problems,
+                    &format!("{who} image"),
+                    image,
+                    MAX_LABEL_CHARS,
+                    true,
+                ),
                 (Some(_), Some(_)) => problems.push(format!(
                     "{who} has an `image` but its runtime is not `image`"
                 )),
@@ -553,11 +606,20 @@ fn check_flow(
     parts: &HashMap<&str, &Component>,
 ) {
     let who = format!("flow {} ({} → {})", index + 1, flow.from, flow.to);
-    check_text(problems, &format!("{who} label"), &flow.label, MAX_LABEL_CHARS, true);
-    let (Some(from), Some(to)) = (parts.get(flow.from.as_str()), parts.get(flow.to.as_str())) else {
+    check_text(
+        problems,
+        &format!("{who} label"),
+        &flow.label,
+        MAX_LABEL_CHARS,
+        true,
+    );
+    let (Some(from), Some(to)) = (parts.get(flow.from.as_str()), parts.get(flow.to.as_str()))
+    else {
         for end in [&flow.from, &flow.to] {
             if !parts.contains_key(end.as_str()) {
-                problems.push(format!("{who} names '{end}', which is not a part of the design"));
+                problems.push(format!(
+                    "{who} names '{end}', which is not a part of the design"
+                ));
             }
         }
         return;
@@ -591,12 +653,16 @@ fn check_flow(
         }
         FlowKind::Cache => {
             if engine != Some(DataEngine::Redis) {
-                problems.push(format!("{who} is a `cache` flow, so it must end at a redis part"));
+                problems.push(format!(
+                    "{who} is a `cache` flow, so it must end at a redis part"
+                ));
             }
         }
         FlowKind::Blob => {
             if engine != Some(DataEngine::S3) {
-                problems.push(format!("{who} is a `blob` flow, so it must end at an s3 part"));
+                problems.push(format!(
+                    "{who} is a `blob` flow, so it must end at an s3 part"
+                ));
             }
         }
         FlowKind::Publish | FlowKind::Subscribe => {
@@ -623,7 +689,13 @@ fn check_flow(
 /// them all in one go.
 pub fn validate(application_id: i64, document: &BlueprintDocument) -> Result<(), BlueprintError> {
     let mut problems = Vec::new();
-    check_text(&mut problems, "the summary", &document.summary, MAX_SUMMARY_CHARS, true);
+    check_text(
+        &mut problems,
+        "the summary",
+        &document.summary,
+        MAX_SUMMARY_CHARS,
+        true,
+    );
     if document.components.is_empty() {
         problems.push("the design has no parts".to_string());
     }
@@ -643,7 +715,12 @@ pub fn validate(application_id: i64, document: &BlueprintDocument) -> Result<(),
     let mut seen_flows = HashSet::new();
     for (index, flow) in document.flows.iter().enumerate() {
         check_flow(&mut problems, index, flow, &parts);
-        if !seen_flows.insert((flow.from.as_str(), flow.to.as_str(), flow.kind, flow.label.trim())) {
+        if !seen_flows.insert((
+            flow.from.as_str(),
+            flow.to.as_str(),
+            flow.kind,
+            flow.label.trim(),
+        )) {
             problems.push(format!(
                 "flow {} repeats an earlier flow ({} → {} {})",
                 index + 1,
@@ -659,7 +736,9 @@ pub fn validate(application_id: i64, document: &BlueprintDocument) -> Result<(),
         if let Err(crate::applications::ApplicationError::SecretValue(path)) =
             crate::applications::validate_secret_free_payload(&value, "$")
         {
-            problems.push(format!("{path} looks like a credential; leave secrets out of the design"));
+            problems.push(format!(
+                "{path} looks like a credential; leave secrets out of the design"
+            ));
         }
     }
     if problems.is_empty() {
@@ -672,7 +751,10 @@ pub fn validate(application_id: i64, document: &BlueprintDocument) -> Result<(),
     })
 }
 
-fn check_change_summary(application_id: i64, change_summary: &str) -> Result<String, BlueprintError> {
+fn check_change_summary(
+    application_id: i64,
+    change_summary: &str,
+) -> Result<String, BlueprintError> {
     let mut problems = Vec::new();
     check_text(
         &mut problems,
@@ -695,11 +777,12 @@ fn decode_version(
     application_id: i64,
     row: ai_blueprint_versions::Model,
 ) -> Result<BlueprintVersion, BlueprintError> {
-    let document = serde_json::from_value(row.document).map_err(|error| BlueprintError::Corrupt {
-        application_id,
-        version: row.version,
-        reason: error.to_string(),
-    })?;
+    let document =
+        serde_json::from_value(row.document).map_err(|error| BlueprintError::Corrupt {
+            application_id,
+            version: row.version,
+            reason: error.to_string(),
+        })?;
     let status = VersionStatus::parse(&row.status).ok_or_else(|| BlueprintError::Corrupt {
         application_id,
         version: row.version,
@@ -744,7 +827,10 @@ fn component_line(component: &Component, binding: Option<&ComponentBinding>) -> 
             .map(|surface| format!("client, {}", enum_label(&surface)))
             .unwrap_or_else(|| "client".to_string()),
         ComponentKind::App => {
-            let role = component.role.map(|role| enum_label(&role)).unwrap_or_default();
+            let role = component
+                .role
+                .map(|role| enum_label(&role))
+                .unwrap_or_default();
             let stack = component.stack.clone().unwrap_or_default();
             let runtime = match (component.runtime, component.image.as_deref()) {
                 (Some(AppRuntime::Image), Some(image)) => format!("image {image}"),
@@ -864,7 +950,9 @@ impl From<BlueprintVersion> for BlueprintVersionResponse {
             change_summary: version.change_summary,
             status: version.status,
             proposed_by_assistant: version.proposed_in.is_some(),
-            created_at: version.created_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            created_at: version
+                .created_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             decided_at: version
                 .decided_at
                 .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
@@ -925,10 +1013,10 @@ impl BlueprintService {
         };
         let rows = ai_blueprint_versions::Entity::find()
             .filter(ai_blueprint_versions::Column::BlueprintId.eq(blueprint.id))
-            .filter(
-                ai_blueprint_versions::Column::Status
-                    .is_in([VersionStatus::Proposed.as_str(), VersionStatus::Accepted.as_str()]),
-            )
+            .filter(ai_blueprint_versions::Column::Status.is_in([
+                VersionStatus::Proposed.as_str(),
+                VersionStatus::Accepted.as_str(),
+            ]))
             .all(self.db.as_ref())
             .await
             .map_err(BlueprintError::db(application_id, "reading"))?;
@@ -961,14 +1049,18 @@ impl BlueprintService {
             .filter(ai_blueprint_versions::Column::BlueprintId.eq(blueprint.id))
             .order_by_desc(ai_blueprint_versions::Column::Version)
             .paginate(self.db.as_ref(), page_size);
-        let total = paginator
-            .num_items()
-            .await
-            .map_err(BlueprintError::db(application_id, "listing the versions of"))?;
-        let rows = paginator
-            .fetch_page(page.saturating_sub(1))
-            .await
-            .map_err(BlueprintError::db(application_id, "listing the versions of"))?;
+        let total = paginator.num_items().await.map_err(BlueprintError::db(
+            application_id,
+            "listing the versions of",
+        ))?;
+        let rows =
+            paginator
+                .fetch_page(page.saturating_sub(1))
+                .await
+                .map_err(BlueprintError::db(
+                    application_id,
+                    "listing the versions of",
+                ))?;
         let versions = rows
             .into_iter()
             .map(|row| decode_version(application_id, row))
@@ -1034,7 +1126,10 @@ impl BlueprintService {
             .filter(ai_blueprint_versions::Column::Status.eq(from.as_str()))
             .exec(txn)
             .await
-            .map_err(BlueprintError::db(application_id, "superseding a version of"))?;
+            .map_err(BlueprintError::db(
+                application_id,
+                "superseding a version of",
+            ))?;
         Ok(())
     }
 
@@ -1296,7 +1391,10 @@ impl BlueprintService {
                 .filter(projects::Column::IsDeleted.eq(false))
                 .all(self.db.as_ref())
                 .await
-                .map_err(BlueprintError::db(application_id, "reading the projects of"))?
+                .map_err(BlueprintError::db(
+                    application_id,
+                    "reading the projects of",
+                ))?
                 .into_iter()
                 .map(|project| (project.id, project))
                 .collect()
@@ -1313,7 +1411,10 @@ impl BlueprintService {
             ))
             .all(self.db.as_ref())
             .await
-            .map_err(BlueprintError::db(application_id, "reading the deployments of"))?
+            .map_err(BlueprintError::db(
+                application_id,
+                "reading the deployments of",
+            ))?
             .into_iter()
             .map(|deployment| (deployment.project_id, deployment))
             .collect()
@@ -1325,7 +1426,10 @@ impl BlueprintService {
                 .filter(external_services::Column::Id.is_in(service_ids))
                 .all(self.db.as_ref())
                 .await
-                .map_err(BlueprintError::db(application_id, "reading the services of"))?
+                .map_err(BlueprintError::db(
+                    application_id,
+                    "reading the services of",
+                ))?
                 .into_iter()
                 .map(|service| (service.id, service))
                 .collect()
@@ -1458,32 +1562,97 @@ mod tests {
         let found = problems(&design);
         let text = found.join("\n");
         assert!(text.contains("the summary is empty"), "{text}");
-        assert!(text.contains("part 'Web App': the id must be a lowercase slug"), "{text}");
-        assert!(text.contains("part 'Web App' is an app and needs a `stack`"), "{text}");
-        assert!(text.contains("part 'db' is data, so it has no stack"), "{text}");
-        assert!(text.contains("part 'db' is data and needs an `engine`"), "{text}");
+        assert!(
+            text.contains("part 'Web App': the id must be a lowercase slug"),
+            "{text}"
+        );
+        assert!(
+            text.contains("part 'Web App' is an app and needs a `stack`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("part 'db' is data, so it has no stack"),
+            "{text}"
+        );
+        assert!(
+            text.contains("part 'db' is data and needs an `engine`"),
+            "{text}"
+        );
         assert!(text.contains("two parts share the id 'db'"), "{text}");
-        assert!(text.contains("names 'nowhere', which is not a part"), "{text}");
+        assert!(
+            text.contains("names 'nowhere', which is not a part"),
+            "{text}"
+        );
     }
 
     #[test]
     fn flows_must_end_where_their_kind_lives() {
         let mut design = taskboard();
         design.flows = vec![
-            Flow { from: "api".into(), to: "events".into(), kind: FlowKind::Query, label: "tasks".into() },
-            Flow { from: "api".into(), to: "db".into(), kind: FlowKind::Cache, label: "sessions".into() },
-            Flow { from: "api".into(), to: "db".into(), kind: FlowKind::Blob, label: "files".into() },
-            Flow { from: "api".into(), to: "mail".into(), kind: FlowKind::Publish, label: "topic".into() },
-            Flow { from: "web".into(), to: "db".into(), kind: FlowKind::Http, label: "rest".into() },
-            Flow { from: "db".into(), to: "api".into(), kind: FlowKind::Http, label: "push".into() },
-            Flow { from: "api".into(), to: "browser".into(), kind: FlowKind::Websocket, label: "updates".into() },
+            Flow {
+                from: "api".into(),
+                to: "events".into(),
+                kind: FlowKind::Query,
+                label: "tasks".into(),
+            },
+            Flow {
+                from: "api".into(),
+                to: "db".into(),
+                kind: FlowKind::Cache,
+                label: "sessions".into(),
+            },
+            Flow {
+                from: "api".into(),
+                to: "db".into(),
+                kind: FlowKind::Blob,
+                label: "files".into(),
+            },
+            Flow {
+                from: "api".into(),
+                to: "mail".into(),
+                kind: FlowKind::Publish,
+                label: "topic".into(),
+            },
+            Flow {
+                from: "web".into(),
+                to: "db".into(),
+                kind: FlowKind::Http,
+                label: "rest".into(),
+            },
+            Flow {
+                from: "db".into(),
+                to: "api".into(),
+                kind: FlowKind::Http,
+                label: "push".into(),
+            },
+            Flow {
+                from: "api".into(),
+                to: "browser".into(),
+                kind: FlowKind::Websocket,
+                label: "updates".into(),
+            },
         ];
         let text = problems(&design).join("\n");
-        assert!(text.contains("`query` flow, so it must end at a postgres"), "{text}");
-        assert!(text.contains("`cache` flow, so it must end at a redis part"), "{text}");
-        assert!(text.contains("`blob` flow, so it must end at an s3 part"), "{text}");
-        assert!(text.contains("`publish` flow, so it must end at the broker"), "{text}");
-        assert!(text.contains("`http` flow to postgres; use `query`"), "{text}");
+        assert!(
+            text.contains("`query` flow, so it must end at a postgres"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`cache` flow, so it must end at a redis part"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`blob` flow, so it must end at an s3 part"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`publish` flow, so it must end at the broker"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`http` flow to postgres; use `query`"),
+            "{text}"
+        );
         assert!(text.contains("starts at data"), "{text}");
         assert!(text.contains("ends at a client"), "{text}");
     }
@@ -1498,8 +1667,12 @@ mod tests {
         let mut design = taskboard();
         design.components[2].stack = Some("Bun".into());
         assert!(problems(&design).is_empty());
-        assert!(!contains_credential_url("https://api.example.test/v1/tasks"));
-        assert!(contains_credential_url("see redis://:secretpass@cache:6379"));
+        assert!(!contains_credential_url(
+            "https://api.example.test/v1/tasks"
+        ));
+        assert!(contains_credential_url(
+            "see redis://:secretpass@cache:6379"
+        ));
     }
 
     #[test]
@@ -1512,7 +1685,10 @@ mod tests {
             design.components.push(part);
         }
         let text = problems(&design).join("\n");
-        assert!(text.contains(&format!("more than {MAX_COMPONENTS} parts")), "{text}");
+        assert!(
+            text.contains(&format!("more than {MAX_COMPONENTS} parts")),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1520,11 +1696,17 @@ mod tests {
         let mut bindings = BTreeMap::new();
         bindings.insert(
             "api".to_string(),
-            ComponentBinding { project_id: Some(12), service_id: None },
+            ComponentBinding {
+                project_id: Some(12),
+                service_id: None,
+            },
         );
         bindings.insert(
             "db".to_string(),
-            ComponentBinding { project_id: None, service_id: Some(4) },
+            ComponentBinding {
+                project_id: None,
+                service_id: Some(4),
+            },
         );
         let state = BlueprintState {
             accepted: Some(BlueprintVersion {
@@ -1560,7 +1742,9 @@ mod tests {
         assert!(section.contains("- `db` Database (data, postgres, holds tasks, users): Keeps tasks and users. Runs as service 4."));
         assert!(section.contains("- `worker` Notifier (app, worker, Bun, runs from preset): Sends notifications when tasks change. Not created yet."));
         assert!(section.contains("- api → events (publish): stream task.events"));
-        assert!(section.contains("Version 4 is waiting for the user's decision (\"Cache sessions in Redis\")"));
+        assert!(section.contains(
+            "Version 4 is waiting for the user's decision (\"Cache sessions in Redis\")"
+        ));
         assert!(section.contains("`temps_propose_blueprint`"));
         assert!(section.contains("`temps_bind_blueprint`"));
     }
@@ -1589,6 +1773,9 @@ mod tests {
         // Fields of other kinds are not written out, so the stored JSON stays
         // as small as what the model sent.
         assert!(value["components"][0].get("engine").is_none());
-        assert_eq!(serde_json::from_value::<BlueprintDocument>(value).unwrap(), design);
+        assert_eq!(
+            serde_json::from_value::<BlueprintDocument>(value).unwrap(),
+            design
+        );
     }
 }

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
@@ -11,7 +14,7 @@ import { AdminGateCard } from '@/components/settings/AdminGateCard'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
 import { AlertCircle, LockKeyhole, Loader2, Network, Save } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
@@ -38,7 +41,7 @@ function parseNetworkLines(text: string): string[] {
 
 export function SecurityPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
   const {
@@ -143,20 +146,15 @@ export function SecurityPage() {
   }
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center min-h-[400px]">
-        <Loader2 className="h-8 w-8 animate-spin" />
-      </div>
-    )
+    return <SettingsFormSkeleton label="Loading security settings" />
   }
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load settings.</AlertDescription>
-      </Alert>
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 
@@ -213,7 +211,7 @@ export function SecurityPage() {
               id="trusted-private-networks"
               rows={4}
               className="font-mono text-sm"
-              placeholder={'10.0.0.0/8\n192.168.1.20\n100.64.0.0/10'}
+              placeholder={'192.168.1.20\n10.0.0.5/32\nfd12::5/128'}
               {...register('trusted_private_networks_text')}
             />
             <p className="text-sm text-muted-foreground">
@@ -225,6 +223,15 @@ export function SecurityPage() {
               (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8,
               100.64.0.0/10, fc00::/7, ::1). Cloud metadata endpoints stay
               blocked.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              This list applies to every outbound feature at once. Prefer
+              single-address entries (a bare IP, <code>/32</code> or{' '}
+              <code>/128</code>) over whole subnets. To reach just one
+              self-hosted AI model server, trust its address on its AI provider
+              key instead (AI Gateway → Self-hosted provider → “Trust this
+              private address for this key only”); that does not widen this
+              list.
             </p>
             <Alert>
               <AlertCircle className="h-4 w-4" />

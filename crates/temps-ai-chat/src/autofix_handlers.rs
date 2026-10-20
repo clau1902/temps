@@ -432,7 +432,10 @@ pub async fn download_patch(
         .collect();
     Ok((
         [
-            (header::CONTENT_TYPE, "text/x-diff; charset=utf-8".to_string()),
+            (
+                header::CONTENT_TYPE,
+                "text/x-diff; charset=utf-8".to_string(),
+            ),
             (
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"autofix-{file_name}.patch\""),

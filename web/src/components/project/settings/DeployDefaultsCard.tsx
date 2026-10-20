@@ -33,32 +33,48 @@ import { Switch } from '@/components/ui/switch'
 import { BUILD_LOCATION_LABELS } from '@/lib/build-location'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import {
+  configuredProbeType,
+  healthProbeFormSchema,
+  healthConfigFromForm,
+} from './health-probe'
 
-const schema = z.object({
-  cpuRequest: z.string().optional(),
-  cpuLimit: z.string().optional(),
-  memoryRequest: z.string().optional(),
-  memoryLimit: z.string().optional(),
-  replicas: z.string().optional(),
-  port: z.string().optional(),
-  healthCheckTimeout: z
-    .string()
-    .optional()
-    .refine(
-      (value) =>
-        !value ||
-        value.trim() === '' ||
-        (Number.isInteger(Number(value)) &&
-          Number(value) >= 30 &&
-          Number(value) <= 3600),
-      { message: 'Enter a whole number of seconds between 30 and 3600' }
-    ),
-  automaticDeploy: z.boolean(),
-  buildLocation: z.enum(['control_plane', 'node']),
-})
+const schema = z
+  .object({
+    cpuRequest: z.string().optional(),
+    cpuLimit: z.string().optional(),
+    memoryRequest: z.string().optional(),
+    memoryLimit: z.string().optional(),
+    replicas: z.string().optional(),
+    port: z.string().optional(),
+    healthCheckTimeout: z
+      .string()
+      .optional()
+      .refine(
+        (value) =>
+          !value ||
+          value.trim() === '' ||
+          (Number.isInteger(Number(value)) &&
+            Number(value) >= 30 &&
+            Number(value) <= 3600),
+        { message: 'Enter a whole number of seconds between 30 and 3600' }
+      ),
+    automaticDeploy: z.boolean(),
+    buildLocation: z.enum(['control_plane', 'node', 'ci']),
+  })
+  .and(healthProbeFormSchema)
+
+const probeExamples = {
+  auto: 'HTTP when a port is declared in settings or by the image; process otherwise.',
+  http: 'Example: GET /ready for a web API. Requires a declared port.',
+  tcp: 'Example: connect to port 6379 for a TCP service. Requires a declared port.',
+  process:
+    'Example: a Redis subscriber worker stays running without restarting for 15 seconds.',
+  exec: 'Example: ["redis-cli", "ping"] exits 0 when the worker dependency is ready.',
+}
 
 type FormValues = z.infer<typeof schema>
 
@@ -112,11 +128,21 @@ export function DeployDefaultsCard({
       port: project?.deployment_config?.exposedPort?.toString() ?? '',
       healthCheckTimeout:
         project?.deployment_config?.healthCheckTimeoutSeconds?.toString() ?? '',
+      probeType: configuredProbeType(project.deployment_config?.health),
+      stableFor: project.deployment_config?.health?.stable_for ?? 15,
+      probeTimeout: project.deployment_config?.health?.timeout ?? 5,
+      probeInterval: project.deployment_config?.health?.interval ?? 30,
+      probeCommand: JSON.stringify(
+        project.deployment_config?.health?.command ?? []
+      ),
+      healthPath: project.deployment_config?.health?.path ?? '/',
       automaticDeploy: project?.deployment_config?.automaticDeploy ?? false,
       buildLocation:
         project?.deployment_config?.buildLocation ?? 'control_plane',
     },
   })
+
+  const probeType = useWatch({ control: form.control, name: 'probeType' })
 
   const handleSave = async (values: FormValues) => {
     if (!project?.id) return
@@ -132,6 +158,7 @@ export function DeployDefaultsCard({
           exposedPort: optionalInt(values.port),
           healthCheckTimeoutSeconds:
             optionalInt(values.healthCheckTimeout) ?? 300,
+          health: healthConfigFromForm(values),
           automaticDeploy: values.automaticDeploy,
           buildLocation: values.buildLocation,
         },
@@ -139,7 +166,6 @@ export function DeployDefaultsCard({
       {
         loading: 'Updating deployment configuration...',
         success: 'Deployment configuration updated successfully',
-        error: 'Failed to update deployment configuration',
       }
     )
     refetch()
@@ -147,7 +173,11 @@ export function DeployDefaultsCard({
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSave)}>
+      <form
+        onSubmit={form.handleSubmit(handleSave, () =>
+          toast.error('Check the highlighted deployment settings')
+        )}
+      >
         <Card className="bg-background text-foreground">
           <CardHeader>
             <CardTitle>Default Deployment Configuration</CardTitle>
@@ -284,12 +314,159 @@ export function DeployDefaultsCard({
                         />
                       </FormControl>
                       <FormDescription className="text-muted-foreground">
-                        Default port your application listens on
+                        Leave empty to use the image’s declared port. Images
+                        without a port deploy as background workers.
                       </FormDescription>
                     </FormItem>
                   )}
                 />
 
+                <FormField
+                  control={form.control}
+                  name="probeType"
+                  render={({ field }) => (
+                    <FormItem id="health-probe">
+                      <FormLabel>Health probe</FormLabel>
+                      <Select
+                        value={field.value}
+                        onValueChange={field.onChange}
+                      >
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          <SelectItem value="auto">Automatic</SelectItem>
+                          <SelectItem value="http">HTTP</SelectItem>
+                          <SelectItem value="tcp">TCP</SelectItem>
+                          <SelectItem value="process">
+                            Process (background worker)
+                          </SelectItem>
+                          <SelectItem value="exec">Exec command</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <FormDescription>
+                        {probeExamples[field.value]} Repository health settings
+                        override these defaults. Applies to image deployments;
+                        Compose keeps its service healthchecks.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                {probeType === 'http' && (
+                  <FormField
+                    control={form.control}
+                    name="healthPath"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>HTTP health path</FormLabel>
+                        <FormControl>
+                          <Input {...field} placeholder="/ready" />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+                {(probeType === 'process' || probeType === 'auto') && (
+                  <FormField
+                    control={form.control}
+                    name="stableFor"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          Process stability window (seconds)
+                        </FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            onChange={(event) =>
+                              field.onChange(event.target.valueAsNumber)
+                            }
+                            type="number"
+                            min="1"
+                            max="3600"
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          The worker must stay running without a restart for
+                          this window. The startup timeout still applies.
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+                {probeType === 'exec' && (
+                  <FormField
+                    control={form.control}
+                    name="probeCommand"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Health command (JSON arguments)</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            placeholder='["redis-cli", "ping"]'
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          Runs inside the container, without an implicit shell.
+                          Exit 0 passes the gate.
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+                {(probeType === 'exec' || probeType === 'tcp') && (
+                  <>
+                    <FormField
+                      control={form.control}
+                      name="probeTimeout"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Probe timeout (seconds)</FormLabel>
+                          <FormControl>
+                            <Input
+                              {...field}
+                              onChange={(event) =>
+                                field.onChange(event.target.valueAsNumber)
+                              }
+                              type="number"
+                              min="1"
+                              max="300"
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name="probeInterval"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Probe interval (seconds)</FormLabel>
+                          <FormControl>
+                            <Input
+                              {...field}
+                              onChange={(event) =>
+                                field.onChange(event.target.valueAsNumber)
+                              }
+                              type="number"
+                              min="1"
+                              max="3600"
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </>
+                )}
                 <FormField
                   control={form.control}
                   name="healthCheckTimeout"
@@ -332,8 +509,17 @@ export function DeployDefaultsCard({
                         Build images on a worker node to keep build CPU and
                         memory away from the proxy and running apps on the
                         control plane. When no worker can take a build, it runs
-                        on the control plane and the build log says why.
-                        Environments can override this.
+                        on the control plane when local builds are enabled, and
+                        the build log says why. Environments can override this.
+                        CI builds use the configured GitHub Actions runner and
+                        stop if verification fails.{' '}
+                        <a
+                          href="/settings/nodes#ci-builder"
+                          className="underline"
+                        >
+                          Configure CI builder
+                        </a>
+                        .
                       </FormDescription>
                     </div>
                     <Select value={field.value} onValueChange={field.onChange}>
@@ -348,6 +534,9 @@ export function DeployDefaultsCard({
                         </SelectItem>
                         <SelectItem value="node">
                           {BUILD_LOCATION_LABELS.node}
+                        </SelectItem>
+                        <SelectItem value="ci">
+                          {BUILD_LOCATION_LABELS.ci}
                         </SelectItem>
                       </SelectContent>
                     </Select>

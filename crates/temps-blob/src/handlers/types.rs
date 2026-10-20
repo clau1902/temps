@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use temps_core::secret_string::SecretString;
 use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_providers::externalsvc::RustfsService;
+use temps_providers::managed_names::ManagedServiceNames;
 use temps_providers::ExternalServiceManager;
 use utoipa::ToSchema;
 
@@ -20,6 +21,8 @@ pub struct BlobAppState {
     pub blob_service: Arc<BlobService>,
     pub rustfs_service: Arc<RustfsService>,
     pub external_service_manager: Arc<ExternalServiceManager>,
+    /// Resolves and edits the name of this instance's Blob service/container.
+    pub managed_names: Arc<ManagedServiceNames>,
     pub audit_service: Arc<dyn AuditLogger>,
     /// Team-based project access checker (registered by a plugin; `None` in
     /// plain OSS, where the guard is a no-op). Confines blob data-plane access

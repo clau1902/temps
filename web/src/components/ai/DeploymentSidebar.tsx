@@ -118,8 +118,16 @@ function useWatchedDeployment(projectId: number, deploymentId: number | null) {
   })
   const latest = useQuery({
     ...getLastDeploymentOptions({ path: { id: projectId } }),
+    // `deployment: null` (nothing deployed yet) reads like a deployment
+    // that has not appeared; keep polling until one does.
+    select: (data) => data.deployment ?? undefined,
     enabled: deploymentId === null,
-    refetchInterval: poll,
+    refetchInterval: (query) => {
+      const deployment = query.state.data?.deployment
+      return deployment && !isActiveDeploymentStatus(deployment.status)
+        ? false
+        : 3000
+    },
   })
   return deploymentId === null ? latest : pinned
 }

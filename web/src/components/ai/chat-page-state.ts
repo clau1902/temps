@@ -137,7 +137,7 @@ export function createProjectChat(
     projectName: project.name,
     contextType: 'project',
     contextId,
-    title: 'Project chat',
+    title: 'Service chat',
     autoStart: false,
   }
 }

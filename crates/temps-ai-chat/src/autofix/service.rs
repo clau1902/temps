@@ -37,9 +37,8 @@ use tokio::sync::Notify;
 
 use super::evidence::{self, AgentReport, CommandOutcome, Evidence, MAX_SCORE};
 use super::{
-    insert_event, is_open_status, AutofixCapabilityResponse, AutofixError,
-    AutofixIncidentResponse, AutofixSettingsResponse, EventDetails, UpdateAutofixSettingsRequest,
-    INCIDENT_METADATA_KEY,
+    insert_event, is_open_status, AutofixCapabilityResponse, AutofixError, AutofixIncidentResponse,
+    AutofixSettingsResponse, EventDetails, UpdateAutofixSettingsRequest, INCIDENT_METADATA_KEY,
 };
 use crate::sandbox_link::SandboxLinkService;
 use crate::{ApplicationService, ConversationService};
@@ -370,7 +369,10 @@ impl AutofixService {
         current.await?;
         project_autofix_settings::Entity::update_many()
             .filter(project_autofix_settings::Column::ProjectId.eq(project_id))
-            .col_expr(project_autofix_settings::Column::Paused, Expr::value(paused))
+            .col_expr(
+                project_autofix_settings::Column::Paused,
+                Expr::value(paused),
+            )
             .col_expr(
                 project_autofix_settings::Column::UpdatedAt,
                 Expr::value(Utc::now()),
@@ -395,10 +397,18 @@ impl AutofixService {
         let (configured, reason, setup_path) = if self.sandboxes.is_none() {
             (
                 false,
-                Some("Sandboxes are not enabled on this server, so a crash cannot be reproduced".into()),
+                Some(
+                    "Sandboxes are not enabled on this server, so a crash cannot be reproduced"
+                        .into(),
+                ),
                 Some("/settings/sandboxes".to_string()),
             )
-        } else if self.conversations.resolve_assistant_provider().await.is_err() {
+        } else if self
+            .conversations
+            .resolve_assistant_provider()
+            .await
+            .is_err()
+        {
             (
                 false,
                 Some("No AI provider is configured".into()),
@@ -1255,8 +1265,7 @@ impl AutofixService {
             .filter(autofix_incidents::Column::SandboxId.is_not_null())
             .filter(autofix_incidents::Column::Status.is_in(super::CLOSED_STATUSES))
             .filter(
-                autofix_incidents::Column::UpdatedAt
-                    .lt(Utc::now() - chrono::Duration::seconds(60)),
+                autofix_incidents::Column::UpdatedAt.lt(Utc::now() - chrono::Duration::seconds(60)),
             )
             .order_by_asc(autofix_incidents::Column::UpdatedAt)
             .limit(RECONCILE_BATCH)
@@ -1428,7 +1437,9 @@ impl AutofixService {
         self.check_stop(incident)?;
 
         // 2. The workspace the chat goes to.
-        let workspace = self.ensure_workspace(incident, &project, settings.as_ref()).await;
+        let workspace = self
+            .ensure_workspace(incident, &project, settings.as_ref())
+            .await;
 
         // 3. The sandbox, for every kind that has buildable source.
         let sandbox = match &plan {
@@ -1699,7 +1710,10 @@ impl AutofixService {
                 .map_err(AutofixError::db("reading the source bundle"))?;
             let Some(bundle) = bundle else {
                 return Ok(SourcePlan::ReportOnly {
-                    reason: format!("source bundle #{bundle_id} of deployment #{} is gone", deployment.id),
+                    reason: format!(
+                        "source bundle #{bundle_id} of deployment #{} is gone",
+                        deployment.id
+                    ),
                 });
             };
             let archive = {
@@ -1724,7 +1738,8 @@ impl AutofixService {
             SourceType::Git | SourceType::External | SourceType::Manual => {}
             SourceType::DockerImage => {
                 return Ok(SourcePlan::ReportOnly {
-                    reason: "the deployment is a prebuilt Docker image with no linked source".into(),
+                    reason: "the deployment is a prebuilt Docker image with no linked source"
+                        .into(),
                 })
             }
             SourceType::StaticFiles => {
@@ -1760,9 +1775,7 @@ impl AutofixService {
                 reason: "the project has no repository".into(),
             });
         }
-        let clone_url = self
-            .clone_url(incident_id, project, connection_id)
-            .await?;
+        let clone_url = self.clone_url(incident_id, project, connection_id).await?;
         Ok(SourcePlan::Git {
             clone_url,
             commit_sha,
@@ -1816,11 +1829,13 @@ impl AutofixService {
             .as_ref()
             .and_then(|provider| provider.base_url.clone())
             .filter(|url| url.starts_with("https://"))
-            .unwrap_or_else(|| match provider.as_ref().map(|p| p.provider_type.as_str()) {
-                Some("gitlab") => "https://gitlab.com".to_string(),
-                Some("bitbucket") => "https://bitbucket.org".to_string(),
-                _ => "https://github.com".to_string(),
-            });
+            .unwrap_or_else(
+                || match provider.as_ref().map(|p| p.provider_type.as_str()) {
+                    Some("gitlab") => "https://gitlab.com".to_string(),
+                    Some("bitbucket") => "https://bitbucket.org".to_string(),
+                    _ => "https://github.com".to_string(),
+                },
+            );
         Ok(format!(
             "{}/{}/{}.git",
             base.trim_end_matches('/'),
@@ -1950,10 +1965,13 @@ impl AutofixService {
     ) -> Result<(String, String), AutofixError> {
         let id = incident.public_id.as_str();
         let owner = incident.owner_user_id;
-        let sandboxes = self.sandboxes.as_ref().ok_or_else(|| AutofixError::Unavailable {
-            project_id: project.id,
-            reason: "sandboxes are not enabled on this server".into(),
-        })?;
+        let sandboxes = self
+            .sandboxes
+            .as_ref()
+            .ok_or_else(|| AutofixError::Unavailable {
+                project_id: project.id,
+                reason: "sandboxes are not enabled on this server".into(),
+            })?;
         let (source, project_id) = match plan {
             SourcePlan::Git {
                 clone_url,
@@ -2041,9 +2059,8 @@ impl AutofixService {
             .join(" ");
         match plan {
             SourcePlan::Bundle { bundle_id, archive } => {
-                let tarball = bundle_as_tar_gz(archive).map_err(|reason| {
-                    AutofixError::step(id, "read the uploaded source", reason)
-                })?;
+                let tarball = bundle_as_tar_gz(archive)
+                    .map_err(|reason| AutofixError::step(id, "read the uploaded source", reason))?;
                 // Written by the runtime as root: the sandbox user cannot
                 // remove it from /tmp, and it goes with the sandbox anyway.
                 let upload = "/tmp/autofix-source.tar.gz";
@@ -2059,7 +2076,14 @@ impl AutofixService {
                     dir = shell_quote(&work_dir),
                 );
                 let outcome = self
-                    .run_command(id, &sandbox_id, owner, &work_dir, &script, "unpack the source")
+                    .run_command(
+                        id,
+                        &sandbox_id,
+                        owner,
+                        &work_dir,
+                        &script,
+                        "unpack the source",
+                    )
                     .await?;
                 if !outcome.passed() {
                     return Err(AutofixError::step(
@@ -2084,7 +2108,14 @@ impl AutofixService {
                     "set -e; mkdir -p .git/info; printf '%s\\n' {excludes} >> .git/info/exclude; git rev-parse HEAD"
                 );
                 let outcome = self
-                    .run_command(id, &sandbox_id, owner, &work_dir, &script, "check the checkout")
+                    .run_command(
+                        id,
+                        &sandbox_id,
+                        owner,
+                        &work_dir,
+                        &script,
+                        "check the checkout",
+                    )
                     .await?;
                 let head = outcome
                     .output_excerpt_full
@@ -2257,7 +2288,13 @@ impl AutofixService {
             )
             .await;
             let status = self
-                .wait_for_turn(incident, &conversation, deadline, last_message_id, &mut tools)
+                .wait_for_turn(
+                    incident,
+                    &conversation,
+                    deadline,
+                    last_message_id,
+                    &mut tools,
+                )
                 .await?;
             let (report, newest) = self
                 .read_turn(incident, conversation.id, last_message_id, &mut tools)
@@ -2549,7 +2586,10 @@ impl AutofixService {
         // File contents now, before any check touches the working tree.
         let mut files = Vec::new();
         if let Some(sandboxes) = &self.sandboxes {
-            for change in changes.iter().filter(|change| !deleted.contains(&change.path)) {
+            for change in changes
+                .iter()
+                .filter(|change| !deleted.contains(&change.path))
+            {
                 let path = format!("{}/{}", work_dir.trim_end_matches('/'), change.path);
                 let bytes = sandboxes
                     .fs_read(sandbox_id, owner, &path)
@@ -2605,7 +2645,13 @@ impl AutofixService {
                     .await?;
                 if stash.passed() {
                     let base = self
-                        .run_check(incident, sandbox_id, work_dir, command, "at the deployed source")
+                        .run_check(
+                            incident,
+                            sandbox_id,
+                            work_dir,
+                            command,
+                            "at the deployed source",
+                        )
                         .await?;
                     let restore = self
                         .run_command(
@@ -3191,7 +3237,12 @@ fn bundle_as_tar_gz(archive: &std::path::Path) -> Result<Vec<u8>, String> {
             continue;
         }
         let Some(path) = entry.enclosed_name() else {
-            return Err(format!("entry '{}' escapes the archive", entry.name()));
+            // `ZipFile::name` is fallible since zip 9; name the raw bytes then.
+            let name = match entry.name() {
+                Ok(name) => name.into_owned(),
+                Err(_) => String::from_utf8_lossy(entry.name_raw()).into_owned(),
+            };
+            return Err(format!("entry '{name}' escapes the archive"));
         };
         total += entry.size();
         if total > MAX_BUNDLE_BYTES {
@@ -3310,11 +3361,17 @@ fn describe_tool_call(tool: &serde_json::Value) -> Option<(String, EventDetails)
             )
         }
         crate::sandbox_link::SANDBOX_WRITE_TOOL => (
-            format!("Wrote {}", argument("path").unwrap_or_else(|| "a file".into())),
+            format!(
+                "Wrote {}",
+                argument("path").unwrap_or_else(|| "a file".into())
+            ),
             None,
         ),
         crate::sandbox_link::SANDBOX_READ_TOOL => (
-            format!("Read {}", argument("path").unwrap_or_else(|| "a file".into())),
+            format!(
+                "Read {}",
+                argument("path").unwrap_or_else(|| "a file".into())
+            ),
             None,
         ),
         _ => (format!("Used {name}"), None),
@@ -3490,8 +3547,14 @@ fn pull_request_body(
         body.push_str(&format!(
             "- `{}` (+{} −{})\n",
             change.path,
-            change.added.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
-            change.removed.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+            change
+                .added
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into()),
+            change
+                .removed
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into())
         ));
     }
     if let Some(command) = report.reproduction_command() {
@@ -3580,7 +3643,10 @@ mod tests {
             "name": "sandbox_write_file",
             "arguments": "{\"path\": \"src/a.ts\", \"content\": \"x\"}"
         });
-        assert_eq!(describe_tool_call(&write).expect("described").0, "Wrote src/a.ts");
+        assert_eq!(
+            describe_tool_call(&write).expect("described").0,
+            "Wrote src/a.ts"
+        );
         assert!(describe_tool_call(&serde_json::json!({})).is_none());
     }
 
@@ -3643,8 +3709,8 @@ mod tests {
 
     #[test]
     fn a_missing_bundle_is_an_error_naming_the_path() {
-        let error = bundle_as_tar_gz(std::path::Path::new("/nonexistent/bundle.zip"))
-            .expect_err("missing");
+        let error =
+            bundle_as_tar_gz(std::path::Path::new("/nonexistent/bundle.zip")).expect_err("missing");
         assert!(error.contains("/nonexistent/bundle.zip"));
     }
 

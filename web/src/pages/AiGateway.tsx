@@ -24,10 +24,15 @@ import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
-import { Fragment, useEffect, useMemo, useState } from 'react'
+import { Fragment, useLayoutEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   Card,
   CardContent,
@@ -40,6 +45,7 @@ import { Input } from '@/components/ui/input'
 import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -146,7 +152,9 @@ import {
   updateProviderModel,
   updateProviderKey,
   testProviderKeyById,
+  type CreateProviderKeyRequest,
   type ProviderKeyResponse,
+  type UpdateProviderKeyRequest,
 } from '@/api/client'
 import {
   getAiProviderStatusOptions,
@@ -169,7 +177,27 @@ import {
   aiProviderModels,
   getAiProvider,
   providerFromAddParam,
+  isSelfHostedProvider,
 } from '@/lib/ai-providers'
+import { SelfHostedProviderFields } from '@/components/ai/SelfHostedProviderFields'
+import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
+import {
+  PROVIDER_KEY_SETTINGS_MUTATION_KEY,
+  settingsSaveKeyId,
+} from '@/components/ai/self-hosted-provider'
+import {
+  canSubmitProviderKeyForm,
+  EMPTY_PROVIDER_KEY_FORM,
+  providerKeyFormForProvider,
+  providerKeyFormSchema,
+  providerKeyFormToRequest,
+  selectProviderKeyFormProvider,
+  type ProviderKeyFormValues,
+} from '@/components/ai/provider-key-form'
+import { ProviderKeyProviderPicker } from '@/components/ai/ProviderKeyProviderPicker'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
@@ -240,6 +268,9 @@ interface UsageLogEntry {
   status: number
   is_streaming: boolean
   is_byok: boolean
+  /** Set when the call came from a deployment token; absent otherwise. */
+  project_id?: number
+  token_id?: number
 }
 
 interface UsageLogPage {
@@ -347,7 +378,7 @@ function AiSummaryDefaultsCard({
       </CardHeader>
       <CardContent className="grid gap-4 md:grid-cols-[1fr_1fr_1fr_auto] md:items-end">
         <div className="space-y-2">
-          <Label>Summary provider</Label>
+          <Label htmlFor="ai-summary-provider">Summary provider</Label>
           <Select
             value={providerId}
             onValueChange={(value) => {
@@ -356,7 +387,7 @@ function AiSummaryDefaultsCard({
               setThinking(inherit)
             }}
           >
-            <SelectTrigger>
+            <SelectTrigger id="ai-summary-provider">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -372,6 +403,7 @@ function AiSummaryDefaultsCard({
         <div className="space-y-2">
           <Label>Summary model</Label>
           <SearchableSelect
+            label="Summary model"
             value={model}
             disabled={!provider}
             options={modelOptions}
@@ -386,13 +418,13 @@ function AiSummaryDefaultsCard({
           />
         </div>
         <div className="space-y-2">
-          <Label>Thinking</Label>
+          <Label htmlFor="ai-summary-thinking">Thinking</Label>
           <Select
             value={thinking}
             disabled={!selectedModel?.thinking_options.length}
             onValueChange={setThinking}
           >
-            <SelectTrigger>
+            <SelectTrigger id="ai-summary-thinking">
               <SelectValue placeholder="Model default" />
             </SelectTrigger>
             <SelectContent>
@@ -435,6 +467,10 @@ function ProviderKeyModelDetail({
   const queryClient = useQueryClient()
   const [modelId, setModelId] = useState('')
   const [modelFilter, setModelFilter] = useState('')
+  const [modelToDelete, setModelToDelete] = useState<{
+    id: number
+    model_id: string
+  } | null>(null)
   const queryKey = ['providerModelInventory', providerKey.id]
   const detailQuery = useQuery({
     queryKey,
@@ -518,6 +554,7 @@ function ProviderKeyModelDetail({
       toast.error('Could not delete model', {
         description: apiErrorMessage(error),
       }),
+    onSettled: () => setModelToDelete(null),
   })
 
   const models = useMemo(
@@ -671,7 +708,12 @@ function ProviderKeyModelDetail({
                           variant="ghost"
                           size="icon"
                           className="h-8 w-8"
-                          onClick={() => deleteMutation.mutate(model.id)}
+                          onClick={() =>
+                            setModelToDelete({
+                              id: model.id,
+                              model_id: model.model_id,
+                            })
+                          }
                           title="Delete manual model"
                         >
                           <Trash2 className="h-3.5 w-3.5 text-destructive" />
@@ -706,6 +748,19 @@ function ProviderKeyModelDetail({
           Add model
         </Button>
       </form>
+      <ConfirmDeleteDialog
+        open={modelToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setModelToDelete(null)
+        }}
+        resourceType="manual model"
+        resourceName={modelToDelete?.model_id ?? ''}
+        consequences={`It is removed from ${providerKey.display_name}; requests for it are no longer routed through this key until it is added again.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (modelToDelete) deleteMutation.mutate(modelToDelete.id)
+        }}
+      />
     </div>
   )
 }
@@ -1386,7 +1441,7 @@ export function UsageAnalytics() {
                         <span>{formatTokenCount(m.request_count)} req</span>
                         <span>{formatTokenCount(m.total_tokens)} tok</span>
                         {cost > 0 && (
-                          <span className="text-orange-500 font-medium">
+                          <span className="text-orange-700 dark:text-orange-500 font-medium">
                             {formatCost(cost)}
                           </span>
                         )}
@@ -1412,7 +1467,7 @@ export function UsageAnalytics() {
               onClick={() => setRecentFiltersOpen((open) => !open)}
             >
               <SlidersHorizontal className="h-4 w-4" />
-              <span className="hidden sm:inline">Filters</span>
+              <span className="max-sm:sr-only">Filters</span>
               {recentActiveFilterCount > 0 && (
                 <Badge
                   variant="secondary"
@@ -1432,7 +1487,10 @@ export function UsageAnalytics() {
                 providers={AI_PROVIDERS}
               />
               <Select value={recentStatus} onValueChange={setRecentStatus}>
-                <SelectTrigger className="w-full sm:w-[150px]">
+                <SelectTrigger
+                  aria-label="Status"
+                  className="w-full sm:w-[150px]"
+                >
                   <SelectValue placeholder="Status" />
                 </SelectTrigger>
                 <SelectContent>
@@ -1453,7 +1511,10 @@ export function UsageAnalytics() {
                     setRecentCostOp(v as typeof recentCostOp)
                   }
                 >
-                  <SelectTrigger className="w-[92px]">
+                  <SelectTrigger
+                    aria-label="Cost comparison"
+                    className="w-[92px]"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1488,7 +1549,10 @@ export function UsageAnalytics() {
                     setRecentTokensOp(v as typeof recentTokensOp)
                   }
                 >
-                  <SelectTrigger className="w-[104px]">
+                  <SelectTrigger
+                    aria-label="Tokens comparison"
+                    className="w-[104px]"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1549,6 +1613,7 @@ export function UsageAnalytics() {
                     <TableHead>Time</TableHead>
                     <TableHead>Provider</TableHead>
                     <TableHead>Model</TableHead>
+                    <TableHead>Caller</TableHead>
                     <TableHead className="hidden md:table-cell">
                       Tokens
                     </TableHead>
@@ -1576,6 +1641,11 @@ export function UsageAnalytics() {
                       <TableCell className="font-mono text-xs">
                         {log.model}
                       </TableCell>
+                      <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
+                        {log.project_id === undefined
+                          ? '—'
+                          : `Project #${log.project_id}${log.token_id === undefined ? '' : ` · token #${log.token_id}`}`}
+                      </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
                         {formatTokenCount(log.input_tokens + log.output_tokens)}
                       </TableCell>
@@ -1593,7 +1663,7 @@ export function UsageAnalytics() {
                             }
                             className={
                               log.status < 400
-                                ? 'bg-green-500/15 text-green-500 hover:bg-green-500/25'
+                                ? 'bg-green-500/15 text-green-700 dark:text-green-500 hover:bg-green-500/25'
                                 : ''
                             }
                           >
@@ -1634,7 +1704,10 @@ export function UsageAnalytics() {
                   value={String(recentPageSize)}
                   onValueChange={(v) => setRecentPageSize(Number(v))}
                 >
-                  <SelectTrigger className="h-8 w-[110px] text-xs">
+                  <SelectTrigger
+                    aria-label="Rows per page"
+                    className="h-8 w-[110px] text-xs"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -1654,7 +1727,7 @@ export function UsageAnalytics() {
                   onClick={() => setRecentPage((p) => Math.max(0, p - 1))}
                 >
                   <ChevronLeft className="h-4 w-4" />
-                  <span className="hidden sm:inline">Previous</span>
+                  <span className="max-sm:sr-only">Previous</span>
                 </Button>
                 <Button
                   variant="outline"
@@ -1662,7 +1735,7 @@ export function UsageAnalytics() {
                   disabled={recentPage + 1 >= recentTotalPages}
                   onClick={() => setRecentPage((p) => p + 1)}
                 >
-                  <span className="hidden sm:inline">Next</span>
+                  <span className="max-sm:sr-only">Next</span>
                   <ChevronRight className="h-4 w-4" />
                 </Button>
               </div>
@@ -1852,7 +1925,7 @@ function SpanTreeRow({
                 <TooltipTrigger asChild>
                   <Badge
                     variant="outline"
-                    className="text-[9px] px-1 py-0 h-4 text-blue-500 border-blue-500/30 shrink-0"
+                    className="text-[9px] px-1 py-0 h-4 text-blue-600 dark:text-blue-500 border-blue-500/30 shrink-0"
                   >
                     cached
                   </Badge>
@@ -1989,7 +2062,7 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
         <div key={`thinking-${i}`} className="flex justify-start">
           <div className="max-w-[90%] rounded-lg px-3 py-2 text-xs bg-violet-500/10 border border-violet-500/20">
             <div className="flex items-center gap-1.5 mb-1">
-              <span className="text-[10px] font-semibold uppercase text-violet-500">
+              <span className="text-[10px] font-semibold uppercase text-violet-600 dark:text-violet-500">
                 thinking
               </span>
             </div>
@@ -2056,7 +2129,9 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
                   key={j}
                   className="bg-background/50 rounded p-1.5 font-mono text-[10px]"
                 >
-                  <span className="text-amber-500">{tc.function?.name}</span>
+                  <span className="text-amber-700 dark:text-amber-500">
+                    {tc.function?.name}
+                  </span>
                   {tc.function?.arguments && (
                     <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
                       <HighlightedCode
@@ -2075,7 +2150,9 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
               key={`tool-use-${j}`}
               className="bg-background/50 rounded p-1.5 font-mono text-[10px] mt-1"
             >
-              <span className="text-amber-500">{block.name}</span>
+              <span className="text-amber-700 dark:text-amber-500">
+                {block.name}
+              </span>
               {block.id && (
                 <span className="text-muted-foreground ml-1">({block.id})</span>
               )}
@@ -2176,11 +2253,11 @@ function FullConversationView({
             <div key={i} className="flex justify-start">
               <div className="max-w-[90%] rounded-lg px-3 py-2 text-xs bg-emerald-500/10 border border-emerald-500/20">
                 <div className="flex items-center gap-1.5 mb-1">
-                  <span className="text-[10px] font-semibold uppercase text-emerald-600">
+                  <span className="text-[10px] font-semibold uppercase text-emerald-700 dark:text-emerald-600">
                     tool execution
                   </span>
                   {block?.name && (
-                    <span className="font-mono text-[10px] text-emerald-500">
+                    <span className="font-mono text-[10px] text-emerald-700 dark:text-emerald-500">
                       {block.name}
                     </span>
                   )}
@@ -2232,7 +2309,10 @@ function JsonBlock({ label, value }: { label: string; value: string | null }) {
         {label}
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <pre className="mt-1 p-2 bg-muted rounded text-[10px] font-mono overflow-x-auto max-h-[200px] overflow-y-auto">
+        <pre
+          tabIndex={0}
+          className="mt-1 p-2 bg-muted rounded text-[10px] font-mono overflow-x-auto max-h-[200px] overflow-y-auto"
+        >
           <HighlightedCode code={formatted} language="json" />
         </pre>
       </CollapsibleContent>
@@ -2299,7 +2379,11 @@ function SpanDetailSheet({
             )}
             <Badge
               variant={isError ? 'destructive' : 'default'}
-              className={!isError ? 'bg-green-500/15 text-green-500' : ''}
+              className={
+                !isError
+                  ? 'bg-green-500/15 text-green-700 dark:text-green-500'
+                  : ''
+              }
             >
               {span.status_code}
             </Badge>
@@ -2324,13 +2408,13 @@ function SpanDetailSheet({
                 </div>
                 {span.cache_read_input_tokens != null &&
                   span.cache_read_input_tokens > 0 && (
-                    <div className="text-[10px] text-blue-500">
+                    <div className="text-[10px] text-blue-600 dark:text-blue-500">
                       {formatTokenCount(span.cache_read_input_tokens)} cached
                     </div>
                   )}
                 {span.cache_creation_input_tokens != null &&
                   span.cache_creation_input_tokens > 0 && (
-                    <div className="text-[10px] text-amber-500">
+                    <div className="text-[10px] text-amber-700 dark:text-amber-500">
                       {formatTokenCount(span.cache_creation_input_tokens)} cache
                       write
                     </div>
@@ -2826,7 +2910,7 @@ function InvocationCard({
                     </span>
                   )}
                   {cacheRead > 0 && (
-                    <span className="text-blue-500">
+                    <span className="text-blue-600 dark:text-blue-500">
                       {formatTokenCount(cacheRead)} cached
                     </span>
                   )}
@@ -2847,7 +2931,7 @@ function InvocationCard({
             onClick={() => onOpenSpan(span)}
           >
             <Info className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Details</span>
+            <span className="max-sm:sr-only">Details</span>
           </Button>
         </div>
         <CollapsibleContent>
@@ -3091,7 +3175,7 @@ function TraceDetailView({
                   {formatTokenCount(stats.totalInput)}
                 </div>
                 {stats.totalCacheRead > 0 && (
-                  <div className="text-[10px] text-blue-500">
+                  <div className="text-[10px] text-blue-600 dark:text-blue-500">
                     {formatTokenCount(stats.totalCacheRead)} cached
                   </div>
                 )}
@@ -3120,7 +3204,7 @@ function TraceDetailView({
                   <div className="text-xl font-bold text-destructive">
                     {stats.errors.length}
                   </div>
-                  <div className="text-[10px] text-destructive/70">
+                  <div className="text-[10px] text-destructive">
                     {stats.errors[0].error_type ?? 'Unknown'}
                   </div>
                 </Card>
@@ -3243,7 +3327,12 @@ function TraceDetailView({
 // ── AgentActivity ───────────────────────────────────────────────────
 
 export function AgentActivity() {
-  const { projects } = useProjects()
+  const {
+    projects,
+    isLoading: projectsLoading,
+    error: projectsError,
+    refetch: refetchProjects,
+  } = useProjects()
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
@@ -3316,14 +3405,17 @@ export function AgentActivity() {
       {/* Filters */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">Agent Activity</h3>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           {projects.length > 0 && (
             <Select
               value={projectId?.toString() ?? ''}
               onValueChange={(v) => setSelectedProjectId(Number(v))}
             >
-              <SelectTrigger className="w-full sm:w-[180px]">
-                <SelectValue placeholder="Select project" />
+              <SelectTrigger
+                aria-label="Service"
+                className="w-full sm:w-[180px]"
+              >
+                <SelectValue placeholder="Select service" />
               </SelectTrigger>
               <SelectContent>
                 {projects.map((p) => (
@@ -3360,11 +3452,33 @@ export function AgentActivity() {
       )}
 
       {/* Traces list */}
-      {!projectId ? (
+      {!projectId && projectsLoading ? (
+        <div className="space-y-2">
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      ) : !projectId && projectsError ? (
+        <ReadFailure
+          resource="Services"
+          error={projectsError}
+          onRetry={refetchProjects}
+        />
+      ) : !projectId ? (
         <EmptyState
+          size="compact"
           icon={Bot}
-          title="No project selected"
-          description="Select a project to view AI agent activity traces."
+          title="No services yet"
+          description="AI activity is recorded per service. Deploy a service that calls an AI provider and its traces appear here."
+          action={
+            <div className="flex flex-wrap justify-center gap-2">
+              <Button asChild>
+                <Link to="/projects/new">Deploy a service</Link>
+              </Button>
+              <Button asChild variant="outline">
+                <Link to="/ai-gateway/setup">Set up the AI gateway</Link>
+              </Button>
+            </div>
+          }
         />
       ) : tracesLoading ? (
         <div className="space-y-2">
@@ -3487,7 +3601,7 @@ export function AgentActivity() {
                                 <TooltipTrigger>
                                   <Badge
                                     variant="outline"
-                                    className="text-[10px] text-blue-500 border-blue-500/30"
+                                    className="text-[10px] text-blue-600 dark:text-blue-500 border-blue-500/30"
                                   >
                                     {cachePct}% hit
                                   </Badge>
@@ -3525,7 +3639,7 @@ export function AgentActivity() {
                           ) : (
                             <Badge
                               variant="default"
-                              className="bg-green-500/15 text-green-500 hover:bg-green-500/25"
+                              className="bg-green-500/15 text-green-700 dark:text-green-500 hover:bg-green-500/25"
                             >
                               OK
                             </Badge>
@@ -3640,7 +3754,7 @@ export function ProjectAgentActivity({
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">AI Activity</h3>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           <AiProviderSelect
             value={systemFilter || 'all'}
             onValueChange={(value) =>
@@ -3780,7 +3894,7 @@ export function ProjectAgentActivity({
                                 <TooltipTrigger>
                                   <Badge
                                     variant="outline"
-                                    className="text-[10px] text-blue-500 border-blue-500/30"
+                                    className="text-[10px] text-blue-600 dark:text-blue-500 border-blue-500/30"
                                   >
                                     {cachePct}% hit
                                   </Badge>
@@ -3818,7 +3932,7 @@ export function ProjectAgentActivity({
                           ) : (
                             <Badge
                               variant="default"
-                              className="bg-green-500/15 text-green-500 hover:bg-green-500/25"
+                              className="bg-green-500/15 text-green-700 dark:text-green-500 hover:bg-green-500/25"
                             >
                               OK
                             </Badge>
@@ -3846,47 +3960,6 @@ export function ProjectAgentActivity({
   )
 }
 
-function DeleteConfirmDialog({
-  open,
-  onOpenChange,
-  providerKey,
-  onConfirm,
-  isPending,
-}: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  providerKey: ProviderKeyResponse | null
-  onConfirm: (id: number) => void
-  isPending: boolean
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Delete Provider Key</DialogTitle>
-          <DialogDescription>
-            Are you sure you want to delete &quot;{providerKey?.display_name}
-            &quot;? This will stop routing requests through this provider key.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={() => providerKey && onConfirm(providerKey.id)}
-            disabled={isPending}
-          >
-            {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            Delete
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 export function AiGatewayPage() {
   const queryClient = useQueryClient()
   const { data: settings } = useSettings()
@@ -3894,6 +3967,10 @@ export function AiGatewayPage() {
   usePageTitle('AI Gateway')
 
   const [dialogOpen, setDialogOpen] = useState(false)
+  // True when the add-key dialog was opened from a provider's own row, so the
+  // provider is fixed. Opened from the header or the onboarding prompt, the
+  // dialog shows a provider choice instead.
+  const [providerPreselected, setProviderPreselected] = useState(false)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [selectedKey, setSelectedKey] = useState<ProviderKeyResponse | null>(
     null
@@ -3903,41 +3980,32 @@ export function AiGatewayPage() {
   >('bash')
   const [snippetProvider, setSnippetProvider] = useState<string>('')
 
-  // Form state
-  const [newProvider, setNewProvider] = useState('')
-  const [newDisplayName, setNewDisplayName] = useState('')
-  const [newApiKey, setNewApiKey] = useState('')
-  const [newBaseUrl, setNewBaseUrl] = useState('')
+  // Add-provider-key form (React Hook Form + Zod; see provider-key-form.ts)
+  const providerKeyForm = useForm<ProviderKeyFormValues>({
+    resolver: zodResolver(providerKeyFormSchema),
+    defaultValues: EMPTY_PROVIDER_KEY_FORM,
+  })
+  const formValues = useWatch({
+    control: providerKeyForm.control,
+    defaultValue: EMPTY_PROVIDER_KEY_FORM,
+  }) as ProviderKeyFormValues
+  const formErrors = providerKeyForm.formState.errors
+  const newProvider = formValues.provider
+  const canTrustPrivateAddress = useIsInstanceAdmin()
+  const newProviderIsSelfHosted = isSelfHostedProvider(newProvider)
+  const setFormValue = <K extends keyof ProviderKeyFormValues>(
+    field: K,
+    value: ProviderKeyFormValues[K]
+  ) =>
+    providerKeyForm.setValue(field as never, value as never, {
+      shouldDirty: true,
+      shouldValidate: providerKeyForm.formState.isSubmitted,
+    })
 
   // `/ai-gateway?add=openrouter` is where the assistant's onboarding sends
-  // operators: open the add-key dialog for that provider, then drop the
-  // parameter so a reload or a back-navigation does not reopen it.
+  // operators. Handled in an effect below, once the existing keys are known.
   const [addSearchParams, setAddSearchParams] = useSearchParams()
   const addProvider = addSearchParams.get('add')
-  const [handledAddProvider, setHandledAddProvider] = useState<string | null>(
-    null
-  )
-  // Adjusted during render rather than in an effect: the page can already be
-  // mounted when the link is followed, and this avoids a cascading render.
-  if (addProvider !== handledAddProvider) {
-    setHandledAddProvider(addProvider)
-    const provider = providerFromAddParam(addProvider)
-    if (provider) {
-      setNewProvider(provider.id)
-      setNewDisplayName(provider.name)
-      setDialogOpen(true)
-    }
-  }
-  useEffect(() => {
-    if (addProvider === null) return
-    setAddSearchParams(
-      (params) => {
-        params.delete('add')
-        return params
-      },
-      { replace: true }
-    )
-  }, [addProvider, setAddSearchParams])
 
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
@@ -3956,6 +4024,42 @@ export function AiGatewayPage() {
   const { data: keysData, isLoading } = keysQuery
 
   const keys = keysData ?? []
+
+  // Open the add-key dialog for the `?add=` provider exactly as its "Add key"
+  // button would (numbering the name after the keys it already has), then
+  // drop the parameter so a reload or a back-navigation does not reopen it.
+  // Waits for the key list so the pre-filled name is the right one. The
+  // dialog state is adjusted during render (the page can already be mounted
+  // when the link is followed); the form store is filled before paint.
+  const keysSettled = keysData !== undefined || keysQuery.isError
+  const [handledAddProvider, setHandledAddProvider] = useState<string | null>(
+    null
+  )
+  if (keysSettled && addProvider !== handledAddProvider) {
+    setHandledAddProvider(addProvider)
+    if (providerFromAddParam(addProvider)) {
+      setProviderPreselected(true)
+      setDialogOpen(true)
+    }
+  }
+  useLayoutEffect(() => {
+    if (addProvider === null || !keysSettled) return
+    const provider = providerFromAddParam(addProvider)
+    if (provider) {
+      const existing = (keysData ?? []).filter(
+        (key) => key.provider === provider.id
+      ).length
+      providerKeyForm.reset(providerKeyFormForProvider(provider, existing))
+    }
+    setAddSearchParams(
+      (params) => {
+        params.delete('add')
+        return params
+      },
+      { replace: true }
+    )
+  }, [addProvider, keysSettled, keysData, providerKeyForm, setAddSearchParams])
+
   const keysRead = { keys: keysData, isError: keysQuery.isError }
   const keysUnknown = providerKeysUnknown(keysRead)
 
@@ -3993,12 +4097,8 @@ export function AiGatewayPage() {
 
   // Create mutation
   const createMutation = useMutation({
-    mutationFn: (data: {
-      provider: string
-      display_name: string
-      api_key: string
-      base_url?: string
-    }) => createProviderKey({ body: data, throwOnError: true }),
+    mutationFn: (body: CreateProviderKeyRequest) =>
+      createProviderKey({ body, throwOnError: true }),
     meta: { errorTitle: 'Failed to create provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4098,34 +4198,73 @@ export function AiGatewayPage() {
   // test surfaces as a 400 on the create call itself.
 
   const resetForm = () => {
-    setNewProvider('')
-    setNewDisplayName('')
-    setNewApiKey('')
-    setNewBaseUrl('')
+    providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
+    setProviderPreselected(false)
   }
 
-  const handleCreate = () => {
+  // Header and onboarding entry points: no provider yet, the user picks one
+  // in the dialog.
+  const openAddKeyDialog = () => {
+    providerKeyForm.reset(EMPTY_PROVIDER_KEY_FORM)
+    setProviderPreselected(false)
+    createMutation.reset()
+    setDialogOpen(true)
+  }
+
+  const handleProviderChosen = (providerId: string) => {
+    const provider = SUPPORTED_PROVIDERS.find((p) => p.id === providerId)
+    if (!provider) return
+    const existingKeyCount = keys.filter(
+      (k) => k.provider === provider.id
+    ).length
+    providerKeyForm.reset(
+      selectProviderKeyFormProvider(
+        providerKeyForm.getValues(),
+        provider,
+        existingKeyCount,
+        SUPPORTED_PROVIDERS.map((p) => p.name)
+      )
+    )
+  }
+
+  const handleCreate = providerKeyForm.handleSubmit((values) => {
     if (createMutation.isPending) return
-    if (!newProvider) {
-      toast.error('Please select a provider')
-      return
-    }
-    if (!newApiKey.trim()) {
-      toast.error('Please enter an API key')
-      return
-    }
-    if (!newDisplayName.trim()) {
-      toast.error('Please enter a display name')
-      return
-    }
+    createMutation.mutate(providerKeyFormToRequest(values))
+  })
 
-    createMutation.mutate({
-      provider: newProvider,
-      display_name: newDisplayName,
-      api_key: newApiKey,
-      base_url: newBaseUrl || undefined,
-    })
-  }
+  // Per-key settings (private-address trust, declared capabilities). Owned
+  // here rather than by the collapsible key rows, so collapsing a provider
+  // never drops an in-flight update. Which keys are saving comes from the
+  // mutation cache, per key: `onSettled` returns the refetch, so a save
+  // stays pending until fresh data has arrived, and a key's controls stay
+  // disabled until then -- a second change can never send its stale
+  // capabilities (the server replaces the whole declaration).
+  const updateKeySettingsMutation = useMutation({
+    mutationKey: PROVIDER_KEY_SETTINGS_MUTATION_KEY,
+    mutationFn: ({
+      id,
+      body,
+    }: {
+      id: number
+      body: UpdateProviderKeyRequest
+    }) => updateProviderKey({ path: { id }, body, throwOnError: true }),
+    onSuccess: () => {
+      toast.success('Provider key updated')
+    },
+    onError: (error) =>
+      toast.error('Could not update the provider key', {
+        description: problemDetail(error, 'Please try again.'),
+      }),
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: ['providerKeys'] }),
+  })
+  const savingKeyIds = useMutationState({
+    filters: {
+      mutationKey: PROVIDER_KEY_SETTINGS_MUTATION_KEY,
+      status: 'pending',
+    },
+    select: (mutation) => settingsSaveKeyId(mutation.state.variables),
+  })
 
   const handleDelete = (key: ProviderKeyResponse) => {
     setSelectedKey(key)
@@ -4143,9 +4282,20 @@ export function AiGatewayPage() {
 
   const effectiveSnippetProvider =
     snippetProvider || firstConfiguredProvider?.id || SUPPORTED_PROVIDERS[0].id
+  // A self-hosted server has no vendor default; show the model its key pins.
+  const selfHostedSnippetModel = isSelfHostedProvider(effectiveSnippetProvider)
+    ? keys.find(
+        (k) =>
+          k.provider === effectiveSnippetProvider &&
+          k.is_active &&
+          k.default_model
+      )?.default_model
+    : undefined
   const snippetModel =
+    selfHostedSnippetModel ??
     SUPPORTED_PROVIDERS.find((p) => p.id === effectiveSnippetProvider)
-      ?.defaultModel ?? SUPPORTED_PROVIDERS[0].defaultModel
+      ?.defaultModel ??
+    SUPPORTED_PROVIDERS[0].defaultModel
 
   const codeSnippets = {
     bash: `curl ${gatewayEndpoint}/chat/completions \\
@@ -4207,10 +4357,7 @@ console.log(response.choices[0].message.content);`,
             Unified API for multiple AI providers with a single endpoint
           </p>
         </div>
-        <Button
-          onClick={() => setDialogOpen(true)}
-          className="w-full sm:w-auto"
-        >
+        <Button onClick={openAddKeyDialog} className="w-full sm:w-auto">
           <Plus className="mr-2 h-4 w-4" />
           Add Provider Key
         </Button>
@@ -4249,7 +4396,7 @@ console.log(response.choices[0].message.content);`,
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => setDialogOpen(true)}
+                    onClick={openAddKeyDialog}
                   >
                     <Plus className="mr-2 h-4 w-4" />
                     Add a provider key
@@ -4275,7 +4422,10 @@ console.log(response.choices[0].message.content);`,
                   value={effectiveSnippetProvider}
                   onValueChange={setSnippetProvider}
                 >
-                  <SelectTrigger className="h-7 w-[150px] text-xs focus:ring-0 focus:ring-offset-0">
+                  <SelectTrigger
+                    aria-label="Snippet provider"
+                    className="h-7 w-[150px] text-xs focus:ring-0 focus:ring-offset-0"
+                  >
                     <SelectValue placeholder="Provider" />
                   </SelectTrigger>
                   <SelectContent>
@@ -4439,7 +4589,7 @@ console.log(response.choices[0].message.content);`,
                               Unknown
                             </Badge>
                           ) : status === 'active' ? (
-                            <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
+                            <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-700 dark:text-green-400 hover:bg-green-500/25">
                               Active
                             </Badge>
                           ) : status === 'disabled' ? (
@@ -4470,12 +4620,13 @@ console.log(response.choices[0].message.content);`,
                             }
                             size="sm"
                             onClick={() => {
-                              setNewProvider(provider.id)
-                              setNewDisplayName(
-                                hasAnyKey
-                                  ? `${provider.name} (key ${providerKeys.length + 1})`
-                                  : provider.name
+                              providerKeyForm.reset(
+                                providerKeyFormForProvider(
+                                  provider,
+                                  providerKeys.length
+                                )
                               )
+                              setProviderPreselected(true)
                               setDialogOpen(true)
                             }}
                           >
@@ -4575,6 +4726,19 @@ console.log(response.choices[0].message.content);`,
                             <TableRow className="bg-muted/20 hover:bg-muted/20">
                               <TableCell />
                               <TableCell colSpan={4} className="pb-4 pt-1">
+                                <SelfHostedKeySettings
+                                  providerKey={key}
+                                  canTrustPrivateAddress={
+                                    canTrustPrivateAddress
+                                  }
+                                  pending={savingKeyIds.includes(key.id)}
+                                  onUpdate={(body) =>
+                                    updateKeySettingsMutation.mutate({
+                                      id: key.id,
+                                      body,
+                                    })
+                                  }
+                                />
                                 <ProviderKeyModelDetail providerKey={key} />
                               </TableCell>
                             </TableRow>
@@ -4626,7 +4790,24 @@ console.log(response.choices[0].message.content);`,
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-4 py-4">
-              {newProvider && (
+              {providerPreselected ? null : (
+                <div className="grid gap-2">
+                  <Label>Provider</Label>
+                  <ProviderKeyProviderPicker
+                    providers={SUPPORTED_PROVIDERS}
+                    value={newProvider}
+                    onChange={handleProviderChosen}
+                    disabled={createMutation.isPending}
+                    invalid={!!formErrors.provider}
+                  />
+                  {formErrors.provider && (
+                    <p className="text-xs text-destructive">
+                      {formErrors.provider.message}
+                    </p>
+                  )}
+                </div>
+              )}
+              {newProvider && providerPreselected && (
                 <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
                   <AiProviderIcon provider={newProvider} size={36} />
                   <div className="min-w-0 flex-1">
@@ -4649,53 +4830,119 @@ console.log(response.choices[0].message.content);`,
                   )}
                 </div>
               )}
-              <div className="grid gap-2">
-                <Label htmlFor="displayName">Display Name</Label>
-                <Input
-                  id="displayName"
-                  placeholder="Production API Key"
-                  value={newDisplayName}
+              {/* Hidden (not unmounted) until a provider is chosen: the fields
+                  depend on the provider, and SelfHostedProviderFields keeps
+                  its discovery state mounted. */}
+              <div className={newProvider ? 'grid gap-4' : 'hidden'}>
+                <div className="grid gap-2">
+                  <Label htmlFor="displayName">Display Name</Label>
+                  <Input
+                    id="displayName"
+                    placeholder="Production API Key"
+                    disabled={createMutation.isPending}
+                    aria-invalid={!!formErrors.display_name}
+                    {...providerKeyForm.register('display_name')}
+                  />
+                  {formErrors.display_name && (
+                    <p className="text-xs text-destructive">
+                      {formErrors.display_name.message}
+                    </p>
+                  )}
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="apiKey">
+                    API Key
+                    {newProviderIsSelfHosted && (
+                      <>
+                        {' '}
+                        <span className="text-muted-foreground font-normal">
+                          (optional)
+                        </span>
+                      </>
+                    )}
+                  </Label>
+                  <Input
+                    id="apiKey"
+                    type="password"
+                    placeholder={
+                      newProviderIsSelfHosted
+                        ? 'Leave empty if your server has no authentication'
+                        : 'sk-...'
+                    }
+                    disabled={createMutation.isPending}
+                    aria-invalid={!!formErrors.api_key}
+                    {...providerKeyForm.register('api_key')}
+                  />
+                  {formErrors.api_key ? (
+                    <p className="text-xs text-destructive">
+                      {formErrors.api_key.message}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      Your key is encrypted at rest and never exposed in the
+                      dashboard.
+                    </p>
+                  )}
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="baseUrl">
+                    {newProviderIsSelfHosted ? 'Base URL' : 'Custom Base URL'}{' '}
+                    <span className="text-muted-foreground font-normal">
+                      {newProviderIsSelfHosted ? '(required)' : '(optional)'}
+                    </span>
+                  </Label>
+                  <Input
+                    id="baseUrl"
+                    placeholder={
+                      newProviderIsSelfHosted
+                        ? 'http://10.0.0.5:8000/v1'
+                        : 'https://api.openai.com/v1'
+                    }
+                    disabled={createMutation.isPending}
+                    aria-invalid={!!formErrors.base_url}
+                    {...providerKeyForm.register('base_url')}
+                  />
+                  {formErrors.base_url && (
+                    <p className="text-xs text-destructive">
+                      {formErrors.base_url.message}
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    {newProviderIsSelfHosted
+                      ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
+                      : 'Override the default API endpoint for this provider.'}
+                  </p>
+                </div>
+                <SelfHostedProviderFields
+                  open={newProviderIsSelfHosted}
+                  baseUrl={formValues.base_url}
+                  apiKey={formValues.api_key}
+                  trustPrivateAddress={formValues.trust_private_address}
+                  onTrustPrivateAddressChange={(trusted) =>
+                    setFormValue('trust_private_address', trusted)
+                  }
+                  canTrustPrivateAddress={canTrustPrivateAddress}
+                  discovery={formValues.discovery}
+                  onDiscovered={(discovery) =>
+                    setFormValue('discovery', discovery)
+                  }
+                  defaultModel={formValues.default_model}
+                  onDefaultModelChange={(model) =>
+                    setFormValue('default_model', model)
+                  }
+                  capabilities={formValues.capabilities}
+                  onCapabilitiesChange={(capabilities) =>
+                    setFormValue('capabilities', capabilities)
+                  }
+                  error={formErrors.default_model?.message}
                   disabled={createMutation.isPending}
-                  onChange={(e) => setNewDisplayName(e.target.value)}
                 />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="apiKey">API Key</Label>
-                <Input
-                  id="apiKey"
-                  type="password"
-                  placeholder="sk-..."
-                  value={newApiKey}
-                  disabled={createMutation.isPending}
-                  onChange={(e) => setNewApiKey(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Your key is encrypted at rest and never exposed in the
-                  dashboard.
-                </p>
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="baseUrl">
-                  Custom Base URL{' '}
-                  <span className="text-muted-foreground font-normal">
-                    (optional)
-                  </span>
-                </Label>
-                <Input
-                  id="baseUrl"
-                  placeholder="https://api.openai.com/v1"
-                  value={newBaseUrl}
-                  disabled={createMutation.isPending}
-                  onChange={(e) => setNewBaseUrl(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Override the default API endpoint for this provider.
-                </p>
               </div>
             </div>
             <p className="text-xs text-muted-foreground">
-              We&apos;ll verify the key works before saving — this usually takes
-              1–2 seconds.
+              {newProviderIsSelfHosted
+                ? 'We’ll send a short test completion to the default model before saving.'
+                : 'We’ll verify the key works before saving — this usually takes 1–2 seconds.'}
             </p>
             {createMutation.isError && (
               <p role="alert" className="text-sm text-destructive">
@@ -4708,7 +4955,10 @@ console.log(response.choices[0].message.content);`,
             <DialogFooter>
               <Button
                 onClick={handleCreate}
-                disabled={createMutation.isPending}
+                disabled={
+                  createMutation.isPending ||
+                  !canSubmitProviderKeyForm({ provider: newProvider })
+                }
                 className="w-full sm:w-auto"
               >
                 {createMutation.isPending ? (
@@ -4744,15 +4994,19 @@ console.log(response.choices[0].message.content);`,
       />
 
       {/* Delete Confirmation Dialog */}
-      <DeleteConfirmDialog
+      <ConfirmDeleteDialog
         open={deleteDialogOpen}
         onOpenChange={(open) => {
           setDeleteDialogOpen(open)
           if (!open) setSelectedKey(null)
         }}
-        providerKey={selectedKey}
-        onConfirm={(id) => deleteMutation.mutate(id)}
+        resourceType="provider key"
+        resourceName={selectedKey?.display_name ?? ''}
+        consequences="Requests will no longer be routed through this provider key."
         isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (selectedKey) deleteMutation.mutate(selectedKey.id)
+        }}
       />
     </div>
   )

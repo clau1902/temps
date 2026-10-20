@@ -328,6 +328,16 @@ pub struct DiscoveredModel {
     pub details: Option<ModelDetails>,
 }
 
+impl From<ModelInfo> for DiscoveredModel {
+    /// A listing entry the provider said nothing more about.
+    fn from(info: ModelInfo) -> Self {
+        Self {
+            info,
+            details: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
     pub id: String,

@@ -343,7 +343,7 @@ export function ArchitectureTab({
                 onClick={() => setEditing(true)}
               >
                 <Pencil className="size-4" />
-                <span className="hidden sm:inline">Edit</span>
+                <span className="max-sm:sr-only">Edit</span>
               </Button>
               <Button
                 type="button"

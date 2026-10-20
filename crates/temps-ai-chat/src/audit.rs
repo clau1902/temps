@@ -338,6 +338,25 @@ pub struct ApplicationWorkspaceDeployedAudit {
     pub deployment_id: i32,
 }
 
+/// An interactive terminal was attached to a persistent AI workspace sandbox.
+///
+/// A terminal is arbitrary command execution inside the workspace, so the
+/// attach itself is the auditable event; what is typed is never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceTerminalAttachedAudit {
+    pub context: AuditContext,
+    /// `application` for an application workspace, `global` for the user's
+    /// default workspace.
+    pub scope: String,
+    /// Application public id, or the global workspace context id.
+    pub workspace_id: String,
+    pub sandbox_id: String,
+    /// Public id of the terminal thread that owns the shell.
+    pub thread_id: String,
+    /// PTY tab the thread owns.
+    pub tab: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplicationPreviewLinkCreatedAudit {
     pub context: AuditContext,
@@ -396,6 +415,10 @@ impl_audit_operation!(
 impl_audit_operation!(
     ApplicationWorkspaceDeployedAudit,
     "ai.application.workspace_deployed"
+);
+impl_audit_operation!(
+    WorkspaceTerminalAttachedAudit,
+    "ai.workspace.terminal_attached"
 );
 impl_audit_operation!(
     ApplicationPreviewLinkCreatedAudit,
@@ -641,3 +664,31 @@ impl_audit_operation!(AutofixIncidentStoppedAudit, "AUTOFIX_INCIDENT_STOPPED");
 impl_audit_operation!(AutofixIncidentClosedAudit, "AUTOFIX_INCIDENT_CLOSED");
 impl_audit_operation!(AutofixSettingsUpdatedAudit, "AUTOFIX_SETTINGS_UPDATED");
 impl_audit_operation!(AutofixPausedAudit, "AUTOFIX_PAUSED");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_attach_audit_names_the_workspace_but_never_the_input() {
+        let audit = WorkspaceTerminalAttachedAudit {
+            context: AuditContext {
+                user_id: 7,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "test".to_string(),
+            },
+            scope: "application".to_string(),
+            workspace_id: "app_123".to_string(),
+            sandbox_id: "sbx_0123456789abcdef".to_string(),
+            thread_id: "0123456789abcdef0123456789abcdef".to_string(),
+            tab: "t-0123456789abcdef0123456789abcdef".to_string(),
+        };
+        assert_eq!(audit.operation_type(), "ai.workspace.terminal_attached");
+        assert_eq!(audit.user_id(), Some(7));
+        let body = AuditOperation::serialize(&audit).expect("serialize audit");
+        assert!(body.contains("sbx_0123456789abcdef"), "{body}");
+        assert!(body.contains("app_123"), "{body}");
+        // There is no field that could carry terminal input or output.
+        assert!(!body.contains("command"), "{body}");
+        assert!(!body.contains("input"), "{body}");
+    }
+}

@@ -14,7 +14,10 @@ import {
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { revealServiceParameter } from '@/api/client/sdk.gen'
+import {
+  revealServiceEnvironmentVariables,
+  revealServiceParameter,
+} from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
 import {
   externalServiceBackupsQueryKey,
@@ -40,7 +43,9 @@ import {
   backupDestinationState,
 } from '@/lib/service-backup-setup'
 import { ActiveRestoreBanner } from '@/pages/service-restore/ActiveRestoreBanner'
+import { MigrateS3Dialog } from '@/components/storage/MigrateS3Dialog'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
+import { s3EngineLabel, s3MigrationSupported } from '@/lib/s3-engine'
 import {
   listPgUpgrades,
   phaseIndex,
@@ -76,10 +81,8 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
-import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
@@ -107,7 +110,12 @@ import {
   type DetailFact,
   type StatusTone,
 } from '@temps-sdk/ds'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -145,6 +153,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
 import { toastRedeployAfterLinkChange } from '@/lib/service-link-redeploy'
 
@@ -209,8 +218,8 @@ export function ServiceDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
-  const [deleteConfirmName, setDeleteConfirmName] = useState('')
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
+  const [isMigrateS3DialogOpen, setIsMigrateS3DialogOpen] = useState(false)
   const [isMajorUpgradeDialogOpen, setIsMajorUpgradeDialogOpen] =
     useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -335,6 +344,7 @@ export function ServiceDetail() {
     data: serviceBackupsData,
     isLoading: isLoadingBackups,
     isFetching: isFetchingBackups,
+    isPlaceholderData: isBackupsPlaceholderData,
     refetch: refetchBackups,
   } = useQuery({
     ...listExternalServiceBackupsOptions(
@@ -343,6 +353,10 @@ export function ServiceDetail() {
       BACKUPS_PAGE_SIZE
     ),
     enabled: !!serviceId,
+    // Keep the previous page (and its `total`) on screen while the next page
+    // loads; without it `data` is undefined mid-navigation and the page-range
+    // clamp below would read total=0 and bounce the user back to page 1.
+    placeholderData: keepPreviousData,
   })
 
   const serviceBackups = serviceBackupsData?.backups ?? []
@@ -361,13 +375,22 @@ export function ServiceDetail() {
   )
 
   useEffect(() => {
+    // Only trust the total once the requested page has actually loaded: before
+    // that (initial load, deep link, or placeholder data from the previous
+    // page) the total is unknown or stale and must not clamp the page.
+    if (!serviceBackupsData || isBackupsPlaceholderData) return
     if (backupsPage > backupsTotalPages) {
       // The server total can shrink after a backup is removed while this page
       // is open; synchronize the requested page back into the valid range.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setBackupsPage(backupsTotalPages)
     }
-  }, [backupsPage, backupsTotalPages])
+  }, [
+    backupsPage,
+    backupsTotalPages,
+    serviceBackupsData,
+    isBackupsPlaceholderData,
+    setBackupsPage,
+  ])
 
   const paginatedBackups = serviceBackups
 
@@ -394,9 +417,9 @@ export function ServiceDetail() {
 
   const linkService = useMutation({
     ...linkServiceToProjectMutation(),
-    meta: { errorTitle: 'Failed to link project' },
+    meta: { errorTitle: 'Failed to link service' },
     onSuccess: (_data, variables) => {
-      toast.success('Project linked successfully')
+      toast.success('Service linked successfully')
       refetchLinkedProjects()
       setIsLinkPopoverOpen(false)
       const project = allProjectsData?.projects?.find(
@@ -623,10 +646,6 @@ export function ServiceDetail() {
       toast.promise(startService.mutateAsync({ path: { id: parseInt(id!) } }), {
         loading: `Starting ${service.service.name}…`,
         success: `${service.service.name} started`,
-        error: (err: Error) =>
-          err?.message
-            ? `Failed to start ${service.service.name}: ${err.message}`
-            : `Failed to start ${service.service.name}`,
       })
     }
   }
@@ -638,14 +657,13 @@ export function ServiceDetail() {
     )
   }
 
-  const handleDelete = async () => {
-    if (deleteConfirmName.trim() !== service?.service?.name) return
+  const handleDelete = () => {
     deleteService.mutate({ path: { id: parseInt(id!) } })
   }
 
   const backAction = (
     <Button variant="ghost" size="icon" asChild>
-      <Link to="/storage">
+      <Link to="/storage" aria-label="Back to storage">
         <ArrowLeft className="h-4 w-4" />
       </Link>
     </Button>
@@ -667,6 +685,22 @@ export function ServiceDetail() {
           </>
         }
         aside={<Skeleton className="h-48 w-full rounded-lg" />}
+      />
+    )
+  }
+
+  if (queryError && isVerifiedNotFound(queryError)) {
+    return (
+      <PageState
+        variant="empty"
+        icon={AlertCircle}
+        title="Service not found"
+        description="This storage service does not exist, or it has been deleted."
+        action={
+          <Button asChild>
+            <Link to="/storage">All storage services</Link>
+          </Button>
+        }
       />
     )
   }
@@ -703,6 +737,15 @@ export function ServiceDetail() {
     label: service.service.status,
   }
 
+  const s3Engine = s3EngineLabel(
+    service.service.service_type,
+    service.current_parameters
+  )
+  const canMigrateS3 = s3MigrationSupported(
+    service.service.service_type,
+    service.current_parameters
+  )
+
   const facts: DetailFact[] = [
     {
       label: 'Type',
@@ -716,6 +759,7 @@ export function ServiceDetail() {
         </span>
       ),
     },
+    ...(s3Engine ? [{ label: 'Engine', value: s3Engine }] : []),
     {
       label: 'Topology',
       value:
@@ -777,7 +821,7 @@ export function ServiceDetail() {
               <PopoverContent className="w-[320px] p-0" align="end">
                 <div className="border-b p-3">
                   <p className="text-xs font-medium text-muted-foreground">
-                    Linked projects
+                    Linked services
                   </p>
                   <LinkedResourceNote
                     serviceType={service.service.service_type}
@@ -807,14 +851,14 @@ export function ServiceDetail() {
                     </ul>
                   ) : (
                     <p className="mt-2 text-xs text-muted-foreground">
-                      No projects yet.
+                      No services linked yet.
                     </p>
                   )}
                 </div>
                 <Command>
-                  <CommandInput placeholder="Link a project..." />
+                  <CommandInput placeholder="Link a service..." />
                   <CommandList>
-                    <CommandEmpty>No projects found.</CommandEmpty>
+                    <CommandEmpty>No services found.</CommandEmpty>
                     <CommandGroup>
                       {allProjectsData?.projects
                         ?.filter(
@@ -935,6 +979,15 @@ export function ServiceDetail() {
                   <ArrowUpCircle className="h-4 w-4 mr-2" />
                   Upgrade
                 </DropdownMenuItem>
+                {canMigrateS3 ? (
+                  <DropdownMenuItem
+                    className="min-h-12 sm:min-h-8"
+                    onClick={() => setIsMigrateS3DialogOpen(true)}
+                  >
+                    <DatabaseZap className="h-4 w-4 mr-2" />
+                    Migrate data from another S3 service…
+                  </DropdownMenuItem>
+                ) : null}
                 {service.service.service_type === 'postgres' ? (
                   <DropdownMenuItem
                     className="min-h-12 sm:min-h-8"
@@ -1174,7 +1227,7 @@ export function ServiceDetail() {
                                 <Server className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                               )}
                               <div className="flex flex-col min-w-0">
-                                <div className="flex items-center gap-2">
+                                <div className="flex min-w-0 items-center gap-2">
                                   <span className="font-mono text-sm truncate">
                                     {member.container_name}
                                   </span>
@@ -1530,7 +1583,7 @@ export function ServiceDetail() {
                         disabled={backupsPage === 1}
                       >
                         <ChevronLeft className="h-4 w-4" />
-                        <span className="hidden sm:inline">Previous</span>
+                        <span className="max-sm:sr-only">Previous</span>
                       </Button>
                       <div className="hidden sm:flex items-center gap-1">
                         {backupsPageWindow.map((pageNum) => (
@@ -1557,7 +1610,7 @@ export function ServiceDetail() {
                         }
                         disabled={backupsPage === backupsTotalPages}
                       >
-                        <span className="hidden sm:inline">Next</span>
+                        <span className="max-sm:sr-only">Next</span>
                         <ChevronRight className="h-4 w-4" />
                       </Button>
                     </div>
@@ -1847,8 +1900,8 @@ export function ServiceDetail() {
               <CardHeader>
                 <CardTitle>Environment Variables</CardTitle>
                 <CardDescription>
-                  Preview of environment variables available to projects using
-                  this service
+                  Preview of environment variables available to the services
+                  linked to it
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -1869,15 +1922,24 @@ export function ServiceDetail() {
                 ) : envVars ? (
                   <>
                     <EnvVariablesDisplay
+                      key={id}
                       variables={envVars}
                       showCopy={true}
                       showMaskToggle={true}
                       defaultMasked={true}
                       maxHeight="20rem"
+                      reveal={async () =>
+                        (
+                          await revealServiceEnvironmentVariables({
+                            path: { id: parseInt(id!) },
+                            throwOnError: true,
+                          })
+                        ).data
+                      }
                     />
                     <p className="text-xs text-muted-foreground text-center mt-3">
-                      These variables are automatically available to projects
-                      that use this service
+                      These variables are automatically available to every
+                      linked service
                     </p>
                   </>
                 ) : null}
@@ -1896,8 +1958,8 @@ export function ServiceDetail() {
               <span className="font-medium text-foreground">
                 {service.service.name}
               </span>
-              ? All connected projects will lose access to this service until it
-              is started again.
+              ? Every linked service will lose access to it until it is started
+              again.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1919,100 +1981,43 @@ export function ServiceDetail() {
         </DialogContent>
       </Dialog>
 
-      <Dialog
+      <ConfirmDeleteDialog
         open={isDeleteDialogOpen}
-        onOpenChange={(open) => {
-          setIsDeleteDialogOpen(open)
-          if (!open) setDeleteConfirmName('')
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Service</DialogTitle>
-            <DialogDescription>
-              This action cannot be undone and all data associated with this
-              service will be permanently removed.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Label htmlFor="confirm-delete-service-name">
-              Type <ConfirmNameBadge value={service.service.name} /> to confirm
-            </Label>
-            <Input
-              id="confirm-delete-service-name"
-              value={deleteConfirmName}
-              onChange={(e) => setDeleteConfirmName(e.target.value)}
-              placeholder={service.service.name}
-              autoComplete="off"
-              autoFocus
-            />
-          </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setIsDeleteDialogOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleteConfirmName.trim() !== service.service.name}
-              busy={deleteService.isPending}
-              busyLabel="Deleting…"
-            >
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        onOpenChange={setIsDeleteDialogOpen}
+        resourceType="service"
+        resourceName={service.service.name}
+        requireTypedName
+        consequences="All data associated with this service will be permanently removed."
+        isPending={deleteService.isPending}
+        onConfirm={handleDelete}
+      />
 
-      <Dialog
-        open={!!memberToRemove}
+      <ConfirmDeleteDialog
+        open={memberToRemove !== null}
         onOpenChange={(open) => {
           if (!open) setMemberToRemove(null)
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Remove Cluster Member</DialogTitle>
-            <DialogDescription>
-              Stop and remove{' '}
-              <span className="font-mono text-foreground">
-                {memberToRemove?.container_name}
-              </span>{' '}
-              from this cluster. The container, its data volume, and the
-              member&apos;s DNS record will be deleted. The pg_auto_failover
-              monitor will mark the node as unreachable; run{' '}
-              <span className="font-mono">pg_autoctl drop node</span> manually
-              if you want a fully-clean monitor view.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setMemberToRemove(null)}
-              disabled={removeMember.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={() =>
-                memberToRemove &&
-                removeMember.mutate({
-                  serviceId: parseInt(id!),
-                  memberId: memberToRemove.id,
-                })
-              }
-              busy={removeMember.isPending}
-              busyLabel="Removing…"
-            >
-              Remove Member
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        resourceType="cluster member"
+        resourceName={memberToRemove?.container_name ?? ''}
+        verb="Remove"
+        consequences={
+          <>
+            Stops and removes it from {service.service.name}. The container, its
+            data volume, and the member&apos;s DNS record will be deleted. The
+            pg_auto_failover monitor will mark the node as unreachable; run{' '}
+            <span className="font-mono">pg_autoctl drop node</span> manually if
+            you want a fully-clean monitor view.
+          </>
+        }
+        isPending={removeMember.isPending}
+        onConfirm={() => {
+          if (memberToRemove)
+            removeMember.mutate({
+              serviceId: parseInt(id!),
+              memberId: memberToRemove.id,
+            })
+        }}
+      />
 
       <Dialog
         open={!!memberToPromote}
@@ -2067,6 +2072,14 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         currentImage={service.current_parameters?.docker_image || undefined}
         serviceType={service.service.service_type}
+        onSuccess={() => refetch()}
+      />
+
+      <MigrateS3Dialog
+        open={isMigrateS3DialogOpen}
+        onOpenChange={setIsMigrateS3DialogOpen}
+        serviceId={parseInt(id!)}
+        serviceName={service.service.name}
         onSuccess={() => refetch()}
       />
 
