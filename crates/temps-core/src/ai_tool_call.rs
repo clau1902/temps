@@ -36,6 +36,36 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AiToolCall;
 
+/// Refuse a request the AI assistant issued itself, for an operation whose
+/// whole protection is that a *human* performs it.
+///
+/// Approving or rejecting a proposed action, and choosing how much the
+/// assistant may do without asking, are the controls that bound the assistant.
+/// If the assistant could call them it would be approving its own proposals.
+/// Authorization (`permission_guard!`) cannot catch this, because the replayed
+/// request carries the human's own `AuthContext`; the marker is the only thing
+/// that tells the two apart.
+///
+/// Call this from the handler, next to `permission_guard!`, rather than relying
+/// on the tool allowlist: the allowlist is a convenience for discovery, while a
+/// handler check holds however the operation is reached.
+pub fn require_human_caller(
+    ai_call: Option<&AiToolCall>,
+    operation: &str,
+) -> Result<(), crate::problemdetails::Problem> {
+    if ai_call.is_none() {
+        return Ok(());
+    }
+    Err(crate::error_builder::forbidden()
+        .title("Human Confirmation Required")
+        .detail(format!(
+            "'{operation}' must be performed by a person in the console; the AI assistant cannot do it on their behalf"
+        ))
+        .value("error_code", "HUMAN_CALLER_REQUIRED")
+        .value("operation", operation)
+        .build())
+}
+
 /// Where an agent-issued request came from: the human client behind it.
 ///
 /// The replayed request has no socket and no `User-Agent` of its own, so
@@ -75,6 +105,24 @@ mod tests {
 
         extensions.insert(AiToolCall);
         assert_eq!(extensions.get::<AiToolCall>(), Some(&AiToolCall));
+    }
+
+    #[test]
+    fn human_only_operations_refuse_the_assistant_and_admit_people() {
+        assert!(require_human_caller(None, "confirm_pending_action").is_ok());
+
+        let problem = require_human_caller(Some(&AiToolCall), "confirm_pending_action")
+            .expect_err("the assistant must not pass a human-only gate");
+        assert_eq!(problem.status_code, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem.body.get("error_code").and_then(|v| v.as_str()),
+            Some("HUMAN_CALLER_REQUIRED")
+        );
+        assert_eq!(
+            problem.body.get("operation").and_then(|v| v.as_str()),
+            Some("confirm_pending_action"),
+            "the refusal names the operation"
+        );
     }
 
     #[test]

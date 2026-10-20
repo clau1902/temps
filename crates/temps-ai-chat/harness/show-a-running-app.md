@@ -10,9 +10,15 @@ contexts: assistant, project
 Use this when the user wants to see, open or try something that runs in the
 sandbox.
 
-1. Start the server in the background and bound to every interface, for example
-   `nohup npm run dev -- -H 0.0.0.0 -p 3000 > /tmp/dev.log 2>&1 &`. A server
-   bound to `localhost` cannot be reached from the preview.
+1. First check that nothing already serves the port
+   (`curl -s -o /dev/null -w '%{http_code}' localhost:3000`): never start a
+   second dev server on top of the first. Then start it in the background,
+   bound to every interface, with the framework's own flags, for example
+   `nohup npm run dev -- -H 0.0.0.0 -p 3000 > /tmp/dev.log 2>&1 &` for Next.js,
+   `--host 0.0.0.0 --port 3000` for Vite or uvicorn. A server bound to
+   `localhost` cannot be reached from the preview. Use 3000, 3001, 3002… when
+   several parts run at once. To stop one, kill its PID (`ss -ltnp` shows it),
+   never `pkill -f node`.
 2. Call `sandbox_preview` with the port. It returns the address and checks that
    the server is listening and answers HTTP. It also opens the page in the
    chat's Preview tab beside the conversation, so call it every time you say a

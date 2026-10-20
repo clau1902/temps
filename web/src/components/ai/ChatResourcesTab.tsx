@@ -16,10 +16,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { Link } from 'react-router'
-import {
-  ConnectSandboxButton,
-  ConnectSandboxServiceButton,
-} from './ConnectSandboxButton'
+import { LinkServiceButton } from './LinkServiceButton'
 import {
   groupResources,
   projectRefOf,
@@ -46,12 +43,12 @@ function statusTone(status: string): string {
 }
 
 function ResourceRow({
-  conversationPublicId,
   resource,
+  chatProjectIds,
   onOpenProject,
 }: {
-  conversationPublicId: string
   resource: ChatResource
+  chatProjectIds: readonly number[]
   onOpenProject: (project: ProjectRef) => void
 }) {
   const Icon = KIND_ICONS[resource.kind]
@@ -97,17 +94,11 @@ function ResourceRow({
       ) : (
         <div className={cn(rowClass, 'hover:bg-transparent')}>{body}</div>
       )}
-      {project && (
-        <ConnectSandboxButton
-          conversationPublicId={conversationPublicId}
-          project={project}
-        />
-      )}
       {resource.kind === 'service' && Number.isInteger(Number(resource.id)) && (
-        <ConnectSandboxServiceButton
-          conversationPublicId={conversationPublicId}
+        <LinkServiceButton
           serviceId={Number(resource.id)}
           serviceName={resource.name}
+          chatProjectIds={chatProjectIds}
         />
       )}
       {resource.url && (
@@ -157,6 +148,10 @@ export function ChatResourcesTab({
   }
 
   const groups = groupResources(resources.data.resources)
+  const chatProjectIds = resources.data.resources.flatMap((resource) => {
+    const project = projectRefOf(resource)
+    return project ? [project.id] : []
+  })
   if (groups.length === 0) {
     return (
       <div className="flex flex-col items-center gap-2 p-6 text-center">
@@ -184,8 +179,8 @@ export function ChatResourcesTab({
             {group.resources.map((resource) => (
               <ResourceRow
                 key={`${resource.kind}:${resource.id}`}
-                conversationPublicId={conversationPublicId}
                 resource={resource}
+                chatProjectIds={chatProjectIds}
                 onOpenProject={onOpenProject}
               />
             ))}

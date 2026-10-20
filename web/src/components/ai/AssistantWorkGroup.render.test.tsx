@@ -1,0 +1,188 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { expect, test } from 'bun:test'
+import { renderToStaticMarkup } from 'react-dom/server'
+import type { ChatMessage, ToolCall } from './chat-message-parts'
+import { AssistantBody } from './DebugChatPanel-components'
+
+const noop = () => {}
+
+function body(message: ChatMessage, streaming = false) {
+  return renderToStaticMarkup(
+    <QueryClientProvider client={new QueryClient()}>
+      <AssistantBody
+        message={message}
+        streaming={streaming}
+        activityLabel="Thinking"
+        conversationPublicId="chat_1"
+        userScoped
+        onFix={noop}
+        onPermissionResolved={noop}
+      />
+    </QueryClientProvider>
+  )
+}
+
+const command = (id: string, cmd: string, result?: string): ToolCall => ({
+  id,
+  name: 'sandbox_exec',
+  arguments: JSON.stringify({ command: cmd }),
+  result,
+})
+
+const settled: ChatMessage = {
+  role: 'assistant',
+  content: '',
+  parts: [
+    { type: 'text', text: 'Checking the workspace first.' },
+    { type: 'tool', tool: command('a', 'ls -la', '{"exit_code":0}') },
+    {
+      type: 'tool',
+      tool: {
+        id: 'b',
+        name: 'sandbox_read_file',
+        arguments: JSON.stringify({ path: 'package.json' }),
+        result: '{"content":"{}"}',
+      },
+    },
+    { type: 'tool', tool: command('c', 'npm test', '{"exit_code":1}') },
+    { type: 'text', text: 'The tests fail on a missing module.' },
+  ],
+}
+
+test('finished work folds into one summary line, and the answer stays in full', () => {
+  const markup = body(settled)
+  expect(markup).toContain('Ran 2 commands, read a file')
+  expect(markup).toContain('1 failed')
+  expect(markup).toContain('The tests fail on a missing module.')
+  // The steps are behind the summary; what the model said stays in view.
+  expect(markup).toContain('Checking the workspace first.')
+  expect(markup).not.toContain('npm test')
+  expect(markup).toContain('aria-expanded="false"')
+})
+
+test('text between tools stays in the conversation, outside the trace', () => {
+  const markup = body(
+    {
+      role: 'assistant',
+      content: '',
+      parts: [
+        { type: 'text', text: 'I will look at the fonts first.' },
+        { type: 'tool', tool: command('a', 'ls', '{"exit_code":0}') },
+        { type: 'text', text: 'The preview is up. Now the logs.' },
+      ],
+    },
+    true
+  )
+  // The finished group closes to its summary; the words around it stay put,
+  // and the one activity indicator follows the text being written.
+  expect(markup).toContain('aria-expanded="false"')
+  expect(markup).toContain('I will look at the fonts first.')
+  expect(markup).toContain('The preview is up. Now the logs.')
+  expect(markup.match(/role="status"/g)).toHaveLength(1)
+  expect(markup.indexOf('I will look at the fonts first.')).toBeLessThan(
+    markup.indexOf('aria-expanded')
+  )
+})
+
+test('while the turn works, the trace is open on the step it is taking', () => {
+  const markup = body(
+    {
+      role: 'assistant',
+      content: '',
+      parts: [
+        { type: 'tool', tool: command('a', 'ls', '{"exit_code":0}') },
+        { type: 'tool', tool: command('b', 'npm install') },
+      ],
+    },
+    true
+  )
+  expect(markup).toContain('Thinking')
+  expect(markup).toContain('aria-expanded="true"')
+  expect(markup).toMatch(/aria-label="Running"[^]*npm install/)
+  expect(markup).not.toContain('Ran 2 commands')
+  // The group's header is the activity: no second indicator after it.
+  expect(markup.match(/role="status"/g)?.length).toBe(1)
+})
+
+test('a long trace shows only its latest steps while it works', () => {
+  const parts = Array.from({ length: 7 }, (_, at) => ({
+    type: 'tool' as const,
+    tool: command(
+      `t${at}`,
+      `step-${at}`,
+      at < 6 ? '{"exit_code":0}' : undefined
+    ),
+  }))
+  const markup = body({ role: 'assistant', content: '', parts }, true)
+  expect(markup).toContain('3 earlier steps')
+  expect(markup).not.toContain('step-2<')
+  expect(markup).toContain('step-6')
+})
+
+test('a settled goal step folds to what it did, not its raw arguments', () => {
+  const markup = renderToStaticMarkup(
+    <QueryClientProvider client={new QueryClient()}>
+      <AssistantBody
+        message={{
+          role: 'assistant',
+          content: 'Watching it.',
+          parts: [
+            {
+              type: 'tool',
+              tool: {
+                id: 'g',
+                name: 'temps_goal',
+                arguments: JSON.stringify({
+                  action: 'track',
+                  title: 'Deployment 43 goes live',
+                  operation_id: 'get_deployment',
+                }),
+                result: '{"ok":true}',
+              },
+            },
+          ],
+        }}
+        streaming={false}
+        activityLabel="Thinking"
+        conversationPublicId="chat_1"
+        userScoped
+        onFix={noop}
+        onPermissionResolved={noop}
+      />
+    </QueryClientProvider>
+  )
+  expect(markup).toContain('Set a goal')
+  expect(markup).not.toContain('operation_id')
+})
+
+test('a proposed change is never folded away with the work', () => {
+  const markup = body({
+    role: 'assistant',
+    content: '',
+    parts: [
+      { type: 'tool', tool: command('a', 'ls', '{"exit_code":0}') },
+      { type: 'text', text: 'I will create the project. Approve below.' },
+      {
+        type: 'tool',
+        tool: {
+          id: 'w',
+          name: 'temps_write',
+          arguments: '{}',
+          result: 'usage: temps_write <method> <path>',
+        },
+      },
+    ],
+  })
+  expect(markup).toContain('Ran a command')
+  expect(markup).toContain('I will create the project. Approve below.')
+  expect(markup).toContain('temps_write')
+})
+
+test('an answer without tools has no work group', () => {
+  const markup = body({ role: 'assistant', content: 'You have two projects.' })
+  expect(markup).toContain('You have two projects.')
+  expect(markup).not.toContain('aria-expanded')
+})

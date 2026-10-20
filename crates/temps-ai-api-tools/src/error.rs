@@ -182,4 +182,40 @@ pub enum ApiToolError {
         /// What went wrong reading the body.
         reason: String,
     },
+
+    #[error(
+        "Operation '{operation_id}' was given a secret reference in {location}. A \
+         `secret_ref:` handle is only accepted as the whole value of a credential field in \
+         the request body; nothing was sent."
+    )]
+    SecretReferenceMisplaced {
+        operation_id: String,
+        location: String,
+    },
+
+    #[error(
+        "Operation '{operation_id}' was given a secret reference for '{field}', but no \
+         secrets are available in this context. Nothing was sent."
+    )]
+    SecretsUnavailable { operation_id: String, field: String },
+
+    /// A credential field held a real value instead of a handle. The value is
+    /// deliberately not part of the message: it must not be echoed back.
+    #[error(
+        "Operation '{operation_id}' was given a literal value for the credential field \
+         '{field}'. Credentials must not pass through the chat: call `request_secret` for \
+         this operation and field, wait for the user to fill the private form, then pass the \
+         `secret_ref:` handle as the whole value. Nothing was sent."
+    )]
+    SecretLiteralRejected { operation_id: String, field: String },
+
+    #[error(
+        "The secret reference for '{field}' of operation '{operation_id}' could not be \
+         used: {reason}. Nothing was sent."
+    )]
+    SecretUnresolved {
+        operation_id: String,
+        field: String,
+        reason: String,
+    },
 }

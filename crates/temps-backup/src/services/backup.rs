@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use cron::Schedule;
 use temps_core::notifications::BackupFailureData;
+use temps_core::secret_string::SecretString;
 use temps_entities::{backup_schedules::Model as BackupSchedule, s3_sources::Model as S3Source};
 use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_providers::ExternalServiceManager;
@@ -3358,8 +3359,8 @@ SELECT cp.id
         request: &CreateS3SourceRequest,
     ) -> Result<S3Client, BackupError> {
         let creds = aws_sdk_s3::config::Credentials::new(
-            request.access_key_id.clone(),
-            request.secret_key.clone(),
+            request.access_key_id.expose().to_string(),
+            request.secret_key.expose().to_string(),
             None,
             None,
             "backup-service",
@@ -5672,8 +5673,8 @@ SELECT cp.id
                 name: request.name.clone(),
                 bucket_name: request.bucket_name,
                 bucket_path: request.bucket_path,
-                access_key_id: request.access_key_id,
-                secret_key: request.secret_key,
+                access_key_id: request.access_key_id.into_exposed(),
+                secret_key: request.secret_key.into_exposed(),
                 // An operator typing credentials into the S3 Sources form is
                 // always configuring a long-lived credential. Temporary,
                 // prefix-scoped credentials only ever arrive from Temps Cloud
@@ -8067,12 +8068,12 @@ RETURNING id
         // that value back for a field the operator did not retype. It means
         // "unchanged": storing it would replace a working credential.
         let is_unchanged_credential =
-            |value: &Option<String>| value.as_deref().is_none_or(|v| v.is_empty() || v == "***");
+            |value: Option<&str>| value.is_none_or(|v| v.is_empty() || v == "***");
         let mut request = request;
-        if is_unchanged_credential(&request.access_key_id) {
+        if is_unchanged_credential(request.access_key_id.as_ref().map(SecretString::expose)) {
             request.access_key_id = None;
         }
-        if is_unchanged_credential(&request.secret_key) {
+        if is_unchanged_credential(request.secret_key.as_ref().map(SecretString::expose)) {
             request.secret_key = None;
         }
 
@@ -8098,17 +8099,23 @@ RETURNING id
         // supplied, to compare them. One that cannot be decrypted any more
         // (a changed server key, damaged data) is being replaced, which is
         // exactly how an operator repairs it, so it counts as a change.
-        let credential_changed = |supplied: &Option<String>, stored: &str| {
-            supplied.as_deref().is_some_and(|value| {
-                match self.encryption_service.decrypt_string(stored) {
+        let credential_changed = |supplied: Option<&str>, stored: &str| {
+            supplied.is_some_and(
+                |value| match self.encryption_service.decrypt_string(stored) {
                     Ok(stored) => value != stored,
                     Err(_) => true,
-                }
-            })
+                },
+            )
         };
         let connection_changed = differs(&request.bucket_name, &current.bucket_name)
-            || credential_changed(&request.access_key_id, &current.access_key_id)
-            || credential_changed(&request.secret_key, &current.secret_key)
+            || credential_changed(
+                request.access_key_id.as_ref().map(SecretString::expose),
+                &current.access_key_id,
+            )
+            || credential_changed(
+                request.secret_key.as_ref().map(SecretString::expose),
+                &current.secret_key,
+            )
             || differs(&request.region, &current.region)
             || request
                 .endpoint
@@ -8127,11 +8134,11 @@ RETURNING id
                 bucket_path: current.bucket_path.clone(),
                 access_key_id: match &request.access_key_id {
                     Some(access_key_id) => access_key_id.clone(),
-                    None => decrypt("access key ID", &current.access_key_id)?,
+                    None => SecretString::new(decrypt("access key ID", &current.access_key_id)?),
                 },
                 secret_key: match &request.secret_key {
                     Some(secret_key) => secret_key.clone(),
-                    None => decrypt("secret key", &current.secret_key)?,
+                    None => SecretString::new(decrypt("secret key", &current.secret_key)?),
                 },
                 region: request
                     .region
@@ -8164,7 +8171,7 @@ RETURNING id
             // Encrypt access key before storing
             let encrypted_access_key = self
                 .encryption_service
-                .encrypt_string(&access_key_id)
+                .encrypt_string(access_key_id.expose())
                 .map_err(|e| BackupError::Internal {
                     message: format!("Failed to encrypt access key: {}", e),
                 })?;
@@ -8174,7 +8181,7 @@ RETURNING id
             // Encrypt secret key before storing
             let encrypted_secret_key = self
                 .encryption_service
-                .encrypt_string(&secret_key)
+                .encrypt_string(secret_key.expose())
                 .map_err(|e| BackupError::Internal {
                     message: format!("Failed to encrypt secret key: {}", e),
                 })?;
@@ -11209,8 +11216,8 @@ mod tests {
                     name: Some("renamed".to_string()),
                     bucket_name: None,
                     bucket_path: None,
-                    access_key_id: Some("attacker-key".to_string()),
-                    secret_key: Some("attacker-secret".to_string()),
+                    access_key_id: Some(SecretString::new("attacker-key")),
+                    secret_key: Some("attacker-secret".into()),
                     region: None,
                     endpoint: None,
                     force_path_style: None,
@@ -11459,7 +11466,6 @@ mod tests {
                 metrics_enabled: false,
                 default_backup_provisioned: false,
                 container_name: None,
-                ai_data_access: false,
                 created_by_user_id: None,
                 continuous_archive_s3_source_id: None,
                 continuous_archive_pinned_at: None,
@@ -11882,8 +11888,8 @@ mod tests {
             name: "test-source".to_string(),
             bucket_name: "test-bucket".to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: "test-key".to_string(),
-            secret_key: "test-secret".to_string(),
+            access_key_id: SecretString::new("test-key"),
+            secret_key: "test-secret".into(),
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
@@ -11919,8 +11925,8 @@ mod tests {
             name: "".to_string(),
             bucket_name: "test-bucket".to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: "test-key".to_string(),
-            secret_key: "test-secret".to_string(),
+            access_key_id: SecretString::new("test-key"),
+            secret_key: "test-secret".into(),
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
@@ -12141,8 +12147,8 @@ mod tests {
             name: "test-rustfs".to_string(),
             bucket_name: bucket_name.to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: crate::test_rustfs::RUSTFS_ACCESS_KEY.to_string(),
-            secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.to_string(),
+            access_key_id: SecretString::new(crate::test_rustfs::RUSTFS_ACCESS_KEY),
+            secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.into(),
             region: "us-east-1".to_string(),
             endpoint: Some(s3_endpoint.clone()),
             force_path_style: Some(true),
@@ -12537,8 +12543,8 @@ mod tests {
                 name: "test-rustfs-toggle".to_string(),
                 bucket_name: bucket_name.to_string(),
                 bucket_path: "/backups".to_string(),
-                access_key_id: crate::test_rustfs::RUSTFS_ACCESS_KEY.to_string(),
-                secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.to_string(),
+                access_key_id: SecretString::new(crate::test_rustfs::RUSTFS_ACCESS_KEY),
+                secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.into(),
                 region: "us-east-1".to_string(),
                 endpoint: Some(s3_endpoint.clone()),
                 force_path_style: Some(true),
@@ -12832,8 +12838,8 @@ mod tests {
             name: "test-restore-source".to_string(),
             bucket_name: bucket_name.to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: crate::test_rustfs::RUSTFS_ACCESS_KEY.to_string(),
-            secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.to_string(),
+            access_key_id: SecretString::new(crate::test_rustfs::RUSTFS_ACCESS_KEY),
+            secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.into(),
             region: "us-east-1".to_string(),
             endpoint: Some(s3_endpoint.clone()),
             force_path_style: Some(true),
@@ -12900,8 +12906,8 @@ mod tests {
             name: "test-restore-source".to_string(),
             bucket_name: bucket_name.to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: crate::test_rustfs::RUSTFS_ACCESS_KEY.to_string(),
-            secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.to_string(),
+            access_key_id: SecretString::new(crate::test_rustfs::RUSTFS_ACCESS_KEY),
+            secret_key: crate::test_rustfs::RUSTFS_SECRET_KEY.into(),
             region: "us-east-1".to_string(),
             endpoint: Some(s3_endpoint.clone()),
             force_path_style: Some(true),
@@ -13099,8 +13105,8 @@ mod tests {
             name: "test-source".to_string(),
             bucket_name: "test-bucket".to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: "test-access-key".to_string(),
-            secret_key: "test-secret-key".to_string(),
+            access_key_id: SecretString::new("test-access-key"),
+            secret_key: "test-secret-key".into(),
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
@@ -13137,8 +13143,8 @@ mod tests {
             name: "test-auto-create-bucket".to_string(),
             bucket_name: "test-auto-create-bucket".to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key_id: SecretString::new("minioadmin"),
+            secret_key: "minioadmin".into(),
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
@@ -13185,8 +13191,8 @@ mod tests {
             name: "".to_string(), // Empty name - should fail validation
             bucket_name: "test-bucket".to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: "test-key".to_string(),
-            secret_key: "test-secret".to_string(),
+            access_key_id: SecretString::new("test-key"),
+            secret_key: "test-secret".into(),
             region: "us-east-1".to_string(),
             endpoint: None,
             force_path_style: None,
@@ -13215,8 +13221,8 @@ mod tests {
             name: "probe".to_string(),
             bucket_name: "probe".to_string(),
             bucket_path: "p".to_string(),
-            access_key_id: "test-access-key".to_string(),
-            secret_key: "test-secret-key-never-in-messages".to_string(),
+            access_key_id: SecretString::new("test-access-key"),
+            secret_key: "test-secret-key-never-in-messages".into(),
             region: "us-east-1".to_string(),
             endpoint: Some(endpoint.to_string()),
             force_path_style: Some(true),
@@ -13329,8 +13335,8 @@ mod tests {
                     name: None,
                     bucket_name: None,
                     bucket_path: None,
-                    access_key_id: Some("***".to_string()),
-                    secret_key: Some(String::new()),
+                    access_key_id: Some(SecretString::new("***")),
+                    secret_key: Some(SecretString::default()),
                     region: None,
                     endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
                     force_path_style: None,
@@ -13389,8 +13395,8 @@ mod tests {
                     name: None,
                     bucket_name: None,
                     bucket_path: None,
-                    access_key_id: Some("new-access-key".to_string()),
-                    secret_key: Some("new-secret-key".to_string()),
+                    access_key_id: Some(SecretString::new("new-access-key")),
+                    secret_key: Some("new-secret-key".into()),
                     region: None,
                     endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
                     force_path_style: None,
@@ -13433,8 +13439,8 @@ mod tests {
                     name: Some("renamed".to_string()),
                     bucket_name: Some(source.bucket_name.clone()),
                     bucket_path: None,
-                    access_key_id: Some("stored-access-key".to_string()),
-                    secret_key: Some("stored-secret-key".to_string()),
+                    access_key_id: Some(SecretString::new("stored-access-key")),
+                    secret_key: Some("stored-secret-key".into()),
                     region: Some(source.region.clone()),
                     endpoint: source.endpoint.clone(),
                     force_path_style: source.force_path_style,
@@ -13473,8 +13479,8 @@ mod tests {
                     name: Some("renamed".to_string()),
                     bucket_name: None,
                     bucket_path: None,
-                    access_key_id: Some("***".to_string()),
-                    secret_key: Some("***".to_string()),
+                    access_key_id: Some(SecretString::new("***")),
+                    secret_key: Some("***".into()),
                     region: None,
                     endpoint: None,
                     force_path_style: None,
@@ -14882,7 +14888,6 @@ mod tests {
             health_metadata: Set(None),
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
-            ai_data_access: Set(false),
             container_name: Set(None),
             created_by_user_id: Set(None),
             continuous_archive_s3_source_id: Set(None),
@@ -15070,7 +15075,6 @@ mod tests {
             health_metadata: Set(None),
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
-            ai_data_access: Set(false),
             container_name: Set(None),
             created_by_user_id: Set(None),
             continuous_archive_s3_source_id: Set(None),
@@ -15562,7 +15566,6 @@ mod tests {
             health_metadata: Set(None),
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
-            ai_data_access: Set(false),
             container_name: Set(None),
             created_by_user_id: Set(None),
             continuous_archive_s3_source_id: Set(None),

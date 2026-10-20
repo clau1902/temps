@@ -111,8 +111,14 @@ export function SandboxTerminal({ sandboxId }: { sandboxId: string }) {
   }, [sandboxId, attempt])
 
   return (
-    <div className="relative flex h-full min-h-[280px] flex-col bg-black">
-      <div ref={hostRef} className="min-h-0 flex-1 p-2" />
+    <div className="relative flex h-full min-h-[280px] flex-col overflow-hidden bg-black [&_.xterm-viewport]:[scrollbar-color:#3f3f46_#000]">
+      {/* The fit addon sizes the grid from the host's computed height, which
+          includes any padding on it, so the inset lives on a wrapper. Were the
+          grid to overflow, the panel would gain a scrollbar, the narrower
+          panel would refit, and the two would flicker back and forth. */}
+      <div className="relative min-h-0 flex-1">
+        <div ref={hostRef} className="absolute inset-2 overflow-hidden" />
+      </div>
       {connection.phase === 'closed' && (
         <div
           role="alert"

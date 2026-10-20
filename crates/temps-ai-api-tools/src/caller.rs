@@ -60,6 +60,10 @@ pub struct ApiCallScope {
     /// write). Recorded in the audit trail next to the "via Temps AI assistant"
     /// label; `None` for calls that have no client to attribute, such as reads.
     pub origin: Option<temps_core::ai_tool_call::AiToolOrigin>,
+    /// Resolves `secret_ref:` handles the model passes in credential fields.
+    /// Already bound to the user and conversation by whoever builds the scope.
+    /// `None` means no secrets exist in this context, so a handle is refused.
+    pub secrets: Option<std::sync::Arc<dyn crate::secrets::SecretResolver>>,
 }
 
 /// Independent policy for project selectors embedded in API operations.
@@ -652,6 +656,19 @@ impl InternalApiCaller {
             .collect()
     }
 
+    /// Whether `pointer` is a credential field of `operation_id`'s request
+    /// body, i.e. a place a `secret_ref:` handle is accepted. `false` for an
+    /// unknown operation.
+    pub fn is_credential_field(&self, operation_id: &str, pointer: &str) -> bool {
+        crate::secrets::pointer_is_credential(pointer, self.index.secret_fields(operation_id))
+    }
+
+    /// The request-body fields of `operation_id` that take a credential, as JSON
+    /// pointers (`*` for an array index). Empty when it takes none.
+    pub fn credential_fields(&self, operation_id: &str) -> Vec<String> {
+        crate::secrets::describe_credential_paths(self.index.secret_fields(operation_id))
+    }
+
     /// Return the full schema for a single operation by `operation_id`.
     pub fn describe(&self, operation_id: &str) -> Option<OperationSchema> {
         self.index.get(operation_id).map(OperationSchema::from)
@@ -938,6 +955,23 @@ impl InternalApiCaller {
             self.max_limit,
         )?;
 
+        // Handles belong in credential body fields only, never in a URL.
+        crate::secrets::reject_references_in_url(operation_id, &built.path, &built.query)?;
+
+        // Swap handles for the user's values. `substituted` is what must not
+        // reach the model again, so it is scrubbed from the response below.
+        let mut built = built;
+        let mut substituted = Vec::new();
+        if let Some(body) = built.body.as_mut() {
+            substituted = crate::secrets::substitute(
+                operation_id,
+                body,
+                self.index.secret_fields(operation_id),
+                scope.secrets.as_deref(),
+            )
+            .await?;
+        }
+
         // Step 3: build the Axum request.
         let uri = if built.query.is_empty() {
             built.path.clone()
@@ -975,10 +1009,9 @@ impl InternalApiCaller {
         req.extensions_mut().insert(scope.auth.clone());
 
         // Mark the request as agent-originated. Authorization still comes from
-        // the AuthContext above; this only lets handlers apply gates that turn
-        // on *because* a model is the consumer — currently the per-service
-        // `ai_data_access` opt-in for reading table rows, which would otherwise
-        // send row contents to a third-party AI provider.
+        // the AuthContext above; this only lets handlers treat a model as the
+        // consumer — tighter row and time budgets, and an audit record of the
+        // rows it read, since those reach a third-party AI provider.
         req.extensions_mut()
             .insert(temps_core::ai_tool_call::AiToolCall);
         if let Some(origin) = &scope.origin {
@@ -999,8 +1032,9 @@ impl InternalApiCaller {
         let status = response.status().as_u16();
 
         // Step 5: collect body with size cap.
-        let (body_value, truncated) =
+        let (mut body_value, truncated) =
             collect_body(response.into_body(), self.max_response_bytes, operation_id).await?;
+        crate::secrets::scrub(&mut body_value, &substituted);
 
         if truncated {
             warn!(
@@ -2759,6 +2793,7 @@ mod tests {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
             origin: None,
+            secrets: None,
         };
 
         let outcome = caller.prepare_write_cli("--help", &scope);
@@ -2801,6 +2836,7 @@ mod tests {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
             origin: None,
+            secrets: None,
         };
 
         // Supply the required `branch` param.
@@ -2854,6 +2890,7 @@ mod tests {
             auth: AuthContext::new_session(user, Role::Admin),
             project_scope: ProjectSelectorScope::Allowed(Vec::new()),
             origin: None,
+            secrets: None,
         };
 
         let outcome =
@@ -2907,6 +2944,7 @@ mod tests {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
             origin: None,
+            secrets: None,
         };
 
         // Do NOT supply `branch` — should get Invalid.

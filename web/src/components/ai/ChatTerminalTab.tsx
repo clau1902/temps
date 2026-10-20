@@ -7,6 +7,7 @@ import { useQuery } from '@tanstack/react-query'
 import { SquareTerminal } from 'lucide-react'
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { SandboxWaking } from './ChatPreviewTab'
+import { CreateSandboxAction } from './ChatSandbox'
 import { useChatSandboxWake } from './chat-sandbox-wake'
 
 // The terminal emulator is a few hundred KB that only a chat which opens the
@@ -91,7 +92,10 @@ export function ChatTerminalTab({
   }
   if (!linked) {
     return (
-      <TerminalOnboarding reason="This chat has no sandbox yet. When the assistant builds something, it runs in one." />
+      <>
+        <TerminalOnboarding reason="This chat has no sandbox yet. When the assistant builds something, it runs in one." />
+        <CreateSandboxAction conversationPublicId={conversationPublicId} />
+      </>
     )
   }
   if (wake.phase !== 'ready') {

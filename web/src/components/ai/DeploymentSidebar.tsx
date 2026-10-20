@@ -19,15 +19,22 @@ import {
   ArrowRight,
   ExternalLink,
   FolderGit2,
+  FolderTree,
   GitBranch,
+  GitCompare,
   Layers,
   Monitor,
+  Network,
   Rocket,
   SquareTerminal,
   X,
+  type LucideIcon,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router'
+import { ArchitectureTab } from './ArchitectureTab'
+import { ChatChangesTab } from './ChatChangesTab'
+import { ChatFilesTab } from './ChatFilesTab'
 import { ChatPreviewTab } from './ChatPreviewTab'
 import { ChatTerminalTab } from './ChatTerminalTab'
 import { ChatResourcesTab } from './ChatResourcesTab'
@@ -39,8 +46,13 @@ import {
 } from './deployment-card-state'
 import { JobStatusIcon, statusPresentation } from './GeneratedDeploymentCard'
 import type { WatchedDeployment } from './goal-presentation'
+import { DEPLOYMENTS_TAB, sidebarSelection } from './sidebar-selection'
 
-const MAX_TABS = 6
+/** Projects opened from replies beyond this many are not given a tab. */
+const MAX_PROJECT_TABS = 6
+
+/** The fixed tab that shows the application's architecture. */
+export const ARCHITECTURE_TAB = 'architecture'
 
 /** The fixed tab that lists what the chat made. */
 const MADE_TAB = 'made'
@@ -48,20 +60,37 @@ const MADE_TAB = 'made'
 /** The fixed tab that shows the page the chat's sandbox is serving. */
 export const PREVIEW_TAB = 'preview'
 const TERMINAL_TAB = 'terminal'
+const FILES_TAB = 'files'
+const CHANGES_TAB = 'changes'
 
-/** A tab beside the chat: a deployment it watches or a project the user opened. */
-export type SidebarTab =
-  | { kind: 'deployment'; deployment: WatchedDeployment }
-  | { kind: 'project'; project: ProjectRef }
+/** The tabs every chat has, in order. Deployments and projects follow. */
+const CHAT_TABS: ReadonlyArray<{
+  value: string
+  label: string
+  Icon: LucideIcon
+}> = [
+  { value: ARCHITECTURE_TAB, label: 'Architecture', Icon: Network },
+  { value: MADE_TAB, label: 'Made here', Icon: Layers },
+  { value: PREVIEW_TAB, label: 'Preview', Icon: Monitor },
+  { value: FILES_TAB, label: 'Files', Icon: FolderTree },
+  { value: CHANGES_TAB, label: 'Changes', Icon: GitCompare },
+  { value: TERMINAL_TAB, label: 'Terminal', Icon: SquareTerminal },
+]
 
-export function tabKey(tab: SidebarTab): string {
-  return tab.kind === 'project'
-    ? `project:${tab.project.id}`
-    : key(tab.deployment)
+/**
+ * A tab's label, hidden to an icon when the panel is narrow so the strip
+ * fits without scrolling. The active tab and a wide panel keep it visible;
+ * screen readers always get it.
+ */
+const COLLAPSIBLE_LABEL =
+  'max-w-32 truncate sr-only group-data-[state=active]:not-sr-only @xl:not-sr-only'
+
+function projectKey(project: ProjectRef): string {
+  return `project:${project.id}`
 }
 
 /** How far along the build is, as whole stages finished out of all of them. */
-export function stageProgress(jobs: ReadonlyArray<{ status: string }>): {
+function stageProgress(jobs: ReadonlyArray<{ status: string }>): {
   done: number
   total: number
 } {
@@ -71,14 +100,11 @@ export function stageProgress(jobs: ReadonlyArray<{ status: string }>): {
   }
 }
 
-function DeploymentTab({
-  projectId,
-  deploymentId,
-}: {
-  projectId: number
-  deploymentId: number | null
-}) {
-  // A goal that watches "the latest deployment" follows whichever one that is.
+/**
+ * A watched deployment, polled while it is still building. A goal that watches
+ * "the latest deployment" follows whichever one that is.
+ */
+function useWatchedDeployment(projectId: number, deploymentId: number | null) {
   const poll = (query: { state: { data?: { status: string } } }) =>
     query.state.data && !isActiveDeploymentStatus(query.state.data.status)
       ? false
@@ -95,7 +121,17 @@ function DeploymentTab({
     enabled: deploymentId === null,
     refetchInterval: poll,
   })
-  const deployment = deploymentId === null ? latest : pinned
+  return deploymentId === null ? latest : pinned
+}
+
+function DeploymentTab({
+  projectId,
+  deploymentId,
+}: {
+  projectId: number
+  deploymentId: number | null
+}) {
+  const deployment = useWatchedDeployment(projectId, deploymentId)
   const active =
     deployment.data !== undefined &&
     isActiveDeploymentStatus(deployment.data.status)
@@ -271,20 +307,23 @@ function DeploymentTab({
 }
 
 /**
- * What this chat is working on, one tab each: the deployments it has started
- * or watched, with their build stages, and the projects the user opened from a
- * reply. Sits beside the conversation so progress stays visible while the
- * assistant keeps working.
+ * What this chat is working on: the chat's own tabs, one Deployments tab with
+ * every deployment it started or watched and their build stages, and the
+ * projects the user opened from a reply. Sits beside the conversation so
+ * progress stays visible while the assistant keeps working.
  */
 export function DeploymentSidebar({
   deployments,
   projects = [],
   focus,
   conversationPublicId,
+  initialSelected,
+  onSelectedChange,
   onOpenProject,
   onClose,
   inDrawer = false,
 }: {
+  /** Newest first. */
   deployments: WatchedDeployment[]
   /** Projects opened from the chat, newest first. */
   projects?: ProjectRef[]
@@ -292,6 +331,14 @@ export function DeploymentSidebar({
   focus?: { key: string; nonce: number }
   /** The chat, for the tab listing what it made. Without it that tab is left out. */
   conversationPublicId?: string
+  /**
+   * The tab to open on, e.g. from the address. A deployment starting later
+   * still takes the focus, but the first one found while the page loads does
+   * not override it.
+   */
+  initialSelected?: string
+  /** Told whenever the selection changes, so it can be kept in the address. */
+  onSelectedChange?: (key: string) => void
   /** Opens a project from the "made" tab as a tab of its own. */
   onOpenProject?: (project: ProjectRef) => void
   /** Omit when the panel is a fixed part of the layout. */
@@ -299,30 +346,66 @@ export function DeploymentSidebar({
   /** Shown in a drawer, which brings its own close button. */
   inDrawer?: boolean
 }) {
-  const tabs: SidebarTab[] = [
-    ...projects.map((project): SidebarTab => ({ kind: 'project', project })),
-    ...deployments.map((deployment): SidebarTab => ({
-      kind: 'deployment',
-      deployment,
-    })),
-  ].slice(0, MAX_TABS)
-  const newest = deployments[0]
-  const newestKey = newest ? key(newest) : ''
+  const projectTabs = projects.slice(0, MAX_PROJECT_TABS)
+  const deploymentKeys = deployments.map(key)
+  const newestKey = deploymentKeys[0] ?? ''
   const [selected, setSelected] = useState(
-    newestKey || (conversationPublicId ? MADE_TAB : '')
+    initialSelected || newestKey || (conversationPublicId ? MADE_TAB : '')
   )
+  // The deployment last shown, so returning to the Deployments tab shows it
+  // again rather than jumping back to the newest.
+  const [pickedDeployment, setPickedDeployment] = useState('')
+  const select = (next: string) => {
+    setSelected(next)
+    if (deploymentKeys.includes(next)) setPickedDeployment(next)
+  }
+  const choose = (next: string) => {
+    const resolved =
+      next === DEPLOYMENTS_TAB
+        ? deploymentKeys.includes(pickedDeployment)
+          ? pickedDeployment
+          : newestKey
+        : next
+    select(resolved)
+    onSelectedChange?.(resolved)
+  }
   // A deployment started later takes the focus; one the user picked stays put
-  // until then.
+  // until then. The first deployment seen while a requested tab is waiting is
+  // just the page loading, so it must not push that tab aside.
+  const lastNewest = useRef('')
   useEffect(() => {
-    if (newestKey) setSelected(newestKey)
+    if (!newestKey) return
+    const first = lastNewest.current === ''
+    lastNewest.current = newestKey
+    if (first && initialSelected) return
+    setSelected(newestKey)
+    setPickedDeployment(newestKey)
+    onSelectedChange?.(newestKey)
+    // Only a new deployment should move the selection, not a new callback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newestKey])
   const focusKey = focus?.key
   const focusNonce = focus?.nonce
+  // A new focus request selects its tab in the same render (asking again for
+  // the same tab bumps the nonce), rather than one render late from an effect.
+  const focusRequest = focusKey ? `${focusNonce}:${focusKey}` : null
+  const [appliedFocus, setAppliedFocus] = useState<string | null>(null)
+  if (focusKey && focusRequest !== appliedFocus) {
+    setAppliedFocus(focusRequest)
+    select(focusKey)
+  }
+  // Telling the parent is a side effect, so it stays out of render.
   useEffect(() => {
-    if (focusKey) setSelected(focusKey)
+    if (focusKey) onSelectedChange?.(focusKey)
+    // Only a new focus request should report, not a new callback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusKey, focusNonce])
 
-  if (tabs.length === 0 && !conversationPublicId) {
+  if (
+    deployments.length === 0 &&
+    projectTabs.length === 0 &&
+    !conversationPublicId
+  ) {
     return (
       <aside
         aria-label="Working tabs"
@@ -334,8 +417,8 @@ export function DeploymentSidebar({
         </p>
         <p className="max-w-xs text-sm text-muted-foreground">
           When Temps deploys something for you, its build stages and link open
-          here as a tab. A project named in a reply opens here too. Try
-          &ldquo;Deploy my app from a Git repository URL&rdquo;.
+          here. A project named in a reply opens here too. Try &ldquo;Deploy my
+          app from a Git repository URL&rdquo;.
         </p>
         {onClose && (
           <Button type="button" variant="outline" size="sm" onClick={onClose}>
@@ -346,12 +429,19 @@ export function DeploymentSidebar({
     )
   }
 
-  const firstKey = conversationPublicId ? MADE_TAB : tabKey(tabs[0])
-  const selectable = [
-    ...(conversationPublicId ? [MADE_TAB, PREVIEW_TAB, TERMINAL_TAB] : []),
-    ...tabs.map(tabKey),
+  const tabs = [
+    ...(conversationPublicId ? CHAT_TABS.map((tab) => tab.value) : []),
+    ...(deployments.length > 0 ? [DEPLOYMENTS_TAB] : []),
+    ...projectTabs.map(projectKey),
   ]
-  const current = selectable.includes(selected) ? selected : firstKey
+  const { tab: current, deployment: shownKey } = sidebarSelection(selected, {
+    tabs,
+    deploymentKeys,
+    fallback: tabs[0] ?? '',
+  })
+  const shown =
+    deployments.find((deployment) => key(deployment) === shownKey) ??
+    deployments[0]
   return (
     <aside
       aria-label="Working tabs"
@@ -359,7 +449,7 @@ export function DeploymentSidebar({
     >
       <Tabs
         value={current}
-        onValueChange={setSelected}
+        onValueChange={choose}
         className="flex min-h-0 flex-1 flex-col"
       >
         <div
@@ -368,44 +458,46 @@ export function DeploymentSidebar({
             inDrawer && 'pr-12'
           )}
         >
-          <TabsList className="h-8 min-w-0 flex-1 justify-start overflow-x-auto">
-            {conversationPublicId && (
-              <TabsTrigger value={MADE_TAB} className="gap-1.5 text-xs">
-                <Layers className="size-3.5 shrink-0" />
-                Made here
-              </TabsTrigger>
-            )}
-            {conversationPublicId && (
-              <TabsTrigger value={PREVIEW_TAB} className="gap-1.5 text-xs">
-                <Monitor className="size-3.5 shrink-0" />
-                Preview
-              </TabsTrigger>
-            )}
-            {conversationPublicId && (
-              <TabsTrigger value={TERMINAL_TAB} className="gap-1.5 text-xs">
-                <SquareTerminal className="size-3.5 shrink-0" />
-                Terminal
-              </TabsTrigger>
-            )}
-            {tabs.map((tab) => (
+          {/* A narrow panel shows the tabs as icons, keeping the selected
+              one's label, so the strip fits instead of scrolling. It still
+              scrolls when many projects are open. */}
+          <TabsList className="@container h-8 min-w-0 flex-1 justify-start overflow-x-auto">
+            {conversationPublicId &&
+              CHAT_TABS.map(({ value, label, Icon }) => (
+                <TabsTrigger
+                  key={value}
+                  value={value}
+                  title={label}
+                  className="group gap-1.5 text-xs"
+                >
+                  <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+                  <span className={COLLAPSIBLE_LABEL}>{label}</span>
+                </TabsTrigger>
+              ))}
+            {deployments.length > 0 && (
               <TabsTrigger
-                key={tabKey(tab)}
-                value={tabKey(tab)}
-                className="gap-1.5 text-xs"
+                value={DEPLOYMENTS_TAB}
+                title="Deployments"
+                className="group gap-1.5 text-xs"
               >
-                {tab.kind === 'project' ? (
-                  <>
-                    <FolderGit2 className="size-3.5 shrink-0" />
-                    <span className="max-w-32 truncate">
-                      {tab.project.name}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <Rocket className="size-3.5 shrink-0" />
-                    <TabLabel deployment={tab.deployment} />
-                  </>
+                <Rocket className="size-3.5 shrink-0" aria-hidden="true" />
+                <span className={COLLAPSIBLE_LABEL}>Deployments</span>
+                {deployments.length > 1 && (
+                  <span className="text-[10px] tabular-nums text-muted-foreground">
+                    {deployments.length}
+                  </span>
                 )}
+              </TabsTrigger>
+            )}
+            {projectTabs.map((project) => (
+              <TabsTrigger
+                key={projectKey(project)}
+                value={projectKey(project)}
+                title={project.name}
+                className="group gap-1.5 text-xs"
+              >
+                <FolderGit2 className="size-3.5 shrink-0" aria-hidden="true" />
+                <span className={COLLAPSIBLE_LABEL}>{project.name}</span>
               </TabsTrigger>
             ))}
           </TabsList>
@@ -423,6 +515,11 @@ export function DeploymentSidebar({
           )}
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto">
+          {conversationPublicId && (
+            <TabsContent value={ARCHITECTURE_TAB} className="mt-0">
+              <ArchitectureTab conversationPublicId={conversationPublicId} />
+            </TabsContent>
+          )}
           {conversationPublicId && (
             <TabsContent value={MADE_TAB} className="mt-0">
               <ChatResourcesTab
@@ -442,6 +539,31 @@ export function DeploymentSidebar({
             </TabsContent>
           )}
           {conversationPublicId && (
+            // Kept mounted so the open file and the expanded folders stay.
+            <TabsContent
+              value={FILES_TAB}
+              forceMount
+              className="mt-0 h-full data-[state=inactive]:hidden"
+            >
+              <ChatFilesTab
+                conversationPublicId={conversationPublicId}
+                active={current === FILES_TAB}
+              />
+            </TabsContent>
+          )}
+          {conversationPublicId && (
+            <TabsContent
+              value={CHANGES_TAB}
+              forceMount
+              className="mt-0 h-full data-[state=inactive]:hidden"
+            >
+              <ChatChangesTab
+                conversationPublicId={conversationPublicId}
+                active={current === CHANGES_TAB}
+              />
+            </TabsContent>
+          )}
+          {conversationPublicId && (
             // Kept mounted so the shell survives switching tabs.
             <TabsContent
               value={TERMINAL_TAB}
@@ -454,16 +576,22 @@ export function DeploymentSidebar({
               />
             </TabsContent>
           )}
-          {tabs.map((tab) => (
-            <TabsContent key={tabKey(tab)} value={tabKey(tab)} className="mt-0">
-              {tab.kind === 'project' ? (
-                <ProjectTab projectId={tab.project.id} />
-              ) : (
-                <DeploymentTab
-                  projectId={tab.deployment.projectId}
-                  deploymentId={tab.deployment.deploymentId}
-                />
-              )}
+          {shown && (
+            <TabsContent value={DEPLOYMENTS_TAB} className="mt-0">
+              <DeploymentsTab
+                deployments={deployments}
+                shown={shown}
+                onShow={(deployment) => choose(key(deployment))}
+              />
+            </TabsContent>
+          )}
+          {projectTabs.map((project) => (
+            <TabsContent
+              key={projectKey(project)}
+              value={projectKey(project)}
+              className="mt-0"
+            >
+              <ProjectTab projectId={project.id} />
             </TabsContent>
           ))}
         </div>
@@ -472,18 +600,103 @@ export function DeploymentSidebar({
   )
 }
 
-/** `project · #id`, or just the project while the goal follows its latest. */
-function TabLabel({ deployment }: { deployment: WatchedDeployment }) {
+/**
+ * Every deployment the chat watched, newest first, with the one shown in
+ * detail below. A single deployment needs no list.
+ */
+function DeploymentsTab({
+  deployments,
+  shown,
+  onShow,
+}: {
+  deployments: WatchedDeployment[]
+  shown: WatchedDeployment
+  onShow: (deployment: WatchedDeployment) => void
+}) {
+  return (
+    <div className="flex min-h-0 flex-col">
+      {deployments.length > 1 && (
+        <ul
+          aria-label="Deployments from this chat"
+          className="max-h-48 overflow-y-auto border-b py-1"
+        >
+          {deployments.map((deployment) => (
+            <DeploymentRow
+              key={key(deployment)}
+              deployment={deployment}
+              selected={key(deployment) === key(shown)}
+              onSelect={() => onShow(deployment)}
+            />
+          ))}
+        </ul>
+      )}
+      {/* Keyed so a different deployment starts from its own skeleton. */}
+      <DeploymentTab
+        key={key(shown)}
+        projectId={shown.projectId}
+        deploymentId={shown.deploymentId}
+      />
+    </div>
+  )
+}
+
+/** `project · #id`, its status, and whether it is the one serving traffic. */
+function DeploymentRow({
+  deployment,
+  selected,
+  onSelect,
+}: {
+  deployment: WatchedDeployment
+  selected: boolean
+  onSelect: () => void
+}) {
   const project = useQuery(
     getProjectOptions({ path: { id: deployment.projectId } })
   )
+  const data = useWatchedDeployment(
+    deployment.projectId,
+    deployment.deploymentId
+  ).data
   const name = project.data?.name ?? `Project ${deployment.projectId}`
+  const id = data?.id ?? deployment.deploymentId
+  const status = data ? statusPresentation(data.status) : null
+  const live = data?.is_current === true && data.status === 'completed'
   return (
-    <span className="max-w-32 truncate">
-      {deployment.deploymentId === null
-        ? name
-        : `${name} · #${deployment.deploymentId}`}
-    </span>
+    <li>
+      <button
+        type="button"
+        aria-pressed={selected}
+        onClick={onSelect}
+        className={cn(
+          'flex w-full min-w-0 items-center gap-2 px-4 py-1.5 text-left text-xs transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+          selected && 'bg-muted'
+        )}
+      >
+        <span className="min-w-0 flex-1 truncate font-medium">
+          {name}
+          {id !== null && (
+            <span className="font-normal text-muted-foreground"> · #{id}</span>
+          )}
+        </span>
+        {live && (
+          <span className="shrink-0 rounded-sm bg-green-600/10 px-1.5 py-0.5 text-[10px] font-medium text-green-700 dark:text-green-400">
+            Live
+          </span>
+        )}
+        {status ? (
+          <span className={cn('shrink-0', status.className)}>
+            {status.label}
+          </span>
+        ) : (
+          <Skeleton className="h-3 w-12 shrink-0" />
+        )}
+        {data && (
+          <span className="w-16 shrink-0 text-right text-muted-foreground">
+            <TimeAgo date={data.started_at ?? data.created_at} />
+          </span>
+        )}
+      </button>
+    </li>
   )
 }
 

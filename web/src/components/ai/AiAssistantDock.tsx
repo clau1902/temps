@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  type ConversationDetailResponse,
   type ConversationResponse,
   type GlobalConversationResponse,
   type ProjectResponse,
   archiveConversation,
   archiveUserConversation,
   getProjects,
+  getUserConversation,
   listAllConversations,
   renameConversation,
   renameUserConversation,
@@ -22,11 +24,16 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { getProjectOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getProjectOptions,
+  listAllConversationsOptions,
+} from '@/api/client/@tanstack/react-query.gen'
+import { useDebounce } from '@/hooks/useDebounce'
 import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { useQuery } from '@tanstack/react-query'
+import { AiSettingsMenu } from './AiSettingsMenu'
 import { ConversationSandboxChip } from './ConversationSandboxChip'
 import { Button } from '@/components/ui/button'
 import {
@@ -50,6 +57,7 @@ import { useIsDesktop } from '@/components/hooks/use-mobile'
 import { cn } from '@/lib/utils'
 import {
   Bell,
+  Boxes,
   ChevronDown,
   ChevronLeft,
   ChevronsUpDown,
@@ -70,7 +78,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { CONSOLE_HOME_PATH } from './AssistantTopBar'
@@ -78,20 +86,42 @@ import { toast } from 'sonner'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
 import { AiAssistantGate } from './AiAssistantGate'
 import {
+  appendChatPage,
+  CHAT_LIST_PAGE_SIZE,
+  chatListRefreshSize,
   conversationListNeedsRefresh,
   createProjectChat,
   hasProjectScope,
+  nextChatListPage,
+  refreshChatList,
   resolvePageChat,
+  withLinkedChat,
+  chatsNotListed,
 } from './chat-page-state'
 import { DebugChatPanel } from './DebugChatPanel'
-import { AgentSwitcher } from './AgentSwitcher'
-import { AssistantStart, AssistantThread } from './AssistantPanels'
+import { OPEN_CHAT_EVENT } from './chat-blueprint'
+import { AgentSwitcher, type SwitcherChat } from './AgentSwitcher'
+import {
+  AssistantStart,
+  AssistantStartWorkView,
+  AssistantThread,
+  type NewChatWorkspaceChoice,
+} from './AssistantPanels'
+import { groupChatsByWorkspace } from './conversation-groups'
 import {
   isSwitcherShortcut,
   readAssistantView,
   writeAssistantView,
   type AssistantView,
 } from './assistant-view'
+import {
+  liveSearchParams,
+  readViewParam,
+  syncedPageParams,
+  VIEW_PARAM,
+  withoutChat,
+  withParam,
+} from './assistant-url'
 import type { OpeningAttachment } from './attachment-previews'
 import { chatTint, isAssistantConversation } from './assistant-state'
 
@@ -112,6 +142,27 @@ interface ActiveChat {
  * assistant chat (`project_id` is null), which uses the user-rooted routes.
  */
 type ProjectConversation = GlobalConversationResponse
+
+/** The kinds of chat this view lists: project chats and the assistant's. */
+function isListedKind(c: ProjectConversation): boolean {
+  return hasProjectScope(c) || isAssistantConversation(c)
+}
+
+/**
+ * A chat loaded by id, in the shape the list holds, or null when this view
+ * does not show it (archived, or a kind it does not list).
+ */
+function linkedChat(
+  detail: ConversationDetailResponse
+): ProjectConversation | null {
+  const {
+    messages: _messages,
+    page: _page,
+    pending_permission: _pending,
+    ...chat
+  } = detail
+  return chat.status === 'active' && isListedKind(chat) ? chat : null
+}
 
 /** The open assistant conversation, and the first message to send into it. */
 interface AssistantChat {
@@ -134,6 +185,18 @@ function metaFor(contextType: string) {
   return (
     CONTEXT_META[contextType] ?? { label: contextType, Icon: MessageSquare }
   )
+}
+
+/** A chat as the ⌘K switcher shows it. */
+function toSwitcherChat(c: ProjectConversation): SwitcherChat {
+  return {
+    id: c.public_id,
+    title: c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
+    subtitle: isAssistantConversation(c)
+      ? 'Assistant'
+      : (c.project_name ?? metaFor(c.context_type).label),
+    lastActivityAt: c.last_activity_at,
+  }
 }
 
 /**
@@ -383,14 +446,33 @@ export function DockBody({
 
   // Two layouts: the chat list beside the conversation, or the conversation
   // beside its working tabs with the list behind the title (and ⌘K).
-  const [view, setViewState] = useState<AssistantView>(readAssistantView)
+  // The address wins over the remembered preference, so a shared link shows the
+  // layout it was copied from; the preference only fills in a bare address.
+  const [storedView, setStoredView] = useState<AssistantView>(readAssistantView)
+  const view = (isPage ? readViewParam(searchParams) : null) ?? storedView
   const setView = (next: AssistantView) => {
-    setViewState(next)
+    setStoredView(next)
     writeAssistantView(next)
+    if (isPage) {
+      setSearchParams(withParam(liveSearchParams(), VIEW_PARAM, next), {
+        replace: true,
+      })
+    }
   }
   const workView = isPage && isDesktop && view === 'work'
   const listShown = isDesktop && !workView
   const [switcherOpen, setSwitcherOpen] = useState(false)
+  // The switcher filters loaded chats as you type; this finds the rest, which
+  // the list has not paged in yet.
+  const [switcherSearch, setSwitcherSearch] = useState('')
+  const switcherQuery = useDebounce(switcherSearch.trim(), 250)
+  const switcherMatches = useQuery({
+    ...listAllConversationsOptions({
+      query: { search: switcherQuery, page_size: 20 },
+    }),
+    enabled: switcherOpen && switcherQuery.length > 0,
+    staleTime: 30_000,
+  })
   useEffect(() => {
     if (!isPage) return
     const panel = sidebarRef.current
@@ -449,7 +531,34 @@ export function DockBody({
   useEffect(() => {
     saveActiveChat(active)
   }, [active])
-  const [conversations, setConversations] = useState<ProjectConversation[]>([])
+  // Every chat the list endpoint returned, including kinds this view does not
+  // show: pages are counted in the endpoint's terms, not in what is shown.
+  const [listedChats, setListedChats] = useState<ProjectConversation[]>([])
+  const conversations = useMemo(
+    () => listedChats.filter(isListedKind),
+    [listedChats]
+  )
+  const olderMatches = useMemo(
+    () =>
+      chatsNotListed(
+        conversations,
+        (switcherMatches.data ?? []).filter(isListedKind)
+      ),
+    [conversations, switcherMatches.data]
+  )
+  // Whether the endpoint has older chats than the pages loaded so far.
+  const [hasMoreChats, setHasMoreChats] = useState(false)
+  const [loadingMoreChats, setLoadingMoreChats] = useState(false)
+  // The fetches merge into the latest list, not the one they started from.
+  const listedChatsRef = useRef<ProjectConversation[]>([])
+  const hasMoreChatsRef = useRef(false)
+  useEffect(() => {
+    listedChatsRef.current = listedChats
+    hasMoreChatsRef.current = hasMoreChats
+  }, [listedChats, hasMoreChats])
+  // Chats opened from a link that the loaded pages had not reached. They are
+  // shown but not counted, or the next page would start past them.
+  const linkedChatIdsRef = useRef(new Set<string>())
   const [loadingList, setLoadingList] = useState(false)
   // Set once the first list fetch settles (success or failure) — distinct
   // from `loadingList` (which starts `false` before the fetch is even
@@ -475,33 +584,90 @@ export function DockBody({
   const [assistantStarting, setAssistantStarting] = useState(
     () => layout === 'page' && !urlChatId && !initialContext
   )
+  // The workspace a chat being started joins, when it was started from that
+  // workspace's group in the list.
+  const [newChatWorkspace, setNewChatWorkspace] =
+    useState<NewChatWorkspaceChoice | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [renaming, setRenaming] = useState(false)
   // When true, the body shows the project picker for starting a fresh
   // project-scoped chat (a new thread, not tied to a deployment/alert).
   const [picking, setPicking] = useState(false)
 
-  // Unified list across every project.
+  const listedCount = useCallback(
+    () =>
+      listedChatsRef.current.filter(
+        (c) => !linkedChatIdsRef.current.has(c.public_id)
+      ).length,
+    []
+  )
+  const applyListedChats = useCallback(
+    (chats: ProjectConversation[], hasMore: boolean) => {
+      listedChatsRef.current = chats
+      hasMoreChatsRef.current = hasMore
+      setListedChats(chats)
+      setHasMoreChats(hasMore)
+    },
+    []
+  )
+
+  // Unified list across every project. Project chats use the legacy project
+  // routes and assistant chats the user-rooted ones; other user-owned
+  // application/global chats live in the AI workspace and are filtered out
+  // (see `isListedKind`) rather than coerced into a fabricated project scope.
+  // A refresh re-reads every page already loaded, so it does not collapse a
+  // list the user scrolled back through.
   const loadList = useCallback(() => {
     setLoadingList(true)
-    listAllConversations()
-      // Project chats use the legacy project routes and assistant chats the
-      // user-rooted ones. Other user-owned application/global chats live in
-      // the AI workspace and must not be coerced into a fabricated project
-      // scope here.
-      .then(({ data }) =>
-        setConversations(
-          (data ?? []).filter(
-            (c) => hasProjectScope(c) || isAssistantConversation(c)
-          )
+    const requested = chatListRefreshSize(listedCount())
+    listAllConversations({ query: { page: 1, page_size: requested } })
+      .then(({ data }) => {
+        if (!data) return
+        // A page that reaches a linked chat lists it like any other.
+        for (const c of data) linkedChatIdsRef.current.delete(c.public_id)
+        const { chats, hasMore } = refreshChatList(
+          listedChatsRef.current,
+          data,
+          requested,
+          hasMoreChatsRef.current
         )
-      )
-      .catch(() => setConversations([]))
+        applyListedChats(chats, hasMore)
+      })
+      .catch(() => undefined)
       .finally(() => {
         setLoadingList(false)
         setListReady(true)
       })
-  }, [])
+  }, [applyListedChats, listedCount])
+
+  // The next page of older chats. Chats created elsewhere since the list was
+  // loaded shift every page down, so a page can hold only chats already shown;
+  // a few more pages are read then, rather than leaving a button that does
+  // nothing.
+  const loadOlderChats = useCallback(async () => {
+    setLoadingMoreChats(true)
+    try {
+      let page = nextChatListPage(listedCount())
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const { data } = await listAllConversations({
+          query: { page, page_size: CHAT_LIST_PAGE_SIZE },
+        })
+        if (!data) throw new Error(`page ${page} of chats did not load`)
+        const before = listedCount()
+        for (const c of data) linkedChatIdsRef.current.delete(c.public_id)
+        const hasMore = data.length === CHAT_LIST_PAGE_SIZE
+        applyListedChats(appendChatPage(listedChatsRef.current, data), hasMore)
+        if (!hasMore || listedCount() > before) return
+        page += 1
+      }
+    } catch {
+      toast.error('Could not load older chats', {
+        description: 'Check your connection and try again.',
+      })
+    } finally {
+      setLoadingMoreChats(false)
+    }
+  }, [applyListedChats, listedCount])
 
   // A project chat is created lazily by DebugChatPanel when its first message
   // is sent. Until that point the list is necessarily a pre-creation snapshot.
@@ -556,6 +722,71 @@ export function DockBody({
     })
   }, [])
 
+  // A `?chat=` route to a chat the loaded pages do not include. It may simply
+  // be older than them, so it is loaded by id and shown at its place in the
+  // list; only a chat that is gone (or archived) falls back to the start
+  // screen.
+  const openLinkedChat = useCallback(
+    async (publicId: string) => {
+      const detail = await getUserConversation({
+        path: { public_id: publicId },
+        query: { limit: 1 },
+      })
+        .then(({ data }) => data)
+        .catch(() => undefined)
+      // The user may have moved on while it loaded.
+      if (liveSearchParams().get('chat') !== publicId) return
+      const chat = detail ? linkedChat(detail) : null
+      if (!chat) {
+        setSearchParams(withoutChat(liveSearchParams()), { replace: true })
+        setAssistantStarting(true)
+        return
+      }
+      if (!listedChatsRef.current.some((c) => c.public_id === chat.public_id)) {
+        linkedChatIdsRef.current.add(chat.public_id)
+        setListedChats((prev) => withLinkedChat(prev, chat))
+      }
+      openConversation(chat)
+    },
+    [openConversation, setSearchParams]
+  )
+
+  // Another part of the page (the workspace chip) asks to open a chat of the
+  // same application. It may not be in the loaded pages, so it is loaded by
+  // id like a linked chat.
+  useEffect(() => {
+    const onOpenChat = (event: Event) => {
+      const publicId = (event as CustomEvent<{ publicId?: string }>).detail
+        ?.publicId
+      if (!publicId) return
+      const listed = listedChatsRef.current.find(
+        (c) => c.public_id === publicId
+      )
+      if (listed) {
+        openConversation(listed)
+        return
+      }
+      void getUserConversation({
+        path: { public_id: publicId },
+        query: { limit: 1 },
+      })
+        .then(({ data }) => data)
+        .catch(() => undefined)
+        .then((detail) => {
+          const chat = detail ? linkedChat(detail) : null
+          if (!chat) {
+            toast.error('That chat is no longer available')
+            return
+          }
+          linkedChatIdsRef.current.add(chat.public_id)
+          setListedChats((prev) => withLinkedChat(prev, chat))
+          openConversation(chat)
+        })
+    }
+    window.addEventListener(OPEN_CHAT_EVENT, onOpenChat)
+    return () => window.removeEventListener(OPEN_CHAT_EVENT, onOpenChat)
+  }, [openConversation])
+
   // Resolve a `?chat=` route exactly once after the list arrives. A valid id
   // is restored; a stale one falls back to the assistant start screen. A bare
   // route needs no resolving: the page already opened on that screen, so the
@@ -584,10 +815,8 @@ export function DockBody({
         openConversation(conversation)
         return
       }
-      const next = new URLSearchParams(searchParams)
-      next.delete('chat')
-      setSearchParams(next, { replace: true })
-      setAssistantStarting(true)
+      // Older than the pages loaded so far, or gone: ask for it by id.
+      void openLinkedChat(urlChatId)
     })
     return () => {
       cancelled = true
@@ -599,6 +828,7 @@ export function DockBody({
     listReady,
     conversations,
     openConversation,
+    openLinkedChat,
     searchParams,
     setSearchParams,
   ])
@@ -610,11 +840,13 @@ export function DockBody({
   // `backToList`).
   useEffect(() => {
     if (layout !== 'page') return
-    const next = new URLSearchParams(searchParams)
-    if (!activePublicId || next.get('chat') === activePublicId) return
-    next.set('chat', activePublicId)
-    setSearchParams(next, { replace: true })
-  }, [layout, activePublicId, searchParams, setSearchParams])
+    // `searchParams` (in the deps) re-runs this; the write starts from the live address.
+    const next = syncedPageParams(liveSearchParams(), {
+      chat: activePublicId,
+      view,
+    })
+    if (next) setSearchParams(next, { replace: true })
+  }, [layout, activePublicId, view, searchParams, setSearchParams])
 
   // Start a brand-new project-scoped chat (a fresh thread). The context_id is a
   // client-generated uuid so a project can have many independent chats; the
@@ -639,9 +871,7 @@ export function DockBody({
     // `onConversationChange` supplies the new public id and the sync effect
     // below writes it back to the URL.
     if (layout === 'page' && searchParams.has('chat')) {
-      const next = new URLSearchParams(searchParams)
-      next.delete('chat')
-      setSearchParams(next, { replace: true })
+      setSearchParams(withoutChat(liveSearchParams()), { replace: true })
     }
   }
 
@@ -664,13 +894,14 @@ export function DockBody({
     setActivePublicId(null)
     setPicking(true)
     if (layout === 'page' && searchParams.has('chat')) {
-      const next = new URLSearchParams(searchParams)
-      next.delete('chat')
-      setSearchParams(next, { replace: true })
+      setSearchParams(withoutChat(liveSearchParams()), { replace: true })
     }
   }
 
-  const startAssistant = () => {
+  const startAssistant = () => startAssistantIn(null)
+
+  const startAssistantIn = (workspace: NewChatWorkspaceChoice | null) => {
+    setNewChatWorkspace(workspace)
     setPicking(false)
     setActive(null)
     setAssistant(null)
@@ -679,9 +910,7 @@ export function DockBody({
     // A new chat must not leave the previous conversation's id in the address
     // bar; the sync effect writes the new one once its first message creates it.
     if (layout === 'page' && searchParams.has('chat')) {
-      const next = new URLSearchParams(searchParams)
-      next.delete('chat')
-      setSearchParams(next, { replace: true })
+      setSearchParams(withoutChat(liveSearchParams()), { replace: true })
     }
   }
 
@@ -734,7 +963,7 @@ export function DockBody({
         backToList()
       }
     } else {
-      setConversations((prev) => prev.filter((c) => c.public_id !== d.publicId))
+      setListedChats((prev) => prev.filter((c) => c.public_id !== d.publicId))
     }
   }
 
@@ -760,7 +989,7 @@ export function DockBody({
               body: { title },
             })
       const newTitle = data?.title ?? title
-      setConversations((prev) =>
+      setListedChats((prev) =>
         prev.map((c) =>
           c.public_id === r.publicId ? { ...c, title: newTitle } : c
         )
@@ -773,6 +1002,19 @@ export function DockBody({
       setRenaming(false)
     }
   }
+
+  const assistantStart = (
+    <AssistantStart
+      onStarted={handleAssistantStarted}
+      onNavigate={() => {
+        if (typeof window !== 'undefined' && window.innerWidth < 1024) onClose()
+      }}
+      cloudPath="/settings/cloud"
+      roomy={isPage}
+      workspace={newChatWorkspace}
+      onLeaveWorkspace={() => setNewChatWorkspace(null)}
+    />
+  )
 
   // Dock -> `/chat`. The open conversation is handed over through the provider
   // so the full-screen view lands on the same thread rather than dumping the
@@ -818,16 +1060,6 @@ export function DockBody({
         <div className="flex items-center gap-1">
           <Button
             size="sm"
-            variant="outline"
-            onClick={startPicking}
-            className="h-8 gap-1"
-            title="New chat about a specific project"
-          >
-            <Plus className="h-4 w-4" />
-            Project
-          </Button>
-          <Button
-            size="sm"
             onClick={startAssistant}
             className="h-8 gap-1"
             title="Ask Temps to inspect or change something"
@@ -841,8 +1073,12 @@ export function DockBody({
         <ConversationList
           loading={loadingList && conversations.length === 0}
           conversations={conversations}
+          hasMore={hasMoreChats}
+          loadingMore={loadingMoreChats}
+          onLoadMore={loadOlderChats}
           activeId={activePublicId}
           onOpen={openConversation}
+          onNewChatIn={startAssistantIn}
           onOpenSource={(c) => {
             const h = sourceHref({
               contextType: c.context_type,
@@ -1153,6 +1389,7 @@ export function DockBody({
               <Trash2 className="h-4 w-4" />
             </button>
           )}
+          <AiSettingsMenu />
           {!isPage && (
             <button
               type="button"
@@ -1174,19 +1411,20 @@ export function DockBody({
           // it and centre the chat column themselves); the rest read best in
           // a centred column.
           isPage && 'w-full px-4 pb-4 pt-3',
-          isPage && !(assistant && !assistantStarting) && 'mx-auto max-w-3xl'
+          isPage &&
+            !(assistant && !assistantStarting) &&
+            !(workView && assistantStarting) &&
+            'mx-auto max-w-3xl'
         )}
       >
         {assistantStarting ? (
-          <AssistantStart
-            onStarted={handleAssistantStarted}
-            onNavigate={() => {
-              if (typeof window !== 'undefined' && window.innerWidth < 1024)
-                onClose()
-            }}
-            cloudPath="/settings/cloud"
-            roomy={isPage}
-          />
+          // The work view keeps its tabs column before the first message too,
+          // explaining what will open there instead of disappearing.
+          workView ? (
+            <AssistantStartWorkView>{assistantStart}</AssistantStartWorkView>
+          ) : (
+            assistantStart
+          )
         ) : assistant ? (
           <AssistantThread
             key={assistant.conversation.public_id}
@@ -1194,6 +1432,7 @@ export function DockBody({
             firstMessage={assistant.firstMessage}
             firstAttachments={assistant.firstAttachments}
             workView={workView}
+            syncUrl={isPage}
           />
         ) : inProjectChat ? (
           <DebugChatPanel
@@ -1243,7 +1482,11 @@ export function DockBody({
           <ConversationList
             loading={loadingList}
             conversations={conversations}
+            hasMore={hasMoreChats}
+            loadingMore={loadingMoreChats}
+            onLoadMore={loadOlderChats}
             onOpen={openConversation}
+            onNewChatIn={startAssistantIn}
             onOpenSource={(c) => {
               const h = sourceHref({
                 contextType: c.context_type,
@@ -1267,19 +1510,30 @@ export function DockBody({
 
       <AgentSwitcher
         open={switcherOpen}
-        onOpenChange={setSwitcherOpen}
-        chats={conversations.map((c) => ({
-          id: c.public_id,
-          title: c.title ?? `${metaFor(c.context_type).label} ${c.context_id}`,
-          subtitle: isAssistantConversation(c)
-            ? 'Assistant'
-            : (c.project_name ?? metaFor(c.context_type).label),
-          lastActivityAt: c.last_activity_at,
-        }))}
+        onOpenChange={(open) => {
+          setSwitcherOpen(open)
+          if (!open) setSwitcherSearch('')
+        }}
+        chats={conversations.map(toSwitcherChat)}
+        search={switcherSearch}
+        onSearchChange={setSwitcherSearch}
+        moreChats={olderMatches.map(toSwitcherChat)}
+        searching={
+          switcherSearch.trim() !== switcherQuery || switcherMatches.isFetching
+        }
         activeId={activePublicId}
         onOpen={(id) => {
           const chat = conversations.find((c) => c.public_id === id)
-          if (chat) openConversation(chat)
+          if (chat) {
+            openConversation(chat)
+            return
+          }
+          // An older chat found by the search: list it, then open it.
+          const match = olderMatches.find((c) => c.public_id === id)
+          if (!match) return
+          linkedChatIdsRef.current.add(match.public_id)
+          setListedChats((prev) => withLinkedChat(prev, match))
+          openConversation(match)
         }}
         onNewAssistant={startAssistant}
         onNewProjectChat={startPicking}
@@ -1405,20 +1659,30 @@ export function DockBody({
 function ConversationList({
   loading,
   conversations,
+  hasMore,
+  loadingMore,
+  onLoadMore,
   activeId,
   onOpen,
   onOpenSource,
   onRename,
   onDelete,
+  onNewChatIn,
 }: {
   loading: boolean
   conversations: ProjectConversation[]
+  /** Whether older chats than the ones shown exist. */
+  hasMore: boolean
+  loadingMore: boolean
+  onLoadMore: () => void
   /** Public id of the chat currently open, highlighted in list-detail layouts. */
   activeId?: string | null
   onOpen: (c: ProjectConversation) => void
   onOpenSource: (c: ProjectConversation) => void
   onRename: (c: ProjectConversation) => void
   onDelete: (c: ProjectConversation) => void
+  /** Starts a new chat that joins the given workspace. */
+  onNewChatIn: (workspace: NewChatWorkspaceChoice) => void
 }) {
   if (loading) {
     return (
@@ -1429,7 +1693,7 @@ function ConversationList({
       </div>
     )
   }
-  if (conversations.length === 0) {
+  if (conversations.length === 0 && !hasMore) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
         <MessageSquare className="h-7 w-7 text-muted-foreground" />
@@ -1442,103 +1706,216 @@ function ConversationList({
       </div>
     )
   }
+  const rowProps = { activeId, onOpen, onOpenSource, onRename, onDelete }
   return (
     <div className="h-full space-y-1 overflow-y-auto pr-1">
-      {conversations.map((c) => {
-        const { label } = metaFor(c.context_type)
-        const hasSource = !!sourceHref({
-          contextType: c.context_type,
-          contextId: c.context_id,
-          projectSlug: c.project_slug ?? undefined,
-        })
-        return (
-          <div
-            key={c.public_id}
-            className={cn(
-              'group relative flex items-center gap-2 rounded-md border border-transparent transition-colors hover:border-border hover:bg-accent',
-              c.public_id === activeId && 'border-border bg-muted'
-            )}
-          >
-            <button
-              type="button"
-              onClick={() => onOpen(c)}
-              className="flex min-w-0 flex-1 items-center gap-3 px-2 py-2.5 text-left"
-            >
-              <ContextAvatar
-                projectId={c.project_id}
-                projectName={c.project_name ?? undefined}
-                contextType={c.context_type}
-                seed={c.public_id}
-              />
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-medium">
-                  {c.title ?? `${label} ${c.context_id}`}
-                </div>
-                {/* The project (name; its logo is the avatar), the sandbox the
-                    chat is linked to, and the time. A context label such as
-                    "Assistant" said nothing the avatar did not. */}
-                <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-                  {c.project_name && (
-                    <span className="min-w-0 flex-1 truncate">
-                      {c.project_name}
-                    </span>
-                  )}
-                  {c.sandbox && (
-                    <ConversationSandboxChip
-                      name={c.sandbox.name}
-                      backend={c.sandbox.backend}
-                    />
-                  )}
-                  <span
-                    className={cn(
-                      'min-w-0 truncate',
-                      c.project_name ? 'shrink' : 'flex-1'
-                    )}
-                  >
-                    <TimeAgo date={c.last_activity_at} />
-                  </span>
-                </div>
-              </div>
-            </button>
-            {/* Overlaid rather than laid out inline: as flex siblings these
-                three buttons reserved ~90px of a 320px row permanently, so
-                titles truncated to "Checkout latency …" even though they were
-                invisible until hover. Absolute positioning gives the text the
-                full row and fades the actions in over it. */}
-            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-0.5 rounded-r-md bg-gradient-to-l from-accent via-accent to-transparent pl-8 pr-1 opacity-0 transition-opacity focus-within:pointer-events-auto focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
-              {hasSource && (
-                <button
-                  type="button"
-                  onClick={() => onOpenSource(c)}
-                  className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-foreground"
-                  title="Go to source"
-                  aria-label="Go to source"
-                >
-                  <ExternalLink className="h-3.5 w-3.5" />
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => onRename(c)}
-                className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-foreground"
-                title="Rename chat"
-                aria-label="Rename chat"
-              >
-                <Pencil className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => onDelete(c)}
-                className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-destructive"
-                title="Delete chat"
-                aria-label="Delete chat"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
+      {groupChatsByWorkspace(conversations).map((entry) =>
+        entry.kind === 'chat' ? (
+          <ConversationRow
+            key={entry.chat.public_id}
+            c={entry.chat}
+            {...rowProps}
+          />
+        ) : (
+          <WorkspaceChatGroup
+            key={entry.workspace.public_id}
+            workspace={entry.workspace}
+            chats={entry.chats}
+            onNewChat={() => onNewChatIn(entry.workspace)}
+            {...rowProps}
+          />
         )
-      })}
+      )}
+      {hasMore && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="w-full text-muted-foreground"
+          onClick={onLoadMore}
+          disabled={loadingMore}
+        >
+          {loadingMore && <Loader2 className="size-4 animate-spin" />}
+          Load older chats
+        </Button>
+      )}
+    </div>
+  )
+}
+
+type ConversationRowActions = {
+  activeId?: string | null
+  onOpen: (c: ProjectConversation) => void
+  onOpenSource: (c: ProjectConversation) => void
+  onRename: (c: ProjectConversation) => void
+  onDelete: (c: ProjectConversation) => void
+}
+
+/**
+ * The chats of one workspace together under its name, so the chats that share
+ * an application's blueprint and sandbox read as one piece of work, with a
+ * visible way to add another chat to it.
+ */
+function WorkspaceChatGroup({
+  workspace,
+  chats,
+  onNewChat,
+  ...rowProps
+}: ConversationRowActions & {
+  workspace: NewChatWorkspaceChoice
+  chats: ProjectConversation[]
+  onNewChat: () => void
+}) {
+  return (
+    <section
+      aria-label={`Chats in ${workspace.name}`}
+      className="rounded-md border bg-muted/30 py-1"
+    >
+      <div className="flex items-center gap-1.5 py-1 pl-3 pr-1 text-xs text-muted-foreground">
+        <Boxes className="size-3.5 shrink-0" aria-hidden />
+        <span
+          className="min-w-0 truncate font-medium text-foreground"
+          title={`Chats in the application ${workspace.name} share its blueprint and sandbox`}
+        >
+          {workspace.name}
+        </span>
+        <span className="shrink-0">
+          · {chats.length} {chats.length === 1 ? 'chat' : 'chats'}
+        </span>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={onNewChat}
+          className="ml-auto h-7 shrink-0 gap-1 px-2 text-xs"
+          title={`Start another chat in ${workspace.name}`}
+          aria-label={`New chat in ${workspace.name}`}
+        >
+          <Plus className="size-3.5" />
+          <span>Chat</span>
+        </Button>
+      </div>
+      <div className="space-y-0.5 px-1">
+        {chats.map((c) => (
+          <ConversationRow key={c.public_id} c={c} inWorkspace {...rowProps} />
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function ConversationRow({
+  c,
+  inWorkspace = false,
+  activeId,
+  onOpen,
+  onOpenSource,
+  onRename,
+  onDelete,
+}: ConversationRowActions & {
+  c: ProjectConversation
+  /** Shown under its workspace's name, so the row does not repeat it. */
+  inWorkspace?: boolean
+}) {
+  const { label } = metaFor(c.context_type)
+  const hasSource = !!sourceHref({
+    contextType: c.context_type,
+    contextId: c.context_id,
+    projectSlug: c.project_slug ?? undefined,
+  })
+  return (
+    <div
+      className={cn(
+        'group relative flex items-center gap-2 rounded-md border border-transparent transition-colors hover:border-border hover:bg-accent',
+        c.public_id === activeId && 'border-border bg-muted'
+      )}
+    >
+      <button
+        type="button"
+        onClick={() => onOpen(c)}
+        className="flex min-w-0 flex-1 items-center gap-3 px-2 py-2.5 text-left"
+      >
+        <ContextAvatar
+          projectId={c.project_id}
+          projectName={c.project_name ?? undefined}
+          contextType={c.context_type}
+          seed={c.public_id}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-medium">
+            {c.title ?? `${label} ${c.context_id}`}
+          </div>
+          {/* The project (name; its logo is the avatar), the sandbox the
+              chat is linked to, and the time. A context label such as
+              "Assistant" said nothing the avatar did not. */}
+          <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+            {c.project_name && (
+              <span className="min-w-0 flex-1 truncate">{c.project_name}</span>
+            )}
+            {c.workspace && !inWorkspace && (
+              <span
+                className="flex min-w-0 flex-1 items-center gap-1"
+                title={`Part of the application ${c.workspace.name}`}
+              >
+                <Boxes className="size-3 shrink-0" aria-hidden />
+                <span className="truncate">{c.workspace.name}</span>
+              </span>
+            )}
+            {c.sandbox && (
+              <ConversationSandboxChip
+                name={c.sandbox.name}
+                backend={c.sandbox.backend}
+              />
+            )}
+            <span
+              className={cn(
+                'min-w-0 truncate',
+                c.project_name || (c.workspace && !inWorkspace)
+                  ? 'shrink'
+                  : 'flex-1'
+              )}
+            >
+              <TimeAgo date={c.last_activity_at} />
+            </span>
+          </div>
+        </div>
+      </button>
+      {/* Overlaid rather than laid out inline: as flex siblings these
+          three buttons reserved ~90px of a 320px row permanently, so
+          titles truncated to "Checkout latency …" even though they were
+          invisible until hover. Absolute positioning gives the text the
+          full row and fades the actions in over it. */}
+      <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-0.5 rounded-r-md bg-gradient-to-l from-accent via-accent to-transparent pl-8 pr-1 opacity-0 transition-opacity focus-within:pointer-events-auto focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
+        {hasSource && (
+          <button
+            type="button"
+            onClick={() => onOpenSource(c)}
+            className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-foreground"
+            title="Go to source"
+            aria-label="Go to source"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => onRename(c)}
+          className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-foreground"
+          title="Rename chat"
+          aria-label="Rename chat"
+        >
+          <Pencil className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => onDelete(c)}
+          className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-background hover:text-destructive"
+          title="Delete chat"
+          aria-label="Delete chat"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
+      </div>
     </div>
   )
 }

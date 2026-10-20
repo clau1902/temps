@@ -19,6 +19,7 @@ use temps_auth::{
 };
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -141,7 +142,7 @@ pub struct CreateWebhookRequestBody {
     #[schema(example = "https://example.com/webhook")]
     pub url: String,
     /// Secret for HMAC signature verification (optional)
-    pub secret: Option<String>,
+    pub secret: Option<SecretString>,
     /// Event types to subscribe to
     #[schema(example = json!(["deployment.created", "deployment.succeeded"]))]
     pub events: Vec<String>,
@@ -155,7 +156,7 @@ pub struct UpdateWebhookRequestBody {
     /// Target URL for webhook delivery
     pub url: Option<String>,
     /// Secret for HMAC signature verification
-    pub secret: Option<String>,
+    pub secret: Option<SecretString>,
     /// Event types to subscribe to
     pub events: Option<Vec<String>>,
     /// Whether the webhook is enabled
@@ -378,7 +379,7 @@ async fn create_webhook(
     let request = CreateWebhookRequest {
         project_id,
         url: body.url,
-        secret: body.secret,
+        secret: body.secret.map(SecretString::into_exposed),
         events,
         enabled: body.enabled.unwrap_or(true),
     };
@@ -479,7 +480,7 @@ async fn update_webhook(
 
     let request = UpdateWebhookRequest {
         url: body.url,
-        secret: body.secret,
+        secret: body.secret.map(SecretString::into_exposed),
         events,
         enabled: body.enabled,
     };

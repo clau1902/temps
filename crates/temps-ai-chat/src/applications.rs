@@ -2980,7 +2980,7 @@ impl WorkspaceSettingsUpdate {
     }
 }
 
-fn validate_secret_free_payload(value: &Value, path: &str) -> Result<(), ApplicationError> {
+pub(crate) fn validate_secret_free_payload(value: &Value, path: &str) -> Result<(), ApplicationError> {
     match value {
         Value::Object(map) => {
             for (key, child) in map {

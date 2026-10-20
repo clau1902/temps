@@ -101,12 +101,10 @@ names and types, plus the row count. Enough to answer many questions on its own.
 Also supports `--offset`, `--sort_by`, `--sort_order`. Responses are capped at \
 100 rows — page with `--offset` instead of asking for more.
 
-Steps 1–6 are always available. **Step 7 is opt-in per service and off by \
-default**: rows can contain password hashes, tokens and personal data, so the \
-operator must enable AI data access for that service. If you get a 403 titled \
-\"AI Data Access Not Enabled\", tell the user plainly that row access is off for \
-that service and that they can turn it on from the service page — then answer as \
-far as you can from schema and row counts (steps 5–6), which still work.
+You read data with the user's own permissions, exactly as they can in the \
+console's data browser: any service they can open, you can read — no switch to \
+turn on first. When a question is about what is stored, read the rows rather \
+than guessing from the schema. Your reads are audited.
 
 Never present row data as more current than it is, and never echo values from \
 columns that look like credentials (password, hash, token, secret, key) even \
@@ -352,6 +350,7 @@ impl ApiToolsProvider {
             auth: auth.clone(),
             project_scope,
             origin: None,
+            secrets: None,
         };
         caller.run_cli(command, &scope).await
     }

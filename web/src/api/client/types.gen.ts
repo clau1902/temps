@@ -922,17 +922,6 @@ export type AiConfigSettings = {
     config_repo_branch?: string;
 };
 
-export type AiDataAccessResponse = {
-    /**
-     * Whether the AI assistant may read row data from this service
-     */
-    enabled: boolean;
-    /**
-     * Service id
-     */
-    service_id: number;
-};
-
 export type AiModelOptionDto = {
     default_thinking_option_id?: string | null;
     id: string;
@@ -1610,6 +1599,13 @@ export type ApiTrafficSummaryResponse = {
     unavailable_reason?: string | null;
 };
 
+export type AppRole = 'web' | 'api' | 'worker' | 'cron' | 'static';
+
+/**
+ * How Temps runs an app.
+ */
+export type AppRuntime = 'preset' | 'dockerfile' | 'image';
+
 /**
  * Application settings stored in the database
  * All fields have sensible defaults for easy onboarding
@@ -2260,6 +2256,31 @@ export type AttachScheduleServicesResponse = {
     total_attached: number;
 };
 
+export type AttachmentChunkReceived = {
+    /**
+     * Bytes of the file the server now holds.
+     */
+    received_bytes: number;
+};
+
+/**
+ * Request body type for the chunk endpoint's OpenAPI entry.
+ */
+export type AttachmentChunkUpload = {
+    chunk: Blob | File;
+};
+
+export type AttachmentUploadStarted = {
+    /**
+     * The most bytes one chunk may carry.
+     */
+    chunk_bytes: number;
+    /**
+     * Opaque id to send every chunk and the completion to.
+     */
+    upload_id: string;
+};
+
 export type AttrOp = 'eq' | 'neq' | 'exists' | 'prefix' | 'gt' | 'lt';
 
 /**
@@ -2762,6 +2783,14 @@ export type BindApplicationGitConnectionRequest = {
 };
 
 /**
+ * The project (for an app part) or service (for a data part) to bind.
+ */
+export type BindBlueprintComponentRequest = {
+    project_id?: number | null;
+    service_id?: number | null;
+};
+
+/**
  * Authentication input for a Bitbucket Cloud provider. Use `access_token` for
  * a Repository or Workspace Access Token (PAT), or `username` + `app_password`
  * for App Password (HTTP Basic) authentication.
@@ -2770,13 +2799,13 @@ export type BitbucketAuthInput = {
     /**
      * The Bitbucket access token value.
      */
-    token: string;
+    token: SecretString;
     type: 'access_token';
 } | {
     /**
      * App password generated in Bitbucket security settings.
      */
-    password: string;
+    password: SecretString;
     type: 'app_password';
     /**
      * Bitbucket account username.
@@ -2830,6 +2859,70 @@ export type BlobStatusResponse = {
      * Current version (if running)
      */
     version?: string | null;
+};
+
+/**
+ * The design of an application: what it is for, its parts and its flows.
+ */
+export type BlueprintDocument = {
+    components: Array<Component>;
+    flows?: Array<Flow>;
+    /**
+     * One paragraph: what the application does and for whom.
+     */
+    summary: string;
+};
+
+/**
+ * A workspace's architecture: what was accepted, what waits for a
+ * decision, and how each bound part is doing.
+ */
+export type BlueprintResponse = {
+    accepted?: BlueprintVersionResponse | null;
+    application_id: string;
+    /**
+     * Which project or service realises each part, by part id.
+     */
+    bindings: {
+        [key: string]: ComponentBinding;
+    };
+    /**
+     * The live state of each bound part, by part id.
+     */
+    live: {
+        [key: string]: ComponentLive;
+    };
+    proposal?: BlueprintVersionResponse | null;
+    workspace_name: string;
+};
+
+/**
+ * What the console needs to draw one version.
+ */
+export type BlueprintVersionResponse = {
+    change_summary: string;
+    /**
+     * ISO 8601.
+     */
+    created_at: string;
+    /**
+     * ISO 8601, once accepted or rejected.
+     */
+    decided_at?: string | null;
+    document: BlueprintDocument;
+    /**
+     * Whether the model proposed it (in a chat) rather than the user writing it.
+     */
+    proposed_by_assistant: boolean;
+    status: VersionStatus;
+    version: number;
+};
+
+export type BlueprintVersionsResponse = {
+    page: number;
+    page_size: number;
+    total: number;
+    versions: Array<BlueprintVersionResponse>;
 };
 
 export type BranchInfo = {
@@ -3422,6 +3515,73 @@ export type ChatMessage = {
 };
 
 /**
+ * One operation the chat started, with its current state.
+ */
+export type ChatOperation = {
+    deployment_id?: number | null;
+    /**
+     * Where: the project and environment, or the S3 source.
+     */
+    detail?: string | null;
+    environment_id?: number | null;
+    /**
+     * Why it failed, when the record says.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    /**
+     * Console path that shows the operation.
+     */
+    href?: string | null;
+    id: number;
+    kind: ChatOperationKind;
+    /**
+     * What started it: the API operation id, or `temps_deploy_sandbox_source`.
+     */
+    operation_id: string;
+    project_id?: number | null;
+    service_id?: number | null;
+    /**
+     * ISO 8601 time the chat started it.
+     */
+    started_at: string;
+    state: ChatOperationState;
+    /**
+     * The record's own status, e.g. `running` or `completed`.
+     */
+    status?: string | null;
+    /**
+     * e.g. "Deployment #41", "Backup of orders-db".
+     */
+    title: string;
+};
+
+/**
+ * What a chat started.
+ */
+export type ChatOperationKind = 'deployment' | 'backup' | 'service_backup' | 'restore';
+
+/**
+ * Where an operation is, in the same words for every kind.
+ */
+export type ChatOperationState = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'not_started';
+
+/**
+ * The operations a chat started, newest first.
+ */
+export type ChatOperationsResponse = {
+    operations: Array<ChatOperation>;
+    /**
+     * How many of them are still running.
+     */
+    running: number;
+    /**
+     * True when the chat started more operations than this response covers.
+     */
+    truncated: boolean;
+};
+
+/**
  * How to reach a page served from the chat's sandbox.
  */
 export type ChatPreview = {
@@ -3538,6 +3698,62 @@ export type ChatSandboxStatus = {
      * Console path where the user can fix it, when there is one.
      */
     setup_path?: string | null;
+};
+
+/**
+ * A chat's next-step suggestion setting.
+ */
+export type ChatSuggestionSettings = {
+    /**
+     * Whether this chat can have suggestions at all. Only the assistant chat
+     * can; the other fields still describe the setting for other chats.
+     */
+    available: boolean;
+    chat_mode?: SuggestionMode | null;
+    /**
+     * The user's default, which applies when `chat_mode` is unset.
+     */
+    default_mode: SuggestionMode;
+    /**
+     * What happens after each answer in this chat.
+     */
+    mode: SuggestionMode;
+    /**
+     * Whether `mode` is the chat's own setting or the user's default.
+     */
+    source: SuggestionModeSource;
+};
+
+/**
+ * The workspace a chat is in.
+ */
+export type ChatWorkspace = {
+    description?: string | null;
+    name: string;
+    /**
+     * Public id of the workspace (`app_…`).
+     */
+    public_id: string;
+};
+
+/**
+ * A chat's workspace, and the chats in it.
+ */
+export type ChatWorkspaceResponse = {
+    /**
+     * The workspace's chats, most recently active first, at most 20.
+     */
+    chats: Array<WorkspaceChatSummary>;
+    /**
+     * Whether this chat can be put in a workspace. Chats about one project
+     * cannot: the project is their scope.
+     */
+    joinable: boolean;
+    /**
+     * Why the chat cannot be in a workspace, when `joinable` is false.
+     */
+    reason?: string | null;
+    workspace?: ChatWorkspace | null;
 };
 
 /**
@@ -3709,6 +3925,8 @@ export type CliLoginRequest = {
     password: string;
     username: string;
 };
+
+export type ClientSurface = 'browser' | 'mobile' | 'cli' | 'third_party';
 
 export type CloudAiCapability = {
     configured: boolean;
@@ -4024,6 +4242,8 @@ export type CloudTelemetryWriteStatusResponse = {
  * Notifications are delivered through Cloudflare's transactional Email Sending
  * API. Only the account, token, sender and recipients are configured here —
  * subject and body are derived from each notification.
+ * Request-side config. Not `Serialize`: `api_token` is a `SecretString`; use
+ * [`CloudflareConfig::into_stored_value`].
  */
 export type CloudflareConfig = {
     /**
@@ -4034,7 +4254,7 @@ export type CloudflareConfig = {
      * Cloudflare API token with the Email Sending permission. Encrypted at
      * rest and masked in normal API responses.
      */
-    api_token: string;
+    api_token: SecretString;
     /**
      * Verified sender address (must belong to a domain enabled for Cloudflare
      * Email Sending).
@@ -4426,6 +4646,81 @@ export type CompactConversationResponse = {
 export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 
 export type Comparison = 'below' | 'above';
+
+/**
+ * One part of the application. Which fields apply depends on `kind`:
+ * a client has `surface`; an app has `role`, `stack` and `runtime` (and
+ * `image` when it runs an image); data has `engine` and `holds`; an external
+ * service has `provider`.
+ */
+export type Component = {
+    engine?: DataEngine | null;
+    /**
+     * What lives in a data part: tables, key prefixes, buckets, streams.
+     */
+    holds?: Array<string>;
+    /**
+     * Stable slug, unique in the document: `web`, `api`, `orders-worker`.
+     */
+    id: string;
+    /**
+     * The image an app runs, when `runtime` is `image`: `nats:2.10`.
+     */
+    image?: string | null;
+    kind: ComponentKind;
+    name: string;
+    /**
+     * The outside service: "Stripe", "an LLM API", "GitHub OAuth".
+     */
+    provider?: string | null;
+    /**
+     * Why it exists, in one sentence.
+     */
+    purpose: string;
+    role?: AppRole | null;
+    runtime?: AppRuntime | null;
+    /**
+     * Free text, as the user wants it: "Next.js", "Bun + Hono", "FastAPI".
+     */
+    stack?: string | null;
+    surface?: ClientSurface | null;
+};
+
+/**
+ * The project or service that realises one part.
+ */
+export type ComponentBinding = {
+    project_id?: number | null;
+    service_id?: number | null;
+};
+
+/**
+ * What a part of the application is.
+ */
+export type ComponentKind = 'client' | 'app' | 'data' | 'external';
+
+/**
+ * The live state of one bound part.
+ */
+export type ComponentLive = {
+    /**
+     * The project's latest deployment.
+     */
+    deployment_id?: number | null;
+    /**
+     * The project's or the service's name.
+     */
+    name?: string | null;
+    /**
+     * The project's slug, for links into the console.
+     */
+    project_slug?: string | null;
+    /**
+     * The service's engine as Temps names it (`postgres`, `redis`…).
+     */
+    service_type?: string | null;
+    status: LiveStatus;
+};
 
 /**
  * A Docker Compose service port mapping, reduced to the information the UI
@@ -5362,6 +5657,10 @@ export type ConversationResponse = {
     context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
     failure?: ChatFailureResponse | null;
+    /**
+     * The project an assistant chat was started about, if any.
+     */
+    focus_project_id?: number | null;
     last_activity_at: string;
     project_id?: number | null;
     public_id: string;
@@ -5436,6 +5735,17 @@ export type ConversationUsage = {
      * model has no known price. When this is not zero, the cost is a floor.
      */
     unpriced_requests: number;
+};
+
+/**
+ * The workspace a chat is in, as the conversation list shows it.
+ */
+export type ConversationWorkspaceResponse = {
+    name: string;
+    /**
+     * Public id of the workspace (`app_…`).
+     */
+    public_id: string;
 };
 
 export type ConversationsQueryParams = {
@@ -5653,6 +5963,12 @@ export type CreateAssistantConversationRequest = {
      * rejected: the assistant has no sandbox.
      */
     ai_provider?: string | null;
+    /**
+     * A project the chat is about. The assistant is told which it is, so it
+     * needs no searching to resolve "my app". It is a default, not a limit,
+     * and grants nothing: the chat still acts with the user's own permissions.
+     */
+    project_id?: number | null;
 };
 
 export type CreateBackupScheduleRequest = {
@@ -5679,6 +5995,11 @@ export type CreateBackupScheduleRequest = {
      * Optional S3 source. If omitted, the current default S3 source is used.
      */
     s3_source_id?: number | null;
+    /**
+     * Cron expression with a leading seconds field: `sec min hour day-of-month
+     * month day-of-week`, for example `0 0 3 * * *` for every day at 03:00
+     * UTC. A five-field expression such as `0 3 * * *` is rejected.
+     */
     schedule_expression: string;
     /**
      * External services to target when `target_all_services` is `false`.
@@ -6019,10 +6340,7 @@ export type CreateGenericRequest = {
      * Display name for this provider.
      */
     name: string;
-    /**
-     * Access token or password. Omit (or set to `null`) for public repositories.
-     */
-    token?: string | null;
+    token?: SecretString | null;
     /**
      * HTTP Basic username used with the token. Defaults to `x-access-token` when
      * absent or empty. Ignored for public (unauthenticated) repositories.
@@ -6032,13 +6350,13 @@ export type CreateGenericRequest = {
 
 export type CreateGitHubPatRequest = {
     name: string;
-    token: string;
+    token: SecretString;
 };
 
 export type CreateGitLabOAuthRequest = {
     base_url?: string | null;
     client_id: string;
-    client_secret: string;
+    client_secret: SecretString;
     name: string;
     redirect_uri: string;
 };
@@ -6046,7 +6364,7 @@ export type CreateGitLabOAuthRequest = {
 export type CreateGitLabPatRequest = {
     base_url?: string | null;
     name: string;
-    token: string;
+    token: SecretString;
 };
 
 export type CreateGiteaPatRequest = {
@@ -6061,7 +6379,7 @@ export type CreateGiteaPatRequest = {
     /**
      * Personal access token issued by the Gitea instance.
      */
-    token: string;
+    token: SecretString;
 };
 
 export type CreateGlobalConversationRequest = {
@@ -6091,7 +6409,7 @@ export type CreateIntegrationBody = {
     /**
      * Signing secret from the provider's dashboard.
      */
-    signing_secret: string;
+    signing_secret: SecretString;
 };
 
 /**
@@ -6233,7 +6551,7 @@ export type CreateNotificationRouteRequest = {
 
 export type CreateOidcProviderRequest = {
     client_id: string;
-    client_secret: string;
+    client_secret: SecretString;
     default_role?: string;
     enabled?: boolean;
     group_claim?: string;
@@ -6560,7 +6878,7 @@ export type CreateProjectSecretRequest = {
 };
 
 export type CreateProviderKeyRequest = {
-    api_key: string;
+    api_key: SecretString;
     base_url?: string | null;
     /**
      * Optional model id to pin for this provider (e.g. "gpt-4o-mini").
@@ -6612,7 +6930,10 @@ export type CreateRouteRequest = {
 };
 
 export type CreateS3SourceRequest = {
-    access_key_id: string;
+    /**
+     * Access key ID of the bucket's credentials, for example `AKIA...` on AWS.
+     */
+    access_key_id: SecretString;
     /**
      * Managed RustFS/S3 service that supplies this destination. When set,
      * schedules using this source can never target that service itself.
@@ -6635,7 +6956,11 @@ export type CreateS3SourceRequest = {
     is_default?: boolean | null;
     name: string;
     region: string;
-    secret_key: string;
+    /**
+     * Secret access key that goes with the access key ID. Shown once by the
+     * provider; stored encrypted and never returned.
+     */
+    secret_key: SecretString;
 };
 
 export type CreateSandboxBody = {
@@ -6708,14 +7033,7 @@ export type CreateSandboxBody = {
      * extra round-trip.
      */
     ports?: Array<number>;
-    /**
-     * Optional preview-URL password. When set, every preview URL served
-     * for this sandbox is gated behind a login form. 8–256 characters.
-     * Omit to leave preview URLs open (the sandbox ID remains the only
-     * gate). The plaintext is never returned; only the last-4 hint is
-     * surfaced in `SandboxResponse.preview_password_hint`.
-     */
-    preview_password?: string | null;
+    preview_password?: SecretString | null;
     projectId?: string | null;
     /**
      * Create the sandbox against a temps project (temps-native). The
@@ -6804,10 +7122,7 @@ export type CreateWebhookRequestBody = {
      * Event types to subscribe to
      */
     events: Array<string>;
-    /**
-     * Secret for HMAC signature verification (optional)
-     */
-    secret?: string | null;
+    secret?: SecretString | null;
     /**
      * Target URL for webhook delivery
      */
@@ -7050,6 +7365,11 @@ export type DashboardTile = {
      */
     title?: string | null;
 };
+
+/**
+ * The engines Temps operates as managed services.
+ */
+export type DataEngine = 'postgres' | 'redis' | 'mongodb' | 'mariadb' | 's3';
 
 /**
  * A specific data implication the user needs to understand
@@ -8432,14 +8752,14 @@ export type DnsLookupResponse = {
  * DNS provider credentials (API-facing)
  */
 export type DnsProviderCredentials = {
-    api_key: string;
+    api_key: SecretString;
     type: 'bunny';
 } | {
     account_id?: string | null;
-    api_token: string;
+    api_token: SecretString;
     type: 'cloudflare';
 } | {
-    api_key: string;
+    api_key: SecretString;
     api_user: string;
     client_ip?: string | null;
     sandbox?: boolean;
@@ -8447,20 +8767,20 @@ export type DnsProviderCredentials = {
 } | {
     access_key_id: string;
     region?: string | null;
-    secret_access_key: string;
-    session_token?: string | null;
+    secret_access_key: SecretString;
+    session_token?: SecretString | null;
     type: 'route53';
 } | {
-    api_token: string;
+    api_token: SecretString;
     type: 'digitalocean';
 } | {
-    private_key: string;
+    private_key: SecretString;
     project_id: string;
     service_account_email: string;
     type: 'gcp';
 } | {
     client_id: string;
-    client_secret: string;
+    client_secret: SecretString;
     resource_group: string;
     subscription_id: string;
     tenant_id: string;
@@ -9249,11 +9569,15 @@ export type EligibleGitRepositoryResponse = {
     repositoryUrl: string;
 };
 
+/**
+ * Request-side SMTP config. Not `Serialize` for the same reason as
+ * [`SlackConfig`]; use [`EmailConfig::into_stored_value`].
+ */
 export type EmailConfig = {
     accept_invalid_certs?: boolean;
     from_address: string;
     from_name?: string | null;
-    password: string;
+    password: SecretString;
     smtp_host: string;
     smtp_port: number;
     starttls_required?: boolean;
@@ -9476,10 +9800,7 @@ export type EnableBlobRequest = {
      * Docker image to use (optional, defaults to RustFS)
      */
     docker_image?: string | null;
-    /**
-     * Root password for S3 access
-     */
-    root_password?: string | null;
+    root_password?: SecretString | null;
     /**
      * Root user for S3 access
      */
@@ -11151,6 +11472,14 @@ export type FileObject = {
     purpose?: string;
 };
 
+export type FillSecretRequest = {
+    /**
+     * The credential. Stored encrypted; never returned and never shown to the
+     * assistant, which only receives an opaque handle.
+     */
+    value: SecretString;
+};
+
 export type Finding = {
     code: string;
     message: string;
@@ -11257,6 +11586,24 @@ export type FlagSnapshotResponse = {
  * The declared type of a flag's value. Fixed at create time.
  */
 export type FlagValueType = 'bool' | 'string' | 'number' | 'json';
+
+/**
+ * Data moving from one part to another. `from` is the part that starts it.
+ */
+export type Flow = {
+    from: string;
+    kind: FlowKind;
+    /**
+     * What travels: "POST /api/tasks", "topic task.created", "tables tasks, users".
+     */
+    label: string;
+    to: string;
+};
+
+/**
+ * What travels along a flow.
+ */
+export type FlowKind = 'http' | 'websocket' | 'query' | 'publish' | 'subscribe' | 'cache' | 'blob' | 'webhook';
 
 /**
  * Forecast model family.
@@ -12150,6 +12497,30 @@ export type GitBindingResponse = {
 };
 
 /**
+ * How a file differs from the last commit.
+ */
+export type GitChangeKind = 'modified' | 'added' | 'deleted' | 'renamed' | 'copied' | 'type_changed' | 'untracked' | 'conflicted';
+
+/**
+ * A file that differs from the repository's last commit.
+ */
+export type GitChangedFile = {
+    change: GitChangeKind;
+    /**
+     * The path before a rename or copy.
+     */
+    old_path?: string | null;
+    /**
+     * Path relative to the repository root.
+     */
+    path: string;
+    /**
+     * True when the change is staged (in the index).
+     */
+    staged: boolean;
+};
+
+/**
  * Git push event information that triggered the deployment
  */
 export type GitPushEvent = {
@@ -12206,6 +12577,33 @@ export type GitRefResponse = {
      * Git repository URL
      */
     url: string;
+};
+
+/**
+ * The uncommitted changes of one repository in the sandbox.
+ */
+export type GitRepoChanges = {
+    /**
+     * The checked-out branch, or the short commit when detached.
+     */
+    branch?: string | null;
+    files: Array<GitChangedFile>;
+    /**
+     * False for a repository with no commit yet: every file is new.
+     */
+    has_commits: boolean;
+    /**
+     * The root relative to the work directory (`.` for the work directory).
+     */
+    name: string;
+    /**
+     * Absolute path of the repository root.
+     */
+    root: string;
+    /**
+     * True when more files changed than are listed.
+     */
+    truncated: boolean;
 };
 
 /**
@@ -12273,6 +12671,10 @@ export type GlobalConversationResponse = {
     context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
     failure?: ChatFailureResponse | null;
+    /**
+     * The project an assistant chat was started about, if any.
+     */
+    focus_project_id?: number | null;
     last_activity_at: string;
     project_id?: number | null;
     project_name?: string | null;
@@ -12285,6 +12687,7 @@ export type GlobalConversationResponse = {
      * Server-authoritative lifecycle for the current/most recent turn.
      */
     turn_status: string;
+    workspace?: ConversationWorkspaceResponse | null;
 };
 
 export type GlobalErrorGroupResponse = {
@@ -14069,6 +14472,12 @@ export type JourneySession = {
 };
 
 /**
+ * Which sandbox the chats keep when a chat with a sandbox of its own joins a
+ * workspace that already has one.
+ */
+export type KeepSandbox = 'workspace' | 'chat';
+
+/**
  * Request to get keys matching a pattern
  */
 export type KeysRequest = {
@@ -14514,6 +14923,11 @@ export type ListVulnerabilitiesQuery = {
     severity?: string | null;
 };
 
+/**
+ * How a bound part is doing right now.
+ */
+export type LiveStatus = 'created' | 'building' | 'live' | 'failed' | 'stopped' | 'missing';
+
 export type LiveVisitorInfo = {
     city?: string | null;
     country?: string | null;
@@ -14948,6 +15362,11 @@ export type MessageResponse = {
      * an uninterpreted token and send it back through the `before` query.
      */
     cursor: string;
+    /**
+     * Next steps already suggested after this answer, shown again on reload
+     * without asking the model a second time.
+     */
+    next_steps?: Array<string> | null;
     /**
      * Ordered render segments (text / tool, in the order they occurred) so a
      * reloaded chat shows the same interleaving as the live stream. Absent for
@@ -15829,6 +16248,33 @@ export type NetworkMode = 'bridge' | 'host' | 'none' | {
 export type NetworkPoolEntry = {
     compute_pool_cidr: string;
     subnet_prefix_len: number;
+};
+
+/**
+ * A new workspace to create for the chat.
+ */
+export type NewChatWorkspace = {
+    description?: string | null;
+    name: string;
+};
+
+/**
+ * Suggestions for one answer.
+ */
+export type NextSteps = {
+    /**
+     * Cursor of the answer they follow on from, as in the message list.
+     */
+    answer: string;
+    /**
+     * The model that wrote them.
+     */
+    model: string;
+    /**
+     * True when they were saved earlier and returned without a new request.
+     */
+    saved: boolean;
+    suggestions: Array<string>;
 };
 
 /**
@@ -21878,6 +22324,22 @@ export type S3SourceResponse = {
 };
 
 /**
+ * The Git changes of every repository found under the work directory.
+ */
+export type SandboxChanges = {
+    /**
+     * False when the sandbox has no `git`: nothing can be tracked.
+     */
+    git_available: boolean;
+    /**
+     * Repositories at most three levels below the work directory, outside
+     * `node_modules`.
+     */
+    repos: Array<GitRepoChanges>;
+    work_dir: string;
+};
+
+/**
  * What linking the sandbox to services gave it.
  */
 export type SandboxConnections = {
@@ -21904,9 +22366,49 @@ export type SandboxConnections = {
     variable_names: Array<string>;
 };
 
+/**
+ * One directory of the chat's sandbox: folders first, then files, by name.
+ */
+export type SandboxDirectory = {
+    entries: Array<SandboxEntry>;
+    /**
+     * Absolute path of the directory listed.
+     */
+    path: string;
+    /**
+     * True when the directory has more than the entries returned.
+     */
+    truncated: boolean;
+    /**
+     * The sandbox work directory, where the assistant's relative paths start.
+     */
+    work_dir: string;
+};
+
 export type SandboxDomainResponse = {
     url: string;
 };
+
+/**
+ * One entry of a sandbox directory.
+ */
+export type SandboxEntry = {
+    kind: SandboxEntryKind;
+    name: string;
+    /**
+     * Absolute path inside the sandbox.
+     */
+    path: string;
+    /**
+     * Size in bytes as the filesystem reports it.
+     */
+    size: number;
+};
+
+/**
+ * What a directory entry is.
+ */
+export type SandboxEntryKind = 'file' | 'directory' | 'symlink' | 'other';
 
 /**
  * One entry in a sandbox's operations timeline.
@@ -21931,6 +22433,57 @@ export type SandboxEvent = {
 
 export type SandboxEventsResponse = {
     events: Array<SandboxEvent>;
+};
+
+/**
+ * Both sides of one file's diff against the last commit.
+ */
+export type SandboxFileDiff = {
+    /**
+     * True when either side is binary; both sides are then `None`.
+     */
+    binary: boolean;
+    /**
+     * The file as it is now. `None` when it was deleted.
+     */
+    modified?: string | null;
+    /**
+     * The file as last committed. `None` when it is new.
+     */
+    original?: string | null;
+    /**
+     * Path relative to the repository root.
+     */
+    path: string;
+    /**
+     * Absolute path of the repository root.
+     */
+    repo: string;
+    /**
+     * True when either side was cut at [`MAX_VIEW_BYTES`].
+     */
+    truncated: boolean;
+};
+
+/**
+ * One file of the chat's sandbox, for the viewer.
+ */
+export type SandboxFileView = {
+    binary: boolean;
+    /**
+     * The text, or its first [`MAX_VIEW_BYTES`] when `truncated`. `None`
+     * for a binary file.
+     */
+    content?: string | null;
+    /**
+     * Absolute path inside the sandbox.
+     */
+    path: string;
+    /**
+     * Size in bytes of the whole file.
+     */
+    size: number;
+    truncated: boolean;
 };
 
 /**
@@ -22087,6 +22640,14 @@ export type SaveAgentTokenResponse = {
     saved: boolean;
 };
 
+/**
+ * A version the user wrote; it is accepted as it is saved.
+ */
+export type SaveBlueprintVersionRequest = {
+    change_summary: string;
+    document: BlueprintDocument;
+};
+
 export type SaveCredentialRequest = {
     /**
      * Auth flavor id (must match one of the provider's catalog entries).
@@ -22097,7 +22658,7 @@ export type SaveCredentialRequest = {
      * contents). Encrypted with `EncryptionService` before being persisted
      * inside the `agent_sandbox.providers` JSON map.
      */
-    credential: string;
+    credential: SecretString;
     /**
      * OpenCode model to test, in `provider/model` form. Omit to use the
      * built-in minimal probe model. A successfully verified explicit model
@@ -22140,7 +22701,7 @@ export type SaveHttpCheck = {
 };
 
 export type ScalewayCredentialsRequest = {
-    api_key: string;
+    api_key: SecretString;
     project_id: string;
 };
 
@@ -22518,6 +23079,39 @@ export type SecretResponse = {
      */
     value: string;
 };
+
+/**
+ * What a slot looks like to the console and to the model: everything except
+ * the value.
+ */
+export type SecretSlotView = {
+    conversation_id: number;
+    created_at: string;
+    expires_at: string;
+    /**
+     * JSON pointer of the request field the value is for.
+     */
+    field: string;
+    filled_at?: string | null;
+    /**
+     * The id inside the handle (`secret_ref:v1:<id>`).
+     */
+    id: string;
+    /**
+     * What the form asks for.
+     */
+    label: string;
+    operation_id: string;
+    /**
+     * `awaiting`, `filled`, `cancelled` or `expired`.
+     */
+    status: string;
+};
+
+/**
+ * A credential. Write-only: it is never returned, and the AI assistant supplies it through a secret slot instead of typing it into the conversation.
+ */
+export type SecretString = string;
 
 /**
  * Security configuration for projects and environments
@@ -23194,6 +23788,12 @@ export type ServiceMemberInfo = {
      * the UI falls back to the `status` column for those.
      */
     provisioning_step?: string | null;
+    /**
+     * Configured member kind. For a PostgreSQL cluster this is `monitor` or
+     * `replica`, and every data node is `replica`, including the current
+     * primary: which node is primary is runtime state, read it from
+     * `live_state`.
+     */
     role: string;
     status: string;
 };
@@ -23453,7 +24053,7 @@ export type ServiceUpdateAlertRuleRequest = {
 
 export type SesCredentialsRequest = {
     access_key_id: string;
-    secret_access_key: string;
+    secret_access_key: SecretString;
 };
 
 export type SessionDetails = {
@@ -23663,6 +24263,20 @@ export type SetAlternateSourcesRequest = {
     allow_alternate_sources: boolean;
 };
 
+/**
+ * Put a chat in a workspace: an existing one (`application_id`) or a new
+ * one (`create`). Exactly one of the two.
+ */
+export type SetChatWorkspaceRequest = {
+    application_id?: string | null;
+    create?: NewChatWorkspace | null;
+    /**
+     * Which sandbox the chats keep when both the chat and the workspace
+     * have one. Default `workspace`.
+     */
+    keep_sandbox?: KeepSandbox;
+};
+
 export type SetFlagEnvironmentRequest = {
     /**
      * The kill switch. `false` makes the flag serve its default regardless of
@@ -23730,7 +24344,7 @@ export type SetPreviewPasswordBody = {
      * server-side with argon2id — we never persist or echo this back.
      * Must be between 8 and 256 characters.
      */
-    password: string;
+    password: SecretString;
 };
 
 export type SetPreviewPasswordResponse = {
@@ -23939,9 +24553,14 @@ export type SkipHostnameRecord = {
     revision: string;
 };
 
+/**
+ * Request-side Slack config. Deliberately not `Serialize`: the webhook URL is
+ * a `SecretString`, which would serialize as `"***"`. Use
+ * [`SlackConfig::into_stored_value`] to build the value that gets encrypted.
+ */
 export type SlackConfig = {
     channel?: string | null;
-    webhook_url: string;
+    webhook_url: SecretString;
 };
 
 /**
@@ -24142,10 +24761,7 @@ export type SmtpCredentialsRequest = {
      * SMTP host, e.g. `email-smtp.eu-west-1.amazonaws.com`.
      */
     host: string;
-    /**
-     * SMTP password / API token. Required when `username` is set.
-     */
-    password?: string | null;
+    password?: SecretString | null;
     /**
      * SMTP port (587 for STARTTLS, 465 for implicit TLS, 25/1025 for plain).
      */
@@ -24662,6 +25278,21 @@ export type StartAnalysisRequest = {
     user_context?: string | null;
 };
 
+export type StartAttachmentUploadRequest = {
+    /**
+     * Content type the browser reported, if any.
+     */
+    mime_type?: string | null;
+    /**
+     * File name as the user knows it; unsafe characters are replaced.
+     */
+    name: string;
+    /**
+     * Size of the whole file in bytes.
+     */
+    size_bytes: number;
+};
+
 /**
  * Start importing an external database into a database of this service.
  */
@@ -25063,6 +25694,35 @@ export type StripeConfig = {
      */
     product_allowlist?: Array<string>;
 };
+
+/**
+ * Which answer to suggest next steps for.
+ */
+export type SuggestNextStepsRequest = {
+    /**
+     * Cursor of the answer the user is looking at, from the message list. When
+     * given, it must still be the chat's latest answer. Without it the latest
+     * answer is used.
+     */
+    answer?: string | null;
+};
+
+/**
+ * The user's default for chats that do not set their own mode.
+ */
+export type SuggestionDefault = {
+    mode: SuggestionMode;
+};
+
+/**
+ * What happens after each answer.
+ */
+export type SuggestionMode = 'off' | 'ask' | 'always';
+
+/**
+ * Where a chat's effective mode comes from.
+ */
+export type SuggestionModeSource = 'chat' | 'default';
 
 /**
  * What (if anything) will restart the process after it exits.
@@ -25545,7 +26205,7 @@ export type TestProviderKeyRequest = {
     /**
      * The raw API key to test
      */
-    api_key: string;
+    api_key: SecretString;
     /**
      * Optional custom base URL
      */
@@ -25703,13 +26363,6 @@ export type TodayStatsResponse = {
     total_requests: number;
 };
 
-export type ToggleAiDataAccessRequest = {
-    /**
-     * Whether the AI assistant may read row data from this service.
-     */
-    enabled: boolean;
-};
-
 /**
  * Request body to toggle OTLP metric ingestion for a deployment.
  */
@@ -25857,6 +26510,17 @@ export type TraceSummary = {
 export type TracesResponse = {
     count: number;
     data: Array<SpanRecord>;
+};
+
+/**
+ * A folder to put under Git.
+ */
+export type TrackSandboxChangesRequest = {
+    /**
+     * Absolute, or relative to the work directory; the work directory when
+     * omitted.
+     */
+    path?: string | null;
 };
 
 /**
@@ -26574,7 +27238,9 @@ export type UpdateBackupScheduleRequest = {
      */
     retention_period?: number | null;
     /**
-     * New cron expression. When changed, `next_run` is recomputed.
+     * New cron expression with a leading seconds field (`sec min hour
+     * day-of-month month day-of-week`, e.g. `0 0 3 * * *`). When changed,
+     * `next_run` is recomputed.
      */
     schedule_expression?: string | null;
     /**
@@ -26706,6 +27372,13 @@ export type UpdateCapabilityResponse = {
      * What would restart the process: `systemd`, `launchd`, `container`, `none`.
      */
     supervisor: SupervisorKind;
+};
+
+/**
+ * Set a chat's own mode, or `null` to follow the user's default.
+ */
+export type UpdateChatSuggestionModeRequest = {
+    mode?: SuggestionMode | null;
 };
 
 export type UpdateCloudflareProviderRequest = {
@@ -26938,13 +27611,7 @@ export type UpdateEnvironmentSettingsRequest = {
      * idle_timeout_seconds of no traffic and started on the next request.
      */
     on_demand?: boolean | null;
-    /**
-     * Set a password to protect this environment. The proxy will show an HTML
-     * password form before allowing access. The password is bcrypt-hashed
-     * server-side and never stored in plaintext.
-     * Send an empty string to remove password protection.
-     */
-    password?: string | null;
+    password?: SecretString | null;
     /**
      * Enable/disable performance metrics collection
      */
@@ -27235,7 +27902,7 @@ export type UpdateNotificationRouteRequest = {
 
 export type UpdateOidcProviderRequest = {
     client_id?: string | null;
-    client_secret?: string | null;
+    client_secret?: SecretString | null;
     default_role?: string | null;
     enabled?: boolean | null;
     group_claim?: string | null;
@@ -27391,38 +28058,23 @@ export type UpdateProviderCredentialsRequest = {
      * Application ID (GitHub App integer as string; GitLab App string).
      */
     app_id?: string | null;
-    /**
-     * GitLab App secret (not used by GitHub App — use `client_secret`).
-     */
-    app_secret?: string | null;
+    app_secret?: SecretString | null;
     /**
      * OAuth client ID (GitLab OAuth, GitHub App).
      */
     client_id?: string | null;
-    /**
-     * OAuth client secret (GitLab OAuth, GitHub App).
-     */
-    client_secret?: string | null;
-    /**
-     * GitHub App private key (PEM).
-     */
-    private_key?: string | null;
+    client_secret?: SecretString | null;
+    private_key?: SecretString | null;
     /**
      * OAuth redirect URI (GitLab OAuth / GitLab App).
      */
     redirect_uri?: string | null;
-    /**
-     * PAT for PAT-type providers.
-     */
-    token?: string | null;
-    /**
-     * GitHub App webhook secret.
-     */
-    webhook_secret?: string | null;
+    token?: SecretString | null;
+    webhook_secret?: SecretString | null;
 };
 
 export type UpdateProviderKeyRequest = {
-    api_key?: string | null;
+    api_key?: SecretString | null;
     /**
      * Double-Option: absent = leave unchanged, present-null = clear (revert to
      * the provider's default endpoint), present-value = set.
@@ -27463,10 +28115,7 @@ export type UpdateRouteRequest = {
 };
 
 export type UpdateS3SourceRequest = {
-    /**
-     * Optional new access key ID
-     */
-    access_key_id?: string | null;
+    access_key_id?: SecretString | null;
     /**
      * Optional new bucket name
      */
@@ -27491,10 +28140,7 @@ export type UpdateS3SourceRequest = {
      * Optional new region
      */
     region?: string | null;
-    /**
-     * Optional new secret key
-     */
-    secret_key?: string | null;
+    secret_key?: SecretString | null;
 };
 
 /**
@@ -27516,7 +28162,7 @@ export type UpdateSecretBody = {
      * New signing secret from the provider's dashboard. Encrypted at
      * rest; never returned in any API response.
      */
-    signing_secret: string;
+    signing_secret: SecretString;
 };
 
 export type UpdateSelfRequest = {
@@ -27638,8 +28284,8 @@ export type UpdateTelemetrySettingsRequest = {
 };
 
 export type UpdateTokenRequest = {
-    access_token: string;
-    refresh_token?: string | null;
+    access_token: SecretString;
+    refresh_token?: SecretString | null;
 };
 
 export type UpdateTokenResponse = {
@@ -27679,10 +28325,7 @@ export type UpdateWebhookRequestBody = {
      * Event types to subscribe to
      */
     events?: Array<string> | null;
-    /**
-     * Secret for HMAC signature verification
-     */
-    secret?: string | null;
+    secret?: SecretString | null;
     /**
      * Target URL for webhook delivery
      */
@@ -28173,6 +28816,11 @@ export type VerifyStepUpRequest = {
      */
     code: string;
 };
+
+/**
+ * Where a version stands.
+ */
+export type VersionStatus = 'proposed' | 'accepted' | 'rejected' | 'superseded';
 
 export type ViewItem = {
     label: string;
@@ -28972,6 +29620,19 @@ export type WorkspaceActivitySummary = {
     application_public_id?: string | null;
     harnesses: Array<WorkspaceHarnessActivity>;
     total: number;
+};
+
+/**
+ * One chat of a workspace, for the switcher.
+ */
+export type WorkspaceChatSummary = {
+    /**
+     * ISO 8601.
+     */
+    last_activity_at: string;
+    public_id: string;
+    title?: string | null;
+    turn_status: string;
 };
 
 export type WorkspaceHarnessActivity = {
@@ -30552,6 +31213,341 @@ export type UploadApplicationWorkspaceFilesResponses = {
 
 export type UploadApplicationWorkspaceFilesResponse = UploadApplicationWorkspaceFilesResponses[keyof UploadApplicationWorkspaceFilesResponses];
 
+export type GetBlueprintData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint';
+};
+
+export type GetBlueprintErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetBlueprintError = GetBlueprintErrors[keyof GetBlueprintErrors];
+
+export type GetBlueprintResponses = {
+    /**
+     * The workspace's blueprint
+     */
+    200: BlueprintResponse;
+};
+
+export type GetBlueprintResponse = GetBlueprintResponses[keyof GetBlueprintResponses];
+
+export type UnbindBlueprintComponentData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+        /**
+         * The part's id in the accepted blueprint
+         */
+        component_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/bindings/{component_id}';
+};
+
+export type UnbindBlueprintComponentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace or part not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UnbindBlueprintComponentError = UnbindBlueprintComponentErrors[keyof UnbindBlueprintComponentErrors];
+
+export type UnbindBlueprintComponentResponses = {
+    /**
+     * The blueprint without the binding
+     */
+    200: BlueprintResponse;
+};
+
+export type UnbindBlueprintComponentResponse = UnbindBlueprintComponentResponses[keyof UnbindBlueprintComponentResponses];
+
+export type BindBlueprintComponentData = {
+    body: BindBlueprintComponentRequest;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+        /**
+         * The part's id in the accepted blueprint
+         */
+        component_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/bindings/{component_id}';
+};
+
+export type BindBlueprintComponentErrors = {
+    /**
+     * The binding does not fit the part
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace or part not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BindBlueprintComponentError = BindBlueprintComponentErrors[keyof BindBlueprintComponentErrors];
+
+export type BindBlueprintComponentResponses = {
+    /**
+     * The blueprint with the new binding
+     */
+    200: BlueprintResponse;
+};
+
+export type BindBlueprintComponentResponse = BindBlueprintComponentResponses[keyof BindBlueprintComponentResponses];
+
+export type ListBlueprintVersionsData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+    };
+    query?: {
+        /**
+         * 1-based page. Default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/ai/applications/{public_id}/blueprint/versions';
+};
+
+export type ListBlueprintVersionsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListBlueprintVersionsError = ListBlueprintVersionsErrors[keyof ListBlueprintVersionsErrors];
+
+export type ListBlueprintVersionsResponses = {
+    /**
+     * Blueprint versions
+     */
+    200: BlueprintVersionsResponse;
+};
+
+export type ListBlueprintVersionsResponse = ListBlueprintVersionsResponses[keyof ListBlueprintVersionsResponses];
+
+export type SaveBlueprintVersionData = {
+    body: SaveBlueprintVersionRequest;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/versions';
+};
+
+export type SaveBlueprintVersionErrors = {
+    /**
+     * The document is not valid
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type SaveBlueprintVersionError = SaveBlueprintVersionErrors[keyof SaveBlueprintVersionErrors];
+
+export type SaveBlueprintVersionResponses = {
+    /**
+     * The saved, accepted version
+     */
+    201: BlueprintResponse;
+};
+
+export type SaveBlueprintVersionResponse = SaveBlueprintVersionResponses[keyof SaveBlueprintVersionResponses];
+
+export type AcceptBlueprintVersionData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+        /**
+         * The proposed version
+         */
+        version: number;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/versions/{version}/accept';
+};
+
+export type AcceptBlueprintVersionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace or version not found
+     */
+    404: ProblemDetails;
+    /**
+     * The version was already decided or replaced
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type AcceptBlueprintVersionError = AcceptBlueprintVersionErrors[keyof AcceptBlueprintVersionErrors];
+
+export type AcceptBlueprintVersionResponses = {
+    /**
+     * The blueprint after the decision
+     */
+    200: BlueprintResponse;
+};
+
+export type AcceptBlueprintVersionResponse = AcceptBlueprintVersionResponses[keyof AcceptBlueprintVersionResponses];
+
+export type RejectBlueprintVersionData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+        /**
+         * The proposed version
+         */
+        version: number;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/versions/{version}/reject';
+};
+
+export type RejectBlueprintVersionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace or version not found
+     */
+    404: ProblemDetails;
+    /**
+     * The version was already decided or replaced
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RejectBlueprintVersionError = RejectBlueprintVersionErrors[keyof RejectBlueprintVersionErrors];
+
+export type RejectBlueprintVersionResponses = {
+    /**
+     * The blueprint after the decision
+     */
+    200: BlueprintResponse;
+};
+
+export type RejectBlueprintVersionResponse = RejectBlueprintVersionResponses[keyof RejectBlueprintVersionResponses];
+
 export type CreateAssistantConversationData = {
     body: CreateAssistantConversationRequest;
     path?: never;
@@ -30607,6 +31603,12 @@ export type ListAllConversationsData = {
          * Number of conversations per page (clamped to 1..=100).
          */
         page_size?: number;
+        /**
+         * Keep only chats whose title, or whose project's name or slug, contains
+         * this text (case-insensitive, matched literally). At most 200
+         * characters; blank means no filter.
+         */
+        search?: string;
     };
     url: '/ai/conversations';
 };
@@ -30716,6 +31718,203 @@ export type ArchiveUserConversationResponses = {
 };
 
 export type ArchiveUserConversationResponse = ArchiveUserConversationResponses[keyof ArchiveUserConversationResponses];
+
+export type StartAttachmentUploadData = {
+    body: StartAttachmentUploadRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/attachment-uploads';
+};
+
+export type StartAttachmentUploadErrors = {
+    /**
+     * Empty file
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * File too large
+     */
+    413: ProblemDetails;
+    /**
+     * Too many uploads in progress
+     */
+    429: ProblemDetails;
+    /**
+     * Upload capacity reached
+     */
+    503: ProblemDetails;
+};
+
+export type StartAttachmentUploadError = StartAttachmentUploadErrors[keyof StartAttachmentUploadErrors];
+
+export type StartAttachmentUploadResponses = {
+    /**
+     * Upload opened
+     */
+    201: AttachmentUploadStarted;
+};
+
+export type StartAttachmentUploadResponse = StartAttachmentUploadResponses[keyof StartAttachmentUploadResponses];
+
+export type CancelAttachmentUploadData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Upload id from the start request
+         */
+        upload_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/attachment-uploads/{upload_id}';
+};
+
+export type CancelAttachmentUploadErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type CancelAttachmentUploadError = CancelAttachmentUploadErrors[keyof CancelAttachmentUploadErrors];
+
+export type CancelAttachmentUploadResponses = {
+    /**
+     * Upload cancelled (or already gone)
+     */
+    204: void;
+};
+
+export type CancelAttachmentUploadResponse = CancelAttachmentUploadResponses[keyof CancelAttachmentUploadResponses];
+
+export type AppendAttachmentChunkData = {
+    body: AttachmentChunkUpload;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Upload id from the start request
+         */
+        upload_id: string;
+    };
+    query: {
+        /**
+         * Where this chunk starts in the file: the bytes received so far.
+         */
+        offset: number;
+    };
+    url: '/ai/conversations/{public_id}/attachment-uploads/{upload_id}/chunk';
+};
+
+export type AppendAttachmentChunkErrors = {
+    /**
+     * Invalid chunk
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Upload not found or expired
+     */
+    404: ProblemDetails;
+    /**
+     * Chunk is not the next one expected
+     */
+    409: ProblemDetails;
+};
+
+export type AppendAttachmentChunkError = AppendAttachmentChunkErrors[keyof AppendAttachmentChunkErrors];
+
+export type AppendAttachmentChunkResponses = {
+    /**
+     * Chunk stored
+     */
+    200: AttachmentChunkReceived;
+};
+
+export type AppendAttachmentChunkResponse = AppendAttachmentChunkResponses[keyof AppendAttachmentChunkResponses];
+
+export type CompleteAttachmentUploadData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Upload id from the start request
+         */
+        upload_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/attachment-uploads/{upload_id}/complete';
+};
+
+export type CompleteAttachmentUploadErrors = {
+    /**
+     * Not every byte has arrived
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Upload or conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no workspace for attachments
+     */
+    409: ProblemDetails;
+};
+
+export type CompleteAttachmentUploadError = CompleteAttachmentUploadErrors[keyof CompleteAttachmentUploadErrors];
+
+export type CompleteAttachmentUploadResponses = {
+    /**
+     * Attachment stored
+     */
+    201: ChatAttachmentResponse;
+};
+
+export type CompleteAttachmentUploadResponse = CompleteAttachmentUploadResponses[keyof CompleteAttachmentUploadResponses];
 
 export type UploadUserConversationAttachmentData = {
     body: ChatAttachmentUpload;
@@ -31006,6 +32205,48 @@ export type SendUserMessageResponses = {
 
 export type SendUserMessageResponse = SendUserMessageResponses[keyof SendUserMessageResponses];
 
+export type ListChatOperationsData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/operations';
+};
+
+export type ListChatOperationsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListChatOperationsError = ListChatOperationsErrors[keyof ListChatOperationsErrors];
+
+export type ListChatOperationsResponses = {
+    /**
+     * Operations the conversation started
+     */
+    200: ChatOperationsResponse;
+};
+
+export type ListChatOperationsResponse = ListChatOperationsResponses[keyof ListChatOperationsResponses];
+
 export type ListUserPendingActionsData = {
     body?: never;
     path: {
@@ -31280,6 +32521,315 @@ export type LinkChatSandboxResponses = {
 
 export type LinkChatSandboxResponse = LinkChatSandboxResponses[keyof LinkChatSandboxResponses];
 
+export type GetChatSandboxChangesData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/changes';
+};
+
+export type GetChatSandboxChangesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * No sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The Git command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type GetChatSandboxChangesError = GetChatSandboxChangesErrors[keyof GetChatSandboxChangesErrors];
+
+export type GetChatSandboxChangesResponses = {
+    /**
+     * Changes per repository
+     */
+    200: SandboxChanges;
+};
+
+export type GetChatSandboxChangesResponse = GetChatSandboxChangesResponses[keyof GetChatSandboxChangesResponses];
+
+export type GetChatSandboxDiffData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query: {
+        /**
+         * The repository root, absolute or relative to the work directory.
+         */
+        repo: string;
+        /**
+         * The file, relative to the repository root.
+         */
+        path: string;
+        /**
+         * The path before a rename, relative to the repository root.
+         */
+        old_path?: string | null;
+    };
+    url: '/ai/conversations/{public_id}/sandbox/changes/diff';
+};
+
+export type GetChatSandboxDiffErrors = {
+    /**
+     * Invalid repository or path
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * No sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The Git command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type GetChatSandboxDiffError = GetChatSandboxDiffErrors[keyof GetChatSandboxDiffErrors];
+
+export type GetChatSandboxDiffResponses = {
+    /**
+     * Both sides of the diff
+     */
+    200: SandboxFileDiff;
+};
+
+export type GetChatSandboxDiffResponse = GetChatSandboxDiffResponses[keyof GetChatSandboxDiffResponses];
+
+export type TrackChatSandboxChangesData = {
+    body: TrackSandboxChangesRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/changes/track';
+};
+
+export type TrackChatSandboxChangesErrors = {
+    /**
+     * Invalid path
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation, sandbox or folder not found
+     */
+    404: ProblemDetails;
+    /**
+     * The folder is already tracked, no sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The Git command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type TrackChatSandboxChangesError = TrackChatSandboxChangesErrors[keyof TrackChatSandboxChangesErrors];
+
+export type TrackChatSandboxChangesResponses = {
+    /**
+     * Tracking started; the changes as they are now
+     */
+    200: SandboxChanges;
+};
+
+export type TrackChatSandboxChangesResponse = TrackChatSandboxChangesResponses[keyof TrackChatSandboxChangesResponses];
+
+export type ReadChatSandboxFileData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query: {
+        /**
+         * Absolute, or relative to the sandbox work directory.
+         */
+        path: string;
+    };
+    url: '/ai/conversations/{public_id}/sandbox/file';
+};
+
+export type ReadChatSandboxFileErrors = {
+    /**
+     * Invalid path
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation, sandbox or file not found
+     */
+    404: ProblemDetails;
+    /**
+     * No sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The read command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type ReadChatSandboxFileError = ReadChatSandboxFileErrors[keyof ReadChatSandboxFileErrors];
+
+export type ReadChatSandboxFileResponses = {
+    /**
+     * File content
+     */
+    200: SandboxFileView;
+};
+
+export type ReadChatSandboxFileResponse = ReadChatSandboxFileResponses[keyof ReadChatSandboxFileResponses];
+
+export type ListChatSandboxFilesData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: {
+        /**
+         * Absolute, or relative to the sandbox work directory.
+         */
+        path?: string | null;
+    };
+    url: '/ai/conversations/{public_id}/sandbox/files';
+};
+
+export type ListChatSandboxFilesErrors = {
+    /**
+     * Invalid path
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation, sandbox or directory not found
+     */
+    404: ProblemDetails;
+    /**
+     * No sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The listing command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type ListChatSandboxFilesError = ListChatSandboxFilesErrors[keyof ListChatSandboxFilesErrors];
+
+export type ListChatSandboxFilesResponses = {
+    /**
+     * Directory listing
+     */
+    200: SandboxDirectory;
+};
+
+export type ListChatSandboxFilesResponse = ListChatSandboxFilesResponses[keyof ListChatSandboxFilesResponses];
+
 export type ConnectChatSandboxProjectData = {
     body: ConnectProjectRequest;
     path: {
@@ -31546,6 +33096,152 @@ export type WakeChatSandboxResponses = {
 
 export type WakeChatSandboxResponse = WakeChatSandboxResponses[keyof WakeChatSandboxResponses];
 
+export type ListSecretRequestsData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/secrets';
+};
+
+export type ListSecretRequestsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListSecretRequestsError = ListSecretRequestsErrors[keyof ListSecretRequestsErrors];
+
+export type ListSecretRequestsResponses = {
+    /**
+     * Open secret requests, never including values
+     */
+    200: Array<SecretSlotView>;
+};
+
+export type ListSecretRequestsResponse = ListSecretRequestsResponses[keyof ListSecretRequestsResponses];
+
+export type ProvideSecretData = {
+    body: FillSecretRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Secret request id
+         */
+        secret_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/secrets/{secret_id}';
+};
+
+export type ProvideSecretErrors = {
+    /**
+     * Empty or oversized value
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or secret request not found
+     */
+    404: ProblemDetails;
+    /**
+     * The request was cancelled or already closed
+     */
+    409: ProblemDetails;
+    /**
+     * The request expired
+     */
+    410: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ProvideSecretError = ProvideSecretErrors[keyof ProvideSecretErrors];
+
+export type ProvideSecretResponses = {
+    /**
+     * Credential stored; the response never includes it
+     */
+    200: SecretSlotView;
+};
+
+export type ProvideSecretResponse = ProvideSecretResponses[keyof ProvideSecretResponses];
+
+export type DiscardSecretData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Secret request id
+         */
+        secret_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/secrets/{secret_id}/discard';
+};
+
+export type DiscardSecretErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or secret request not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DiscardSecretError = DiscardSecretErrors[keyof DiscardSecretErrors];
+
+export type DiscardSecretResponses = {
+    /**
+     * Request discarded
+     */
+    200: SecretSlotView;
+};
+
+export type DiscardSecretResponse = DiscardSecretResponses[keyof DiscardSecretResponses];
+
 export type StopUserTurnData = {
     body?: never;
     path: {
@@ -31567,6 +33263,152 @@ export type StopUserTurnResponses = {
 
 export type StopUserTurnResponse = StopUserTurnResponses[keyof StopUserTurnResponses];
 
+export type GetChatSuggestionModeData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/suggestion-mode';
+};
+
+export type GetChatSuggestionModeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetChatSuggestionModeError = GetChatSuggestionModeErrors[keyof GetChatSuggestionModeErrors];
+
+export type GetChatSuggestionModeResponses = {
+    /**
+     * The chat's setting
+     */
+    200: ChatSuggestionSettings;
+};
+
+export type GetChatSuggestionModeResponse = GetChatSuggestionModeResponses[keyof GetChatSuggestionModeResponses];
+
+export type UpdateChatSuggestionModeData = {
+    body: UpdateChatSuggestionModeRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/suggestion-mode';
+};
+
+export type UpdateChatSuggestionModeErrors = {
+    /**
+     * Invalid mode
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * This chat cannot have suggestions
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateChatSuggestionModeError = UpdateChatSuggestionModeErrors[keyof UpdateChatSuggestionModeErrors];
+
+export type UpdateChatSuggestionModeResponses = {
+    /**
+     * The chat's new setting
+     */
+    200: ChatSuggestionSettings;
+};
+
+export type UpdateChatSuggestionModeResponse = UpdateChatSuggestionModeResponses[keyof UpdateChatSuggestionModeResponses];
+
+export type SuggestNextStepsData = {
+    body: SuggestNextStepsRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/suggestions';
+};
+
+export type SuggestNextStepsErrors = {
+    /**
+     * The answer cursor is malformed
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Suggestions are off or unavailable in this chat, a turn is running, the answer is no longer the latest, there is no answer yet, or a suggestion is already being made
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * The model failed to suggest anything
+     */
+    502: ProblemDetails;
+};
+
+export type SuggestNextStepsError = SuggestNextStepsErrors[keyof SuggestNextStepsErrors];
+
+export type SuggestNextStepsResponses = {
+    /**
+     * Suggested next steps
+     */
+    200: NextSteps;
+};
+
+export type SuggestNextStepsResponse = SuggestNextStepsResponses[keyof SuggestNextStepsResponses];
+
 export type GetUserConversationUsageData = {
     body?: never;
     path: {
@@ -31587,6 +33429,140 @@ export type GetUserConversationUsageResponses = {
 };
 
 export type GetUserConversationUsageResponse = GetUserConversationUsageResponses[keyof GetUserConversationUsageResponses];
+
+export type LeaveChatWorkspaceData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/workspace';
+};
+
+export type LeaveChatWorkspaceErrors = {
+    /**
+     * Not an assistant chat
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found or not in a workspace
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type LeaveChatWorkspaceError = LeaveChatWorkspaceErrors[keyof LeaveChatWorkspaceErrors];
+
+export type LeaveChatWorkspaceResponses = {
+    /**
+     * The chat is no longer in a workspace
+     */
+    200: ChatWorkspaceResponse;
+};
+
+export type LeaveChatWorkspaceResponse = LeaveChatWorkspaceResponses[keyof LeaveChatWorkspaceResponses];
+
+export type GetChatWorkspaceData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/workspace';
+};
+
+export type GetChatWorkspaceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetChatWorkspaceError = GetChatWorkspaceErrors[keyof GetChatWorkspaceErrors];
+
+export type GetChatWorkspaceResponses = {
+    /**
+     * The chat's workspace
+     */
+    200: ChatWorkspaceResponse;
+};
+
+export type GetChatWorkspaceResponse = GetChatWorkspaceResponses[keyof GetChatWorkspaceResponses];
+
+export type SetChatWorkspaceData = {
+    body: SetChatWorkspaceRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/workspace';
+};
+
+export type SetChatWorkspaceErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or workspace not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type SetChatWorkspaceError = SetChatWorkspaceErrors[keyof SetChatWorkspaceErrors];
+
+export type SetChatWorkspaceResponses = {
+    /**
+     * The chat's workspace
+     */
+    200: ChatWorkspaceResponse;
+};
+
+export type SetChatWorkspaceResponse = SetChatWorkspaceResponses[keyof SetChatWorkspaceResponses];
 
 export type GetUserPendingActionData = {
     body?: never;
@@ -31652,6 +33628,76 @@ export type RejectUserPendingActionResponses = {
 };
 
 export type RejectUserPendingActionResponse = RejectUserPendingActionResponses[keyof RejectUserPendingActionResponses];
+
+export type GetSuggestionDefaultData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/preferences/suggestions';
+};
+
+export type GetSuggestionDefaultErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetSuggestionDefaultError = GetSuggestionDefaultErrors[keyof GetSuggestionDefaultErrors];
+
+export type GetSuggestionDefaultResponses = {
+    /**
+     * The user's default
+     */
+    200: SuggestionDefault;
+};
+
+export type GetSuggestionDefaultResponse = GetSuggestionDefaultResponses[keyof GetSuggestionDefaultResponses];
+
+export type UpdateSuggestionDefaultData = {
+    body: SuggestionDefault;
+    path?: never;
+    query?: never;
+    url: '/ai/preferences/suggestions';
+};
+
+export type UpdateSuggestionDefaultErrors = {
+    /**
+     * Invalid mode
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateSuggestionDefaultError = UpdateSuggestionDefaultErrors[keyof UpdateSuggestionDefaultErrors];
+
+export type UpdateSuggestionDefaultResponses = {
+    /**
+     * The saved default
+     */
+    200: SuggestionDefault;
+};
+
+export type UpdateSuggestionDefaultResponse = UpdateSuggestionDefaultResponses[keyof UpdateSuggestionDefaultResponses];
 
 export type AuthorizeWorkspacePreviewData = {
     body: AuthorizeWorkspacePreviewRequest;
@@ -31934,7 +33980,7 @@ export type UpdateProviderKeyData = {
 
 export type UpdateProviderKeyErrors = {
     /**
-     * Validation error
+     * Validation error, or a new API key that failed verification (the current key is kept)
      */
     400: ProblemDetails;
     /**
@@ -43180,82 +45226,6 @@ export type GetSlowQueriesResponses = {
 
 export type GetSlowQueriesResponse = GetSlowQueriesResponses[keyof GetSlowQueriesResponses];
 
-export type GetAiDataAccessData = {
-    body?: never;
-    path: {
-        /**
-         * External service id
-         */
-        service_id: number;
-    };
-    query?: never;
-    url: '/external-services/{service_id}/query/ai-data-access';
-};
-
-export type GetAiDataAccessErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Service not found
-     */
-    404: unknown;
-};
-
-export type GetAiDataAccessResponses = {
-    /**
-     * Current AI data access setting
-     */
-    200: AiDataAccessResponse;
-};
-
-export type GetAiDataAccessResponse = GetAiDataAccessResponses[keyof GetAiDataAccessResponses];
-
-export type SetAiDataAccessData = {
-    body: ToggleAiDataAccessRequest;
-    path: {
-        /**
-         * External service id
-         */
-        service_id: number;
-    };
-    query?: never;
-    url: '/external-services/{service_id}/query/ai-data-access';
-};
-
-export type SetAiDataAccessErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Service not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type SetAiDataAccessResponses = {
-    /**
-     * Setting applied
-     */
-    200: AiDataAccessResponse;
-};
-
-export type SetAiDataAccessResponse = SetAiDataAccessResponses[keyof SetAiDataAccessResponses];
-
 export type ListRootContainersData = {
     body?: never;
     path: {
@@ -43468,7 +45438,7 @@ export type ReadEntityRowsErrors = {
      */
     401: unknown;
     /**
-     * Insufficient permissions, or AI data access not enabled for this service
+     * Insufficient permissions
      */
     403: unknown;
     /**

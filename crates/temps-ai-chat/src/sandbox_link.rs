@@ -44,7 +44,7 @@ use temps_sandbox::error::SandboxError;
 use temps_sandbox::services::{CreateSandboxRequest, ExecOptions, LinkedService};
 use temps_sandbox::SandboxService;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
 use crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
@@ -70,6 +70,14 @@ pub use crate::sandbox_deploy::SANDBOX_DEPLOY_TOOL;
 
 /// Most bytes of command output or file content handed back to the model.
 const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+/// Most lines one `sandbox_read_file` call returns unless the model asks for
+/// fewer or more, so a large file is read in pieces instead of filling the
+/// context in one go.
+const DEFAULT_READ_LINES: usize = 500;
+/// Most lines the model may ask for in one read.
+const MAX_READ_LINES: usize = 2000;
+/// Most bytes of file content one read returns, whatever the line count.
+const MAX_READ_BYTES: usize = 48 * 1024;
 /// Largest file the model may write in one call.
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 120;
@@ -409,24 +417,85 @@ fn cap_tail(text: &str, max: usize) -> String {
     )
 }
 
-/// Keep the start of `text` (a file's head), at most `max` bytes.
-fn cap_head(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
+/// The window of `text` a read returns: the whole file when it fits, otherwise
+/// the requested lines with a note saying which lines these are and how to
+/// ask for the next ones.
+fn read_window(
+    path: &str,
+    text: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    max_bytes: usize,
+) -> String {
+    let total = text.split_inclusive('\n').count();
+    let start = offset.unwrap_or(1).max(1);
+    let wanted = limit.unwrap_or(DEFAULT_READ_LINES).clamp(1, MAX_READ_LINES);
+    if total == 0 {
+        return String::new();
     }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
+    if start > total {
+        return format!(
+            "{path} has {total} lines; offset {start} is past the end. Use an offset from 1 to {total}."
+        );
     }
-    format!(
-        "{}\n[truncated: showing the first {} of {} bytes]",
-        &text[..end],
-        end,
-        text.len()
-    )
+    let mut body = String::new();
+    let mut last = start - 1;
+    for line in text.split_inclusive('\n').skip(start - 1).take(wanted) {
+        if body.len() + line.len() > max_bytes {
+            if body.is_empty() {
+                // One line larger than the budget: hand back its start.
+                let mut end = max_bytes.min(line.len());
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body.push_str(&line[..end]);
+                body.push_str("\n[line cut: it is longer than the read limit]\n");
+                last += 1;
+            }
+            break;
+        }
+        body.push_str(line);
+        last += 1;
+    }
+    if start == 1 && last == total && !body.contains("[line cut:") {
+        return body;
+    }
+    let mut out = format!("[{path}: lines {start}-{last} of {total}.");
+    if last < total {
+        out.push_str(&format!(
+            " Call `{SANDBOX_READ_TOOL}` again with offset={} to continue.",
+            last + 1
+        ));
+    }
+    out.push_str("]\n");
+    out.push_str(&body);
+    out
 }
 
 /// Resolve a model-supplied path against the sandbox work dir.
+/// A file to copy into a chat's sandbox.
+pub struct SandboxFile<'a> {
+    /// The attachment's opaque id; keeps two files with one name apart.
+    pub id: &'a str,
+    pub name: &'a str,
+    pub bytes: &'a [u8],
+}
+
+/// Where an attachment lands in a chat's sandbox: the same layout a workspace
+/// chat uses, under the sandbox's working directory. Name and id are already
+/// sanitized by the upload path (no separators), so they cannot climb out.
+pub fn attachment_sandbox_path(
+    work_dir: &str,
+    conversation_public_id: &str,
+    attachment_id: &str,
+    name: &str,
+) -> String {
+    resolve_path(
+        work_dir,
+        &format!(".temps/chat-attachments/{conversation_public_id}/{attachment_id}/{name}"),
+    )
+}
+
 pub(crate) fn resolve_path(work_dir: &str, path: &str) -> String {
     if path.starts_with('/') {
         path.to_string()
@@ -445,6 +514,12 @@ struct ExecArgs {
 #[derive(Debug, Deserialize)]
 struct ReadArgs {
     path: String,
+    /// First line to return, counting from 1.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Most lines to return.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -565,12 +640,18 @@ pub fn tools_for(
             ChatTool {
                 name: SANDBOX_READ_TOOL.to_string(),
                 description: "Read a text file from the linked sandbox. Relative paths resolve \
-                    against the sandbox work directory."
+                    against the sandbox work directory. A long file comes back in pieces of \
+                    about 500 lines, with a note naming the lines shown and the `offset` for \
+                    the next piece: read only the part you need, and prefer `sandbox_exec` \
+                    with `grep -n` or `sed -n '120,200p'` to find and fetch a region of a big \
+                    file."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path." }
+                        "path": { "type": "string", "description": "File path." },
+                        "offset": { "type": "integer", "description": "First line to return, counting from 1. Defaults to 1." },
+                        "limit": { "type": "integer", "description": "Most lines to return (default 500, at most 2000)." }
                     },
                     "required": ["path"]
                 }),
@@ -579,7 +660,10 @@ pub fn tools_for(
                 name: SANDBOX_WRITE_TOOL.to_string(),
                 description: "Write a text file in the linked sandbox, replacing any existing \
                     file. Relative paths resolve against the sandbox work directory. At most \
-                    1 MiB per call."
+                    1 MiB per call. Keep a single project flat at the top of the work \
+                    directory (`package.json`, `index.html`, `src/…`), not inside a folder named \
+                    after it; give each project its own folder only when the sandbox holds more \
+                    than one."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -671,10 +755,38 @@ pub(crate) struct ReadySandbox {
     pub(crate) notice: Option<String>,
 }
 
+/// The chats of one workspace share its sandbox (ADR-053): the link and the
+/// confirmed preview port are written to every assistant chat of the
+/// workspace at once, so whichever chat links, relinks or unlinks, the others
+/// follow. Other metadata stays per chat.
+fn is_workspace_shared_key(key: &str) -> bool {
+    matches!(key, SANDBOX_LINK_KEY | SANDBOX_PREVIEW_KEY)
+}
+
+/// The rows a metadata write touches: the chat itself, plus (for a shared
+/// key) the other assistant chats of the same owner in the same workspace.
+/// Workspace membership is read in the statement, so a chat that just joined
+/// or left is scoped correctly without reloading it first.
+pub(crate) fn metadata_scope(conversation_param: &str, shared: bool) -> String {
+    if !shared {
+        return format!("id = {conversation_param}");
+    }
+    format!(
+        "(id = {conversation_param} OR id IN ( \
+            SELECT sibling.id FROM ai_conversations sibling \
+            JOIN ai_conversations chat ON chat.id = {conversation_param} \
+            WHERE chat.application_id IS NOT NULL \
+              AND chat.context_type = '{ASSISTANT_CONTEXT_TYPE}' \
+              AND sibling.context_type = '{ASSISTANT_CONTEXT_TYPE}' \
+              AND sibling.application_id = chat.application_id \
+              AND sibling.created_by = chat.created_by))"
+    )
+}
+
 /// Links a sandbox to a chat and runs the chat's scoped sandbox tools.
 #[derive(Clone)]
 pub struct SandboxLinkService {
-    db: Arc<DatabaseConnection>,
+    pub(crate) db: Arc<DatabaseConnection>,
     pub(crate) sandboxes: Arc<SandboxService>,
     pub(crate) audit: Option<Arc<dyn AuditLogger>>,
     /// Deploys an archive of the sandbox's files; absent on a server without
@@ -726,10 +838,13 @@ impl SandboxLinkService {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE ai_conversations \
-                 SET metadata = (CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata ELSE '{}'::jsonb END) \
-                     || jsonb_build_object($1::text, $2::jsonb) \
-                 WHERE id = $3",
+                &format!(
+                    "UPDATE ai_conversations \
+                     SET metadata = (CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata ELSE '{{}}'::jsonb END) \
+                         || jsonb_build_object($1::text, $2::jsonb) \
+                     WHERE {}",
+                    metadata_scope("$3", is_workspace_shared_key(key))
+                ),
                 [key.into(), value.clone().into(), conversation.id.into()],
             ))
             .await
@@ -745,9 +860,12 @@ impl SandboxLinkService {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE ai_conversations \
-                 SET metadata = metadata - $1::text \
-                 WHERE id = $2 AND jsonb_typeof(metadata) = 'object'",
+                &format!(
+                    "UPDATE ai_conversations \
+                     SET metadata = metadata - $1::text \
+                     WHERE {} AND jsonb_typeof(metadata) = 'object'",
+                    metadata_scope("$2", is_workspace_shared_key(key))
+                ),
                 [key.into(), conversation.id.into()],
             ))
             .await
@@ -905,18 +1023,25 @@ impl SandboxLinkService {
         let Some(link) = link_from_metadata(conversation.metadata.as_ref()) else {
             return;
         };
-        self.forget_credentials(&link.sandbox_id);
-        let linked = match self
-            .sandboxes
-            .linked_services(conversation.created_by, &link.sandbox_id)
-            .await
-        {
+        self.release_sandbox(
+            conversation.created_by,
+            &link.sandbox_id,
+            &conversation.public_id,
+        )
+        .await;
+    }
+
+    /// Cut a sandbox off from every service it is linked to, for a sandbox no
+    /// chat uses any more. Best effort, like [`Self::unlink`]: failures are
+    /// logged with the chat that let the sandbox go.
+    pub async fn release_sandbox(&self, user_id: i32, sandbox_id: &str, conversation_id: &str) {
+        self.forget_credentials(sandbox_id);
+        let linked = match self.sandboxes.linked_services(user_id, sandbox_id).await {
             Ok(linked) => linked,
             Err(error) => {
                 warn!(
-                    conversation_id = %conversation.public_id,
-                    sandbox_id = %link.sandbox_id,
-                    "could not read the sandbox's service links: {error}"
+                    conversation_id,
+                    sandbox_id, "could not read the sandbox's service links: {error}"
                 );
                 return;
             }
@@ -925,16 +1050,21 @@ impl SandboxLinkService {
             return;
         }
         let service_ids: Vec<i32> = linked.iter().map(|link| link.service_id).collect();
-        if let Err(error) = self
+        match self
             .sandboxes
-            .unlink_services(conversation.created_by, &link.sandbox_id, &service_ids)
+            .unlink_services(user_id, sandbox_id, &service_ids)
             .await
         {
-            warn!(
-                conversation_id = %conversation.public_id,
-                sandbox_id = %link.sandbox_id,
-                "could not disconnect the sandbox from its services: {error}"
-            );
+            Ok(_) => info!(
+                conversation_id,
+                sandbox_id,
+                services = service_ids.len(),
+                "disconnected a sandbox no chat uses from its services"
+            ),
+            Err(error) => warn!(
+                conversation_id,
+                sandbox_id, "could not disconnect the sandbox from its services: {error}"
+            ),
         }
     }
 
@@ -1913,7 +2043,7 @@ impl SandboxLinkService {
             .await
         {
             Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => cap_head(&text, MAX_TOOL_OUTPUT_BYTES),
+                Ok(text) => read_window(&path, &text, args.offset, args.limit, MAX_READ_BYTES),
                 Err(error) => format!(
                     "{path} is not UTF-8 text ({} bytes). Inspect it with `{SANDBOX_EXEC_TOOL}` \
                      (for example `file` or `head -c 200 | xxd`).",
@@ -1982,10 +2112,138 @@ impl SandboxLinkService {
     }
 }
 
+impl SandboxLinkService {
+    /// Copy attached files into the chat's linked sandbox so shell tools can
+    /// reach them. Returns the sandbox path of each file, or `None` for a file
+    /// that was not placed: no sandbox is linked, it could not be woken, or the
+    /// write failed. Callers must only tell the model about the paths returned.
+    pub async fn place_attachments(
+        &self,
+        conversation: &ai_conversations::Model,
+        user_id: i32,
+        files: &[SandboxFile<'_>],
+    ) -> Vec<Option<String>> {
+        if files.is_empty() {
+            return Vec::new();
+        }
+        let ReadySandbox { link, work_dir, .. } = match self
+            .ready_sandbox("attachments", conversation.id, user_id)
+            .await
+        {
+            Ok(ready) => ready,
+            Err(reason) => {
+                debug!(
+                    conversation_id = conversation.id,
+                    "attachments stay out of the sandbox: {reason}"
+                );
+                return vec![None; files.len()];
+            }
+        };
+        let mut placed = Vec::with_capacity(files.len());
+        for file in files {
+            let path =
+                attachment_sandbox_path(&work_dir, &conversation.public_id, file.id, file.name);
+            match self
+                .sandboxes
+                .fs_write(&link.sandbox_id, user_id, &path, file.bytes, 0o644)
+                .await
+            {
+                Ok(()) => placed.push(Some(path)),
+                Err(error) => {
+                    warn!(
+                        conversation_id = conversation.id,
+                        sandbox_id = %link.sandbox_id,
+                        attachment_id = file.id,
+                        "could not copy attachment to {path}: {error}"
+                    );
+                    placed.push(None);
+                }
+            }
+        }
+        placed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn numbered(lines: usize) -> String {
+        (1..=lines).map(|n| format!("line {n}\n")).collect()
+    }
+
+    #[test]
+    fn a_small_file_is_read_whole_with_no_note() {
+        let text = numbered(3);
+        assert_eq!(read_window("/w/a.txt", &text, None, None, 4096), text);
+    }
+
+    #[test]
+    fn a_long_file_is_read_in_pieces_that_say_where_to_continue() {
+        let text = numbered(1200);
+        let first = read_window("/w/a.txt", &text, None, None, 1 << 20);
+        assert!(first.starts_with("[/w/a.txt: lines 1-500 of 1200."));
+        assert!(first.contains("offset=501"));
+        assert!(first.contains("line 500\n"));
+        assert!(!first.contains("line 501\n"));
+
+        let last = read_window("/w/a.txt", &text, Some(1101), Some(500), 1 << 20);
+        assert!(last.starts_with("[/w/a.txt: lines 1101-1200 of 1200.]"));
+        assert!(!last.contains("offset="));
+        assert!(last.ends_with("line 1200\n"));
+    }
+
+    #[test]
+    fn a_requested_window_is_honoured_and_clamped() {
+        let text = numbered(50);
+        let window = read_window("/w/a.txt", &text, Some(10), Some(3), 4096);
+        assert!(window.starts_with("[/w/a.txt: lines 10-12 of 50. Call"));
+        assert!(window.contains("offset=13"));
+        assert!(window.ends_with("line 10\nline 11\nline 12\n"));
+        // offset 0 and limit 0 are read as 1.
+        let clamped = read_window("/w/a.txt", &text, Some(0), Some(0), 4096);
+        assert!(clamped.starts_with("[/w/a.txt: lines 1-1 of 50."));
+    }
+
+    #[test]
+    fn an_offset_past_the_end_says_how_long_the_file_is() {
+        let message = read_window("/w/a.txt", &numbered(5), Some(9), None, 4096);
+        assert!(message.contains("has 5 lines"));
+        assert!(message.contains("offset 9"));
+    }
+
+    #[test]
+    fn the_byte_budget_stops_a_piece_early_and_points_at_the_next_line() {
+        let text = numbered(100);
+        let piece = read_window("/w/a.txt", &text, None, Some(100), 40);
+        let shown = piece.lines().filter(|l| l.starts_with("line ")).count();
+        assert!(shown > 0 && shown < 100);
+        assert!(piece.contains(&format!("offset={}", shown + 1)));
+    }
+
+    #[test]
+    fn one_huge_line_is_cut_instead_of_filling_the_context() {
+        let text = format!("{}\nnext\n", "x".repeat(10_000));
+        let piece = read_window("/w/min.js", &text, None, None, 100);
+        assert!(piece.contains("[line cut"));
+        assert!(piece.contains("lines 1-1 of 2"));
+        assert!(piece.contains("offset=2"));
+        assert!(piece.len() < 400);
+    }
+
+    #[test]
+    fn an_empty_file_reads_as_empty() {
+        assert_eq!(read_window("/w/a.txt", "", None, None, 4096), "");
+    }
+
+    #[test]
+    fn attachments_land_under_the_sandbox_work_dir_in_the_workspace_layout() {
+        assert_eq!(
+            attachment_sandbox_path("/home/temps/workspace/", "conv_1", "att_2", "shot.png"),
+            "/home/temps/workspace/.temps/chat-attachments/conv_1/att_2/shot.png"
+        );
+    }
 
     #[test]
     fn only_a_stopped_sandbox_needs_waking() {
@@ -2248,6 +2506,7 @@ mod tests {
             active_turn_id: None,
             last_turn_id: None,
             turn_started_at: None,
+            next_step_suggestions: None,
         }
     }
 
@@ -2327,15 +2586,6 @@ mod tests {
         assert!(capped.ends_with("end"));
         assert!(capped.starts_with("[earlier output truncated"));
         assert_eq!(cap_tail("short", 100), "short");
-    }
-
-    #[test]
-    fn long_files_keep_their_head_on_a_char_boundary() {
-        let text = "é".repeat(100);
-        let capped = cap_head(&text, 11);
-        assert!(capped.starts_with("ééééé"));
-        assert!(capped.contains("[truncated"));
-        assert_eq!(cap_head("short", 100), "short");
     }
 
     #[test]

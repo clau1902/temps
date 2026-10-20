@@ -77,6 +77,10 @@ pub struct PendingActionService {
     db: Arc<DatabaseConnection>,
     write_handle: Arc<WriteApiToolsHandle>,
     encryption: Arc<temps_core::EncryptionService>,
+    /// Where `secret_ref:` handles in an approved action's params are resolved
+    /// from. `None` means the action runs without secrets, and a handle in its
+    /// params is refused rather than sent as text.
+    secret_slots: Option<crate::secret_slots::SecretSlotService>,
 }
 
 impl PendingActionService {
@@ -89,7 +93,14 @@ impl PendingActionService {
             db,
             write_handle,
             encryption,
+            secret_slots: None,
         }
+    }
+
+    /// Let approved actions use the secrets the user provided in this chat.
+    pub fn with_secret_slots(mut self, slots: crate::secret_slots::SecretSlotService) -> Self {
+        self.secret_slots = Some(slots);
+        self
     }
 
     /// Insert a new `proposed` pending action row.
@@ -517,6 +528,12 @@ impl PendingActionService {
                 ProjectSelectorScope::Allowed(vec![project_id])
             }),
             origin,
+            // Bound to the action's owner and conversation, so an action can
+            // only spend secrets its own user gave in its own chat.
+            secrets: self.secret_slots.as_ref().map(|slots| {
+                Arc::new(slots.resolver(user_id, action.conversation_id))
+                    as Arc<dyn temps_ai_api_tools::SecretResolver>
+            }),
         };
         let exec_result = caller
             .execute_write(&action.operation_id, executable_params, &scope)
@@ -525,7 +542,7 @@ impl PendingActionService {
         // 8. Persist outcome regardless of success/failure.
         let updated = match exec_result {
             Ok(resp) => {
-                ai_pending_actions::ActiveModel {
+                let executed = ai_pending_actions::ActiveModel {
                     id: Set(action.id),
                     status: Set("executed".to_string()),
                     result: Set(Some(redact_value(&resp.body))),
@@ -535,7 +552,11 @@ impl PendingActionService {
                     ..Default::default()
                 }
                 .update(self.db.as_ref())
-                .await?
+                .await?;
+                // A deployment, backup or restore it started joins the chat's
+                // operations list.
+                crate::chat_operations::record_executed_action(self.db.as_ref(), &executed).await;
+                executed
             }
             Err(e) => {
                 let failed = ai_pending_actions::ActiveModel {

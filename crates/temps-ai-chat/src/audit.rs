@@ -74,6 +74,16 @@ pub struct AiGoalHealStartedAudit {
     pub attempt: i32,
 }
 
+/// A deployment goal was reached and the watcher started one turn in the chat
+/// to check the live app, on the owner's behalf, like a fix turn.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiGoalLiveCheckStartedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub goal_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AiGoalCancelledAudit {
     pub context: AuditContext,
@@ -88,6 +98,29 @@ pub struct AiGoalRetriedAudit {
     pub project_id: Option<i32>,
     pub conversation_id: String,
     pub goal_id: String,
+}
+
+/// The user gave the assistant a credential through a sealed form. Records who
+/// and for which operation and field; the value is never part of an audit row.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSecretProvidedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub secret_id: String,
+    pub operation_id: String,
+    pub field: String,
+}
+
+/// The user discarded a credential they had provided (or declined to).
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSecretDiscardedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub secret_id: String,
+    pub operation_id: String,
+    pub field: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +142,17 @@ pub struct AiSandboxWokenAudit {
     pub sandbox_id: String,
 }
 
+/// A folder of a chat's sandbox was put under Git from the Changes tab, so its
+/// changes can be shown: a first commit of what it held.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSandboxChangesTrackedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub sandbox_id: String,
+    pub path: String,
+}
+
 /// A chat's older messages were folded into its running summary. Records how
 /// many, never what they said.
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +163,23 @@ pub struct AiConversationCompactedAudit {
     pub folded_messages: usize,
     pub kept_messages: usize,
     pub summary_model: String,
+}
+
+/// The user's default for next-step suggestions changed.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSuggestionDefaultUpdatedAudit {
+    pub context: AuditContext,
+    pub mode: String,
+}
+
+/// A chat's own next-step suggestion mode was set, or cleared to follow the
+/// user's default (`mode: None`).
+#[derive(Debug, Clone, Serialize)]
+pub struct AiSuggestionChatModeUpdatedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -386,12 +447,24 @@ pub struct AiActionTransitionFailedAudit {
 }
 
 impl_audit_operation!(AiGoalHealStartedAudit, "ai.goal.heal_started");
+impl_audit_operation!(AiGoalLiveCheckStartedAudit, "ai.goal.live_check_started");
 impl_audit_operation!(AiGoalCancelledAudit, "ai.goal.cancelled");
 impl_audit_operation!(AiGoalRetriedAudit, "ai.goal.retried");
 impl_audit_operation!(AiConversationCompactedAudit, "ai.conversation.compacted");
+impl_audit_operation!(
+    AiSuggestionDefaultUpdatedAudit,
+    "ai.suggestions.default_updated"
+);
+impl_audit_operation!(
+    AiSuggestionChatModeUpdatedAudit,
+    "ai.suggestions.chat_mode_updated"
+);
+impl_audit_operation!(AiSecretProvidedAudit, "ai.secret.provided");
+impl_audit_operation!(AiSecretDiscardedAudit, "ai.secret.discarded");
 impl_audit_operation!(AiSandboxLinkedAudit, "ai.sandbox.linked");
 impl_audit_operation!(AiSandboxUnlinkedAudit, "ai.sandbox.unlinked");
 impl_audit_operation!(AiSandboxWokenAudit, "ai.sandbox.woken");
+impl_audit_operation!(AiSandboxChangesTrackedAudit, "ai.sandbox.changes_tracked");
 impl_audit_operation!(
     AiSandboxServicesConnectedAudit,
     "ai.sandbox.services_connected"
@@ -430,3 +503,77 @@ pub struct PermissionResolvedAudit {
 }
 
 impl_audit_operation!(PermissionResolvedAudit, "ai.permission.resolved");
+
+// --- Workspace chats and the architecture blueprint (ADR-053) ---------------
+
+/// A chat joined a workspace, which may have been created for it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiChatWorkspaceJoinedAudit {
+    pub context: AuditContext,
+    pub conversation_id: String,
+    /// Public id of the workspace (`ai_applications.public_id`).
+    pub application_id: String,
+    /// True when the workspace was created by this request.
+    pub created: bool,
+}
+
+/// A chat left its workspace.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiChatWorkspaceLeftAudit {
+    pub context: AuditContext,
+    pub conversation_id: String,
+    pub application_id: String,
+}
+
+/// A blueprint version was written: proposed by the assistant, or saved by
+/// the user (and accepted as it was saved).
+#[derive(Debug, Clone, Serialize)]
+pub struct AiBlueprintVersionCreatedAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub version: i32,
+    /// `proposed` or `accepted`.
+    pub status: String,
+    /// The chat that proposed it, when the assistant did.
+    pub conversation_id: Option<String>,
+    pub change_summary: String,
+}
+
+/// The user accepted or rejected a proposed blueprint version.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiBlueprintVersionDecidedAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub version: i32,
+    /// `accepted` or `rejected`.
+    pub decision: String,
+}
+
+/// A part of the accepted blueprint was bound to (or unbound from) a project
+/// or service.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiBlueprintBindingChangedAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub component_id: String,
+    /// `None` when the binding was removed.
+    pub project_id: Option<i32>,
+    pub service_id: Option<i32>,
+    /// Who made the change: `user` or `assistant`.
+    pub actor: String,
+}
+
+impl_audit_operation!(AiChatWorkspaceJoinedAudit, "ai.chat.workspace_joined");
+impl_audit_operation!(AiChatWorkspaceLeftAudit, "ai.chat.workspace_left");
+impl_audit_operation!(
+    AiBlueprintVersionCreatedAudit,
+    "ai.blueprint.version_created"
+);
+impl_audit_operation!(
+    AiBlueprintVersionDecidedAudit,
+    "ai.blueprint.version_decided"
+);
+impl_audit_operation!(
+    AiBlueprintBindingChangedAudit,
+    "ai.blueprint.binding_changed"
+);

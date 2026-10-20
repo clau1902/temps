@@ -7,8 +7,14 @@ import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { ExternalLink, Monitor, RefreshCw } from 'lucide-react'
-import { useEffect, useState, type FormEvent } from 'react'
-import { canEmbed, parsePort, previewUrlFor } from './chat-preview'
+import { useState, type FormEvent } from 'react'
+import {
+  canEmbed,
+  parsePreviewTarget,
+  previewAddress,
+  type PreviewTarget,
+} from './chat-preview'
+import { CreateSandboxAction } from './ChatSandbox'
 import { useChatSandboxWake } from './chat-sandbox-wake'
 
 function PreviewOnboarding({ reason }: { reason: string }) {
@@ -66,7 +72,8 @@ export function SandboxWaking({
 
 /**
  * The page the chat's sandbox is serving, shown beside the conversation. The
- * port is the one the assistant last confirmed; any other can be typed in.
+ * port is the one the assistant last confirmed; the address bar takes any
+ * other port or any path on it.
  */
 export function ChatPreviewTab({
   conversationPublicId,
@@ -78,15 +85,21 @@ export function ChatPreviewTab({
   )
   const wake = useChatSandboxWake(conversationPublicId)
   const confirmed = status.data?.preview?.port ?? null
-  const [port, setPort] = useState<number | null>(confirmed)
-  const [draft, setDraft] = useState(confirmed ? String(confirmed) : '')
+  const [target, setTarget] = useState<PreviewTarget | null>(
+    confirmed === null ? null : { port: confirmed, path: '/' }
+  )
+  // What the user is typing; null while the bar just shows where the frame is.
+  const [draft, setDraft] = useState<string | null>(null)
   const [reloads, setReloads] = useState(0)
   // The assistant starting a server on another port takes the tab with it.
-  useEffect(() => {
-    if (confirmed === null) return
-    setPort(confirmed)
-    setDraft(String(confirmed))
-  }, [confirmed])
+  const [seenConfirmed, setSeenConfirmed] = useState(confirmed)
+  if (confirmed !== seenConfirmed) {
+    setSeenConfirmed(confirmed)
+    if (confirmed !== null) {
+      setTarget({ port: confirmed, path: '/' })
+      setDraft(null)
+    }
+  }
 
   if (status.isPending) {
     return (
@@ -112,7 +125,12 @@ export function ChatPreviewTab({
   }
   if (!linked || !preview) {
     return (
-      <PreviewOnboarding reason="This chat has no sandbox yet. When the assistant builds something, it runs in one." />
+      <>
+        <PreviewOnboarding reason="This chat has no sandbox yet. When the assistant builds something, it runs in one." />
+        {!linked && (
+          <CreateSandboxAction conversationPublicId={conversationPublicId} />
+        )}
+      </>
     )
   }
 
@@ -120,12 +138,24 @@ export function ChatPreviewTab({
     return <SandboxWaking error={wake.error} onRetry={wake.retry} />
   }
 
-  const url = port === null ? null : previewUrlFor(preview.url_template, port)
+  const url =
+    target === null ? null : previewAddress(preview.url_template, target)
   const embeddable = url !== null && canEmbed(url, window.location.protocol)
+  const shown = draft ?? url ?? ''
+  const parsed =
+    draft === null
+      ? null
+      : parsePreviewTarget(draft, target?.port ?? null, preview.url_template)
+  const invalid = draft !== null && draft.trim() !== '' && parsed === null
   const submit = (event: FormEvent) => {
     event.preventDefault()
-    const next = parsePort(draft)
-    if (next !== null) setPort(next)
+    if (parsed === null) return
+    // Going to the page already shown reloads it, as in a browser.
+    if (url !== null && previewAddress(preview.url_template, parsed) === url) {
+      setReloads((count) => count + 1)
+    }
+    setTarget(parsed)
+    setDraft(null)
   }
 
   return (
@@ -134,35 +164,30 @@ export function ChatPreviewTab({
         onSubmit={submit}
         className="flex shrink-0 items-center gap-1.5 border-b px-3 py-2"
       >
-        <label htmlFor="preview-port" className="text-xs text-muted-foreground">
-          Port
+        <label htmlFor="preview-address" className="sr-only">
+          Address of the preview
         </label>
         <Input
-          id="preview-port"
-          inputMode="numeric"
-          value={draft}
+          id="preview-address"
+          value={shown}
           onChange={(event) => setDraft(event.target.value)}
-          placeholder="3000"
-          className="h-8 w-20"
-          aria-invalid={draft !== '' && parsePort(draft) === null}
+          onFocus={(event) => event.target.select()}
+          onBlur={() => setDraft(null)}
+          placeholder="Port or path, e.g. 3000 or /pricing"
+          spellCheck={false}
+          autoComplete="off"
+          autoCapitalize="off"
+          className="h-8 min-w-0 flex-1 font-mono text-xs"
+          aria-invalid={invalid}
+          aria-describedby={invalid ? 'preview-address-hint' : undefined}
         />
-        <Button
-          type="submit"
-          size="sm"
-          variant="outline"
-          className="h-8"
-          disabled={parsePort(draft) === null}
-        >
-          Show
-        </Button>
-        <span className="flex-1" />
         {url && (
           <>
             <Button
               type="button"
               size="icon"
               variant="ghost"
-              className="size-8"
+              className="size-8 shrink-0"
               onClick={() => setReloads((count) => count + 1)}
               aria-label="Reload the preview"
             >
@@ -172,7 +197,7 @@ export function ChatPreviewTab({
               asChild
               size="icon"
               variant="ghost"
-              className="size-8"
+              className="size-8 shrink-0"
               aria-label="Open the preview in a new tab"
             >
               <a href={url} target="_blank" rel="noopener noreferrer">
@@ -182,10 +207,21 @@ export function ChatPreviewTab({
           </>
         )}
       </form>
+      {invalid && (
+        <p
+          id="preview-address-hint"
+          role="alert"
+          className="shrink-0 border-b px-3 py-1.5 text-xs text-destructive"
+        >
+          Enter a path such as /pricing, a port such as 5173, or both
+          (:5173/about). Only this sandbox&rsquo;s own pages can be shown.
+        </p>
+      )}
       {url === null ? (
         <p className="p-4 text-sm text-muted-foreground">
-          Enter the port your app listens on, or ask the assistant to run it and
-          show it. It appears here as soon as the assistant confirms it answers.
+          Enter a port above (for example 3000), or ask the assistant to run it
+          and show it. It appears here as soon as the assistant confirms it
+          answers.
         </p>
       ) : embeddable ? (
         <iframe

@@ -326,6 +326,10 @@ pub struct ExternalServiceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ServiceMemberInfo {
     pub id: i32,
+    /// Configured member kind. For a PostgreSQL cluster this is `monitor` or
+    /// `replica`, and every data node is `replica`, including the current
+    /// primary: which node is primary is runtime state, read it from
+    /// `live_state`.
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<i32>,

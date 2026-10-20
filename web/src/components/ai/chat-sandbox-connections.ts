@@ -5,7 +5,6 @@
 export interface SandboxConnectionStatus {
   linked?: unknown
   connected_projects?: readonly number[]
-  connected_services?: readonly { service_id: number }[]
 }
 
 export type SandboxConnectionState = 'no-sandbox' | 'connected' | 'available'
@@ -19,29 +18,6 @@ export function connectionState(
   return status.connected_projects?.includes(projectId)
     ? 'connected'
     : 'available'
-}
-
-/** Whether the chat's sandbox can use, or already uses, one service. */
-export function serviceConnectionState(
-  status: SandboxConnectionStatus | undefined,
-  serviceId: number
-): SandboxConnectionState {
-  if (!status?.linked) return 'no-sandbox'
-  return status.connected_services?.some((s) => s.service_id === serviceId)
-    ? 'connected'
-    : 'available'
-}
-
-/** What the per-service control does, shown as its tooltip. */
-export function serviceConnectionTitle(state: SandboxConnectionState): string {
-  switch (state) {
-    case 'connected':
-      return 'The sandbox uses this service through credentials of its own. Disconnect to cut its access; the data stays.'
-    case 'available':
-      return 'Connect the sandbox to this service: it gets a database or bucket of its own and credentials for it alone, never production credentials.'
-    case 'no-sandbox':
-      return 'Link a sandbox to this chat first, then connect it to this service.'
-  }
 }
 
 export const CONNECT_LABEL = 'Connect sandbox'

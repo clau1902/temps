@@ -7,7 +7,9 @@
 //! written as a read-only API operation plus the values that mean success and
 //! failure. [`GoalService`] stores them. [`GoalWatcher`] evaluates the open ones
 //! on an interval, as the user who created them, and starts a bounded fix turn
-//! in the owning chat when a check fails.
+//! in the owning chat when a check fails. When a goal watching a deployment
+//! is reached, it starts one short turn that checks the live app, since a
+//! deployment marked complete has only passed the health check on `/`.
 //!
 //! The watcher is O(open goals due): one indexed query per tick, no per-goal
 //! scan of anything else. Fix turns are capped per goal (`max_attempts`) and by
@@ -55,6 +57,9 @@ const TICK: Duration = Duration::from_secs(10);
 const DUE_BATCH: u64 = 25;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_OBSERVATION_CHARS: usize = 500;
+/// Starts the observation of a reached deployment goal whose live check waits
+/// for the chat's current reply to finish.
+const LIVE_CHECK_WAITING: &str = "Reached; the live app is checked once the current reply finishes";
 const MAX_VALUES: usize = 20;
 const MAX_VALUE_CHARS: usize = 100;
 
@@ -386,6 +391,36 @@ pub fn heal_prompt(goal: &ai_goals::Model, observation: &str) -> String {
     )
 }
 
+/// Message the live-app check starts from, after a deployment goal is reached.
+/// Shown in the chat as a note from the goal, like [`heal_prompt`].
+pub fn live_check_prompt(goal: &ai_goals::Model, observation: &str) -> String {
+    format!(
+        "Goal reached: \"{title}\" (goal {id}). {observation}.\n\n\
+         Check the live app once before calling it done. Request its main routes on the \
+         deployed URL (from the sandbox with curl, when the sandbox can reach that URL) and read \
+         the deployment's container logs for errors since it started. Then reply in two or three \
+         lines with what you checked and what you saw; if you could not reach something, say so \
+         rather than assuming it works. If something is broken, find the cause, fix it, redeploy \
+         and call `temps_goal` to watch the new deployment. Do not change anything that works.",
+        title = goal.title,
+        id = goal.public_id,
+    )
+}
+
+/// Whether the goal was reached and only its live check is waiting for the
+/// chat's reply to finish.
+fn waits_for_live_check(goal: &ai_goals::Model) -> bool {
+    goal.last_observation
+        .as_deref()
+        .is_some_and(|text| text.starts_with(LIVE_CHECK_WAITING))
+}
+
+/// Whether a reached goal gets a live check: only a deployment has a running
+/// app to look at.
+fn wants_live_check(goal: &ai_goals::Model) -> bool {
+    watched_deployment(&goal.check_operation, &goal.check_params).is_some()
+}
+
 pub struct GoalService {
     db: Arc<DatabaseConnection>,
 }
@@ -698,7 +733,12 @@ impl GoalToolSupport {
                 "title": goal.title,
                 "checks": goal.check_operation,
                 "max_attempts": goal.max_attempts,
-                "note": "Temps now watches this and will bring you back into the chat if it fails."
+                "note": if wants_live_check(&goal) {
+                    "Temps now watches this. It brings you back into the chat if the deployment \
+                     fails, and once when it is live, to check the running app."
+                } else {
+                    "Temps now watches this and will bring you back into the chat if it fails."
+                }
             })
             .to_string(),
             Err(error) => error.to_string(),
@@ -728,6 +768,7 @@ impl GoalToolSupport {
             auth: auth.clone(),
             project_scope: ProjectSelectorScope::Unrestricted,
             origin: None,
+            secrets: None,
         };
         let params = if input.params.is_null() {
             Value::Object(Default::default())
@@ -813,6 +854,19 @@ impl GoalWatcher {
 
     async fn step(&self, goal: ai_goals::Model) -> Result<(), GoalError> {
         let now = Utc::now();
+        // Reached, but the chat stayed busy until the deadline: the goal was
+        // met, it is only the live check that did not run.
+        if goal.deadline_at <= now && waits_for_live_check(&goal) {
+            self.goals
+                .record(
+                    goal,
+                    STATUS_ACHIEVED,
+                    "Reached; the live app was not checked because the chat stayed busy",
+                    None,
+                )
+                .await?;
+            return Ok(());
+        }
         if goal.deadline_at <= now {
             self.goals
                 .record(
@@ -870,11 +924,7 @@ impl GoalWatcher {
 
         let observation = self.check(&goal, &auth).await;
         match observation {
-            Observation::Achieved(text) => {
-                self.goals
-                    .record(goal, STATUS_ACHIEVED, &text, None)
-                    .await?;
-            }
+            Observation::Achieved(text) => self.on_achieved(goal, conversation, auth, text).await?,
             Observation::Pending(text) => {
                 // A healing goal whose fix turn already ended and which was not
                 // re-targeted is waiting on the user, not on a turn.
@@ -898,6 +948,7 @@ impl GoalWatcher {
             auth: auth.clone(),
             project_scope: ProjectSelectorScope::Unrestricted,
             origin: None,
+            secrets: None,
         };
         let call = caller.call(&goal.check_operation, goal.check_params.clone(), &scope);
         match tokio::time::timeout(CHECK_TIMEOUT, call).await {
@@ -1015,6 +1066,105 @@ impl GoalWatcher {
             }
         }
         Ok(())
+    }
+
+    async fn on_achieved(
+        &self,
+        goal: ai_goals::Model,
+        conversation: ai_conversations::Model,
+        auth: AuthContext,
+        observation: String,
+    ) -> Result<(), GoalError> {
+        if !wants_live_check(&goal) {
+            self.goals
+                .record(goal, STATUS_ACHIEVED, &observation, None)
+                .await?;
+            return Ok(());
+        }
+        if conversation.turn_status == "running" {
+            // The user is mid-conversation; check once the reply is done.
+            self.goals
+                .record(
+                    goal,
+                    STATUS_ACTIVE,
+                    &format!("{LIVE_CHECK_WAITING}. {observation}"),
+                    Some(ACTIVE_CHECK_SECONDS),
+                )
+                .await?;
+            return Ok(());
+        }
+        // Close the goal first: an achieved goal is never looked at again, so
+        // the check starts at most once whatever happens to the turn.
+        let goal = self
+            .goals
+            .record(goal, STATUS_ACHIEVED, &observation, None)
+            .await?;
+        let prompt = live_check_prompt(&goal, &observation);
+        let metadata = serde_json::json!({
+            "origin": "goal",
+            "goal_id": goal.public_id,
+            "goal_title": goal.title,
+            "check": "live",
+        });
+        match self
+            .conversations
+            .start_goal_turn(
+                &conversation,
+                &prompt,
+                metadata,
+                &auth,
+                self.project_access_checker.clone(),
+            )
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    goal_id = %goal.public_id,
+                    conversation_id = conversation.id,
+                    "AI goal reached; started a live check as the owner"
+                );
+                self.audit_live_check(&goal, &conversation).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    goal_id = %goal.public_id,
+                    conversation_id = conversation.id,
+                    "could not start the live check of a reached goal: {error}"
+                );
+                self.goals
+                    .record(
+                        goal,
+                        STATUS_ACHIEVED,
+                        &format!("{observation}. The live app was not checked: {error}"),
+                        None,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn audit_live_check(
+        &self,
+        goal: &ai_goals::Model,
+        conversation: &ai_conversations::Model,
+    ) {
+        let entry = crate::audit::AiGoalLiveCheckStartedAudit {
+            context: temps_core::AuditContext {
+                user_id: goal.owner_user_id,
+                ip_address: None,
+                user_agent: "temps-ai-goal-watcher".to_string(),
+            },
+            project_id: conversation.project_id,
+            conversation_id: conversation.public_id.clone(),
+            goal_id: goal.public_id.clone(),
+        };
+        if let Err(error) = self.audit.create_audit_log(&entry).await {
+            tracing::error!(
+                goal_id = %goal.public_id,
+                "failed to audit the goal live check: {error}"
+            );
+        }
     }
 
     async fn audit_heal(&self, goal: &ai_goals::Model, conversation: &ai_conversations::Model) {
@@ -1226,6 +1376,37 @@ mod tests {
         assert!(prompt.contains("attempt 1 of 3"));
         assert!(prompt.contains("build exited 1"));
         assert!(prompt.contains("retarget"));
+    }
+
+    #[test]
+    fn the_live_check_names_the_goal_and_asks_for_evidence_not_changes() {
+        let g = goal(&["completed"], &["failed"]);
+        let prompt = live_check_prompt(&g, "status is completed");
+        assert!(prompt.contains("goal_test"));
+        assert!(prompt.contains("status is completed"));
+        assert!(prompt.contains("container logs"));
+        assert!(prompt.contains("say so rather than assuming it works"));
+        assert!(prompt.contains("`temps_goal`"));
+        assert!(prompt.contains("Do not change anything that works"));
+    }
+
+    #[test]
+    fn only_a_deployment_goal_gets_a_live_check() {
+        let mut g = goal(&["completed"], &["failed"]);
+        assert!(wants_live_check(&g));
+        g.check_operation = "get_external_service".into();
+        g.check_params = serde_json::json!({ "id": 3 });
+        assert!(!wants_live_check(&g));
+    }
+
+    #[test]
+    fn a_goal_waiting_for_its_live_check_is_told_apart_by_its_observation() {
+        let mut g = goal(&["completed"], &["failed"]);
+        assert!(!waits_for_live_check(&g));
+        g.last_observation = Some(clip(&format!("{LIVE_CHECK_WAITING}. status is completed")));
+        assert!(waits_for_live_check(&g));
+        g.last_observation = Some("status is building".into());
+        assert!(!waits_for_live_check(&g));
     }
 
     #[test]

@@ -65,3 +65,6 @@ url = { workspace = true }
 # `test-util` gives the paused clock used to exercise the turn deadline without
 # a test that actually waits fifteen minutes. Dev-only — not in the binary.
 tokio = { workspace = true, features = ["test-util"] }
+# Migrated PostgreSQL for the workspace and blueprint storage tests; they skip
+# when no container runtime is available.
+temps-database = { path = "../temps-database" }

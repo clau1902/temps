@@ -223,3 +223,20 @@ test('simple detail keeps tool calls collapsed like the default', () => {
   expect(html).toContain('aria-expanded="false"')
   expect(html).not.toContain('all tests passed')
 })
+
+test('a rejected platform change shows the reason, not the JSON envelope', () => {
+  const html = renderToStaticMarkup(
+    <ToolCard
+      tool={{
+        ...tool,
+        result: JSON.stringify({
+          status: 'failed',
+          error:
+            'Upstream call to operation \'x\' returned HTTP 400: {"detail":"Invalid backup schedule","title":"Validation Error"}',
+        }),
+      }}
+    />
+  )
+  expect(html).toContain('Validation Error: Invalid backup schedule')
+  expect(html).not.toContain('Upstream call')
+})

@@ -16,7 +16,7 @@ use chrono::Utc;
 use futures::{future::BoxFuture, Stream};
 use futures_util::StreamExt;
 use sea_orm::{
-    sea_query::{Expr, Query},
+    sea_query::{Expr, Func, Query},
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set,
 };
@@ -1019,6 +1019,24 @@ fn public_tool_result(name: &str, result: &str) -> String {
     if name == TEMPS_GOAL_TOOL_NAME {
         return redact_json_string(result);
     }
+    if crate::workspace_chats::is_blueprint_tool(name) {
+        // The proposal itself (parts and flows, never credentials: the
+        // document is checked for them) is what the console draws as the
+        // architecture card.
+        return redact_json_string(result);
+    }
+    if name == crate::ask_user::ASK_USER_TOOL {
+        // The questions and the user's own answers: the transcript keeps them
+        // so the exchange survives a reload.
+        return redact_json_string(result);
+    }
+    if name == crate::secret_slots::REQUEST_SECRET_TOOL {
+        // The descriptor (handle, label, field) is what the console renders as
+        // the private form. It carries no value, so it is shown as returned
+        // rather than run through the credential redactor, which exists for
+        // results that may hold one and could mask the handle the card needs.
+        return result.to_string();
+    }
     if name == "temps" || crate::sandbox_link::is_sandbox_tool(name) {
         return truncate_for_display(redact_json_string(result), MAX_PUBLIC_API_RESULT_BYTES);
     }
@@ -1142,8 +1160,39 @@ fn platform_request_is_destructive(request: &PermissionRequest) -> bool {
         })
 }
 
+/// Whether any string in `value` is a `secret_ref:` handle, i.e. the write is
+/// about to be run with a credential the user entered in a private form.
+fn params_carry_secret_handle(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => temps_ai_api_tools::is_secret_ref(text),
+        serde_json::Value::Array(items) => items.iter().any(params_carry_secret_handle),
+        serde_json::Value::Object(map) => map.values().any(params_carry_secret_handle),
+        _ => false,
+    }
+}
+
+/// A write that spends a user-provided credential. Permission modes that
+/// approve non-destructive writes on their own must not approve these: the
+/// other fields of the same request (an endpoint, a base URL) are chosen by the
+/// model, and a prompt-injected model could point the user's key at a host it
+/// controls. The approval card shows those fields, so the user decides.
+fn platform_request_uses_secret(request: &PermissionRequest) -> bool {
+    let flagged = |value: &serde_json::Value| {
+        value
+            .get("carries_handle")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    flagged(&request.input)
+        || request
+            .input
+            .get("steps")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|steps| steps.iter().any(flagged))
+}
+
 fn automatic_platform_decision(request: &PermissionRequest) -> Option<PermissionDecision> {
-    if platform_request_is_destructive(request) {
+    if platform_request_is_destructive(request) || platform_request_uses_secret(request) {
         return None;
     }
     match request.kind {
@@ -1694,6 +1743,10 @@ pub struct ConversationService {
     /// [`ConversationService::with_goal_support`] is called; the `temps_goal`
     /// tool is then simply not offered.
     goal_support: Option<crate::goals::GoalToolSupport>,
+    /// Sealed credential input (`request_secret`). `None` until
+    /// [`ConversationService::with_secret_support`] is called; the tool is then
+    /// simply not offered.
+    secret_support: Option<crate::secret_slots::SecretToolSupport>,
     /// Reads operator-tunable chat limits. Consulted once per turn (the service
     /// caches, so this is not a per-turn database hit) rather than at startup,
     /// so changing the timeout in Settings takes effect on the next message
@@ -1716,6 +1769,10 @@ pub struct ConversationService {
     /// the same instance as HTTP handlers so admission checks and topology
     /// mutations participate in one in-process serialization boundary.
     application_service: Option<Arc<crate::ApplicationService>>,
+    /// Workspaces and the architecture blueprint for assistant chats
+    /// (ADR-053). `None` until [`ConversationService::with_blueprint_support`]
+    /// is called; the blueprint tools and section are then not offered.
+    blueprint_support: Option<crate::workspace_chats::BlueprintToolSupport>,
     /// In-process registry for normalized provider interaction requests.
     ///
     /// Keyed by the CLI's own `request_id` (a UUID).  The resolve endpoint
@@ -2121,11 +2178,13 @@ impl ConversationService {
             providers,
             write_support: None,
             goal_support: None,
+            secret_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
             source_drop_deployer: Default::default(),
             application_service: None,
+            blueprint_support: None,
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
@@ -2743,6 +2802,30 @@ impl ConversationService {
         self
     }
 
+    /// Let chats that can propose changes ask the user for a credential
+    /// through a sealed form instead of in the conversation.
+    pub fn with_secret_support(mut self, support: crate::secret_slots::SecretToolSupport) -> Self {
+        self.secret_support = Some(support);
+        self
+    }
+
+    /// Let assistant chats work in workspaces and agree an architecture
+    /// blueprint with the user.
+    pub fn with_blueprint_support(
+        mut self,
+        support: crate::workspace_chats::BlueprintToolSupport,
+    ) -> Self {
+        self.blueprint_support = Some(support);
+        self
+    }
+
+    /// The workspace service, for the workspace and blueprint routes.
+    pub fn workspace_chats(&self) -> Option<&crate::workspace_chats::WorkspaceChatService> {
+        self.blueprint_support
+            .as_ref()
+            .map(|support| &support.workspaces)
+    }
+
     /// Let assistant chats track goals and be brought back to fix them.
     pub fn with_goal_support(mut self, support: crate::goals::GoalToolSupport) -> Self {
         self.goal_support = Some(support);
@@ -3062,6 +3145,7 @@ impl ConversationService {
             page_size,
             None,
             &[],
+            None,
         )
         .await
     }
@@ -3071,6 +3155,10 @@ impl ConversationService {
     /// visibility from the caller's current role; both filters must be part
     /// of the SQL query before `OFFSET/LIMIT`, otherwise a filtered short page
     /// can strand visible conversations behind it.
+    ///
+    /// `search` keeps chats whose title, or whose project's name or slug,
+    /// contains the text (case-insensitive). It is matched literally: `%` and
+    /// `_` in it are not wildcards.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_all_conversations_with_visibility(
         &self,
@@ -3082,6 +3170,7 @@ impl ConversationService {
         page_size: u64,
         visible_application_ids: Option<&[i64]>,
         hidden_context_types: &[&str],
+        search: Option<&str>,
     ) -> Result<Vec<ConversationWithProject>, ChatError> {
         let existing_project_ids = Query::select()
             .column(projects::Column::Id)
@@ -3128,6 +3217,32 @@ impl ConversationService {
                     .is_not_in(hidden_context_types.iter().copied()),
             );
         }
+        if let Some(search) = search.map(str::trim).filter(|s| !s.is_empty()) {
+            let pattern = format!("%{}%", escape_like(&search.to_lowercase()));
+            let matching_projects = Query::select()
+                .column(projects::Column::Id)
+                .from(projects::Entity)
+                .cond_where(
+                    Condition::any()
+                        .add(
+                            Expr::expr(Func::lower(Expr::col(projects::Column::Name)))
+                                .like(pattern.clone()),
+                        )
+                        .add(
+                            Expr::expr(Func::lower(Expr::col(projects::Column::Slug)))
+                                .like(pattern.clone()),
+                        ),
+                )
+                .to_owned();
+            query = query.filter(
+                Condition::any()
+                    .add(
+                        Expr::expr(Func::lower(Expr::col(ai_conversations::Column::Title)))
+                            .like(pattern),
+                    )
+                    .add(ai_conversations::Column::ProjectId.in_subquery(matching_projects)),
+            );
+        }
         let convs = query
             .order_by_desc(ai_conversations::Column::LastActivityAt)
             .offset(page.saturating_sub(1).saturating_mul(page_size))
@@ -3150,13 +3265,15 @@ impl ConversationService {
             .into_iter()
             .map(|p| (p.id, (p.name, p.slug)))
             .collect();
-        let mut sandboxes = self.linked_sandboxes(user_id, &convs).await?;
+        // Chats in one workspace share a sandbox, so each link is looked up,
+        // not taken: every chat that names it shows it.
+        let sandboxes = self.linked_sandboxes(user_id, &convs).await?;
 
         Ok(convs
             .into_iter()
             .map(|c| {
                 let sandbox = crate::sandbox_link::link_from_metadata(c.metadata.as_ref())
-                    .and_then(|link| sandboxes.remove(&link.sandbox_id));
+                    .and_then(|link| sandboxes.get(&link.sandbox_id).cloned());
                 let info = c
                     .project_id
                     .and_then(|project_id| by_id.get(&project_id).cloned());
@@ -3435,6 +3552,46 @@ impl ConversationService {
         conv: &ai_conversations::Model,
     ) -> Result<crate::compaction::CompactionOutcome, crate::compaction::CompactionError> {
         crate::compaction::compact_conversation(&self.ai, &self.db, conv).await
+    }
+
+    /// The user's default for next-step suggestions.
+    pub async fn suggestion_default(
+        &self,
+        user_id: i32,
+    ) -> Result<crate::suggestions::SuggestionMode, crate::suggestions::SuggestionError> {
+        crate::suggestions::user_default(&self.db, user_id).await
+    }
+
+    /// Set the user's default for next-step suggestions.
+    pub async fn set_suggestion_default(
+        &self,
+        user_id: i32,
+        mode: crate::suggestions::SuggestionMode,
+    ) -> Result<crate::suggestions::SuggestionMode, crate::suggestions::SuggestionError> {
+        crate::suggestions::set_user_default(&self.db, user_id, mode).await
+    }
+
+    /// Set, or clear with `None`, the chat's own next-step suggestion mode.
+    pub async fn set_chat_suggestion_mode(
+        &self,
+        conv: &ai_conversations::Model,
+        mode: Option<crate::suggestions::SuggestionMode>,
+    ) -> Result<ai_conversations::Model, crate::suggestions::SuggestionError> {
+        crate::suggestions::set_chat_mode(&self.db, conv, mode).await
+    }
+
+    /// Suggest next steps after the chat's latest answer, under the chat's
+    /// effective mode. `answer` is the answer the user is looking at, when known.
+    pub async fn suggest_next_steps(
+        &self,
+        conv: &ai_conversations::Model,
+        principal_id: i32,
+        answer: Option<i64>,
+    ) -> Result<crate::suggestions::NextSteps, crate::suggestions::SuggestionError> {
+        let default = crate::suggestions::user_default(&self.db, principal_id).await?;
+        let (mode, _) =
+            crate::suggestions::effective_mode(crate::suggestions::chat_mode(conv), default);
+        crate::suggestions::suggest(&self.ai, &self.db, conv, principal_id, mode, answer).await
     }
 
     /// All turns of a conversation, oldest first.
@@ -3842,6 +3999,7 @@ impl ConversationService {
         user_id: i32,
         requested_provider: Option<&str>,
         requested_model: Option<&str>,
+        focus_project_id: Option<i32>,
     ) -> Result<ai_conversations::Model, ChatError> {
         if let Some(provider) = requested_provider {
             if !provider.starts_with(GATEWAY_PROVIDER_PREFIX) {
@@ -3854,22 +4012,97 @@ impl ConversationService {
             Some(provider) => provider.to_string(),
             None => self.resolve_assistant_provider().await?,
         };
+        // Looked up before anything is created, so a project that does not
+        // exist leaves no empty chat behind.
+        if let Some(project_id) = focus_project_id {
+            temps_entities::projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await
+                .map_err(|source| ChatError::ProjectLookup { project_id, source })?
+                .ok_or(ChatError::ProjectNotFound(project_id))?;
+        }
         let context_id = format!(
             "{}{}",
             crate::providers::assistant::ASSISTANT_CONTEXT_ID_PREFIX,
             uuid::Uuid::new_v4().simple()
         );
-        self.get_or_create(
-            None,
-            "assistant",
-            &context_id,
-            user_id,
-            Some(&provider),
-            requested_model,
-            None,
-            Some(ASSISTANT_DEFAULT_PERMISSION_MODE),
-        )
-        .await
+        let conversation = self
+            .get_or_create(
+                None,
+                "assistant",
+                &context_id,
+                user_id,
+                Some(&provider),
+                requested_model,
+                None,
+                Some(ASSISTANT_DEFAULT_PERMISSION_MODE),
+            )
+            .await?;
+        let Some(project_id) = focus_project_id else {
+            return Ok(conversation);
+        };
+        let mut metadata = conversation
+            .metadata
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(FOCUS_PROJECT_METADATA_KEY.to_string(), project_id.into());
+        }
+        let mut active: ai_conversations::ActiveModel = conversation.into();
+        active.metadata = Set(Some(metadata));
+        Ok(active.update(self.db.as_ref()).await?)
+    }
+
+    /// The prompt section naming a chat's focus project, when it has one the
+    /// user can still reach. Access is checked on every turn, not just at
+    /// creation, so losing access to the project also stops the chat naming it.
+    async fn focus_project_prompt(
+        &self,
+        conversation: &ai_conversations::Model,
+        auth: &temps_auth::AuthContext,
+        checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+    ) -> Option<String> {
+        let project_id = focus_project_id(conversation.metadata.as_ref())?;
+        let allowed =
+            if auth.is_admin() || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin) {
+                true
+            } else if let (Some(checker), Some(user_id)) = (checker, auth.user_id_opt()) {
+                match checker.user_can_access_project(user_id, project_id).await {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        tracing::warn!(
+                            conversation_id = conversation.id,
+                            project_id,
+                            "Could not check access to a chat's focus project: {error}"
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+        if !allowed {
+            return None;
+        }
+        let project = match temps_entities::projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(project) => project?,
+            Err(error) => {
+                tracing::warn!(
+                    conversation_id = conversation.id,
+                    project_id,
+                    "Could not load a chat's focus project: {error}"
+                );
+                return None;
+            }
+        };
+        Some(focus_project_section(
+            &project.name,
+            &project.slug,
+            project.id,
+        ))
     }
 
     /// Prefer the active OpenRouter key, so pasting that one key is the whole
@@ -4357,6 +4590,43 @@ impl ConversationService {
             }
         }
 
+        if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+            if let Some(section) = self
+                .focus_project_prompt(&conv, auth, project_access_checker.as_ref())
+                .await
+            {
+                match messages.iter_mut().find(|m| m.role == "system") {
+                    Some(sys) => {
+                        sys.content.push_str("\n\n");
+                        sys.content.push_str(&section);
+                    }
+                    None => messages.insert(0, ChatMessage::system(section)),
+                }
+            }
+            let workspace_section = match &self.blueprint_support {
+                Some(support) => match support.workspaces.prompt_section(&conv).await {
+                    Ok(section) => section,
+                    Err(error) => {
+                        tracing::warn!(
+                            conversation_id = %conv.public_id,
+                            "could not read the chat's workspace blueprint for the prompt: {error}"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            if let Some(section) = workspace_section {
+                match messages.iter_mut().find(|m| m.role == "system") {
+                    Some(sys) => {
+                        sys.content.push_str("\n\n");
+                        sys.content.push_str(&section);
+                    }
+                    None => messages.insert(0, ChatMessage::system(section)),
+                }
+            }
+        }
+
         if let Some(summary) = summary.as_ref() {
             let section = crate::compaction::summary_section(&summary.text);
             match messages.iter_mut().find(|m| m.role == "system") {
@@ -4461,6 +4731,14 @@ impl ConversationService {
             // scope; there is no second project-level feature toggle.
             if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
                 self.maybe_add_goal_tool(&mut tools);
+                if self.blueprint_support.is_some() && conv.project_id.is_none() {
+                    tools.extend(crate::workspace_chats::BlueprintToolSupport::tools());
+                }
+            }
+            // Native harnesses bring their own AskUserQuestion, which reaches
+            // the same question card through the provider bridge.
+            if !harness_execution {
+                tools.push(crate::ask_user::tool());
             }
             tools.extend(
                 self.sandbox_tools(&conv, auth, project_access_checker.as_ref())
@@ -4557,6 +4835,20 @@ impl ConversationService {
     }
 
     /// Offer `temps_goal` when goal tracking is wired.
+    /// Copy a message's attachments into the chat's linked sandbox, if it has
+    /// one. One entry per file: its sandbox path, or `None` when not placed.
+    pub async fn place_attachments_in_sandbox(
+        &self,
+        conv: &ai_conversations::Model,
+        user_id: i32,
+        files: &[crate::sandbox_link::SandboxFile<'_>],
+    ) -> Vec<Option<String>> {
+        match self.sandbox_link_for(conv) {
+            Some(link) => link.place_attachments(conv, user_id, files).await,
+            None => vec![None; files.len()],
+        }
+    }
+
     /// The sandbox link service for an assistant or project chat, when this
     /// server has a sandbox backend. Other chat kinds never get sandbox tools.
     fn sandbox_link_for(
@@ -4658,7 +4950,8 @@ impl ConversationService {
                 deployment id. When a goal fails Temps starts a fix turn in this chat, up to \
                 `max_attempts` times (default 3). In that turn, after you redeploy, call this \
                 tool with `action` `retarget` and the `goal_id` so the new deployment is \
-                watched. Every call needs ALL of title, operation_id, params, success_path, \
+                watched. When a goal on a deployment is reached, Temps starts one short turn \
+                here to check the live app, so do not promise the user a check of your own. Every call needs ALL of title, operation_id, params, success_path, \
                 success_values and failure_values: a goal with no failure value can never \
                 fail, so it can never be fixed. The check runs with the user's own permissions and never \
                 changes anything."
@@ -4795,6 +5088,13 @@ impl ConversationService {
                 "additionalProperties": false
             }),
         });
+        if self.secret_support.is_some() {
+            tools.push(ChatTool {
+                name: crate::secret_slots::REQUEST_SECRET_TOOL.to_string(),
+                description: crate::secret_slots::REQUEST_SECRET_DESCRIPTION.to_string(),
+                parameters: crate::secret_slots::request_secret_parameters(),
+            });
+        }
         if !help.trim().is_empty() {
             Some(format!(
                 "## The `temps_write` approval-gated mutation CLI\n\
@@ -5015,6 +5315,20 @@ impl ConversationService {
             .then(|| self.goal_support.clone())
             .flatten();
         let sandbox_link_opt = self.sandbox_link_for(&conv);
+        let blueprint_support_opt = (conv.context_type
+            == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
+            .then(|| self.blueprint_support.clone())
+            .flatten()
+            .map(|mut support| {
+                support.project_access = project_access_checker.clone();
+                support
+            });
+        // Offered exactly where `temps_write` is: a credential has no use
+        // outside an operation that can be proposed.
+        let secret_support_opt = write_handle_opt
+            .is_some()
+            .then(|| self.secret_support.clone())
+            .flatten();
 
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamEvent, ChatError>>();
@@ -5053,7 +5367,9 @@ impl ConversationService {
             let mut messages = base_messages;
             let execution_state = Arc::new(tokio::sync::Mutex::new(ToolExecutionState {
                 goals: goal_support_opt.clone(),
+                secrets: secret_support_opt.clone(),
                 sandbox: sandbox_link_opt.clone(),
+                blueprints: blueprint_support_opt.clone(),
                 ..Default::default()
             }));
             let interaction_conv_public_id = conv_public_id.clone();
@@ -6301,6 +6617,15 @@ impl ConversationService {
                 // Bound what gets replayed next round. This, not the round
                 // count, is what keeps a long turn from running out of context.
                 trim_carried_tool_results(&mut messages, MAX_CARRIED_TOOL_BYTES);
+                // Warn the model before the step cap cuts it off, so work still
+                // in flight (a deployment building) gets watched instead of
+                // promised. It rides on the round's last tool result, which the
+                // model reads next and the user never sees.
+                if let Some(note) = steps_left_note(max_rounds, round_index + 1) {
+                    if let Some(last) = messages.last_mut().filter(|m| m.role == "tool") {
+                        last.content.push_str(note);
+                    }
+                }
                 if round_index + 1 == max_rounds {
                     round_backstop_exhausted = true;
                 }
@@ -7066,19 +7391,61 @@ fn tool_result_is_productive(result: &str) -> bool {
     }
 }
 
+/// Conversation metadata key holding the project a chat was started about.
+const FOCUS_PROJECT_METADATA_KEY: &str = "focus_project_id";
+
+/// The project a chat was started about, if its metadata names one.
+pub(crate) fn focus_project_id(metadata: Option<&serde_json::Value>) -> Option<i32> {
+    metadata?
+        .get(FOCUS_PROJECT_METADATA_KEY)?
+        .as_i64()
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+/// What the model is told about a chat's focus project. The id is given so the
+/// model can use it directly instead of searching, and the scope is stated as a
+/// default only: the user can still ask about anything they can reach.
+fn focus_project_section(name: &str, slug: &str, id: i32) -> String {
+    format!(
+        "## Project in focus\n\
+         This chat was started about the project \"{name}\" (id {id}, slug `{slug}`). \
+         When the user says \"the project\", \"my app\" or similar without naming one, they mean \
+         this one, and you can use id {id} in API calls without looking it up. It is a default, \
+         not a limit: other projects stay reachable when the user asks about them."
+    )
+}
+
 /// Provider-id prefix of AI-gateway providers (`gateway_key:<provider key id>`).
 pub(crate) const GATEWAY_PROVIDER_PREFIX: &str = "gateway_key:";
 
-/// Tool-call rounds one assistant turn may take. Far below the generic
-/// anti-spin ceiling because the assistant is a conversational surface: a user
-/// is watching, every write needs their click, and a turn that has not settled
-/// in this many model round-trips is looping, not working. The wall-clock
-/// deadline still applies on top; this is the step-count backstop.
 /// New assistant conversations apply changes without asking (deletions still
 /// ask, see `automatic_platform_decision`). The user can switch a thread back
 /// to `confirm-actions` from the composer.
 const ASSISTANT_DEFAULT_PERMISSION_MODE: &str = "auto";
-const ASSISTANT_MAX_ROUNDS: usize = 24;
+/// Tool-call rounds one assistant turn may take. Far below the generic
+/// anti-spin ceiling because the assistant is a conversational surface with a
+/// user watching, but enough for one accepted design to go from an empty
+/// sandbox to a deployment: writing the files, installing, building, testing,
+/// creating and binding the project and its services, deploying and watching
+/// it took a little under 30 rounds in practice. The wall-clock deadline and
+/// the unproductive-round stop still apply on top; this is the step backstop.
+const ASSISTANT_MAX_ROUNDS: usize = 40;
+/// Rounds before the step cap at which the model is told to wrap up.
+const WRAP_UP_ROUNDS: usize = 3;
+/// What the model reads when [`WRAP_UP_ROUNDS`] rounds are left.
+const STEPS_LEFT_NOTE: &str = "\n\n[Temps: this turn has 3 tool rounds left. Start nothing new. \
+If a deployment, build or other job you started is still running, call `temps_goal` now to \
+watch it, so the chat comes back to it when it finishes; then reply with what is done, what is \
+still running and what comes next.]";
+
+/// The wrap-up note to add after round `rounds_done`, for capped turns only:
+/// the generic ceiling is an anti-spin guard, not a budget the model plans by.
+fn steps_left_note(max_rounds: usize, rounds_done: usize) -> Option<&'static str> {
+    (max_rounds <= ASSISTANT_MAX_ROUNDS
+        && max_rounds > WRAP_UP_ROUNDS
+        && rounds_done + WRAP_UP_ROUNDS == max_rounds)
+        .then_some(STEPS_LEFT_NOTE)
+}
 /// Tool calls honoured from a single model response. Models can emit dozens of
 /// parallel calls; each is a replayed API request plus a transcript entry.
 const ASSISTANT_MAX_CALLS_PER_ROUND: usize = 8;
@@ -7362,8 +7729,14 @@ fn missing_backtest(
 #[derive(Default)]
 struct ToolExecutionState {
     goals: Option<crate::goals::GoalToolSupport>,
+    secrets: Option<crate::secret_slots::SecretToolSupport>,
     /// Present for assistant chats on a server with a sandbox backend.
     sandbox: Option<crate::sandbox_link::SandboxLinkService>,
+    /// Present for assistant chats when workspaces are wired.
+    blueprints: Option<crate::workspace_chats::BlueprintToolSupport>,
+    /// An architecture was proposed this turn: the user decides before
+    /// anything is built, so the turn may still read but no longer act.
+    blueprint_proposed: bool,
     proposed_action_ids: Vec<i64>,
     seen_calls: std::collections::HashMap<String, String>,
 }
@@ -7440,6 +7813,15 @@ async fn project_repo_tools_allowed(
     }
 }
 
+/// What the model may still do in a turn after it proposed an architecture:
+/// read the platform and its playbooks, and revise the proposal itself.
+fn may_follow_a_proposal(name: &str) -> bool {
+    name == "temps"
+        || name == crate::harness::PLAYBOOK_TOOL
+        || name == crate::workspace_chats::PROPOSE_BLUEPRINT_TOOL
+        || name == crate::sandbox_link::SANDBOX_READ_TOOL
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_conversation_tool(
     call: &ToolCall,
@@ -7469,7 +7851,15 @@ async fn dispatch_conversation_tool(
             call.name, previous
         );
     }
-    let result = if call.name == TEMPS_WRITE_TOOL_NAME {
+    let result = if state.blueprint_proposed && !may_follow_a_proposal(&call.name) {
+        format!(
+            "Not run: you proposed an architecture in this turn, and the user decides on it \
+             before anything is built or changed. End your turn now: say in one or two \
+             sentences why the design is shaped this way and that you will start once they \
+             accept it. (`{}` was not called.)",
+            call.name
+        )
+    } else if call.name == TEMPS_WRITE_TOOL_NAME {
         dispatch_write_tool(
             &call.arguments,
             project_id,
@@ -7486,6 +7876,34 @@ async fn dispatch_conversation_tool(
         .await
     } else if call.name == crate::harness::PLAYBOOK_TOOL {
         crate::harness::dispatch(&call.arguments)
+    } else if call.name == crate::secret_slots::REQUEST_SECRET_TOOL {
+        match &state.secrets {
+            Some(secrets) => {
+                secrets
+                    .dispatch(&call.arguments, conversation_id, auth)
+                    .await
+            }
+            None => "Secret requests are not available in this chat.".to_string(),
+        }
+    } else if call.name == crate::ask_user::ASK_USER_TOOL {
+        dispatch_ask_user_tool(&call.arguments, conversation_id, interactions).await
+    } else if crate::workspace_chats::is_blueprint_tool(&call.name) {
+        match &state.blueprints {
+            Some(blueprints) => {
+                let result = blueprints
+                    .dispatch(&call.name, &call.arguments, conversation_id, auth)
+                    .await;
+                if call.name == crate::workspace_chats::PROPOSE_BLUEPRINT_TOOL
+                    && crate::workspace_chats::is_proposal_receipt(&result)
+                {
+                    state.blueprint_proposed = true;
+                }
+                result
+            }
+            None => {
+                "Workspaces and architecture blueprints are not available in this chat.".to_string()
+            }
+        }
     } else if call.name == TEMPS_GOAL_TOOL_NAME {
         match &state.goals {
             Some(goals) => goals.dispatch(&call.arguments, conversation_id, auth).await,
@@ -7571,6 +7989,60 @@ async fn dispatch_conversation_tool(
             .insert(call_key, summarize_for_recall(&result));
     }
     result
+}
+
+/// Show the model's questions on the chat's question card and wait for the
+/// user's answers. Questions are never answered automatically, in any
+/// permission mode; when nobody answers before the turn ends the model is told
+/// so instead of being handed an invented answer.
+async fn dispatch_ask_user_tool(
+    arguments: &str,
+    conversation_id: i64,
+    interactions: Option<&PlatformInteractionExecutor>,
+) -> String {
+    use crate::ask_user::{self, ASK_USER_TOOL};
+    let questions = match ask_user::parse(arguments) {
+        Ok(questions) => questions,
+        Err(message) => return message,
+    };
+    let Some(interactions) = interactions else {
+        return ask_user::unanswered_result("questions cannot be shown in this turn");
+    };
+    let request = PermissionRequest {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        kind: PermissionKind::Question,
+        tool_name: ASK_USER_TOOL.to_string(),
+        input: ask_user::card_input(&questions),
+    };
+    match interactions(request).await {
+        Ok(PermissionResolution {
+            decision: PermissionDecision::AnswerQuestion { answers },
+            ..
+        }) => {
+            let answers = ask_user::answers(&questions, &answers);
+            tracing::info!(
+                conversation_id,
+                questions = answers.len(),
+                blank = answers
+                    .iter()
+                    .filter(|answer| answer.answer.is_empty())
+                    .count(),
+                "user answered assistant question"
+            );
+            ask_user::answered_result(&answers)
+        }
+        Ok(_) => ask_user::unanswered_result("the question was dismissed"),
+        Err(error) => {
+            tracing::info!(
+                conversation_id,
+                %error,
+                "assistant question ended without an answer"
+            );
+            ask_user::unanswered_result(
+                "the question was not answered before the turn ended or was stopped",
+            )
+        }
+    }
 }
 
 /// Dispatch a `temps_write` tool call: parse and validate the command, request
@@ -7756,6 +8228,7 @@ async fn dispatch_write_tool(
         auth: auth.clone(),
         project_scope,
         origin: None,
+        secrets: None,
     };
 
     // Two shapes: a single `command` (standalone action) or an ordered
@@ -7844,6 +8317,7 @@ async fn dispatch_write_tool(
                 "summary": row.summary,
                 "project_id": row.project_id,
                 "parameters": redact_value(&prepared.params),
+                "carries_handle": params_carry_secret_handle(&prepared.params),
                 "required_permission": perm,
                 "action_id": row.public_id,
             }),
@@ -7983,6 +8457,7 @@ async fn dispatch_write_tool(
                 "method": row.method,
                 "summary": row.summary,
                 "parameters": redact_value(&prepared.params),
+                "carries_handle": params_carry_secret_handle(&prepared.params),
                 "required_permission": row.required_permission,
             })).collect::<Vec<_>>()
         }),
@@ -8212,6 +8687,15 @@ async fn audit_action_transition_failed(
             "failed to audit inline AI action transition failure"
         );
     }
+}
+
+/// Escape `LIKE` metacharacters (`\`, `%`, `_`) so user text is matched
+/// literally. PostgreSQL's default `LIKE` escape character is `\`, so
+/// escaping the bound value is enough.
+fn escape_like(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 #[cfg(test)]
@@ -8893,6 +9377,38 @@ mod tests {
     }
 
     #[test]
+    fn focus_project_is_read_from_conversation_metadata() {
+        assert_eq!(
+            focus_project_id(Some(&serde_json::json!({ "focus_project_id": 42 }))),
+            Some(42)
+        );
+        assert_eq!(focus_project_id(None), None);
+        assert_eq!(
+            focus_project_id(Some(&serde_json::json!({ "scope": "user" }))),
+            None
+        );
+        // A value that is not an id never names a project.
+        assert_eq!(
+            focus_project_id(Some(&serde_json::json!({ "focus_project_id": "7" }))),
+            None
+        );
+        assert_eq!(
+            focus_project_id(Some(
+                &serde_json::json!({ "focus_project_id": 99999999999i64 })
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn focus_project_section_names_the_project_and_keeps_it_a_default() {
+        let section = focus_project_section("Storefront", "storefront", 12);
+        assert!(section.starts_with("## Project in focus"));
+        assert!(section.contains("\"Storefront\" (id 12, slug `storefront`)"));
+        assert!(section.contains("not a limit"));
+    }
+
+    #[test]
     fn system_sections_are_reported_largest_first() {
         let messages = vec![
             ChatMessage::system("intro\n## Small\nab\n## Large\nabcdefghijkl\n"),
@@ -8993,6 +9509,19 @@ mod tests {
             ASSISTANT_MAX_CALLS_PER_ROUND
         );
         assert_eq!(max_calls_per_round_for_context("project"), usize::MAX);
+    }
+
+    #[test]
+    fn a_capped_turn_is_told_to_wrap_up_three_rounds_before_the_cap() {
+        let cap = ASSISTANT_MAX_ROUNDS;
+        assert_eq!(steps_left_note(cap, cap - 3), Some(STEPS_LEFT_NOTE));
+        assert_eq!(steps_left_note(cap, cap - 4), None);
+        assert_eq!(steps_left_note(cap, cap - 2), None);
+        assert!(STEPS_LEFT_NOTE.contains("temps_goal"));
+        // The generic anti-spin ceiling is not a budget to plan by.
+        assert_eq!(steps_left_note(500, 497), None);
+        // Too few rounds to warn about.
+        assert_eq!(steps_left_note(3, 0), None);
     }
 
     #[test]
@@ -9775,6 +10304,7 @@ mod tests {
             active_turn_id: None,
             last_turn_id: None,
             turn_started_at: None,
+            next_step_suggestions: None,
             created_at: now,
             last_activity_at: now,
         }
@@ -10455,11 +10985,13 @@ mod tests {
             providers: HashMap::new(),
             write_support: None,
             goal_support: None,
+            secret_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
             source_drop_deployer: Default::default(),
             application_service: None,
+            blueprint_support: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -10894,11 +11426,13 @@ mod tests {
             providers: HashMap::new(),
             write_support: None,
             goal_support: None,
+            secret_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
             source_drop_deployer: Default::default(),
             application_service: None,
+            blueprint_support: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -11370,6 +11904,206 @@ mod tests {
         );
     }
 
+    /// An interaction executor that records the request it was shown and
+    /// answers it with `decision`, or fails like a stopped turn when `None`.
+    fn scripted_interactions(
+        decision: Option<PermissionDecision>,
+        seen: Arc<Mutex<Vec<PermissionRequest>>>,
+    ) -> PlatformInteractionExecutor {
+        Arc::new(move |request| {
+            if let Ok(mut seen) = seen.lock() {
+                seen.push(request);
+            }
+            let decision = decision.clone();
+            Box::pin(async move {
+                match decision {
+                    Some(decision) => Ok(PermissionResolution {
+                        decision,
+                        auth: test_auth(),
+                        metadata: test_request_metadata(),
+                    }),
+                    None => Err(temps_ai::AiError::Provider {
+                        purpose: "chat.permission".to_string(),
+                        reason: "turn stopped".to_string(),
+                    }),
+                }
+            })
+        })
+    }
+
+    /// After a proposal, the rest of the turn may read and revise the
+    /// proposal, but never build: the user decides first.
+    #[tokio::test]
+    async fn a_turn_that_proposed_an_architecture_no_longer_builds() {
+        let mut state = ToolExecutionState {
+            blueprint_proposed: true,
+            ..Default::default()
+        };
+        let call = |name: &str| ToolCall {
+            id: format!("{name}-call"),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+        };
+        for name in [
+            crate::sandbox_link::SANDBOX_WRITE_TOOL,
+            crate::sandbox_link::SANDBOX_EXEC_TOOL,
+            crate::sandbox_link::SANDBOX_CREATE_TOOL,
+            crate::sandbox_deploy::SANDBOX_DEPLOY_TOOL,
+            TEMPS_WRITE_TOOL_NAME,
+        ] {
+            let result = dispatch_conversation_tool(
+                &call(name),
+                None,
+                1,
+                "assistant",
+                &test_auth(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut state,
+            )
+            .await;
+            assert!(
+                result.starts_with("Not run: you proposed an architecture"),
+                "{name}: {result}"
+            );
+            assert!(result.contains(name));
+        }
+        assert!(may_follow_a_proposal("temps"));
+        assert!(may_follow_a_proposal(
+            crate::workspace_chats::PROPOSE_BLUEPRINT_TOOL
+        ));
+        assert!(!may_follow_a_proposal(
+            crate::workspace_chats::BIND_BLUEPRINT_TOOL
+        ));
+    }
+
+    async fn ask_user(
+        arguments: &str,
+        interactions: Option<&PlatformInteractionExecutor>,
+    ) -> String {
+        dispatch_conversation_tool(
+            &ToolCall {
+                id: "ask-call".to_string(),
+                name: crate::ask_user::ASK_USER_TOOL.to_string(),
+                arguments: arguments.to_string(),
+            },
+            None,
+            1,
+            "assistant",
+            &test_auth(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            interactions,
+            &mut ToolExecutionState::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn ask_user_shows_a_question_card_and_returns_the_answers() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let interactions = scripted_interactions(
+            Some(PermissionDecision::AnswerQuestion {
+                answers: serde_json::json!({
+                    "Which database should I create?": "PostgreSQL",
+                    "What should it be called?": "orders-db",
+                }),
+            }),
+            seen.clone(),
+        );
+        let result = ask_user(
+            r#"{"questions":[
+                {"question":"Which database should I create?","header":"Database",
+                 "options":[{"label":"PostgreSQL"},{"label":"Redis"}]},
+                {"question":"What should it be called?"}]}"#,
+            Some(&interactions),
+        )
+        .await;
+
+        let shown = seen.lock().expect("seen lock").clone();
+        assert_eq!(shown.len(), 1, "exactly one card is shown");
+        assert_eq!(shown[0].kind, PermissionKind::Question);
+        assert_eq!(shown[0].tool_name, crate::ask_user::ASK_USER_TOOL);
+        assert_eq!(
+            shown[0].input["questions"][0]["options"][1]["label"],
+            "Redis"
+        );
+
+        let result: serde_json::Value = serde_json::from_str(&result).expect("json result");
+        assert_eq!(result["status"], "answered");
+        assert_eq!(result["answers"][0]["answer"], "PostgreSQL");
+        assert_eq!(result["answers"][1]["answer"], "orders-db");
+    }
+
+    #[tokio::test]
+    async fn ask_user_is_never_answered_automatically() {
+        let request = PermissionRequest {
+            id: "q".to_string(),
+            kind: PermissionKind::Question,
+            tool_name: crate::ask_user::ASK_USER_TOOL.to_string(),
+            input: serde_json::json!({ "questions": [{ "question": "Which?" }] }),
+        };
+        assert!(automatic_platform_decision(&request).is_none());
+    }
+
+    #[tokio::test]
+    async fn ask_user_without_an_answer_tells_the_model_not_to_guess() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stopped = scripted_interactions(None, seen.clone());
+        let result = ask_user(
+            r#"{"questions":[{"question":"Which region?"}]}"#,
+            Some(&stopped),
+        )
+        .await;
+        assert!(result.contains("\"not_answered\""), "{result}");
+
+        let dismissed = scripted_interactions(
+            Some(PermissionDecision::DenyTool { reason: None }),
+            seen.clone(),
+        );
+        let result = ask_user(
+            r#"{"questions":[{"question":"Which zone?"}]}"#,
+            Some(&dismissed),
+        )
+        .await;
+        assert!(result.contains("dismissed"), "{result}");
+
+        let result = ask_user(r#"{"questions":[{"question":"Which plan?"}]}"#, None).await;
+        assert!(result.contains("\"not_answered\""), "{result}");
+    }
+
+    #[tokio::test]
+    async fn ask_user_rejects_a_malformed_call_without_showing_a_card() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let interactions = scripted_interactions(None, seen.clone());
+        let result = ask_user(r#"{"questions":[]}"#, Some(&interactions)).await;
+        assert!(result.contains("1 to 4 questions"), "{result}");
+        assert!(seen.lock().expect("seen lock").is_empty());
+    }
+
+    #[test]
+    fn ask_user_answers_are_kept_in_the_transcript() {
+        let result = crate::ask_user::answered_result(&[crate::ask_user::AskAnswer {
+            question: "Which database?".to_string(),
+            header: None,
+            answer: "PostgreSQL".to_string(),
+        }]);
+        let public = public_tool_result(crate::ask_user::ASK_USER_TOOL, &result);
+        assert!(public.contains("PostgreSQL"), "{public}");
+        assert!(!public.contains("withheld"), "{public}");
+    }
+
     // --- service-layer DB tests (MockDatabase) ------------------------------
 
     fn activity_row(
@@ -11518,11 +12252,13 @@ mod tests {
             providers: HashMap::new(),
             write_support: None,
             goal_support: None,
+            secret_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
             source_drop_deployer: Default::default(),
             application_service: None,
+            blueprint_support: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -11537,11 +12273,13 @@ mod tests {
             providers: HashMap::new(),
             write_support: None,
             goal_support: None,
+            secret_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
             source_drop_deployer: Default::default(),
             application_service: None,
+            blueprint_support: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -12057,6 +12795,7 @@ mod tests {
             active_turn_id: None,
             last_turn_id: None,
             turn_started_at: None,
+            next_step_suggestions: None,
             created_at: now,
             last_activity_at: now,
         }
@@ -12166,11 +12905,13 @@ mod tests {
             providers,
             write_support: None,
             goal_support: None,
+            secret_support: None,
             config: None,
             application_workspaces: None,
             application_sandboxes: None,
             source_drop_deployer: Default::default(),
             application_service: None,
+            blueprint_support: None,
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conversation_broadcasts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -12435,6 +13176,69 @@ mod tests {
         assert_eq!(alpha.project_slug.as_deref(), Some("alpha"));
     }
 
+    /// Chats in one workspace link the same sandbox, and every one of them
+    /// shows it in the list, not only the first.
+    #[tokio::test]
+    async fn every_chat_sharing_a_sandbox_lists_it() {
+        let link = serde_json::json!({
+            "sandbox_link": {
+                "sandbox_id": "sbx_shared",
+                "name": "shared",
+                "linked_at": "2026-01-01T00:00:00Z"
+            }
+        });
+        let chat = |id: i64, public_id: &str| ai_conversations::Model {
+            project_id: None,
+            context_type: crate::providers::assistant::ASSISTANT_CONTEXT_TYPE.to_string(),
+            metadata: Some(link.clone()),
+            ..conv_for(id, 0, public_id)
+        };
+        let now = Utc::now();
+        let sandbox = temps_entities::sandboxes::Model {
+            id: 3,
+            public_id: "sbx_shared".to_string(),
+            user_id: Some(5),
+            agent_run_id: None,
+            name: "shared".to_string(),
+            status: "running".to_string(),
+            lifecycle: "workspace".to_string(),
+            project_id: None,
+            source_repo_url: None,
+            image: None,
+            work_dir: "/workspace".to_string(),
+            timeout_secs: 3600,
+            metadata: None,
+            backend: Some("docker".to_string()),
+            node_id: None,
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now,
+            preview_password_hash: None,
+            preview_password_hint: None,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![chat(1, "first"), chat(2, "second")]])
+                .append_query_results([vec![sandbox]])
+                .into_connection(),
+        );
+
+        let items = db_service_from_arc(db)
+            .list_all_conversations(5, &[])
+            .await
+            .expect("conversation list");
+
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(
+                item.sandbox.as_ref().map(|s| s.sandbox_id.as_str()),
+                Some("sbx_shared"),
+                "{}",
+                item.conversation.public_id
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_list_all_conversations_excludes_currently_hidden_projects() {
         // MockDatabase does not execute query predicates, so return the row the
@@ -12518,6 +13322,7 @@ mod tests {
                 25,
                 Some(&[11, 13]),
                 &["deployment"],
+                None,
             )
             .await
             .expect("visibility-filtered conversation page")
@@ -12550,7 +13355,17 @@ mod tests {
         let service = db_service_from_arc(db.clone());
 
         assert!(service
-            .list_all_conversations_with_visibility(5, &[], "active", false, 1, 25, Some(&[]), &[],)
+            .list_all_conversations_with_visibility(
+                5,
+                &[],
+                "active",
+                false,
+                1,
+                25,
+                Some(&[]),
+                &[],
+                None,
+            )
             .await
             .expect("non-application conversation page")
             .is_empty());
@@ -12567,6 +13382,61 @@ mod tests {
         assert!(sql.contains("\"context_type\" <>"));
         assert!(!sql.contains("\"application_id\" IN"));
         assert!(sql.contains("LIMIT") && sql.contains("OFFSET"));
+    }
+
+    /// Searching must filter in SQL before `OFFSET/LIMIT`; filtering a loaded
+    /// page would miss every match outside it, which is the bug this fixes
+    /// (the chat switcher only found chats already in the sidebar).
+    #[tokio::test]
+    async fn conversation_search_matches_title_or_project_before_pagination() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_conversations::Model>::new()])
+                .into_connection(),
+        );
+        let service = db_service_from_arc(db.clone());
+
+        assert!(service
+            .list_all_conversations_with_visibility(
+                5,
+                &[],
+                "active",
+                false,
+                1,
+                25,
+                None,
+                &[],
+                Some("  Barber_50%  "),
+            )
+            .await
+            .expect("searched conversation page")
+            .is_empty());
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log();
+        let statements: Vec<_> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        let sql = statements
+            .iter()
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("LOWER(\"title\") LIKE"), "{sql}");
+        assert!(sql.contains("LOWER(\"name\") LIKE"), "{sql}");
+        assert!(sql.contains("LOWER(\"slug\") LIKE"), "{sql}");
+        assert!(sql.contains("LIMIT") && sql.contains("OFFSET"));
+        let values = format!("{:?}", statements[0].values);
+        assert!(values.contains(r"%barber\\_50\\%%"), "{values}");
+    }
+
+    #[test]
+    fn escape_like_matches_metacharacters_literally() {
+        assert_eq!(escape_like(r"50%_off\"), r"50\%\_off\\");
+        assert_eq!(escape_like("plain"), "plain");
     }
 
     // Legacy project toggle values no longer affect chat visibility. Access is
@@ -12921,6 +13791,63 @@ mod tests {
             }),
         };
         assert!(automatic_platform_decision(&destructive_plan).is_none());
+    }
+
+    /// A write that spends a credential the user entered privately is never
+    /// approved by a permission mode on its own: the model picks the other fields
+    /// (an endpoint, a base URL) and could aim the key at a host it controls.
+    #[test]
+    fn platform_auto_approval_never_spends_a_provided_secret() {
+        let handle = "secret_ref:v1:0123456789abcdef";
+        assert!(params_carry_secret_handle(
+            &serde_json::json!({"name": "x", "secret_key": handle})
+        ));
+        assert!(params_carry_secret_handle(
+            &serde_json::json!({"extra": [{"token": handle}]})
+        ));
+        assert!(!params_carry_secret_handle(
+            &serde_json::json!({"name": "x", "secret_key": "***", "port": 9000})
+        ));
+
+        // The marker must survive the credential redactor that sanitises approval
+        // input before it is shown: a key named after "secret" would be masked to
+        // "***" and silently read back as false.
+        assert_eq!(
+            redact_value(&serde_json::json!({"carries_handle": true}))["carries_handle"],
+            serde_json::json!(true)
+        );
+
+        let uses_secret = PermissionRequest {
+            id: "secret".to_string(),
+            kind: PermissionKind::ToolApproval,
+            tool_name: TEMPS_WRITE_TOOL_NAME.to_string(),
+            input: serde_json::json!({"method": "POST", "carries_handle": true}),
+        };
+        assert!(automatic_platform_decision(&uses_secret).is_none());
+
+        let plain = PermissionRequest {
+            id: "plain".to_string(),
+            kind: PermissionKind::ToolApproval,
+            tool_name: TEMPS_WRITE_TOOL_NAME.to_string(),
+            input: serde_json::json!({"method": "POST", "carries_handle": false}),
+        };
+        assert!(matches!(
+            automatic_platform_decision(&plain),
+            Some(PermissionDecision::AllowTool)
+        ));
+
+        let plan_with_one_secret_step = PermissionRequest {
+            id: "plan".to_string(),
+            kind: PermissionKind::PlanApproval,
+            tool_name: TEMPS_WRITE_TOOL_NAME.to_string(),
+            input: serde_json::json!({
+                "steps": [
+                    {"method": "POST", "carries_handle": false},
+                    {"method": "POST", "carries_handle": true}
+                ]
+            }),
+        };
+        assert!(automatic_platform_decision(&plan_with_one_secret_step).is_none());
     }
 
     /// Double-resolve: the second remove returns None (409 semantic).

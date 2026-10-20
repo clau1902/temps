@@ -2103,25 +2103,6 @@
         },
         "type": "object"
       },
-      "AiDataAccessResponse": {
-        "properties": {
-          "enabled": {
-            "description": "Whether the AI assistant may read row data from this service",
-            "example": false,
-            "type": "boolean"
-          },
-          "service_id": {
-            "description": "Service id",
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "service_id",
-          "enabled"
-        ],
-        "type": "object"
-      },
       "AiModelOptionDto": {
         "properties": {
           "default_thinking_option_id": {
@@ -3481,6 +3462,25 @@
         ],
         "type": "object"
       },
+      "AppRole": {
+        "enum": [
+          "web",
+          "api",
+          "worker",
+          "cron",
+          "static"
+        ],
+        "type": "string"
+      },
+      "AppRuntime": {
+        "description": "How Temps runs an app.",
+        "enum": [
+          "preset",
+          "dockerfile",
+          "image"
+        ],
+        "type": "string"
+      },
       "AppSettings": {
         "description": "Application settings stored in the database\nAll fields have sensible defaults for easy onboarding",
         "properties": {
@@ -4825,6 +4825,51 @@
         ],
         "type": "object"
       },
+      "AttachmentChunkReceived": {
+        "properties": {
+          "received_bytes": {
+            "description": "Bytes of the file the server now holds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "received_bytes"
+        ],
+        "type": "object"
+      },
+      "AttachmentChunkUpload": {
+        "description": "Request body type for the chunk endpoint's OpenAPI entry.",
+        "properties": {
+          "chunk": {
+            "format": "binary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "chunk"
+        ],
+        "type": "object"
+      },
+      "AttachmentUploadStarted": {
+        "properties": {
+          "chunk_bytes": {
+            "description": "The most bytes one chunk may carry.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upload_id": {
+            "description": "Opaque id to send every chunk and the completion to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id",
+          "chunk_bytes"
+        ],
+        "type": "object"
+      },
       "AttrOp": {
         "enum": [
           "eq",
@@ -5790,7 +5835,7 @@
             "type": "integer"
           },
           "schedule_expression": {
-            "example": "0 0 * * *",
+            "example": "0 0 3 * * *",
             "type": "string"
           },
           "tags": {
@@ -5968,6 +6013,26 @@
         ],
         "type": "object"
       },
+      "BindBlueprintComponentRequest": {
+        "description": "The project (for an app part) or service (for a data part) to bind.",
+        "properties": {
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "BitbucketAuthInput": {
         "description": "Authentication input for a Bitbucket Cloud provider. Use `access_token` for\na Repository or Workspace Access Token (PAT), or `username` + `app_password`\nfor App Password (HTTP Basic) authentication.",
         "oneOf": [
@@ -5975,8 +6040,8 @@
             "description": "Personal / Workspace / Repository Access Token.",
             "properties": {
               "token": {
-                "description": "The Bitbucket access token value.",
-                "type": "string"
+                "$ref": "#/components/schemas/SecretString",
+                "description": "The Bitbucket access token value."
               },
               "type": {
                 "enum": [
@@ -5995,8 +6060,8 @@
             "description": "HTTP Basic / App Password authentication.",
             "properties": {
               "password": {
-                "description": "App password generated in Bitbucket security settings.",
-                "type": "string"
+                "$ref": "#/components/schemas/SecretString",
+                "description": "App password generated in Bitbucket security settings."
               },
               "type": {
                 "enum": [
@@ -6091,6 +6156,164 @@
         "required": [
           "enabled",
           "healthy"
+        ],
+        "type": "object"
+      },
+      "BlueprintDocument": {
+        "description": "The design of an application: what it is for, its parts and its flows.",
+        "properties": {
+          "components": {
+            "items": {
+              "$ref": "#/components/schemas/Component"
+            },
+            "type": "array"
+          },
+          "flows": {
+            "items": {
+              "$ref": "#/components/schemas/Flow"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "description": "One paragraph: what the application does and for whom.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "components"
+        ],
+        "type": "object"
+      },
+      "BlueprintResponse": {
+        "description": "A workspace's architecture: what was accepted, what waits for a\ndecision, and how each bound part is doing.",
+        "properties": {
+          "accepted": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BlueprintVersionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "application_id": {
+            "type": "string"
+          },
+          "bindings": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ComponentBinding"
+            },
+            "description": "Which project or service realises each part, by part id.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "live": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ComponentLive"
+            },
+            "description": "The live state of each bound part, by part id.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "proposal": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BlueprintVersionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workspace_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "application_id",
+          "workspace_name",
+          "bindings",
+          "live"
+        ],
+        "type": "object"
+      },
+      "BlueprintVersionResponse": {
+        "description": "What the console needs to draw one version.",
+        "properties": {
+          "change_summary": {
+            "type": "string"
+          },
+          "created_at": {
+            "description": "ISO 8601.",
+            "type": "string"
+          },
+          "decided_at": {
+            "description": "ISO 8601, once accepted or rejected.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "document": {
+            "$ref": "#/components/schemas/BlueprintDocument"
+          },
+          "proposed_by_assistant": {
+            "description": "Whether the model proposed it (in a chat) rather than the user writing it.",
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/VersionStatus"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "document",
+          "change_summary",
+          "status",
+          "proposed_by_assistant",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "BlueprintVersionsResponse": {
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/BlueprintVersionResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "versions",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -7377,6 +7600,153 @@
         ],
         "type": "object"
       },
+      "ChatOperation": {
+        "description": "One operation the chat started, with its current state.",
+        "properties": {
+          "deployment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "Where: the project and environment, or the S3 source.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Why it failed, when the record says.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "href": {
+            "description": "Console path that shows the operation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ChatOperationKind"
+          },
+          "operation_id": {
+            "description": "What started it: the API operation id, or `temps_deploy_sandbox_source`.",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "started_at": {
+            "description": "ISO 8601 time the chat started it.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ChatOperationState"
+          },
+          "status": {
+            "description": "The record's own status, e.g. `running` or `completed`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "e.g. \"Deployment #41\", \"Backup of orders-db\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "operation_id",
+          "title",
+          "state",
+          "started_at"
+        ],
+        "type": "object"
+      },
+      "ChatOperationKind": {
+        "description": "What a chat started.",
+        "enum": [
+          "deployment",
+          "backup",
+          "service_backup",
+          "restore"
+        ],
+        "type": "string"
+      },
+      "ChatOperationState": {
+        "description": "Where an operation is, in the same words for every kind.",
+        "enum": [
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "not_started"
+        ],
+        "type": "string"
+      },
+      "ChatOperationsResponse": {
+        "description": "The operations a chat started, newest first.",
+        "properties": {
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/ChatOperation"
+            },
+            "type": "array"
+          },
+          "running": {
+            "description": "How many of them are still running.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "True when the chat started more operations than this response covers.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operations",
+          "running",
+          "truncated"
+        ],
+        "type": "object"
+      },
       "ChatPreview": {
         "description": "How to reach a page served from the chat's sandbox.",
         "properties": {
@@ -7591,6 +7961,107 @@
           "offered",
           "connected_projects",
           "connected_services"
+        ],
+        "type": "object"
+      },
+      "ChatSuggestionSettings": {
+        "description": "A chat's next-step suggestion setting.",
+        "properties": {
+          "available": {
+            "description": "Whether this chat can have suggestions at all. Only the assistant chat\ncan; the other fields still describe the setting for other chats.",
+            "type": "boolean"
+          },
+          "chat_mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SuggestionMode",
+                "description": "The chat's own setting, when it has one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "default_mode": {
+            "$ref": "#/components/schemas/SuggestionMode",
+            "description": "The user's default, which applies when `chat_mode` is unset."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/SuggestionMode",
+            "description": "What happens after each answer in this chat."
+          },
+          "source": {
+            "$ref": "#/components/schemas/SuggestionModeSource",
+            "description": "Whether `mode` is the chat's own setting or the user's default."
+          }
+        },
+        "required": [
+          "available",
+          "mode",
+          "source",
+          "default_mode"
+        ],
+        "type": "object"
+      },
+      "ChatWorkspace": {
+        "description": "The workspace a chat is in.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "public_id": {
+            "description": "Public id of the workspace (`app_…`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "ChatWorkspaceResponse": {
+        "description": "A chat's workspace, and the chats in it.",
+        "properties": {
+          "chats": {
+            "description": "The workspace's chats, most recently active first, at most 20.",
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceChatSummary"
+            },
+            "type": "array"
+          },
+          "joinable": {
+            "description": "Whether this chat can be put in a workspace. Chats about one project\ncannot: the project is their scope.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why the chat cannot be in a workspace, when `joinable` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ChatWorkspace",
+                "description": "`None` when the chat is not in a workspace."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "chats",
+          "joinable"
         ],
         "type": "object"
       },
@@ -7968,6 +8439,15 @@
           "password"
         ],
         "type": "object"
+      },
+      "ClientSurface": {
+        "enum": [
+          "browser",
+          "mobile",
+          "cli",
+          "third_party"
+        ],
+        "type": "string"
       },
       "CloudAiCapability": {
         "properties": {
@@ -8467,7 +8947,7 @@
         "type": "object"
       },
       "CloudflareConfig": {
-        "description": "Configuration for a Cloudflare Email Sending notification provider.\n\nNotifications are delivered through Cloudflare's transactional Email Sending\nAPI. Only the account, token, sender and recipients are configured here —\nsubject and body are derived from each notification.",
+        "description": "Configuration for a Cloudflare Email Sending notification provider.\n\nNotifications are delivered through Cloudflare's transactional Email Sending\nAPI. Only the account, token, sender and recipients are configured here —\nsubject and body are derived from each notification.\nRequest-side config. Not `Serialize`: `api_token` is a `SecretString`; use\n[`CloudflareConfig::into_stored_value`].",
         "properties": {
           "account_id": {
             "description": "Cloudflare account id that owns the Email Sending configuration.",
@@ -8475,8 +8955,8 @@
             "type": "string"
           },
           "api_token": {
-            "description": "Cloudflare API token with the Email Sending permission. Encrypted at\nrest and masked in normal API responses.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Cloudflare API token with the Email Sending permission. Encrypted at\nrest and masked in normal API responses."
           },
           "from_address": {
             "description": "Verified sender address (must belong to a domain enabled for Cloudflare\nEmail Sending).",
@@ -9121,6 +9601,171 @@
           "above"
         ],
         "type": "string"
+      },
+      "Component": {
+        "description": "One part of the application. Which fields apply depends on `kind`:\na client has `surface`; an app has `role`, `stack` and `runtime` (and\n`image` when it runs an image); data has `engine` and `holds`; an external\nservice has `provider`.",
+        "properties": {
+          "engine": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DataEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "holds": {
+            "description": "What lives in a data part: tables, key prefixes, buckets, streams.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "description": "Stable slug, unique in the document: `web`, `api`, `orders-worker`.",
+            "type": "string"
+          },
+          "image": {
+            "description": "The image an app runs, when `runtime` is `image`: `nats:2.10`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ComponentKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider": {
+            "description": "The outside service: \"Stripe\", \"an LLM API\", \"GitHub OAuth\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "purpose": {
+            "description": "Why it exists, in one sentence.",
+            "type": "string"
+          },
+          "role": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AppRole"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "runtime": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AppRuntime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stack": {
+            "description": "Free text, as the user wants it: \"Next.js\", \"Bun + Hono\", \"FastAPI\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "surface": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClientSurface"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "purpose",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "ComponentBinding": {
+        "description": "The project or service that realises one part.",
+        "properties": {
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ComponentKind": {
+        "description": "What a part of the application is.",
+        "enum": [
+          "client",
+          "app",
+          "data",
+          "external"
+        ],
+        "type": "string"
+      },
+      "ComponentLive": {
+        "description": "The live state of one bound part.",
+        "properties": {
+          "deployment_id": {
+            "description": "The project's latest deployment.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "The project's or the service's name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_slug": {
+            "description": "The project's slug, for links into the console.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_type": {
+            "description": "The service's engine as Temps names it (`postgres`, `redis`…).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/LiveStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
       },
       "ComposePortMapping": {
         "description": "A Docker Compose service port mapping, reduced to the information the UI\nneeds to build a public route without confusing host and container ports.",
@@ -11223,6 +11868,14 @@
               }
             ]
           },
+          "focus_project_id": {
+            "description": "The project an assistant chat was started about, if any.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "last_activity_at": {
             "type": "string"
           },
@@ -11413,6 +12066,23 @@
           "byok_requests",
           "models",
           "summarized_messages"
+        ],
+        "type": "object"
+      },
+      "ConversationWorkspaceResponse": {
+        "description": "The workspace a chat is in, as the conversation list shows it.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "public_id": {
+            "description": "Public id of the workspace (`app_…`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_id",
+          "name"
         ],
         "type": "object"
       },
@@ -11876,6 +12546,14 @@
               "string",
               "null"
             ]
+          },
+          "project_id": {
+            "description": "A project the chat is about. The assistant is told which it is, so it\nneeds no searching to resolve \"my app\". It is a default, not a limit,\nand grants nothing: the chat still acts with the user's own permissions.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -11925,6 +12603,8 @@
             ]
           },
           "schedule_expression": {
+            "description": "Cron expression with a leading seconds field: `sec min hour day-of-month\nmonth day-of-week`, for example `0 0 3 * * *` for every day at 03:00\nUTC. A five-field expression such as `0 3 * * *` is rejected.",
+            "example": "0 0 3 * * *",
             "type": "string"
           },
           "service_ids": {
@@ -12648,10 +13328,14 @@
             "type": "string"
           },
           "token": {
-            "description": "Access token or password. Omit (or set to `null`) for public repositories.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Access token or password. Omit (or set to `null`) for public repositories."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "token_username": {
@@ -12674,7 +13358,7 @@
             "type": "string"
           },
           "token": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           }
         },
         "required": [
@@ -12695,7 +13379,7 @@
             "type": "string"
           },
           "client_secret": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           },
           "name": {
             "type": "string"
@@ -12724,7 +13408,7 @@
             "type": "string"
           },
           "token": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           }
         },
         "required": [
@@ -12744,8 +13428,8 @@
             "type": "string"
           },
           "token": {
-            "description": "Personal access token issued by the Gitea instance.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Personal access token issued by the Gitea instance."
           }
         },
         "required": [
@@ -12827,8 +13511,8 @@
             "type": "string"
           },
           "signing_secret": {
-            "description": "Signing secret from the provider's dashboard.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Signing secret from the provider's dashboard."
           }
         },
         "required": [
@@ -13107,7 +13791,7 @@
             "type": "string"
           },
           "client_secret": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           },
           "default_role": {
             "type": "string"
@@ -13670,7 +14354,7 @@
       "CreateProviderKeyRequest": {
         "properties": {
           "api_key": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           },
           "base_url": {
             "type": [
@@ -13784,7 +14468,8 @@
       "CreateS3SourceRequest": {
         "properties": {
           "access_key_id": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Access key ID of the bucket's credentials, for example `AKIA...` on AWS."
           },
           "backing_service_id": {
             "description": "Managed RustFS/S3 service that supplies this destination. When set,\nschedules using this source can never target that service itself.",
@@ -13831,7 +14516,8 @@
             "type": "string"
           },
           "secret_key": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Secret access key that goes with the access key ID. Shown once by the\nprovider; stored encrypted and never returned."
           }
         },
         "required": [
@@ -13946,10 +14632,14 @@
             "type": "array"
           },
           "preview_password": {
-            "description": "Optional preview-URL password. When set, every preview URL served\nfor this sandbox is gated behind a login form. 8–256 characters.\nOmit to leave preview URLs open (the sandbox ID remains the only\ngate). The plaintext is never returned; only the last-4 hint is\nsurfaced in `SandboxResponse.preview_password_hint`.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Optional preview-URL password. When set, every preview URL served\nfor this sandbox is gated behind a login form. 8–256 characters.\nOmit to leave preview URLs open (the sandbox ID remains the only\ngate). The plaintext is never returned; only the last-4 hint is\nsurfaced in `SandboxResponse.preview_password_hint`."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "projectId": {
@@ -14200,10 +14890,14 @@
             "type": "array"
           },
           "secret": {
-            "description": "Secret for HMAC signature verification (optional)",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Secret for HMAC signature verification (optional)"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "url": {
@@ -14762,6 +15456,17 @@
           "aggregation"
         ],
         "type": "object"
+      },
+      "DataEngine": {
+        "description": "The engines Temps operates as managed services.",
+        "enum": [
+          "postgres",
+          "redis",
+          "mongodb",
+          "mariadb",
+          "s3"
+        ],
+        "type": "string"
       },
       "DataImplication": {
         "description": "A specific data implication the user needs to understand",
@@ -17579,7 +18284,7 @@
           {
             "properties": {
               "api_key": {
-                "type": "string"
+                "$ref": "#/components/schemas/SecretString"
               },
               "type": {
                 "enum": [
@@ -17603,8 +18308,7 @@
                 ]
               },
               "api_token": {
-                "example": "your-api-token",
-                "type": "string"
+                "$ref": "#/components/schemas/SecretString"
               },
               "type": {
                 "enum": [
@@ -17622,8 +18326,7 @@
           {
             "properties": {
               "api_key": {
-                "example": "your-api-key",
-                "type": "string"
+                "$ref": "#/components/schemas/SecretString"
               },
               "api_user": {
                 "example": "your-username",
@@ -17666,13 +18369,16 @@
                 ]
               },
               "secret_access_key": {
-                "example": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-                "type": "string"
+                "$ref": "#/components/schemas/SecretString"
               },
               "session_token": {
-                "type": [
-                  "string",
-                  "null"
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/SecretString"
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               },
               "type": {
@@ -17692,8 +18398,7 @@
           {
             "properties": {
               "api_token": {
-                "example": "dop_v1_your-token",
-                "type": "string"
+                "$ref": "#/components/schemas/SecretString"
               },
               "type": {
                 "enum": [
@@ -17711,8 +18416,7 @@
           {
             "properties": {
               "private_key": {
-                "example": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----",
-                "type": "string"
+                "$ref": "#/components/schemas/SecretString"
               },
               "project_id": {
                 "example": "my-gcp-project",
@@ -17744,7 +18448,7 @@
                 "type": "string"
               },
               "client_secret": {
-                "type": "string"
+                "$ref": "#/components/schemas/SecretString"
               },
               "resource_group": {
                 "example": "my-resource-group",
@@ -19468,6 +20172,7 @@
         "type": "object"
       },
       "EmailConfig": {
+        "description": "Request-side SMTP config. Not `Serialize` for the same reason as\n[`SlackConfig`]; use [`EmailConfig::into_stored_value`].",
         "properties": {
           "accept_invalid_certs": {
             "type": "boolean"
@@ -19482,7 +20187,7 @@
             ]
           },
           "password": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           },
           "smtp_host": {
             "type": "string"
@@ -20154,10 +20859,14 @@
             ]
           },
           "root_password": {
-            "description": "Root password for S3 access",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Root password for S3 access"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "root_user": {
@@ -23620,6 +24329,18 @@
         ],
         "description": "A file object as returned by the provider."
       },
+      "FillSecretRequest": {
+        "properties": {
+          "value": {
+            "$ref": "#/components/schemas/SecretString",
+            "description": "The credential. Stored encrypted; never returned and never shown to the\nassistant, which only receives an opaque handle."
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
       "Finding": {
         "properties": {
           "code": {
@@ -23850,6 +24571,45 @@
           "string",
           "number",
           "json"
+        ],
+        "type": "string"
+      },
+      "Flow": {
+        "description": "Data moving from one part to another. `from` is the part that starts it.",
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/FlowKind"
+          },
+          "label": {
+            "description": "What travels: \"POST /api/tasks\", \"topic task.created\", \"tables tasks, users\".",
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "kind",
+          "label"
+        ],
+        "type": "object"
+      },
+      "FlowKind": {
+        "description": "What travels along a flow.",
+        "enum": [
+          "http",
+          "websocket",
+          "query",
+          "publish",
+          "subscribe",
+          "cache",
+          "blob",
+          "webhook"
         ],
         "type": "string"
       },
@@ -25829,6 +26589,49 @@
         ],
         "type": "object"
       },
+      "GitChangeKind": {
+        "description": "How a file differs from the last commit.",
+        "enum": [
+          "modified",
+          "added",
+          "deleted",
+          "renamed",
+          "copied",
+          "type_changed",
+          "untracked",
+          "conflicted"
+        ],
+        "type": "string"
+      },
+      "GitChangedFile": {
+        "description": "A file that differs from the repository's last commit.",
+        "properties": {
+          "change": {
+            "$ref": "#/components/schemas/GitChangeKind"
+          },
+          "old_path": {
+            "description": "The path before a rename or copy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Path relative to the repository root.",
+            "type": "string"
+          },
+          "staged": {
+            "description": "True when the change is staged (in the index).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "change",
+          "staged"
+        ],
+        "type": "object"
+      },
       "GitPushEvent": {
         "description": "Git push event information that triggered the deployment",
         "properties": {
@@ -25903,6 +26706,48 @@
         "required": [
           "url",
           "ref"
+        ],
+        "type": "object"
+      },
+      "GitRepoChanges": {
+        "description": "The uncommitted changes of one repository in the sandbox.",
+        "properties": {
+          "branch": {
+            "description": "The checked-out branch, or the short commit when detached.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/GitChangedFile"
+            },
+            "type": "array"
+          },
+          "has_commits": {
+            "description": "False for a repository with no commit yet: every file is new.",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "The root relative to the work directory (`.` for the work directory).",
+            "type": "string"
+          },
+          "root": {
+            "description": "Absolute path of the repository root.",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "True when more files changed than are listed.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "root",
+          "name",
+          "has_commits",
+          "files",
+          "truncated"
         ],
         "type": "object"
       },
@@ -26096,6 +26941,14 @@
               }
             ]
           },
+          "focus_project_id": {
+            "description": "The project an assistant chat was started about, if any.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "last_activity_at": {
             "type": "string"
           },
@@ -26144,6 +26997,17 @@
           "turn_status": {
             "description": "Server-authoritative lifecycle for the current/most recent turn.",
             "type": "string"
+          },
+          "workspace": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConversationWorkspaceResponse",
+                "description": "The workspace an assistant chat is in (ADR-053)."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -29979,6 +30843,14 @@
         ],
         "type": "object"
       },
+      "KeepSandbox": {
+        "description": "Which sandbox the chats keep when a chat with a sandbox of its own joins a\nworkspace that already has one.",
+        "enum": [
+          "workspace",
+          "chat"
+        ],
+        "type": "string"
+      },
       "KeysRequest": {
         "description": "Request to get keys matching a pattern",
         "properties": {
@@ -31051,6 +31923,18 @@
         },
         "type": "object"
       },
+      "LiveStatus": {
+        "description": "How a bound part is doing right now.",
+        "enum": [
+          "created",
+          "building",
+          "live",
+          "failed",
+          "stopped",
+          "missing"
+        ],
+        "type": "string"
+      },
       "LiveVisitorInfo": {
         "properties": {
           "city": {
@@ -32081,6 +32965,16 @@
           "cursor": {
             "description": "Stable opaque cursor for this stored message. Clients must treat this as\nan uninterpreted token and send it back through the `before` query.",
             "type": "string"
+          },
+          "next_steps": {
+            "description": "Next steps already suggested after this answer, shown again on reload\nwithout asking the model a second time.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "parts": {
             "description": "Ordered render segments (text / tool, in the order they occurred) so a\nreloaded chat shows the same interleaving as the live stream. Absent for\nolder messages persisted before parts were tracked; the client then falls\nback to `tools` (rendered first) + `content`.",
@@ -34001,6 +34895,54 @@
         "required": [
           "compute_pool_cidr",
           "subnet_prefix_len"
+        ],
+        "type": "object"
+      },
+      "NewChatWorkspace": {
+        "description": "A new workspace to create for the chat.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "NextSteps": {
+        "description": "Suggestions for one answer.",
+        "properties": {
+          "answer": {
+            "description": "Cursor of the answer they follow on from, as in the message list.",
+            "type": "string"
+          },
+          "model": {
+            "description": "The model that wrote them.",
+            "type": "string"
+          },
+          "saved": {
+            "description": "True when they were saved earlier and returned without a new request.",
+            "type": "boolean"
+          },
+          "suggestions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "answer",
+          "suggestions",
+          "model",
+          "saved"
         ],
         "type": "object"
       },
@@ -46226,6 +47168,31 @@
         ],
         "type": "object"
       },
+      "SandboxChanges": {
+        "description": "The Git changes of every repository found under the work directory.",
+        "properties": {
+          "git_available": {
+            "description": "False when the sandbox has no `git`: nothing can be tracked.",
+            "type": "boolean"
+          },
+          "repos": {
+            "description": "Repositories at most three levels below the work directory, outside\n`node_modules`.",
+            "items": {
+              "$ref": "#/components/schemas/GitRepoChanges"
+            },
+            "type": "array"
+          },
+          "work_dir": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_dir",
+          "git_available",
+          "repos"
+        ],
+        "type": "object"
+      },
       "SandboxConnections": {
         "description": "What linking the sandbox to services gave it.",
         "properties": {
@@ -46277,6 +47244,36 @@
         ],
         "type": "object"
       },
+      "SandboxDirectory": {
+        "description": "One directory of the chat's sandbox: folders first, then files, by name.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxEntry"
+            },
+            "type": "array"
+          },
+          "path": {
+            "description": "Absolute path of the directory listed.",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "True when the directory has more than the entries returned.",
+            "type": "boolean"
+          },
+          "work_dir": {
+            "description": "The sandbox work directory, where the assistant's relative paths start.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "work_dir",
+          "entries",
+          "truncated"
+        ],
+        "type": "object"
+      },
       "SandboxDomainResponse": {
         "properties": {
           "url": {
@@ -46287,6 +47284,44 @@
           "url"
         ],
         "type": "object"
+      },
+      "SandboxEntry": {
+        "description": "One entry of a sandbox directory.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/SandboxEntryKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute path inside the sandbox.",
+            "type": "string"
+          },
+          "size": {
+            "description": "Size in bytes as the filesystem reports it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "kind",
+          "size"
+        ],
+        "type": "object"
+      },
+      "SandboxEntryKind": {
+        "description": "What a directory entry is.",
+        "enum": [
+          "file",
+          "directory",
+          "symlink",
+          "other"
+        ],
+        "type": "string"
       },
       "SandboxEvent": {
         "description": "One entry in a sandbox's operations timeline.",
@@ -46321,6 +47356,83 @@
         },
         "required": [
           "events"
+        ],
+        "type": "object"
+      },
+      "SandboxFileDiff": {
+        "description": "Both sides of one file's diff against the last commit.",
+        "properties": {
+          "binary": {
+            "description": "True when either side is binary; both sides are then `None`.",
+            "type": "boolean"
+          },
+          "modified": {
+            "description": "The file as it is now. `None` when it was deleted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "original": {
+            "description": "The file as last committed. `None` when it is new.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Path relative to the repository root.",
+            "type": "string"
+          },
+          "repo": {
+            "description": "Absolute path of the repository root.",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "True when either side was cut at [`MAX_VIEW_BYTES`].",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repo",
+          "path",
+          "binary",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "SandboxFileView": {
+        "description": "One file of the chat's sandbox, for the viewer.",
+        "properties": {
+          "binary": {
+            "type": "boolean"
+          },
+          "content": {
+            "description": "The text, or its first [`MAX_VIEW_BYTES`] when `truncated`. `None`\nfor a binary file.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Absolute path inside the sandbox.",
+            "type": "string"
+          },
+          "size": {
+            "description": "Size in bytes of the whole file.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "size",
+          "binary",
+          "truncated"
         ],
         "type": "object"
       },
@@ -46630,6 +47742,22 @@
         ],
         "type": "object"
       },
+      "SaveBlueprintVersionRequest": {
+        "description": "A version the user wrote; it is accepted as it is saved.",
+        "properties": {
+          "change_summary": {
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/BlueprintDocument"
+          }
+        },
+        "required": [
+          "document",
+          "change_summary"
+        ],
+        "type": "object"
+      },
       "SaveCredentialRequest": {
         "properties": {
           "auth_type": {
@@ -46637,8 +47765,8 @@
             "type": "string"
           },
           "credential": {
-            "description": "Plaintext credential body (API key, OAuth token, or full config file\ncontents). Encrypted with `EncryptionService` before being persisted\ninside the `agent_sandbox.providers` JSON map.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Plaintext credential body (API key, OAuth token, or full config file\ncontents). Encrypted with `EncryptionService` before being persisted\ninside the `agent_sandbox.providers` JSON map."
           },
           "verification_model": {
             "description": "OpenCode model to test, in `provider/model` form. Omit to use the\nbuilt-in minimal probe model. A successfully verified explicit model\nbecomes this provider's workspace default.",
@@ -46756,8 +47884,7 @@
       "ScalewayCredentialsRequest": {
         "properties": {
           "api_key": {
-            "example": "scw-secret-key-12345",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           },
           "project_id": {
             "example": "12345678-1234-1234-1234-123456789012",
@@ -47454,6 +48581,66 @@
           "updated_at"
         ],
         "type": "object"
+      },
+      "SecretSlotView": {
+        "description": "What a slot looks like to the console and to the model: everything except\nthe value.",
+        "properties": {
+          "conversation_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "field": {
+            "description": "JSON pointer of the request field the value is for.",
+            "type": "string"
+          },
+          "filled_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "The id inside the handle (`secret_ref:v1:<id>`).",
+            "type": "string"
+          },
+          "label": {
+            "description": "What the form asks for.",
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "status": {
+            "description": "`awaiting`, `filled`, `cancelled` or `expired`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "conversation_id",
+          "operation_id",
+          "field",
+          "label",
+          "status",
+          "expires_at",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "SecretString": {
+        "description": "A credential. Write-only: it is never returned, and the AI assistant supplies it through a secret slot instead of typing it into the conversation.",
+        "format": "password",
+        "type": "string",
+        "x-temps-secret": true
       },
       "SecurityConfig": {
         "description": "Security configuration for projects and environments\n\nThis configuration can be set at three levels:\n1. Global (in settings table) - applies to all projects\n2. Project level - overrides global settings for specific project\n3. Environment level - overrides project settings for specific environment\n\nThe inheritance chain: Environment > Project > Global",
@@ -48796,6 +49983,7 @@
             ]
           },
           "role": {
+            "description": "Configured member kind. For a PostgreSQL cluster this is `monitor` or\n`replica`, and every data node is `replica`, including the current\nprimary: which node is primary is runtime state, read it from\n`live_state`.",
             "type": "string"
           },
           "status": {
@@ -49303,8 +50491,7 @@
             "type": "string"
           },
           "secret_access_key": {
-            "example": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           }
         },
         "required": [
@@ -50188,6 +51375,32 @@
         ],
         "type": "object"
       },
+      "SetChatWorkspaceRequest": {
+        "description": "Put a chat in a workspace: an existing one (`application_id`) or a new\none (`create`). Exactly one of the two.",
+        "properties": {
+          "application_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "create": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NewChatWorkspace"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "keep_sandbox": {
+            "$ref": "#/components/schemas/KeepSandbox",
+            "description": "Which sandbox the chats keep when both the chat and the workspace\nhave one. Default `workspace`."
+          }
+        },
+        "type": "object"
+      },
       "SetFlagEnvironmentRequest": {
         "properties": {
           "enabled": {
@@ -50301,8 +51514,8 @@
       "SetPreviewPasswordBody": {
         "properties": {
           "password": {
-            "description": "Plaintext password to protect the sandbox's preview URLs. Hashed\nserver-side with argon2id — we never persist or echo this back.\nMust be between 8 and 256 characters.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Plaintext password to protect the sandbox's preview URLs. Hashed\nserver-side with argon2id — we never persist or echo this back.\nMust be between 8 and 256 characters."
           }
         },
         "required": [
@@ -50649,6 +51862,7 @@
         "type": "object"
       },
       "SlackConfig": {
+        "description": "Request-side Slack config. Deliberately not `Serialize`: the webhook URL is\na `SecretString`, which would serialize as `\"***\"`. Use\n[`SlackConfig::into_stored_value`] to build the value that gets encrypted.",
         "properties": {
           "channel": {
             "type": [
@@ -50657,7 +51871,7 @@
             ]
           },
           "webhook_url": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           }
         },
         "required": [
@@ -51081,10 +52295,14 @@
             "type": "string"
           },
           "password": {
-            "description": "SMTP password / API token. Required when `username` is set.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "SMTP password / API token. Required when `username` is set."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "port": {
@@ -52156,6 +53374,32 @@
         ],
         "type": "object"
       },
+      "StartAttachmentUploadRequest": {
+        "properties": {
+          "mime_type": {
+            "description": "Content type the browser reported, if any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "File name as the user knows it; unsafe characters are replaced.",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "Size of the whole file in bytes.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "size_bytes"
+        ],
+        "type": "object"
+      },
       "StartDataImportRequest": {
         "description": "Start importing an external database into a database of this service.",
         "properties": {
@@ -53052,6 +54296,48 @@
         },
         "type": "object"
       },
+      "SuggestNextStepsRequest": {
+        "description": "Which answer to suggest next steps for.",
+        "properties": {
+          "answer": {
+            "description": "Cursor of the answer the user is looking at, from the message list. When\ngiven, it must still be the chat's latest answer. Without it the latest\nanswer is used.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SuggestionDefault": {
+        "description": "The user's default for chats that do not set their own mode.",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/SuggestionMode"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "SuggestionMode": {
+        "description": "What happens after each answer.",
+        "enum": [
+          "off",
+          "ask",
+          "always"
+        ],
+        "type": "string"
+      },
+      "SuggestionModeSource": {
+        "description": "Where a chat's effective mode comes from.",
+        "enum": [
+          "chat",
+          "default"
+        ],
+        "type": "string"
+      },
       "SupervisorKind": {
         "description": "What (if anything) will restart the process after it exits.",
         "enum": [
@@ -53945,8 +55231,8 @@
       "TestProviderKeyRequest": {
         "properties": {
           "api_key": {
-            "description": "The raw API key to test",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "The raw API key to test"
           },
           "base_url": {
             "description": "Optional custom base URL",
@@ -54269,19 +55555,6 @@
         ],
         "type": "object"
       },
-      "ToggleAiDataAccessRequest": {
-        "properties": {
-          "enabled": {
-            "description": "Whether the AI assistant may read row data from this service.",
-            "example": false,
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "enabled"
-        ],
-        "type": "object"
-      },
       "ToggleDeploymentMetricsRequest": {
         "description": "Request body to toggle OTLP metric ingestion for a deployment.",
         "properties": {
@@ -54592,6 +55865,19 @@
           "data",
           "count"
         ],
+        "type": "object"
+      },
+      "TrackSandboxChangesRequest": {
+        "description": "A folder to put under Git.",
+        "properties": {
+          "path": {
+            "description": "Absolute, or relative to the work directory; the work directory when\nomitted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "TrackedLinkResponse": {
@@ -56224,7 +57510,8 @@
             ]
           },
           "schedule_expression": {
-            "description": "New cron expression. When changed, `next_run` is recomputed.",
+            "description": "New cron expression with a leading seconds field (`sec min hour\nday-of-month month day-of-week`, e.g. `0 0 3 * * *`). When changed,\n`next_run` is recomputed.",
+            "example": "0 0 3 * * *",
             "type": [
               "string",
               "null"
@@ -56424,6 +57711,22 @@
           "binary_path",
           "phase"
         ],
+        "type": "object"
+      },
+      "UpdateChatSuggestionModeRequest": {
+        "description": "Set a chat's own mode, or `null` to follow the user's default.",
+        "properties": {
+          "mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SuggestionMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
         "type": "object"
       },
       "UpdateCloudflareProviderRequest": {
@@ -56944,10 +58247,14 @@
             ]
           },
           "password": {
-            "description": "Set a password to protect this environment. The proxy will show an HTML\npassword form before allowing access. The password is bcrypt-hashed\nserver-side and never stored in plaintext.\nSend an empty string to remove password protection.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Set a password to protect this environment. The proxy will show an HTML\npassword form before allowing access. The password is bcrypt-hashed\nserver-side and never stored in plaintext.\nSend an empty string to remove password protection."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "performance_metrics_enabled": {
@@ -57560,9 +58867,13 @@
             ]
           },
           "client_secret": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "default_role": {
@@ -57909,10 +59220,14 @@
             ]
           },
           "app_secret": {
-            "description": "GitLab App secret (not used by GitHub App — use `client_secret`).",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "GitLab App secret (not used by GitHub App — use `client_secret`)."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "client_id": {
@@ -57923,17 +59238,25 @@
             ]
           },
           "client_secret": {
-            "description": "OAuth client secret (GitLab OAuth, GitHub App).",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "OAuth client secret (GitLab OAuth, GitHub App)."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "private_key": {
-            "description": "GitHub App private key (PEM).",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "GitHub App private key (PEM)."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "redirect_uri": {
@@ -57944,17 +59267,25 @@
             ]
           },
           "token": {
-            "description": "PAT for PAT-type providers.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "PAT for PAT-type providers."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "webhook_secret": {
-            "description": "GitHub App webhook secret.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "GitHub App webhook secret."
+              },
+              {
+                "type": "null"
+              }
             ]
           }
         },
@@ -57963,9 +59294,13 @@
       "UpdateProviderKeyRequest": {
         "properties": {
           "api_key": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "base_url": {
@@ -58056,11 +59391,14 @@
       "UpdateS3SourceRequest": {
         "properties": {
           "access_key_id": {
-            "description": "Optional new access key ID",
-            "example": "AKIAXXXXXXXXXXXXXXXX",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Optional new access key ID"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "bucket_name": {
@@ -58108,10 +59446,14 @@
             ]
           },
           "secret_key": {
-            "description": "Optional new secret key",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Optional new secret key"
+              },
+              {
+                "type": "null"
+              }
             ]
           }
         },
@@ -58145,8 +59487,8 @@
       "UpdateSecretBody": {
         "properties": {
           "signing_secret": {
-            "description": "New signing secret from the provider's dashboard. Encrypted at\nrest; never returned in any API response.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "New signing secret from the provider's dashboard. Encrypted at\nrest; never returned in any API response."
           }
         },
         "required": [
@@ -58421,12 +59763,16 @@
       "UpdateTokenRequest": {
         "properties": {
           "access_token": {
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString"
           },
           "refresh_token": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString"
+              },
+              {
+                "type": "null"
+              }
             ]
           }
         },
@@ -58530,10 +59876,14 @@
             ]
           },
           "secret": {
-            "description": "Secret for HMAC signature verification",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Secret for HMAC signature verification"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "url": {
@@ -59637,6 +60987,16 @@
           "code"
         ],
         "type": "object"
+      },
+      "VersionStatus": {
+        "description": "Where a version stands.",
+        "enum": [
+          "proposed",
+          "accepted",
+          "rejected",
+          "superseded"
+        ],
+        "type": "string"
       },
       "ViewItem": {
         "properties": {
@@ -61832,6 +63192,33 @@
         "required": [
           "total",
           "harnesses"
+        ],
+        "type": "object"
+      },
+      "WorkspaceChatSummary": {
+        "description": "One chat of a workspace, for the switcher.",
+        "properties": {
+          "last_activity_at": {
+            "description": "ISO 8601.",
+            "type": "string"
+          },
+          "public_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_id",
+          "last_activity_at",
+          "turn_status"
         ],
         "type": "object"
       },
@@ -64715,6 +66102,674 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/applications/{public_id}/blueprint": {
+      "get": {
+        "operationId": "get_blueprint",
+        "parameters": [
+          {
+            "description": "Workspace (application) public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlueprintResponse"
+                }
+              }
+            },
+            "description": "The workspace's blueprint"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Workspace not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The workspace's architecture blueprint with the live state of its parts.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/applications/{public_id}/blueprint/bindings/{component_id}": {
+      "delete": {
+        "operationId": "unbind_blueprint_component",
+        "parameters": [
+          {
+            "description": "Workspace (application) public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The part's id in the accepted blueprint",
+            "in": "path",
+            "name": "component_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlueprintResponse"
+                }
+              }
+            },
+            "description": "The blueprint without the binding"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Workspace or part not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove a part's binding. The project or service itself is untouched.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "bind_blueprint_component",
+        "parameters": [
+          {
+            "description": "Workspace (application) public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The part's id in the accepted blueprint",
+            "in": "path",
+            "name": "component_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindBlueprintComponentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlueprintResponse"
+                }
+              }
+            },
+            "description": "The blueprint with the new binding"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The binding does not fit the part"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Workspace or part not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Bind a part of the accepted blueprint to the project or service that\nrealises it.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/applications/{public_id}/blueprint/versions": {
+      "get": {
+        "operationId": "list_blueprint_versions",
+        "parameters": [
+          {
+            "description": "Workspace (application) public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1-based page. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, at most 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlueprintVersionsResponse"
+                }
+              }
+            },
+            "description": "Blueprint versions"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Workspace not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Every version of the workspace's blueprint, newest first.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      },
+      "post": {
+        "operationId": "save_blueprint_version",
+        "parameters": [
+          {
+            "description": "Workspace (application) public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveBlueprintVersionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlueprintResponse"
+                }
+              }
+            },
+            "description": "The saved, accepted version"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The document is not valid"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Workspace not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Save a version the user wrote. It replaces the accepted version (and any\nopen proposal) as it is saved.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/applications/{public_id}/blueprint/versions/{version}/accept": {
+      "post": {
+        "operationId": "accept_blueprint_version",
+        "parameters": [
+          {
+            "description": "Workspace (application) public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The proposed version",
+            "in": "path",
+            "name": "version",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlueprintResponse"
+                }
+              }
+            },
+            "description": "The blueprint after the decision"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Workspace or version not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The version was already decided or replaced"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Accept a proposed version: every chat of the workspace builds against it.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/applications/{public_id}/blueprint/versions/{version}/reject": {
+      "post": {
+        "operationId": "reject_blueprint_version",
+        "parameters": [
+          {
+            "description": "Workspace (application) public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The proposed version",
+            "in": "path",
+            "name": "version",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlueprintResponse"
+                }
+              }
+            },
+            "description": "The blueprint after the decision"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Workspace or version not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The version was already decided or replaced"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Reject a proposed version. The accepted version, if any, stays.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/assistant/conversations": {
       "post": {
         "description": "The assistant runs on the AI gateway (an OpenRouter key is enough), has no\nsandbox, and acts with the calling user's own permissions: every tool call\nis replayed through the real router with their auth, and every change is a\nproposal the user confirms in the UI. When no provider is configured this\nanswers `409` with `setup_path`, so the client can onboard instead of\nfailing.",
@@ -64810,6 +66865,17 @@
               "maximum": 100,
               "minimum": 1,
               "type": "integer"
+            }
+          },
+          {
+            "description": "Keep only chats whose title, or whose project's name or slug, contains\nthis text (case-insensitive, matched literally). At most 200\ncharacters; blank means no filter.",
+            "example": "landing page",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "maxLength": 200,
+              "type": "string"
             }
           }
         ],
@@ -65011,6 +67077,399 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/attachment-uploads": {
+      "post": {
+        "operationId": "start_attachment_upload",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartAttachmentUploadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadStarted"
+                }
+              }
+            },
+            "description": "Upload opened"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Empty file"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "File too large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Too many uploads in progress"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Upload capacity reached"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Start uploading a file in chunks, for clients behind a small request-size\nlimit. Send the chunks in order, then complete.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/attachment-uploads/{upload_id}": {
+      "delete": {
+        "operationId": "cancel_attachment_upload",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Upload id from the start request",
+            "in": "path",
+            "name": "upload_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Upload cancelled (or already gone)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Abandon an upload and free what it reserved.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/attachment-uploads/{upload_id}/chunk": {
+      "put": {
+        "operationId": "append_attachment_chunk",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Upload id from the start request",
+            "in": "path",
+            "name": "upload_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Where this chunk starts in the file: the bytes received so far.",
+            "in": "query",
+            "name": "offset",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachmentChunkUpload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentChunkReceived"
+                }
+              }
+            },
+            "description": "Chunk stored"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid chunk"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Upload not found or expired"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Chunk is not the next one expected"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Append the next chunk of an upload.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/attachment-uploads/{upload_id}/complete": {
+      "post": {
+        "operationId": "complete_attachment_upload",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Upload id from the start request",
+            "in": "path",
+            "name": "upload_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatAttachmentResponse"
+                }
+              }
+            },
+            "description": "Attachment stored"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not every byte has arrived"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Upload or conversation not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The chat has no workspace for attachments"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Finish an upload once every byte has arrived. The file is stored as a\nsingle-request upload would store it, and described the same way.",
         "tags": [
           "AI Chat"
         ],
@@ -65604,6 +68063,84 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/conversations/{public_id}/operations": {
+      "get": {
+        "operationId": "list_chat_operations",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatOperationsResponse"
+                }
+              }
+            },
+            "description": "Operations the conversation started"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The deployments, backups and restores this chat started, newest first, with\ntheir current state. Only what the caller may still read is listed:\ndeployments of projects they can access, and backups and restores when they\ncan read backups.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/conversations/{public_id}/pending-actions": {
       "get": {
         "operationId": "list_user_pending_actions",
@@ -66129,6 +68666,647 @@
           }
         ],
         "summary": "Link a sandbox to the chat, or create one for it. Replaces any earlier link.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/sandbox/changes": {
+      "get": {
+        "operationId": "get_chat_sandbox_changes",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxChanges"
+                }
+              }
+            },
+            "description": "Changes per repository"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No sandbox is linked, or it could not be started"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The Git command failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox did not answer in time"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The uncommitted Git changes of every repository under the sandbox work\ndirectory.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/sandbox/changes/diff": {
+      "get": {
+        "operationId": "get_chat_sandbox_diff",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The repository root, absolute or relative to the work directory.",
+            "in": "query",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The file, relative to the repository root.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The path before a rename, relative to the repository root.",
+            "in": "query",
+            "name": "old_path",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxFileDiff"
+                }
+              }
+            },
+            "description": "Both sides of the diff"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid repository or path"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No sandbox is linked, or it could not be started"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The Git command failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox did not answer in time"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Both sides of one changed file: as last committed, and as it is now.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/sandbox/changes/track": {
+      "post": {
+        "operationId": "track_chat_sandbox_changes",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrackSandboxChangesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxChanges"
+                }
+              }
+            },
+            "description": "Tracking started; the changes as they are now"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid path"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation, sandbox or folder not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The folder is already tracked, no sandbox is linked, or it could not be started"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The Git command failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox did not answer in time"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Put a folder of the sandbox under Git, so its changes show from now on:\na `.gitignore` for dependencies, builds and `.env` files when it has none,\nthen a first commit of what is there. A folder already inside a\nrepository is refused with `409`.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/sandbox/file": {
+      "get": {
+        "operationId": "read_chat_sandbox_file",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Absolute, or relative to the sandbox work directory.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxFileView"
+                }
+              }
+            },
+            "description": "File content"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid path"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation, sandbox or file not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No sandbox is linked, or it could not be started"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The read command failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox did not answer in time"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One file of the chat's sandbox, for the viewer. Text is cut at 1 MiB;\nbinary files come back without content.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/sandbox/files": {
+      "get": {
+        "operationId": "list_chat_sandbox_files",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Absolute, or relative to the sandbox work directory.",
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxDirectory"
+                }
+              }
+            },
+            "description": "Directory listing"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid path"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation, sandbox or directory not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No sandbox is linked, or it could not be started"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The listing command failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This server has no sandbox backend"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox did not answer in time"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List one directory of the chat's sandbox: folders first, then files.",
         "tags": [
           "AI Chat"
         ],
@@ -66686,6 +69864,301 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/conversations/{public_id}/secrets": {
+      "get": {
+        "operationId": "list_secret_requests",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SecretSlotView"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Open secret requests, never including values"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the credentials this chat has asked for and not yet used up or lost.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/secrets/{secret_id}": {
+      "put": {
+        "operationId": "provide_secret",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Secret request id",
+            "in": "path",
+            "name": "secret_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FillSecretRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretSlotView"
+                }
+              }
+            },
+            "description": "Credential stored; the response never includes it"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Empty or oversized value"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or secret request not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The request was cancelled or already closed"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The request expired"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Provide the credential the assistant asked for.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/secrets/{secret_id}/discard": {
+      "post": {
+        "operationId": "discard_secret",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Secret request id",
+            "in": "path",
+            "name": "secret_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretSlotView"
+                }
+              }
+            },
+            "description": "Request discarded"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or secret request not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Discard a credential request and anything already typed into it.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/conversations/{public_id}/stop": {
       "post": {
         "operationId": "stop_user_turn",
@@ -66710,6 +70183,308 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/suggestion-mode": {
+      "get": {
+        "operationId": "get_chat_suggestion_mode",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSuggestionSettings"
+                }
+              }
+            },
+            "description": "The chat's setting"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "A chat's next-step suggestion setting, with the default it falls back to.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "update_chat_suggestion_mode",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateChatSuggestionModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSuggestionSettings"
+                }
+              }
+            },
+            "description": "The chat's new setting"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid mode"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This chat cannot have suggestions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set a chat's own next-step suggestion mode, or clear it to follow the\nuser's default.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/suggestions": {
+      "post": {
+        "operationId": "suggest_next_steps",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SuggestNextStepsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NextSteps"
+                }
+              }
+            },
+            "description": "Suggested next steps"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The answer cursor is malformed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Suggestions are off or unavailable in this chat, a turn is running, the answer is no longer the latest, there is no answer yet, or a suggestion is already being made"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The model failed to suggest anything"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Suggest a few next steps after the chat's latest answer. The first request\nfor an answer makes one small request to the chat's model, with only the\nlast question and answer, and its cost counts toward the chat's spend. The\nresult is saved on the answer, and later requests for it return the saved\nset at no cost.",
         "tags": [
           "AI Chat"
         ],
@@ -66750,6 +70525,266 @@
           }
         ],
         "summary": "What this conversation has cost so far.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/conversations/{public_id}/workspace": {
+      "delete": {
+        "operationId": "leave_chat_workspace",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatWorkspaceResponse"
+                }
+              }
+            },
+            "description": "The chat is no longer in a workspace"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not an assistant chat"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found or not in a workspace"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Take this chat out of its workspace. It stops using the workspace's\nsandbox; the workspace and its other chats are unchanged.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      },
+      "get": {
+        "operationId": "get_chat_workspace",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatWorkspaceResponse"
+                }
+              }
+            },
+            "description": "The chat's workspace"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The workspace this chat is in, with its other chats.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "set_chat_workspace",
+        "parameters": [
+          {
+            "description": "Conversation public id",
+            "in": "path",
+            "name": "public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetChatWorkspaceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatWorkspaceResponse"
+                }
+              }
+            },
+            "description": "The chat's workspace"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conversation or workspace not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Put this chat in a workspace, creating it when asked. The chats of a\nworkspace share its sandbox, projects and architecture blueprint.",
         "tags": [
           "AI Chat"
         ],
@@ -66866,6 +70901,138 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/preferences/suggestions": {
+      "get": {
+        "operationId": "get_suggestion_default",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuggestionDefault"
+                }
+              }
+            },
+            "description": "The user's default"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The user's default for next-step suggestions.",
+        "tags": [
+          "AI Chat"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "update_suggestion_default",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SuggestionDefault"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuggestionDefault"
+                }
+              }
+            },
+            "description": "The saved default"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid mode"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set the user's default for every chat that does not set its own mode.",
         "tags": [
           "AI Chat"
         ],
@@ -67395,7 +71562,7 @@
                 }
               }
             },
-            "description": "Validation error"
+            "description": "Validation error, or a new API key that failed verification (the current key is kept)"
           },
           "401": {
             "content": {
@@ -85614,115 +89781,6 @@
         ]
       }
     },
-    "/external-services/{service_id}/query/ai-data-access": {
-      "get": {
-        "description": "Always answers (rather than 404-ing when disabled) so the console can render\nthe capability with an \"off — here's how to turn it on\" state instead of\nhiding it, and so the agent can tell \"not set up\" apart from \"not supported\".",
-        "operationId": "get_ai_data_access",
-        "parameters": [
-          {
-            "description": "External service id",
-            "in": "path",
-            "name": "service_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AiDataAccessResponse"
-                }
-              }
-            },
-            "description": "Current AI data access setting"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Service not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "summary": "Report whether the AI assistant may read row data from this service.",
-        "tags": [
-          "External Services - Query"
-        ],
-        "x-maturity": "beta"
-      },
-      "patch": {
-        "description": "Off by default. Row contents can include password hashes, API tokens and\npersonal data, and enabling this sends them to the configured AI provider —\nso it is a deliberate, audited, per-service decision by the operator.",
-        "operationId": "set_ai_data_access",
-        "parameters": [
-          {
-            "description": "External service id",
-            "in": "path",
-            "name": "service_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ToggleAiDataAccessRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AiDataAccessResponse"
-                }
-              }
-            },
-            "description": "Setting applied"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Service not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "summary": "Enable or disable AI assistant access to this service's row data.",
-        "tags": [
-          "External Services - Query"
-        ],
-        "x-maturity": "beta"
-      }
-    },
     "/external-services/{service_id}/query/containers": {
       "get": {
         "operationId": "list_root_containers",
@@ -85982,7 +90040,7 @@
     },
     "/external-services/{service_id}/query/containers/{path}/entities/{entity}/data": {
       "get": {
-        "description": "Gated for AI callers by the service's `ai_data_access` opt-in — see\n[`temps_core::ai_tool_call::AiToolCall`].",
+        "description": "The AI assistant reads through this with the user's own permissions; its\nreads are audited — see [`temps_core::ai_tool_call::AiToolCall`].",
         "operationId": "read_entity_rows",
         "parameters": [
           {
@@ -86079,7 +90137,7 @@
             "description": "Unauthorized"
           },
           "403": {
-            "description": "Insufficient permissions, or AI data access not enabled for this service"
+            "description": "Insufficient permissions"
           },
           "404": {
             "description": "Service, container, or entity not found"

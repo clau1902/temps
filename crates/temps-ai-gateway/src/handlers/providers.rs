@@ -15,6 +15,7 @@ use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use utoipa::{OpenApi, ToSchema};
 
@@ -255,7 +256,7 @@ impl From<temps_entities::ai_provider_keys::Model> for ProviderKeyResponse {
 pub struct CreateProviderKeyRequest {
     pub provider: String,
     pub display_name: String,
-    pub api_key: String,
+    pub api_key: SecretString,
     pub base_url: Option<String>,
     /// Optional model id to pin for this provider (e.g. "gpt-4o-mini").
     pub default_model: Option<String>,
@@ -280,7 +281,7 @@ where
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateProviderKeyRequest {
     pub display_name: Option<String>,
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// Double-Option: absent = leave unchanged, present-null = clear (revert to
     /// the provider's default endpoint), present-value = set.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
@@ -292,12 +293,30 @@ pub struct UpdateProviderKeyRequest {
     pub is_active: Option<bool>,
 }
 
+/// The endpoint and model a replacement key is checked against: those the same
+/// request sets, otherwise the ones already on the key. A field the request
+/// clears is checked as cleared, which is how the key will then be used.
+fn replacement_check_target<'a>(
+    current: &'a temps_entities::ai_provider_keys::Model,
+    request: &'a UpdateProviderKeyRequest,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let base_url = match request.base_url.as_ref() {
+        Some(requested) => requested.as_deref(),
+        None => current.base_url.as_deref(),
+    };
+    let default_model = match request.default_model.as_ref() {
+        Some(requested) => requested.as_deref(),
+        None => current.default_model.as_deref(),
+    };
+    (base_url, default_model)
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TestProviderKeyRequest {
     /// Provider ID: "openai", "anthropic", "xai", "gemini", "openrouter"
     pub provider: String,
     /// The raw API key to test
-    pub api_key: String,
+    pub api_key: SecretString,
     /// Optional custom base URL
     pub base_url: Option<String>,
 }
@@ -461,7 +480,7 @@ async fn create_provider_key(
         .gateway_service
         .test_provider(
             &request.provider,
-            &request.api_key,
+            request.api_key.expose(),
             request.base_url.as_deref(),
             request.default_model.as_deref(),
         )
@@ -475,7 +494,7 @@ async fn create_provider_key(
         .create(
             &request.provider,
             &request.display_name,
-            &request.api_key,
+            request.api_key.expose(),
             request.base_url.as_deref(),
             None,
         )
@@ -612,7 +631,7 @@ async fn delete_provider_model(
     request_body = UpdateProviderKeyRequest,
     responses(
         (status = 200, description = "Provider key updated", body = ProviderKeyResponse),
-        (status = 400, description = "Validation error", body = ProblemDetails),
+        (status = 400, description = "Validation error, or a new API key that failed verification (the current key is kept)", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Not found", body = ProblemDetails)
@@ -628,6 +647,23 @@ async fn update_provider_key(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayWrite);
 
+    // A replacement key is verified like a new one, against the endpoint and
+    // model it will be used with, before it overwrites a working key.
+    if let Some(api_key) = request.api_key.as_ref() {
+        let current = app_state.provider_key_service.get_by_id(id).await?;
+        let (base_url, default_model) = replacement_check_target(&current, &request);
+        app_state
+            .gateway_service
+            .test_provider(&current.provider, api_key.expose(), base_url, default_model)
+            .await
+            .map_err(|e| AiGatewayError::Validation {
+                message: format!(
+                    "API key verification failed for provider key {id} ('{}'); the current key was kept: {e}",
+                    current.display_name
+                ),
+            })?;
+    }
+
     if let Some(Some(model_id)) = request.default_model.as_ref() {
         app_state
             .provider_model_service
@@ -640,7 +676,7 @@ async fn update_provider_key(
         .update(
             id,
             request.display_name.as_deref(),
-            request.api_key.as_deref(),
+            request.api_key.as_ref().map(SecretString::expose),
             request.base_url.as_ref().map(|o| o.as_deref()),
             request.default_model.as_ref().map(|o| o.as_deref()),
             request.is_active,
@@ -722,7 +758,7 @@ async fn test_provider_key_inline(
         .gateway_service
         .test_provider(
             &request.provider,
-            &request.api_key,
+            request.api_key.expose(),
             request.base_url.as_deref(),
             None,
         )
@@ -864,5 +900,59 @@ mod patch_deser_tests {
 
         let absent: UpdateProviderKeyRequest = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(absent.default_model, None);
+    }
+}
+
+#[cfg(test)]
+mod replacement_check_tests {
+    use super::{replacement_check_target, UpdateProviderKeyRequest};
+    use chrono::Utc;
+    use temps_entities::ai_provider_keys;
+
+    fn key(base_url: Option<&str>, default_model: Option<&str>) -> ai_provider_keys::Model {
+        ai_provider_keys::Model {
+            id: 7,
+            provider: "openai".to_string(),
+            display_name: "Team key".to_string(),
+            api_key_encrypted: "encrypted".to_string(),
+            base_url: base_url.map(str::to_string),
+            default_model: default_model.map(str::to_string),
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn request(json: &str) -> UpdateProviderKeyRequest {
+        serde_json::from_str(json).expect("a valid update request")
+    }
+
+    #[test]
+    fn a_new_key_alone_is_checked_against_the_keys_own_endpoint_and_model() {
+        let current = key(Some("https://llm.example.test/v1"), Some("small-model"));
+        let update = request(r#"{"api_key":"sk-new"}"#);
+        assert_eq!(
+            replacement_check_target(&current, &update),
+            (Some("https://llm.example.test/v1"), Some("small-model"))
+        );
+    }
+
+    #[test]
+    fn an_endpoint_and_model_changed_with_the_key_are_the_ones_checked() {
+        let current = key(Some("https://old.example.test/v1"), Some("old-model"));
+        let update = request(
+            r#"{"api_key":"sk-new","base_url":"https://new.example.test/v1","default_model":"new-model"}"#,
+        );
+        assert_eq!(
+            replacement_check_target(&current, &update),
+            (Some("https://new.example.test/v1"), Some("new-model"))
+        );
+    }
+
+    #[test]
+    fn a_cleared_endpoint_or_model_is_checked_as_cleared() {
+        let current = key(Some("https://old.example.test/v1"), Some("old-model"));
+        let update = request(r#"{"api_key":"sk-new","base_url":null,"default_model":null}"#);
+        assert_eq!(replacement_check_target(&current, &update), (None, None));
     }
 }

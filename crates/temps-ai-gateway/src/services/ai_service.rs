@@ -336,6 +336,29 @@ fn tool_to_json(t: &ChatTool) -> serde_json::Value {
     })
 }
 
+/// Splits an SSE byte stream into lines. Network chunks can end in the middle
+/// of a multi-byte character (an em dash, an accented letter), so bytes are
+/// kept until a whole line has arrived and only then decoded; decoding each
+/// chunk on its own would turn both halves into U+FFFD. A `\n` byte never
+/// occurs inside a UTF-8 sequence, so splitting on it is safe.
+#[derive(Default)]
+struct SseLines {
+    bytes: Vec<u8>,
+}
+
+impl SseLines {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    /// The next complete line, newline included, or `None` until one arrives.
+    fn next_line(&mut self) -> Option<String> {
+        let end = self.bytes.iter().position(|&b| b == b'\n')?;
+        let line: Vec<u8> = self.bytes.drain(..=end).collect();
+        Some(String::from_utf8_lossy(&line).into_owned())
+    }
+}
+
 /// Merge one SSE chunk's `delta.tool_calls` fragments into the per-`index`
 /// accumulator. The first fragment for an index carries `id` + `function.name`;
 /// later fragments append `function.arguments` text. Each entry is
@@ -664,13 +687,12 @@ impl AiService for GatewayAiService {
 
         let token_stream = async_stream::stream! {
             let mut byte_stream = byte_stream;
-            let mut buffer = String::new();
+            let mut buffer = SseLines::default();
             while let Some(item) = byte_stream.next().await {
                 match item {
                     Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(newline) = buffer.find('\n') {
-                            let line: String = buffer.drain(..=newline).collect();
+                        buffer.push(&bytes);
+                        while let Some(line) = buffer.next_line() {
                             let line = line.trim();
                             let Some(data) = line.strip_prefix("data:") else {
                                 continue;
@@ -814,13 +836,12 @@ impl AiService for GatewayAiService {
         // boundaries; `data: [DONE]` terminates.
         let token_stream = async_stream::stream! {
             let mut byte_stream = byte_stream;
-            let mut buf = String::new();
+            let mut buf = SseLines::default();
             while let Some(item) = byte_stream.next().await {
                 match item {
                     Ok(bytes) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(nl) = buf.find('\n') {
-                            let line: String = buf.drain(..=nl).collect();
+                        buf.push(&bytes);
+                        while let Some(line) = buf.next_line() {
                             let line = line.trim();
                             let Some(data) = line.strip_prefix("data:") else { continue };
                             let data = data.trim();
@@ -933,16 +954,15 @@ impl AiService for GatewayAiService {
         // chunks, so buffer to line boundaries.
         let delta_stream = async_stream::stream! {
             let mut byte_stream = byte_stream;
-            let mut buf = String::new();
+            let mut buf = SseLines::default();
             // (id, name, arguments-so-far) accumulated per tool-call `index`.
             let mut pending: Vec<(String, String, String)> = Vec::new();
 
             while let Some(item) = byte_stream.next().await {
                 match item {
                     Ok(bytes) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(nl) = buf.find('\n') {
-                            let line: String = buf.drain(..=nl).collect();
+                        buf.push(&bytes);
+                        while let Some(line) = buf.next_line() {
                             let line = line.trim();
                             let Some(data) = line.strip_prefix("data:") else { continue };
                             let data = data.trim();
@@ -1012,6 +1032,37 @@ mod tests {
     use temps_core::EncryptionService;
 
     use crate::services::ProviderKeyService;
+
+    #[test]
+    fn sse_lines_keep_a_character_split_across_chunks() {
+        let line = "data: {\"content\":\"design — done\"}\n".as_bytes();
+        let dash = line
+            .iter()
+            .position(|&b| b == 0xE2)
+            .expect("the em dash starts with 0xE2");
+        let mut lines = SseLines::default();
+        // Cut inside the em dash's three bytes.
+        lines.push(&line[..dash + 1]);
+        assert_eq!(lines.next_line(), None);
+        lines.push(&line[dash + 1..]);
+        assert_eq!(
+            lines.next_line().as_deref(),
+            Some("data: {\"content\":\"design — done\"}\n")
+        );
+        assert_eq!(lines.next_line(), None);
+    }
+
+    #[test]
+    fn sse_lines_return_every_line_in_a_chunk_and_keep_the_rest() {
+        let mut lines = SseLines::default();
+        lines.push(b"data: a\n\ndata: b\ndata: c");
+        assert_eq!(lines.next_line().as_deref(), Some("data: a\n"));
+        assert_eq!(lines.next_line().as_deref(), Some("\n"));
+        assert_eq!(lines.next_line().as_deref(), Some("data: b\n"));
+        assert_eq!(lines.next_line(), None);
+        lines.push(b"\n");
+        assert_eq!(lines.next_line().as_deref(), Some("data: c\n"));
+    }
 
     /// Build a [`GatewayAiService`] over the given mock connection. The gateway
     /// half is never exercised by `resolve_model`, but the struct still needs

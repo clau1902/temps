@@ -59,3 +59,14 @@ test('a summarized chat says how much was folded, and a running compaction is di
   expect(markup).toContain('Compacting…')
   expect(markup).toContain('disabled=""')
 })
+
+test('the meter reads like the context window: title, percent used, bar', () => {
+  const markup = renderToStaticMarkup(
+    <ContextMeter
+      context={{ model: 'vendor/large', tokens: 148_900, window: 1_000_000 }}
+    />
+  )
+  expect(markup).toContain('Context window')
+  expect(markup).toContain('15% used')
+  expect(markup).toContain('148.9k of 1.0M tokens (15%)')
+})

@@ -98,6 +98,7 @@ export function mapConversationDetail(detail: {
     tools?: ChatMessage['tools'] | null
     parts?: ChatPart[] | null
     attachments?: ChatAttachment[] | null
+    next_steps?: string[] | null
   }> | null
   pending_permission?: PermissionRequest | null
   turn_status?: string | null
@@ -131,6 +132,7 @@ export function mapConversationDetail(detail: {
       tools: m.tools?.map(finishTool) ?? undefined,
       parts: rawParts && rawParts.length > 0 ? rawParts : undefined,
       attachments: m.attachments ?? undefined,
+      next_steps: m.next_steps ?? undefined,
     }
   })
   const pendingPermission = detail.pending_permission

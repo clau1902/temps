@@ -32,6 +32,7 @@ use utoipa::{IntoParams, ToSchema};
 use temps_auth::{permission_guard, Permission, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::secret_string::SecretString;
 use temps_core::RequestMetadata;
 
 use crate::ai_cli::catalog::{
@@ -168,7 +169,7 @@ pub struct SaveCredentialRequest {
     /// Plaintext credential body (API key, OAuth token, or full config file
     /// contents). Encrypted with `EncryptionService` before being persisted
     /// inside the `agent_sandbox.providers` JSON map.
-    pub credential: String,
+    pub credential: SecretString,
     /// OpenCode model to test, in `provider/model` form. Omit to use the
     /// built-in minimal probe model. A successfully verified explicit model
     /// becomes this provider's workspace default.
@@ -1124,7 +1125,7 @@ pub async fn save_ai_provider_credential(
             ),
         })
     })?;
-    if request.credential.trim().is_empty() {
+    if request.credential.expose().trim().is_empty() {
         return Err(Problem::from(AgentError::Validation {
             message: "Credential cannot be empty".into(),
         }));
@@ -1138,7 +1139,7 @@ pub async fn save_ai_provider_credential(
     let credential = canonical_credential(
         &provider_id,
         flavor.format,
-        &request.credential,
+        request.credential.expose(),
         request.verification_model.as_deref(),
     )?;
 

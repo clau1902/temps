@@ -27,7 +27,15 @@ import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
-import { Check, HelpCircle, Loader2, MapPin, Shield, X } from 'lucide-react'
+import {
+  Check,
+  HelpCircle,
+  Loader2,
+  Lock,
+  MapPin,
+  Shield,
+  X,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -35,6 +43,11 @@ import {
   untrustedMarkdownImage,
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
+import {
+  describeParameters,
+  summaryTitle,
+  type ParameterRow,
+} from './platform-write-view'
 import {
   GeneratedServiceLinkProposal,
   GeneratedServiceProposal,
@@ -393,6 +406,58 @@ function PlanApprovalVariant({
  * `<code>` block; other fields render as a key/value list. Allow sends
  * `AllowTool`; Deny opens an optional reason field.
  */
+/** What a platform change will do, as a titled list instead of raw JSON. */
+function PlatformWriteSummary({
+  title,
+  operation,
+  rows,
+  carriesHandle,
+}: {
+  title: string | null
+  operation: string | null
+  rows: ParameterRow[]
+  carriesHandle: boolean
+}) {
+  return (
+    <div className="space-y-2 rounded-lg border bg-background px-3 py-2.5 text-xs">
+      <div className="min-w-0">
+        <p className="text-sm font-medium">{title ?? operation ?? 'Change'}</p>
+        {operation && title && (
+          <code className="text-[11px] text-muted-foreground">{operation}</code>
+        )}
+      </div>
+      {rows.length > 0 && (
+        <dl className="grid grid-cols-[minmax(6rem,max-content)_minmax(0,1fr)] gap-x-4 gap-y-1">
+          {rows.map((row) => (
+            <div key={row.key} className="contents">
+              <dt className="text-muted-foreground" title={row.key}>
+                {row.label}
+              </dt>
+              <dd className="min-w-0 break-all font-mono text-[11px]">
+                {row.value.kind === 'hidden' ? (
+                  <span className="inline-flex items-center gap-1 font-sans text-muted-foreground">
+                    <Lock className="size-3" />
+                    Hidden, provided by you
+                  </span>
+                ) : (
+                  row.value.text
+                )}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {carriesHandle && (
+        <p className="flex items-start gap-1.5 border-t pt-2 text-muted-foreground">
+          <Shield className="mt-0.5 size-3.5 shrink-0" />
+          Uses the values you entered privately. Temps adds them when you
+          approve; the assistant never saw them.
+        </p>
+      )}
+    </div>
+  )
+}
+
 function ToolApprovalVariant({
   toolName,
   input,
@@ -441,6 +506,12 @@ function ToolApprovalVariant({
   const hasRichPlatformCard =
     serviceProposal !== null || serviceLinkProposal !== null
 
+  const plainPlatformWrite = platformInput !== null && !hasRichPlatformCard
+  const writeTitle = summaryTitle(
+    typeof platformInput?.summary === 'string' ? platformInput.summary : null
+  )
+  const parameterRows = describeParameters(parameters)
+
   const fields =
     input !== null && typeof input === 'object' && !Array.isArray(input)
       ? (Object.entries(input as Record<string, unknown>) as [
@@ -484,7 +555,16 @@ function ToolApprovalVariant({
         </div>
       )}
 
-      {fields.length > 0 && !hasRichPlatformCard && (
+      {plainPlatformWrite && (
+        <PlatformWriteSummary
+          title={writeTitle}
+          operation={operation}
+          rows={parameterRows}
+          carriesHandle={platformInput?.carries_handle === true}
+        />
+      )}
+
+      {fields.length > 0 && !hasRichPlatformCard && !plainPlatformWrite && (
         <div className="space-y-1 rounded-lg border bg-background px-2.5 py-2 text-xs">
           {fields.map(([key, value]) =>
             key === 'command' ? (

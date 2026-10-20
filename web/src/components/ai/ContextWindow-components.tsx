@@ -9,6 +9,33 @@ import {
 } from '@/components/ui/popover'
 import { type ContextUsage, contextPercentage } from './ContextWindow-shared'
 
+/** The ring that fills as the context window does. */
+export function ContextPie({ percentage }: { percentage: number }) {
+  return (
+    <svg viewBox="0 0 20 20" className="size-4 -rotate-90" aria-hidden="true">
+      <circle
+        cx="10"
+        cy="10"
+        r="8"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        opacity="0.2"
+      />
+      <circle
+        cx="10"
+        cy="10"
+        r="8"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        pathLength="100"
+        strokeDasharray={`${Math.min(percentage, 100)} 100`}
+      />
+    </svg>
+  )
+}
+
 export function ContextWindow({
   usage,
   model,
@@ -41,31 +68,7 @@ export function ContextWindow({
           {percentage === null ? (
             <CircleHelp className="size-4" />
           ) : (
-            <svg
-              viewBox="0 0 20 20"
-              className="size-4 -rotate-90"
-              aria-hidden="true"
-            >
-              <circle
-                cx="10"
-                cy="10"
-                r="8"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.5"
-                opacity="0.2"
-              />
-              <circle
-                cx="10"
-                cy="10"
-                r="8"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.5"
-                pathLength="100"
-                strokeDasharray={`${Math.min(percentage, 100)} 100`}
-              />
-            </svg>
+            <ContextPie percentage={percentage} />
           )}
           <span className={percentage === null ? 'sr-only' : undefined}>
             {label}

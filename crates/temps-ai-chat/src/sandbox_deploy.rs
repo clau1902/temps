@@ -101,7 +101,8 @@ pub enum SandboxDeployError {
 
     #[error(
         "{directory} in sandbox {sandbox_id} has no deployable files (node_modules, .git, \
-         .env files, credentials and build output are never uploaded)"
+         .env files, credentials and folders named dist, build, .next, target or coverage are \
+         never uploaded, at any depth)"
     )]
     Empty {
         sandbox_id: String,
@@ -118,23 +119,65 @@ pub fn deploy_tool() -> ChatTool {
         description: "Deploy the files in the linked sandbox as the source of a Temps project, \
             with no Git repository: Temps builds them with the project's preset and serves the \
             result. Use it to publish an app you built in the sandbox. The server packs the \
-            directory itself and leaves out node_modules, .git, .env files, credentials and \
-            build output, so do not zip or upload anything yourself and do not commit the code \
-            just to deploy it. The user is asked to approve the deployment. The project must \
-            deploy from uploaded source (create it with `source_type` `uploaded_source`, or \
-            `static_files` for a prebuilt static site) or have alternate sources enabled. \
-            Returns the deployment; watch it with a goal on the deployment's state."
+            directory itself and leaves out node_modules, .git, .env files, credentials and every \
+            folder named dist, build, .next, target or coverage at any depth (so a source folder \
+            such as `src/build/` must be renamed to be deployed), so do not zip or upload \
+            anything yourself and do not commit the code just to deploy it. The user is asked to \
+            approve the deployment. The project must deploy from uploaded source (create it with \
+            `source_type` `uploaded_source` so Temps builds it) or have alternate sources \
+            enabled; a `static_files` project takes plain HTML, CSS and JS, and to deploy a \
+            site already built in the sandbox, point `directory` at the output folder itself \
+            (for example `web/dist`). \
+            Returns the deployment. The chat shows its build stages live to the user, so never \
+            poll it or sleep waiting for it."
             .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "project_id": { "type": "integer", "description": "The Temps project to deploy to." },
                 "environment_id": { "type": "integer", "description": "Target environment. Defaults to the project's production environment." },
-                "directory": { "type": "string", "description": "Directory in the sandbox that holds the project (the one with package.json, index.html, a Dockerfile, …). Defaults to the sandbox work directory." }
+                "directory": { "type": "string", "description": "Directory in the sandbox that holds the project (the one with package.json, index.html, a Dockerfile, …). Defaults to the sandbox work directory, where a single project lives; set it only when the sandbox holds several projects in their own folders." }
             },
             "required": ["project_id"]
         }),
     }
+}
+
+/// What the model is told once the deployment has started. The console shows
+/// the deployment's stages live from this result, so the model is told not to
+/// poll or sleep, and is handed the exact goal that watches it: guessing one
+/// tends to miss `project_id` or point at a field that does not exist.
+fn started_result(
+    deployment_id: i32,
+    project_id: i32,
+    environment_id: i32,
+    state: &str,
+    files: usize,
+    left_out: usize,
+) -> String {
+    json!({
+        "status": "started",
+        "deployment_id": deployment_id,
+        "project_id": project_id,
+        "environment_id": environment_id,
+        "state": state,
+        "files": files,
+        "left_out": left_out,
+        "goal": {
+            "title": format!("Deployment {deployment_id} goes live"),
+            "operation_id": "get_deployment",
+            "params": { "project_id": project_id, "deployment_id": deployment_id },
+            "success_path": "status",
+            "success_values": ["completed"],
+            "failure_values": ["failed", "cancelled"],
+        },
+        "instruction": "Temps is building the project from those files, and the user already \
+            sees its stages live in the chat. Do not check on it, poll it or sleep waiting for \
+            it. If you have `temps_goal`, call it with exactly the `goal` above so you are \
+            brought back if the deployment fails, and once it is live to check the running app. \
+            Then tell the user in a sentence that it is building and end your reply.",
+    })
+    .to_string()
 }
 
 /// Files packed from a sandbox, as the ZIP the uploaded-source pipeline takes.
@@ -163,7 +206,8 @@ impl PreparedDeploy {
         };
         format!(
             "Deploy {} files ({}) from the chat's sandbox to project {}{target}, without Git. \
-             node_modules, .git, .env files and credentials are left out.",
+             node_modules, .git, .env files, credentials and build folders (dist, build, .next, \
+             target, coverage) are left out.",
             self.packed.files,
             human_bytes(self.packed.source_bytes),
             self.args.project_id
@@ -189,10 +233,18 @@ fn shell_quote(value: &str) -> String {
 /// The command that tars `directory` into `output` and prints the size of the
 /// tarball. Excluding `node_modules` and `.git` here only keeps the transfer
 /// small; the server filters every entry again.
+///
+/// GNU tar exits 1, not 0, when a file changes while it is read. The sandbox's
+/// work directory itself is touched constantly (a dev server, editors, the
+/// preview), so packing a project kept flat at its top failed every time. The
+/// archive is still complete then, and is fully parsed on the server, so 1 is
+/// accepted when the archive was written; real errors are 2.
 fn pack_command(directory: &str, output: &str) -> String {
     let output = shell_quote(output);
     format!(
-        "tar -czf {output} -C {} --exclude=node_modules --exclude=.git . && wc -c < {output}",
+        "tar -czf {output} -C {} --exclude=node_modules --exclude=.git .; status=$?; \
+         if [ \"$status\" -gt 1 ] || [ ! -s {output} ]; then exit \"$status\"; fi; \
+         wc -c < {output}",
         shell_quote(directory)
     )
 }
@@ -549,19 +601,28 @@ impl SandboxLinkService {
                     deployment.environment_id,
                 )
                 .await;
-                json!({
-                    "status": "started",
-                    "deployment_id": deployment.id,
-                    "project_id": deployment.project_id,
-                    "environment_id": deployment.environment_id,
-                    "state": deployment.state,
-                    "files": prepared.packed.files,
-                    "left_out": prepared.packed.left_out,
-                    "instruction": "Temps is building the project from those files. Tell the user \
-                        it started; check progress with the `temps` tool (the deployment's state) \
-                        and watch it with a goal if it can fail later.",
-                })
-                .to_string()
+                let operation = crate::chat_operations::NewChatOperation {
+                    kind: crate::chat_operations::ChatOperationKind::Deployment,
+                    operation_id: SANDBOX_DEPLOY_TOOL.to_string(),
+                    target_id: Some(deployment.id),
+                    project_id: Some(deployment.project_id),
+                    environment_id: Some(deployment.environment_id),
+                    service_id: None,
+                };
+                if let Err(error) =
+                    crate::chat_operations::record(self.db.as_ref(), conversation_id, operation)
+                        .await
+                {
+                    warn!(deployment_id = deployment.id, "{error}");
+                }
+                started_result(
+                    deployment.id,
+                    deployment.project_id,
+                    deployment.environment_id,
+                    &deployment.state,
+                    prepared.packed.files,
+                    prepared.packed.left_out,
+                )
             }
             Err(error) => {
                 warn!(project_id, sandbox_id = %prepared.sandbox_id, "sandbox source deploy failed: {error}");
@@ -617,6 +678,27 @@ impl SandboxLinkService {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_started_deployment_hands_the_model_the_goal_that_watches_it() {
+        let result: serde_json::Value =
+            serde_json::from_str(&started_result(41, 39, 12, "pending", 48, 3)).expect("json");
+
+        assert_eq!(result["status"], "started");
+        assert_eq!(result["deployment_id"], 41);
+        assert_eq!(result["project_id"], 39);
+        let goal = &result["goal"];
+        assert_eq!(goal["operation_id"], "get_deployment");
+        assert_eq!(
+            goal["params"],
+            json!({"project_id": 39, "deployment_id": 41})
+        );
+        assert_eq!(goal["success_path"], "status");
+        assert_eq!(goal["success_values"], json!(["completed"]));
+        assert_eq!(goal["failure_values"], json!(["failed", "cancelled"]));
+        let instruction = result["instruction"].as_str().expect("instruction");
+        assert!(instruction.contains("Do not check on it, poll it or sleep"));
+    }
+
     fn tarball(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         build(&mut builder);
@@ -669,6 +751,30 @@ mod tests {
         );
         assert_eq!(packed.files, 4);
         assert_eq!(packed.left_out, 7);
+    }
+
+    /// What the deploy tool tells the model: build folders are left out at any
+    /// depth, and a site already built deploys by packing the output folder
+    /// itself, whose files then sit at the top of the archive.
+    #[test]
+    fn build_folders_are_left_out_at_any_depth_but_their_contents_pack_alone() {
+        let project = tarball(|b| {
+            add_file(b, "./package.json", b"{}", 0o644);
+            add_file(b, "./src/build/helpers.js", b"x", 0o644);
+            add_file(b, "./web/.next/cache/x", b"x", 0o644);
+            add_file(b, "./api/target/debug/app", b"x", 0o755);
+        });
+        let packed = zip_from_tar_gz("sbx_t", "/work", &project).expect("packs");
+        assert_eq!(names(&packed), vec!["package.json"]);
+        assert_eq!(packed.left_out, 3);
+
+        let output = tarball(|b| {
+            add_file(b, "./index.html", b"<!doctype html>", 0o644);
+            add_file(b, "./assets/app.js", b"x", 0o644);
+        });
+        let packed = zip_from_tar_gz("sbx_t", "/work/web/dist", &output).expect("packs");
+        assert_eq!(names(&packed), vec!["assets/app.js", "index.html"]);
+        assert_eq!(packed.left_out, 0);
     }
 
     #[test]
@@ -786,6 +892,38 @@ mod tests {
         assert!(command.contains(r"'/work/it'\''s a dir; rm -rf /'"));
         assert!(command.starts_with("tar -czf '/tmp/out.tgz' -C "));
         assert!(command.ends_with("wc -c < '/tmp/out.tgz'"));
+    }
+
+    /// Runs the command for real: it packs a directory and prints the size,
+    /// and a missing directory still fails rather than reporting an archive.
+    #[test]
+    fn the_pack_command_packs_and_still_fails_on_a_real_error() {
+        let work = tempfile::tempdir().expect("tempdir");
+        std::fs::write(work.path().join("index.html"), "<h1>hi</h1>").expect("write");
+        let output = work.path().join("out.tgz");
+        let source = work.path().join("site");
+        std::fs::create_dir(&source).expect("mkdir");
+        std::fs::write(source.join("index.html"), "<h1>hi</h1>").expect("write");
+        let run = |directory: &str| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(pack_command(directory, &output.to_string_lossy()))
+                .output()
+                .expect("sh runs")
+        };
+
+        let packed = run(&source.to_string_lossy());
+        assert!(packed.status.success(), "{packed:?}");
+        let size: u64 = String::from_utf8_lossy(&packed.stdout)
+            .trim()
+            .parse()
+            .expect("prints the size");
+        assert_eq!(size, std::fs::metadata(&output).expect("archive").len());
+
+        std::fs::remove_file(&output).expect("rm");
+        let missing = run(&work.path().join("missing").to_string_lossy());
+        assert!(!missing.status.success());
+        assert!(missing.stdout.is_empty());
     }
 
     #[test]

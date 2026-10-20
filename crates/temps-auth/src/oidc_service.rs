@@ -318,7 +318,7 @@ impl OidcService {
             .await?;
         let encrypted_secret = self
             .encryption_service
-            .encrypt_string(&request.client_secret)
+            .encrypt_string(request.client_secret.expose())
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: request.issuer_url.clone(),
                 reason: format!("failed to encrypt client secret: {e}"),
@@ -383,7 +383,7 @@ impl OidcService {
         if let Some(client_secret) = request.client_secret {
             let encrypted_secret = self
                 .encryption_service
-                .encrypt_string(&client_secret)
+                .encrypt_string(client_secret.expose())
                 .map_err(|e| OidcError::DiscoveryFailed {
                     issuer: "local".into(),
                     reason: format!("failed to encrypt client secret: {e}"),
@@ -2918,7 +2918,7 @@ mod tests {
                 name: "Shadow Provider".to_string(),
                 issuer_url: "https://cloud.example.com".to_string(),
                 client_id: "shadow-client".to_string(),
-                client_secret: "shadow-secret".to_string(),
+                client_secret: "shadow-secret".into(),
                 scopes: "openid email profile".to_string(),
                 jit_provisioning: true,
                 enabled: true,
@@ -2968,7 +2968,7 @@ mod tests {
                 name: "Keycloak".to_string(),
                 issuer_url: "https://keycloak.example.com/realms/temps".to_string(),
                 client_id: "keycloak-client".to_string(),
-                client_secret: "keycloak-secret".to_string(),
+                client_secret: "keycloak-secret".into(),
                 scopes: "openid email profile".to_string(),
                 jit_provisioning: true,
                 enabled: true,
@@ -3054,7 +3054,7 @@ mod tests {
             name: name.to_string(),
             issuer_url: issuer_url.to_string(),
             client_id: "ordinary-client".to_string(),
-            client_secret: "ordinary-secret".to_string(),
+            client_secret: "ordinary-secret".into(),
             scopes: "openid email profile".to_string(),
             jit_provisioning: true,
             enabled: true,

@@ -42,6 +42,7 @@ mod error;
 mod handle;
 mod index;
 mod integration_tests;
+mod secrets;
 
 pub use caller::{
     ApiCallScope, ApiToolResponse, BuiltRequest, InternalApiCaller, PreparedWrite,
@@ -51,6 +52,10 @@ pub use error::ApiToolError;
 pub use handle::{ApiToolsHandle, WriteApiToolsHandle};
 pub use index::{
     ApiOperation, OperationSchema, OperationSummary, ParamLocation, ParamSpec, ReadOnlyApiIndex,
+};
+pub use secrets::{
+    is_secret_ref, pointer_is_credential, SecretPath, SecretPathSegment, SecretResolveError,
+    SecretResolver, SecretUse, SECRET_REF_PREFIX,
 };
 
 /// Build the request path+query string+optional body from a flat params object.

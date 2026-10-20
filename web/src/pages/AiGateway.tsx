@@ -131,6 +131,7 @@ import {
   Cpu,
   Hash,
   Info,
+  KeyRound,
   RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -154,6 +155,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from '@/hooks/useSettings'
 import { ReadFailure } from '@/components/ui/read-failure'
+import { ReplaceProviderKeyDialog } from '@/components/ai/ReplaceProviderKeyDialog'
 import {
   aiProviderRowStatus,
   providerKeysUnknown,
@@ -4028,6 +4030,36 @@ export function AiGatewayPage() {
     },
   })
 
+  // Replace a key's secret. The dialog keeps the key it was opened for while
+  // it animates closed, so `replaceOpen` is separate from `replacingKey`.
+  const [replacingKey, setReplacingKey] = useState<ProviderKeyResponse | null>(
+    null
+  )
+  const [replaceOpen, setReplaceOpen] = useState(false)
+  const replaceMutation = useMutation({
+    mutationFn: ({ id, apiKey }: { id: number; apiKey: string }) =>
+      updateProviderKey({
+        path: { id },
+        body: { api_key: apiKey },
+        throwOnError: true,
+      }),
+    onSuccess: (_, { id }) => {
+      queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
+      queryClient.invalidateQueries({
+        queryKey: getAiProviderStatusQueryKey(),
+      })
+      setReplaceOpen(false)
+      toast.success('API key replaced', {
+        description: 'The new key was verified with the provider.',
+        action: {
+          label: 'Test key',
+          onClick: () => testKeyMutation.mutate(id),
+        },
+      })
+    },
+    // A refusal is shown in the dialog, which stays open for another try.
+  })
+
   // Test existing key by ID
   const [testingKeyId, setTestingKeyId] = useState<number | null>(null)
   // Which provider row is expanded in the keys table
@@ -4500,6 +4532,20 @@ console.log(response.choices[0].message.content);`,
                                     variant="ghost"
                                     size="icon"
                                     className="h-8 w-8"
+                                    onClick={() => {
+                                      replaceMutation.reset()
+                                      setReplacingKey(key)
+                                      setReplaceOpen(true)
+                                    }}
+                                    title="Replace API key"
+                                    aria-label={`Replace API key for ${key.display_name}`}
+                                  >
+                                    <KeyRound className="h-4 w-4" />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
                                     onClick={() => handleToggle(key)}
                                     disabled={toggleMutation.isPending}
                                     title={
@@ -4678,6 +4724,24 @@ console.log(response.choices[0].message.content);`,
           </>
         </DialogContent>
       </Dialog>
+
+      <ReplaceProviderKeyDialog
+        open={replaceOpen}
+        onOpenChange={setReplaceOpen}
+        keyName={replacingKey?.display_name ?? ''}
+        providerName={replacingKey ? providerName(replacingKey.provider) : ''}
+        pending={replaceMutation.isPending}
+        error={
+          replaceMutation.isError
+            ? apiErrorMessage(replaceMutation.error)
+            : null
+        }
+        onReplace={(apiKey) =>
+          replacingKey
+            ? replaceMutation.mutateAsync({ id: replacingKey.id, apiKey })
+            : Promise.reject(new Error('No provider key selected'))
+        }
+      />
 
       {/* Delete Confirmation Dialog */}
       <DeleteConfirmDialog

@@ -38,7 +38,9 @@
 //! | Object required      | `obj.required: Vec<String>`                               |
 //! | $ref location        | `Ref::ref_location: String`                               |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+use crate::secrets::{secret_paths_for_request_body, SecretPath};
 
 use serde::{Deserialize, Serialize};
 use utoipa::openapi::{
@@ -308,6 +310,24 @@ pub struct ReadOnlyApiIndex {
     /// `tags`. Used to describe CLI sections in `--help`. Empty when the
     /// document declares no tag descriptions.
     tag_descriptions: BTreeMap<String, String>,
+    /// `operation_id` → where in its request body a credential goes (fields the
+    /// API flagged `x-temps-secret`). Only operations that have such fields are
+    /// present. Computed once, at construction, from the OpenAPI document.
+    secret_paths: HashMap<String, Vec<SecretPath>>,
+}
+
+/// The document's `components`, serialized once so request-body schemas can be
+/// walked as JSON. `Null` when the document has none.
+fn components_json(openapi: &utoipa::openapi::OpenApi) -> serde_json::Value {
+    serde_json::to_value(&openapi.components).unwrap_or(serde_json::Value::Null)
+}
+
+/// The credential paths for `op`'s request body, keyed for [`ReadOnlyApiIndex`].
+fn secret_paths_of(op: &Operation, components: &serde_json::Value) -> Vec<SecretPath> {
+    match op.request_body.as_ref().map(serde_json::to_value) {
+        Some(Ok(body)) => secret_paths_for_request_body(&body, components),
+        _ => Vec::new(),
+    }
 }
 
 /// Extract `tag name → description` from the OpenAPI document's top-level tags.
@@ -351,6 +371,7 @@ impl ReadOnlyApiIndex {
         Self {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
+            secret_paths: HashMap::new(),
         }
     }
 
@@ -381,6 +402,7 @@ impl ReadOnlyApiIndex {
         Self {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
+            secret_paths: HashMap::new(),
         }
     }
 
@@ -422,6 +444,7 @@ impl ReadOnlyApiIndex {
         safe_posts: &[&str],
     ) -> Self {
         let mut index = Self::from_openapi_allowlist(openapi, allowlist);
+        let components = components_json(openapi);
 
         for (path, path_item) in &openapi.paths.paths {
             let Some(op) = path_item.post.as_ref() else {
@@ -434,6 +457,10 @@ impl ReadOnlyApiIndex {
                 continue;
             }
             let body_params = resolve_body_params(op, openapi);
+            let credential_paths = secret_paths_of(op, &components);
+            if !credential_paths.is_empty() {
+                index.secret_paths.insert(op_id.clone(), credential_paths);
+            }
             index.operations.push(build_api_operation(
                 op_id.clone(),
                 path.clone(),
@@ -467,6 +494,8 @@ impl ReadOnlyApiIndex {
         allowlist: &[&str],
     ) -> Self {
         let mut operations = Vec::new();
+        let mut secret_paths = HashMap::new();
+        let components = components_json(openapi);
 
         // Pre-build a slice of (method-string, Option<Operation>) pairs from
         // each path_item so we can iterate uniformly.
@@ -498,6 +527,10 @@ impl ReadOnlyApiIndex {
                     &body_params,
                     openapi,
                 );
+                let credential_paths = secret_paths_of(op, &components);
+                if !credential_paths.is_empty() {
+                    secret_paths.insert(op_id.clone(), credential_paths);
+                }
                 operations.push(api_op);
             }
         }
@@ -505,12 +538,22 @@ impl ReadOnlyApiIndex {
         Self {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
+            secret_paths,
         }
     }
 
     /// All indexed operations, in document order.
     pub fn operations(&self) -> &[ApiOperation] {
         &self.operations
+    }
+
+    /// Where in `operation_id`'s request body a credential goes, i.e. the fields
+    /// the API declared `x-temps-secret`. Empty for operations that take none.
+    pub fn secret_fields(&self, operation_id: &str) -> &[SecretPath] {
+        self.secret_paths
+            .get(operation_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Human description for a tag/section, from the OpenAPI top-level tags.

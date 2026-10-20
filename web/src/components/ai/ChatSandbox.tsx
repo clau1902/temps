@@ -208,6 +208,40 @@ function SandboxPicker({
 }
 
 /**
+ * The one-click way to give a chat a sandbox, for the tabs that show nothing
+ * until it has one (Files, Changes, Terminal, Preview).
+ */
+export function CreateSandboxAction({
+  conversationPublicId,
+}: {
+  conversationPublicId: string
+}) {
+  const { link } = useChatSandbox(conversationPublicId)
+  return (
+    <div className="flex justify-center px-6 pb-6">
+      <Button
+        type="button"
+        size="sm"
+        disabled={link.isPending}
+        onClick={() =>
+          link.mutate({
+            path: { public_id: conversationPublicId },
+            body: { create: true },
+          })
+        }
+      >
+        {link.isPending ? (
+          <Loader2 className="size-4 animate-spin" />
+        ) : (
+          <SquareTerminal className="size-4" />
+        )}
+        {link.isPending ? 'Creating sandbox…' : 'Create sandbox'}
+      </Button>
+    </div>
+  )
+}
+
+/**
  * Everything the user can do about a chat's sandbox, in one place: why it is
  * unavailable, create or pick one, or see and unlink the one that is linked.
  * Used by the composer-row popover and by the assistant's inline offer.

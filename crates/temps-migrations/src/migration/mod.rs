@@ -322,6 +322,11 @@ mod m20261017_000001_create_ai_chat_attachments;
 mod m20261017_000002_add_text_to_ai_chat_attachments;
 mod m20261017_000003_create_sandbox_services;
 mod m20261018_000001_add_cache_tokens_to_ai_usage_logs;
+mod m20261018_000002_create_ai_secret_slots;
+mod m20261019_000001_add_ai_next_step_suggestions;
+mod m20261019_000002_create_ai_chat_operations;
+mod m20261019_000003_drop_ai_data_access_from_external_services;
+mod m20261020_000001_create_ai_blueprints;
 
 pub struct Migrator;
 
@@ -715,6 +720,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20261017_000002_add_text_to_ai_chat_attachments::Migration),
             Box::new(m20261017_000003_create_sandbox_services::Migration),
             Box::new(m20261018_000001_add_cache_tokens_to_ai_usage_logs::Migration),
+            Box::new(m20261018_000002_create_ai_secret_slots::Migration),
+            Box::new(m20261019_000001_add_ai_next_step_suggestions::Migration),
+            Box::new(m20261019_000002_create_ai_chat_operations::Migration),
+            Box::new(m20261019_000003_drop_ai_data_access_from_external_services::Migration),
+            Box::new(m20261020_000001_create_ai_blueprints::Migration),
         ]
     }
 }

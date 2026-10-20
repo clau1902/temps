@@ -530,6 +530,40 @@ body {
   animation: ai-activity-shimmer 1.4s linear infinite;
 }
 
+/* The assistant's work trace: a step slides in as it is taken, the summary
+   fades in as the work settles, and the sparkle breathes while it works. */
+@keyframes ai-trace-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@keyframes ai-trace-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes ai-trace-sparkle {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82) rotate(45deg);
+  }
+}
+
+.ai-trace-row {
+  animation: ai-trace-in 320ms cubic-bezier(0.23, 1, 0.32, 1) both;
+}
+
+.ai-trace-fade {
+  animation: ai-trace-fade 350ms ease-out both;
+}
+
+.ai-trace-sparkle {
+  animation: ai-trace-sparkle 1.6s ease-in-out infinite;
+}
+
 /* First-paint screen (InitialLoadScreen): the mark breathes and a segment
    sweeps across the track. The reduced-motion block below swaps the sweep for
    a slow full-bar fade, since a motionless bar looks like a hung load. */
@@ -568,7 +602,10 @@ body {
 
   .log-fresh-line,
   .ai-activity-pixel,
-  .ai-activity-shimmer {
+  .ai-activity-shimmer,
+  .ai-trace-row,
+  .ai-trace-fade,
+  .ai-trace-sparkle {
     animation: none;
   }
 }

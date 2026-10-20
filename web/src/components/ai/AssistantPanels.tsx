@@ -4,6 +4,7 @@
 import {
   createAssistantConversation,
   createProviderKey,
+  setChatWorkspace,
   uploadUserConversationAttachment,
   type ConversationResponse,
 } from '@/api/client'
@@ -24,6 +25,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowRight,
+  Boxes,
   Cloud,
   KeyRound,
   ArrowUp,
@@ -33,13 +35,24 @@ import {
   Sparkles,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
 import { useForm } from 'react-hook-form'
-import { Link } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { FOCUS_COMPOSER_HINT } from './assistant-view'
+import { WorkspaceChip } from './WorkspaceChip'
+import { useChatBlueprint } from './chat-blueprint'
+import { projectRequest, type ProjectChoice } from './chat-project'
+import { NewChatProjectChip } from './NewChatProjectChip'
 import { useFocusComposerShortcut } from './useFocusComposerShortcut'
 import {
   ASSISTANT_CONTEXT_TYPE,
@@ -61,14 +74,24 @@ import {
   attachmentSelectionError,
   type OpeningAttachment,
 } from './attachment-previews'
-import { ChatSpend } from './ChatSpend'
 import { DebugChatPanel } from './DebugChatPanel'
-import { DeploymentSidebar, PREVIEW_TAB } from './DeploymentSidebar'
+import {
+  ARCHITECTURE_TAB,
+  DeploymentSidebar,
+  PREVIEW_TAB,
+} from './DeploymentSidebar'
+import { WorkTabsOnboarding } from './WorkTabsOnboarding'
+import {
+  liveSearchParams,
+  PANEL_PARAM,
+  TAB_PARAM,
+  withParam,
+} from './assistant-url'
 import { resourceKeys, useChatResources } from './chat-resources'
 import { ProjectReferencesProvider } from './ProjectReference'
 import type { ProjectRef } from './project-refs'
 import { ChatSandbox } from './ChatSandbox'
-import { GoalPanel, useChatGoals } from './GoalPanel'
+import { ChatOperationsIndicator, useChatGoals } from './GoalPanel'
 import { presentGoal, watchedDeployments } from './goal-presentation'
 import { useIsDesktop, useIsMobile } from '@/components/hooks/use-mobile'
 import {
@@ -365,6 +388,8 @@ export function AssistantStart({
   onNavigate,
   cloudPath,
   roomy,
+  workspace,
+  onLeaveWorkspace,
 }: {
   onStarted: (
     conversation: ConversationResponse,
@@ -375,6 +400,11 @@ export function AssistantStart({
   cloudPath?: string
   /** Full-screen sizing: larger type and controls, content centred. */
   roomy?: boolean
+  /** A workspace the new chat joins before its first message, sharing its
+   *  blueprint and sandbox with the workspace's other chats. */
+  workspace?: NewChatWorkspaceChoice | null
+  /** Starts the chat on its own instead of in `workspace`. */
+  onLeaveWorkspace?: () => void
 }) {
   const isMobile = useIsMobile()
   const status = useQuery({
@@ -397,13 +427,20 @@ export function AssistantStart({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const newChatModel = useNewChatModel()
   const imageSupport = useAssistantImageSupport(true, newChatModel.model)
+  const [project, setProject] = useState<ProjectChoice | null>(null)
+  // The workspace the created chat already joined, so a retry after a failed
+  // upload does not join it twice.
+  const joined = useRef<string | null>(null)
 
   const start = useMutation({
     mutationFn: async (firstMessage: string) => {
       let conversation = created
       if (!conversation) {
         const { data, error, response } = await createAssistantConversation({
-          body: newChatModel.model ? { ai_model: newChatModel.model } : {},
+          body: {
+            ...(newChatModel.model ? { ai_model: newChatModel.model } : {}),
+            ...projectRequest(project),
+          },
         })
         if (!data) {
           throw new AssistantStartError(
@@ -416,6 +453,26 @@ export function AssistantStart({
         setCreated(data)
       }
       const target = conversation
+      if (workspace && joined.current !== workspace.public_id) {
+        const { data, error, response } = await setChatWorkspace({
+          path: { public_id: target.public_id },
+          body: {
+            application_id: workspace.public_id,
+            keep_sandbox: 'workspace',
+          },
+        })
+        if (!data) {
+          throw new AssistantStartError(
+            response?.status,
+            error,
+            getErrorMessage(
+              error,
+              `The chat was created but could not join ${workspace.name}.`
+            )
+          )
+        }
+        joined.current = workspace.public_id
+      }
       await Promise.all(
         files
           .filter((file) => !uploaded.current.has(file))
@@ -646,6 +703,20 @@ export function AssistantStart({
               disabled={start.isPending || created !== null}
               roomy={roomy}
             />
+            <NewChatProjectChip
+              value={project}
+              onChange={setProject}
+              disabled={start.isPending || created !== null}
+              roomy={roomy}
+            />
+            {workspace && (
+              <NewChatWorkspaceChip
+                workspace={workspace}
+                onLeave={onLeaveWorkspace}
+                disabled={start.isPending || created !== null}
+                roomy={roomy}
+              />
+            )}
           </div>
           <Button
             type="submit"
@@ -710,6 +781,84 @@ function AssistantStartSkeleton({ roomy }: { roomy?: boolean }) {
 }
 
 /**
+ * The work view before the first message: the start screen beside what the
+ * working tabs will hold. It shares the conversation's split (and its
+ * remembered size), so sending the first message does not move the columns.
+ */
+export type NewChatWorkspaceChoice = { public_id: string; name: string }
+
+/** Says which workspace a chat being started will join, with a way out. */
+function NewChatWorkspaceChip({
+  workspace,
+  onLeave,
+  disabled,
+  roomy,
+}: {
+  workspace: NewChatWorkspaceChoice
+  onLeave?: () => void
+  disabled: boolean
+  roomy?: boolean
+}) {
+  return (
+    <span
+      className={cn(
+        'inline-flex h-8 min-w-0 max-w-40 items-center gap-1.5 rounded-md border px-2 text-muted-foreground md:max-w-56',
+        roomy ? 'text-sm' : 'text-xs'
+      )}
+      title={`This chat joins the application ${workspace.name} and shares its blueprint and sandbox`}
+    >
+      <Boxes className="size-3.5 shrink-0" aria-hidden />
+      <span className="truncate">In {workspace.name}</span>
+      {onLeave && (
+        <button
+          type="button"
+          onClick={onLeave}
+          disabled={disabled}
+          className="shrink-0 rounded-sm hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+          aria-label={`Start this chat outside ${workspace.name}`}
+          title="Start it on its own instead"
+        >
+          <X className="size-3.5" />
+        </button>
+      )}
+    </span>
+  )
+}
+
+export function AssistantStartWorkView({ children }: { children: ReactNode }) {
+  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
+    id: 'assistant-deployment-split',
+    onlySaveAfterUserInteractions: true,
+  })
+  return (
+    <ResizablePanelGroup
+      orientation="horizontal"
+      className="h-full"
+      defaultLayout={defaultLayout}
+      onLayoutChanged={onLayoutChanged}
+    >
+      <ResizablePanel id="thread" minSize={360}>
+        <div className="mx-auto h-full w-full max-w-3xl">{children}</div>
+      </ResizablePanel>
+      <ResizableHandle
+        withHandle
+        aria-label="Resize deployment panel"
+        className="mx-2"
+      />
+      <ResizablePanel
+        id="deployment"
+        defaultSize="40"
+        minSize={300}
+        maxSize="50"
+        className="min-w-0"
+      >
+        <WorkTabsOnboarding />
+      </ResizablePanel>
+    </ResizablePanelGroup>
+  )
+}
+
+/**
  * An assistant conversation: the shared chat panel on the chat's model, named
  * above it. Whether changes ask first is a switch inside the composer.
  */
@@ -719,6 +868,7 @@ export function AssistantThread({
   firstAttachments,
   readOnly,
   workView = false,
+  syncUrl = false,
 }: {
   conversation: Pick<ConversationResponse, 'public_id' | 'context_id'>
   firstMessage?: string
@@ -727,6 +877,12 @@ export function AssistantThread({
   readOnly?: boolean
   /** The work view: working tabs are always docked beside the chat. */
   workView?: boolean
+  /**
+   * Keep the working tabs (open or not, and which one) in the address, so a
+   * link or reload shows the same screen. Only the full-screen page does:
+   * the dock sits on arbitrary console pages and must not rewrite their URL.
+   */
+  syncUrl?: boolean
 }) {
   const goals = useChatGoals(conversation.public_id)
   const deployments = useMemo(
@@ -734,24 +890,65 @@ export function AssistantThread({
     [goals.data]
   )
   const isDesktop = useIsDesktop()
-  const [panelOpen, setPanelOpen] = useState(false)
+  const [searchParams, setSearchParams] = useSearchParams()
+  // Callbacks below run long after the render that made them; each write
+  // starts from the live address (see `liveSearchParams`), and the setter is
+  // kept in a ref so the callbacks stay stable.
+  const setSearchParamsRef = useRef(setSearchParams)
+  useEffect(() => {
+    setSearchParamsRef.current = setSearchParams
+  })
+  const [localPanelOpen, setLocalPanelOpen] = useState(false)
+  const panelOpen = syncUrl
+    ? searchParams.get(PANEL_PARAM) === 'open'
+    : localPanelOpen
+  const urlTab = syncUrl ? searchParams.get(TAB_PARAM) : null
+  const setPanelOpen = useCallback(
+    (open: boolean) => {
+      if (!syncUrl) {
+        setLocalPanelOpen(open)
+        return
+      }
+      const current = liveSearchParams()
+      const write = setSearchParamsRef.current
+      // Closing the panel forgets which tab it was on.
+      const next = open
+        ? withParam(current, PANEL_PARAM, 'open')
+        : withParam(withParam(current, PANEL_PARAM, null), TAB_PARAM, null)
+      write(next, { replace: true })
+    },
+    [syncUrl]
+  )
+  const setUrlTab = useCallback(
+    (tab: string) => {
+      if (!syncUrl) return
+      const current = liveSearchParams()
+      const write = setSearchParamsRef.current
+      if (current.get(TAB_PARAM) === tab) return
+      write(withParam(current, TAB_PARAM, tab), { replace: true })
+    },
+    [syncUrl]
+  )
   // Projects the user opened from a reply, newest first.
   const [openedProjects, setOpenedProjects] = useState<ProjectRef[]>([])
   const [focus, setFocus] = useState({ key: '', nonce: 0 })
   // The panel always has its "Made here" tab, so it can always be opened: a
   // chat that has made nothing yet says what will appear there.
   const resources = useChatResources(conversation.public_id)
-  const openProject = useCallback((project: ProjectRef) => {
-    setOpenedProjects((current) => [
-      project,
-      ...current.filter((p) => p.id !== project.id),
-    ])
-    setFocus((current) => ({
-      key: `project:${project.id}`,
-      nonce: current.nonce + 1,
-    }))
-    setPanelOpen(true)
-  }, [])
+  const openProject = useCallback(
+    (project: ProjectRef) => {
+      setOpenedProjects((current) => [
+        project,
+        ...current.filter((p) => p.id !== project.id),
+      ])
+      setFocus((current) => ({
+        key: `project:${project.id}`,
+        nonce: current.nonce + 1,
+      }))
+      setPanelOpen(true)
+    },
+    [setPanelOpen]
+  )
   // A piece the chat makes while the user is watching opens the panel, once;
   // what an old chat already made waits for the button instead.
   const seenPieces = useRef<Set<string> | null>(null)
@@ -761,7 +958,7 @@ export function AssistantThread({
     const seen = seenPieces.current
     seenPieces.current = new Set(keys)
     if (seen && keys.some((piece) => !seen.has(piece))) setPanelOpen(true)
-  }, [resources.data])
+  }, [resources.data, setPanelOpen])
   // The assistant confirming a page is being served shows it in the Preview
   // tab; the port a chat already had when it was opened stays in the
   // background.
@@ -778,7 +975,25 @@ export function AssistantThread({
       return
     setFocus((current) => ({ key: PREVIEW_TAB, nonce: current.nonce + 1 }))
     setPanelOpen(true)
-  }, [sandbox.data, previewPort])
+  }, [sandbox.data, previewPort, setPanelOpen])
+  // An architecture proposal waiting for a decision opens the Architecture
+  // tab, once per version, so what the assistant waits for is in view.
+  const { blueprint } = useChatBlueprint(conversation.public_id)
+  const proposalVersion = blueprint.data
+    ? (blueprint.data.proposal?.version ?? null)
+    : undefined
+  const seenProposal = useRef<number | null | undefined>(undefined)
+  useEffect(() => {
+    if (proposalVersion === undefined) return
+    const before = seenProposal.current
+    seenProposal.current = proposalVersion
+    if (proposalVersion === null || before === proposalVersion) return
+    setFocus((current) => ({
+      key: ARCHITECTURE_TAB,
+      nonce: current.nonce + 1,
+    }))
+    setPanelOpen(true)
+  }, [proposalVersion, setPanelOpen])
   const panelRef = usePanelRef()
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
     id: 'assistant-deployment-split',
@@ -795,16 +1010,28 @@ export function AssistantThread({
   const newestOpen = newest ? presentGoal(newest.goal).open : false
   useEffect(() => {
     if (!newestKey || announced.current === newestKey) return
-    announced.current = newestKey
-    if (newestOpen) setPanelOpen(true)
-  }, [newestKey, newestOpen])
+    // Opening the panel can write the address, so it runs after the effect
+    // body rather than inside it. The ref is only consumed once it does, so
+    // Strict Mode's setup/cleanup replay cannot swallow the announcement.
+    let cancelled = false
+    queueMicrotask(() => {
+      if (cancelled) return
+      announced.current = newestKey
+      if (newestOpen) setPanelOpen(true)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [newestKey, newestOpen, setPanelOpen])
 
   // Wide screens dock the panel beside the chat (resizable); narrower ones
   // show the same content in a drawer, so the chat is never squeezed.
   const docked = isDesktop && (workView || panelOpen)
+  const wasShown = useRef(false)
   useEffect(() => {
     const panel = panelRef.current
     if (!panel) return
+    if (!docked) wasShown.current = false
     if (docked && panel.isCollapsed()) panel.expand()
     if (!docked && !panel.isCollapsed()) panel.collapse()
   }, [docked, panelRef])
@@ -815,6 +1042,8 @@ export function AssistantThread({
       projects={openedProjects}
       focus={focus}
       conversationPublicId={conversation.public_id}
+      initialSelected={urlTab ?? undefined}
+      onSelectedChange={setUrlTab}
       onOpenProject={openProject}
       onClose={workView ? undefined : () => setPanelOpen(false)}
     />
@@ -842,8 +1071,11 @@ export function AssistantThread({
             )}
           >
             <div className="flex shrink-0 items-center justify-end gap-2">
+              <ChatOperationsIndicator
+                conversationPublicId={conversation.public_id}
+              />
+              <WorkspaceChip conversationPublicId={conversation.public_id} />
               <ChatSandbox conversationPublicId={conversation.public_id} />
-              <ChatSpend conversationPublicId={conversation.public_id} />
               {!workView && (
                 <Button
                   type="button"
@@ -851,7 +1083,7 @@ export function AssistantThread({
                   size="sm"
                   className="h-8 gap-1.5"
                   aria-pressed={panelOpen}
-                  onClick={() => setPanelOpen((open) => !open)}
+                  onClick={() => setPanelOpen(!panelOpen)}
                   title="Show what this chat made and the deployments it is working on"
                 >
                   <Rocket className="size-4" />
@@ -859,7 +1091,6 @@ export function AssistantThread({
                 </Button>
               )}
             </div>
-            <GoalPanel conversationPublicId={conversation.public_id} />
             <div className="min-h-0 flex-1">
               <DebugChatPanel
                 key={conversation.public_id}
@@ -892,7 +1123,11 @@ export function AssistantThread({
           collapsedSize={0}
           disabled={!docked}
           onResize={(size) => {
-            if (size.asPercentage !== 0 || !docked) return
+            // A page opened on `panel=open` starts the panel at zero for a
+            // moment before the effect above expands it; that is not the user
+            // dragging it shut.
+            if (size.asPercentage > 0) wasShown.current = true
+            if (size.asPercentage !== 0 || !docked || !wasShown.current) return
             // The work view keeps its tabs; elsewhere closing is the user's call.
             if (workView) panelRef.current?.expand()
             else setPanelOpen(false)
@@ -916,6 +1151,8 @@ export function AssistantThread({
             projects={openedProjects}
             focus={focus}
             conversationPublicId={conversation.public_id}
+            initialSelected={urlTab ?? undefined}
+            onSelectedChange={setUrlTab}
             onOpenProject={openProject}
             inDrawer
           />

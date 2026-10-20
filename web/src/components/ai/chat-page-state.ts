@@ -141,3 +141,112 @@ export function createProjectChat(
     autoStart: false,
   }
 }
+
+/** How many chats the list asks for at a time. */
+export const CHAT_LIST_PAGE_SIZE = 30
+/** The most the list endpoint returns in one page. */
+const CHAT_LIST_MAX_PAGE_SIZE = 100
+
+export interface ListedChat extends ChatRouteItem {
+  last_activity_at: string
+}
+
+function activityTime(chat: ListedChat): number {
+  const time = Date.parse(chat.last_activity_at)
+  return Number.isNaN(time) ? 0 : time
+}
+
+/** Most recently active first, keeping the server's order between equals. */
+function byActivity<T extends ListedChat>(chats: T[]): T[] {
+  return [...chats].sort((a, b) => activityTime(b) - activityTime(a))
+}
+
+/**
+ * The page to ask for when the user loads older chats, given how many listed
+ * chats are already shown. Rounding down re-reads a partly seen page instead
+ * of skipping chats that moved up because others were deleted in the
+ * meantime; the repeats are dropped by {@link appendChatPage}.
+ */
+export function nextChatListPage(
+  listedCount: number,
+  pageSize: number = CHAT_LIST_PAGE_SIZE
+): number {
+  return Math.floor(listedCount / pageSize) + 1
+}
+
+/**
+ * How many chats a refresh asks for: enough to cover every page already
+ * loaded, so refreshing after a rename does not collapse the list back to the
+ * first page.
+ */
+export function chatListRefreshSize(
+  listedCount: number,
+  pageSize: number = CHAT_LIST_PAGE_SIZE
+): number {
+  const pages = Math.max(1, Math.ceil(listedCount / pageSize))
+  return Math.min(CHAT_LIST_MAX_PAGE_SIZE, pages * pageSize)
+}
+
+/** Adds a page of older chats; the page's copy of a chat already shown wins. */
+export function appendChatPage<T extends ListedChat>(
+  existing: T[],
+  page: T[]
+): T[] {
+  const fromPage = new Map(page.map((chat) => [chat.public_id, chat]))
+  const updated = existing.map((chat) => fromPage.get(chat.public_id) ?? chat)
+  const shown = new Set(existing.map((chat) => chat.public_id))
+  return byActivity([
+    ...updated,
+    ...page.filter((chat) => !shown.has(chat.public_id)),
+  ])
+}
+
+/**
+ * Replaces the newest chats with a fresh first page. Older chats the user had
+ * already loaded (or opened from a link) stay, unless the fresh page is the
+ * whole list: then anything missing from it was deleted.
+ */
+export function refreshChatList<T extends ListedChat>(
+  existing: T[],
+  fresh: T[],
+  requested: number,
+  hadMore: boolean
+): { chats: T[]; hasMore: boolean } {
+  if (fresh.length < requested) return { chats: fresh, hasMore: false }
+  const oldest = Math.min(...fresh.map(activityTime))
+  const inFresh = new Set(fresh.map((chat) => chat.public_id))
+  const older = existing.filter(
+    (chat) => !inFresh.has(chat.public_id) && activityTime(chat) < oldest
+  )
+  return {
+    chats: byActivity([...fresh, ...older]),
+    hasMore: older.length > 0 ? hadMore : true,
+  }
+}
+
+/**
+ * Adds a chat opened from a link that is older than the pages loaded so far,
+ * so the list shows (and highlights) what is open.
+ */
+export function withLinkedChat<T extends ListedChat>(
+  existing: T[],
+  chat: T
+): T[] {
+  if (existing.some((item) => item.public_id === chat.public_id)) {
+    return existing
+  }
+  return byActivity([...existing, chat])
+}
+
+/**
+ * Search matches from every chat that the loaded list does not hold. The
+ * loaded ones are already offered, filtered as the user types, so they are not
+ * repeated.
+ */
+export function chatsNotListed<T extends { public_id: string }>(
+  listed: { public_id: string }[],
+  matches: T[]
+): T[] {
+  const shown = new Set(listed.map((chat) => chat.public_id))
+  return matches.filter((chat) => !shown.has(chat.public_id))
+}

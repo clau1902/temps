@@ -4,7 +4,9 @@
 import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 import { useQueryClient } from '@tanstack/react-query'
 import { FOCUS_COMPOSER_HINT } from './assistant-view'
+import { uploadChatAttachment } from './chat-attachment-upload'
 import { useFocusComposerShortcut } from './useFocusComposerShortcut'
+import { invalidateChatOperations } from './chat-operations'
 import { invalidateChatResources } from './chat-resources'
 import {
   ChatDetailContext,
@@ -32,7 +34,6 @@ import {
   stopUserTurn,
   updatePermissionMode,
   updateUserPermissionMode,
-  uploadUserConversationAttachment,
   type ConversationDetailResponse,
   type ConversationResponse,
   type SendMessageRequest,
@@ -55,11 +56,40 @@ import {
   isSandboxScopedTool,
   offerReason,
 } from '@/components/ai/chat-sandbox'
+import {
+  isRequestSecretTool,
+  parseSecretRequest,
+  SECRETS_PROVIDED_MESSAGE,
+  type SecretRequest,
+} from '@/components/ai/chat-secrets'
+import { SecretRequestCard } from '@/components/ai/SecretRequestCard'
+import { AskUserAnswerCard } from '@/components/ai/AskUserAnswerCard'
+import {
+  answeredQuestionPermissionIds,
+  isAskUserTool,
+  parseAskUserResult,
+} from '@/components/ai/ask-user'
+import {
+  isSandboxDeployTool,
+  parseSandboxDeployStarted,
+  sandboxDeploySummary,
+} from '@/components/ai/sandbox-deploy'
 import { GeneratedDeploymentCard } from '@/components/ai/GeneratedDeploymentCard'
+import { BlueprintProposalCard } from '@/components/ai/BlueprintProposalCard'
+import {
+  CHAT_CONTINUE_EVENT,
+  isProposeBlueprintTool,
+  parseBlueprintProposal,
+  type BlueprintProposalReceipt,
+  type ChatContinueDetail,
+} from '@/components/ai/chat-blueprint'
 import { GeneratedProjectCollection } from '@/components/ai/GeneratedProjectCollection'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { AiAgentLogo } from '@/components/ui/ai-agent-logo'
 import { SessionDiagnostics } from './SessionDiagnostics'
+import { ChatContextMeter } from './ChatSpend'
+import { ChatNextSteps, ChatSuggestionControl } from './ChatNextSteps'
+import { answeredSince, latestAnswerKey } from './next-steps'
 import { ContextWindow, type ContextUsage } from './ContextWindow'
 import { Button } from '@/components/ui/button'
 import {
@@ -88,6 +118,7 @@ import {
   FileText,
   Image as ImageIcon,
   Info,
+  ListPlus,
   Lock,
   Loader2,
   Paperclip,
@@ -106,6 +137,7 @@ import {
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
 import { ProjectChip, useProjectReference } from './ProjectReference'
+import { QueuedMessages } from './QueuedMessages'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   SearchableSelect,
@@ -123,6 +155,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type CSSProperties,
 } from 'react'
 import { toast } from 'sonner'
 import ReactMarkdown, { type Components } from 'react-markdown'
@@ -159,13 +192,33 @@ import {
   resolveChatComposerLayout,
 } from './chat-page-state'
 import {
+  isQueueShortcut,
+  mergeQueuedMessages,
+  queueShortcutLabel,
+  readChatQueue,
+  useChatMessageQueue,
+  type QueuedChatMessage,
+} from './chat-message-queue'
+import {
   assistantParts,
   toolExecutionState,
   isTempsWriteToolName,
   type ChatMessage,
   type ChatAttachment,
+  type ChatPart,
   type ToolCall,
 } from './chat-message-parts'
+import {
+  failedToolCount,
+  groupAssistantParts,
+  liveWorkSegmentKey,
+  runningTool,
+  stepTools,
+  toolActivity,
+  traceStep,
+  workSummary,
+  type WorkStep,
+} from './assistant-work'
 import {
   prependHistoryPage,
   reconcileLatestHistoryPage,
@@ -187,6 +240,7 @@ import {
   revokeAttachmentPreviews,
 } from './attachment-previews'
 import { ChatFailureActions } from './ChatFailureActions'
+import { upstreamFailureMessage } from './platform-write-view'
 import { isHarnessFailure } from './chat-failure-recovery'
 import {
   type MdNode,
@@ -447,10 +501,10 @@ function toolFailureText(result: string | null | undefined): string {
     if (
       error &&
       typeof error === 'object' &&
-      error.is_error === true &&
-      typeof error.error === 'string'
+      typeof error.error === 'string' &&
+      (error.is_error === true || error.status === 'failed')
     ) {
-      return error.error
+      return upstreamFailureMessage(error.error)
     }
   } catch {
     // Native command output is already readable text.
@@ -568,6 +622,65 @@ export function ToolCard({ tool }: { tool: ToolCall }) {
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/** A question the assistant asked: nothing while it is open (the question card
+ * is where it is answered), the saved answers once it is done, and the plain
+ * tool card for a call the server refused. */
+function AskUserToolPart({ tool }: { tool: ToolCall }) {
+  const outcome = parseAskUserResult(tool.result)
+  if (outcome) return <AskUserAnswerCard outcome={outcome} />
+  if (tool.result == null) return null
+  return <ToolCard tool={tool} />
+}
+
+/** A deployment of the sandbox's files: its stages, live, once it has
+ * started. While the call waits for approval or packs the files, and when it
+ * refused, the plain tool card says so. `createdAt` is the message's time, so
+ * a reopened chat stops looking for a deployment it cannot find. */
+function SandboxDeployToolPart({
+  tool,
+  createdAt,
+}: {
+  tool: ToolCall
+  createdAt: string | null
+}) {
+  const started = parseSandboxDeployStarted(tool.result)
+  const queryClient = useQueryClient()
+  const deploymentId = started?.deploymentId ?? null
+  // The deployment joins the chat's operations button straight away.
+  useEffect(() => {
+    if (deploymentId !== null) void invalidateChatOperations(queryClient)
+  }, [deploymentId, queryClient])
+  if (!started) return <ToolCard tool={tool} />
+  return (
+    <div className="min-w-0 overflow-hidden rounded-lg border border-border bg-background text-xs">
+      <GeneratedDeploymentCard
+        paramsJson={tool.arguments}
+        resultJson={tool.result ?? null}
+        actionStatus="executed"
+        createdAt={createdAt}
+        summary={sandboxDeploySummary(started)}
+        statusLabel="Queued"
+      />
+      <details className="group border-t">
+        <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground sm:px-4">
+          <ChevronRight className="size-3.5 transition-transform group-open:rotate-90" />
+          Request details
+        </summary>
+        <div className="min-w-0 space-y-2 border-t px-3 py-2.5 sm:px-4">
+          <div className="min-w-0 space-y-1">
+            <div className="font-medium text-muted-foreground">Arguments</div>
+            <ToolBlock value={tool.arguments} />
+          </div>
+          <div className="min-w-0 space-y-1">
+            <div className="font-medium text-muted-foreground">Result</div>
+            <ToolBlock value={tool.result ?? ''} />
+          </div>
+        </div>
+      </details>
     </div>
   )
 }
@@ -698,10 +811,13 @@ function PendingActionCard({
   const onStatusChangeRef = useRef(onStatusChange)
   const queryClient = useQueryClient()
 
-  // A write that ran may have made a project, service or repository: the
-  // chat's "Made here" tab asks again.
+  // A write that ran may have made a project, service or repository, or
+  // started a deployment or backup: the "Made here" tab and the operations
+  // button ask again.
   useEffect(() => {
-    if (status === 'executed') void invalidateChatResources(queryClient)
+    if (status !== 'executed') return
+    void invalidateChatResources(queryClient)
+    void invalidateChatOperations(queryClient)
   }, [status, queryClient])
 
   useEffect(() => {
@@ -1054,7 +1170,9 @@ function PlanActionCard({
     (state) => state.status === 'executed'
   ).length
   useEffect(() => {
-    if (executedSteps > 0) void invalidateChatResources(queryClient)
+    if (executedSteps === 0) return
+    void invalidateChatResources(queryClient)
+    void invalidateChatOperations(queryClient)
   }, [executedSteps, queryClient])
 
   const statuses = plan.steps.map(
@@ -1522,23 +1640,6 @@ function ActivityIndicator({
   /** Durable server timestamp for the active turn. */
   startedAt?: string | null
 }) {
-  const [nowMs, setNowMs] = useState(() => Date.now())
-
-  useEffect(() => {
-    if (compact) return
-    const timer = window.setInterval(() => {
-      setNowMs(Date.now())
-    }, 100)
-    return () => window.clearInterval(timer)
-  }, [compact])
-
-  const deciseconds = serverElapsedDeciseconds(startedAt, nowMs)
-  const elapsed = deciseconds / 10
-  const elapsedLabel =
-    elapsed < 60
-      ? `${elapsed.toFixed(1)}s`
-      : `${Math.floor(elapsed / 60)}m ${(elapsed % 60).toFixed(1)}s`
-
   return (
     <span
       className={cn(
@@ -1565,11 +1666,7 @@ function ActivityIndicator({
           {label}
         </span>
       )}
-      {!compact && (
-        <span className="font-mono text-[12px] tabular-nums text-muted-foreground">
-          {elapsedLabel}
-        </span>
-      )}
+      {!compact && <ElapsedTime startedAt={startedAt} />}
     </span>
   )
 }
@@ -1639,11 +1736,300 @@ function MarkdownText({ text }: { text: string }) {
   )
 }
 
+/** Seconds since the turn started, ticking while it is shown. */
+function ElapsedTime({ startedAt }: { startedAt?: string | null }) {
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 100)
+    return () => window.clearInterval(timer)
+  }, [])
+  const elapsed = serverElapsedDeciseconds(startedAt, nowMs) / 10
+  return (
+    <span className="font-mono text-[12px] tabular-nums text-muted-foreground">
+      {elapsed < 60
+        ? `${elapsed.toFixed(1)}s`
+        : `${Math.floor(elapsed / 60)}m ${(elapsed % 60).toFixed(1)}s`}
+    </span>
+  )
+}
+
+/** While a turn works its trace shows only its latest steps. */
+const LIVE_TRACE_STEPS = 4
+
+function TraceSparkle({ working }: { working: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      className={cn(
+        'size-4 shrink-0 fill-current transition-colors duration-200',
+        working
+          ? 'ai-trace-sparkle text-foreground/75'
+          : 'text-muted-foreground'
+      )}
+    >
+      <path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z" />
+    </svg>
+  )
+}
+
+function TraceStateIcon({
+  state,
+}: {
+  state: 'running' | 'completed' | 'failed'
+}) {
+  if (state === 'running')
+    return (
+      <span
+        className="size-3 shrink-0 animate-spin rounded-full border-[1.5px] border-border border-t-foreground/70"
+        aria-label="Running"
+        role="img"
+      />
+    )
+  if (state === 'failed')
+    return (
+      <X className="size-3.5 shrink-0 text-destructive" aria-label="Failed" />
+    )
+  return (
+    <Check
+      className="size-3.5 shrink-0 text-muted-foreground"
+      aria-label="Done"
+    />
+  )
+}
+
+/** One tool in the trace: what it did in a line, its input and result on click. */
+function TraceToolRow({
+  tool,
+  order,
+  selected,
+  onSelect,
+}: {
+  tool: ToolCall
+  order: number
+  selected: boolean
+  onSelect: () => void
+}) {
+  const state = toolExecutionState(tool)
+  const step = traceStep(tool)
+  const note = state === 'completed' ? processToolSummary(tool) : undefined
+  return (
+    <div className="ai-trace-row min-w-0" style={traceRowDelay(order)}>
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-expanded={selected}
+        title={toolLabel(tool)}
+        className={cn(
+          'flex min-h-7 w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-0.5 text-left transition-colors duration-150',
+          selected ? 'bg-muted' : 'hover:bg-muted/60'
+        )}
+      >
+        <TraceStateIcon state={state} />
+        <span className="shrink-0 text-[12.5px] font-medium text-foreground">
+          {step.verb}
+        </span>
+        {step.detail && (
+          <span className="min-w-0 truncate font-mono text-[11.5px] text-muted-foreground">
+            {step.detail}
+          </span>
+        )}
+        {step.added !== undefined && (
+          <span className="shrink-0 font-mono text-[11px] tabular-nums">
+            <span className="text-emerald-600 dark:text-emerald-400">
+              +{step.added}
+            </span>
+            {step.removed ? (
+              <span className="text-destructive"> −{step.removed}</span>
+            ) : null}
+          </span>
+        )}
+        {note && (
+          <span className="shrink-0 text-[11.5px] text-muted-foreground">
+            {note}
+          </span>
+        )}
+      </button>
+      {state === 'failed' && !selected && (
+        <p className="mb-1 ml-7 line-clamp-2 break-words font-mono text-[11px] text-destructive">
+          {toolFailureText(tool.result)}
+        </p>
+      )}
+      {selected && (
+        <div className="mb-1.5 ml-7 mt-1 min-w-0 space-y-2 text-xs">
+          <div className="min-w-0 space-y-1">
+            <div className="font-medium text-muted-foreground">Input</div>
+            <ToolBlock value={tool.arguments} />
+          </div>
+          {state !== 'running' && (
+            <div className="min-w-0 space-y-1">
+              <div className="font-medium text-muted-foreground">Result</div>
+              <ToolBlock value={tool.result ?? ''} />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Rows that appear together arrive one after another, briefly. */
+function traceRowDelay(order: number): CSSProperties {
+  return { animationDelay: `${Math.min(order, 6) * 40}ms` }
+}
+
+/**
+ * The work behind an answer, as a trace the way the answer reads best. While
+ * the turn works on it, the trace is open on its latest steps under a ticking
+ * "Working"; once it moves on, it folds to what it did ("Ran 4 commands, read
+ * 2 files"). Opening it lists every step in order, narration included, and
+ * each step opens to its input and result. Opening or closing it by hand wins
+ * over all of that.
+ */
+function AssistantWorkGroup({
+  steps,
+  live,
+  activityLabel,
+  turnStartedAt,
+  conversationPublicId,
+}: {
+  steps: WorkStep[]
+  /** The turn is still working on this group. */
+  live: boolean
+  activityLabel: string
+  turnStartedAt?: string | null
+  conversationPublicId: string | null
+}) {
+  const { expandToolCalls } = useChatDetail()
+  const [chosenOpen, setChosenOpen] = useState<boolean | null>(
+    expandToolCalls ? true : null
+  )
+  const [selectedTool, setSelectedTool] = useState<string | null>(null)
+  const open = chosenOpen ?? live
+  // A trace never opened has nothing to lay out; once opened it stays
+  // mounted so closing it animates.
+  const [opened, setOpened] = useState(open)
+  if (open && !opened) setOpened(true)
+
+  const tools = stepTools(steps)
+  const failed = failedToolCount(tools)
+  const tail =
+    live && chosenOpen === null && steps.length > LIVE_TRACE_STEPS
+      ? steps.slice(-LIVE_TRACE_STEPS)
+      : steps
+  const earlier = steps.length - tail.length
+  const current = runningTool(steps) ?? tools[tools.length - 1] ?? null
+  const currentActivity = current
+    ? (toolActivity(current) ?? toolLabel(current))
+    : null
+  const sandboxTools = conversationPublicId
+    ? tools.filter(
+        (tool) =>
+          isSandboxCreateTool(tool.name) || isSandboxScopedTool(tool.name)
+      )
+    : []
+
+  return (
+    <div className="min-w-0">
+      <button
+        type="button"
+        onClick={() => setChosenOpen(!open)}
+        aria-expanded={open}
+        className="-mx-1.5 flex w-fit max-w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left transition-colors duration-100 hover:bg-muted/60"
+      >
+        <TraceSparkle working={live} />
+        {live ? (
+          <span
+            role="status"
+            aria-label={activityLabel}
+            className="flex min-w-0 items-center gap-2"
+          >
+            <span className="ai-activity-shimmer whitespace-nowrap bg-gradient-to-r from-muted-foreground from-35% via-foreground via-50% to-muted-foreground to-65% bg-[length:200%_100%] bg-clip-text text-[13px] font-medium text-transparent">
+              {activityLabel}
+            </span>
+            <ElapsedTime startedAt={turnStartedAt} />
+          </span>
+        ) : (
+          <span className="ai-trace-fade min-w-0 truncate text-[13px] font-medium text-muted-foreground">
+            {workSummary(tools)}
+            {failed > 0 && (
+              <span className="text-destructive"> · {failed} failed</span>
+            )}
+          </span>
+        )}
+        <ChevronDown
+          className={cn(
+            'size-3.5 shrink-0 text-muted-foreground transition-transform duration-300',
+            open && 'rotate-180'
+          )}
+          aria-hidden="true"
+        />
+      </button>
+      {live && !open && currentActivity && (
+        <p
+          className="ml-6 truncate text-xs text-muted-foreground"
+          title={currentActivity}
+        >
+          {currentActivity}
+        </p>
+      )}
+      <div
+        className="grid transition-[grid-template-rows,opacity] duration-300 ease-[cubic-bezier(0.23,1,0.32,1)] motion-reduce:transition-none"
+        style={{
+          gridTemplateRows: open ? '1fr' : '0fr',
+          opacity: open ? 1 : 0,
+        }}
+        inert={!open}
+      >
+        <div className="min-h-0 overflow-hidden">
+          {opened && (
+            <div className="ml-[7.5px] mt-0.5 flex min-w-0 flex-col gap-0.5 border-l py-1 pl-3">
+              {earlier > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setChosenOpen(true)}
+                  className="w-fit rounded-md px-1.5 py-0.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                >
+                  {earlier} earlier {earlier === 1 ? 'step' : 'steps'}
+                </button>
+              )}
+              {tail.map((step, order) => (
+                <TraceToolRow
+                  key={step.tool.id}
+                  tool={step.tool}
+                  order={order}
+                  selected={selectedTool === step.tool.id}
+                  onSelect={() =>
+                    setSelectedTool((id) =>
+                      id === step.tool.id ? null : step.tool.id
+                    )
+                  }
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+      {/* The sandbox panel follows these tools whether or not they are shown. */}
+      {conversationPublicId &&
+        sandboxTools.map((tool) => (
+          <SandboxStatusRefresher
+            key={tool.id}
+            conversationPublicId={conversationPublicId}
+            done={tool.result != null}
+          />
+        ))}
+    </div>
+  )
+}
+
 /**
  * The body of an assistant turn: its ordered text/tool/permission segments, so
  * cards render inline where they occurred instead of all hoisted above the
- * prose. The activity indicator remains visible for the full server-owned
- * turn, including while tokens and tool cards stream into the message.
+ * prose. Routine tool work folds into work groups; cards that need the user,
+ * and the answer itself, stay in full. The activity indicator remains visible
+ * for the full server-owned turn — in the header of the group being worked on,
+ * or after the content while text streams.
  */
 export function AssistantBody({
   message,
@@ -1656,6 +2042,7 @@ export function AssistantBody({
   fromProject = false,
   onFix,
   onPermissionResolved,
+  onSecretsProvided,
 }: {
   message: ChatMessage
   streaming: boolean
@@ -1667,66 +2054,151 @@ export function AssistantBody({
   fromProject?: boolean
   onFix?: (text: string) => void
   onPermissionResolved?: () => void
+  onSecretsProvided?: () => void
 }) {
   const parts = assistantParts(message)
+  const answeredQuestions = answeredQuestionPermissionIds(parts)
   if (parts.length === 0) {
     return streaming ? (
       <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
     ) : null
   }
+  const segments = groupAssistantParts(parts, (tool) =>
+    isFoldableTool(tool, conversationPublicId)
+  )
+  const liveWorkKey = liveWorkSegmentKey(segments, streaming)
+
+  const renderPart = (part: ChatPart, idx: number) =>
+    part.type === 'tool' ? (
+      // A `temps_write` tool is a *proposed* mutation — render the human
+      // confirm/reject gate instead of a read-only result card.
+      isTempsWriteToolName(part.tool.name) ? (
+        <WriteProposalCard
+          key={part.tool.id}
+          userScoped={userScoped}
+          projectId={projectId}
+          tool={part.tool}
+          onFix={onFix}
+        />
+      ) : isAskUserTool(part.tool.name) ? (
+        <AskUserToolPart key={part.tool.id} tool={part.tool} />
+      ) : isProposeBlueprintTool(part.tool.name) &&
+        conversationPublicId &&
+        parseBlueprintProposal(part.tool.result) ? (
+        <BlueprintProposalCard
+          key={part.tool.id}
+          conversationPublicId={conversationPublicId}
+          receipt={
+            parseBlueprintProposal(part.tool.result) as BlueprintProposalReceipt
+          }
+        />
+      ) : isSandboxDeployTool(part.tool.name) ? (
+        <Fragment key={part.tool.id}>
+          <SandboxDeployToolPart
+            tool={part.tool}
+            createdAt={message.created_at ?? null}
+          />
+          {conversationPublicId && (
+            <SandboxStatusRefresher
+              conversationPublicId={conversationPublicId}
+              done={part.tool.result != null}
+            />
+          )}
+        </Fragment>
+      ) : isRequestSecretTool(part.tool.name) &&
+        conversationPublicId &&
+        parseSecretRequest(part.tool.result) ? (
+        <SecretRequestCard
+          key={part.tool.id}
+          conversationPublicId={conversationPublicId}
+          request={parseSecretRequest(part.tool.result) as SecretRequest}
+          onProvided={onSecretsProvided}
+        />
+      ) : isSandboxOfferTool(part.tool.name) && conversationPublicId ? (
+        <SandboxOfferCard
+          key={part.tool.id}
+          conversationPublicId={conversationPublicId}
+          reason={offerReason(part.tool.arguments)}
+          fromProject={fromProject}
+        />
+      ) : (isSandboxCreateTool(part.tool.name) ||
+          isSandboxScopedTool(part.tool.name)) &&
+        conversationPublicId ? (
+        <Fragment key={part.tool.id}>
+          <ReadToolResultCard tool={part.tool} />
+          <SandboxStatusRefresher
+            conversationPublicId={conversationPublicId}
+            done={part.tool.result != null}
+          />
+        </Fragment>
+      ) : (
+        <ReadToolResultCard key={part.tool.id} tool={part.tool} />
+      )
+    ) : part.type === 'permission' ? (
+      answeredQuestions.has(part.permission.id) ? null : (
+        // ADR-038 Phase 2: interactive bridge permission request
+        <PermissionCard
+          key={`perm-${part.permission.id}`}
+          conversationPublicId={conversationPublicId ?? ''}
+          permission={part.permission}
+          projectId={projectId}
+          userScoped={userScoped}
+          onResolved={onPermissionResolved}
+        />
+      )
+    ) : (
+      <MarkdownText key={`text-${idx}`} text={part.text} />
+    )
+
   return (
     <>
-      {parts.map((part, idx) =>
-        part.type === 'tool' ? (
-          // A `temps_write` tool is a *proposed* mutation — render the human
-          // confirm/reject gate instead of a read-only result card.
-          isTempsWriteToolName(part.tool.name) ? (
-            <WriteProposalCard
-              key={part.tool.id}
-              userScoped={userScoped}
-              projectId={projectId}
-              tool={part.tool}
-              onFix={onFix}
-            />
-          ) : isSandboxOfferTool(part.tool.name) && conversationPublicId ? (
-            <SandboxOfferCard
-              key={part.tool.id}
-              conversationPublicId={conversationPublicId}
-              reason={offerReason(part.tool.arguments)}
-              fromProject={fromProject}
-            />
-          ) : (isSandboxCreateTool(part.tool.name) ||
-              isSandboxScopedTool(part.tool.name)) &&
-            conversationPublicId ? (
-            <Fragment key={part.tool.id}>
-              <ReadToolResultCard tool={part.tool} />
-              <SandboxStatusRefresher
-                conversationPublicId={conversationPublicId}
-                done={part.tool.result != null}
-              />
-            </Fragment>
-          ) : (
-            <ReadToolResultCard key={part.tool.id} tool={part.tool} />
-          )
-        ) : part.type === 'permission' ? (
-          // ADR-038 Phase 2: interactive bridge permission request
-          <PermissionCard
-            key={`perm-${part.permission.id}`}
-            conversationPublicId={conversationPublicId ?? ''}
-            permission={part.permission}
-            projectId={projectId}
-            userScoped={userScoped}
-            onResolved={onPermissionResolved}
+      {segments.map((segment) =>
+        segment.kind === 'work' ? (
+          <AssistantWorkGroup
+            key={segment.key}
+            steps={segment.steps}
+            live={segment.key === liveWorkKey}
+            activityLabel={activityLabel}
+            turnStartedAt={turnStartedAt}
+            conversationPublicId={conversationPublicId}
           />
         ) : (
-          <MarkdownText key={`text-${idx}`} text={part.text} />
+          renderPart(segment.part, segment.index)
         )
       )}
-      {shouldShowAssistantActivityAfterContent(parts.length, streaming) && (
-        <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
-      )}
+      {shouldShowAssistantActivityAfterContent(parts.length, streaming) &&
+        liveWorkKey === null && (
+          <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
+        )}
     </>
   )
+}
+
+/**
+ * Whether a tool's card can fold into a work group: everything except the
+ * cards that ask the user for something or show a result as its own view.
+ */
+function isFoldableTool(
+  tool: ToolCall,
+  conversationPublicId: string | null
+): boolean {
+  if (isTempsWriteToolName(tool.name)) return false
+  if (isAskUserTool(tool.name)) return false
+  if (isSandboxDeployTool(tool.name)) return false
+  if (
+    isProposeBlueprintTool(tool.name) &&
+    conversationPublicId &&
+    parseBlueprintProposal(tool.result)
+  )
+    return false
+  if (
+    isRequestSecretTool(tool.name) &&
+    conversationPublicId &&
+    parseSecretRequest(tool.result)
+  )
+    return false
+  if (isSandboxOfferTool(tool.name) && conversationPublicId) return false
+  return projectCollectionFromTool(tool) === null
 }
 
 /**
@@ -1754,6 +2226,7 @@ export const TranscriptRow = memo(function TranscriptRow({
   attachmentsBase,
   onFix,
   onPermissionResolved,
+  onSecretsProvided,
 }: {
   message: ChatMessage
   streaming: boolean
@@ -1766,6 +2239,7 @@ export const TranscriptRow = memo(function TranscriptRow({
   attachmentsBase?: string
   onFix: (text: string) => void
   onPermissionResolved: () => void
+  onSecretsProvided?: () => void
 }) {
   // A completed assistant turn with nothing extracted (e.g. the CLI's only
   // action was a tool call CLI-chat can't bridge — ADR-038) renders as truly
@@ -1820,6 +2294,7 @@ export const TranscriptRow = memo(function TranscriptRow({
             fromProject={fromProject}
             onFix={onFix}
             onPermissionResolved={onPermissionResolved}
+            onSecretsProvided={onSecretsProvided}
           />
         </div>
         {assistantParts(m).length > 0 && (
@@ -2264,6 +2739,9 @@ function DebugChatPanelBody({
     }
   })
   const [streaming, setStreaming] = useState(false)
+  // Suggestions are fetched automatically only for answers that arrive while
+  // the chat is open, never for one the user had already read.
+  const [openedAt] = useState(() => Date.now())
   const [starting, setStarting] = useState(false)
   // True until the run-once init fetch resolves. Lets us show a skeleton instead
   // of flashing the "Start AI diagnosis" empty state while resuming a chat —
@@ -2294,8 +2772,10 @@ function DebugChatPanelBody({
   } | null>(null)
   const followTranscriptRef = useRef(true)
   const [showJumpToLatest, setShowJumpToLatest] = useState(false)
-  const queuedInterruptRef = useRef<string | null>(null)
-  const sendAfterInterruptRef = useRef<(text: string) => void>(() => {})
+  // Set when the user interrupts to send: the stopped turn may end in an
+  // error state, and the queue must still go out right after it.
+  const flushQueueAfterStopRef = useRef(false)
+  const queueFlushingRef = useRef(false)
   const submissionInFlightRef = useRef(false)
   // Counts history-replacing permission resolution polls. Ordinary messages
   // never suppress the WebSocket because it is their only live transport.
@@ -2306,6 +2786,7 @@ function DebugChatPanelBody({
   const [turnStartedAt, setTurnStartedAt] = useState<string | null>(null)
   const [liveUpdatesUnavailable, setLiveUpdatesUnavailable] = useState(false)
   const turnActive = streaming || wsTurnActive
+  const [queuedMessages, updateQueue] = useChatMessageQueue(publicId ?? null)
 
   const changePermissionMode = useCallback(
     async (permissionModeId: string) => {
@@ -2536,14 +3017,6 @@ function DebugChatPanelBody({
         }
         setWsTurnActive(false)
         onConversationStatusInvalidated?.()
-        const queuedInterrupt = queuedInterruptRef.current
-        queuedInterruptRef.current = null
-        if (queuedInterrupt) {
-          window.setTimeout(
-            () => sendAfterInterruptRef.current(queuedInterrupt),
-            0
-          )
-        }
       })
       .catch((stopError) => {
         setError(
@@ -2635,7 +3108,7 @@ function DebugChatPanelBody({
       text: string,
       conversationId?: string,
       retryAttachments?: ChatAttachment[]
-    ) => {
+    ): Promise<boolean> => {
       let id = conversationId ?? publicId
       const content = text.trim()
       const attachments = retryAttachments ?? pendingAttachments
@@ -2647,9 +3120,10 @@ function DebugChatPanelBody({
         (!id && !lazyCreate) ||
         submissionInFlightRef.current
       )
-        return
+        return false
       submissionInFlightRef.current = true
       let submissionStarted = false
+      let restoreDraft = () => {}
       const turnId = crypto.randomUUID()
       try {
         // Refresh the server-owned lifecycle and message history before making
@@ -2666,7 +3140,7 @@ function DebugChatPanelBody({
             setError(
               chatFailureFromProblem(snapshotProblem, snapshotResponse?.status)
             )
-            return
+            return false
           }
           const running = hasRunningServerTurn(snapshotPayload)
           setMessages((current) =>
@@ -2690,7 +3164,7 @@ function DebugChatPanelBody({
                 'turn_in_progress'
               )
             )
-            return
+            return false
           }
         }
 
@@ -2718,6 +3192,23 @@ function DebugChatPanelBody({
             client_turn_id: turnId,
           },
         ])
+        // The message is on screen, so the composer lets go of it now rather
+        // than after the server answers (which waits on copying the files into
+        // the sandbox). A failed send puts the draft back.
+        const consumesDraft = retryAttachments === undefined
+        if (consumesDraft) {
+          setInput('')
+          pendingAttachmentsRef.current = []
+          setPendingAttachments([])
+        }
+        restoreDraft = () => {
+          if (!consumesDraft) return
+          setInput((current) => (current === '' ? text : current))
+          pendingAttachmentsRef.current = attachments
+          setPendingAttachments((current) =>
+            current.length === 0 ? attachments : current
+          )
+        }
         // Lazy-create the conversation on the first message (new project chat).
         if (!id) {
           if (userScoped || projectId == null) {
@@ -2730,7 +3221,8 @@ function DebugChatPanelBody({
               )
             )
             dropOptimisticTurn(setMessages, turnId)
-            return
+            restoreDraft()
+            return false
           }
           const { data: conv, error: problem } = await createConversation({
             path: { project_id: projectId },
@@ -2746,7 +3238,8 @@ function DebugChatPanelBody({
           if (!conv) {
             setError(chatFailureFromProblem(problem))
             dropOptimisticTurn(setMessages, turnId)
-            return
+            restoreDraft()
+            return false
           }
           id = conv.public_id
           providerPinnedRef.current = true
@@ -2772,6 +3265,7 @@ function DebugChatPanelBody({
         onConversationStatusInvalidated?.()
         if (!responsePayload) {
           const problem = responseProblem
+          restoreDraft()
           if (res?.status === 409) {
             // Another tab may have won the atomic claim after our preflight.
             // Immediately replace optimism with the authoritative snapshot.
@@ -2803,16 +3297,14 @@ function DebugChatPanelBody({
             setError(chatFailureFromProblem(problem, res?.status))
             dropOptimisticTurn(setMessages, turnId)
           }
-          return
+          return false
         }
-        setInput('')
         revokeAttachmentPreviews(attachments)
-        pendingAttachmentsRef.current = []
-        setPendingAttachments([])
         if (typeof responsePayload.turn_started_at === 'string') {
           setTurnStartedAt(responsePayload.turn_started_at)
         }
         setWsTurnActive(true)
+        return true
       } catch {
         setError(
           localChatFailure(
@@ -2823,11 +3315,15 @@ function DebugChatPanelBody({
             'chat_connection_failed'
           )
         )
-        if (submissionStarted) dropOptimisticTurn(setMessages, turnId)
+        if (submissionStarted) {
+          dropOptimisticTurn(setMessages, turnId)
+          restoreDraft()
+        }
       } finally {
         if (submissionStarted) setStreaming(false)
         submissionInFlightRef.current = false
       }
+      return false
     },
     [
       runtimeUpdateRequired,
@@ -2849,33 +3345,178 @@ function DebugChatPanelBody({
     ]
   )
 
-  useEffect(() => {
-    sendAfterInterruptRef.current = (text) => void send(text)
-  }, [send])
-  const submitComposer = useCallback(() => {
-    if (readOnly || runtimeUpdateRequired) return
-    if (!input.trim() && pendingAttachments.length > 0 && !turnActive) {
-      void send('')
-      return
+  /** Put text and files back in the composer, after whatever is there. */
+  const returnToComposer = useCallback(
+    (text: string, attachments: ChatAttachment[]) => {
+      if (text) {
+        setInput((current) =>
+          [current.trim(), text].filter(Boolean).join('\n\n')
+        )
+      }
+      if (attachments.length > 0) {
+        setPendingAttachments((current) => {
+          const next = [...current, ...attachments]
+          pendingAttachmentsRef.current = next
+          return next
+        })
+      }
+    },
+    []
+  )
+
+  /** Move the draft and its files to the end of the queue. */
+  const enqueueDraft = useCallback((): boolean => {
+    const text = input.trim()
+    const attachments = pendingAttachmentsRef.current
+    if ((!text && attachments.length === 0) || attachmentUploads > 0) {
+      return false
     }
-    const action = chatComposerSubmitAction(input, turnActive)
-    if (action === 'none') return
-    if (action === 'interrupt-and-send') {
-      queuedInterruptRef.current = input.trim()
-      setInput('')
+    updateQueue((queue) => [
+      ...queue,
+      { id: crypto.randomUUID(), text, attachments },
+    ])
+    setInput('')
+    pendingAttachmentsRef.current = []
+    setPendingAttachments([])
+    return true
+  }, [input, attachmentUploads, updateQueue])
+
+  /**
+   * Send everything queued as one message. It leaves the queue while it is
+   * sent and goes back if Temps refuses it, so a failed send loses nothing.
+   */
+  const flushQueue = useCallback(() => {
+    if (!publicId || queueFlushingRef.current) return
+    if (submissionInFlightRef.current || attachmentUploads > 0) return
+    const batch = readChatQueue(publicId)
+    if (batch.length === 0) return
+    queueFlushingRef.current = true
+    flushQueueAfterStopRef.current = false
+    const { text, attachments } = mergeQueuedMessages(batch)
+    updateQueue((queue) => queue.filter((message) => !batch.includes(message)))
+    void send(text, undefined, attachments)
+      .then((accepted) => {
+        if (!accepted) updateQueue((queue) => [...batch, ...queue])
+      })
+      .finally(() => {
+        queueFlushingRef.current = false
+      })
+  }, [publicId, attachmentUploads, send, updateQueue])
+
+  // A turn that finishes sends what was queued while it ran. One that failed
+  // holds the queue so the user can read what went wrong first, unless they
+  // interrupted it on purpose to send.
+  useEffect(() => {
+    if (turnActive || initializing || queuedMessages.length === 0) return
+    if (readOnly || runtimeUpdateRequired) return
+    if (error && !flushQueueAfterStopRef.current) return
+    flushQueue()
+  }, [
+    turnActive,
+    initializing,
+    queuedMessages.length,
+    error,
+    readOnly,
+    runtimeUpdateRequired,
+    flushQueue,
+  ])
+
+  /** Send the queue now, interrupting the running turn if there is one. */
+  const sendQueueNow = useCallback(() => {
+    if (turnActive) {
+      flushQueueAfterStopRef.current = true
       stop()
       return
     }
-    void send(input)
-  }, [
-    input,
-    pendingAttachments.length,
-    turnActive,
-    send,
-    stop,
-    readOnly,
-    runtimeUpdateRequired,
-  ])
+    flushQueue()
+  }, [turnActive, stop, flushQueue])
+
+  /** Stop the turn and hand anything queued back to the composer to edit. */
+  const stopAndReturnQueue = useCallback(() => {
+    if (publicId) {
+      const batch = readChatQueue(publicId)
+      if (batch.length > 0) {
+        updateQueue(() => [])
+        const { text, attachments } = mergeQueuedMessages(batch)
+        returnToComposer(text, attachments)
+      }
+    }
+    flushQueueAfterStopRef.current = false
+    stop()
+  }, [publicId, updateQueue, returnToComposer, stop])
+
+  /** Take one queued message back into the composer. */
+  const editQueued = useCallback(
+    (message: QueuedChatMessage) => {
+      updateQueue((queue) => queue.filter((item) => item.id !== message.id))
+      returnToComposer(message.text, message.attachments)
+      composerRef.current?.focus()
+    },
+    [updateQueue, returnToComposer]
+  )
+
+  const removeQueued = useCallback(
+    (id: string) => {
+      updateQueue((queue) => {
+        const removed = queue.find((item) => item.id === id)
+        if (removed) revokeAttachmentPreviews(removed.attachments)
+        return queue.filter((item) => item.id !== id)
+      })
+    },
+    [updateQueue]
+  )
+
+  /**
+   * Enter sends; while a turn runs it interrupts that turn and sends at once.
+   * `queue` (⌘Enter, or the queue button) instead waits for the turn to end.
+   * With a queue waiting and no turn running, what is typed joins it and
+   * everything goes out together.
+   */
+  const submitComposer = useCallback(
+    (mode: 'send' | 'queue' = 'send') => {
+      if (readOnly || runtimeUpdateRequired) return
+      if (mode === 'queue' && turnActive) {
+        enqueueDraft()
+        return
+      }
+      if (queuedMessages.length > 0) {
+        if (turnActive) {
+          if (!enqueueDraft()) return
+          flushQueueAfterStopRef.current = true
+          stop()
+          return
+        }
+        enqueueDraft()
+        flushQueue()
+        return
+      }
+      if (!input.trim() && pendingAttachments.length > 0 && !turnActive) {
+        void send('')
+        return
+      }
+      const action = chatComposerSubmitAction(input, turnActive)
+      if (action === 'none') return
+      if (action === 'interrupt-and-send') {
+        if (!enqueueDraft()) return
+        flushQueueAfterStopRef.current = true
+        stop()
+        return
+      }
+      void send(input)
+    },
+    [
+      input,
+      pendingAttachments.length,
+      queuedMessages.length,
+      turnActive,
+      send,
+      stop,
+      enqueueDraft,
+      flushQueue,
+      readOnly,
+      runtimeUpdateRequired,
+    ]
+  )
 
   const uploadAttachments = useCallback(
     async (files: FileList | null) => {
@@ -2917,20 +3558,7 @@ function DebugChatPanelBody({
       await Promise.all(
         selected.map(async (file) => {
           try {
-            const {
-              data: payload,
-              error: problem,
-              response,
-            } = await uploadUserConversationAttachment({
-              path: { public_id: publicId },
-              body: { file },
-            })
-            if (!payload) {
-              throw new Error(
-                (problem as { detail?: string } | undefined)?.detail ??
-                  `Could not upload ${file.name} (HTTP ${response?.status ?? 'unknown'}).`
-              )
-            }
+            const payload = await uploadChatAttachment(publicId, file)
             const attachment = createPendingAttachment(
               payload,
               file,
@@ -3408,6 +4036,41 @@ function DebugChatPanelBody({
   const permissionResolvedInTranscript = useCallback(() => {
     transcriptActions.current.pollForReply()
   }, [])
+  // The user saved the private form the assistant asked for. The assistant is
+  // waiting on exactly that, so carry on without making them type "done". If
+  // the assistant is still finishing its message, send as soon as it is idle:
+  // `send` drops a message submitted while a turn is running.
+  const pendingContinueRef = useRef<string | null>(null)
+  const [continueRequests, setContinueRequests] = useState(0)
+  const continueWith = useCallback((message: string) => {
+    pendingContinueRef.current = message
+    setContinueRequests((count) => count + 1)
+  }, [])
+  const continueAfterSecrets = useCallback(
+    () => continueWith(SECRETS_PROVIDED_MESSAGE),
+    [continueWith]
+  )
+  // Cards outside the transcript (the Architecture tab, a proposal card)
+  // carry the chat on the same way, once the user decides on a design.
+  useEffect(() => {
+    if (!publicId) return
+    const onContinue = (event: Event) => {
+      const detail = (event as CustomEvent<ChatContinueDetail>).detail
+      if (detail?.conversationPublicId === publicId && detail.message) {
+        continueWith(detail.message)
+      }
+    }
+    window.addEventListener(CHAT_CONTINUE_EVENT, onContinue)
+    return () => window.removeEventListener(CHAT_CONTINUE_EVENT, onContinue)
+  }, [publicId, continueWith])
+  useEffect(() => {
+    const message = pendingContinueRef.current
+    if (!message || turnActive || starting || !publicId) {
+      return
+    }
+    pendingContinueRef.current = null
+    void send(message)
+  }, [continueRequests, turnActive, starting, publicId, send])
 
   const visible = messages.filter((m) => m.role !== 'system')
   const busy = turnActive || starting
@@ -3425,6 +4088,13 @@ function DebugChatPanelBody({
     !showBootRow &&
     needsTrailingActivityRow(liveTurn, visible[visible.length - 1]?.role)
   const activityLabel = chatTurnActivityLabel(contextType, streaming)
+  // Next steps follow the latest finished answer, once the chat is idle.
+  const nextStepsAnswer =
+    isAssistantChat && userScoped && publicId && !busy
+      ? latestAnswerKey(visible)
+      : null
+  const latestAnswer = visible[visible.length - 1]
+  const pickNextStep = useCallback((text: string) => void send(text), [send])
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
@@ -3567,9 +4237,22 @@ function DebugChatPanelBody({
                 }
                 onFix={fixFromTranscript}
                 onPermissionResolved={permissionResolvedInTranscript}
+                onSecretsProvided={continueAfterSecrets}
               />
             )
           })}
+
+          {nextStepsAnswer && publicId ? (
+            <ChatNextSteps
+              key={nextStepsAnswer}
+              conversationPublicId={publicId}
+              answerKey={nextStepsAnswer}
+              answerCursor={latestAnswer?.server_cursor}
+              saved={latestAnswer?.next_steps}
+              answeredWhileOpen={answeredSince(visible, openedAt)}
+              onPick={pickNextStep}
+            />
+          ) : null}
 
           {showTrailingActivityRow && (
             <div className="flex items-start">
@@ -3858,20 +4541,39 @@ function DebugChatPanelBody({
               )}
             </div>
           )}
+          <QueuedMessages
+            messages={queuedMessages}
+            waiting={turnActive}
+            onEdit={editQueued}
+            onRemove={removeQueued}
+            onSendNow={sendQueueNow}
+          />
           <Textarea
             ref={composerRef}
             autoFocus
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder={
-              compactComposer || !placeholder
-                ? placeholder
-                : `${placeholder}${FOCUS_COMPOSER_HINT}`
+              turnActive && !compactComposer
+                ? `Queue a follow-up with ${queueShortcutLabel()}, or press ↵ to interrupt and send`
+                : compactComposer || !placeholder
+                  ? placeholder
+                  : `${placeholder}${FOCUS_COMPOSER_HINT}`
             }
             rows={compactComposer ? 1 : 2}
             disabled={composerDisabled}
             className="min-h-10 resize-none md:min-h-[72px] overflow-y-hidden rounded-none border-0 shadow-none focus-visible:border-0 focus-visible:outline-none focus-visible:ring-0"
             onKeyDown={(e) => {
+              if (
+                isQueueShortcut({
+                  ...e,
+                  isComposing: e.nativeEvent.isComposing,
+                })
+              ) {
+                e.preventDefault()
+                submitComposer('queue')
+                return
+              }
               if (
                 enterSendsMessage(
                   { ...e, isComposing: e.nativeEvent.isComposing },
@@ -3888,10 +4590,12 @@ function DebugChatPanelBody({
               {userScoped && publicId && (
                 <SessionDiagnostics key={publicId} publicId={publicId} />
               )}
-              <ContextWindow
-                usage={contextUsage}
-                model={runtimeSelection.modelId ?? undefined}
-              />
+              {isAssistantChat ? null : (
+                <ContextWindow
+                  usage={contextUsage}
+                  model={runtimeSelection.modelId ?? undefined}
+                />
+              )}
               {contextType === 'project' ? (
                 publicId ? (
                   <ChatSandbox
@@ -4238,10 +4942,30 @@ function DebugChatPanelBody({
                 </>
               )}
             </div>
-            {turnActive && !input.trim() ? (
+            {isAssistantChat && userScoped && publicId ? (
+              <>
+                <ChatSuggestionControl conversationPublicId={publicId} />
+                <ChatContextMeter conversationPublicId={publicId} />
+              </>
+            ) : null}
+            {turnActive && (input.trim() || pendingAttachments.length > 0) && (
               <Button
                 type="button"
-                onClick={stop}
+                onClick={() => submitComposer('queue')}
+                disabled={attachmentUploads > 0}
+                size="icon"
+                variant="secondary"
+                className="h-8 w-8 rounded-full md:h-9 md:w-9"
+                title={`Queue — sends when this turn finishes (${queueShortcutLabel()})`}
+                aria-label="Queue message"
+              >
+                <ListPlus className="h-4 w-4" />
+              </Button>
+            )}
+            {turnActive && !input.trim() && pendingAttachments.length === 0 ? (
+              <Button
+                type="button"
+                onClick={stopAndReturnQueue}
                 size="icon"
                 variant="secondary"
                 className="h-8 w-8 rounded-full md:h-9 md:w-9"
@@ -4252,7 +4976,7 @@ function DebugChatPanelBody({
               </Button>
             ) : (
               <Button
-                onClick={submitComposer}
+                onClick={() => submitComposer()}
                 disabled={
                   runtimeUpdateRequired ||
                   (!input.trim() && pendingAttachments.length === 0) ||
@@ -4263,9 +4987,9 @@ function DebugChatPanelBody({
                 size="icon"
                 className="h-8 w-8 rounded-full md:h-9 md:w-9"
                 aria-label={
-                  streaming ? 'Interrupt and send message' : 'Send message'
+                  turnActive ? 'Interrupt and send message' : 'Send message'
                 }
-                title={streaming ? 'Interrupt and send message' : undefined}
+                title={turnActive ? 'Interrupt and send (↵)' : undefined}
               >
                 <Send className="h-4 w-4" />
               </Button>

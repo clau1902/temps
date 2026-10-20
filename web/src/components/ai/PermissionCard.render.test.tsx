@@ -67,3 +67,35 @@ describe('PermissionCard rich platform writes', () => {
     expect(markup).not.toContain('parameters:')
   })
 })
+
+describe('PermissionCard generic platform writes', () => {
+  test('lists the parameters readably and hides credentials', () => {
+    const markup = renderPermission({
+      operation: 'create_s3_source',
+      method: 'POST',
+      summary: 'Create a new S3 source (POST /backups/s3-sources)',
+      parameters: {
+        name: 'temps-backups',
+        bucket_name: 'temps-backups',
+        force_path_style: true,
+        access_key_id: '***',
+        secret_key: '***',
+      },
+      carries_handle: true,
+      required_permission: null,
+      action_id: 'abc123',
+    })
+
+    expect(markup).toContain('Create a new S3 source')
+    expect(markup).not.toContain('POST /backups')
+    expect(markup).toContain('Bucket name')
+    expect(markup).toContain('temps-backups')
+    expect(markup).toContain('Yes')
+    expect(markup).toContain('Hidden, provided by you')
+    expect(markup).toContain('the assistant never saw them')
+    expect(markup).not.toContain('carries_handle')
+    expect(markup).not.toContain('action_id')
+    expect(markup).not.toContain('{&quot;name&quot;')
+    expect(markup).toContain('Approve &amp; run')
+  })
+})

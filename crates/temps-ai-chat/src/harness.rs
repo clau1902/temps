@@ -41,6 +41,18 @@ const SOURCES: &[(&str, &str)] = &[
         "build-an-app.md",
         include_str!("../harness/build-an-app.md"),
     ),
+    // The two website playbooks condense the approach of Hallmark
+    // (https://github.com/Nutlope/hallmark, MIT): ask for audience, use and
+    // tone; pick a genre and a page shape; lock the tokens; then check the
+    // result against the named tells of generated pages.
+    (
+        "build-a-website.md",
+        include_str!("../harness/build-a-website.md"),
+    ),
+    (
+        "check-a-website.md",
+        include_str!("../harness/check-a-website.md"),
+    ),
     (
         "connect-a-service.md",
         include_str!("../harness/connect-a-service.md"),
@@ -48,6 +60,14 @@ const SOURCES: &[(&str, &str)] = &[
     (
         "host-with-temps.md",
         include_str!("../harness/host-with-temps.md"),
+    ),
+    (
+        "debug-a-deployment.md",
+        include_str!("../harness/debug-a-deployment.md"),
+    ),
+    (
+        "add-temps-observability.md",
+        include_str!("../harness/add-temps-observability.md"),
     ),
 ];
 
@@ -269,6 +289,10 @@ mod tests {
         SANDBOX_OFFER_TOOL,
         SANDBOX_DEPLOY_TOOL,
         PLAYBOOK_TOOL,
+        crate::workspace_chats::PROPOSE_BLUEPRINT_TOOL,
+        crate::workspace_chats::BIND_BLUEPRINT_TOOL,
+        crate::ask_user::ASK_USER_TOOL,
+        "temps_goal",
         "temps_write",
         "temps",
     ];
@@ -280,6 +304,59 @@ mod tests {
             assert_eq!(format!("{}.md", playbook.name), *file, "file name matches");
         }
         assert_eq!(all().len(), SOURCES.len());
+    }
+
+    #[test]
+    fn a_single_project_is_built_flat_in_the_sandbox() {
+        let build = all()
+            .into_iter()
+            .find(|playbook| playbook.name == "build-an-app")
+            .expect("build-an-app playbook");
+        assert!(build.body.contains("Keep one project flat at the top"));
+        assert!(build.body.contains("not in a folder named"));
+        assert!(build.body.contains("`directory` only when"));
+
+        let write = crate::sandbox_link::tools_for(true, false, true, true, false, true)
+            .into_iter()
+            .find(|tool| tool.name == crate::sandbox_link::SANDBOX_WRITE_TOOL)
+            .expect("write tool");
+        assert!(write.description.contains("Keep a single project flat"));
+        let deploy = crate::sandbox_deploy::deploy_tool();
+        assert!(deploy.parameters["properties"]["directory"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("set it only when the sandbox holds several projects"));
+    }
+
+    /// Pages get a direction before code and a check the model can run
+    /// without seeing them, including the self-referencing font variable that
+    /// drops a whole page to the browser's default serif.
+    #[test]
+    fn a_website_is_designed_and_checked_before_it_is_done() {
+        let find = |name: &str| {
+            all()
+                .iter()
+                .find(|playbook| playbook.name == name)
+                .unwrap_or_else(|| panic!("{name} playbook"))
+        };
+        let website = find("build-a-website");
+        assert!(website
+            .body
+            .contains("Pick a page shape before writing code"));
+        assert!(website.body.contains("the `check-a-website` playbook"));
+
+        let check = find("check-a-website");
+        assert!(check.body.contains("--font-sans: var(--font-sans);"));
+        assert!(check
+            .body
+            .contains("Is any metric, testimonial, customer logo or count invented?"));
+        assert!(check.body.contains("`sandbox_preview`"));
+
+        let build = all()
+            .iter()
+            .find(|playbook| playbook.name == "build-an-app")
+            .expect("build-an-app playbook");
+        assert!(build.body.contains("the `build-a-website` playbook"));
     }
 
     #[test]
@@ -382,18 +459,67 @@ mod tests {
         }
     }
 
+    /// The variables the observability playbook tells the model to read are
+    /// the ones the deployment pipeline really sets.
+    #[test]
+    fn observability_playbook_names_variables_deployments_get() {
+        let catalog =
+            include_str!("../../temps-deployments/src/services/managed_environment_variables.rs");
+        let playbook = all()
+            .iter()
+            .find(|playbook| playbook.name == "add-temps-observability")
+            .expect("add-temps-observability is embedded");
+        for variable in [
+            "SENTRY_DSN",
+            "NEXT_PUBLIC_SENTRY_DSN",
+            "VITE_SENTRY_DSN",
+            "PUBLIC_SENTRY_DSN",
+            "SENTRY_RELEASE",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_SERVICE_NAME",
+        ] {
+            assert!(
+                playbook.body.contains(variable),
+                "the playbook does not mention {variable}"
+            );
+            assert!(
+                catalog.contains(&format!("\"{variable}\"")),
+                "{variable} is promised but deployments do not get it"
+            );
+        }
+        let build = all()
+            .iter()
+            .find(|playbook| playbook.name == "build-an-app")
+            .expect("build-an-app is embedded");
+        assert!(build.body.contains("`add-temps-observability` playbook"));
+    }
+
     #[test]
     fn the_index_lists_only_what_applies() {
         let with_sandbox = applicable("assistant", &[SANDBOX_EXEC_TOOL, SANDBOX_PREVIEW_TOOL]);
         let names: Vec<&str> = with_sandbox.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"show-a-running-app"));
         assert!(names.contains(&"build-an-app"));
+        assert!(names.contains(&"build-a-website"));
+        assert!(names.contains(&"check-a-website"));
         assert!(names.contains(&"host-with-temps"));
         assert!(names.contains(&"connect-a-service"));
 
         let without = applicable("assistant", &[]);
         let names: Vec<&str> = without.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["connect-a-service", "host-with-temps"]);
+        // Designing and debugging happen before any sandbox exists, so those
+        // playbooks are listed without one.
+        assert_eq!(
+            names,
+            [
+                "build-an-app",
+                "connect-a-service",
+                "host-with-temps",
+                "debug-a-deployment"
+            ]
+        );
 
         // A chat type a playbook does not list never sees it.
         assert!(applicable("deployment", &[SANDBOX_EXEC_TOOL, SANDBOX_PREVIEW_TOOL]).is_empty());

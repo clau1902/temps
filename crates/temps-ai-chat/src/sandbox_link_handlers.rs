@@ -226,7 +226,10 @@ fn project_ids_of(connected: &[ConnectedService]) -> Vec<i32> {
     projects
 }
 
-fn link_service(state: &AppState, conversation_id: &str) -> Result<SandboxLinkService, Problem> {
+pub(crate) fn link_service(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<SandboxLinkService, Problem> {
     let sandboxes =
         state
             .application_sandboxes

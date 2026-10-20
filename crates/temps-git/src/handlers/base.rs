@@ -31,6 +31,7 @@ use std::sync::Arc;
 use temps_auth::{
     permission_check, permission_guard, require_sensitive_action, Permission, RequireAuth,
 };
+use temps_core::secret_string::SecretString;
 use temps_core::telemetry::OperationFailureCode;
 use temps_core::RequestMetadata;
 use temps_core::SensitiveAction;
@@ -291,13 +292,13 @@ pub struct CreateProviderRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateGitHubPATRequest {
     pub name: String,
-    pub token: String,
+    pub token: SecretString,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateGitLabPATRequest {
     pub name: String,
-    pub token: String,
+    pub token: SecretString,
     pub base_url: Option<String>,
 }
 
@@ -305,7 +306,7 @@ pub struct CreateGitLabPATRequest {
 pub struct CreateGitLabOAuthRequest {
     pub name: String,
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: SecretString,
     pub redirect_uri: String,
     pub base_url: Option<String>,
 }
@@ -315,7 +316,7 @@ pub struct CreateGiteaPATRequest {
     /// Display name for this provider.
     pub name: String,
     /// Personal access token issued by the Gitea instance.
-    pub token: String,
+    pub token: SecretString,
     /// HTTPS base URL of the Gitea instance, e.g. `https://git.example.com`.
     pub base_url: String,
 }
@@ -329,14 +330,14 @@ pub enum BitbucketAuthInput {
     /// Personal / Workspace / Repository Access Token.
     AccessToken {
         /// The Bitbucket access token value.
-        token: String,
+        token: SecretString,
     },
     /// HTTP Basic / App Password authentication.
     AppPassword {
         /// Bitbucket account username.
         username: String,
         /// App password generated in Bitbucket security settings.
-        password: String,
+        password: SecretString,
     },
 }
 
@@ -358,7 +359,7 @@ pub struct CreateGenericRequest {
     /// absent or empty. Ignored for public (unauthenticated) repositories.
     pub token_username: Option<String>,
     /// Access token or password. Omit (or set to `null`) for public repositories.
-    pub token: Option<String>,
+    pub token: Option<SecretString>,
     /// Optional base URL of the git host for display purposes (no API is called).
     pub base_url: Option<String>,
 }
@@ -372,19 +373,19 @@ pub struct UpdateProviderCredentialsRequest {
     /// OAuth client ID (GitLab OAuth, GitHub App).
     pub client_id: Option<String>,
     /// OAuth client secret (GitLab OAuth, GitHub App).
-    pub client_secret: Option<String>,
+    pub client_secret: Option<SecretString>,
     /// Application ID (GitHub App integer as string; GitLab App string).
     pub app_id: Option<String>,
     /// GitLab App secret (not used by GitHub App — use `client_secret`).
-    pub app_secret: Option<String>,
+    pub app_secret: Option<SecretString>,
     /// GitHub App private key (PEM).
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretString>,
     /// GitHub App webhook secret.
-    pub webhook_secret: Option<String>,
+    pub webhook_secret: Option<SecretString>,
     /// OAuth redirect URI (GitLab OAuth / GitLab App).
     pub redirect_uri: Option<String>,
     /// PAT for PAT-type providers.
-    pub token: Option<String>,
+    pub token: Option<SecretString>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2632,7 +2633,7 @@ pub async fn create_github_pat_provider(
 
     let result = state
         .git_provider_manager
-        .create_github_pat_provider(request.name.clone(), request.token, user_id)
+        .create_github_pat_provider(request.name.clone(), request.token.into_exposed(), user_id)
         .await;
     report_git_provider_result(&state, Some("github"), "pat", &result);
     let provider = result?;
@@ -2686,7 +2687,7 @@ pub async fn create_gitlab_pat_provider(
         .git_provider_manager
         .create_gitlab_pat_provider(
             request.name.clone(),
-            request.token,
+            request.token.into_exposed(),
             user_id,
             request.base_url,
         )
@@ -2738,7 +2739,7 @@ pub async fn create_gitlab_oauth_provider(
         .create_gitlab_oauth_provider(
             request.name.clone(),
             request.client_id,
-            request.client_secret,
+            request.client_secret.into_exposed(),
             request.redirect_uri,
             request.base_url,
         )
@@ -2806,7 +2807,7 @@ pub async fn create_gitea_pat_provider(
         .git_provider_manager
         .create_gitea_pat_provider(
             request.name.clone(),
-            request.token,
+            request.token.into_exposed(),
             user_id,
             request.base_url,
         )
@@ -2864,10 +2865,13 @@ pub async fn create_bitbucket_provider(
     let user_id = auth.user_id();
 
     let auth_method = match request.auth {
-        BitbucketAuthInput::AccessToken { token } => AuthMethod::PersonalAccessToken { token },
-        BitbucketAuthInput::AppPassword { username, password } => {
-            AuthMethod::BasicAuth { username, password }
-        }
+        BitbucketAuthInput::AccessToken { token } => AuthMethod::PersonalAccessToken {
+            token: token.into_exposed(),
+        },
+        BitbucketAuthInput::AppPassword { username, password } => AuthMethod::BasicAuth {
+            username,
+            password: password.into_exposed(),
+        },
     };
 
     let result = state
@@ -2955,7 +2959,7 @@ pub async fn create_generic_provider(
             request.name.clone(),
             request.clone_url,
             token_username,
-            request.token,
+            request.token.map(SecretString::into_exposed),
             request.base_url,
             user_id,
         )
@@ -3022,13 +3026,13 @@ pub async fn update_git_provider_credentials(
         .update_provider_credentials(
             provider_id,
             request.client_id,
-            request.client_secret,
+            request.client_secret.map(SecretString::into_exposed),
             request.app_id,
-            request.app_secret,
-            request.private_key,
-            request.webhook_secret,
+            request.app_secret.map(SecretString::into_exposed),
+            request.private_key.map(SecretString::into_exposed),
+            request.webhook_secret.map(SecretString::into_exposed),
             request.redirect_uri,
-            request.token,
+            request.token.map(SecretString::into_exposed),
         )
         .await?;
 
@@ -3693,8 +3697,8 @@ pub async fn delete_connection(
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateTokenRequest {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -3743,7 +3747,11 @@ pub async fn update_connection_token(
 
     state
         .git_provider_manager
-        .update_connection_token(connection_id, request.access_token, request.refresh_token)
+        .update_connection_token(
+            connection_id,
+            request.access_token.into_exposed(),
+            request.refresh_token.map(SecretString::into_exposed),
+        )
         .await?;
     Ok(Json(UpdateTokenResponse {
         connection_id,

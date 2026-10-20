@@ -1635,6 +1635,66 @@ fn completed_exec_lines(bytes: &[u8], emitted: &mut usize, eof: bool) -> Vec<Str
     lines
 }
 
+/// Whether an ownership fix may cross into filesystems mounted below its root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipScope {
+    /// Stay on the root's own filesystem. The home volume has the workspace
+    /// bind-mounted inside it, which gets its own pass; without this a
+    /// home pass walks every workspace file a second time.
+    OwnFilesystem,
+    /// Follow the tree wherever it is mounted from.
+    AcrossMounts,
+}
+
+/// Root-run command giving the sandbox user everything under `root` that it
+/// does not already own.
+///
+/// It changes only what is wrong instead of `chown -R` on every file, so a
+/// recovered sandbox whose files are already right costs a directory walk
+/// rather than a write per file (a JavaScript project's dependencies alone
+/// run to tens of thousands of files). `-h` changes a symlink itself, never
+/// what it points at: a link in the workspace must not let root hand an
+/// arbitrary container file to the sandbox user.
+fn ownership_fix_command(root: &str, scope: OwnershipScope) -> Vec<String> {
+    let mut cmd = vec!["find".to_string(), root.to_string()];
+    if scope == OwnershipScope::OwnFilesystem {
+        cmd.push("-xdev".to_string());
+    }
+    cmd.extend(
+        [
+            "(",
+            "!",
+            "-uid",
+            &SANDBOX_UID.to_string(),
+            "-o",
+            "!",
+            "-gid",
+            &SANDBOX_GID.to_string(),
+            ")",
+            "-exec",
+            "chown",
+            "-h",
+            SANDBOX_CHOWN,
+            "{}",
+            "+",
+        ]
+        .iter()
+        .map(|arg| arg.to_string()),
+    );
+    cmd
+}
+
+/// Shell script, run as the sandbox user, that proves it can create a file
+/// in `dir`. Each run uses its own file name, so two checks of the same
+/// sandbox at once (two requests recovering it together) cannot delete each
+/// other's file and report a writable workspace as broken.
+fn write_probe_script(dir: &str) -> String {
+    format!(
+        "probe=$(mktemp '{}/.temps-write-probe.XXXXXX') && rm -f \"$probe\"",
+        dir
+    )
+}
+
 impl DockerSandboxProvider {
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
         Self {
@@ -1799,12 +1859,7 @@ impl DockerSandboxProvider {
                 container_id,
                 run_id,
                 "chown-home",
-                vec![
-                    "chown".to_string(),
-                    "-R".to_string(),
-                    SANDBOX_CHOWN.to_string(),
-                    SANDBOX_HOME.to_string(),
-                ],
+                ownership_fix_command(SANDBOX_HOME, OwnershipScope::OwnFilesystem),
             )
             .await?;
         if home_exit != 0 {
@@ -1836,12 +1891,7 @@ impl DockerSandboxProvider {
                 container_id,
                 run_id,
                 "chown-work",
-                vec![
-                    "chown".to_string(),
-                    "-R".to_string(),
-                    SANDBOX_CHOWN.to_string(),
-                    CONTAINER_WORK_DIR.to_string(),
-                ],
+                ownership_fix_command(CONTAINER_WORK_DIR, OwnershipScope::AcrossMounts),
             )
             .await?;
 
@@ -1849,7 +1899,6 @@ impl DockerSandboxProvider {
         // `su temps -c 'touch ...'` is the truest test — if this fails,
         // every subsequent workflow command will fail too, so refuse to
         // hand back a broken sandbox.
-        let probe_path = format!("{}/.temps-write-probe", CONTAINER_WORK_DIR);
         let probe_exit = self
             .run_root_exec(
                 container_id,
@@ -1859,7 +1908,7 @@ impl DockerSandboxProvider {
                     "su".to_string(),
                     SANDBOX_USER.to_string(),
                     "-c".to_string(),
-                    format!("touch {} && rm {}", probe_path, probe_path),
+                    write_probe_script(CONTAINER_WORK_DIR),
                 ],
             )
             .await?;
@@ -6411,6 +6460,54 @@ fn sandbox_egress_drop_ranges() -> Vec<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ownership_fix_changes_only_wrongly_owned_files_without_following_links() {
+        use super::{ownership_fix_command, OwnershipScope};
+
+        let home = ownership_fix_command("/home/temps", OwnershipScope::OwnFilesystem);
+        assert_eq!(
+            home,
+            [
+                "find",
+                "/home/temps",
+                "-xdev",
+                "(",
+                "!",
+                "-uid",
+                "1000",
+                "-o",
+                "!",
+                "-gid",
+                "1000",
+                ")",
+                "-exec",
+                "chown",
+                "-h",
+                "temps:temps",
+                "{}",
+                "+",
+            ]
+        );
+        assert!(!home.iter().any(|arg| arg == "-R"));
+
+        let work = ownership_fix_command("/home/temps/workspace", OwnershipScope::AcrossMounts);
+        assert_eq!(work[1], "/home/temps/workspace");
+        assert!(
+            !work.iter().any(|arg| arg == "-xdev"),
+            "the workspace pass must reach a bind-mounted workspace: {work:?}"
+        );
+        assert!(work.windows(2).any(|pair| pair == ["chown", "-h"]));
+    }
+
+    #[test]
+    fn write_probe_uses_a_fresh_file_each_time() {
+        let script = super::write_probe_script("/home/temps/workspace");
+        assert_eq!(
+            script,
+            "probe=$(mktemp '/home/temps/workspace/.temps-write-probe.XXXXXX') && rm -f \"$probe\""
+        );
+    }
+
     #[test]
     fn runtime_health_requires_harness_recovery_capability() {
         use super::has_harness_recovery_capability;

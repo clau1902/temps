@@ -88,14 +88,22 @@ impl TempsPlugin for AiChatPlugin {
             // the router is assembled with new_write_allowlisted(...).
             let write_handle = Arc::new(WriteApiToolsHandle::new());
             context.register_service(write_handle.clone());
+            let write_handle_for_secrets = write_handle.clone();
 
             // Pending-action service (propose-then-confirm write actions).
             // Audit is emitted by the handler layer (with full RequestMetadata).
-            let pending_actions = Arc::new(PendingActionService::new(
+            // Credentials the user hands the assistant through a sealed form.
+            // An approved action resolves its `secret_ref:` handles from here.
+            let secret_slots = Arc::new(crate::secret_slots::SecretSlotService::new(
                 db.clone(),
-                write_handle.clone(),
-                encryption,
+                encryption.clone(),
             ));
+            context.register_service(secret_slots.clone());
+
+            let pending_actions = Arc::new(
+                PendingActionService::new(db.clone(), write_handle.clone(), encryption)
+                    .with_secret_slots(secret_slots.as_ref().clone()),
+            );
             context.register_service(pending_actions.clone());
 
             let goals = Arc::new(crate::goals::GoalService::new(db.clone()));
@@ -250,12 +258,26 @@ impl TempsPlugin for AiChatPlugin {
             let config_service = context.get_service::<temps_config::ConfigService>();
             let mut service = ConversationService::new(db.clone(), ai, providers)
                 .with_write_support(write_handle, pending_actions.clone(), audit_service.clone())
+                .with_secret_support(crate::secret_slots::SecretToolSupport {
+                    slots: secret_slots.as_ref().clone(),
+                    write_api: write_handle_for_secrets,
+                })
                 .with_goal_support(crate::goals::GoalToolSupport {
                     goals: goals.clone(),
                     read_api: api_tools_handle_for_goals,
                 })
                 .with_application_workspaces(application_workspaces.clone())
-                .with_application_service(applications.clone());
+                .with_application_service(applications.clone())
+                .with_blueprint_support(crate::workspace_chats::BlueprintToolSupport {
+                    workspaces: crate::workspace_chats::WorkspaceChatService::new(
+                        db.clone(),
+                        applications.clone(),
+                        crate::blueprint::BlueprintService::new(db.clone()),
+                    )
+                    .with_sandboxes(application_sandboxes.clone()),
+                    audit: Some(audit_service.clone()),
+                    project_access: None,
+                });
             if let Some(sandboxes) = &application_sandboxes {
                 service = service.with_application_sandboxes(sandboxes.clone());
             } else {
@@ -292,7 +314,9 @@ impl TempsPlugin for AiChatPlugin {
                 pending_actions,
                 applications,
                 goals,
+                secret_slots,
                 assistant_attachments,
+                attachment_uploads: Arc::new(crate::attachment_uploads::UploadSessions::new()),
                 project_service,
                 application_workspaces,
                 config_service,
@@ -327,6 +351,26 @@ impl TempsPlugin for AiChatPlugin {
             );
             tokio::spawn(Arc::new(watcher).run());
             tracing::debug!("AI goal watcher started");
+
+            // Erase the values of expired secret slots. Each slot is also
+            // refused on use once expired, so this only bounds how long a
+            // dead value stays encrypted at rest.
+            let slots = context.require_service::<crate::secret_slots::SecretSlotService>();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    match slots.sweep_expired().await {
+                        Ok(0) => {}
+                        Ok(erased) => tracing::info!(erased, "erased expired AI secret slots"),
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "failed to erase expired AI secret slots"
+                        ),
+                    }
+                }
+            });
             Ok(())
         })
     }
@@ -344,7 +388,9 @@ impl TempsPlugin for AiChatPlugin {
             pending_actions: old.pending_actions.clone(),
             applications: old.applications.clone(),
             goals: old.goals.clone(),
+            secret_slots: old.secret_slots.clone(),
             assistant_attachments: old.assistant_attachments.clone(),
+            attachment_uploads: old.attachment_uploads.clone(),
             project_service: old.project_service.clone(),
             application_workspaces: old.application_workspaces.clone(),
             config_service: old.config_service.clone(),
@@ -362,9 +408,15 @@ impl TempsPlugin for AiChatPlugin {
         let router = handlers::configure_routes()
             .merge(crate::git_bindings_handlers::configure_routes())
             .merge(crate::goals_handlers::configure_routes())
+            .merge(crate::secret_slot_handlers::configure_routes())
             .merge(crate::sandbox_link_handlers::configure_routes())
+            .merge(crate::sandbox_files_handlers::configure_routes())
             .merge(crate::compaction_handlers::configure_routes())
+            .merge(crate::suggestion_handlers::configure_routes())
+            .merge(crate::attachment_upload_handlers::configure_routes())
             .merge(crate::chat_resources_handlers::configure_routes())
+            .merge(crate::chat_operations_handlers::configure_routes())
+            .merge(crate::blueprint_handlers::configure_routes())
             .with_state(app_state)
             .merge(temps_ai_agent_cli::sandbox_model_relay_routes().with_state(model_relay));
         Some(PluginRoutes::new(router))
@@ -375,12 +427,23 @@ impl TempsPlugin for AiChatPlugin {
         document
             .merge(<crate::git_bindings_handlers::GitBindingsApiDoc as OpenApiTrait>::openapi());
         document.merge(<crate::goals_handlers::GoalsApiDoc as OpenApiTrait>::openapi());
+        document.merge(<crate::secret_slot_handlers::SecretSlotsApiDoc as OpenApiTrait>::openapi());
         document
             .merge(<crate::sandbox_link_handlers::SandboxLinkApiDoc as OpenApiTrait>::openapi());
+        document
+            .merge(<crate::sandbox_files_handlers::SandboxFilesApiDoc as OpenApiTrait>::openapi());
         document.merge(<crate::compaction_handlers::CompactionApiDoc as OpenApiTrait>::openapi());
+        document.merge(<crate::suggestion_handlers::SuggestionApiDoc as OpenApiTrait>::openapi());
+        document.merge(
+            <crate::attachment_upload_handlers::AttachmentUploadApiDoc as OpenApiTrait>::openapi(),
+        );
         document.merge(
             <crate::chat_resources_handlers::ChatResourcesApiDoc as OpenApiTrait>::openapi(),
         );
+        document.merge(
+            <crate::chat_operations_handlers::ChatOperationsApiDoc as OpenApiTrait>::openapi(),
+        );
+        document.merge(<crate::blueprint_handlers::BlueprintApiDoc as OpenApiTrait>::openapi());
         Some(document)
     }
 }

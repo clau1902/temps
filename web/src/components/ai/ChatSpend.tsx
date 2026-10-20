@@ -8,6 +8,7 @@ import {
   getUserConversationUsageQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { ContextPie } from './ContextWindow-components'
 import {
   Popover,
   PopoverContent,
@@ -17,7 +18,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
-import { Coins, Shrink } from 'lucide-react'
+import { CircleHelp, Shrink } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   compactResultMessage,
@@ -42,15 +43,15 @@ export function ContextMeter({
   const share = contextShare(context)
   const level = contextLevel(context)
   return (
-    <div className="space-y-1.5" aria-label="Context size">
-      <div>
-        <p className="font-medium">Context</p>
-        <p className="text-xs text-muted-foreground">
-          What the model reads on every request: the conversation so far, the
-          instructions and the tools.
-        </p>
+    <div className="space-y-2" aria-label="Context size">
+      <div className="flex items-baseline justify-between gap-3">
+        <p className="font-medium">Context window</p>
+        {share !== null && (
+          <p className="text-xs tabular-nums text-muted-foreground">
+            {percentUsed(share)}% used
+          </p>
+        )}
       </div>
-      <p className="text-xs tabular-nums">{contextLabel(context)}</p>
       {share !== null && (
         <div
           role="progressbar"
@@ -62,7 +63,7 @@ export function ContextMeter({
           <div
             className={cn(
               'h-full rounded-full',
-              level === 'ok' && 'bg-foreground/60',
+              level === 'ok' && 'bg-emerald-500',
               level === 'high' && 'bg-amber-500',
               level === 'critical' && 'bg-red-500'
             )}
@@ -70,6 +71,13 @@ export function ContextMeter({
           />
         </div>
       )}
+      <p className="text-xs tabular-nums text-muted-foreground">
+        {contextLabel(context)}
+      </p>
+      <p className="text-xs text-muted-foreground">
+        What the model reads on every request: the conversation so far, the
+        instructions and the tools.
+      </p>
       {level !== 'ok' && (
         <p className="text-xs text-amber-600 dark:text-amber-300">
           A long chat costs more with every message, because all of it is sent
@@ -78,6 +86,11 @@ export function ContextMeter({
       )}
     </div>
   )
+}
+
+/** Whole percent for display; "<1" rather than a misleading 0 for a small share. */
+function percentUsed(share: number): string {
+  return share > 0 && share < 0.01 ? '<1' : String(Math.round(share * 100))
 }
 
 /**
@@ -166,7 +179,10 @@ function SpendBreakdown({
         summarizedMessages={usage.summarized_messages}
       />
       <div>
-        <p className="font-medium">What this chat has cost</p>
+        <div className="flex items-baseline justify-between gap-3">
+          <p className="font-medium">What this chat has cost</p>
+          <p className="text-sm tabular-nums">{spendLabel(usage)}</p>
+        </div>
         <p className="text-xs text-muted-foreground">
           An estimate from each model&apos;s published price and the tokens it
           used.
@@ -221,10 +237,12 @@ function SpendBreakdown({
 }
 
 /**
- * What the chat has cost so far. Always shown, so the spend is never a thing
- * the user has to know to look for; the breakdown opens on click.
+ * How full the chat's context is, shown beside the send button as a ring and a
+ * percentage. The popover holds the figures behind it, the compact action and
+ * what the chat has cost, so none of it is something the user has to know to
+ * look for.
  */
-export function ChatSpend({
+export function ChatContextMeter({
   conversationPublicId,
 }: {
   conversationPublicId: string
@@ -238,30 +256,33 @@ export function ChatSpend({
   })
 
   if (usage.isPending) {
-    return <Skeleton className="h-8 w-28" />
+    return <Skeleton className="h-8 w-14 rounded-full" />
   }
 
-  const spend = usage.data ? spendLabel(usage.data) : 'Spend unavailable'
   const context = usage.data?.context
-  const label = context
-    ? `${spend} · ${formatTokens(context.tokens)} ctx`
-    : spend
+  const share = context ? contextShare(context) : null
+  const label = share !== null ? `${percentUsed(share)}%` : 'Context'
 
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button
+        <button
           type="button"
-          variant="outline"
-          size="sm"
-          className="h-8 gap-1.5 tabular-nums"
-          title="See what this chat has cost and how much context it uses"
+          aria-label="Context window and spend"
+          title="How much of the model's context window this chat uses, and what it has cost"
+          className="flex h-8 items-center gap-1.5 rounded-full px-2 text-xs tabular-nums text-muted-foreground hover:bg-muted hover:text-foreground"
         >
-          <Coins className="size-4" />
-          {label}
-        </Button>
+          {share === null ? (
+            <CircleHelp className="size-4" />
+          ) : (
+            <ContextPie percentage={Math.round(share * 100)} />
+          )}
+          <span className={share === null ? 'sr-only' : undefined}>
+            {label}
+          </span>
+        </button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="w-80">
+      <PopoverContent align="end" side="top" className="w-80">
         {usage.data ? (
           <SpendBreakdown
             usage={usage.data}
@@ -269,7 +290,7 @@ export function ChatSpend({
           />
         ) : (
           <p className="text-sm text-muted-foreground">
-            The spend for this chat could not be loaded. It will retry on its
+            The usage for this chat could not be loaded. It will retry on its
             own.
           </p>
         )}

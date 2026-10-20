@@ -8,8 +8,10 @@ contexts: assistant, project
 
 Use this when the user asks to connect, use or wire up a database, cache or
 object store (PostgreSQL, Redis, MongoDB, S3) for a project, or asks whether the
-app is already connected. Also offer it yourself, without being asked, as soon as
-a chat has made both a project and a service. Never answer "no" and stop: say what is missing and
+app is already connected. When an accepted architecture has a flow from an app
+to a database, cache or bucket, link that service as part of deploying, without
+being asked. Otherwise offer it yourself as soon as a chat has made both a
+project and a service. Never answer "no" and stop: say what is missing and
 offer to do it.
 
 Linking is the connection. A service linked to a project hands the app its
@@ -18,8 +20,9 @@ into the project's environment variables, do not ask the user to type or paste a
 password, and do not ask them to name the database: Temps provisions one for the
 project when it is linked.
 
-1. Link the service to the project with the link operation. If the service does
-   not exist yet, create it first. Say which service and which project.
+1. A new service: read `get_service_type_parameters`, then `create_service`
+   with the project's `--project_id` creates and links it in one step. An
+   existing one: `link_service_to_project`. Say which service and which project.
 2. Tell the app which variables to read. They appear in the app's environment:
    - PostgreSQL: `POSTGRES_URL`, or `POSTGRES_HOST`, `POSTGRES_PORT`,
      `POSTGRES_DB`, `POSTGRES_USER` and `POSTGRES_PASSWORD`.
@@ -44,7 +47,9 @@ project when it is linked.
      Made here tab, and carry on without asking them for a password. Until
      then, write the code and prove the connection on the deployed app.
    - Only PostgreSQL can be connected to the sandbox so far. For Redis, MongoDB
-     and S3, prove the connection on the deployed app.
+     and S3, make the code fail with a clear message when the variable is
+     missing, test the rest of the logic in the sandbox without it, and prove
+     the connection on the deployed app.
 4. The variables reach the app on the next deployment, so deploy the project
    again after linking and after the code change. To get the code to the
    project, follow the `build-an-app` playbook.
