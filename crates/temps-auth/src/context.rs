@@ -718,4 +718,45 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn every_permission_a_token_can_use_is_a_grant_requirement() {
+        // The other direction: if a token can satisfy a standard permission,
+        // whoever hands out the token permission that satisfies it must be
+        // required to hold it. A requirement dropped from
+        // `standard_permissions_behind` would otherwise let a caller grant
+        // more than it holds without any test noticing.
+        let full = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+        let usable: Vec<Permission> = Permission::all()
+            .into_iter()
+            .filter(|permission| full.has_permission(permission))
+            .collect();
+        assert!(!usable.is_empty(), "a full-access token can use something");
+
+        for permission in usable {
+            let granted_by: Vec<DeploymentTokenPermission> = DeploymentTokenPermission::all()
+                .into_iter()
+                .filter(|candidate| *candidate != DeploymentTokenPermission::FullAccess)
+                .filter(|candidate| {
+                    deployment_token_ctx(7, vec![candidate.clone()]).has_permission(&permission)
+                })
+                .collect();
+            assert!(
+                !granted_by.is_empty(),
+                "{permission} is usable by a full-access token, so some token permission must grant it"
+            );
+            for candidate in granted_by {
+                assert!(
+                    standard_permissions_behind(&candidate).contains(&permission),
+                    "granting {} gives a token {permission}, so it must require it",
+                    candidate.as_str()
+                );
+            }
+            assert!(
+                standard_permissions_behind(&DeploymentTokenPermission::FullAccess)
+                    .contains(&permission),
+                "full access gives a token {permission}, so it must require it"
+            );
+        }
+    }
 }
