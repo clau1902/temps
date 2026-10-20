@@ -10,6 +10,12 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { ClusterNetworkCard } from '@/components/settings/ClusterNetworkCard'
+import { useClusterNetwork } from '@/hooks/useClusterNetwork'
+import {
+  nodeOverlayStatus,
+  type ClusterNetworkNode,
+} from '@/lib/cluster-network'
 import { CiBuilderPanel } from '@/components/nodes/CiBuilderPanel'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
 import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
@@ -551,14 +557,37 @@ function NodeRoleDescription({ labels }: { labels: unknown }) {
 
 // ── Node Table ──
 
+/** A node's cross-node overlay (ADR 056); the cause is in the title. */
+function OverlayBadge({ node }: { node: ClusterNetworkNode | undefined }) {
+  if (!node) {
+    return <span className="text-xs text-muted-foreground">—</span>
+  }
+  const view = nodeOverlayStatus(node)
+  const variant =
+    view.tone === 'ok'
+      ? 'success-subtle'
+      : view.tone === 'warn'
+        ? 'warning-subtle'
+        : 'neutral-subtle'
+  return (
+    <Badge variant={variant} className="text-xs" title={view.description}>
+      {view.tone === 'warn' ? 'Unavailable' : view.label}
+    </Badge>
+  )
+}
+
 function NodeTable({
   nodes,
   mesh,
+  overlay,
 }: {
   nodes: NodeInfoResponse[]
   mesh: WireguardMeshStatusResponse | undefined
+  overlay: ClusterNetworkNode[] | undefined
 }) {
   const navigate = useNavigate()
+  const overlayNodes = new Map(overlay?.map((node) => [node.id, node]))
+  const showOverlay = overlay?.some((node) => node.compute_cidr) ?? false
   const showMesh = mesh !== undefined && mesh.state !== 'disabled'
   const meshNodes = new Map(mesh?.nodes.map((node) => [node.node_id, node]))
   return (
@@ -573,6 +602,7 @@ function NodeTable({
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
             <TableHead className="hidden md:table-cell">Address</TableHead>
             {showMesh && <TableHead>Mesh</TableHead>}
+            {showOverlay && <TableHead>Cross-node</TableHead>}
             <TableHead>Last Heartbeat</TableHead>
           </TableRow>
         </TableHeader>
@@ -651,6 +681,11 @@ function NodeTable({
                     ) : (
                       <span className="text-xs text-muted-foreground">—</span>
                     )}
+                  </TableCell>
+                )}
+                {showOverlay && (
+                  <TableCell>
+                    <OverlayBadge node={overlayNodes.get(node.id)} />
                   </TableCell>
                 )}
                 <TableCell>
@@ -1820,6 +1855,10 @@ export function NodesPage() {
     isFetching: meshFetching,
   } = useWireguardMesh()
   const stranded = strandedPublicNodes(mesh)
+  const { data: clusterNetwork } = useClusterNetwork()
+  const overlayDown = (clusterNetwork?.nodes ?? []).filter(
+    (node) => nodeOverlayStatus(node).tone === 'warn'
+  )
   const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
   const nodeCount = nodes.length
@@ -1905,6 +1944,31 @@ export function NodesPage() {
             </Alert>
           )}
 
+          {overlayDown.length > 0 && (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                Cross-node network unavailable on{' '}
+                {overlayDown.map((node) => node.name).join(', ')}
+              </AlertTitle>
+              <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                <p>
+                  Their deployments keep working; containers on them cannot
+                  reach containers on other nodes, and managed-service members
+                  spanning hosts are not placed there.
+                </p>
+                <ul className="list-disc space-y-1 pl-4">
+                  {overlayDown.map((node) => (
+                    <li key={node.id} className="break-words">
+                      <span className="font-medium">{node.name}:</span>{' '}
+                      {nodeOverlayStatus(node).description}
+                    </li>
+                  ))}
+                </ul>
+              </AlertDescription>
+            </Alert>
+          )}
+
           {needsFirstNode ? (
             <div className="border-t pt-6">
               <WorkerNodeRequiredAlert
@@ -1923,7 +1987,11 @@ export function NodesPage() {
               </p>
             </div>
           ) : (
-            <NodeTable nodes={nodes} mesh={mesh} />
+            <NodeTable
+              nodes={nodes}
+              mesh={mesh}
+              overlay={clusterNetwork?.nodes}
+            />
           )}
         </CardContent>
       </Card>
@@ -1936,6 +2004,7 @@ export function NodesPage() {
         retrying={meshFetching}
       />
       <CiBuilderPanel />
+      <ClusterNetworkCard />
       <ClusterDnsCard />
       <ClusterTrustCard />
     </div>

@@ -169,6 +169,106 @@ pub struct RegisterNodeApiRequest {
     /// cluster CA and returns the leaf + CA cert. Optional — token-only nodes
     /// (legacy / edge) still register without one.
     pub csr_pem: Option<String>,
+    /// IPv4 ranges this machine already uses (ADR 056), so its overlay
+    /// allocation avoids them. Absent from older CLIs.
+    #[serde(default)]
+    pub occupied_ranges: Option<Vec<OccupiedRangeReport>>,
+}
+
+/// One IPv4 range a node already uses outside Temps (ADR 056).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OccupiedRangeReport {
+    /// IPv4 network, e.g. `172.20.0.0/16`.
+    pub cidr: String,
+    /// `route` (a host route) or `docker` (a Docker network's subnet).
+    pub source: String,
+    /// Device name for a route, network name for a Docker network.
+    pub name: String,
+}
+
+/// Cross-node overlay state reported by the agent (ADR 056).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct OverlayHeartbeat {
+    /// `ready` or `unavailable`.
+    pub status: String,
+    /// The allocation the agent applied (when `ready`) or tried to.
+    pub compute_cidr: Option<String>,
+    /// Why the overlay is unavailable, with the fix.
+    pub last_error: Option<String>,
+}
+
+/// Validate reported occupied ranges: malformed entries are dropped (and
+/// logged) rather than failing the heartbeat that carries them, and the rest
+/// is normalized and capped by `temps_network::occupied::normalize`.
+fn occupied_ranges_from_report(
+    node_id: Option<i32>,
+    reports: Vec<OccupiedRangeReport>,
+) -> Vec<temps_network::occupied::OccupiedRange> {
+    use temps_network::occupied::{OccupiedRange, OccupiedSource, MAX_OCCUPIED_RANGES};
+    let mut dropped = 0usize;
+    let ranges: Vec<OccupiedRange> = reports
+        .into_iter()
+        // A report far larger than what is stored is not worth parsing.
+        .take(MAX_OCCUPIED_RANGES * 4)
+        .filter_map(|report| {
+            let source = match report.source.as_str() {
+                "route" => OccupiedSource::Route,
+                "docker" => OccupiedSource::Docker,
+                _ => {
+                    dropped += 1;
+                    return None;
+                }
+            };
+            match report.cidr.parse::<ipnet::Ipv4Net>() {
+                Ok(cidr) => Some(OccupiedRange {
+                    cidr,
+                    source,
+                    name: report.name,
+                }),
+                Err(_) => {
+                    dropped += 1;
+                    None
+                }
+            }
+        })
+        .collect();
+    if dropped > 0 {
+        warn!(
+            ?node_id,
+            dropped, "ignored malformed occupied ranges reported by a node"
+        );
+    }
+    temps_network::occupied::normalize(ranges)
+}
+
+fn overlay_heartbeat_update(
+    node_id: i32,
+    overlay: OverlayHeartbeat,
+) -> Option<crate::services::node_service::OverlayHeartbeatUpdate> {
+    let ready = match overlay.status.as_str() {
+        crate::services::node_service::OVERLAY_READY => true,
+        crate::services::node_service::OVERLAY_UNAVAILABLE => false,
+        other => {
+            // Node-supplied: bounded and printable before it reaches a log.
+            let status: String = other.chars().filter(|c| !c.is_control()).take(32).collect();
+            warn!(node_id, %status, "ignoring an unknown overlay status");
+            return None;
+        }
+    };
+    Some(crate::services::node_service::OverlayHeartbeatUpdate {
+        ready,
+        compute_cidr: overlay
+            .compute_cidr
+            .and_then(|raw| raw.parse::<ipnet::Ipv4Net>().ok()),
+        // Shown in the console and the CLI: no control characters (the
+        // service caps the length).
+        last_error: overlay.last_error.map(|error| {
+            error
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect()
+        }),
+    })
 }
 
 #[derive(Serialize, ToSchema)]
@@ -220,6 +320,13 @@ pub struct HeartbeatApiRequest {
     /// clears it.
     pub docker_socket_projects: Option<Vec<String>>,
     pub public_ingress: Option<PublicIngressHeartbeat>,
+    /// Cross-node overlay state (ADR 056). `None` from older agents leaves the
+    /// stored status untouched.
+    #[serde(default)]
+    pub overlay: Option<OverlayHeartbeat>,
+    /// The node's occupied IPv4 ranges (ADR 056), sent when they change.
+    #[serde(default)]
+    pub occupied_ranges: Option<Vec<OccupiedRangeReport>>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -301,6 +408,20 @@ pub struct NodeInfoResponse {
     pub public_ingress_route_count: Option<i32>,
     pub public_ingress_unsupported_route_count: Option<i32>,
     pub public_ingress_unsupported_reasons: Vec<String>,
+    /// This node's subnet of the cluster compute pool, if allocated.
+    #[serde(default)]
+    pub compute_cidr: Option<String>,
+    /// Cross-node overlay (ADR 056): `ready`, `unavailable`, or `None` when
+    /// the agent never reported it (older agent, or no heartbeat yet).
+    #[serde(default)]
+    pub overlay_status: Option<String>,
+    /// Why the overlay is unavailable: the colliding range, its owner and the
+    /// fixes.
+    #[serde(default)]
+    pub overlay_last_error: Option<String>,
+    /// The last automatic move of this node's allocation, and why.
+    #[serde(default)]
+    pub overlay_remediation: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -503,6 +624,7 @@ pub struct ClusterDnsStatusResponse {
 #[openapi(
     paths(
         register_node,
+        mesh_enroll,
         node_heartbeat,
         get_s3_credentials,
         crate::handlers::network::list_peers,
@@ -523,6 +645,8 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::wireguard_mesh::wireguard_mesh_status,
         crate::handlers::wireguard_mesh::enable_wireguard_mesh,
         crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
+        crate::handlers::cluster_network::get_cluster_network,
+        crate::handlers::cluster_network::update_cluster_network,
         crate::handlers::node_pairings::create_node_pairing,
         crate::handlers::node_pairings::list_node_pairings,
         crate::handlers::node_pairings::cancel_node_pairing,
@@ -535,6 +659,8 @@ pub struct ClusterDnsStatusResponse {
         temps_deployer::build_protocol::BuildLimits,
         RegisterNodeApiRequest,
         RegisterNodeResponse,
+        MeshEnrollApiRequest,
+        MeshEnrollResponse,
         HeartbeatApiRequest,
         HeartbeatResponse,
         DnsResolverHeartbeat,
@@ -576,6 +702,14 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::wireguard_mesh::WireguardMeshHub,
         crate::handlers::wireguard_mesh::WireguardMeshLink,
         crate::handlers::wireguard_mesh::WireguardMeshLinkState,
+        crate::handlers::cluster_network::ClusterNetworkStatus,
+        crate::handlers::cluster_network::ClusterNetworkNode,
+        crate::handlers::cluster_network::ClusterNetworkControlPlane,
+        crate::handlers::cluster_network::ClusterNetworkReassignment,
+        crate::handlers::cluster_network::ClusterNetworkChangeResponse,
+        crate::handlers::cluster_network::UpdateClusterNetworkRequest,
+        OccupiedRangeReport,
+        OverlayHeartbeat,
         crate::handlers::node_pairings::CreateNodePairingRequest,
         crate::handlers::node_pairings::CreateNodePairingResponse,
         crate::handlers::node_pairings::NodePairingResponse,
@@ -602,6 +736,9 @@ pub struct NodesApiDoc;
 pub fn configure_routes() -> Router<Arc<NodeAppState>> {
     Router::new()
         .route("/internal/nodes/register", post(register_node))
+        // Not on the mesh node API (`is_node_route`): a worker only calls it
+        // before it is on the mesh (ADR 055).
+        .route("/internal/nodes/mesh-enroll", post(mesh_enroll))
         .route("/internal/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route(
             "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}",
@@ -679,6 +816,11 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         .route(
             "/nodes/wireguard/hub",
             put(crate::handlers::wireguard_mesh::set_wireguard_mesh_hub),
+        )
+        .route(
+            "/settings/cluster-network",
+            get(crate::handlers::cluster_network::get_cluster_network)
+                .put(crate::handlers::cluster_network::update_cluster_network),
         )
         .route(
             "/nodes/pairings",
@@ -1186,20 +1328,19 @@ fn pairing_problem(error: &temps_network::mesh::MeshError) -> Problem {
     }
 }
 
-async fn register_node_inner(
-    State(app_state): State<Arc<NodeAppState>>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
-    node_api_peer: Option<std::net::SocketAddr>,
-    Json(request): Json<RegisterNodeApiRequest>,
-) -> Result<impl IntoResponse, Problem> {
-    // Rate-limit enrollment (ADR-020 WS-1.3 / enroll-3) before doing any work:
-    // cap attempts per source IP and globally to blunt registration DoS and
-    // brute-force against the join token.
-    if let Err(retry_after) = app_state.rate_limiter.check(addr.ip()) {
+/// Refuse an enrollment from a source IP over its rate limit (ADR-020 WS-1.3
+/// / enroll-3), before doing any work: caps attempts per source IP and
+/// globally to blunt registration DoS and brute-force against the join token.
+fn check_enrollment_rate(
+    app_state: &NodeAppState,
+    ip: std::net::IpAddr,
+    node_name: &str,
+) -> Result<(), Problem> {
+    if let Err(retry_after) = app_state.rate_limiter.check(ip) {
         warn!(
-            ip = %addr.ip(),
+            ip = %ip,
             retry_after,
-            node = %request.name,
+            node = %node_name,
             "Node registration rate-limited"
         );
         return Err(problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
@@ -1209,51 +1350,67 @@ async fn register_node_inner(
                 retry_after
             )));
     }
+    Ok(())
+}
 
-    // Validate join token against the stored hash in settings
-    let settings = app_state.config_service.get_settings().await.map_err(|e| {
+async fn enrollment_settings(app_state: &NodeAppState) -> Result<AppSettings, Problem> {
+    app_state.config_service.get_settings().await.map_err(|e| {
         error!("Failed to read settings for join token validation: {}", e);
         problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
             .with_title("Internal Server Error")
             .with_detail("Failed to validate join token")
-    })?;
+    })
+}
 
-    // ── Enrollment authorization (ADR-020 WS-1.1) ────────────────────────────
-    // Prefer a short-lived, single-use enrollment token; fall back to the legacy
-    // single shared join token only while it is still enabled.
-    let provided_token = request.join_token.as_deref().ok_or_else(|| {
+/// A join token that authorized an enrollment (not yet consumed).
+struct AuthorizedEnrollment<'a> {
+    join_token: &'a str,
+    /// The enrollment token row; `None` for the legacy shared join token.
+    token: Option<temps_entities::node_enrollment_tokens::Model>,
+    /// The pairing the token was minted for, when the request came from its
+    /// reserved mesh address over the node API.
+    pairing_source: Option<crate::services::node_service::PairingSource>,
+}
+
+/// Enrollment authorization (ADR-020 WS-1.1), shared by registration and
+/// mesh enrollment (ADR 055). Prefers a short-lived, single-use enrollment
+/// token; falls back to the legacy single shared join token only while it is
+/// still enabled. Checks the token's bound name and labels and, for a token
+/// minted for a pairing, where the request came from. Consumes nothing.
+async fn authorize_enrollment<'a>(
+    app_state: &NodeAppState,
+    settings: &AppSettings,
+    join_token: Option<&'a str>,
+    node_name: &str,
+    labels: Option<&serde_json::Value>,
+    node_api_peer: Option<std::net::IpAddr>,
+) -> Result<AuthorizedEnrollment<'a>, Problem> {
+    let provided_token = join_token.ok_or_else(|| {
         warn!(
             "Node registration rejected: missing token for node '{}'",
-            request.name
+            node_name
         );
         problemdetails::new(StatusCode::FORBIDDEN)
             .with_title(TITLE_JOIN_TOKEN_REQUIRED)
             .with_detail("A token is required to register a node. Generate an enrollment token in Settings > Worker Nodes.")
     })?;
 
-    // The enrollment token this node registered with, when it was one: a
-    // token minted for a node pairing links the pairing to the node.
-    let mut enrollment_token_id = None;
     match app_state
         .enrollment_token_service
         .validate(provided_token)
         .await
     {
         Ok(token_row) => {
-            app_state
+            let pairing_source = app_state
                 .node_service
-                .assert_pairing_source(
-                    request.name.trim(),
-                    token_row.id,
-                    node_api_peer.map(|peer| peer.ip()),
-                )
+                .assert_pairing_source(node_name, token_row.id, node_api_peer)
                 .await
                 .map_err(Problem::from)?;
             // Enforce a node-name pin if the token was scoped to one node.
             if let Some(ref bound) = token_row.bound_node_name {
-                if bound != request.name.trim() {
+                if bound != node_name {
                     warn!(
-                        node = %request.name,
+                        node = %node_name,
                         bound = %bound,
                         "Node registration rejected: enrollment token bound to a different node name"
                     );
@@ -1268,17 +1425,14 @@ async fn register_node_inner(
             // Enforce a label pin if the token requires specific scheduling
             // labels — every required key/value must be present on the node.
             if let Some(serde_json::Value::Object(required)) = token_row.bound_labels.as_ref() {
-                let provided = request
-                    .labels
-                    .clone()
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let provided = labels.cloned().unwrap_or_else(|| serde_json::json!({}));
                 let provided_obj = provided.as_object();
                 let satisfied = required
                     .iter()
                     .all(|(k, v)| provided_obj.and_then(|o| o.get(k)) == Some(v));
                 if !satisfied {
                     warn!(
-                        node = %request.name,
+                        node = %node_name,
                         "Node registration rejected: enrollment token requires labels the node did not present"
                     );
                     return Err(problemdetails::new(StatusCode::FORBIDDEN)
@@ -1288,8 +1442,12 @@ async fn register_node_inner(
                         ));
                 }
             }
-            enrollment_token_id = Some(token_row.id);
-            info!(node = %request.name, "Node authorized via enrollment token");
+            info!(node = %node_name, "Node authorized via enrollment token");
+            Ok(AuthorizedEnrollment {
+                join_token: provided_token,
+                token: Some(token_row),
+                pairing_source,
+            })
         }
         Err(temps_config::EnrollmentError::InvalidToken) => {
             // Not a known enrollment token — try the legacy shared join token.
@@ -1304,16 +1462,21 @@ async fn register_node_inner(
             if !legacy_ok {
                 warn!(
                     "Node registration rejected: invalid or expired token for node '{}'",
-                    request.name
+                    node_name
                 );
                 return Err(problemdetails::new(StatusCode::FORBIDDEN)
                     .with_title(TITLE_UNKNOWN_ENROLLMENT_TOKEN)
                     .with_detail("The provided token is invalid or expired. Generate a new enrollment token in Settings > Worker Nodes."));
             }
             warn!(
-                node = %request.name,
+                node = %node_name,
                 "Node authorized via DEPRECATED legacy shared join token — mint per-node enrollment tokens instead"
             );
+            Ok(AuthorizedEnrollment {
+                join_token: provided_token,
+                token: None,
+                pairing_source: None,
+            })
         }
         Err(
             e @ (temps_config::EnrollmentError::Expired
@@ -1322,18 +1485,41 @@ async fn register_node_inner(
         ) => {
             // It matched a real enrollment token that is no longer usable — do
             // NOT silently fall through to the legacy shared token.
-            warn!(node = %request.name, "Node registration rejected: {}", e);
-            return Err(problemdetails::new(StatusCode::FORBIDDEN)
+            warn!(node = %node_name, "Node registration rejected: {}", e);
+            Err(problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Enrollment Token Not Usable")
-                .with_detail(e.to_string()));
+                .with_detail(e.to_string()))
         }
         Err(e) => {
             error!("Enrollment token validation error: {}", e);
-            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
-                .with_detail("Failed to validate enrollment token"));
+                .with_detail("Failed to validate enrollment token"))
         }
     }
+}
+
+async fn register_node_inner(
+    State(app_state): State<Arc<NodeAppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    node_api_peer: Option<std::net::SocketAddr>,
+    Json(request): Json<RegisterNodeApiRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    check_enrollment_rate(&app_state, addr.ip(), &request.name)?;
+    let settings = enrollment_settings(&app_state).await?;
+    let authorized = authorize_enrollment(
+        &app_state,
+        &settings,
+        request.join_token.as_deref(),
+        request.name.trim(),
+        request.labels.as_ref(),
+        node_api_peer.map(|peer| peer.ip()),
+    )
+    .await?;
+    let provided_token = authorized.join_token;
+    // The enrollment token this node registered with, when it was one: a
+    // token minted for a node pairing links the pairing to the node.
+    let enrollment_token_id = authorized.token.as_ref().map(|token| token.id);
 
     if settings.multi_node.require_mtls && request.csr_pem.is_none() {
         warn!(
@@ -1455,7 +1641,16 @@ async fn register_node_inner(
         claim_token_use(&app_state, provided_token, enrollment_token_id).await?;
         if let Err(error) = app_state
             .node_service
-            .reserve_certificate_addresses(&ca.cert_pem, &allowed_sans, request.name.trim())
+            .reserve_certificate_addresses(
+                &ca.cert_pem,
+                &allowed_sans,
+                request.name.trim(),
+                // A worker that joined outbound only registers under its own
+                // mesh address (ADR 055); the service re-checks the rest.
+                authorized
+                    .pairing_source
+                    .and_then(|source| source.own_mesh_address(&private_address)),
+            )
             .await
         {
             if let Some(token_id) = enrollment_token_id {
@@ -1543,7 +1738,23 @@ async fn register_node_inner(
         node.private_address.as_str(),
     )
     .await;
+    // ADR 056: record what the machine already uses first, so the allocation
+    // below avoids it, and move an existing never-applied allocation off it.
+    if let Some(reports) = request.occupied_ranges {
+        let ranges = occupied_ranges_from_report(Some(node.id), reports);
+        if let Err(error) = app_state
+            .node_service
+            .record_occupied_ranges(node.id, ranges)
+            .await
+        {
+            warn!(node_id = node.id, %error, "could not record the node's occupied ranges");
+        }
+    }
     allocate_overlay_cidr(app_state.db.clone(), node.id).await;
+    app_state
+        .node_service
+        .remediate_overlay_allocation(node.id)
+        .await;
 
     Ok((
         StatusCode::CREATED,
@@ -1557,6 +1768,306 @@ async fn register_node_inner(
             ca_cert_pem,
         }),
     ))
+}
+
+/// Body of `POST /internal/nodes/mesh-enroll` (ADR 055).
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct MeshEnrollApiRequest {
+    /// The name the worker will register under.
+    pub name: String,
+    /// Enrollment token, as for `/internal/nodes/register`.
+    pub join_token: Option<String>,
+    /// The worker's base64 WireGuard public key. The private key never
+    /// leaves the worker.
+    pub wg_public_key: String,
+    /// Scheduling labels the worker will register with; checked against the
+    /// token's bound labels and carried over to the pairing's token.
+    pub labels: Option<serde_json::Value>,
+}
+
+/// What a worker that joins outbound only needs to bring its end of the mesh
+/// up and register over it (ADR 055): a pairing code without its secret.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MeshEnrollResponse {
+    /// The pairing created for the worker.
+    pub pairing_id: i32,
+    /// The name the pairing's join token is bound to.
+    pub name: String,
+    pub control_plane_public_key: String,
+    /// `ip:port` the worker dials.
+    pub control_plane_endpoint: String,
+    /// The control plane's mesh address; the node API listens there.
+    pub control_plane_address: String,
+    /// The worker's mesh address, reserved for it. It registers under it.
+    pub node_address: String,
+    pub prefix_len: u8,
+    /// The mesh UDP port.
+    pub listen_port: u16,
+    /// TCP port of the node API on the control plane's mesh address.
+    pub node_api_port: u16,
+    /// SHA-256 fingerprint of the cluster CA the node API presents.
+    pub ca_fingerprint: String,
+    /// Single-use join token bound to `name`, accepted only over the mesh
+    /// node API from `node_address`.
+    pub join_token: String,
+    /// When the pairing and its token expire (RFC 3339).
+    pub expires_at: String,
+}
+
+/// Enroll a worker on the WireGuard mesh with no address of its own (ADR 055)
+///
+/// The worker sends its WireGuard public key with a join token; the control
+/// plane reserves it a mesh address and answers with what it needs to dial
+/// the control plane and register over the mesh node API.
+#[utoipa::path(
+    tag = "Nodes",
+    post,
+    path = "/internal/nodes/mesh-enroll",
+    request_body = MeshEnrollApiRequest,
+    responses(
+        (status = 201, description = "Pairing created; register over the mesh next", body = MeshEnrollResponse),
+        (status = 400, description = "Invalid name or WireGuard key"),
+        (status = 403, description = "Missing, unknown or unusable join token"),
+        (status = 409, description = "Mesh off or not ready, control plane not dialable, key in use, or too many pairings"),
+        (status = 429, description = "Rate limited"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+async fn mesh_enroll(
+    State(app_state): State<Arc<NodeAppState>>,
+    connect_info: ConnectInfo<std::net::SocketAddr>,
+    request: Json<MeshEnrollApiRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    let telemetry = app_state.telemetry.clone();
+    let result = mesh_enroll_inner(State(app_state), connect_info, request).await;
+    if let Err(problem) = &result {
+        let title = problem.body.get("title").and_then(|t| t.as_str());
+        if let Some(code) = node_join_failure_code(problem.status_code, title) {
+            telemetry.report(
+                temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::WorkerNodeJoinFailed,
+                )
+                .with_failure(code),
+            );
+        }
+    }
+    result
+}
+
+async fn mesh_enroll_inner(
+    State(app_state): State<Arc<NodeAppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    Json(request): Json<MeshEnrollApiRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    use crate::services::node_pairing_admin::{NodePairingAdminError, NodePairingAdminService};
+
+    check_enrollment_rate(&app_state, addr.ip(), &request.name)?;
+    let name = request.name.trim();
+    if !crate::services::node_service::is_valid_node_name(name) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Node Name")
+            .with_detail(format!(
+                "Node name '{name}' is invalid: use at most 63 letters, digits, '-', '.' or '_'. \
+                 Re-run `temps join` with `--name <name>`."
+            )));
+    }
+    let settings = enrollment_settings(&app_state).await?;
+    // Never over the mesh node API (the route is not served there), so a
+    // pairing's own token is refused: it cannot start another pairing.
+    let authorized = authorize_enrollment(
+        &app_state,
+        &settings,
+        request.join_token.as_deref(),
+        name,
+        request.labels.as_ref(),
+        None,
+    )
+    .await?;
+    // The legacy shared token has no use count: on this route it could hold
+    // every pending pairing slot forever, one fresh key at a time. Nothing
+    // older calls mesh-enroll, so it takes enrollment tokens only.
+    if authorized.token.is_none() {
+        return Err(problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Enrollment Token Required")
+            .with_detail(
+                "Joining without an address needs a node enrollment token, not the legacy \
+                 shared join token. Create one in Worker Nodes → Add node and re-run \
+                 `temps join <url> <token>`.",
+            ));
+    }
+    let public_key = request.wg_public_key.trim();
+    if !temps_wireguard::mesh::is_valid_public_key(public_key) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid WireGuard Key")
+            .with_detail(
+                "wg_public_key is not a base64-encoded 32-byte WireGuard public key. Upgrade the \
+                 Temps CLI on the worker and re-run `temps join`.",
+            ));
+    }
+    // Refuse what the pairing would refuse before taking a use of the token.
+    check_outbound_enrollment(&app_state).await?;
+
+    let token_id = authorized.token.as_ref().map(|token| token.id);
+    claim_token_use(&app_state, authorized.join_token, token_id).await?;
+    let service = NodePairingAdminService::new(
+        app_state.db.clone(),
+        app_state.config_service.clone(),
+        app_state.encryption_service.clone(),
+        app_state.enrollment_token_service.clone(),
+    );
+    let enrollment = match service
+        .start_outbound(
+            name,
+            public_key,
+            authorized
+                .token
+                .as_ref()
+                .and_then(|token| token.created_by_user_id),
+            authorized
+                .token
+                .as_ref()
+                .and_then(|token| token.bound_labels.clone()),
+        )
+        .await
+    {
+        Ok(enrollment) => enrollment,
+        Err(error) => {
+            if let Some(token_id) = token_id {
+                release_token_use(&app_state, token_id).await;
+            }
+            return Err(match error {
+                NodePairingAdminError::Mesh { source, .. } => mesh_enroll_problem(source),
+                other => crate::handlers::node_pairings::pairing_problem(other),
+            });
+        }
+    };
+
+    info!(
+        node = %name,
+        pairing = enrollment.pairing.id,
+        mesh_address = %enrollment.node_address,
+        "worker enrolled on the WireGuard mesh with no address of its own"
+    );
+    let audit = crate::handlers::audit::NodePairingCreatedAudit {
+        context: AuditContext {
+            // No user: a worker holding a join token. `0` is the codebase's
+            // convention for an actor that isn't a user.
+            user_id: 0,
+            ip_address: Some(addr.ip().to_string()),
+            user_agent: "temps-join/mesh-enroll".to_string(),
+        },
+        pairing_id: enrollment.pairing.id,
+        name: enrollment.pairing.name.clone(),
+        node_endpoint: None,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(%error, "mesh enrollment created a pairing but its audit record failed");
+    }
+
+    let response = MeshEnrollResponse {
+        pairing_id: enrollment.pairing.id,
+        name: enrollment.pairing.name.clone(),
+        control_plane_public_key: enrollment.control_plane_public_key,
+        control_plane_endpoint: enrollment.control_plane_endpoint,
+        control_plane_address: enrollment.control_plane_address.to_string(),
+        node_address: enrollment.node_address.to_string(),
+        prefix_len: enrollment.prefix_len,
+        listen_port: enrollment.listen_port,
+        node_api_port: enrollment.node_api_port,
+        ca_fingerprint: enrollment.ca_fingerprint,
+        join_token: enrollment.join_token.to_string(),
+        expires_at: enrollment.pairing.expires_at.to_rfc3339(),
+    };
+    Ok((
+        StatusCode::CREATED,
+        // The body carries a join token.
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(response),
+    ))
+}
+
+/// Refuse a mesh enrollment the mesh state cannot take (ADR 055), before a
+/// use of the join token is taken.
+async fn check_outbound_enrollment(app_state: &NodeAppState) -> Result<(), Problem> {
+    use crate::services::node_pairing_admin::NodePairingAdminError;
+    let db = app_state.db.as_ref();
+    let read_error = |error: temps_network::mesh::MeshError| {
+        error!(%error, "could not read the WireGuard mesh state for a mesh enrollment");
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("WireGuard Mesh Error")
+            .with_detail("the control plane could not read the WireGuard mesh state; see its logs")
+    };
+    if temps_network::mesh::load_settings(db)
+        .await
+        .map_err(read_error)?
+        .is_none()
+    {
+        return Err(mesh_enroll_problem(
+            temps_network::mesh::MeshError::Disabled,
+        ));
+    }
+    let Some(control_plane) = temps_network::mesh::published_control_plane(db)
+        .await
+        .map_err(read_error)?
+    else {
+        return Err(crate::handlers::node_pairings::pairing_problem(
+            NodePairingAdminError::MeshNotReady,
+        ));
+    };
+    if control_plane.endpoint.is_none() {
+        return Err(crate::handlers::node_pairings::pairing_problem(
+            NodePairingAdminError::ControlPlaneNotDialable,
+        ));
+    }
+    Ok(())
+}
+
+/// Why a worker could not enroll on the mesh (ADR 055), and what to do.
+fn mesh_enroll_problem(error: temps_network::mesh::MeshError) -> Problem {
+    use temps_network::mesh::MeshError;
+    match error {
+        MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Mesh Off")
+            .with_detail(
+                "A worker joins with no address of its own over the WireGuard mesh, which is \
+                 off on this control plane. Turn it on (Settings > Worker Nodes > Over the \
+                 internet) and re-run `temps join`, or join this worker with \
+                 `temps join <url> <token> --private-address <worker-ip>`.",
+            ),
+        MeshError::PublicKeyInUse => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Key In Use")
+            .with_detail(
+                "This worker's WireGuard key already belongs to a cluster member or to a pending \
+                 enrollment under another name. If an earlier `temps join` on this worker was \
+                 interrupted, re-run it with the same node name to resume that enrollment, or \
+                 cancel its pending pairing on the Worker Nodes page (or wait 30 minutes for it \
+                 to expire) and re-run `temps join`. If this worker is already a node, remove it on \
+                 the Worker Nodes page before joining it again. If its key was copied from \
+                 another machine, delete `~/.temps/wireguard` on this worker and re-run \
+                 `temps join`.",
+            ),
+        MeshError::TooManyPairings { limit } => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Too Many Pairings In Progress")
+            .with_detail(format!(
+                "{limit} workers are already joining. Wait for them to finish, cancel the ones \
+                 you no longer need on the Worker Nodes page, or let them expire after 30 \
+                 minutes, then re-run `temps join`."
+            )),
+        MeshError::Exhausted { cidr } => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Mesh Pool Full")
+            .with_detail(format!(
+                "The WireGuard mesh pool {cidr} has no free address for this worker. Remove \
+                 nodes you no longer need, cancel pending pairings on the Worker Nodes page, or \
+                 move the mesh to a larger pool while no node is on it."
+            )),
+        MeshError::InvalidPublicKey => problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid WireGuard Key")
+            .with_detail(
+                "wg_public_key is not a base64-encoded 32-byte WireGuard public key. Upgrade the \
+                 Temps CLI on the worker and re-run `temps join`.",
+            ),
+        other => crate::handlers::node_pairings::problem(other),
+    }
 }
 
 /// Set `nodes.underlay_address` to the value other nodes will use to reach
@@ -1689,6 +2200,12 @@ async fn node_heartbeat(
             })
             .transpose()
             .map_err(Problem::from)?,
+        overlay: request
+            .overlay
+            .and_then(|overlay| overlay_heartbeat_update(node_id, overlay)),
+        occupied_ranges: request
+            .occupied_ranges
+            .map(|reports| occupied_ranges_from_report(Some(node_id), reports)),
     };
 
     let architecture_change = app_state
@@ -2276,6 +2793,11 @@ fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
         public_ingress_route_count: None,
         public_ingress_unsupported_route_count: None,
         public_ingress_unsupported_reasons: Vec::new(),
+        // The control plane's overlay is shown under Cluster network.
+        compute_cidr: None,
+        overlay_status: None,
+        overlay_last_error: None,
+        overlay_remediation: None,
     }
 }
 
@@ -2330,6 +2852,10 @@ async fn admin_list_nodes(
                 n.public_ingress_unsupported_reasons,
             )
             .unwrap_or_default(),
+            compute_cidr: n.compute_cidr,
+            overlay_status: n.overlay_status,
+            overlay_last_error: n.overlay_last_error,
+            overlay_remediation: n.overlay_remediation,
         })
         .collect();
 
@@ -2401,6 +2927,10 @@ async fn admin_get_node(
             node.public_ingress_unsupported_reasons,
         )
         .unwrap_or_default(),
+        compute_cidr: node.compute_cidr,
+        overlay_status: node.overlay_status,
+        overlay_last_error: node.overlay_last_error,
+        overlay_remediation: node.overlay_remediation,
     }))
 }
 
@@ -2851,15 +3381,10 @@ async fn create_remote_deployer(
     let encrypted_token = node.token_encrypted.as_ref()?;
     let decrypted_bytes = encryption_service.decrypt(encrypted_token).ok()?;
     let token = String::from_utf8(decrypted_bytes).ok()?;
-    let deployer = crate::cluster_ca::build_node_deployer(
-        &node.address,
-        token,
-        node.name.clone(),
-        config_service,
-        encryption_service,
-    )
-    .await
-    .ok()?;
+    let deployer =
+        crate::cluster_ca::build_node_deployer(node, token, config_service, encryption_service)
+            .await
+            .ok()?;
     Some(Arc::new(deployer))
 }
 
@@ -4561,6 +5086,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -4572,7 +5102,7 @@ mod tests {
 
     fn make_app_with_settings(
         db: sea_orm::DatabaseConnection,
-        settings: temps_core::AppSettings,
+        settings: AppSettings,
     ) -> axum::Router {
         let db = Arc::new(db);
         let config_service = config_service_with(settings);
@@ -4610,7 +5140,14 @@ mod tests {
                 updated_at: chrono::Utc::now(),
             }]])
             .into_connection();
-        let server_config = Arc::new(temps_config::ServerConfig {
+        Arc::new(temps_config::ConfigService::new(
+            test_server_config(),
+            Arc::new(config_db),
+        ))
+    }
+
+    fn test_server_config() -> Arc<temps_config::ServerConfig> {
+        Arc::new(temps_config::ServerConfig {
             address: "127.0.0.1:3000".to_string(),
             database_url: "postgres://test".to_string(),
             tls_address: None,
@@ -4635,11 +5172,7 @@ mod tests {
             clickhouse_user: None,
             clickhouse_password: None,
             docker_extra_networks: Vec::new(),
-        });
-        Arc::new(temps_config::ConfigService::new(
-            server_config,
-            Arc::new(config_db),
-        ))
+        })
     }
 
     /// [`make_app_with_settings`] with the enrollment-token service on
@@ -5027,7 +5560,7 @@ mod tests {
             id: 5,
             pairing_id: "pairing-id".into(),
             name: "edge-1".into(),
-            node_endpoint: "10.100.0.2:51820".into(),
+            node_endpoint: Some("10.100.0.2:51820".into()),
             mesh_address: "10.201.0.7".into(),
             secret_encrypted: "secret".into(),
             enrollment_token_id: token_id,
@@ -6124,5 +6657,432 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Mesh enrollment (ADR 055) ───────────────────────────────────────
+
+    const WORKER_KEY: &str = "d29ya2VyLWtleS0zMi1ieXRlcy1sb25nLXBhZGRlZCE=";
+
+    async fn post_mesh_enroll(app: Router, body: &serde_json::Value) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/nodes/mesh-enroll")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn mesh_enroll_body(name: &str, join_token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "join_token": join_token,
+            "wg_public_key": WORKER_KEY,
+        })
+    }
+
+    /// A mesh enrollment of `edge-1` with an enrollment token bound to it,
+    /// against a control plane whose mesh state is `network_config` (each
+    /// query returns it). Returns the response and the SQL the
+    /// enrollment-token service ran.
+    async fn mesh_enroll_with_token(
+        network_config: Option<temps_entities::network_config::Model>,
+        body: serde_json::Value,
+    ) -> (axum::response::Response, Vec<String>) {
+        // Not a pairing's token.
+        let mut db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()]);
+        if let Some(config) = network_config {
+            db = db
+                .append_query_results(vec![vec![config.clone()]])
+                .append_query_results(vec![vec![config]]);
+        }
+        let db = db.into_connection();
+        let mut token = pairing_token(41, "edge-1");
+        token.token_hash = sha256_hash("worker-join-token");
+        let enrollment_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![token]])
+                .into_connection(),
+        );
+        let app = make_app_with_enrollment(
+            Arc::new(db),
+            config_service_with(settings_with_join_token()),
+            Arc::new(
+                temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+            ),
+            enrollment_db.clone(),
+        );
+        let response = post_mesh_enroll(app, &body).await;
+        let log = Arc::try_unwrap(enrollment_db)
+            .map(|db| {
+                db.into_transaction_log()
+                    .into_iter()
+                    .map(|transaction| format!("{transaction:?}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (response, log)
+    }
+
+    #[tokio::test]
+    async fn mesh_enroll_refuses_a_missing_or_unknown_token_like_register() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+        let mut body = mesh_enroll_body("edge-1", "unused");
+        body.as_object_mut().unwrap().remove("join_token");
+        let response = post_mesh_enroll(app, &body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem_of(response).await["title"],
+            TITLE_JOIN_TOKEN_REQUIRED
+        );
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+        let response = post_mesh_enroll(app, &mesh_enroll_body("edge-1", "not-a-token")).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem_of(response).await["title"],
+            TITLE_UNKNOWN_ENROLLMENT_TOKEN
+        );
+    }
+
+    /// The legacy shared token has no use count, so on mesh-enroll it could
+    /// hold every pending pairing slot; only enrollment tokens are accepted.
+    #[tokio::test]
+    async fn mesh_enroll_refuses_the_legacy_shared_token() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
+            .into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+        let response = post_mesh_enroll(app, &mesh_enroll_body("edge-1", "test-join-token")).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["title"], "Enrollment Token Required");
+        assert!(problem["detail"].as_str().unwrap().contains("Add node"));
+    }
+
+    #[tokio::test]
+    async fn mesh_enroll_refuses_an_invalid_name_or_key_before_any_work() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+        let response =
+            post_mesh_enroll(app, &mesh_enroll_body("bad name;", "test-join-token")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["title"], "Invalid Node Name");
+        assert!(problem["detail"].as_str().unwrap().contains("--name"));
+
+        let (response, log) = mesh_enroll_with_token(None, {
+            let mut body = mesh_enroll_body("edge-1", "worker-join-token");
+            body["wg_public_key"] = serde_json::json!("not-a-key");
+            body
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(problem_of(response).await["title"], "Invalid WireGuard Key");
+        assert!(log.iter().all(|sql| !sql.contains("UPDATE")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn mesh_enroll_with_the_mesh_off_says_how_to_join_and_keeps_the_token() {
+        let config =
+            crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false);
+        let (response, log) = mesh_enroll_with_token(
+            Some(config),
+            mesh_enroll_body("edge-1", "worker-join-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["title"], "WireGuard Mesh Off");
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(detail.contains("--private-address"), "{detail}");
+        assert!(log.iter().all(|sql| !sql.contains("UPDATE")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn mesh_enroll_without_a_control_plane_endpoint_says_how_to_publish_one() {
+        let mut config =
+            crate::handlers::wireguard_mesh::admin_test_support::network_config(true, true);
+        config.control_plane_wg_endpoint = None;
+        let (response, log) = mesh_enroll_with_token(
+            Some(config),
+            mesh_enroll_body("edge-1", "worker-join-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["title"], "Control Plane Not Dialable");
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(detail.contains("--wg-endpoint"), "{detail}");
+        assert!(detail.contains("--pair"), "{detail}");
+        assert!(log.iter().all(|sql| !sql.contains("UPDATE")), "{log:?}");
+
+        // Before the control plane published its end at all.
+        let config =
+            crate::handlers::wireguard_mesh::admin_test_support::network_config(true, false);
+        let (response, _) = mesh_enroll_with_token(
+            Some(config),
+            mesh_enroll_body("edge-1", "worker-join-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(problem_of(response).await["title"], "Mesh Not Ready");
+    }
+
+    #[tokio::test]
+    async fn mesh_enroll_refuses_a_pairings_own_token() {
+        // A pairing's token is only redeemed over the mesh node API from its
+        // reserved address; it can never start another pairing.
+        let token_id = 41;
+        let now = chrono::Utc::now();
+        let pairing = temps_entities::node_pairings::Model {
+            id: 5,
+            pairing_id: "pairing-id".into(),
+            name: "edge-1".into(),
+            node_endpoint: None,
+            mesh_address: "10.201.0.7".into(),
+            secret_encrypted: "secret".into(),
+            enrollment_token_id: token_id,
+            public_key: Some(WORKER_KEY.into()),
+            status: "key_received".into(),
+            last_error: None,
+            last_rejection: None,
+            last_attempt_at: None,
+            key_received_at: Some(now),
+            expires_at: now + chrono::Duration::minutes(30),
+            node_id: None,
+            created_by_user_id: None,
+            dialing_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![pairing]])
+            .into_connection();
+        let enrollment_db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![pairing_token(token_id, "edge-1")]])
+                .into_connection(),
+        );
+        let app = make_app_with_enrollment(
+            Arc::new(db),
+            config_service_with(settings_with_join_token()),
+            Arc::new(
+                temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+            ),
+            enrollment_db,
+        );
+        let response =
+            post_mesh_enroll(app, &mesh_enroll_body("edge-1", "pairing-join-token")).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem_of(response).await["title"],
+            "Pairing Token Outside The Mesh"
+        );
+    }
+
+    async fn migrated_test_db() -> Option<temps_database::test_utils::TestDatabase> {
+        if std::env::var("TEMPS_TEST_DATABASE_URL").is_err() {
+            let docker_up = match bollard::Docker::connect_with_local_defaults() {
+                Ok(docker) => docker.ping().await.is_ok(),
+                Err(_) => false,
+            };
+            if !docker_up {
+                println!("Docker not available and TEMPS_TEST_DATABASE_URL unset, skipping");
+                return None;
+            }
+        }
+        match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => Some(db),
+            Err(e) => panic!("test database setup failed: {e}"),
+        }
+    }
+
+    /// ADR 055 end to end on a real database: a worker with a join token
+    /// gets a pairing in `key_received` with no endpoint, the token loses
+    /// one use, and the answer carries what the worker needs. Its key is
+    /// then in use for any other enrollment, which keeps its token. The same
+    /// machine enrolling again resumes it (ADR 056).
+    #[tokio::test]
+    async fn mesh_enroll_creates_an_outbound_pairing_and_refuses_its_key_twice() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        temps_network::mesh::enable(db.as_ref(), Some("10.201.0.0/24"), Some(51820), None)
+            .await
+            .unwrap();
+        temps_network::mesh::publish_control_plane(
+            db.as_ref(),
+            "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE=",
+            Some("198.51.100.1:51820".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            test_server_config(),
+            db.clone(),
+        ));
+        let tokens = Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
+        let mint = |name: &'static str| {
+            let tokens = tokens.clone();
+            async move {
+                tokens
+                    .mint(temps_config::MintParams {
+                        max_uses: 1,
+                        ttl_secs: 3600,
+                        bound_node_name: Some(name.to_string()),
+                        bound_labels: Some(serde_json::json!({ "zone": "a" })),
+                        created_by_user_id: None,
+                        ca_fingerprint: None,
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let (join_token, token) = mint("edge-1").await;
+        let app = make_app_with_enrollment(
+            db.clone(),
+            config_service.clone(),
+            encryption.clone(),
+            db.clone(),
+        );
+
+        let mut body = mesh_enroll_body("edge-1", &join_token);
+        body["labels"] = serde_json::json!({ "zone": "a" });
+        let response = post_mesh_enroll(app.clone(), &body).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        let answer: MeshEnrollResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(answer.name, "edge-1");
+        assert_eq!(
+            answer.control_plane_public_key,
+            "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE="
+        );
+        assert_eq!(answer.control_plane_endpoint, "198.51.100.1:51820");
+        assert_eq!(answer.control_plane_address, "10.201.0.1");
+        assert_eq!(answer.node_address, "10.201.0.2");
+        assert_eq!(
+            (answer.prefix_len, answer.listen_port, answer.node_api_port),
+            (24, 51820, 51820)
+        );
+        let settings = config_service.get_settings().await.unwrap();
+        let ca = settings
+            .multi_node
+            .cluster_ca_cert_pem
+            .expect("cluster CA created");
+        assert_eq!(
+            answer.ca_fingerprint,
+            temps_core::node_pki::ca_fingerprint_sha256(&ca).unwrap()
+        );
+        assert_ne!(answer.join_token, join_token);
+        assert!(chrono::DateTime::parse_from_rfc3339(&answer.expires_at).is_ok());
+
+        let pairing = temps_network::pairing::get(db.as_ref(), answer.pairing_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pairing.status, temps_network::pairing::STATUS_KEY_RECEIVED);
+        assert_eq!(pairing.node_endpoint, None);
+        assert_eq!(pairing.public_key.as_deref(), Some(WORKER_KEY));
+        assert_eq!(pairing.mesh_address, "10.201.0.2");
+        let token_row = |id: i32| {
+            let db = db.clone();
+            async move {
+                temps_entities::node_enrollment_tokens::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        assert_eq!(token_row(token.id).await.used_count, 1);
+        let pairing_token = token_row(pairing.enrollment_token_id).await;
+        assert_eq!(pairing_token.bound_node_name.as_deref(), Some("edge-1"));
+        assert_eq!(
+            pairing_token.bound_labels,
+            Some(serde_json::json!({ "zone": "a" }))
+        );
+        assert_eq!(pairing_token.max_uses, 1);
+        assert_eq!(pairing_token.used_count, 0);
+        assert_eq!(
+            pairing_token.ca_fingerprint.as_deref(),
+            Some(answer.ca_fingerprint.as_str())
+        );
+
+        // The token is spent.
+        let response = post_mesh_enroll(app.clone(), &body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // ADR 056: the same machine (same key, same name) re-running
+        // `temps join` with a fresh token resumes its pending enrollment:
+        // same pairing and mesh address, a new pairing token, the old one
+        // revoked.
+        let (rejoin_token, rejoin) = mint("edge-1").await;
+        let mut rejoin_body = mesh_enroll_body("edge-1", &rejoin_token);
+        rejoin_body["labels"] = serde_json::json!({ "zone": "a" });
+        let response = post_mesh_enroll(app.clone(), &rejoin_body).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let resumed: MeshEnrollResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resumed.pairing_id, answer.pairing_id);
+        assert_eq!(resumed.node_address, answer.node_address);
+        assert_ne!(resumed.join_token, answer.join_token);
+        assert_eq!(token_row(rejoin.id).await.used_count, 1);
+        assert!(
+            token_row(pairing.enrollment_token_id)
+                .await
+                .revoked_at
+                .is_some(),
+            "the superseded pairing token is revoked"
+        );
+        let resumed_pairing = temps_network::pairing::get(db.as_ref(), answer.pairing_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            resumed_pairing.enrollment_token_id,
+            pairing.enrollment_token_id
+        );
+        assert_eq!(resumed_pairing.mesh_address, "10.201.0.2");
+
+        // The same key under another name, with a fresh token: in use.
+        let (join_token, token) = mint("edge-2").await;
+        let mut body = mesh_enroll_body("edge-2", &join_token);
+        body["labels"] = serde_json::json!({ "zone": "a" });
+        let response = post_mesh_enroll(app, &body).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["title"], "WireGuard Key In Use");
+        assert!(problem["detail"].as_str().unwrap().contains("cancel"));
+        assert_eq!(
+            token_row(token.id).await.used_count,
+            0,
+            "a refused enrollment gives the token its use back"
+        );
     }
 }

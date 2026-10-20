@@ -67,6 +67,7 @@ import {
 import { problemDetail } from '@/lib/api-problem'
 import { httpStatusOf } from '@/lib/http-error-status'
 import {
+  controlPlaneMeshPort,
   defaultInternetMethod,
   defaultJoinPath,
   joinCommand,
@@ -74,6 +75,8 @@ import {
   joinUrlReachableFromOutside,
   meshConnectionLabel,
   meshProblems,
+  offersOutboundJoin,
+  outboundJoinCommand,
   pairingAsOf,
   pairingEnded,
   pairingProgress,
@@ -434,6 +437,16 @@ function UrlJoin({
   missingToken?: MissingJoinToken
   urlReachable: boolean
 }) {
+  if (offersOutboundJoin(mesh, url)) {
+    return (
+      <OutboundJoin
+        mesh={mesh}
+        url={url}
+        token={token}
+        missingToken={missingToken}
+      />
+    )
+  }
   return (
     <>
       {!urlReachable && (
@@ -462,15 +475,29 @@ function UrlJoin({
             The mesh endpoint is {mesh.control_plane.endpoint}, which a machine
             on the internet cannot reach. Pair workers from here instead (This
             server reaches the worker), or start <code>temps serve</code> with{' '}
-            <code>--private-address &lt;this server&apos;s public IP&gt;</code>.
+            <code>--private-address &lt;this server&apos;s public IP&gt;</code>{' '}
+            (or <code>--wg-endpoint &lt;public-ip&gt;:&lt;port&gt;</code> when
+            it is behind NAT).
           </AlertDescription>
         </Alert>
       )}
       <Step number={1} title="Open the mesh port">
         <p className="mt-1">
-          Allow UDP <code>{mesh.listen_port}</code> in from the other nodes on
-          this server and on the new worker (your provider&apos;s firewall and
-          any host firewall).
+          {controlPlaneMeshPort(mesh) === mesh.listen_port ? (
+            <>
+              Allow UDP <code>{mesh.listen_port}</code> in from the other nodes
+              on this server and on the new worker (your provider&apos;s
+              firewall and any host firewall).
+            </>
+          ) : (
+            <>
+              Allow UDP <code>{controlPlaneMeshPort(mesh)}</code> in from the
+              other nodes on this server (forwarded to its port{' '}
+              <code>{mesh.listen_port}</code>), and UDP{' '}
+              <code>{mesh.listen_port}</code> on the new worker (your
+              provider&apos;s firewall and any host firewall).
+            </>
+          )}
         </p>
       </Step>
       <Step number={2} title="Install Temps on the worker">
@@ -500,6 +527,72 @@ function UrlJoin({
             temps agent --wg-endpoint &lt;public-ip&gt;:{mesh.listen_port}
           </code>
           .
+        </p>
+      </Step>
+    </>
+  )
+}
+
+/**
+ * The worker joins with no public address (ADR 055): it sends its WireGuard
+ * key over HTTPS and dials this server, so only this server's mesh port has
+ * to be open.
+ */
+function OutboundJoin({
+  mesh,
+  url,
+  token,
+  missingToken,
+}: {
+  mesh: WireguardMeshStatusResponse
+  url: string
+  token: string | null
+  missingToken?: MissingJoinToken
+}) {
+  const port = controlPlaneMeshPort(mesh)
+  return (
+    <>
+      <Step number={1} title="Open the mesh port on this server">
+        <p className="mt-1">
+          Allow UDP <code>{port}</code> in on this server
+          {port !== mesh.listen_port && (
+            <>
+              {' '}
+              (forwarded to its port <code>{mesh.listen_port}</code>)
+            </>
+          )}{' '}
+          in your provider&apos;s firewall and any host firewall. Nothing has to
+          be opened on the worker: it dials out.
+        </p>
+      </Step>
+      <Step number={2} title="Install Temps on the worker">
+        <CommandLine command={INSTALL_COMMAND} />
+      </Step>
+      <Step number={3} title="Join the cluster, as root">
+        {missingToken ? (
+          <GenerateTokenFirst missing={missingToken} />
+        ) : (
+          <>
+            <CommandLine command={outboundJoinCommand(url, token)} />
+            <p className="mt-1 text-xs">
+              The worker sends its WireGuard key to this server over HTTPS,
+              brings the mesh up by dialing{' '}
+              <code>{mesh.control_plane?.endpoint}</code> and registers under
+              its mesh address. It needs no public IP.
+            </p>
+          </>
+        )}
+      </Step>
+      <Step number={4} title="Start the agent, as root">
+        <CommandLine command={AGENT_SERVICE_COMMAND} />
+        <p className="mt-1 text-xs">
+          The worker shows as Connected below within a minute. {WITHOUT_SYSTEMD}{' '}
+          Other workers reach it through this server; to let them connect to it
+          directly, start it with{' '}
+          <code>
+            temps agent --wg-endpoint &lt;public-ip&gt;:{mesh.listen_port}
+          </code>{' '}
+          and open that UDP port on the worker.
         </p>
       </Step>
     </>
@@ -616,7 +709,7 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           onCreateAgain={() =>
             create.mutate({
               body: {
-                address: address.trim() || created.pairing.node_endpoint,
+                address: address.trim() || created.pairing.node_endpoint || '',
                 name: name.trim() || null,
               },
             })
@@ -671,8 +764,14 @@ function CreatedPairing({
               Its command no longer works.{' '}
               {pairing.status === 'expired' &&
                 'The node did not answer before it expired. '}
-              A new pairing for <code>{pairing.node_endpoint}</code> gives a new
-              command.
+              {pairing.node_endpoint ? (
+                <>
+                  A new pairing for <code>{pairing.node_endpoint}</code> gives a
+                  new command.
+                </>
+              ) : (
+                'A new pairing gives a new command.'
+              )}
             </p>
             <Button
               type="button"
@@ -778,7 +877,7 @@ function PendingPairings() {
               <p className="font-medium text-foreground">
                 {pairing.name}{' '}
                 <span className="font-mono text-muted-foreground">
-                  {pairing.node_endpoint}
+                  {pairing.node_endpoint ?? 'joined outbound'}
                 </span>
               </p>
               {hint && (

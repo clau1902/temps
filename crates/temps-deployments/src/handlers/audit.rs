@@ -276,12 +276,14 @@ pub struct WireguardMeshEnabledAudit {
 
 /// An operator started pairing a node the control plane will dial (ADR 048
 /// D2b): whoever runs the returned command at that address joins the mesh.
+/// Also recorded when a worker that joins outbound only starts its own
+/// pairing with a join token (ADR 055); it has no endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct NodePairingCreatedAudit {
     pub context: AuditContext,
     pub pairing_id: i32,
     pub name: String,
-    pub node_endpoint: String,
+    pub node_endpoint: Option<String>,
 }
 
 /// An operator cancelled a pending node pairing.
@@ -298,6 +300,18 @@ pub struct WireguardMeshHubChangedAudit {
     pub context: AuditContext,
     /// `none`, `control-plane` or `node <id>`.
     pub hub: String,
+}
+
+/// The cluster compute pool changed (ADR 056); never-applied allocations
+/// moved to the new pool.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterComputePoolChangedAudit {
+    pub context: AuditContext,
+    /// `<pool>/<per-node prefix>` before and after.
+    pub from: String,
+    pub to: String,
+    /// `<node>: <old subnet> -> <new subnet>` per moved allocation.
+    pub reassigned: Vec<String>,
 }
 
 /// An operator started adding a server over SSH (ADR 048 D2c). The
@@ -497,6 +511,10 @@ impl_audit_operation!(NodeRemovalAudit, "NODE_REMOVAL");
 impl_audit_operation!(NodeDrainAudit, "NODE_DRAIN");
 impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");
 impl_audit_operation!(WireguardMeshHubChangedAudit, "WIREGUARD_MESH_HUB_CHANGED");
+impl_audit_operation!(
+    ClusterComputePoolChangedAudit,
+    "CLUSTER_COMPUTE_POOL_CHANGED"
+);
 impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
 impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
 impl_audit_operation!(NodeSshEnrollmentStartedAudit, "NODE_SSH_ENROLLMENT_STARTED");
@@ -540,7 +558,8 @@ pub struct NodeMeshKeyChangedAudit {
     pub old_public_key: String,
     pub new_public_key: String,
     pub old_endpoint: Option<String>,
-    pub new_endpoint: String,
+    /// `None` for a node nobody dials (ADR 055).
+    pub new_endpoint: Option<String>,
 }
 
 impl_audit_operation!(NodeMeshKeyChangedAudit, "NODE_MESH_KEY_CHANGED");

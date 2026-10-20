@@ -18,6 +18,8 @@ mod m20261017_000001_deployment_health_probes;
 pub mod m20261017_000001_retain_ci_cancellation;
 pub mod m20261017_000002_runtime_health;
 mod m20261019_000001_mfa_verification_guards;
+mod m20261020_000001_node_pairings_outbound;
+mod m20261020_000002_compute_pool_collisions;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -769,6 +771,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20261017_000001_deployment_health_probes::Migration),
             Box::new(m20261017_000002_runtime_health::Migration),
             Box::new(m20261019_000001_mfa_verification_guards::Migration),
+            // ADR 055: outbound-only worker joins have no pairing endpoint.
+            Box::new(m20261020_000001_node_pairings_outbound::Migration),
+            // ADR 056: new default compute pool, per-node overlay status.
+            Box::new(m20261020_000002_compute_pool_collisions::Migration),
         ]
     }
 }

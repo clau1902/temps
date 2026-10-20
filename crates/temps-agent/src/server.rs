@@ -154,6 +154,11 @@ pub fn build_router(
                 .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route(
+            "/agent/plugins/build",
+            post(crate::plugin_build_handler::build_plugin)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
             "/agent/images/export",
             get(crate::build_handler::export_image),
         )
@@ -367,8 +372,9 @@ fn spawn_heartbeat_loop(
     container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
     platform: SharedPlatform,
     docker: Option<bollard::Docker>,
-    dns_health: crate::network_sync::SharedDnsHealth,
+    health: crate::network_sync::HealthSlots,
     docker_socket_grant: DockerSocketGrant,
+    mesh_listener: crate::mesh_listener::SharedMeshListener,
 ) {
     let control_plane_url = config.control_plane_url.clone();
     let heartbeat_client = crate::control_plane_client_builder(config);
@@ -404,11 +410,39 @@ fn spawn_heartbeat_loop(
         let mut consecutive_failures: u32 = 0;
         let mut inventory_sent = false;
         let mut beats_since_platform_check: u32 = 0;
+        // Occupied ranges the control plane acknowledged last (ADR 056):
+        // they are sent only when they differ.
+        let mut occupied_sent: Option<Vec<temps_network::occupied::OccupiedRange>> = None;
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                // Report a new mesh listener at once: a control plane that
+                // reaches this node only through the mesh dials the
+                // registered address until it hears of it.
+                _ = mesh_listener.changed() => {
+                    tracing::info!(
+                        node_id,
+                        mesh_listener = ?mesh_listener.get(),
+                        "the agent API's mesh listener changed; sending a heartbeat now"
+                    );
+                }
+            }
 
-            let capacity = collect_capacity_metrics();
+            let mut capacity = collect_capacity_metrics();
+            // Where the agent API is served on the WireGuard mesh: what lets
+            // the control plane call this node through the mesh (an agent
+            // that never reports it keeps being called at its registered
+            // address).
+            if let (Some(value), Some(fields)) = (
+                mesh_listener.get().heartbeat_value(),
+                capacity.as_object_mut(),
+            ) {
+                fields.insert(
+                    temps_core::node_address::AGENT_MESH_LISTENER_KEY.to_string(),
+                    value,
+                );
+            }
 
             // Platform discovery can fail at startup — the agent often boots
             // alongside the Docker daemon — so retry here until it answers.
@@ -486,7 +520,7 @@ fn spawn_heartbeat_loop(
             // that never gets a compute_cidr allocation and so never
             // touches cluster DNS at all) — omitted from the body in that
             // case, same treatment as `architecture` above.
-            let dns_snapshot = dns_health.read().ok().and_then(|guard| guard.clone());
+            let dns_snapshot = health.dns.read().ok().and_then(|guard| guard.clone());
             if let Some(health) = dns_snapshot {
                 match serde_json::to_value(&health) {
                     Ok(v) => body["dns_resolver"] = v,
@@ -496,6 +530,24 @@ fn spawn_heartbeat_loop(
                         "Failed to serialize DNS resolver health for heartbeat"
                     ),
                 }
+            }
+
+            // Cross-node overlay state and this host's occupied ranges
+            // (ADR 056), published by the network-sync loop. Both omitted
+            // until it ran; the ranges also when unchanged since last sent.
+            let overlay_snapshot = health
+                .overlay
+                .read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            if let Some(overlay) = &overlay_snapshot.overlay {
+                body["overlay"] = serde_json::json!(overlay);
+            }
+            let occupied_to_send = overlay_snapshot
+                .occupied_ranges
+                .filter(|ranges| occupied_sent.as_ref() != Some(ranges));
+            if let Some(ranges) = &occupied_to_send {
+                body["occupied_ranges"] = serde_json::json!(ranges);
             }
 
             // On the first heartbeat (agent startup/reconnect), include a full
@@ -560,6 +612,9 @@ fn spawn_heartbeat_loop(
                         succeeded = true;
                         if body.get("containers").is_some() {
                             inventory_sent = true;
+                        }
+                        if let Some(ranges) = occupied_to_send.clone() {
+                            occupied_sent = Some(ranges);
                         }
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
@@ -774,11 +829,19 @@ pub async fn start_agent_server(
         platform.clone(),
     );
 
-    // Shared DNS resolver health slot (ADR-024). Written by the network-sync
-    // loop below on every tick, read by the heartbeat loop so the control
-    // plane learns resolver health without an operator SSHing in to read
-    // logs. Lives for the agent's process lifetime, same as `platform`.
-    let dns_health: crate::network_sync::SharedDnsHealth = Arc::new(std::sync::RwLock::new(None));
+    // Shared DNS resolver health (ADR-024) and overlay report (ADR 056)
+    // slots. Written by the network-sync loop below on every tick, read by
+    // the heartbeat loop so the control plane learns resolver and overlay
+    // health without an operator SSHing in to read logs. Live for the
+    // agent's process lifetime, same as `platform`.
+    let health = crate::network_sync::HealthSlots::default();
+
+    // This node's mesh address (published by the network-sync loop) and the
+    // address the agent API is served on over the mesh (reported by the
+    // heartbeat). Only an mTLS agent ever serves there; see `mesh_listener`.
+    let (mesh_address_tx, mesh_address_rx) =
+        tokio::sync::watch::channel(crate::mesh_listener::MeshAddress::Unknown);
+    let mesh_listener: crate::mesh_listener::SharedMeshListener = Arc::default();
 
     // Start heartbeat background loop (with deployer for container inventory on first beat)
     spawn_heartbeat_loop(
@@ -786,8 +849,9 @@ pub async fn start_agent_server(
         container_deployer.clone(),
         platform,
         docker,
-        dns_health.clone(),
+        health.clone(),
         docker_socket_grant,
+        mesh_listener.clone(),
     );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
@@ -799,9 +863,10 @@ pub async fn start_agent_server(
         &config,
         network.overlay_bridge_address,
         network.overlay_peers,
-        dns_health,
+        health,
         network.host_bind_address,
         container_deployer,
+        mesh_address_tx,
     );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
@@ -840,8 +905,18 @@ pub async fn start_agent_server(
                 cert = %cert.display(),
                 "Agent serving with mutual TLS (control-plane client cert verified against cluster CA)"
             );
-            let server_config = build_tls_server_config(cert, key, ca)?;
-            serve_mtls(listener, router, std::sync::Arc::new(server_config)).await?;
+            let server_config = std::sync::Arc::new(build_tls_server_config(cert, key, ca)?);
+            // The same router, TLS configuration and auth on the mesh
+            // address, for a control plane that reaches this node only
+            // through the mesh. Never for the plaintext branch below.
+            crate::mesh_listener::spawn(
+                router.clone(),
+                server_config.clone(),
+                config.listen_address.clone(),
+                mesh_address_rx,
+                mesh_listener,
+            );
+            serve_mtls(listener, router, server_config).await?;
         }
         (None, None, None) if !config.require_mtls => {
             tracing::warn!(
@@ -865,7 +940,7 @@ pub async fn start_agent_server(
 /// Build a rustls `ServerConfig` that serves the node's leaf cert and requires
 /// the client (the control plane) to present a certificate chaining to the
 /// cluster CA (ADR-020 WS-2.1).
-fn build_tls_server_config(
+pub(crate) fn build_tls_server_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
     ca_path: &std::path::Path,
@@ -921,7 +996,7 @@ fn build_tls_server_config(
 /// axum router over hyper with WebSocket-upgrade support (the agent exposes a
 /// terminal WS route, so `serve_connection_with_upgrades` is required). Mirrors
 /// the pattern in `temps-plugin-sdk/src/runtime.rs`.
-async fn serve_mtls(
+pub(crate) async fn serve_mtls(
     listener: tokio::net::TcpListener,
     router: Router,
     server_config: std::sync::Arc<rustls::ServerConfig>,
@@ -970,10 +1045,10 @@ async fn serve_mtls(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn test_agent_config(require_mtls: bool) -> AgentConfig {
+    pub(crate) fn test_agent_config(require_mtls: bool) -> AgentConfig {
         AgentConfig {
             listen_address: "127.0.0.1:3100".to_string(),
             token: "secret".to_string(),

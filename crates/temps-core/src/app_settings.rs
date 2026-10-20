@@ -1363,6 +1363,17 @@ pub struct MultiNodeSettings {
     /// Used by remote worker nodes to reach services (databases, etc.) running on the control plane.
     /// Set via `--private-address` or `TEMPS_PRIVATE_ADDRESS`.
     pub private_address: Option<String>,
+    /// `ip:port` workers dial for the control plane's end of the WireGuard
+    /// mesh, published instead of `private_address` on the mesh port. For a
+    /// control plane reachable only through NAT or a forwarded port.
+    ///
+    /// Owned by `temps serve --wg-endpoint` / `TEMPS_WG_ENDPOINT`: every start
+    /// records the flag's value (clearing it when the flag is absent), and a
+    /// settings write never changes it. Stored here only so the processes
+    /// that set the mesh up (the deployer plugin, `temps network
+    /// setup-multi-node`) read the same value.
+    #[serde(default)]
+    pub wg_endpoint: Option<String>,
     /// Whether the legacy single shared join token is still accepted for node
     /// registration (ADR-020 WS-1.1). Defaults to `true` so existing clusters
     /// keep working on upgrade; fresh installs should set it `false` and rely on
@@ -1432,6 +1443,7 @@ impl Default for MultiNodeSettings {
         Self {
             join_token_hash: None,
             private_address: None,
+            wg_endpoint: None,
             legacy_shared_token_enabled: true,
             cluster_ca_cert_pem: None,
             cluster_ca_key_encrypted: None,

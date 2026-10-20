@@ -41,6 +41,49 @@ export function joinCommand(
   return `temps join ${url} ${token ?? '<join-token>'} --private-address ${address}`
 }
 
+/**
+ * The join for a worker with no public address (ADR 055): it sends its
+ * WireGuard key over HTTPS and dials this server, so it needs no address.
+ */
+export function outboundJoinCommand(url: string, token: string | null): string {
+  return `temps join ${url} ${token ?? '<join-token>'}`
+}
+
+/**
+ * Whether to offer the outbound-only join (ADR 055): the worker must reach
+ * the join URL and dial this server's mesh endpoint, so both have to be
+ * reachable from the internet. Otherwise the page keeps the joins that
+ * need a worker address.
+ */
+export function offersOutboundJoin(
+  mesh: Pick<WireguardMeshStatusResponse, 'control_plane'> | undefined,
+  url: string
+): boolean {
+  const controlPlane = mesh?.control_plane
+  return (
+    joinUrlReachableFromOutside(url) &&
+    !!controlPlane?.endpoint?.trim() &&
+    !controlPlane.endpoint_is_private
+  )
+}
+
+/**
+ * The UDP port this server accepts the mesh on, as workers dial it: the port
+ * of its published endpoint, which `temps serve --wg-endpoint` may set to a
+ * forwarded port that differs from the listen port. Falls back to the
+ * listen port when there is no endpoint or it cannot be read.
+ */
+export function controlPlaneMeshPort(
+  mesh: Pick<WireguardMeshStatusResponse, 'listen_port' | 'control_plane'>
+): number {
+  const endpoint = mesh.control_plane?.endpoint?.trim()
+  const match = endpoint?.match(/:(\d{1,5})$/)
+  const port = match ? Number(match[1]) : NaN
+  return Number.isInteger(port) && port > 0 && port <= 65535
+    ? port
+    : mesh.listen_port
+}
+
 /** Label and tone for a node's mesh connection. */
 export function meshConnectionLabel(connection: WireguardMeshNodeConnection): {
   label: string
@@ -184,7 +227,9 @@ export function pairingProgress(pairing: NodePairingResponse): {
       return {
         label: 'Registering',
         tone: 'ok',
-        hint: 'The node answered and is registering over the mesh.',
+        hint: pairing.node_endpoint
+          ? 'The node answered and is registering over the mesh.'
+          : 'The node sent its key and is registering over the mesh.',
       }
     case 'completed':
       return { label: 'Joined', tone: 'ok' }

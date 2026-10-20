@@ -16989,9 +16989,10 @@ export type NodePairingResponse = {
     mesh_address: string;
     name: string;
     /**
-     * `ip:port` the control plane dials.
+     * `ip:port` the control plane dials. `None` for a worker that joined
+     * outbound only (ADR 055): it sent its key and dials the control plane.
      */
-    node_endpoint: string;
+    node_endpoint?: string | null;
     /**
      * The node that registered with this pairing.
      */

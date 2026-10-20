@@ -30,14 +30,15 @@ const NETWORK_OWNER_VALUE: &str = "multi-node-overlay";
 /// an overlapping address range. Docker rejects these late with a generic
 /// `invalid pool request`; this turns it into an actionable, named conflict.
 ///
-/// Preflights the complete cluster pool, not only this node's allocation.
-/// Every node installs routes for peer subnets, so a local Docker network
-/// overlapping any part of the pool can black-hole a future peer.
-pub async fn preflight_network_for_pool(
+/// Checks the subnets this node routes on the overlay (`routed`: its own and
+/// every peer's), not the whole cluster pool (ADR 056). A Docker network
+/// elsewhere in the pool cannot black-hole anything this node sends; a new
+/// peer is allocated around the ranges this node reports as occupied.
+pub async fn preflight_network_for_subnets(
     docker: &Docker,
     config: &NetworkConfig,
     alloc: &NodeAlloc,
-    compute_pool: Ipv4Net,
+    routed: &[Ipv4Net],
 ) -> crate::Result<()> {
     let desired_subnet = alloc.compute_cidr.to_string();
     let desired_gateway = alloc.bridge_address.to_string();
@@ -68,8 +69,11 @@ pub async fn preflight_network_for_pool(
                 return Err(NetworkError::InterfaceConflict {
                     name,
                     reason: format!(
-                        "existing Temps-owned Docker network does not use authoritative subnet {} and gateway {}",
-                        alloc.compute_cidr, alloc.bridge_address
+                        "existing Temps-owned Docker network does not use authoritative subnet {} \
+                         and gateway {}; the node's allocation changed. Remove it (`docker network \
+                         rm {}` after disconnecting its containers) so it is recreated on the new \
+                         subnet",
+                        alloc.compute_cidr, alloc.bridge_address, config.docker_network_name
                     ),
                 });
             }
@@ -83,9 +87,9 @@ pub async fn preflight_network_for_pool(
             let Ok(existing_cidr) = Ipv4Net::from_str(&raw) else {
                 continue;
             };
-            if cidrs_overlap(&compute_pool, &existing_cidr) {
+            if let Some(subnet) = routed_overlap(routed, &existing_cidr) {
                 return Err(NetworkError::DockerCidrCollision {
-                    cidr: compute_pool,
+                    cidr: subnet,
                     existing_cidr,
                     existing_network: name,
                     desired_network: config.docker_network_name.clone(),
@@ -94,6 +98,50 @@ pub async fn preflight_network_for_pool(
         }
     }
     Ok(())
+}
+
+/// The first routed subnet `existing` overlaps, in either direction.
+fn routed_overlap(routed: &[Ipv4Net], existing: &Ipv4Net) -> Option<Ipv4Net> {
+    routed
+        .iter()
+        .copied()
+        .find(|subnet| cidrs_overlap(subnet, existing))
+}
+
+/// Every Docker network's IPv4 subnets except `owned_network`'s, as occupied
+/// ranges (ADR 056).
+pub async fn occupied_docker_subnets(
+    docker: &Docker,
+    owned_network: &str,
+) -> crate::Result<Vec<crate::occupied::OccupiedRange>> {
+    let networks = docker
+        .list_networks(None::<ListNetworksOptions>)
+        .await
+        .map_err(|error| NetworkError::Docker {
+            op: "list_networks",
+            network: owned_network.to_owned(),
+            reason: error.to_string(),
+        })?;
+    let mut ranges = Vec::new();
+    for network in networks {
+        let Some(name) = network.name else {
+            continue;
+        };
+        if name == owned_network {
+            continue;
+        }
+        let subnets = network
+            .ipam
+            .and_then(|ipam| ipam.config)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| entry.subnet)
+            .filter_map(|raw| Ipv4Net::from_str(&raw).ok());
+        for cidr in subnets {
+            ranges.push(crate::occupied::OccupiedRange::docker(cidr, name.clone()));
+        }
+    }
+    Ok(ranges)
 }
 
 /// Verify that a pre-existing Docker network is the overlay created and
@@ -153,20 +201,20 @@ pub async fn ensure_network(
     config: &NetworkConfig,
     alloc: &NodeAlloc,
 ) -> crate::Result<String> {
-    ensure_network_for_pool(docker, config, alloc, alloc.compute_cidr).await
+    ensure_network_for_subnets(docker, config, alloc, &[alloc.compute_cidr]).await
 }
 
-/// Ensure the local Docker network while fencing against every subnet in the
-/// authoritative cluster pool. Use this in multi-node setup/reconciliation;
-/// the narrower [`ensure_network`] wrapper remains for single-allocation
-/// callers and backwards compatibility.
-pub async fn ensure_network_for_pool(
+/// Ensure the local Docker network while fencing against every subnet this
+/// node routes on the overlay (its own and its peers'). Use this in multi-node
+/// setup/reconciliation; the narrower [`ensure_network`] wrapper remains for
+/// single-allocation callers and backwards compatibility.
+pub async fn ensure_network_for_subnets(
     docker: &Docker,
     config: &NetworkConfig,
     alloc: &NodeAlloc,
-    compute_pool: Ipv4Net,
+    routed: &[Ipv4Net],
 ) -> crate::Result<String> {
-    preflight_network_for_pool(docker, config, alloc, compute_pool).await?;
+    preflight_network_for_subnets(docker, config, alloc, routed).await?;
     // 1. Inspect existing networks to detect collisions and short-circuit
     //    when our network already exists in a compatible state.
     let networks = docker
@@ -199,9 +247,9 @@ pub async fn ensure_network_for_pool(
             let Ok(existing_cidr) = Ipv4Net::from_str(cidr) else {
                 continue;
             };
-            if cidrs_overlap(&compute_pool, &existing_cidr) {
+            if let Some(subnet) = routed_overlap(routed, &existing_cidr) {
                 return Err(NetworkError::DockerCidrCollision {
-                    cidr: compute_pool,
+                    cidr: subnet,
                     existing_cidr,
                     existing_network: name,
                     desired_network: config.docker_network_name.clone(),
@@ -504,6 +552,28 @@ mod tests {
         let requested: Ipv4Net = "172.20.255.0/24".parse().expect("valid node subnet");
         assert!(cidrs_overlap(&requested, &existing));
         assert!(cidrs_overlap(&existing, &requested));
+    }
+
+    #[test]
+    fn only_routed_subnets_are_checked_against_docker_networks() {
+        let routed: [Ipv4Net; 2] = [
+            "10.202.0.0/24".parse().unwrap(),
+            "10.202.1.0/24".parse().unwrap(),
+        ];
+        // A Compose network elsewhere in the cluster pool is fine.
+        assert_eq!(
+            routed_overlap(&routed, &"10.202.9.0/24".parse().unwrap()),
+            None
+        );
+        // One over a peer's subnet, or covering all of them, is not.
+        assert_eq!(
+            routed_overlap(&routed, &"10.202.1.0/24".parse().unwrap()),
+            Some(routed[1])
+        );
+        assert_eq!(
+            routed_overlap(&routed, &"10.0.0.0/8".parse().unwrap()),
+            Some(routed[0])
+        );
     }
 
     #[test]

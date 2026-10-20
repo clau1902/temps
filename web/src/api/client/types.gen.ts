@@ -4664,6 +4664,12 @@ export type ComposeCheckReport = {
  */
 export type ComposeHostStatusResponse = {
     /**
+     * False when this process never runs Compose workloads (a hosted control
+     * plane): the CLI is neither probed nor expected, so a missing or old
+     * Compose is not a problem to report there.
+     */
+    applicable: boolean;
+    /**
      * Whether the Compose CLI ran.
      */
     available: boolean;
@@ -17046,9 +17052,10 @@ export type NodePairingResponse = {
     mesh_address: string;
     name: string;
     /**
-     * `ip:port` the control plane dials.
+     * `ip:port` the control plane dials. `None` for a worker that joined
+     * outbound only (ADR 055): it sent its key and dials the control plane.
      */
-    node_endpoint: string;
+    node_endpoint?: string | null;
     /**
      * The node that registered with this pairing.
      */

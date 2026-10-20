@@ -204,6 +204,16 @@ fn render_mesh_lockdown(lockdown: &MeshLockdown) -> String {
             )
         })
         .unwrap_or_default();
+    // A worker's agent API, for the control plane only (mutual TLS on top).
+    let agent_api = lockdown
+        .agent_api
+        .map(|api| {
+            format!(
+                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {} tcp dport {} accept\n",
+                api.from, api.port
+            )
+        })
+        .unwrap_or_default();
     // A hub forwards between members (ADR 048 D4): in from the tunnel and
     // straight back into it, mesh address to mesh address. Each member's own
     // input rules still decide what it accepts.
@@ -226,7 +236,7 @@ add rule inet {MESH_TABLE} input counter comment \"{marker}\"
 add rule inet {MESH_TABLE} input iifname \"{wg}\" ct state established,related accept
 add rule inet {MESH_TABLE} input iifname \"{wg}\" udp dport {vxlan_port} accept
 add rule inet {MESH_TABLE} input iifname \"{wg}\" icmp type echo-request accept
-{node_api}add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
+{node_api}{agent_api}add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
 
 add chain inet {MESH_TABLE} forward {{ type filter hook forward priority -110; policy accept; }}
 add rule inet {MESH_TABLE} forward oifname \"{wg}\" ct state established,related accept
@@ -1377,6 +1387,7 @@ mod tests {
             vxlan_port: 4789,
             mesh,
             node_api_port: None,
+            agent_api: None,
             relay: false,
         });
         assert!(
@@ -1387,6 +1398,7 @@ mod tests {
             vxlan_port: 4789,
             mesh,
             node_api_port: Some(51820),
+            agent_api: None,
             relay: false,
         });
         let node_api = control_plane
@@ -1422,15 +1434,54 @@ mod tests {
                 vxlan_port: 4789,
                 mesh,
                 node_api_port: None,
+                agent_api: None,
                 relay: false,
             }),
             mesh_lockdown_marker(&MeshLockdown {
                 vxlan_port: 4789,
                 mesh: "10.202.0.0/24".parse().unwrap(),
                 node_api_port: None,
+                agent_api: None,
                 relay: false,
             }),
             "a new pool reinstalls the rules"
+        );
+    }
+
+    #[test]
+    fn a_worker_serves_its_agent_api_on_the_mesh_to_the_control_plane_only() {
+        let mesh: ipnet::Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let lockdown = MeshLockdown {
+            vxlan_port: 4789,
+            mesh,
+            node_api_port: None,
+            agent_api: Some(crate::mesh::MeshAgentApi {
+                from: "10.201.0.1".parse().unwrap(),
+                port: 3100,
+            }),
+            relay: false,
+        };
+        let rules = render_mesh_lockdown(&lockdown);
+        let agent_api = rules
+            .find("input iifname \"temps-wg0\" ip saddr 10.201.0.1 tcp dport 3100 accept")
+            .expect("the control plane reaches the agent API over the mesh");
+        assert!(
+            agent_api
+                < rules
+                    .find("input iifname \"temps-wg0\" counter drop")
+                    .unwrap()
+        );
+        assert!(
+            !rules.contains("ip saddr 10.201.0.0/24 tcp dport"),
+            "other mesh members still reach no TCP port on the host"
+        );
+        assert_ne!(
+            mesh_lockdown_marker(&lockdown),
+            mesh_lockdown_marker(&MeshLockdown {
+                agent_api: None,
+                ..lockdown.clone()
+            }),
+            "turning the agent API on or off reinstalls the rules"
         );
     }
 
@@ -1478,6 +1529,7 @@ mod tests {
             vxlan_port: 4789,
             mesh,
             node_api_port: None,
+            agent_api: None,
             relay: false,
         };
         let relay_rule = "forward iifname \"temps-wg0\" oifname \"temps-wg0\" ip saddr 10.201.0.0/24 ip daddr 10.201.0.0/24 accept";
@@ -1514,6 +1566,7 @@ mod tests {
             vxlan_port: 4789,
             mesh,
             node_api_port: None,
+            agent_api: None,
             relay: false,
         });
         let from_tunnel: Vec<&str> = rules

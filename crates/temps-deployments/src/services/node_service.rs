@@ -603,7 +603,31 @@ pub struct HeartbeatRequest {
     /// untouched, same rule as `architecture` above.
     pub docker_socket_projects: Option<Vec<String>>,
     pub public_ingress: Option<PublicIngressHeartbeatUpdate>,
+    /// Cross-node overlay state (ADR 056). `None` from an older agent, or
+    /// before its network-sync loop first ran: stored columns untouched.
+    pub overlay: Option<OverlayHeartbeatUpdate>,
+    /// The node's occupied IPv4 ranges (ADR 056), sent when they change.
+    /// `None` leaves the stored ranges untouched; already validated.
+    pub occupied_ranges: Option<Vec<temps_network::occupied::OccupiedRange>>,
 }
+
+/// What the agent last saw of its cross-node overlay (ADR 056).
+#[derive(Debug, Clone)]
+pub struct OverlayHeartbeatUpdate {
+    pub ready: bool,
+    /// The allocation the overlay runs on; recorded as applied when `ready`.
+    pub compute_cidr: Option<ipnet::Ipv4Net>,
+    /// Why the overlay is unavailable (cause and fix), when it is not ready.
+    pub last_error: Option<String>,
+}
+
+/// `nodes.overlay_status` values.
+pub const OVERLAY_READY: &str = "ready";
+pub const OVERLAY_UNAVAILABLE: &str = "unavailable";
+
+/// Longest stored overlay error. The agent's messages name the colliding
+/// range, its owner and both fixes, which takes more than a DNS error.
+const OVERLAY_ERROR_MAX_CHARS: usize = 1000;
 
 #[derive(Debug, Clone)]
 pub struct PublicIngressHeartbeatUpdate {
@@ -847,21 +871,26 @@ pub fn node_address_host(address: &str) -> String {
 }
 
 /// Field checks every registration passes before any database work.
+/// A name a node may register under: at most 63 letters, digits, '-', '.'
+/// or '_'. Restricted to a DNS-label-style charset because the name is
+/// surfaced in logs and injected into every container's `TEMPS_NODE_NAME`
+/// env var, so shell metacharacters, newlines and control characters are
+/// refused defensively.
+pub fn is_valid_node_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= temps_core::node_pki::MAX_NODE_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+}
+
 fn validate_registration(request: &RegisterNodeRequest) -> Result<(), NodeError> {
     if request.name.is_empty() {
         return Err(NodeError::Validation {
             message: "Node name cannot be empty".into(),
         });
     }
-    // Restrict to a DNS-label-style charset. The name is surfaced in logs
-    // and injected into every container's `TEMPS_NODE_NAME` env var, so
-    // reject shell metacharacters / newlines / control chars defensively.
-    if request.name.len() > temps_core::node_pki::MAX_NODE_NAME_LEN
-        || !request
-            .name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
-    {
+    if !is_valid_node_name(&request.name) {
         return Err(NodeError::Validation {
             message: "Node name must be <=63 chars of letters, digits, '-', '.', or '_'".into(),
         });
@@ -910,6 +939,33 @@ pub struct RegistrationContext {
     /// pairing's enrollment token is only accepted with this set to the
     /// address the pairing reserved.
     pub node_api_peer: Option<std::net::IpAddr>,
+}
+
+/// The pairing a registration redeemed the enrollment token of, when the
+/// registration came from that pairing's reserved mesh address over the
+/// node API (ADR 048 D2b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingSource {
+    pub pairing_id: i32,
+    pub mesh_address: std::net::Ipv4Addr,
+}
+
+impl PairingSource {
+    /// The registration's own mesh address, when it registers under it
+    /// (`private_address` is the pairing's address): a worker that joined
+    /// outbound only (ADR 055). That one mesh-pool address is exempt from
+    /// the mesh identity checks; nothing else is.
+    pub fn own_mesh_address(
+        &self,
+        private_address: &str,
+    ) -> Option<temps_network::mesh::OwnMeshAddress> {
+        (temps_network::mesh::identity_ipv4(private_address) == Some(self.mesh_address)).then_some(
+            temps_network::mesh::OwnMeshAddress {
+                pairing_id: self.pairing_id,
+                address: self.mesh_address,
+            },
+        )
+    }
 }
 
 /// The first of `claimed` that is one of `reserved`, compared
@@ -1028,10 +1084,14 @@ impl NodeService {
     /// a host it is reached at, or its mesh address. Every name and address a
     /// node registers becomes a SAN on the leaf the cluster CA signs it, and
     /// nodes paired over the mesh verify the control plane against that CA.
+    ///
+    /// `own` is the registration's own mesh address (ADR 055), accepted in
+    /// `address` and `private_address` but never as the name.
     async fn assert_not_control_plane_identity(
         &self,
         request: &RegisterNodeRequest,
         control_plane_hosts: &[String],
+        own: Option<temps_network::mesh::OwnMeshAddress>,
     ) -> Result<(), NodeError> {
         let claimed: Vec<String> = [
             request.name.trim().to_string(),
@@ -1063,12 +1123,30 @@ impl NodeService {
         // Mesh identities are reserved whether or not the mesh is on: a leaf
         // is never revoked, so one signed now for the control plane's future
         // mesh address, or a future member's, would outlive any later check.
-        let mesh_claim = temps_network::mesh::mesh_identity_claimed(self.db.as_ref(), &claimed)
-            .await
-            .map_err(|source| NodeError::MeshSettings {
-                node_name: request.name.clone(),
-                source,
-            })?;
+        let mesh_settings = |source| NodeError::MeshSettings {
+            node_name: request.name.clone(),
+            source,
+        };
+        let name = [request.name.trim().to_string()];
+        let addresses: Vec<String> = [
+            node_address_host(&request.address),
+            node_address_host(&request.private_address),
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect();
+        let mesh_claim =
+            match temps_network::mesh::mesh_identity_claimed(self.db.as_ref(), &name, None)
+                .await
+                .map_err(mesh_settings)?
+            {
+                Some(claim) => Some(claim),
+                None => {
+                    temps_network::mesh::mesh_identity_claimed(self.db.as_ref(), &addresses, own)
+                        .await
+                        .map_err(mesh_settings)?
+                }
+            };
         let Some(mesh_claim) = mesh_claim else {
             return Ok(());
         };
@@ -1098,13 +1176,13 @@ impl NodeService {
     /// Refuse a registration that redeems a pairing's enrollment token
     /// anywhere but over the mesh node API from the pairing's reserved mesh
     /// address (ADR 048: a leaked pairing code only pairs from that address).
-    /// `Ok(())` when the token was not minted for a pairing.
+    /// `Ok(None)` when the token was not minted for a pairing.
     pub async fn assert_pairing_source(
         &self,
         node_name: &str,
         token_id: i32,
         node_api_peer: Option<std::net::IpAddr>,
-    ) -> Result<(), NodeError> {
+    ) -> Result<Option<PairingSource>, NodeError> {
         let pairing = temps_network::pairing::for_enrollment_token(self.db.as_ref(), token_id)
             .await
             .map_err(|source| NodeError::Pairing {
@@ -1113,10 +1191,16 @@ impl NodeService {
                 source,
             })?;
         let Some(pairing) = pairing else {
-            return Ok(());
+            return Ok(None);
         };
         if temps_network::pairing::registration_source_matches(&pairing, node_api_peer) {
-            return Ok(());
+            // The source matched the reserved address, so it parses.
+            if let Ok(mesh_address) = pairing.mesh_address.parse() {
+                return Ok(Some(PairingSource {
+                    pairing_id: pairing.id,
+                    mesh_address,
+                }));
+            }
         }
         let arrived = match node_api_peer {
             Some(peer) => format!("mesh address {peer}"),
@@ -1141,16 +1225,20 @@ impl NodeService {
     }
 
     /// Reserve signed IP identities independently of the node lifecycle.
+    /// `own` is the registration's own mesh address (ADR 055), the one pool
+    /// address a leaf may name.
     pub async fn reserve_certificate_addresses(
         &self,
         ca_cert_pem: &str,
         identities: &[String],
         node_name: &str,
+        own: Option<temps_network::mesh::OwnMeshAddress>,
     ) -> Result<(), NodeError> {
         temps_network::mesh::reserve_certificate_addresses(
             self.db.as_ref(),
             ca_cert_pem,
             identities,
+            own,
         )
         .await
         .map_err(|source| NodeError::MeshSettings {
@@ -1172,16 +1260,22 @@ impl NodeService {
         context: &RegistrationContext,
     ) -> Result<nodes::Model, NodeError> {
         validate_registration(&request)?;
-        self.assert_not_control_plane_identity(&request, &context.control_plane_hosts)
-            .await?;
         let Some(token_id) = context.pairing_token_id else {
+            self.assert_not_control_plane_identity(&request, &context.control_plane_hosts, None)
+                .await?;
             return self.register(request).await;
         };
 
         // Refuse before creating the node, so a pairing that cannot complete
         // never leaves a half-registered node behind.
         let node_name = request.name.clone();
-        self.assert_pairing_source(&node_name, token_id, context.node_api_peer)
+        let source = self
+            .assert_pairing_source(&node_name, token_id, context.node_api_peer)
+            .await?;
+        // A worker that joined outbound only registers under the address its
+        // pairing reserved (ADR 055); nothing else in the pool is exempt.
+        let own = source.and_then(|source| source.own_mesh_address(&request.private_address));
+        self.assert_not_control_plane_identity(&request, &context.control_plane_hosts, own)
             .await?;
         temps_network::pairing::check_linkable(self.db.as_ref(), token_id)
             .await
@@ -1396,10 +1490,18 @@ impl NodeService {
         // replaced on every beat and never written through the API — exactly
         // the lifecycle this list has — so a migration would buy nothing but
         // a column that can disagree with the beat that set it.
-        let resolved_capacity = resolve_heartbeat_capacity(
+        let mut resolved_capacity = resolve_heartbeat_capacity(
             request.capacity,
             request.docker_socket_projects,
             &node.capacity,
+        );
+        // The agent's mesh listener survives a heartbeat that does not know
+        // it yet (sent right after an agent restart, before the listener
+        // binds), so calls keep going over the mesh meanwhile.
+        temps_core::node_address::carry_agent_mesh_listener(
+            &mut resolved_capacity,
+            &node.capacity,
+            node.mesh_wg_address.as_deref(),
         );
         // An advertisement narrows where a declared project may run; it never
         // declares one. Say so when a node advertises something this control
@@ -1500,9 +1602,99 @@ impl NodeService {
             active.public_ingress_unsupported_reasons =
                 Set(serde_json::json!(ingress.unsupported_reasons));
         }
+        // ADR 056: same "absent means not reported" rule.
+        let mut ready_cidr = None;
+        if let Some(overlay) = request.overlay {
+            if overlay.ready {
+                active.overlay_status = Set(Some(OVERLAY_READY.to_string()));
+                active.overlay_last_error = Set(None);
+                ready_cidr = overlay.compute_cidr.map(|cidr| cidr.to_string());
+            } else {
+                active.overlay_status = Set(Some(OVERLAY_UNAVAILABLE.to_string()));
+                active.overlay_last_error = Set(overlay
+                    .last_error
+                    .map(|error| error.chars().take(OVERLAY_ERROR_MAX_CHARS).collect()));
+            }
+        }
+        let mut occupied_changed = false;
+        if let Some(ranges) = request.occupied_ranges {
+            let value = serde_json::to_value(temps_network::occupied::normalize(ranges)).map_err(
+                |error| NodeError::Validation {
+                    message: format!("occupied_ranges: {error}"),
+                },
+            )?;
+            occupied_changed = node.occupied_ranges.as_ref() != Some(&value);
+            active.occupied_ranges = Set(Some(value));
+        }
         active.update(self.db.as_ref()).await?;
+        if let Some(cidr) = ready_cidr {
+            // Only while it is still this node's allocation: a pool change or
+            // a remediation may have re-assigned it after this agent applied
+            // it. Recording the old subnet as ready then would let the next
+            // pool change treat the new one as free. The pool change holds
+            // this row locked, so the two cannot interleave.
+            nodes::Entity::update_many()
+                .col_expr(
+                    nodes::Column::OverlayReadyCidr,
+                    sea_orm::sea_query::Expr::value(Some(cidr.clone())),
+                )
+                .filter(nodes::Column::Id.eq(node_id))
+                .filter(nodes::Column::ComputeCidr.eq(cidr))
+                .exec(self.db.as_ref())
+                .await?;
+        }
+        if occupied_changed {
+            self.remediate_overlay_allocation(node_id).await;
+        }
 
         Ok(architecture_change)
+    }
+
+    /// Store a node's occupied ranges reported at registration (ADR 056).
+    pub async fn record_occupied_ranges(
+        &self,
+        node_id: i32,
+        ranges: Vec<temps_network::occupied::OccupiedRange>,
+    ) -> Result<(), NodeError> {
+        let value =
+            serde_json::to_value(temps_network::occupied::normalize(ranges)).map_err(|error| {
+                NodeError::Validation {
+                    message: format!("occupied_ranges: {error}"),
+                }
+            })?;
+        nodes::Entity::update_many()
+            .col_expr(
+                nodes::Column::OccupiedRanges,
+                sea_orm::sea_query::Expr::value(Some(value)),
+            )
+            .filter(nodes::Column::Id.eq(node_id))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    /// Auto-remediation (ADR 056): move a node's never-applied allocation off
+    /// its own occupied ranges. Best effort; a failure is logged, and the
+    /// node keeps reporting the collision with its fixes.
+    pub async fn remediate_overlay_allocation(&self, node_id: i32) {
+        let allocator = temps_network::allocator::PostgresAllocator::new(self.db.clone());
+        match allocator.remediate_unapplied_collision(node_id).await {
+            Ok(Some(moved)) => tracing::info!(
+                node_id,
+                node_name = %moved.node_name,
+                from = %moved.from,
+                to = %moved.to,
+                "moved the node's overlay allocation off a network it already uses; it applies \
+                 the new one on its next network poll"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                node_id,
+                %error,
+                "could not check the node's overlay allocation against its occupied ranges; \
+                 will retry when it reports them again"
+            ),
+        }
     }
 
     /// Get a node by its ID.
@@ -3092,6 +3284,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -3348,6 +3545,170 @@ mod tests {
             .deployment_config
             .as_ref()
             .and_then(|config| config.target_nodes.clone())
+    }
+
+    /// ADR 056: the heartbeat stores the overlay state and occupied ranges,
+    /// keeps the applied allocation once reported ready, and moves a
+    /// never-applied allocation off the node's own occupied ranges.
+    #[tokio::test]
+    async fn heartbeat_persists_overlay_status_and_moves_an_unapplied_colliding_allocation() {
+        use sea_orm::ConnectionTrait;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        db.execute_unprepared(
+            "UPDATE network_config SET compute_pool_cidr = '10.202.0.0/16', \
+             subnet_prefix_len = 24, wireguard_cidr = '10.201.0.0/16' WHERE id = 1",
+        )
+        .await
+        .unwrap();
+        let service = NodeService::new(db.clone());
+        let node = service
+            .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+            .await
+            .unwrap();
+        db.execute_unprepared(&format!(
+            "UPDATE nodes SET compute_cidr = '10.202.0.0/24' WHERE id = {}",
+            node.id
+        ))
+        .await
+        .unwrap();
+        let beat =
+            |overlay: Option<OverlayHeartbeatUpdate>,
+             occupied: Option<Vec<temps_network::occupied::OccupiedRange>>| {
+                HeartbeatRequest {
+                    architecture: None,
+                    capacity: serde_json::json!({}),
+                    labels: None,
+                    dns_resolver: None,
+                    docker_socket_projects: None,
+                    public_ingress: None,
+                    overlay,
+                    occupied_ranges: occupied,
+                }
+            };
+        let collision = "overlay subnet 10.202.0.0/24, which this node routes, overlaps Docker \
+                         network 'shop_default' (10.202.0.0/20). Fix: ...";
+
+        service
+            .heartbeat(
+                node.id,
+                beat(
+                    Some(OverlayHeartbeatUpdate {
+                        ready: false,
+                        compute_cidr: Some("10.202.0.0/24".parse().unwrap()),
+                        last_error: Some(collision.into()),
+                    }),
+                    Some(vec![temps_network::occupied::OccupiedRange::docker(
+                        "10.202.0.0/20".parse().unwrap(),
+                        "shop_default",
+                    )]),
+                ),
+            )
+            .await
+            .unwrap();
+        let stored = service.get_by_id(node.id).await.unwrap();
+        assert_eq!(stored.overlay_status.as_deref(), Some(OVERLAY_UNAVAILABLE));
+        assert_eq!(stored.overlay_last_error.as_deref(), Some(collision));
+        assert_eq!(stored.overlay_ready_cidr, None);
+        assert_eq!(
+            stored.occupied_ranges,
+            Some(serde_json::json!([
+                {"cidr": "10.202.0.0/20", "source": "docker", "name": "shop_default"}
+            ]))
+        );
+        let moved: ipnet::Ipv4Net = stored.compute_cidr.as_deref().unwrap().parse().unwrap();
+        let occupied: ipnet::Ipv4Net = "10.202.0.0/20".parse().unwrap();
+        assert!(
+            !occupied.contains(&moved.network()),
+            "the never-applied allocation moved off the occupied range, got {moved}"
+        );
+        assert!(
+            stored
+                .overlay_remediation
+                .as_deref()
+                .is_some_and(|note| note.contains("moved from 10.202.0.0/24")),
+            "{:?}",
+            stored.overlay_remediation
+        );
+
+        // A heartbeat sent before the move, ready on the old subnet: never
+        // recorded as applied, so it cannot make the new one look free.
+        service
+            .heartbeat(
+                node.id,
+                beat(
+                    Some(OverlayHeartbeatUpdate {
+                        ready: true,
+                        compute_cidr: Some("10.202.0.0/24".parse().unwrap()),
+                        last_error: None,
+                    }),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let stored = service.get_by_id(node.id).await.unwrap();
+        assert_eq!(stored.overlay_ready_cidr, None);
+        assert_eq!(stored.compute_cidr, Some(moved.to_string()));
+
+        // Up on the new allocation: ready, error cleared, recorded as applied.
+        service
+            .heartbeat(
+                node.id,
+                beat(
+                    Some(OverlayHeartbeatUpdate {
+                        ready: true,
+                        compute_cidr: Some(moved),
+                        last_error: None,
+                    }),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let stored = service.get_by_id(node.id).await.unwrap();
+        assert_eq!(stored.overlay_status.as_deref(), Some(OVERLAY_READY));
+        assert_eq!(stored.overlay_last_error, None);
+        assert_eq!(stored.overlay_ready_cidr, Some(moved.to_string()));
+        assert!(stored.occupied_ranges.is_some(), "absent ranges are kept");
+
+        // A later failure keeps the applied allocation recorded, so it is
+        // never moved automatically and keeps locking the pool.
+        service
+            .heartbeat(
+                node.id,
+                beat(
+                    Some(OverlayHeartbeatUpdate {
+                        ready: false,
+                        compute_cidr: Some(moved),
+                        last_error: Some("peer route collides".into()),
+                    }),
+                    Some(vec![temps_network::occupied::OccupiedRange::route(
+                        moved, "wg-corp",
+                    )]),
+                ),
+            )
+            .await
+            .unwrap();
+        let stored = service.get_by_id(node.id).await.unwrap();
+        assert_eq!(stored.overlay_status.as_deref(), Some(OVERLAY_UNAVAILABLE));
+        assert_eq!(stored.overlay_ready_cidr, Some(moved.to_string()));
+        assert_eq!(
+            stored.compute_cidr,
+            Some(moved.to_string()),
+            "applied: not moved"
+        );
+
+        // An agent that does not report the overlay leaves it untouched.
+        service.heartbeat(node.id, beat(None, None)).await.unwrap();
+        let stored = service.get_by_id(node.id).await.unwrap();
+        assert_eq!(stored.overlay_status.as_deref(), Some(OVERLAY_UNAVAILABLE));
+        assert_eq!(
+            stored.overlay_last_error.as_deref(),
+            Some("peer route collides")
+        );
     }
 
     /// #1390: the removed node's ID used to stay in `target_nodes`, so the
@@ -3713,7 +4074,7 @@ mod tests {
         let db = test_db.connection_arc();
         let service = NodeService::new(db.clone());
         db.execute_unprepared(
-            "UPDATE network_config SET wireguard_cidr = '10.202.0.0/16' WHERE id = 1",
+            "UPDATE network_config SET wireguard_cidr = '10.203.0.0/16' WHERE id = 1",
         )
         .await
         .unwrap();
@@ -3758,7 +4119,7 @@ mod tests {
         let pairing = temps_entities::node_pairings::ActiveModel {
             pairing_id: Set("pairing-edge-1".into()),
             name: Set("edge-1".into()),
-            node_endpoint: Set("10.100.0.9:51820".into()),
+            node_endpoint: Set(Some("10.100.0.9:51820".into())),
             mesh_address: Set("10.201.0.6".into()),
             secret_encrypted: Set("encrypted".into()),
             enrollment_token_id: Set(token.id),
@@ -3869,6 +4230,168 @@ mod tests {
             .unwrap();
         assert_eq!(linked.node_id, Some(node.id));
         assert_eq!(linked.status, temps_network::pairing::STATUS_COMPLETED);
+    }
+
+    /// ADR 055: a worker that joined outbound only registers under the mesh
+    /// address its pairing reserved. That one pool address is accepted, and
+    /// only for a registration through that pairing from that address; every
+    /// other mesh identity stays refused.
+    #[tokio::test]
+    async fn an_outbound_worker_registers_under_its_own_mesh_address_only() {
+        use base64::Engine;
+        use temps_network::mesh::MeshIdentityHolder;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        temps_network::mesh::enable(db.as_ref(), Some("10.201.0.0/24"), None, None)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let token = |name: &str| temps_entities::node_enrollment_tokens::ActiveModel {
+            token_hash: Set(format!("hash-{name}")),
+            max_uses: Set(1),
+            used_count: Set(0),
+            expires_at: Set(now + chrono::Duration::minutes(30)),
+            bound_node_name: Set(Some(name.into())),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let outbound =
+            |name: &str, token_id: i32, seed: u8| temps_network::pairing::NewOutboundPairing {
+                pairing_id: format!("pairing-{name}"),
+                name: name.into(),
+                public_key: base64::engine::general_purpose::STANDARD.encode([seed; 32]),
+                secret_encrypted: "encrypted".into(),
+                enrollment_token_id: token_id,
+                expires_at: now + chrono::Duration::minutes(30),
+                created_by_user_id: None,
+            };
+        let token_a = token("edge-1").insert(db.as_ref()).await.unwrap();
+        let token_b = token("edge-2").insert(db.as_ref()).await.unwrap();
+        let pairing =
+            temps_network::pairing::create_outbound(db.as_ref(), outbound("edge-1", token_a.id, 7))
+                .await
+                .unwrap();
+        let other =
+            temps_network::pairing::create_outbound(db.as_ref(), outbound("edge-2", token_b.id, 8))
+                .await
+                .unwrap();
+        assert_eq!(pairing.mesh_address, "10.201.0.2");
+        assert_eq!(other.mesh_address, "10.201.0.3");
+        let own: std::net::IpAddr = "10.201.0.2".parse().unwrap();
+        let through_pairing = |node_api_peer: Option<std::net::IpAddr>| RegistrationContext {
+            pairing_token_id: Some(token_a.id),
+            control_plane_hosts: Vec::new(),
+            node_api_peer,
+        };
+
+        // Without the pairing, the address is just a pool address.
+        let error = service
+            .register_with_context(register_at("edge-1", "10.201.0.2"), &public_context())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NodeError::MeshIdentityReserved {
+                    holder: MeshIdentityHolder::Pool { .. },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        // Through the pairing but from anywhere else.
+        for peer in [None, Some("10.201.0.3".parse().unwrap())] {
+            let error = service
+                .register_with_context(register_at("edge-1", "10.201.0.2"), &through_pairing(peer))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, NodeError::PairingSourceRefused { .. }),
+                "{peer:?}: {error:?}"
+            );
+        }
+        // From its own address, claiming another pairing's address, another
+        // pool address or the control plane's.
+        for (claimed, expected) in [
+            ("10.201.0.3", "pairing"),
+            ("10.201.0.9", "pool"),
+            ("10.201.0.1", "control plane"),
+        ] {
+            let mut request = register_at("edge-1", "10.201.0.2");
+            request.address = format!("https://{claimed}:3100");
+            let error = service
+                .register_with_context(request, &through_pairing(Some(own)))
+                .await
+                .unwrap_err();
+            let matched = match (&error, expected) {
+                // Every pool address is refused as part of the pool before
+                // its holder is looked up.
+                (
+                    NodeError::MeshIdentityReserved {
+                        holder: MeshIdentityHolder::Pool { .. },
+                        claimed,
+                        ..
+                    },
+                    "pairing",
+                ) => claimed == &other.mesh_address,
+                (
+                    NodeError::MeshIdentityReserved {
+                        holder: MeshIdentityHolder::Pool { .. },
+                        ..
+                    },
+                    "pool",
+                ) => true,
+                (NodeError::ControlPlaneIdentity { role, .. }, "control plane") => {
+                    role == "mesh address"
+                }
+                _ => false,
+            };
+            assert!(matched, "{claimed}: {error:?}");
+        }
+        // Its own address is never a name.
+        let mut request = register_at("edge-1", "10.201.0.2");
+        request.name = "10.201.0.2".into();
+        assert!(service
+            .register_with_context(request, &through_pairing(Some(own)))
+            .await
+            .is_err());
+        assert!(service.get_by_name("edge-1").await.is_err());
+
+        let node = service
+            .register_with_context(
+                register_at("edge-1", "10.201.0.2"),
+                &through_pairing(Some(own)),
+            )
+            .await
+            .expect("an outbound worker registers under its own mesh address");
+        assert_eq!(node.private_address, "10.201.0.2");
+        let node = service.get_by_name("edge-1").await.unwrap();
+        assert_eq!(node.mesh_wg_address.as_deref(), Some("10.201.0.2"));
+        assert_eq!(node.mesh_wg_endpoint, None);
+        assert_eq!(
+            temps_network::pairing::get(db.as_ref(), pairing.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            temps_network::pairing::STATUS_COMPLETED
+        );
+        // Another node can no longer claim it, pairing or not.
+        let error = service
+            .register_with_context(register_at("edge-3", "10.201.0.2"), &public_context())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                NodeError::IdentityClaimed { .. } | NodeError::MeshIdentityReserved { .. }
+            ),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -4348,6 +4871,8 @@ mod tests {
                     labels: None,
                     dns_resolver: None,
                     docker_socket_projects: None,
+                    overlay: None,
+                    occupied_ranges: None,
                     public_ingress: None,
                 },
             )
@@ -4378,6 +4903,8 @@ mod tests {
                     labels: None,
                     dns_resolver: None,
                     docker_socket_projects: None,
+                    overlay: None,
+                    occupied_ranges: None,
                     public_ingress: None,
                 },
             )
@@ -4417,6 +4944,8 @@ mod tests {
                         record_count: 37,
                     }),
                     docker_socket_projects: None,
+                    overlay: None,
+                    occupied_ranges: None,
                     public_ingress: None,
                 },
             )
@@ -4475,6 +5004,8 @@ mod tests {
                         labels: None,
                         dns_resolver: None,
                         docker_socket_projects: None,
+                        overlay: None,
+                        occupied_ranges: None,
                         public_ingress: None,
                     },
                 )
@@ -4533,6 +5064,8 @@ mod tests {
                     labels: None,
                     dns_resolver: None,
                     docker_socket_projects: None,
+                    overlay: None,
+                    occupied_ranges: None,
                     public_ingress: None,
                 },
             )
@@ -4607,6 +5140,8 @@ mod tests {
                         record_count: 0,
                     }),
                     docker_socket_projects: None,
+                    overlay: None,
+                    occupied_ranges: None,
                     public_ingress: None,
                 },
             )
@@ -5747,6 +6282,8 @@ mod tests {
             architecture: None,
             dns_resolver: None,
             docker_socket_projects: None,
+            overlay: None,
+            occupied_ranges: None,
             public_ingress: Some(PublicIngressHeartbeatUpdate {
                 running: true,
                 last_error: None,
