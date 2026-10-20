@@ -43,7 +43,10 @@ import {
 } from '@/hooks/useNodeCapability'
 import {
   canAddWorkerNode,
+  nodeIsUnreachable,
+  servingOnUnreachableNode,
   shouldPromptForFirstWorkerNode,
+  type ServingOnUnreachableNode,
   unremovedNodeContainers,
   type UnremovedNodeContainers,
   WORKER_NODES_URL,
@@ -978,7 +981,8 @@ export function NodeDetailPage() {
  */
 function removeNodeConsequences(
   pinnedPlacements: NodePlacementReference[] | null,
-  unremovedContainers: UnremovedNodeContainers | null
+  unremovedContainers: UnremovedNodeContainers | null,
+  servingOnGoneNode: ServingOnUnreachableNode | null
 ) {
   if (pinnedPlacements) {
     const targets = pinnedPlacements
@@ -989,6 +993,28 @@ function removeNodeConsequences(
       )
       .join(', ')
     return `The node was not removed: it is the only target node of ${targets}. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.`
+  }
+  if (servingOnGoneNode) {
+    return (
+      <>
+        This node stopped sending heartbeats, so a drain cannot move the{' '}
+        {servingOnGoneNode.count} container(s) live deployments still have on it
+        {servingOnGoneNode.environments.length > 0 && (
+          <>
+            {' '}
+            (
+            <span className="break-words">
+              {servingOnGoneNode.environments.join(', ')}
+            </span>
+            )
+          </>
+        )}
+        . If the host still exists, start its agent and drain it instead. If it
+        is gone for good, remove it anyway: those containers are recorded as
+        orphaned, and any of these environments with no replicas on another node
+        stops serving until you redeploy it.
+      </>
+    )
   }
   if (unremovedContainers) {
     return (
@@ -1032,6 +1058,10 @@ function NodeDetail({
   const [pinnedPlacements, setPinnedPlacements] = useState<
     NodePlacementReference[] | null
   >(null)
+  // Live deployments an unreachable node still serves, from a refused
+  // removal. While set, the dialog names them and offers to remove anyway.
+  const [servingOnGoneNode, setServingOnGoneNode] =
+    useState<ServingOnUnreachableNode | null>(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -1144,6 +1174,13 @@ function NodeDetail({
           setShowRemoveDialog(true)
           return
         }
+        const serving = servingOnUnreachableNode(resp.error)
+        if (serving && !force) {
+          setServingOnGoneNode(serving)
+          keepDialogOpen = true
+          setShowRemoveDialog(true)
+          return
+        }
         const unremoved = unremovedNodeContainers(resp.error)
         if (unremoved && !force) {
           setUnremovedContainers(unremoved)
@@ -1179,10 +1216,21 @@ function NodeDetail({
       }
       const removal = resp.data as RemoveNodeResponse | undefined
       const orphaned = removal?.orphaned_containers ?? []
+      const lost = removal?.lost_environments ?? []
       // Environments whose target nodes listed this node no longer do; say
       // which, since a rejoined machine gets a new ID and is not targeted.
       const placements = describeUpdatedPlacements(removal?.placements_updated)
-      if (orphaned.length > 0) {
+      if (lost.length > 0) {
+        toast.warning('Node removed', {
+          description: [
+            `These environments were still serving from it; redeploy any with no replicas on another node: ${lost.join(', ')}.`,
+            'If the host comes back, remove its containers there with docker rm -f.',
+            placements,
+          ]
+            .filter(Boolean)
+            .join(' '),
+        })
+      } else if (orphaned.length > 0) {
         toast.warning('Node removed', {
           description: [
             'Some containers could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.',
@@ -1209,6 +1257,7 @@ function NodeDetail({
         setShowRemoveDialog(false)
         setUnremovedContainers(null)
         setPinnedPlacements(null)
+        setServingOnGoneNode(null)
       }
     }
   }
@@ -1280,10 +1329,13 @@ function NodeDetail({
   const canUndrain = node.status === 'draining' || node.status === 'drained'
   // Draining does not move sandboxes; they have to be destroyed first.
   const remainingSandboxes = drainStatus?.remaining_sandboxes ?? liveSandboxes
+  // A node the control plane stopped hearing from can be removed whatever
+  // its status: a drain cannot finish without its agent (ADR 057).
   const removableState =
     (node.status === 'drained' &&
       (drainStatus?.remaining_containers ?? containers.length) === 0) ||
-    node.status === 'offline'
+    node.status === 'offline' ||
+    nodeIsUnreachable(node)
   const canRemove = removableState && remainingSandboxes === 0
   const blockedBySandboxes = removableState && remainingSandboxes > 0
 
@@ -1388,18 +1440,28 @@ function NodeDetail({
           if (!open) {
             setUnremovedContainers(null)
             setPinnedPlacements(null)
+            setServingOnGoneNode(null)
           }
         }}
         resourceType="node"
         resourceName={node.name}
         verb="Remove"
-        confirmLabel={unremovedContainers ? 'Remove anyway' : 'Remove node'}
+        confirmLabel={
+          unremovedContainers || servingOnGoneNode
+            ? 'Remove anyway'
+            : 'Remove node'
+        }
         consequences={removeNodeConsequences(
           pinnedPlacements,
-          unremovedContainers
+          unremovedContainers,
+          servingOnGoneNode
         )}
         isPending={removePending}
-        onConfirm={() => void handleRemove(unremovedContainers !== null)}
+        onConfirm={() =>
+          void handleRemove(
+            unremovedContainers !== null || servingOnGoneNode !== null
+          )
+        }
       />
 
       {/* Undrain confirmation dialog */}

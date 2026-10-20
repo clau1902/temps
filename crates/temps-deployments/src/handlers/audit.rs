@@ -250,6 +250,13 @@ pub struct NodeRemovalAudit {
     /// Placements whose `target_nodes` named the node and were rewritten
     /// without it, each with the target nodes left.
     pub placements_updated: Vec<String>,
+    /// Environments still serving from the node when it was removed as gone
+    /// (`force` on an unreachable node, ADR 057); they need a redeploy.
+    /// Listed up to 20, then a line counting the serving containers.
+    pub lost_environments: Vec<String>,
+    /// Whether the removal was allowed to let go of serving containers:
+    /// `force` on a node with no heartbeat for 90 seconds.
+    pub node_unreachable: bool,
 }
 
 /// An operator drained a node: redeploys were queued elsewhere and the
@@ -618,6 +625,8 @@ mod node_audit_tests {
             placements_updated: vec![
                 "environment 'production' (id 4) of project 'shop' now targets [0, 1]".to_string(),
             ],
+            lost_environments: vec!["environment 'prod' of project 'api'".to_string()],
+            node_unreachable: true,
         };
         assert_eq!(audit.operation_type(), "NODE_REMOVAL");
         assert_eq!(AuditOperation::user_id(&audit), Some(3));
@@ -632,6 +641,11 @@ mod node_audit_tests {
             json["placements_updated"][0],
             "environment 'production' (id 4) of project 'shop' now targets [0, 1]"
         );
+        assert_eq!(
+            json["lost_environments"][0],
+            "environment 'prod' of project 'api'"
+        );
+        assert_eq!(json["node_unreachable"], true);
     }
 
     #[test]

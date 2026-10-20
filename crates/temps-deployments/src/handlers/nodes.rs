@@ -34,7 +34,8 @@ use crate::handlers::audit::{
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
     node_address_host, remove_owned_container, HeartbeatRequest, NodeError, NodePlacementReference,
-    NodeService, RegisterNodeRequest, RegistrationContext, MAX_DESCRIBED_UNREMOVED,
+    NodeService, RegisterNodeRequest, RegistrationContext, ServingContainers,
+    MAX_DESCRIBED_UNREMOVED,
 };
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
 use crate::services::{CONTROL_PLANE_NODE_ID, MAX_REDEPLOY_PLAN_BATCH};
@@ -485,6 +486,12 @@ pub struct RemoveNodeResponse {
     /// nodes they still target.
     #[serde(default)]
     pub placements_updated: Vec<NodePlacementReference>,
+    /// Environments that were still serving from the node when it was
+    /// removed as gone (`force=true` on an unreachable node, ADR 057). Their
+    /// containers there are recorded as orphaned; one with no replicas on
+    /// another node serves nothing until it is redeployed.
+    #[serde(default)]
+    pub lost_environments: Vec<String>,
 }
 
 /// Query parameters for removing a node.
@@ -493,7 +500,11 @@ pub struct RemoveNodeResponse {
 pub struct RemoveNodeQuery {
     /// Remove the node even if containers Temps placed on it could not be
     /// confirmed removed (e.g. the host is gone for good). Those containers
-    /// are recorded as orphaned instead of being re-homed.
+    /// are recorded as orphaned instead of being re-homed. On a node the
+    /// control plane can no longer reach (no heartbeat for 90 seconds) this
+    /// also covers containers deployments still serve from it:
+    /// they are recorded as orphaned too and their environments listed in
+    /// `lost_environments` (ADR 057).
     #[serde(default)]
     pub force: bool,
 }
@@ -3388,6 +3399,37 @@ async fn create_remote_deployer(
     Some(Arc::new(deployer))
 }
 
+/// 409 for removing an unreachable node that deployments still serve from:
+/// a drain cannot move them while the agent is gone, so say that forcing the
+/// removal is the way out and what it takes down (ADR 057).
+fn unreachable_node_still_serving_problem(
+    node_id: i32,
+    node_name: &str,
+    serving: usize,
+    environments: &[String],
+) -> Problem {
+    problemdetails::new(StatusCode::CONFLICT)
+        .with_title("Unreachable Node Still Serves Deployments")
+        .with_detail(format!(
+            "Node '{node_name}' was not removed: {serving} container(s) of live deployments are \
+             recorded on it ({}), and the control plane cannot reach it, so a drain cannot move \
+             them. Start `temps agent` on the node and drain it if the host still exists. If it \
+             is gone for good, retry with DELETE /internal/nodes/{node_id}?force=true: the \
+             containers are recorded as orphaned, and those of these environments with no \
+             replicas on another node stop serving until you redeploy them.",
+            if environments.is_empty() {
+                "their environments could not be listed".to_string()
+            } else {
+                environments.join("; ")
+            }
+        ))
+        .with_value("node_id", node_id)
+        .with_value("node_name", node_name.to_string())
+        .with_value("serving_containers", serving)
+        .with_value("serving_environments", environments.to_vec())
+        .with_value("force_removes_serving", true)
+}
+
 /// 409 for a node removal refused because containers Temps placed on it may
 /// still exist there, and removing the node would lose track of them.
 fn node_holds_containers_problem(
@@ -3903,7 +3945,7 @@ async fn admin_undrain_node(
         (status = 200, description = "Node removed", body = RemoveNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 409, description = "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)"),
+        (status = 409, description = "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first). For a node the control plane cannot reach that live deployments still serve from, `force_removes_serving` is set and `serving_environments` names them: force=true removes it anyway (ADR 057)"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -3940,6 +3982,16 @@ async fn admin_remove_node(
         &app_state.encryption_service,
     )
     .await;
+    // A node the control plane can no longer reach cannot be drained, so
+    // `force` also lets go of what its deployments still serve from it; a
+    // reachable node keeps the drain-first rule (ADR 057).
+    let serving_containers = if query.force
+        && crate::services::node_service::node_is_unreachable(&node, chrono::Utc::now())
+    {
+        ServingContainers::RecordLost
+    } else {
+        ServingContainers::Refuse
+    };
     let audit_removal =
         |outcome: &str, confirmed_gone: usize, unconfirmed: usize| NodeRemovalAudit {
             context: AuditContext {
@@ -3954,6 +4006,8 @@ async fn admin_remove_node(
             containers_confirmed_gone: confirmed_gone,
             containers_unconfirmed: unconfirmed,
             placements_updated: Vec::new(),
+            lost_environments: Vec::new(),
+            node_unreachable: serving_containers == ServingContainers::RecordLost,
         };
     // Refused before anything is removed from the host: a placement that
     // names only this node would be left with none. `remove` checks again
@@ -3979,7 +4033,7 @@ async fn admin_remove_node(
 
     let leftovers = match app_state
         .node_service
-        .remove_leftover_containers(&node, remote_deployer.as_deref())
+        .remove_leftover_containers_with(&node, remote_deployer.as_deref(), serving_containers)
         .await
     {
         Ok(leftovers) => leftovers,
@@ -4002,7 +4056,7 @@ async fn admin_remove_node(
                 node_id,
             )
             .await;
-            return Err(Problem::from(error));
+            return Err(still_serving_problem(&app_state, &node, query.force, error).await);
         }
     };
     let unremoved_count = leftovers.unremoved_count;
@@ -4030,11 +4084,16 @@ async fn admin_remove_node(
 
     let node_name = node.name.clone();
 
-    let removal = match app_state.node_service.remove(node_id).await {
+    let removal = match app_state
+        .node_service
+        .remove_with(node_id, serving_containers)
+        .await
+    {
         Ok(removal) => removal,
         Err(error) => {
             let outcome = match &error {
                 NodeError::OnlyPlacementTarget { .. } => "refused_only_placement_target",
+                NodeError::StillServing { .. } => "refused_still_serving",
                 _ => "failed",
             };
             record_audit(
@@ -4043,7 +4102,7 @@ async fn admin_remove_node(
                 node_id,
             )
             .await;
-            return Err(Problem::from(error));
+            return Err(still_serving_problem(&app_state, &node, query.force, error).await);
         }
     };
     let placement_notes: Vec<String> = removal
@@ -4053,6 +4112,7 @@ async fn admin_remove_node(
         .collect();
     let mut removed_audit = audit_removal("removed", confirmed_gone, unremoved_count);
     removed_audit.placements_updated = placement_notes.clone();
+    removed_audit.lost_environments = removal.lost_environments.clone();
     record_audit(&app_state, &removed_audit, node_id).await;
 
     info!(
@@ -4082,12 +4142,59 @@ async fn admin_remove_node(
             placement_notes.join("; ")
         ));
     }
+    if !removal.lost_environments.is_empty() {
+        message.push_str(&format!(
+            ". These environments were still serving from it; any with no replicas on another \
+             node serves nothing until you redeploy it: {}",
+            removal.lost_environments.join("; ")
+        ));
+    }
     Ok(Json(RemoveNodeResponse {
         id: node_id,
         message,
         orphaned_containers: unremoved,
         placements_updated: removal.placements_updated,
+        lost_environments: removal.lost_environments,
     }))
+}
+
+/// The problem for a failed removal. A [`NodeError::StillServing`] refusal
+/// without `force` on a node the control plane cannot reach names what it
+/// serves and says `force` removes it anyway (ADR 057); everything else maps
+/// as usual. With `force` already set the node was reachable when the
+/// removal looked under its row lock, so the drain-first refusal stands.
+/// Reachability is read again here: the handler's copy of the node may
+/// predate a heartbeat.
+async fn still_serving_problem(
+    app_state: &AppState,
+    node: &temps_entities::nodes::Model,
+    force: bool,
+    error: NodeError,
+) -> Problem {
+    let NodeError::StillServing { count, .. } = &error else {
+        return Problem::from(error);
+    };
+    if force {
+        return Problem::from(error);
+    }
+    let unreachable = match app_state.node_service.get_by_id(node.id).await {
+        Ok(current) => {
+            crate::services::node_service::node_is_unreachable(&current, chrono::Utc::now())
+        }
+        Err(_) => false,
+    };
+    if !unreachable {
+        return Problem::from(error);
+    }
+    match app_state.node_service.serving_environments(node.id).await {
+        Ok(environments) => {
+            unreachable_node_still_serving_problem(node.id, &node.name, *count, &environments)
+        }
+        Err(lookup) => {
+            warn!(node_id = node.id, error = %lookup, "could not list the environments serving from an unreachable node");
+            unreachable_node_still_serving_problem(node.id, &node.name, *count, &[])
+        }
+    }
 }
 
 /// Get the drain status for a node, including migration progress.
@@ -4141,24 +4248,29 @@ async fn admin_drain_status(
         .await
         .map_err(Problem::from)?;
 
+    let unreachable = crate::services::node_service::node_is_unreachable(&node, chrono::Utc::now());
     Ok(Json(drain_status(
         node_id,
         node.name,
         node.status,
         containers.len(),
         remaining_sandboxes,
+        unreachable,
     )))
 }
 
 /// Drain progress of a node from what is still on it. Draining moves
 /// containers, never sandboxes (ADR-048): a node still hosting sandboxes
-/// cannot be removed, and the message says how to clear them.
+/// cannot be removed, and the message says how to clear them. A drain on a
+/// node the control plane cannot reach never finishes, and the message says
+/// so instead of reporting progress (ADR 057).
 fn drain_status(
     node_id: i32,
     node_name: String,
     status: String,
     remaining_containers: usize,
     remaining_sandboxes: u64,
+    unreachable: bool,
 ) -> DrainStatusResponse {
     let is_draining = status == "draining";
     let is_drained = status == "drained";
@@ -4176,6 +4288,13 @@ fn drain_status(
         format!(
             "Drain complete. Node '{node_name}' has no remaining containers and can be safely \
              removed."
+        )
+    } else if is_draining && unreachable {
+        format!(
+            "Draining cannot finish: node '{node_name}' has stopped sending heartbeats, so its \
+             {remaining_containers} container(s) cannot be moved. Start `temps agent` on it, or \
+             if the host is gone for good, remove the node anyway; the environments serving \
+             from it stop until you redeploy them."
         )
     } else if is_draining {
         format!(
@@ -4904,7 +5023,7 @@ mod tests {
 
     #[test]
     fn a_drained_node_with_sandboxes_cannot_be_removed() {
-        let status = drain_status(4, "worker-4".into(), "drained".into(), 0, 2);
+        let status = drain_status(4, "worker-4".into(), "drained".into(), 0, 2, false);
         assert!(status.drain_complete);
         assert!(!status.can_remove);
         assert_eq!(status.remaining_sandboxes, 2);
@@ -4919,7 +5038,7 @@ mod tests {
 
     #[test]
     fn an_offline_node_with_sandboxes_cannot_be_removed() {
-        let status = drain_status(4, "worker-4".into(), "offline".into(), 0, 1);
+        let status = drain_status(4, "worker-4".into(), "offline".into(), 0, 1, false);
         assert!(!status.can_remove);
         assert!(status.message.contains("still hosts 1 sandbox(es)"));
     }
@@ -4927,21 +5046,35 @@ mod tests {
     #[test]
     fn an_empty_drained_or_offline_node_can_be_removed() {
         for node_status in ["drained", "offline"] {
-            let status = drain_status(4, "worker-4".into(), node_status.into(), 0, 0);
+            let status = drain_status(4, "worker-4".into(), node_status.into(), 0, 0, false);
             assert!(status.can_remove, "{node_status}");
         }
-        let draining = drain_status(4, "worker-4".into(), "draining".into(), 0, 0);
+        let draining = drain_status(4, "worker-4".into(), "draining".into(), 0, 0, false);
         assert!(draining.drain_complete && draining.can_remove);
     }
 
     #[test]
     fn a_node_still_draining_or_active_cannot_be_removed() {
-        let draining = drain_status(4, "worker-4".into(), "draining".into(), 3, 0);
+        let draining = drain_status(4, "worker-4".into(), "draining".into(), 3, 0, false);
         assert!(!draining.drain_complete && !draining.can_remove);
         assert!(draining.message.contains("3 container(s)"));
-        let active = drain_status(4, "worker-4".into(), "active".into(), 0, 0);
+        let active = drain_status(4, "worker-4".into(), "active".into(), 0, 0, false);
         assert!(!active.can_remove);
         assert!(active.message.contains("not draining"));
+    }
+
+    /// A drain whose node stopped heartbeating can never move its
+    /// containers; the status says so and points at removing it anyway.
+    #[test]
+    fn a_drain_on_an_unreachable_node_says_it_cannot_finish() {
+        let stuck = drain_status(4, "worker-4".into(), "draining".into(), 1, 0, true);
+        assert!(!stuck.drain_complete && !stuck.can_remove);
+        assert!(stuck.message.contains("cannot finish"), "{}", stuck.message);
+        assert!(
+            stuck.message.contains("remove the node anyway"),
+            "{}",
+            stuck.message
+        );
     }
 
     #[tokio::test]

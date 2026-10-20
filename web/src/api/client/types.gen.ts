@@ -22102,6 +22102,13 @@ export type RemoveNodeResponse = {
      * nodes they still target.
      */
     placements_updated?: Array<NodePlacementReference>;
+    /**
+     * Environments that were still serving from the node when it was
+     * removed as gone (`force=true` on an unreachable node, ADR 057). Their
+     * containers there are recorded as orphaned; redeploy each to run it
+     * again.
+     */
+    lost_environments?: Array<string>;
 };
 
 export type RenameConversationRequest = {
@@ -48306,7 +48313,11 @@ export type AdminRemoveNodeData = {
         /**
          * Remove the node even if containers Temps placed on it could not be
          * confirmed removed (e.g. the host is gone for good). Those containers
-         * are recorded as orphaned instead of being re-homed.
+         * are recorded as orphaned instead of being re-homed. On a node the
+         * control plane can no longer reach (offline, or no heartbeat for 90
+         * seconds) this also covers containers deployments still serve from it:
+         * they are recorded as orphaned too and their environments listed in
+         * `lost_environments` (ADR 057).
          */
         force?: boolean;
     };
@@ -48323,7 +48334,7 @@ export type AdminRemoveNodeErrors = {
      */
     404: unknown;
     /**
-     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)
+     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first). For a node the control plane cannot reach that live deployments still serve from, `force_removes_serving` is set and `serving_environments` names them: force=true removes it anyway (ADR 057)
      */
     409: unknown;
     /**

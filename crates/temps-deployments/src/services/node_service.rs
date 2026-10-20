@@ -539,6 +539,46 @@ pub struct NodeRemoval {
     /// Placements that named the node and still name other nodes; the
     /// node's ID was taken out of each, and `target_nodes` holds the rest.
     pub placements_updated: Vec<NodePlacementReference>,
+    /// Environments that were serving from the node when it was removed as
+    /// gone ([`ServingContainers::RecordLost`]). Their containers there are
+    /// recorded as orphaned; each needs a redeploy to run again.
+    pub lost_environments: Vec<String>,
+}
+
+/// What removing a node does about containers a deployment still serves
+/// from it (ADR 057).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServingContainers {
+    /// Refuse the removal: moving them to another node is a drain's job.
+    Refuse,
+    /// The operator says the host is gone: record them as orphaned and
+    /// report their environments. Honoured only while the node is
+    /// unreachable ([`node_is_unreachable`]), checked again under the
+    /// node's row lock, so a node that is still heartbeating is never
+    /// pulled out from under its traffic.
+    RecordLost,
+}
+
+/// How long a node may go without a heartbeat before the control plane
+/// treats it as unreachable. The health check marks an `active` node
+/// `offline` after this long.
+pub const NODE_HEARTBEAT_STALE_SECS: i64 = 90;
+
+/// Environments listed by name when a removal reports the ones serving from
+/// a node; the rest are counted.
+const MAX_LISTED_SERVING_ENVIRONMENTS: u64 = 20;
+
+/// Whether the control plane has stopped hearing from `node`: no heartbeat
+/// ever, or none for longer than [`NODE_HEARTBEAT_STALE_SECS`]. Decided on
+/// the heartbeat alone, never the status: a node that was draining when its
+/// agent stopped keeps its status but is just as gone, and the health
+/// check's `offline` can land just after a heartbeat brought the node back.
+/// `last_heartbeat` is the control plane's own receive time.
+pub fn node_is_unreachable(node: &nodes::Model, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match node.last_heartbeat {
+        Some(heartbeat) => now - heartbeat > chrono::Duration::seconds(NODE_HEARTBEAT_STALE_SECS),
+        None => true,
+    }
 }
 
 /// Request to register a new worker node.
@@ -2130,6 +2170,20 @@ impl NodeService {
     /// ([`NodeError::OnlyPlacementTarget`]): emptying it would turn a pinned
     /// environment into one that runs on any node.
     pub async fn remove(&self, node_id: i32) -> Result<NodeRemoval, NodeError> {
+        self.remove_with(node_id, ServingContainers::Refuse).await
+    }
+
+    /// [`Self::remove`], choosing what happens to containers a deployment
+    /// still serves from the node. With [`ServingContainers::RecordLost`] a
+    /// node the control plane can no longer reach is removed anyway: those
+    /// containers are recorded as orphaned like any other unconfirmed one,
+    /// and [`NodeRemoval::lost_environments`] names the environments that
+    /// now need a redeploy (ADR 057).
+    pub async fn remove_with(
+        &self,
+        node_id: i32,
+        serving_containers: ServingContainers,
+    ) -> Result<NodeRemoval, NodeError> {
         let txn = self.db.begin().await?;
 
         // First, before any row lock: environment settings saves take the
@@ -2174,15 +2228,23 @@ impl NodeService {
         // KEY SHARE lock on this row through `deployment_containers.node_id`,
         // so it is either committed and seen here, or waits and then fails
         // the foreign key once the node is gone. Never orphan a container a
-        // deployment is using.
+        // deployment is using, unless the operator says the node is gone and
+        // the row read under this lock agrees: a heartbeat that arrived since
+        // the caller looked makes it reachable again.
         let serving = Self::serving_container_count_on(&txn, node_id).await?;
-        if serving > 0 {
+        let lost_environments = if serving == 0 {
+            Vec::new()
+        } else if serving_containers == ServingContainers::RecordLost
+            && node_is_unreachable(&locked, chrono::Utc::now())
+        {
+            Self::serving_environments_on(&txn, node_id, serving).await?
+        } else {
             return Err(NodeError::StillServing {
                 node_id,
                 node_name: locked.name,
                 count: serving,
             });
-        }
+        };
 
         // Read and rewritten under the placement lock taken above: a settings
         // save that names this node either committed first and is rewritten
@@ -2225,6 +2287,16 @@ impl NodeService {
                 "Node removed with containers Temps could not confirm were removed; recorded as orphaned"
             );
         }
+        if !lost_environments.is_empty() {
+            tracing::warn!(
+                node_id = node_id,
+                node_name = %locked.name,
+                serving_containers = serving,
+                environments = ?lost_environments,
+                "Unreachable node removed while deployments still served from it; their \
+                 containers there are recorded as orphaned and the environments need a redeploy"
+            );
+        }
         for placement in &placements_updated {
             tracing::info!(
                 node_id = node_id,
@@ -2241,7 +2313,60 @@ impl NodeService {
             "Node removed from cluster"
         );
 
-        Ok(NodeRemoval { placements_updated })
+        Ok(NodeRemoval {
+            placements_updated,
+            lost_environments,
+        })
+    }
+
+    /// The environments (of live projects) with containers serving from
+    /// `node_id`, each as
+    /// "environment 'E' of project 'P'", at most
+    /// [`MAX_LISTED_SERVING_ENVIRONMENTS`] of them plus a line counting the
+    /// containers not covered. For telling an operator what removing an
+    /// unreachable node takes down.
+    pub async fn serving_environments(&self, node_id: i32) -> Result<Vec<String>, NodeError> {
+        let serving = Self::serving_container_count_on(self.db.as_ref(), node_id).await?;
+        if serving == 0 {
+            return Ok(Vec::new());
+        }
+        Self::serving_environments_on(self.db.as_ref(), node_id, serving).await
+    }
+
+    async fn serving_environments_on<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        node_id: i32,
+        serving: usize,
+    ) -> Result<Vec<String>, NodeError> {
+        let rows: Vec<(String, Option<String>, i32)> = Self::node_containers_query(node_id)
+            .filter(Self::serving_condition())
+            .join(JoinType::InnerJoin, deployments::Relation::Project.def())
+            .filter(projects::Column::IsDeleted.eq(false))
+            .select_only()
+            .column_as(projects::Column::Name, "project_name")
+            .column_as(environments::Column::Name, "environment_name")
+            .column_as(deployments::Column::EnvironmentId, "environment_id")
+            .distinct()
+            .order_by_asc(projects::Column::Name)
+            .order_by_asc(deployments::Column::EnvironmentId)
+            .limit(MAX_LISTED_SERVING_ENVIRONMENTS + 1)
+            .into_tuple()
+            .all(db)
+            .await?;
+        let mut lines: Vec<String> = rows
+            .iter()
+            .take(MAX_LISTED_SERVING_ENVIRONMENTS as usize)
+            .map(|(project, environment, environment_id)| match environment {
+                Some(environment) => format!("environment '{environment}' of project '{project}'"),
+                None => format!("environment {environment_id} of project '{project}'"),
+            })
+            .collect();
+        if rows.len() as u64 > MAX_LISTED_SERVING_ENVIRONMENTS {
+            lines.push(format!(
+                "and more environments ({serving} serving container(s) in all)"
+            ));
+        }
+        Ok(lines)
     }
 
     /// Environments (of live projects) and projects whose `target_nodes`
@@ -2509,8 +2634,25 @@ impl NodeService {
         node: &nodes::Model,
         deployer: Option<&dyn temps_deployer::ContainerDeployer>,
     ) -> Result<LeftoverRemoval, NodeError> {
+        self.remove_leftover_containers_with(node, deployer, ServingContainers::Refuse)
+            .await
+    }
+
+    /// [`Self::remove_leftover_containers`]; with
+    /// [`ServingContainers::RecordLost`] and an unreachable node, containers
+    /// a deployment still serves from it do not refuse the cleanup. They are
+    /// not leftovers either: they are left for [`Self::remove_with`] to
+    /// record as orphaned.
+    pub async fn remove_leftover_containers_with(
+        &self,
+        node: &nodes::Model,
+        deployer: Option<&dyn temps_deployer::ContainerDeployer>,
+        serving_containers: ServingContainers,
+    ) -> Result<LeftoverRemoval, NodeError> {
         let serving = Self::serving_container_count_on(self.db.as_ref(), node.id).await?;
-        if serving > 0 {
+        let gone = serving_containers == ServingContainers::RecordLost
+            && node_is_unreachable(node, chrono::Utc::now());
+        if serving > 0 && !gone {
             return Err(NodeError::StillServing {
                 node_id: node.id,
                 node_name: node.name.clone(),
@@ -5845,6 +5987,163 @@ mod tests {
             );
         }
 
+        /// Against Postgres (ADR 057): a node still serving a deployment is
+        /// removed as gone only while it is unreachable. Then its serving
+        /// container is recorded as orphaned and its environment reported;
+        /// a heartbeat in the threshold keeps the drain-first refusal.
+        #[tokio::test]
+        async fn an_unreachable_node_can_be_removed_while_it_still_serves() {
+            use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList};
+
+            let Some(test_db) = migrated_test_db().await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let service = NodeService::new(db.clone());
+            let node = service
+                .register(register_req(
+                    "worker-gone",
+                    "hash",
+                    "https://10.100.0.4:3100",
+                ))
+                .await
+                .unwrap();
+            let project = projects::ActiveModel {
+                name: Set("Gone Node".to_string()),
+                slug: Set("gone-node".to_string()),
+                repo_owner: Set("owner".to_string()),
+                repo_name: Set("repo".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(Preset::NextJs),
+                directory: Set("/".to_string()),
+                created_at: Set(chrono::Utc::now()),
+                updated_at: Set(chrono::Utc::now()),
+                is_deleted: Set(false),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            let environment = environments::ActiveModel {
+                project_id: Set(project.id),
+                name: Set("prod".to_string()),
+                slug: Set("prod".to_string()),
+                host: Set("gone.example.test".to_string()),
+                subdomain: Set("gone.example.test".to_string()),
+                upstreams: Set(UpstreamList::default()),
+                created_at: Set(chrono::Utc::now()),
+                updated_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            let current = seed_deployment(
+                db.as_ref(),
+                project.id,
+                environment.id,
+                "current",
+                "completed",
+            )
+            .await;
+            let mut serving: environments::ActiveModel = environment.into();
+            serving.current_deployment_id = Set(Some(current.id));
+            serving.update(db.as_ref()).await.unwrap();
+            deployment_containers::Entity::insert(container_row(
+                current.id,
+                node.id,
+                "c-serving",
+                "running",
+                false,
+            ))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+            let heartbeat = |seconds_ago: i64| {
+                let mut row: nodes::ActiveModel = node.clone().into();
+                row.status = Set("draining".to_string());
+                row.last_heartbeat = Set(Some(
+                    chrono::Utc::now() - chrono::Duration::seconds(seconds_ago),
+                ));
+                row
+            };
+
+            // Still heartbeating: forcing does not pull it out from under
+            // its traffic, and nothing is touched.
+            let fresh = heartbeat(5).update(db.as_ref()).await.unwrap();
+            assert!(!node_is_unreachable(&fresh, chrono::Utc::now()));
+            let err = service
+                .remove_leftover_containers_with(&fresh, None, ServingContainers::RecordLost)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, NodeError::StillServing { count: 1, .. }),
+                "{err:?}"
+            );
+            let err = service
+                .remove_with(fresh.id, ServingContainers::RecordLost)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, NodeError::StillServing { count: 1, .. }),
+                "{err:?}"
+            );
+
+            // Draining but silent past the threshold: gone. Without the
+            // operator's say-so the refusal stands.
+            let silent = heartbeat(NODE_HEARTBEAT_STALE_SECS + 30)
+                .update(db.as_ref())
+                .await
+                .unwrap();
+            assert!(node_is_unreachable(&silent, chrono::Utc::now()));
+            let err = service.remove(silent.id).await.unwrap_err();
+            assert!(
+                matches!(err, NodeError::StillServing { count: 1, .. }),
+                "{err:?}"
+            );
+            assert_eq!(
+                service.serving_environments(silent.id).await.unwrap(),
+                vec!["environment 'prod' of project 'Gone Node'".to_string()]
+            );
+
+            let outcome = service
+                .remove_leftover_containers_with(&silent, None, ServingContainers::RecordLost)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.unremoved_count, 0,
+                "a serving container is no leftover"
+            );
+            let removal = service
+                .remove_with(silent.id, ServingContainers::RecordLost)
+                .await
+                .unwrap();
+            assert_eq!(
+                removal.lost_environments,
+                vec!["environment 'prod' of project 'Gone Node'".to_string()]
+            );
+            assert!(nodes::Entity::find_by_id(silent.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .is_none());
+            let lost = deployment_containers::Entity::find()
+                .filter(deployment_containers::Column::ContainerId.eq("c-serving"))
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .expect("the row is kept");
+            assert_eq!(lost.status.as_deref(), Some(CONTAINER_STATUS_ORPHANED));
+            assert!(lost.deleted_at.is_some());
+            assert!(
+                lost.error_message
+                    .as_deref()
+                    .is_some_and(|note| note.contains("worker-gone")),
+                "{:?}",
+                lost.error_message
+            );
+        }
+
         /// Without an agent nothing is confirmed: every leftover is reported
         /// and no row is rewritten.
         #[tokio::test]
@@ -5863,6 +6162,33 @@ mod tests {
                 .iter()
                 .all(|line| line.contains("cannot be reached")));
         }
+    }
+
+    /// Never heard from, or silent past the threshold, is unreachable
+    /// whatever the status; a recent heartbeat is not, even while draining
+    /// or marked offline (ADR 057).
+    #[test]
+    fn a_node_is_unreachable_once_silent_past_the_threshold() {
+        let now = chrono::Utc::now();
+        let with = |status: &str, seconds_ago: Option<i64>| {
+            let mut node = sample_node();
+            node.status = status.to_string();
+            node.last_heartbeat = seconds_ago.map(|s| now - chrono::Duration::seconds(s));
+            node
+        };
+        assert!(node_is_unreachable(&with("active", None), now));
+        // An `offline` written just after a heartbeat brought the node back
+        // does not make it removable as gone.
+        assert!(!node_is_unreachable(&with("offline", Some(1)), now));
+        assert!(node_is_unreachable(
+            &with("draining", Some(NODE_HEARTBEAT_STALE_SECS + 1)),
+            now
+        ));
+        assert!(!node_is_unreachable(
+            &with("draining", Some(NODE_HEARTBEAT_STALE_SECS - 1)),
+            now
+        ));
+        assert!(!node_is_unreachable(&with("active", Some(0)), now));
     }
 
     #[tokio::test]
