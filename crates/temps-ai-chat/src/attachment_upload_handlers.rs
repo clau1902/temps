@@ -392,7 +392,7 @@ mod tests {
     fn a_chunk_request_fits_under_a_40_kib_proxy_limit() {
         // The preview proxy that motivated chunking rejects bodies over 40 KiB;
         // the chunk plus its multipart framing must stay well under it.
-        assert!(UPLOAD_CHUNK_BYTES + 1024 < 40 * 1024);
-        assert!(CHUNK_REQUEST_BODY_LIMIT >= UPLOAD_CHUNK_BYTES);
+        const { assert!(UPLOAD_CHUNK_BYTES + 1024 < 40 * 1024) };
+        const { assert!(CHUNK_REQUEST_BODY_LIMIT >= UPLOAD_CHUNK_BYTES) };
     }
 }

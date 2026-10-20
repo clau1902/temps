@@ -350,7 +350,7 @@ impl WorkspaceChatService {
             .db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                &format!(
+                format!(
                     "SELECT sibling.id FROM ai_conversations sibling \
                      JOIN ai_conversations chat ON chat.id = $1 \
                      WHERE sibling.id <> chat.id \
@@ -383,7 +383,7 @@ impl WorkspaceChatService {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                &format!(
+                format!(
                     "UPDATE ai_conversations \
                      SET metadata = ((CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata ELSE '{{}}'::jsonb END) \
                          - '{SANDBOX_LINK_KEY}' - '{SANDBOX_PREVIEW_KEY}') \
@@ -411,7 +411,7 @@ impl WorkspaceChatService {
             .db
             .query_all(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                &format!(
+                format!(
                     "SELECT DISTINCT metadata -> '{SANDBOX_LINK_KEY}' ->> 'sandbox_id' AS sandbox_id \
                      FROM ai_conversations \
                      WHERE {} \
@@ -446,7 +446,7 @@ impl WorkspaceChatService {
             .db
             .query_all(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                &format!(
+                format!(
                     "SELECT DISTINCT metadata -> '{SANDBOX_LINK_KEY}' ->> 'sandbox_id' AS sandbox_id \
                      FROM ai_conversations \
                      WHERE jsonb_typeof(metadata) = 'object' \
@@ -519,7 +519,7 @@ impl WorkspaceChatService {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                &format!(
+                format!(
                     "UPDATE ai_conversations \
                      SET application_id = NULL, \
                          metadata = CASE WHEN jsonb_typeof(metadata) = 'object' \
@@ -1319,7 +1319,7 @@ mod tests {
         // Linking from any chat is a shared write.
         db.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            &format!(
+            format!(
                 "UPDATE ai_conversations SET metadata = metadata || jsonb_build_object($1::text, $2::jsonb) WHERE {}",
                 metadata_scope("$3", true)
             ),

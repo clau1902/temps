@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn a_single_project_is_built_flat_in_the_sandbox() {
         let build = all()
-            .into_iter()
+            .iter()
             .find(|playbook| playbook.name == "build-an-app")
             .expect("build-an-app playbook");
         assert!(build.body.contains("Keep one project flat at the top"));

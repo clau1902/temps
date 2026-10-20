@@ -4651,7 +4651,7 @@ impl ConversationService {
         // full transcript stays stored and on screen.
         let summary = crate::compaction::latest_summary(&history);
         let summarized_through = summary.as_ref().map_or(0, |s| s.through_message_id);
-        self.compact_in_background_if_needed(&conv, &history, summary.as_ref())
+        self.compact_in_background_if_needed(conv, &history, summary.as_ref())
             .await;
         let mut messages: Vec<ChatMessage> = history
             .iter()
@@ -4739,7 +4739,7 @@ impl ConversationService {
 
         if conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
             if let Some(section) = self
-                .focus_project_prompt(&conv, auth, project_access_checker.as_ref())
+                .focus_project_prompt(conv, auth, project_access_checker.as_ref())
                 .await
             {
                 match messages.iter_mut().find(|m| m.role == "system") {
@@ -4751,7 +4751,7 @@ impl ConversationService {
                 }
             }
             let workspace_section = match &self.blueprint_support {
-                Some(support) => match support.workspaces.prompt_section(&conv).await {
+                Some(support) => match support.workspaces.prompt_section(conv).await {
                     Ok(section) => section,
                     Err(error) => {
                         tracing::warn!(
@@ -4900,7 +4900,7 @@ impl ConversationService {
                 tools.push(crate::ask_user::tool());
             }
             tools.extend(
-                self.sandbox_tools(&conv, auth, project_access_checker.as_ref())
+                self.sandbox_tools(conv, auth, project_access_checker.as_ref())
                     .await,
             );
             // Playbooks follow the tools the chat holds, so one that needs the
@@ -4946,7 +4946,7 @@ impl ConversationService {
             }
         }
         log_phase("prompt_context_built");
-        log_prompt_composition(&conv, &messages, &tools);
+        log_prompt_composition(conv, &messages, &tools);
 
         // Persist the assistant row before execution starts. Live WebSocket
         // events are only a notification channel; this draft is the
@@ -5477,7 +5477,7 @@ impl ConversationService {
             == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
             .then(|| self.goal_support.clone())
             .flatten();
-        let sandbox_link_opt = self.sandbox_link_for(&conv);
+        let sandbox_link_opt = self.sandbox_link_for(conv);
         let blueprint_support_opt = (conv.context_type
             == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
             .then(|| self.blueprint_support.clone())
@@ -7828,7 +7828,7 @@ fn system_section_sizes(messages: &[ChatMessage]) -> String {
             }
         }
     }
-    sections.sort_by(|a, b| b.1.cmp(&a.1));
+    sections.sort_by_key(|section| std::cmp::Reverse(section.1));
     sections
         .iter()
         .take(12)
@@ -8429,6 +8429,7 @@ async fn dispatch_sandbox_deploy_tool(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_write_tool(
     arguments: &str,
     project_id: Option<i32>,
@@ -11664,7 +11665,7 @@ mod tests {
     #[test]
     fn conversation_digest_prefers_recent_messages_and_skips_tool_rows() {
         let long = "x".repeat(TITLE_DIGEST_MESSAGE_CHARS * 3);
-        let rows = vec![
+        let rows = [
             ("user", "hi"),
             ("tool", "ignored"),
             ("assistant", long.as_str()),

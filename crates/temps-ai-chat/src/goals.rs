@@ -266,8 +266,8 @@ impl TrackGoalInput {
                     .into(),
             ));
         }
-        validate_values("success_values", &self.success_values).map_err(&fail)?;
-        validate_values("failure_values", &self.failure_values).map_err(&fail)?;
+        validate_values("success_values", &self.success_values).map_err(fail)?;
+        validate_values("failure_values", &self.failure_values).map_err(fail)?;
         if self.success_values.iter().any(|s| {
             self.failure_values
                 .iter()

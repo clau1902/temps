@@ -2812,6 +2812,7 @@ impl AutofixService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn deliver_pull_request(
         &self,
         incident: &autofix_incidents::Model,
@@ -2935,7 +2936,7 @@ impl AutofixService {
             .await
             .map_err(|error| AutofixError::step(id, "open the pull request", error))?;
         let url = pull_request.url.clone();
-        let number = i32::try_from(pull_request.number).ok();
+        let number = Some(pull_request.number);
         let branch_stored = branch.clone();
         let sha_stored = sha.clone();
         let url_stored = url.clone();

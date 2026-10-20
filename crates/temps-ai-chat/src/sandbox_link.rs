@@ -844,7 +844,7 @@ impl SandboxLinkService {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                &format!(
+                format!(
                     "UPDATE ai_conversations \
                      SET metadata = (CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata ELSE '{{}}'::jsonb END) \
                          || jsonb_build_object($1::text, $2::jsonb) \
@@ -866,7 +866,7 @@ impl SandboxLinkService {
         self.db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                &format!(
+                format!(
                     "UPDATE ai_conversations \
                      SET metadata = metadata - $1::text \
                      WHERE {} AND jsonb_typeof(metadata) = 'object'",

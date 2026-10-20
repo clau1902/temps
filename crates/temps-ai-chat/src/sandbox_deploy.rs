@@ -962,8 +962,7 @@ mod tests {
                 }
                 .to_string()
             })
-            .err()
-            .expect("missing project");
+            .expect_err("missing project");
         assert!(error.contains("project_id"), "{error}");
         assert!(error.contains("Nothing was deployed"));
     }

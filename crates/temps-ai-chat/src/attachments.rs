@@ -1063,8 +1063,10 @@ mod tests {
         assert!(error.to_string().contains("vendor/text-only"));
         assert!(error.to_string().contains("shot.png"));
 
-        assert!(ensure_images_readable(&[note.clone()], ImageSupport::No, "m").is_ok());
-        assert!(ensure_images_readable(&[image.clone()], ImageSupport::Yes, "m").is_ok());
+        assert!(ensure_images_readable(std::slice::from_ref(&note), ImageSupport::No, "m").is_ok());
+        assert!(
+            ensure_images_readable(std::slice::from_ref(&image), ImageSupport::Yes, "m").is_ok()
+        );
         assert!(ensure_images_readable(&[image], ImageSupport::Unknown, "m").is_ok());
     }
 
