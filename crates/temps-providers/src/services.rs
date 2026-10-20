@@ -24050,15 +24050,25 @@ mod tests {
         )
         .await;
 
-        // Empty member request + no preserved members in DB
-        let result = manager.retry_cluster(service_id, &[]).await;
+        // Empty member request + no preserved members in DB: the retry falls
+        // back to the default layout instead of asking for a member list.
+        // Claimed inside a transaction that is rolled back, so no cluster is
+        // actually rebuilt.
+        let lock = manager.db.begin().await.expect("begin transaction");
+        let (leftover, members) = manager
+            .claim_cluster_retry(&lock, service_id, &[])
+            .await
+            .expect("a failed cluster with no members retries with the default layout");
+        lock.rollback().await.expect("rollback transaction");
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, ExternalServiceError::ParameterValidationFailed { .. }),
-            "Expected ParameterValidationFailed for missing members, got: {:?}",
-            err
+        assert!(leftover.is_empty());
+        let roles: Vec<_> = members
+            .iter()
+            .map(|m| (m.role.as_str(), m.node_id))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![("monitor", None), ("primary", None), ("replica", None)]
         );
     }
 

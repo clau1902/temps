@@ -5652,6 +5652,7 @@ impl GitProviderManager {
     /// repository's default branch), so existing history is never rewritten.
     /// A branch that does not exist yet is started from the default branch's
     /// tip. Returns the new commit's SHA and the branch it landed on.
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit_files_for_user(
         &self,
         connection_id: i32,
@@ -5729,6 +5730,7 @@ impl GitProviderManager {
 
     /// Open a pull request on `owner/repo` through a connection owned by
     /// `user_id`. `base_branch` defaults to the repository's default branch.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_pull_request_for_user(
         &self,
         connection_id: i32,

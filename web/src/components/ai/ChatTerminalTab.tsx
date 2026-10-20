@@ -5,7 +5,7 @@ import { getChatSandboxOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { SquareTerminal } from 'lucide-react'
-import { lazy, Suspense, useEffect, useState } from 'react'
+import { lazy, Suspense, useState } from 'react'
 import { SandboxWaking } from './ChatPreviewTab'
 import { CreateSandboxAction } from './ChatSandbox'
 import { useChatSandboxWake } from './chat-sandbox-wake'
@@ -61,10 +61,9 @@ export function ChatTerminalTab({
     getChatSandboxOptions({ path: { public_id: conversationPublicId } })
   )
   const wake = useChatSandboxWake(conversationPublicId)
+  // Once shown, the terminal stays connected while the tab is hidden.
   const [opened, setOpened] = useState(active)
-  useEffect(() => {
-    if (active) setOpened(true)
-  }, [active])
+  if (active && !opened) setOpened(true)
 
   if (status.isPending) {
     return (
