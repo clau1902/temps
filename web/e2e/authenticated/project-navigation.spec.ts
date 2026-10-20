@@ -1,13 +1,19 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { expect, test } from '@playwright/test'
+import type { ProjectResponse } from '../../src/api/client'
 
 test('direct project links and direct flat settings navigation', async ({
   page,
 }) => {
   const { projects } = await (await page.request.get('/api/projects')).json()
   expect(projects.length).toBeGreaterThan(0)
-  const root = `/projects/${projects[0].slug}`
+  const project = projects.find(
+    (project: ProjectResponse) =>
+      project.hosting === 'hosted' && project.source_type !== 'external'
+  )
+  expect(project, 'Hosted navigation needs a hosted project').toBeDefined()
+  const root = `/projects/${project.slug}`
   const errors: string[] = []
   page.on('pageerror', (error) => errors.push(error.message))
   await page.setViewportSize({ width: 1440, height: 1000 })
@@ -119,7 +125,10 @@ test('direct project links and direct flat settings navigation', async ({
   for (const [section, pages] of [
     ['Logs', ['Application logs', 'Request logs', 'Telemetry logs']],
     ['Traces', ['Traces', 'AI traces']],
-    ['Monitoring', ['Metrics', 'Uptime', 'Status pages', 'Alert rules']],
+    [
+      'Monitoring',
+      ['Metrics', 'Uptime', 'Cron jobs', 'Status pages', 'Alert rules'],
+    ],
     [
       'Analytics',
       [
@@ -172,7 +181,12 @@ test('legacy build links and mobile contextual navigation stay usable', async ({
 }) => {
   const { projects } = await (await page.request.get('/api/projects')).json()
   expect(projects.length).toBeGreaterThan(0)
-  const root = `/projects/${projects[0].slug}`
+  const project = projects.find(
+    (project: ProjectResponse) =>
+      project.hosting === 'hosted' && project.source_type !== 'external'
+  )
+  expect(project, 'Hosted navigation needs a hosted project').toBeDefined()
+  const root = `/projects/${project.slug}`
   await page.setViewportSize({ width: 390, height: 844 })
   // The old standalone build page redirects to its section of Build & deploy,
   // opened and scrolled into view.
