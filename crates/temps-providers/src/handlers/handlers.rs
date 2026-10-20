@@ -3534,6 +3534,7 @@ async fn get_service_preview_environment_variables_masked(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let options = EnvironmentVariableOptions {
         include_docker: false,
@@ -4905,6 +4906,214 @@ mod tests {
                 reason: "Error response from daemon: pull access denied for private/db".to_string(),
             }),
             OperationFailureCode::ImagePull
+        );
+    }
+
+    /// Both env-preview reads expose data derived from a service's
+    /// credentials, so each must confirm the caller can reach the service
+    /// through one of its linked projects, not just hold
+    /// `ExternalServicesRead`.
+    #[test]
+    fn service_env_previews_check_ownership() {
+        let source = include_str!("handlers.rs");
+        for handler_name in [
+            "get_service_preview_environment_variable_names",
+            "get_service_preview_environment_variables_masked",
+        ] {
+            let fn_start = source
+                .find(&format!("async fn {handler_name}("))
+                .unwrap_or_else(|| panic!("{handler_name} handler not found in source"));
+            let after_start = &source[fn_start + 1..];
+            let next_fn_offset = after_start.find("async fn ").unwrap_or(after_start.len());
+            let body = &source[fn_start..fn_start + 1 + next_fn_offset];
+            assert!(
+                body.contains("assert_service_owned_by_caller(id, &auth, &app_state)"),
+                "{handler_name} must verify the caller can access service {{id}}"
+            );
+        }
+    }
+
+    /// A Postgres service (id 17) linked to project 99, whose config is
+    /// encrypted with `encryption_service`.
+    fn preview_service(
+        encryption_service: &temps_core::EncryptionService,
+    ) -> (external_services::Model, project_services::Model) {
+        let now = chrono::Utc::now();
+        let config = encryption_service
+            .encrypt_string(
+                &serde_json::json!({
+                    "database": "app",
+                    "username": "app_user",
+                    "password": "preview-secret",
+                })
+                .to_string(),
+            )
+            .expect("test service config encryption should succeed");
+        let service = external_services::Model {
+            id: 17,
+            name: "preview-database".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("18".to_string()),
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            slug: Some("preview-database".to_string()),
+            config: Some(config),
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        };
+        let link = project_services::Model {
+            id: 1,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
+            project_id: 99,
+            service_id: 17,
+            created_at: now,
+            updated_at: now,
+        };
+        (service, link)
+    }
+
+    fn preview_state(
+        db: Arc<sea_orm::DatabaseConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+        allowed_project_ids: Vec<i32>,
+    ) -> Arc<AppState> {
+        // Never asked to reach a daemon: the preview only reads stored
+        // parameters, so these tests run on hosts without Docker.
+        let docker = Arc::new(
+            bollard::Docker::connect_with_http(
+                "http://127.0.0.1:1",
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .expect("a lazily connecting client"),
+        );
+        let manager = Arc::new(crate::services::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        ));
+        Arc::new(AppState {
+            external_service_manager: manager.clone(),
+            data_import_service: crate::handlers::types::test_support::data_import_service(
+                manager.clone(),
+                db.clone(),
+            ),
+            sensitive_action_authorizer:
+                crate::handlers::types::test_support::allow_sensitive_actions(),
+            audit_service: Arc::new(RecordingAuditLogger::default()),
+            query_service: Arc::new(crate::QueryService::new(manager)),
+            health_monitor: None,
+            metrics_store: None,
+            db: db.clone(),
+            api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
+            config_service: None,
+            telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            project_access_checker: Some(Arc::new(TestProjectAccessChecker {
+                allowed_project_ids,
+                fail: false,
+            })),
+            application_network_reconciler: None,
+            notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
+                destinations: Some(0),
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn masked_env_preview_rejects_user_without_linked_project_access() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "masked-env-preview-denied-test",
+        ));
+        let (service, link) = preview_service(&encryption_service);
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                // 1: assert_service_owned_by_caller's existence check
+                .append_query_results([vec![service]])
+                // 2: assert_service_owned_by_caller's linked-projects lookup
+                .append_query_results([vec![link]])
+                // Nothing further: the preview itself must never be built.
+                .into_connection(),
+        );
+        let state = preview_state(db, encryption_service, vec![7]);
+
+        let result = get_service_preview_environment_variables_masked(
+            State(state),
+            Path(17),
+            RequireAuth(test_auth_context_with_role(temps_auth::Role::User)),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a service linked only to an inaccessible project must not preview"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn masked_env_preview_allows_user_with_linked_project_access() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "masked-env-preview-allowed-test",
+        ));
+        let (service, link) = preview_service(&encryption_service);
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                // 1-2: assert_service_owned_by_caller
+                .append_query_results([vec![service.clone()]])
+                .append_query_results([vec![link]])
+                // 3: get_environment_variables' service fetch
+                .append_query_results([vec![service.clone()]])
+                // 4: get_service_parameters' service fetch
+                .append_query_results([vec![service]])
+                .into_connection(),
+        );
+        let state = preview_state(db, encryption_service, vec![99]);
+
+        let response = get_service_preview_environment_variables_masked(
+            State(state),
+            Path(17),
+            RequireAuth(test_auth_context_with_role(temps_auth::Role::User)),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "a caller with access to the linked project should preview, got {}",
+                error.into_response().status()
+            )
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("preview response body should be readable");
+        let preview: HashMap<String, String> =
+            serde_json::from_slice(&body).expect("preview response should be JSON");
+        assert!(
+            !preview.is_empty(),
+            "the authorized preview should list the service's variables"
+        );
+        assert!(
+            preview
+                .values()
+                .all(|value| !value.contains("preview-secret")),
+            "the preview must keep the password masked: {preview:?}"
         );
     }
 
