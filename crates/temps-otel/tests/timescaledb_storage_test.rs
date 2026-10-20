@@ -125,6 +125,7 @@ fn sample_log(
     trace_id: Option<&str>,
 ) -> LogRecord {
     LogRecord {
+        attribute_types: Default::default(),
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -2958,5 +2959,211 @@ async fn test_record_ingest_error_truncates_long_sample_message_before_insert() 
         stored.chars().count() <= 501,
         "the raw DB column must already be truncated at insert time, got {} chars",
         stored.chars().count()
+    );
+}
+
+#[tokio::test]
+async fn native_typed_log_filters_preserve_precision_types_and_project_scope() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let make = |project, key_value: &str, ty: Option<LogAttributeType>, body: &str| {
+        let mut log = sample_log(project, LogSeverity::Info, body, None);
+        log.attributes.insert("count".into(), key_value.into());
+        if let Some(ty) = ty {
+            log.attribute_types.insert("count".into(), ty);
+        }
+        log
+    };
+    let rows = vec![
+        make(
+            1,
+            "9007199254740993",
+            Some(LogAttributeType::Integer),
+            "Synthetic int64",
+        ),
+        make(
+            1,
+            "9007199254740992",
+            Some(LogAttributeType::Integer),
+            "Synthetic smaller int64",
+        ),
+        make(
+            1,
+            "9007199254740993",
+            Some(LogAttributeType::String),
+            "Synthetic numeric string",
+        ),
+        make(
+            1,
+            "true",
+            Some(LogAttributeType::Boolean),
+            "Synthetic boolean",
+        ),
+        make(
+            1,
+            "0.1234567890123456789",
+            Some(LogAttributeType::Double),
+            "Synthetic precise decimal",
+        ),
+        make(
+            1,
+            "0.1234567890123456788",
+            Some(LogAttributeType::Double),
+            "Synthetic smaller decimal",
+        ),
+        make(
+            1,
+            "not a number",
+            Some(LogAttributeType::Double),
+            "Synthetic malformed numeric producer",
+        ),
+        make(
+            1,
+            "1e999999999",
+            Some(LogAttributeType::Double),
+            "Synthetic overflowing numeric producer",
+        ),
+        make(
+            2,
+            "9007199254740993",
+            Some(LogAttributeType::Integer),
+            "Synthetic other project",
+        ),
+        make(
+            1,
+            "9007199254740993",
+            None,
+            "Synthetic historical untyped log",
+        ),
+    ];
+    assert_eq!(storage.store_logs(rows).await.unwrap(), 10);
+    let query = |ty, op, value: &str| LogQuery {
+        project_id: 1,
+        attribute_filter: Some(LogAttributeFilter {
+            key: "count".into(),
+            ty,
+            operator: op,
+            value: value.into(),
+        }),
+        ..Default::default()
+    };
+    let exact = storage
+        .query_logs(query(
+            Some(LogAttributeType::Integer),
+            LogAttributeOperator::Eq,
+            "9007199254740993",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].body, "Synthetic int64");
+    assert_eq!(exact[0].attributes["count"], "9007199254740993");
+    assert_eq!(exact[0].attribute_types["count"], LogAttributeType::Integer);
+    let greater = storage
+        .query_logs(query(
+            Some(LogAttributeType::Integer),
+            LogAttributeOperator::Gt,
+            "9007199254740992",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(greater.len(), 1);
+    assert_eq!(greater[0].body, "Synthetic int64");
+    let text = storage
+        .query_logs(query(
+            Some(LogAttributeType::String),
+            LogAttributeOperator::Eq,
+            "9007199254740993",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(text.len(), 1);
+    assert_eq!(text[0].body, "Synthetic numeric string");
+    let untyped = storage
+        .query_logs(query(None, LogAttributeOperator::Eq, "9007199254740993"))
+        .await
+        .unwrap();
+    assert_eq!(untyped.len(), 3);
+    let boolean = storage
+        .query_logs(query(
+            Some(LogAttributeType::Boolean),
+            LogAttributeOperator::Eq,
+            "true",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(boolean.len(), 1);
+    assert_eq!(boolean[0].body, "Synthetic boolean");
+    let decimal = storage
+        .query_logs(query(
+            Some(LogAttributeType::Double),
+            LogAttributeOperator::Gt,
+            "0.12345678901234567885",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(decimal.len(), 1);
+    assert_eq!(decimal[0].body, "Synthetic precise decimal");
+    assert_eq!(decimal[0].attributes["count"], "0.1234567890123456789");
+    let mut injection = query(None, LogAttributeOperator::Eq, "9007199254740993");
+    injection.attribute_filter.as_mut().unwrap().key = "count' OR '1'='1".into();
+    assert!(storage.query_logs(injection).await.unwrap().is_empty());
+    let mut page = query(None, LogAttributeOperator::Eq, "9007199254740993");
+    page.limit = Some(1);
+    page.offset = Some(1);
+    assert_eq!(storage.query_logs(page).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn typed_log_column_default_preserves_compressed_history() {
+    use sea_orm::ConnectionTrait;
+    let Some((test_db, storage)) = setup_storage().await else {
+        return;
+    };
+    storage
+        .store_logs(vec![sample_log(
+            1,
+            LogSeverity::Info,
+            "Synthetic historical log",
+            None,
+        )])
+        .await
+        .unwrap();
+    // Reproduce the pre-migration shape, with an actual compressed historical
+    // chunk. Exercise the exact ADD COLUMN operation used by the migration.
+    test_db
+        .db
+        .execute_unprepared("ALTER TABLE otel_log_events DROP COLUMN attribute_types")
+        .await
+        .unwrap();
+    if test_db
+        .db
+        .execute_unprepared("SELECT compress_chunk(c) FROM show_chunks('otel_log_events') c")
+        .await
+        .is_err()
+    {
+        println!("Compression unavailable, skipping historical log DDL check");
+        return;
+    }
+    test_db
+        .db
+        .execute_unprepared(
+            "ALTER TABLE otel_log_events ADD COLUMN attribute_types JSONB NOT NULL DEFAULT '{}'",
+        )
+        .await
+        .expect("constant type metadata default must work on compressed log chunks");
+    let logs = storage
+        .query_logs(LogQuery {
+            project_id: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].body, "Synthetic historical log");
+    assert!(
+        logs[0].attribute_types.is_empty(),
+        "historical types must not be invented"
     );
 }

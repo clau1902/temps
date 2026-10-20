@@ -228,7 +228,16 @@ where
                 // Terminal errors (malformed rows, schema drift, validation)
                 // fail identically on every attempt — returning now keeps the
                 // ingest permit held for the shortest possible time.
-                if is_last_attempt || !e.is_transient() {
+                if is_last_attempt
+                    || !e.is_transient()
+                    || matches!(
+                        e,
+                        OtelError::Storage {
+                            kind: StorageErrorKind::AdapterCapacity,
+                            ..
+                        }
+                    )
+                {
                     return Err(e);
                 }
                 let delay = config.compute_delay(attempt);
@@ -237,7 +246,7 @@ where
                     attempt = attempt + 1,
                     max_attempts = config.max_attempts,
                     delay_ms = delay.as_millis() as u64,
-                    error = %e,
+                    error_class = e.error_class(),
                     "Transient OTel storage write failure, retrying"
                 );
                 tokio::time::sleep(delay).await;
@@ -531,9 +540,15 @@ impl OtelService {
     /// would delay releasing that permit for bookkeeping.
     async fn record_ingest_failure(&self, signal_type: &str, error: &OtelError) {
         let error_class = error.error_class();
+        // PostgreSQL diagnostics can include an entire failing row, including
+        // application log bodies and attributes. Keep those out of diagnostics.
+        let message = match error {
+            OtelError::Database(_) => format!("Native telemetry storage failed ({error_class})"),
+            _ => error.to_string(),
+        };
         if let Err(record_err) = self
             .storage
-            .record_ingest_error(signal_type, error_class, &error.to_string())
+            .record_ingest_error(signal_type, error_class, &message)
             .await
         {
             warn!(
@@ -731,7 +746,11 @@ impl OtelService {
                     .metrics_dropped
                     .fetch_add(count, Ordering::Relaxed);
                 self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
-                error!(count, error = %e, "Failed to store metrics");
+                error!(
+                    count,
+                    error_class = e.error_class(),
+                    "Failed to store metrics"
+                );
                 self.record_ingest_failure("metrics", &e).await;
                 Err(e)
             }
@@ -968,7 +987,11 @@ impl OtelService {
             Err(e) => {
                 self.stats.spans_dropped.fetch_add(count, Ordering::Relaxed);
                 self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
-                error!(count, error = %e, "Failed to store spans");
+                error!(
+                    count,
+                    error_class = e.error_class(),
+                    "Failed to store spans"
+                );
                 self.record_ingest_failure("spans", &e).await;
                 Err(e)
             }
@@ -997,6 +1020,14 @@ impl OtelService {
         require_confirmation: bool,
     ) -> Result<u64, OtelError> {
         let count = records.len() as u64;
+        let unidentified = records
+            .iter()
+            .filter(|record| {
+                !record
+                    .attributes
+                    .contains_key(crate::storage::receipts::SOURCE_KEY)
+            })
+            .count() as u64;
         self.stats.logs_received.fetch_add(count, Ordering::Relaxed);
 
         // Store EVERY record in the queryable DB (all severities), so the Logs
@@ -1028,7 +1059,11 @@ impl OtelService {
                     .logs_dropped
                     .fetch_add(db_count, Ordering::Relaxed);
                 self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
-                error!(db_count, error = %e, "Failed to store log records in DB");
+                error!(
+                    db_count,
+                    error_class = e.error_class(),
+                    "Failed to store log records in DB"
+                );
                 self.record_ingest_failure("logs", e).await;
             }
         }
@@ -1048,7 +1083,10 @@ impl OtelService {
 
         if require_confirmation {
             let stored = db_result?;
-            if stored != count {
+            // Atomic native storage may confirm fewer NEW rows when adapter
+            // identities already exist. Every unidentified record must still
+            // be confirmed; a partial anonymous write remains an error.
+            if stored < unidentified || stored > count {
                 return Err(OtelError::Validation {
                     message: format!("log storage confirmed {stored} of {count} records; batch may be partially stored"),
                 });
@@ -1239,7 +1277,17 @@ impl OtelService {
         Ok(())
     }
 
-    pub async fn query_logs(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError> {
+    pub async fn query_logs(&self, mut query: LogQuery) -> Result<Vec<LogRecord>, OtelError> {
+        if let Some(filter) = &query.attribute_filter {
+            filter.validate()?;
+            // Attribute comparisons are control-plane queries. Default to a
+            // bounded window unless correlation already selects one trace.
+            if query.start_time.is_none() && query.trace_id.is_none() {
+                query.start_time = Some(
+                    query.end_time.unwrap_or_else(chrono::Utc::now) - chrono::Duration::hours(24),
+                );
+            }
+        }
         self.storage.query_logs(query).await
     }
 
@@ -1375,6 +1423,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn confirmed_logs_use_native_retries_archival_and_failure_accounting() {
         let log = LogRecord {
+            attribute_types: Default::default(),
             project_id: 1,
             deployment_id: None,
             resource: ResourceInfo::default(),
@@ -2134,6 +2183,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
+            attribute_types: Default::default(),
             project_id: 1,
             deployment_id: None,
             resource: ResourceInfo::default(),
@@ -2675,6 +2725,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
+            attribute_types: Default::default(),
             project_id: 1,
             deployment_id: None,
             resource: ResourceInfo::default(),

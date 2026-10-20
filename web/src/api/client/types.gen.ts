@@ -2224,6 +2224,20 @@ export type ArchiveFlagResponse = {
 
 export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
 
+export type ArtifactAssembleRequest = {
+    checksum: string;
+    chunks: Array<string>;
+    dist?: string | null;
+    projects: Array<string>;
+    version?: string | null;
+};
+
+export type ArtifactAssembly = {
+    detail?: string | null;
+    missingChunks: Array<string>;
+    state: string;
+};
+
 /**
  * The formats local checks read. Adding one needs no migration or new check kind.
  */
@@ -3600,6 +3614,30 @@ export type CliDeviceStartResponse = {
 export type CliLoginRequest = {
     password: string;
     username: string;
+};
+
+export type ClientOutcome = {
+    bucket: string;
+    category: string;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    first_reported_at: string;
+    id: number;
+    last_received_at: string;
+    last_reported_at: string;
+    /**
+     * Decimal string avoids rounding large integer totals in JavaScript.
+     */
+    quantity: string;
+    reason: string;
+    unit: string;
+};
+
+export type ClientOutcomePage = {
+    approximate: boolean;
+    items: Array<ClientOutcome>;
+    retention_days: number;
+    total: number;
 };
 
 export type CloudAiCapability = {
@@ -10814,6 +10852,45 @@ export type FeatureMaturity = {
     reason: string;
 };
 
+export type FeedbackPage = {
+    items: Array<FeedbackView>;
+    total: number;
+};
+
+export type FeedbackQuery = {
+    page?: number | null;
+    page_size?: number | null;
+    status?: string | null;
+};
+
+export type FeedbackStatusRequest = {
+    status: string;
+};
+
+export type FeedbackView = {
+    associated_event_id?: string | null;
+    context: unknown;
+    deployment_id?: number | null;
+    email?: string | null;
+    environment?: string | null;
+    environment_id?: number | null;
+    error_group_id?: number | null;
+    id: number;
+    message: string;
+    name?: string | null;
+    project_id: number;
+    received_at: string;
+    release?: string | null;
+    replay_id?: string | null;
+    replay_session_id?: number | null;
+    replay_visitor_id?: number | null;
+    source: string;
+    source_id: string;
+    status: string;
+    timestamp: string;
+    url?: string | null;
+};
+
 export type FieldResponse = {
     /**
      * Field type (Int32, String, Timestamp, etc.)
@@ -13976,6 +14053,15 @@ export type ListEntitiesQuery = {
 export type ListErrorEventsQuery = {
     page?: number;
     page_size?: number;
+    /**
+     * Exact tag match; supply tag_value together with this field.
+     */
+    tag_key?: string | null;
+    tag_value?: string | null;
+    /**
+     * Exact native user ID match.
+     */
+    user_id?: string | null;
 };
 
 export type ListErrorGroupsQuery = {
@@ -14238,6 +14324,10 @@ export type LocationInfo = {
     region?: string | null;
 };
 
+export type LogAttributeOperator = 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte';
+
+export type LogAttributeType = 'string' | 'boolean' | 'integer' | 'double' | 'array' | 'object' | 'bytes';
+
 /**
  * Whether new container log lines are being collected right now. Separate
  * from `analytics` because the two fail independently: after a restart the
@@ -14305,6 +14395,12 @@ export type LogLevel = 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
  * A single log record ready for storage.
  */
 export type LogRecord = {
+    /**
+     * Declared native types for keys in `attributes`; absent on older records.
+     */
+    attribute_types?: {
+        [key: string]: LogAttributeType;
+    };
     attributes: {
         [key: string]: string;
     };
@@ -23879,12 +23975,19 @@ export type SourceMapListResponse = {
 export type SourceMapResponse = {
     checksum?: string | null;
     created_at: string;
+    debug_id?: string | null;
     dist?: string | null;
     file_path: string;
     id: number;
     project_id: number;
     release: string;
     size_bytes: number;
+};
+
+export type SourceMapUploadForm = {
+    dist?: string | null;
+    file: Blob | File;
+    file_path: string;
 };
 
 /**
@@ -24786,6 +24889,31 @@ export type TelemetryGapWindowResponse = {
     project_id: number;
     reason: TelemetryWriteIntervalReason;
     started_at: string;
+};
+
+export type TelemetryRelease = {
+    check_ins: number;
+    errors: number;
+    example_error_group_id?: number | null;
+    example_feedback_id?: number | null;
+    example_log_trace_id?: string | null;
+    example_metric_name?: string | null;
+    example_monitor_id?: number | null;
+    example_trace_id?: string | null;
+    feedback: number;
+    first_seen: string;
+    last_seen: string;
+    logs: number;
+    metric_points: number;
+    release: string;
+    spans: number;
+};
+
+export type TelemetryReleasePage = {
+    end_time: string;
+    items: Array<TelemetryRelease>;
+    start_time: string;
+    total: number;
 };
 
 /**
@@ -28602,26 +28730,67 @@ export type GetPlatformInfoResponses = {
 
 export type GetPlatformInfoResponse = GetPlatformInfoResponses[keyof GetPlatformInfoResponses];
 
+export type AssembleArtifactBundleData = {
+    body: ArtifactAssembleRequest;
+    path: {
+        org_slug: string;
+    };
+    query?: never;
+    url: '/0/organizations/{org_slug}/artifactbundle/assemble/';
+};
+
+export type AssembleArtifactBundleErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    429: unknown;
+};
+
+export type AssembleArtifactBundleResponses = {
+    200: ArtifactAssembly;
+};
+
+export type AssembleArtifactBundleResponse = AssembleArtifactBundleResponses[keyof AssembleArtifactBundleResponses];
+
 export type ChunkUploadOptionsData = {
     body?: never;
     path: {
-        /**
-         * Organization slug (ignored)
-         */
         org_slug: string;
     };
     query?: never;
     url: '/0/organizations/{org_slug}/chunk-upload/';
 };
 
+export type ChunkUploadOptionsErrors = {
+    401: unknown;
+    403: unknown;
+};
+
 export type ChunkUploadOptionsResponses = {
-    /**
-     * Chunk upload options
-     */
     200: SentryChunkUploadResponse;
 };
 
 export type ChunkUploadOptionsResponse = ChunkUploadOptionsResponses[keyof ChunkUploadOptionsResponses];
+
+export type UploadArtifactChunkData = {
+    body?: never;
+    path: {
+        org_slug: string;
+    };
+    query?: never;
+    url: '/0/organizations/{org_slug}/chunk-upload/';
+};
+
+export type UploadArtifactChunkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    429: unknown;
+};
+
+export type UploadArtifactChunkResponses = {
+    200: unknown;
+};
 
 export type CreateReleaseData = {
     body: SentryCreateReleaseRequest;
@@ -49982,6 +50151,22 @@ export type QueryLogsData = {
          */
         search?: string;
         /**
+         * Exact attribute key; pair with attribute_value
+         */
+        attribute_key?: string;
+        /**
+         * Exact string or numeric text, preserving int64 precision
+         */
+        attribute_value?: string;
+        /**
+         * Optional native declared type; older records without type metadata do not match
+         */
+        attribute_type?: LogAttributeType;
+        /**
+         * Default eq; numeric types also support lt/lte/gt/gte
+         */
+        attribute_op?: LogAttributeOperator;
+        /**
          * Filter by correlated trace ID
          */
         trace_id?: string;
@@ -50006,6 +50191,10 @@ export type QueryLogsData = {
 };
 
 export type QueryLogsErrors = {
+    /**
+     * Invalid log attribute filter
+     */
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
@@ -54916,6 +55105,43 @@ export type UpdateAutomaticDeployResponses = {
 
 export type UpdateAutomaticDeployResponse = UpdateAutomaticDeployResponses[keyof UpdateAutomaticDeployResponses];
 
+export type ListClientOutcomesData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Retained observation window, 1–31 days; default 7.
+         */
+        days?: number | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/client-outcomes';
+};
+
+export type ListClientOutcomesErrors = {
+    /**
+     * Invalid outcome query
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Project and telemetry permissions required
+     */
+    403: unknown;
+};
+
+export type ListClientOutcomesResponses = {
+    200: ClientOutcomePage;
+};
+
+export type ListClientOutcomesResponse = ListClientOutcomesResponses[keyof ListClientOutcomesResponses];
+
 export type ListCronMonitorsData = {
     body?: never;
     path: {
@@ -59122,11 +59348,24 @@ export type ListErrorEventsData = {
     query?: {
         page?: number;
         page_size?: number;
+        /**
+         * Exact native user ID match.
+         */
+        user_id?: string | null;
+        /**
+         * Exact tag match; supply tag_value together with this field.
+         */
+        tag_key?: string | null;
+        tag_value?: string | null;
     };
     url: '/projects/{project_id}/error-groups/{group_id}/events';
 };
 
 export type ListErrorEventsErrors = {
+    /**
+     * Invalid metadata filters
+     */
+    400: unknown;
     /**
      * Error group not found
      */
@@ -59840,6 +60079,119 @@ export type GetRemoteExternalImageResponses = {
 };
 
 export type GetRemoteExternalImageResponse = GetRemoteExternalImageResponses[keyof GetRemoteExternalImageResponses];
+
+export type ListProjectFeedbackData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        status?: string | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/feedback';
+};
+
+export type ListProjectFeedbackErrors = {
+    /**
+     * Invalid filter
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Project access required
+     */
+    403: unknown;
+};
+
+export type ListProjectFeedbackResponses = {
+    200: FeedbackPage;
+};
+
+export type ListProjectFeedbackResponse = ListProjectFeedbackResponses[keyof ListProjectFeedbackResponses];
+
+export type DeleteProjectFeedbackData = {
+    body?: never;
+    path: {
+        project_id: number;
+        feedback_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/feedback/{feedback_id}';
+};
+
+export type DeleteProjectFeedbackErrors = {
+    /**
+     * Feedback not found
+     */
+    404: unknown;
+};
+
+export type DeleteProjectFeedbackResponses = {
+    /**
+     * Feedback permanently deleted
+     */
+    204: void;
+};
+
+export type DeleteProjectFeedbackResponse = DeleteProjectFeedbackResponses[keyof DeleteProjectFeedbackResponses];
+
+export type GetProjectFeedbackData = {
+    body?: never;
+    path: {
+        project_id: number;
+        feedback_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/feedback/{feedback_id}';
+};
+
+export type GetProjectFeedbackErrors = {
+    /**
+     * Feedback not found
+     */
+    404: unknown;
+};
+
+export type GetProjectFeedbackResponses = {
+    200: FeedbackView;
+};
+
+export type GetProjectFeedbackResponse = GetProjectFeedbackResponses[keyof GetProjectFeedbackResponses];
+
+export type UpdateProjectFeedbackData = {
+    body: FeedbackStatusRequest;
+    path: {
+        project_id: number;
+        feedback_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/feedback/{feedback_id}';
+};
+
+export type UpdateProjectFeedbackErrors = {
+    /**
+     * Invalid status
+     */
+    400: unknown;
+    /**
+     * Feedback not found
+     */
+    404: unknown;
+};
+
+export type UpdateProjectFeedbackResponses = {
+    /**
+     * Feedback status updated
+     */
+    204: void;
+};
+
+export type UpdateProjectFeedbackResponse = UpdateProjectFeedbackResponses[keyof UpdateProjectFeedbackResponses];
 
 export type ListFlagsData = {
     body?: never;
@@ -61885,7 +62237,7 @@ export type ListSourceMapsResponses = {
 export type ListSourceMapsResponse = ListSourceMapsResponses[keyof ListSourceMapsResponses];
 
 export type UploadSourceMapData = {
-    body?: never;
+    body: SourceMapUploadForm;
     path: {
         /**
          * Project ID
@@ -63028,6 +63380,47 @@ export type GetStatusOverviewResponses = {
 };
 
 export type GetStatusOverviewResponse = GetStatusOverviewResponses[keyof GetStatusOverviewResponses];
+
+export type ListTelemetryReleasesData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Exact SDK release identity; absent lists observed releases.
+         */
+        release?: string | null;
+        /**
+         * Retained observation window, 1–31 days; default 7.
+         */
+        days?: number | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/telemetry-releases';
+};
+
+export type ListTelemetryReleasesErrors = {
+    /**
+     * Invalid release query
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Project and telemetry permissions required
+     */
+    403: unknown;
+};
+
+export type ListTelemetryReleasesResponses = {
+    200: TelemetryReleasePage;
+};
+
+export type ListTelemetryReleasesResponse = ListTelemetryReleasesResponses[keyof ListTelemetryReleasesResponses];
 
 export type GetUniqueCountsData = {
     body?: never;
@@ -70661,6 +71054,50 @@ export type IngestSentryEnvelopeResponses = {
     /**
      * Envelope ingested
      */
+    200: unknown;
+};
+
+export type IngestNelReportsData = {
+    body: string;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/{project_id}/nel/';
+};
+
+export type IngestNelReportsErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    415: unknown;
+    429: unknown;
+};
+
+export type IngestNelReportsResponses = {
+    200: unknown;
+};
+
+export type IngestSecurityReportsData = {
+    body: string;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/{project_id}/security/';
+};
+
+export type IngestSecurityReportsErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    415: unknown;
+    429: unknown;
+};
+
+export type IngestSecurityReportsResponses = {
     200: unknown;
 };
 

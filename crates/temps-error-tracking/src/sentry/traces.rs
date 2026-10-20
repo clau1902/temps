@@ -22,6 +22,8 @@ struct Trace {
     op: Option<String>,
     description: Option<String>,
     status: Option<String>,
+    origin: Option<String>,
+    links: Option<Value>,
     #[serde(default)]
     data: BTreeMap<String, Value>,
 }
@@ -100,7 +102,7 @@ fn attributes(values: BTreeMap<String, Value>) -> Result<BTreeMap<String, String
 }
 
 fn map(
-    trace: Trace,
+    mut trace: Trace,
     start: &RawValue,
     end: &RawValue,
     name: Option<String>,
@@ -116,6 +118,36 @@ fn map(
             .is_some_and(|id| !logs::valid_id(id, 16))
     {
         return Err(invalid());
+    }
+    // Python SDK 2.42.1 serializes a child span's status as tags.status;
+    // context/root status and explicit top-level status keep precedence.
+    if trace.status.is_none() {
+        trace.status = tags
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|status| {
+                matches!(
+                    *status,
+                    "ok" | "unknown"
+                        | "unknown_error"
+                        | "cancelled"
+                        | "invalid_argument"
+                        | "deadline_exceeded"
+                        | "not_found"
+                        | "already_exists"
+                        | "permission_denied"
+                        | "resource_exhausted"
+                        | "failed_precondition"
+                        | "aborted"
+                        | "out_of_range"
+                        | "unimplemented"
+                        | "internal_error"
+                        | "unavailable"
+                        | "data_loss"
+                        | "unauthenticated"
+                )
+            })
+            .map(str::to_owned);
     }
     let start_time = time(start)?;
     let end_time = time(end)?;
@@ -145,6 +177,13 @@ fn map(
         return Err(invalid());
     }
     let mut attributes = attributes(trace.data)?;
+    if let Some(links) = trace.links {
+        let values = links.as_array().ok_or_else(invalid)?;
+        if values.len() > 128 || links.to_string().len() > 32 * 1024 {
+            return Err(invalid());
+        }
+        attributes.insert("temps.sentry.links".into(), links.to_string());
+    }
     // The native map is flat; retain data before a tag with the same name
     // wins the searchable key. Tags retain their source representation too.
     let source_tags = serde_json::to_string(&tags).map_err(|_| invalid())?;
@@ -167,17 +206,20 @@ fn map(
         _ => SpanStatusCode::Error,
     };
     let status_message = trace.status.unwrap_or_default();
-    let kind = match attributes
-        .get("sentry.kind")
-        .and_then(|s| s.parse::<u8>().ok())
-    {
-        Some(1) => SpanKind::Internal,
-        Some(2) => SpanKind::Server,
-        Some(3) => SpanKind::Client,
-        Some(4) => SpanKind::Producer,
-        Some(5) => SpanKind::Consumer,
+    let kind = match attributes.get("sentry.kind").map(String::as_str) {
+        Some("1" | "internal") => SpanKind::Internal,
+        Some("2" | "server") => SpanKind::Server,
+        Some("3" | "client") => SpanKind::Client,
+        Some("4" | "producer") => SpanKind::Producer,
+        Some("5" | "consumer") => SpanKind::Consumer,
         _ => SpanKind::Unspecified,
     };
+    if let Some(origin) = trace.origin {
+        if origin.len() > 256 || origin.contains('\0') {
+            return Err(invalid());
+        }
+        attributes.insert("sentry.origin".into(), origin);
+    }
     if let Some(op) = trace.op {
         if op.len() > 256 || op.contains('\0') {
             return Err(invalid());
@@ -304,6 +346,7 @@ struct StreamedSpan<'a> {
     parent_span_id: Option<String>,
     status: Option<String>,
     is_segment: Option<bool>,
+    links: Option<Value>,
     #[serde(borrow)]
     start_timestamp: &'a RawValue,
     #[serde(borrow)]
@@ -324,15 +367,10 @@ pub fn streamed(
         return Err(invalid());
     }
     let batch: logs::Batch<'_> = serde_json::from_slice(payload).map_err(|_| invalid())?;
-    if batch.version != Some(2)
-        || header.item_count != Some(batch.items.len())
-        || batch.ingest_settings.is_some_and(|s| {
-            s.infer_ip.is_some_and(|v| v != "never")
-                || s.infer_user_agent.is_some_and(|v| v != "never")
-        })
-    {
+    if batch.version != Some(2) || header.item_count != Some(batch.items.len()) {
         return Err(invalid());
     }
+    super::inference::validate(batch.ingest_settings.as_ref())?;
     let mut records = Vec::with_capacity(batch.items.len());
     for raw in batch.items {
         let span: StreamedSpan<'_> = serde_json::from_str(raw.get()).map_err(|_| invalid())?;
@@ -353,7 +391,12 @@ pub fn streamed(
             op: attrs.get("sentry.op").cloned(),
             description: None,
             status: span.status,
-            data: BTreeMap::new(),
+            origin: attrs.get("sentry.origin").cloned(),
+            links: span.links,
+            data: attrs
+                .get("sentry.kind")
+                .map(|kind| BTreeMap::from([("sentry.kind".into(), Value::String(kind.clone()))]))
+                .unwrap_or_default(),
         };
         let mut record = map(
             trace,
@@ -370,6 +413,11 @@ pub fn streamed(
         );
         if let Some(segment) = span.is_segment {
             attrs.insert("temps.sentry.is_segment".into(), segment.to_string());
+        }
+        if record.status_code == SpanStatusCode::Error {
+            if let Some(message) = attrs.get("sentry.status_message") {
+                record.status_message = message.clone();
+            }
         }
         record.attributes.extend(attrs);
         records.push(record);
@@ -390,6 +438,28 @@ mod tests {
     }
     fn payload() -> Value {
         serde_json::json!({"transaction":"Synthetic root","start_timestamp":1790000000.1234567,"timestamp":1790000001.25,"release":"synthetic-release","environment":"test","contexts":{"trace":{"trace_id":"11111111111111111111111111111111","span_id":"2222222222222222","op":"http.server","status":"ok"}},"spans":[{"trace_id":"11111111111111111111111111111111","span_id":"3333333333333333","parent_span_id":"2222222222222222","start_timestamp":1790000000.5,"timestamp":1790000001.0,"description":"Synthetic child","data":{"count":7},"status":"internal_error"}]})
+    }
+    #[test]
+    fn legacy_python_child_status_and_span_origins_are_preserved() {
+        let mut event = payload();
+        event["contexts"]["trace"]["origin"] = serde_json::json!("manual");
+        event["spans"][0].as_object_mut().unwrap().remove("status");
+        event["spans"][0]["tags"] = serde_json::json!({"status":"internal_error"});
+        let records = transaction(&serde_json::to_vec(&event).unwrap(), &auth()).unwrap();
+        assert_eq!(records[0].attributes["sentry.origin"], "manual");
+        assert_eq!(records[1].status_code, SpanStatusCode::Error);
+        assert_eq!(records[1].status_message, "internal_error");
+        event["spans"][0]["status"] = serde_json::json!("ok");
+        assert_eq!(
+            transaction(&serde_json::to_vec(&event).unwrap(), &auth()).unwrap()[1].status_code,
+            SpanStatusCode::Ok
+        );
+        event["spans"][0].as_object_mut().unwrap().remove("status");
+        event["spans"][0]["tags"]["status"] = serde_json::json!("custom tag");
+        assert_eq!(
+            transaction(&serde_json::to_vec(&event).unwrap(), &auth()).unwrap()[1].status_code,
+            SpanStatusCode::Unset
+        );
     }
     #[test]
     fn transactions_preserve_tree_resource_status_and_scope() {
@@ -425,11 +495,15 @@ mod tests {
     #[test]
     fn modern_streamed_spans_preserve_typed_attributes_and_validate_batch_contract() {
         let header=serde_json::from_value(serde_json::json!({"type":"span","item_count":1,"content_type":"application/vnd.sentry.items.span.v2+json"})).unwrap();
-        let mut payload = serde_json::json!({"version":2,"items":[{"name":"Synthetic streamed span","trace_id":"11111111111111111111111111111111","span_id":"2222222222222222","start_timestamp":1790000000,"end_timestamp":1790000001,"is_segment":true,"attributes":{"sentry.sdk.integrations":{"type":"array","value":["SpanStreaming"]},"flag":{"type":"boolean","value":true},"sentry.release":{"type":"string","value":"synthetic-release"}}}]});
+        let mut payload = serde_json::json!({"version":2,"items":[{"name":"Synthetic streamed span","trace_id":"11111111111111111111111111111111","span_id":"2222222222222222","start_timestamp":1790000000,"end_timestamp":1790000001,"is_segment":true,"status":"error","links":[{"trace_id":"33333333333333333333333333333333","span_id":"4444444444444444"}],"attributes":{"sentry.kind":{"type":"integer","value":2},"sentry.status_message":{"type":"string","value":"deadline_exceeded"},"sentry.sdk.integrations":{"type":"array","value":["SpanStreaming"]},"flag":{"type":"boolean","value":true},"sentry.release":{"type":"string","value":"synthetic-release"}}}]});
         let span = streamed(&header, &serde_json::to_vec(&payload).unwrap(), &auth())
             .unwrap()
             .remove(0);
         assert_eq!(span.attributes["flag"], "true");
+        assert_eq!(span.kind, SpanKind::Server);
+        assert_eq!(span.status_code, SpanStatusCode::Error);
+        assert_eq!(span.status_message, "deadline_exceeded");
+        assert!(span.attributes["temps.sentry.links"].contains("4444444444444444"));
         assert_eq!(
             span.resource.service_version.as_deref(),
             Some("synthetic-release")

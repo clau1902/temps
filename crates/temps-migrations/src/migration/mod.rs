@@ -15,6 +15,13 @@ pub mod m20261002_000001_secret_checks_and_history;
 mod m20261019_000001_cron_monitors;
 pub mod m20261019_000002_reconcile_error_group_counts;
 mod m20261019_000003_cron_monitor_management;
+mod m20261019_000004_error_event_source_keys;
+mod m20261020_000001_project_feedback;
+mod m20261020_000002_log_attribute_types;
+mod m20261020_000003_debug_id_artifacts;
+mod m20261020_000004_client_outcomes;
+mod m20261020_000005_client_outcome_receipts;
+mod m20261020_000006_otel_ingest_receipts;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -711,6 +718,13 @@ impl MigratorTrait for Migrator {
             Box::new(m20261019_000001_cron_monitors::Migration),
             Box::new(m20261019_000002_reconcile_error_group_counts::Migration),
             Box::new(m20261019_000003_cron_monitor_management::Migration),
+            Box::new(m20261019_000004_error_event_source_keys::Migration),
+            Box::new(m20261020_000001_project_feedback::Migration),
+            Box::new(m20261020_000002_log_attribute_types::Migration),
+            Box::new(m20261020_000003_debug_id_artifacts::Migration),
+            Box::new(m20261020_000004_client_outcomes::Migration),
+            Box::new(m20261020_000005_client_outcome_receipts::Migration),
+            Box::new(m20261020_000006_otel_ingest_receipts::Migration),
         ]
     }
 }

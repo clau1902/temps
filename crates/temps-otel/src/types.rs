@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
+pub use crate::log_attributes::{LogAttributeFilter, LogAttributeOperator, LogAttributeType};
+
 /// Resource attributes extracted from OTel resource descriptors.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResourceInfo {
@@ -505,6 +507,9 @@ pub struct LogRecord {
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
     pub attributes: BTreeMap<String, String>,
+    /// Declared native types for keys in `attributes`; absent on older records.
+    #[serde(default)]
+    pub attribute_types: BTreeMap<String, LogAttributeType>,
 }
 
 // ── Insights / Anomalies ────────────────────────────────────────────
@@ -1367,6 +1372,8 @@ pub struct LogQuery {
     pub end_time: Option<DateTime<Utc>>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    #[serde(default)]
+    pub attribute_filter: Option<LogAttributeFilter>,
 }
 
 /// An explicit-bucket histogram aggregated over a time bucket.

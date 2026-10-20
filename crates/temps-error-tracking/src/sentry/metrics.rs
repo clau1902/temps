@@ -50,13 +50,10 @@ pub fn decode(
     let batch: logs::Batch<'_> = serde_json::from_slice(payload).map_err(|_| invalid())?;
     if header.item_count != Some(batch.items.len())
         || batch.version.is_some_and(|v| v != 1 && v != 2)
-        || batch.ingest_settings.is_some_and(|s| {
-            s.infer_ip.is_some_and(|v| v != "never")
-                || s.infer_user_agent.is_some_and(|v| v != "never")
-        })
     {
         return Err(invalid());
     }
+    super::inference::validate(batch.ingest_settings.as_ref())?;
     let mut points = Vec::with_capacity(batch.items.len());
     for raw in batch.items {
         let metric: Metric<'_> = serde_json::from_str(raw.get()).map_err(|_| invalid())?;

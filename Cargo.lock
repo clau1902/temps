@@ -13544,6 +13544,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serial_test",
+ "sha1_smol",
  "sha2 0.11.0",
  "sourcemap",
  "temps-analytics-session-replay",
@@ -13570,6 +13571,7 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
+ "zip",
 ]
 
 [[package]]

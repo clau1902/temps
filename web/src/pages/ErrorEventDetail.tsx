@@ -5,6 +5,7 @@ import { HighlightedCode } from '@/components/ui/code-block'
 import { ProjectResponse } from '@/api/client'
 import { getErrorEventOptions } from '@/api/client/@tanstack/react-query.gen'
 import { SentryEventDetail } from '@/components/error-tracking/SentryEventDetail'
+import { CspReportDetails } from '@/components/error-tracking/CspReportDetails'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -20,7 +21,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
-import { extractSentryEvent } from '@/lib/sentry-utils'
+import { extractSentryEvent, sentryExceptions } from '@/lib/sentry-utils'
+import { readCspReport } from '@/lib/csp-report'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
@@ -60,10 +62,14 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
   })
 
   const sentryEvent = event ? extractSentryEvent(event.data) : null
+  const isCsp = Boolean(readCspReport(event?.data))
+  const primaryException = sentryEvent
+    ? sentryExceptions(sentryEvent).slice(-1)[0]
+    : undefined
 
   usePageTitle(
     sentryEvent
-      ? `Event: ${sentryEvent.sentry.exception?.values?.[0]?.type || 'Event'}`
+      ? `Event: ${primaryException?.type || 'Event'}`
       : 'Event Details'
   )
 
@@ -189,9 +195,11 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
                 {sentryEvent?.sentry?.level || 'error'}
               </Badge>
               <h1 className="text-2xl font-semibold">
-                {sentryEvent?.sentry?.exception?.values?.[0]?.value ||
+                {primaryException?.value ||
                   sentryEvent?.sentry?.logentry?.formatted ||
-                  'Event Details'}
+                  (isCsp
+                    ? 'Content Security Policy violation'
+                    : 'Event Details')}
               </h1>
             </div>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -210,6 +218,7 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
+      <CspReportDetails data={event.data} />
       {/* Event Content */}
       {sentryEvent ? (
         <SentryEventDetail

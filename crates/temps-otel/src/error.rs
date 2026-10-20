@@ -129,6 +129,8 @@ pub enum OtelError {
 /// or any other unbounded value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageErrorKind {
+    /// Bounded adapter retry receipts are full; transaction was aborted.
+    AdapterCapacity,
     /// ClickHouse transport failure — socket error, connection refused/reset.
     ClickHouseNetwork,
     /// ClickHouse request exceeded its deadline.
@@ -216,7 +218,8 @@ impl StorageErrorKind {
     pub fn is_transient(&self) -> bool {
         match self {
             // Idempotent destination (ReplacingMergeTree): safe to re-send.
-            StorageErrorKind::ClickHouseNetwork
+            StorageErrorKind::AdapterCapacity
+            | StorageErrorKind::ClickHouseNetwork
             | StorageErrorKind::ClickHouseTimeout
             | StorageErrorKind::ClickHouseOther => true,
             // Non-idempotent destination, but the batch provably never left us.
@@ -238,6 +241,7 @@ impl StorageErrorKind {
     /// format: renaming one splits an existing group in two.
     pub fn as_class(&self) -> &'static str {
         match self {
+            StorageErrorKind::AdapterCapacity => "adapter_capacity",
             StorageErrorKind::ClickHouseNetwork => "clickhouse_network",
             StorageErrorKind::ClickHouseTimeout => "clickhouse_timeout",
             StorageErrorKind::ClickHouseSchema => "clickhouse_schema",

@@ -40,6 +40,8 @@ thiserror = { workspace = true }
 axum = { workspace = true }
 axum-macros = { workspace = true }
 sha2 = { workspace = true }
+sha1_smol = "1.0.1"
+zip = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }

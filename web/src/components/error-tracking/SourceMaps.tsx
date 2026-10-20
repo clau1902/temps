@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { HighlightedCode } from '@/components/ui/code-block'
 
-import type { ProjectResponse, SourceMapResponse } from '@/api/client'
+import {
+  uploadSourceMap,
+  type ProjectResponse,
+  type SourceMapResponse,
+} from '@/api/client'
 import {
   deleteReleaseSourceMapsMutation,
   deleteSourceMapMutation,
@@ -37,9 +41,9 @@ import {
 import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
+import { Callout } from '@temps-sdk/ds'
 
-// --- API function for multipart upload (generated client can't handle multipart) ---
-
+// Multipart request fields come from the native OpenAPI schema.
 async function uploadSourceMapFile(
   projectId: number,
   release: string,
@@ -47,26 +51,12 @@ async function uploadSourceMapFile(
   filePath: string,
   dist?: string
 ): Promise<SourceMapResponse> {
-  const formData = new FormData()
-  formData.append('file', file)
-  formData.append('file_path', filePath)
-  if (dist) formData.append('dist', dist)
-
-  const response = await fetch(
-    `/api/projects/${projectId}/releases/${encodeURIComponent(release)}/source-maps`,
-    {
-      method: 'POST',
-      body: formData,
-      credentials: 'include',
-    }
-  )
-
-  if (!response.ok) {
-    const text = await response.text()
-    throw new Error(text || 'Failed to upload source map')
-  }
-
-  return response.json()
+  const response = await uploadSourceMap({
+    path: { project_id: projectId, release },
+    body: { file, file_path: filePath, dist },
+    throwOnError: true,
+  })
+  return response.data
 }
 
 // --- Helper functions ---
@@ -100,7 +90,12 @@ export function SourceMaps({ project }: SourceMapsProps) {
   const releasesQueryOpts = listReleasesOptions({
     path: { project_id: project.id },
   })
-  const { data: releasesData, isLoading: isLoadingReleases } = useQuery({
+  const {
+    data: releasesData,
+    isLoading: isLoadingReleases,
+    isError: releasesFailed,
+    refetch: refetchReleases,
+  } = useQuery({
     ...releasesQueryOpts,
   })
 
@@ -108,7 +103,12 @@ export function SourceMaps({ project }: SourceMapsProps) {
   const mapsQueryOpts = listSourceMapsOptions({
     path: { project_id: project.id, release: selectedRelease ?? '' },
   })
-  const { data: mapsData, isLoading: isLoadingMaps } = useQuery({
+  const {
+    data: mapsData,
+    isLoading: isLoadingMaps,
+    isError: mapsFailed,
+    refetch: refetchMaps,
+  } = useQuery({
     ...mapsQueryOpts,
     enabled: !!selectedRelease,
   })
@@ -170,9 +170,8 @@ export function SourceMaps({ project }: SourceMapsProps) {
   return (
     <div className="space-y-6">
       {/* Header with upload button */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h3 className="text-lg font-semibold">Source Maps</h3>
           <p className="text-sm text-muted-foreground">
             Upload source maps to get readable stack traces in error reports.
             Source maps are automatically captured during deployments.
@@ -189,34 +188,23 @@ export function SourceMaps({ project }: SourceMapsProps) {
         </Button>
       </div>
 
-      {/* CLI instructions */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">Upload via sentry-cli</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2">
-            <p className="text-sm text-muted-foreground">
-              You can use the standard{' '}
-              <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                sentry-cli
-              </code>{' '}
-              to upload source maps. Use your DSN public key as the auth token:
-            </p>
-            <div className="flex items-center gap-2">
-              <HighlightedCode
-                language="bash"
-                code={`SENTRY_URL=${window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_DSN_KEY --org temps --project ${project.slug} ./dist`}
-                className="text-xs bg-muted px-3 py-2 rounded font-mono flex-1 block"
-              />
-              <CopyButton
-                value={`SENTRY_URL=${window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_DSN_KEY --org temps --project ${project.slug} ./dist`}
-                className="h-8 w-8 p-0 hover:bg-accent hover:text-accent-foreground rounded-md shrink-0"
-              />
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+      {(releasesFailed || (selectedRelease && mapsFailed)) && (
+        <Callout tone="error" title="Could not load source maps">
+          <p>
+            The source-map query failed. Your existing artifacts have not been
+            removed.
+          </p>
+          <Button
+            variant="outline"
+            onClick={() => {
+              void refetchReleases()
+              if (selectedRelease) void refetchMaps()
+            }}
+          >
+            Retry
+          </Button>
+        </Callout>
+      )}
 
       {/* Releases list */}
       {isLoadingReleases ? (
@@ -246,6 +234,7 @@ export function SourceMaps({ project }: SourceMapsProps) {
                 selectedRelease === release ? mapsData?.source_maps : undefined
               }
               isLoadingMaps={selectedRelease === release && isLoadingMaps}
+              mapsFailed={selectedRelease === release && mapsFailed}
               onDeleteFile={(id, name) =>
                 setDeleteConfirm({
                   type: 'file',
@@ -257,6 +246,42 @@ export function SourceMaps({ project }: SourceMapsProps) {
           ))}
         </div>
       )}
+
+      {/* CLI instructions */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm">Upload via sentry-cli</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2">
+            <p className="text-sm text-muted-foreground">
+              You can use the standard{' '}
+              <code className="text-xs bg-muted px-1 py-0.5 rounded">
+                sentry-cli
+              </code>{' '}
+              to inject Debug IDs and upload artifact bundles. Use a full-access
+              project deployment token from project settings:
+            </p>
+            <a
+              className="text-sm underline"
+              href={`/projects/${project.slug}/errors/source-maps/credentials`}
+            >
+              Manage build tokens
+            </a>
+            <div className="flex min-w-0 items-center gap-2">
+              <HighlightedCode
+                language="bash"
+                code={`sentry-cli sourcemaps inject ./dist\nSENTRY_URL=${window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_BUILD_TOKEN --org temps --project ${project.slug} ./dist`}
+                className="text-xs bg-muted px-3 py-2 rounded font-mono flex-1 min-w-0 overflow-x-auto block"
+              />
+              <CopyButton
+                value={`sentry-cli sourcemaps inject ./dist\nSENTRY_URL=${window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_BUILD_TOKEN --org temps --project ${project.slug} ./dist`}
+                className="h-8 w-8 p-0 hover:bg-accent hover:text-accent-foreground rounded-md shrink-0"
+              />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Upload dialog */}
       <UploadDialog
@@ -333,6 +358,7 @@ interface ReleaseCardProps {
   onDelete: () => void
   maps?: SourceMapResponse[]
   isLoadingMaps: boolean
+  mapsFailed: boolean
   onDeleteFile: (id: number, name: string) => void
 }
 
@@ -343,6 +369,7 @@ function ReleaseCard({
   onDelete,
   maps,
   isLoadingMaps,
+  mapsFailed,
   onDeleteFile,
 }: ReleaseCardProps) {
   const shortRelease =
@@ -350,12 +377,14 @@ function ReleaseCard({
 
   return (
     <Card>
-      <button
-        type="button"
-        className="flex items-center justify-between px-4 py-3 cursor-pointer hover:bg-muted/50 transition-colors w-full text-left"
-        onClick={onSelect}
-      >
-        <div className="flex items-center gap-3">
+      <div className="flex items-center justify-between gap-2 px-4 py-3">
+        <button
+          type="button"
+          aria-label={`Show source maps for ${release}`}
+          aria-expanded={isSelected}
+          onClick={onSelect}
+          className="flex min-w-0 flex-1 items-center gap-3 text-left hover:underline"
+        >
           <ChevronRight
             className={`h-4 w-4 text-muted-foreground transition-transform ${
               isSelected ? 'rotate-90' : ''
@@ -366,16 +395,16 @@ function ReleaseCard({
               <span className="font-mono text-sm font-medium">
                 {shortRelease}
               </span>
-              {release !== shortRelease && (
-                <CopyButton
-                  value={release}
-                  className="h-6 w-6 p-0 hover:bg-accent rounded-md"
-                />
-              )}
             </div>
           </div>
-        </div>
+        </button>
         <div className="flex items-center gap-2">
+          {release !== shortRelease && (
+            <CopyButton
+              value={release}
+              className="h-6 w-6 p-0 hover:bg-accent rounded-md"
+            />
+          )}
           {maps && (
             <Badge variant="secondary">
               {maps.length} file{maps.length !== 1 ? 's' : ''}
@@ -395,7 +424,7 @@ function ReleaseCard({
             <Trash2 className="h-4 w-4" />
           </Button>
         </div>
-      </button>
+      </div>
 
       {isSelected && (
         <CardContent className="pt-0 pb-4">
@@ -405,6 +434,10 @@ function ReleaseCard({
                 <Skeleton key={key} className="h-10" />
               ))}
             </div>
+          ) : mapsFailed ? (
+            <p role="alert" className="text-sm text-muted-foreground py-2">
+              Source maps could not be loaded. Retry the query above.
+            </p>
           ) : maps && maps.length > 0 ? (
             <div className="divide-y">
               {maps.map((map) => (
@@ -441,6 +474,14 @@ function SourceMapFileRow({ map, onDelete }: SourceMapFileRowProps) {
         <span className="font-mono text-sm truncate" title={map.file_path}>
           {map.file_path}
         </span>
+        {map.debug_id && (
+          <span
+            className="font-mono text-xs text-muted-foreground truncate"
+            title={`Debug ID: ${map.debug_id}`}
+          >
+            Debug ID: {map.debug_id}
+          </span>
+        )}
         <Badge variant="outline" className="text-xs shrink-0">
           {formatBytes(map.size_bytes)}
         </Badge>

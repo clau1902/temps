@@ -50,8 +50,44 @@ fn extract_trace_id_from_data(data: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn primary_exception(data: &CreateErrorEventData) -> Option<&super::types::ExceptionData> {
+    if data.source.as_deref() == Some("sentry") {
+        data.exceptions.last()
+    } else {
+        data.exceptions.first()
+    }
+}
+
+fn sdk_fingerprint(data: &CreateErrorEventData) -> Option<Vec<&str>> {
+    if data.source.as_deref() != Some("sentry") {
+        return None;
+    }
+    let values = data
+        .raw_sentry_event
+        .as_ref()?
+        .get("fingerprint")?
+        .as_array()?;
+    if values.is_empty() {
+        return None;
+    }
+    values.iter().map(|v| v.as_str()).collect()
+}
+
+fn default_placeholder(value: &str) -> bool {
+    matches!(value, "{{ default }}" | "{{default}}")
+}
+
+fn sdk_event_id(data: &CreateErrorEventData) -> Option<String> {
+    if data.source.as_deref() != Some("sentry") {
+        return None;
+    }
+    let id = data.raw_sentry_event.as_ref()?.get("event_id")?.as_str()?;
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) && id.bytes().any(|b| b != b'0'))
+        .then(|| id.to_ascii_lowercase())
+}
+
 /// The exception type and message a group is created from, from the first
-/// exception or else the legacy top-level fields. When the message is
+/// exception (last for Sentry chains) or else the legacy top-level fields. When the message is
 /// missing (most `captureMessage` payloads and Sentry SDKs that send only an
 /// event-level message), probe the raw event for a usable one so the title
 /// doesn't render as the useless literal "Error: Unknown error".
@@ -60,7 +96,7 @@ fn extract_trace_id_from_data(data: &serde_json::Value) -> Option<String> {
 /// incoming event is compared against what each group was embedded from.
 fn group_type_and_message(error_data: &CreateErrorEventData) -> (String, Option<String>) {
     let raw_message = || extract_message_from_raw(error_data.raw_sentry_event.as_ref());
-    match error_data.exceptions.first() {
+    match primary_exception(error_data) {
         Some(first_exception) => (
             first_exception.exception_type.clone(),
             first_exception
@@ -122,6 +158,7 @@ pub(super) struct IngestedError {
     pub group_id: i32,
     pub created: bool,
     pub previous_status: String,
+    pub inserted: bool,
 }
 
 fn is_transaction_abort(error: &ErrorTrackingError) -> bool {
@@ -214,6 +251,54 @@ impl ErrorIngestionService {
     ) -> Result<IngestedError, ErrorTrackingError> {
         let event_time = Utc::now();
         let tx = self.db.begin().await?;
+        let source_id = sdk_event_id(error_data);
+        if let Some(id) = &source_id {
+            tx.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,$2))",
+                [
+                    format!("sentry-event:{id}").into(),
+                    i64::from(error_data.project_id).into(),
+                ],
+            ))
+            .await?;
+            let cached=tx.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "SELECT error_group_id,environment_id,deployment_id,error_event_id,received_at FROM error_event_source_keys WHERE project_id=$1 AND sdk_event_id=$2 AND received_at >= NOW() - INTERVAL '7 days'",
+                [error_data.project_id.into(),id.clone().into()])).await?;
+            let needs_cache = cached.is_none();
+            let previous=match cached {
+                Some(row)=>Some(row),
+                None=>tx.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                    "SELECT error_group_id,environment_id,deployment_id,id AS error_event_id,timestamp AS received_at FROM error_events WHERE project_id=$1 AND data #>> '{sentry,event_id}'=$2 AND timestamp >= NOW() - INTERVAL '7 days' ORDER BY timestamp,id LIMIT 1",
+                    [error_data.project_id.into(),id.clone().into()])).await?,
+            };
+            if let Some(row) = previous {
+                let environment: Option<i32> = row.try_get("", "environment_id")?;
+                let deployment: Option<i32> = row.try_get("", "deployment_id")?;
+                if environment != error_data.environment_id
+                    || deployment != error_data.deployment_id
+                {
+                    return Err(ErrorTrackingError::Validation(
+                        "Sentry event identity conflicts with its authenticated scope".into(),
+                    ));
+                }
+                let group_id: i32 = row.try_get("", "error_group_id")?;
+                if needs_cache {
+                    let record_id: i64 = row.try_get("", "error_event_id")?;
+                    let received_at: DateTime<Utc> = row.try_get("", "received_at")?;
+                    tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                        "INSERT INTO error_event_source_keys(project_id,sdk_event_id,environment_id,deployment_id,error_group_id,error_event_id,received_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+                        [error_data.project_id.into(),id.clone().into(),environment.into(),deployment.into(),group_id.into(),record_id.into(),received_at.into()])).await?;
+                }
+                tx.commit().await?;
+                return Ok(IngestedError {
+                    group_id,
+                    created: false,
+                    previous_status: String::new(),
+                    inserted: false,
+                });
+            }
+        }
         // Acquire the cold-chunk gate BEFORE group/FK writes. Timescale clones
         // child FKs during chunk creation and needs parent table locks.
         let refresh_chunk = self.enter_chunk_gate(&tx, event_time).await?;
@@ -235,7 +320,9 @@ impl ErrorIngestionService {
         } else {
             let (exception_type, exception_value) = group_type_and_message(error_data);
             let text = exception_value.unwrap_or_else(|| exception_type.clone());
-            let similar = if let Some(embedding) = self.create_embedding(&text) {
+            let similar = if error_data.source.as_deref() == Some("sentry") {
+                None
+            } else if let Some(embedding) = self.create_embedding(&text) {
                 self.find_similar_group_by_embedding_on(
                     &tx,
                     &embedding,
@@ -267,8 +354,14 @@ impl ErrorIngestionService {
         tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "INSERT INTO error_group_fingerprints(project_id,fingerprint_hash,error_group_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
             [error_data.project_id.into(),fingerprint.into(),group_id.into()])).await?;
-        self.create_error_event_on(&tx, error_data, group_id, fingerprint, event_time)
+        let event_id = self
+            .create_error_event_on(&tx, error_data, group_id, fingerprint, event_time)
             .await?;
+        if let Some(id) = source_id {
+            tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO error_event_source_keys(project_id,sdk_event_id,environment_id,deployment_id,error_group_id,error_event_id,received_at) VALUES($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT(project_id,sdk_event_id) DO UPDATE SET environment_id=EXCLUDED.environment_id,deployment_id=EXCLUDED.deployment_id,error_group_id=EXCLUDED.error_group_id,error_event_id=EXCLUDED.error_event_id,received_at=EXCLUDED.received_at",
+                [error_data.project_id.into(),id.into(),error_data.environment_id.into(),error_data.deployment_id.into(),group_id.into(),event_id.into()])).await?;
+        }
         tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "UPDATE error_groups SET total_count = total_count + 1, last_seen = GREATEST(last_seen, $2), updated_at = NOW(), status = CASE WHEN status IN ('resolved','ignored') THEN 'unresolved' ELSE status END WHERE id = $1",
             [group_id.into(),event_time.into()])).await?;
@@ -285,6 +378,7 @@ impl ErrorIngestionService {
             group_id,
             created,
             previous_status,
+            inserted: true,
         })
     }
 
@@ -323,11 +417,17 @@ impl ErrorIngestionService {
         Ok(true)
     }
 
+    /// Bounded indexed cleanup; a quiet instance performs no payload scans.
+    pub async fn cleanup_source_keys(&self) -> Result<u64, ErrorTrackingError> {
+        Ok(self.db.execute(Statement::from_string(DatabaseBackend::Postgres,
+            "DELETE FROM error_event_source_keys WHERE (project_id,sdk_event_id) IN (SELECT project_id,sdk_event_id FROM error_event_source_keys WHERE received_at < NOW() - INTERVAL '7 days' ORDER BY received_at LIMIT 2000)")).await?.rows_affected())
+    }
+
     /// Generate a fingerprint for error matching
     pub fn generate_fingerprint(&self, error_data: &CreateErrorEventData) -> String {
         // Use first exception for fingerprint, or fall back to legacy fields
         let (exception_type, exception_value, stack_trace) =
-            if let Some(first_exception) = error_data.exceptions.first() {
+            if let Some(first_exception) = primary_exception(error_data) {
                 (
                     first_exception.exception_type.clone(),
                     first_exception.exception_value.clone().unwrap_or_default(),
@@ -341,16 +441,90 @@ impl ErrorIngestionService {
                 )
             };
 
-        let components = [
-            exception_type,
-            self.normalize_error_message(&exception_value),
-            self.extract_stack_signature(stack_trace, 3),
-        ];
-
-        let content = components.join("||");
+        let signature = if error_data.source.as_deref() == Some("sentry") {
+            let frames = stack_trace.as_ref().and_then(|v| {
+                v.as_array()
+                    .or_else(|| v.get("frames").and_then(|v| v.as_array()))
+            });
+            match frames {
+                Some(frames) => {
+                    let app_only = frames
+                        .iter()
+                        .any(|v| v.get("in_app").and_then(|v| v.as_bool()) == Some(true));
+                    let signature = frames
+                        .iter()
+                        .rev()
+                        .filter(|v| {
+                            !app_only || v.get("in_app").and_then(|v| v.as_bool()) == Some(true)
+                        })
+                        .filter_map(|frame| {
+                            let filename = frame
+                                .get("filename")
+                                .or_else(|| frame.get("abs_path"))
+                                .and_then(|v| v.as_str());
+                            let function = frame.get("function").and_then(|v| v.as_str());
+                            if filename.is_none() && function.is_none() {
+                                return None;
+                            }
+                            Some(format!(
+                                "{}:{}",
+                                self.normalize_filename(filename.unwrap_or("unknown")),
+                                function.unwrap_or("anonymous")
+                            ))
+                        })
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    if signature.is_empty() {
+                        "unknown".into()
+                    } else {
+                        signature
+                    }
+                }
+                None => "unknown".into(),
+            }
+        } else {
+            self.extract_stack_signature(stack_trace, 3)
+        };
+        let template = error_data
+            .raw_sentry_event
+            .as_ref()
+            .and_then(|v| v.pointer("/logentry/message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&exception_value);
+        let components = if error_data.source.as_deref() == Some("sentry") && signature != "unknown"
+        {
+            vec![exception_type, signature]
+        } else {
+            vec![
+                exception_type,
+                self.normalize_error_message(template),
+                signature,
+            ]
+        };
         let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        hex::encode(hasher.finalize())
+        hasher.update(components.join("||").as_bytes());
+        let default = hex::encode(hasher.finalize());
+        match sdk_fingerprint(error_data) {
+            None => default,
+            Some(values) if values.len() == 1 && default_placeholder(values[0]) => default,
+            Some(values) => {
+                // Length framing preserves component boundaries without a JSON
+                // allocation or ambiguous delimiter joins.
+                let mut hasher = Sha256::new();
+                hasher.update(b"temps.sentry.fingerprint.v1\0");
+                for value in values {
+                    let value = if default_placeholder(value) {
+                        default.as_str()
+                    } else {
+                        value
+                    };
+                    hasher.update((value.len() as u64).to_be_bytes());
+                    hasher.update(value.as_bytes());
+                }
+                hex::encode(hasher.finalize())
+            }
+        }
     }
 
     /// Normalize error messages for consistent grouping
@@ -626,17 +800,9 @@ impl ErrorIngestionService {
         fingerprint: &str,
         event_time: DateTime<Utc>,
     ) -> Result<i64, ErrorTrackingError> {
-        // Use raw Sentry event if available, otherwise build from individual fields
-        let data_json = if let Some(raw_sentry) = &error_data.raw_sentry_event {
-            // Wrap the raw Sentry event in our structure with source metadata
-            let mut wrapper = serde_json::Map::new();
-            wrapper.insert(
-                "source".to_string(),
-                serde_json::Value::String("sentry".to_string()),
-            );
-            wrapper.insert("sentry".to_string(), raw_sentry.clone());
-            serde_json::Value::Object(wrapper)
-        } else {
+        // Populate native typed context for every source, while retaining the
+        // original Sentry document for wire fields without a native equivalent.
+        let data_json = {
             use temps_entities::error_events::{
                 DeviceContext, EnvironmentContext, ErrorEventData, RequestContext, StackFrame,
                 TraceContext, UserContext,
@@ -644,7 +810,7 @@ impl ErrorIngestionService {
 
             // Build structured data from individual fields (for non-Sentry sources)
             let event_data = ErrorEventData {
-                source: Some("custom".to_string()),
+                source: Some(error_data.source.clone().unwrap_or_else(|| "custom".into())),
                 user: Some(UserContext {
                     user_id: error_data.user_id.clone(),
                     email: error_data.user_email.clone(),
@@ -722,16 +888,16 @@ impl ErrorIngestionService {
                     extra: error_data.extra_context.clone(),
                     contexts: error_data.contexts.clone(),
                 }),
-                sentry: None, // Can be populated from raw SDK payload if needed
+                sentry: error_data.raw_sentry_event.clone(),
             };
             event_data
                 .to_json_value()
                 .unwrap_or_else(|| serde_json::json!({}))
         };
 
-        // Use first exception for event fields (legacy compatibility)
+        // Preserve legacy ordering; Sentry chains end with the primary exception.
         let (event_exception_type, event_exception_value) =
-            if let Some(first_exception) = error_data.exceptions.first() {
+            if let Some(first_exception) = primary_exception(error_data) {
                 (
                     first_exception.exception_type.clone(),
                     first_exception.exception_value.clone(),
@@ -1497,6 +1663,218 @@ mod tests {
             .expect("an event matched by embedding similarity must be stored, not rejected");
         assert_eq!(group_a, group_b);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn sdk_retries_grouping_queries_and_rollback_are_atomic() {
+        use super::super::{error_crud_service::ErrorCRUDService, types::ErrorEventFilter};
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("SDK atomic ingestion test not run: container runtime unavailable");
+                return;
+            }
+            Err(error) => panic!("SDK atomic ingestion test setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let project = create_test_project(&db).await;
+        let other_project = create_test_project(&db).await;
+        let service = Arc::new(ErrorIngestionService::new(db.clone()));
+        let data = |project_id, id: u128, fingerprint: &str, ty: &str| CreateErrorEventData {
+            source: Some("sentry".into()),
+            raw_sentry_event: Some(serde_json::json!({
+                "event_id":format!("{id:032x}"), "fingerprint":[fingerprint],
+                "request":{"url":"https://synthetic.example/path","custom":null},
+                "custom":{"large":9007199254740993_u64}
+            })),
+            project_id,
+            exception_type: Some(ty.into()),
+            exception_value: Some("Synthetic same message".into()),
+            user_id: Some("synthetic-user".into()),
+            browser: Some("SyntheticBrowser".into()),
+            extra_context: Some(serde_json::json!({"tags":{"synthetic.key":"test'value"}})),
+            ..Default::default()
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..48 {
+            let service = service.clone();
+            let event = data(project, 1, "same", "TypeError");
+            tasks.spawn(async move { service.process_with_outcome(event).await.unwrap() });
+        }
+        let mut stored = 0;
+        let mut group = 0;
+        while let Some(result) = tasks.join_next().await {
+            let result = result.unwrap();
+            stored += usize::from(result.inserted);
+            if group != 0 {
+                assert_eq!(group, result.group_id);
+            }
+            group = result.group_id;
+        }
+        assert_eq!(stored, 1);
+        assert_eq!(
+            error_events::Entity::find()
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            error_groups::Entity::find_by_id(group)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .total_count,
+            1
+        );
+        // Upgrade path: a stored event without a receipt remains deduplicated.
+        db.execute_unprepared("DELETE FROM error_event_source_keys")
+            .await
+            .unwrap();
+        assert!(
+            !service
+                .process_with_outcome(data(project, 1, "same", "TypeError"))
+                .await
+                .unwrap()
+                .inserted
+        );
+        assert_eq!(
+            service
+                .process_with_outcome(data(project, 2, "same", "RangeError"))
+                .await
+                .unwrap()
+                .group_id,
+            group
+        );
+        assert_ne!(
+            service
+                .process_with_outcome(data(project, 3, "different", "TypeError"))
+                .await
+                .unwrap()
+                .group_id,
+            group
+        );
+        let other = service
+            .process_with_outcome(data(other_project, 1, "same", "TypeError"))
+            .await
+            .unwrap();
+        assert!(other.inserted);
+        assert_ne!(other.group_id, group);
+        let mut bad_scope = data(project, 1, "same", "TypeError");
+        bad_scope.environment_id = Some(999);
+        assert!(matches!(
+            service.process_with_outcome(bad_scope).await,
+            Err(ErrorTrackingError::Validation(_))
+        ));
+        let crud = ErrorCRUDService::new(db.clone());
+        let filter = ErrorEventFilter {
+            user_id: Some("synthetic-user".into()),
+            tag_key: Some("synthetic.key".into()),
+            tag_value: Some("test'value".into()),
+        };
+        let (events, count) = crud
+            .list_error_events_filtered(group, project, None, None, &filter)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(events[0].browser.as_deref(), Some("SyntheticBrowser"));
+        assert_eq!(
+            events[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .pointer("/sentry/custom/large")
+                .and_then(|v| v.as_u64()),
+            Some(9007199254740993)
+        );
+        assert_eq!(
+            crud.list_error_events_filtered(group, other_project, None, None, &filter)
+                .await
+                .unwrap()
+                .1,
+            0
+        );
+        let unmatched = ErrorEventFilter {
+            user_id: Some("absent".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            crud.list_error_events_filtered(group, project, None, None, &unmatched)
+                .await
+                .unwrap()
+                .1,
+            0
+        );
+        let invalid = ErrorEventFilter {
+            tag_key: Some("unpaired".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            crud.list_error_events_filtered(group, project, None, None, &invalid)
+                .await,
+            Err(ErrorTrackingError::Validation(_))
+        ));
+        // Force a permanent native write failure; no group, count or receipt may leak.
+        db.execute_unprepared("ALTER TABLE error_events ADD CONSTRAINT synthetic_reject CHECK (exception_type <> 'SyntheticRejected')").await.unwrap();
+        assert!(service
+            .process_with_outcome(data(project, 4, "rollback", "SyntheticRejected"))
+            .await
+            .is_err());
+        assert_eq!(
+            error_events::Entity::find()
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            error_groups::Entity::find()
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            3
+        );
+        db.execute_unprepared("ALTER TABLE error_events DROP CONSTRAINT synthetic_reject")
+            .await
+            .unwrap();
+        assert!(
+            service
+                .process_with_outcome(data(project, 4, "rollback", "SyntheticRejected"))
+                .await
+                .unwrap()
+                .inserted
+        );
+        let mut default_event = data(project, 5, "same", "TypeError");
+        default_event.raw_sentry_event.as_mut().unwrap()["fingerprint"] = serde_json::Value::Null;
+        assert_ne!(
+            service
+                .process_with_outcome(default_event)
+                .await
+                .unwrap()
+                .group_id,
+            group,
+            "default grouping must not fuzzily join a custom fingerprint"
+        );
+        db.execute_unprepared(
+            "UPDATE error_event_source_keys SET received_at=NOW()-INTERVAL '8 days'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(service.cleanup_source_keys().await.unwrap(), 6);
+        // The surviving native row still protects retries even after receipt expiry.
+        assert!(
+            !service
+                .process_with_outcome(data(project, 4, "rollback", "SyntheticRejected"))
+                .await
+                .unwrap()
+                .inserted
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1576,5 +1954,96 @@ mod trace_id_extraction_tests {
             extract_trace_id_from_data(&data),
             Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod sdk_grouping_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn data() -> CreateErrorEventData {
+        CreateErrorEventData {
+            source: Some("sentry".into()),
+            exception_type: Some("SyntheticError".into()),
+            exception_value: Some("Synthetic failure".into()),
+            stack_trace: Some(
+                json!({"frames":[{"filename":"sdk.js","function":"transport","in_app":false},{"filename":"application.js","function":"execute","in_app":true}]}),
+            ),
+            ..Default::default()
+        }
+    }
+    fn service() -> ErrorIngestionService {
+        ErrorIngestionService::new(Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ))
+    }
+    #[test]
+    fn default_token_extends_or_preserves_native_default_and_custom_values_override() {
+        let svc = service();
+        let mut item = data();
+        let default = svc.generate_fingerprint(&item);
+        for values in [json!([]), json!(["{{ default }}"]), json!(["{{default}}"])] {
+            item.raw_sentry_event = Some(json!({"fingerprint":values}));
+            assert_eq!(svc.generate_fingerprint(&item), default);
+        }
+        item.raw_sentry_event = Some(json!({"fingerprint":["{{ default }}","sample"]}));
+        let extended = svc.generate_fingerprint(&item);
+        assert_ne!(extended, default);
+        item.exception_type = Some("AnotherError".into());
+        assert_ne!(svc.generate_fingerprint(&item), extended);
+        item.raw_sentry_event = Some(json!({"fingerprint":["custom","sample"]}));
+        let custom = svc.generate_fingerprint(&item);
+        item.exception_type = Some("DifferentError".into());
+        item.exception_value = Some("Different message".into());
+        assert_eq!(svc.generate_fingerprint(&item), custom);
+        item.raw_sentry_event = Some(json!({"fingerprint":["customsample"]}));
+        assert_ne!(svc.generate_fingerprint(&item), custom);
+    }
+    #[test]
+    fn fingerprint_order_repeated_defaults_and_stackless_messages_are_stable() {
+        let svc = service();
+        let mut item = data();
+        let fingerprint = |values: serde_json::Value| {
+            let mut event = item.clone();
+            event.raw_sentry_event = Some(json!({"fingerprint":values}));
+            svc.generate_fingerprint(&event)
+        };
+        assert_ne!(
+            fingerprint(json!(["a", "b"])),
+            fingerprint(json!(["b", "a"]))
+        );
+        assert_ne!(
+            fingerprint(json!(["{{ default }}"])),
+            fingerprint(json!(["{{ default }}", "{{ default }}"]))
+        );
+        assert_eq!(
+            fingerprint(json!(["", "synthetic"])),
+            fingerprint(json!(["", "synthetic"]))
+        );
+        item.stack_trace = None;
+        let first = svc.generate_fingerprint(&item);
+        item.exception_value = Some("Synthetic failure 1234".into());
+        let second = svc.generate_fingerprint(&item);
+        item.exception_value = Some("Synthetic failure 5678".into());
+        assert_eq!(svc.generate_fingerprint(&item), second);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn sentry_stack_shapes_use_recent_app_frames_and_ignore_incidental_messages() {
+        let svc = service();
+        let mut item = data();
+        let before = svc.generate_fingerprint(&item);
+        item.exception_value = Some("Another incidental message".into());
+        assert_eq!(svc.generate_fingerprint(&item), before);
+        item.stack_trace.as_mut().unwrap()["frames"][0]["function"] = json!("differentSdkFrame");
+        assert_eq!(svc.generate_fingerprint(&item), before);
+        item.stack_trace.as_mut().unwrap()["frames"][1]["function"] = json!("anotherOperation");
+        assert_ne!(svc.generate_fingerprint(&item), before);
+        item.stack_trace = Some(json!({"frames":[{"instruction_addr":"0x1"}]}));
+        let missing_symbols = svc.generate_fingerprint(&item);
+        item.exception_value = Some("A different failure without symbols".into());
+        assert_ne!(svc.generate_fingerprint(&item), missing_symbols);
     }
 }

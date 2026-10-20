@@ -67,11 +67,31 @@ impl ErrorTrackingPlugin {
     }
 
     /// Periodically clean up old alert fire records
-    async fn cleanup_loop(alert_service: Arc<ErrorAlertService>) {
+    async fn cleanup_loop(
+        alert_service: Arc<ErrorAlertService>,
+        tracking: Arc<ErrorTrackingService>,
+    ) {
         let retention_days = 30;
+        let mut ticks = 0_u32;
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(6 * 3600)).await;
-            alert_service.cleanup_old_fires(retention_days).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            if tracking.cleanup_source_keys().await.is_err() {
+                tracing::warn!(
+                    error_class = "source_key_cleanup",
+                    "Error ingest identity cleanup failed"
+                );
+            }
+            if tracking.client_outcomes.cleanup().await.is_err() {
+                tracing::warn!(
+                    error_class = "client_outcome_cleanup",
+                    "Client outcome retention cleanup failed"
+                );
+            }
+            ticks += 1;
+            if ticks == 1440 {
+                alert_service.cleanup_old_fires(retention_days).await;
+                ticks = 0;
+            }
         }
     }
 }
@@ -358,8 +378,9 @@ impl TempsPlugin for ErrorTrackingPlugin {
 
                 // Start periodic cleanup of old alert fire records
                 let alert_service_for_cleanup = alert_service.clone();
+                let tracking_for_cleanup = error_tracking_service.clone();
                 tokio::spawn(async move {
-                    Self::cleanup_loop(alert_service_for_cleanup).await;
+                    Self::cleanup_loop(alert_service_for_cleanup, tracking_for_cleanup).await;
                 });
             }
 
@@ -493,6 +514,14 @@ impl TempsPlugin for ErrorTrackingPlugin {
     fn openapi_schema(&self) -> Option<OpenApi> {
         // Get base error tracking schema
         let mut schema = <crate::handlers::handler::ErrorTrackingApiDoc as OpenApiTrait>::openapi();
+
+        schema
+            .merge(<crate::handlers::feedback_handler::FeedbackApiDoc as OpenApiTrait>::openapi());
+        schema.merge(<crate::handlers::release_handler::ReleaseApiDoc as OpenApiTrait>::openapi());
+        schema.merge(
+            <crate::handlers::client_outcome_handler::ClientOutcomeApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
 
         // Merge alert rules routes schema
         let alert_rules_schema =

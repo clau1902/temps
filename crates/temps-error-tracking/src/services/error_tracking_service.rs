@@ -34,6 +34,9 @@ pub struct ErrorTrackingService {
     pub crud: ErrorCRUDService,
     pub analytics: ErrorAnalyticsService,
     pub alerts: ErrorAlertService,
+    pub feedback: super::feedback_service::FeedbackService,
+    pub client_outcomes: super::client_outcome_service::ClientOutcomeService,
+    pub releases: super::release_service::ReleaseService,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     notification_callback: OnceCell<NotificationCallback>,
     autopilot_callback: OnceCell<NotificationCallback>,
@@ -46,6 +49,9 @@ impl ErrorTrackingService {
             ingestion: ErrorIngestionService::new(db.clone()),
             crud: ErrorCRUDService::new(db.clone()),
             analytics: ErrorAnalyticsService::new(db.clone()),
+            feedback: super::feedback_service::FeedbackService::new(db.clone()),
+            client_outcomes: super::client_outcome_service::ClientOutcomeService::new(db.clone()),
+            releases: super::release_service::ReleaseService::new(db.clone()),
             alerts: ErrorAlertService::new(db),
             source_map_service: OnceCell::new(),
             notification_callback: OnceCell::new(),
@@ -126,8 +132,39 @@ impl ErrorTrackingService {
     /// After ingestion, evaluates alert rules and sends notifications.
     pub async fn process_error_event(
         &self,
-        mut error_data: CreateErrorEventData,
+        error_data: CreateErrorEventData,
     ) -> Result<i32, ErrorTrackingError> {
+        Ok(self
+            .process_error_event_with_receipt(error_data)
+            .await?
+            .group_id)
+    }
+
+    pub async fn cleanup_source_keys(&self) -> Result<u64, ErrorTrackingError> {
+        if let Some(source_maps) = self.source_map_service.get() {
+            if source_maps.cleanup_artifact_chunks().await.is_err() {
+                tracing::warn!(
+                    error_class = "artifact_chunk_cleanup",
+                    "Expired artifact chunk cleanup failed"
+                );
+            }
+        }
+        if temps_otel::storage::receipts::cleanup(self.db.as_ref())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                error_class = "telemetry_receipt_cleanup",
+                "Telemetry retry receipt cleanup failed"
+            );
+        }
+        self.ingestion.cleanup_source_keys().await
+    }
+
+    pub async fn process_error_event_with_receipt(
+        &self,
+        mut error_data: CreateErrorEventData,
+    ) -> Result<super::types::ErrorIngestReceipt, ErrorTrackingError> {
         // Symbolicate stack traces if source maps are available
         if let Some(sm_service) = self.source_map_service.get() {
             if let Err(e) = sm_service.symbolicate_error_event(&mut error_data).await {
@@ -145,6 +182,12 @@ impl ErrorTrackingService {
         let project_id = error_data.project_id;
         let outcome = self.ingestion.process_with_outcome(error_data).await?;
         let group_id = outcome.group_id;
+        if !outcome.inserted {
+            return Ok(super::types::ErrorIngestReceipt {
+                group_id,
+                stored: false,
+            });
+        }
         let pre_ingestion_status = outcome.previous_status;
 
         // Evaluate alert rules (fire-and-forget, don't fail the ingestion)
@@ -182,7 +225,10 @@ impl ErrorTrackingService {
             self.send_alert_notifications(enriched).await;
         }
 
-        Ok(group_id)
+        Ok(super::types::ErrorIngestReceipt {
+            group_id,
+            stored: true,
+        })
     }
 
     /// List error groups (delegates to CRUD service).
@@ -277,19 +323,38 @@ impl ErrorTrackingService {
         page: Option<u64>,
         page_size: Option<u64>,
     ) -> Result<(Vec<ErrorEventDomain>, u64), ErrorTrackingError> {
+        self.list_error_events_filtered(
+            group_id,
+            project_id,
+            page,
+            page_size,
+            &super::types::ErrorEventFilter::default(),
+        )
+        .await
+    }
+
+    pub async fn list_error_events_filtered(
+        &self,
+        group_id: i32,
+        project_id: i32,
+        page: Option<u64>,
+        page_size: Option<u64>,
+        filter: &super::types::ErrorEventFilter,
+    ) -> Result<(Vec<ErrorEventDomain>, u64), ErrorTrackingError> {
         let (mut events, total) = self
             .crud
-            .list_error_events(group_id, project_id, page, page_size)
+            .list_error_events_filtered(group_id, project_id, page, page_size, filter)
             .await?;
-
         if let Some(sm_service) = self.source_map_service.get() {
             for event in &mut events {
                 if let Some(data) = &mut event.data {
                     sm_service.symbolicate_stored_event(project_id, data).await;
+                    if let Some(frames) = data.get("stack_trace") {
+                        event.stack_trace = Some(frames.clone());
+                    }
                 }
             }
         }
-
         Ok((events, total))
     }
 
@@ -350,7 +415,7 @@ impl ErrorTrackingService {
     ///
     /// Performs on-the-fly symbolication if:
     /// - A source map service is configured
-    /// - The event has stored sentry data with a release version
+    /// - The event has Debug ID images or a release version
     /// - The stack frames haven't been symbolicated yet
     pub async fn get_error_event(
         &self,
@@ -367,6 +432,9 @@ impl ErrorTrackingService {
         if let Some(sm_service) = self.source_map_service.get() {
             if let Some(data) = &mut event.data {
                 sm_service.symbolicate_stored_event(project_id, data).await;
+                if let Some(frames) = data.get("stack_trace") {
+                    event.stack_trace = Some(frames.clone());
+                }
             }
         }
 

@@ -283,6 +283,7 @@ pub struct Envelope<'a> {
     header: EnvelopeHeaders,
     items: Vec<EnvelopeItem<'a>>,
     item_headers: Vec<ItemHeader>,
+    item_payloads: Vec<&'a [u8]>,
 }
 
 impl<'a> Envelope<'a> {
@@ -313,6 +314,7 @@ impl<'a> Envelope<'a> {
             .map_err(|_| EnvelopeError::InvalidHeader("invalid JSON object".into()))?;
         let mut items = Vec::new();
         let mut item_headers = Vec::new();
+        let mut item_payloads = Vec::new();
         while offset < data.len() {
             if items.len() >= 1000 {
                 return Err(EnvelopeError::LimitExceeded);
@@ -359,6 +361,7 @@ impl<'a> Envelope<'a> {
             if !decode_legacy && !matches!(&item_header.ty, ItemType::Event | ItemType::Log) {
                 items.push(EnvelopeItem::Unsupported(payload));
                 item_headers.push(item_header);
+                item_payloads.push(payload);
                 continue;
             }
             // Parse item based on type
@@ -435,6 +438,7 @@ impl<'a> Envelope<'a> {
             if let Some(item) = item {
                 items.push(item);
                 item_headers.push(item_header);
+                item_payloads.push(payload);
             }
         }
 
@@ -442,6 +446,7 @@ impl<'a> Envelope<'a> {
             header,
             items,
             item_headers,
+            item_payloads,
         })
     }
 
@@ -449,7 +454,20 @@ impl<'a> Envelope<'a> {
         self.item_headers.iter().zip(self.items.iter())
     }
 
+    /// Borrow original wire payloads without copying or normalizing unknown fields.
+    pub fn items_with_payloads(
+        &self,
+    ) -> impl Iterator<Item = (&ItemHeader, &EnvelopeItem<'a>, &'a [u8])> {
+        self.items_with_headers()
+            .zip(self.item_payloads.iter())
+            .map(|((header, item), payload)| (header, item, *payload))
+    }
+
     /// Get the envelope header
+    pub fn event_id(&self) -> Option<String> {
+        self.header.event_id.map(|id| id.to_string())
+    }
+
     pub fn header(&self) -> &EnvelopeHeaders {
         &self.header
     }

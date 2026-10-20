@@ -42,6 +42,8 @@ describe('flat project navigation', () => {
       'analytics/pages': 'analytics',
       'analytics/visitors/42': 'analytics',
       'errors/12': 'errors',
+      releases: 'errors',
+      'client-outcomes': 'errors',
       'errors/alert-rules/new': 'monitoring',
       'traces/abc': 'traces',
       'ai-gateway?tab=activity': 'traces',

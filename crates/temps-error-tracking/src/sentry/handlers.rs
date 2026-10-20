@@ -9,7 +9,6 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use flate2::read::GzDecoder;
 use std::io::Read as IoRead;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -60,6 +59,8 @@ const INGEST_RETRY_AFTER_SECONDS: &str = "60";
         ingest_sentry_event,
         ingest_sentry_envelope,
         ingest_tunneled_envelope,
+        ingest_security_reports,
+        ingest_nel_reports,
     ),
     components(schemas(
         SentryEventRequest,
@@ -139,6 +140,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/{project_id}/store/", post(ingest_sentry_event))
         .route("/{project_id}/envelope/", post(ingest_sentry_envelope))
+        .route("/{project_id}/security/", post(ingest_security_reports))
+        .route("/{project_id}/nel/", post(ingest_nel_reports))
         .route(SENTRY_TUNNEL_ROUTE_PATH, post(ingest_tunneled_envelope))
         // Fix #3: cap compressed body to 2 MiB before any buffering occurs.
         // This prevents slow-POST DoS where a client drip-feeds a large body
@@ -347,7 +350,134 @@ async fn ingest_sentry_envelope(
     let peer = connect_info.map(|ext| ext.0 .0);
     let client_ip = temps_auth::resolve_client_ip(&headers, peer);
 
-    process_parsed_envelope(&state, &auth, &decompressed_body, &client_ip, true).await
+    process_parsed_envelope(
+        &state,
+        &auth,
+        &decompressed_body,
+        &client_ip,
+        &headers,
+        true,
+    )
+    .await
+}
+
+#[utoipa::path(post,path="/{project_id}/security/",tag="sentry-ingestor",params(("project_id"=i32,Path)),
+    request_body(content=String,content_type="application/csp-report"),responses((status=200),(status=400),(status=401),(status=403),(status=413),(status=415),(status=429)))]
+async fn ingest_security_reports(
+    _permit: SentryIngestPermit,
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    body: Bytes,
+) -> Response {
+    ingest_browser_reports(
+        &state,
+        project_id,
+        params,
+        headers,
+        connect_info,
+        body,
+        false,
+    )
+    .await
+}
+#[utoipa::path(post,path="/{project_id}/nel/",tag="sentry-ingestor",params(("project_id"=i32,Path)),
+    request_body(content=String,content_type="application/reports+json"),responses((status=200),(status=400),(status=401),(status=403),(status=413),(status=415),(status=429)))]
+async fn ingest_nel_reports(
+    _permit: SentryIngestPermit,
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    body: Bytes,
+) -> Response {
+    ingest_browser_reports(
+        &state,
+        project_id,
+        params,
+        headers,
+        connect_info,
+        body,
+        true,
+    )
+    .await
+}
+async fn ingest_browser_reports(
+    state: &AppState,
+    project_id: i32,
+    params: std::collections::HashMap<String, String>,
+    headers: HeaderMap,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    body: Bytes,
+    nel: bool,
+) -> Response {
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.split(';').next())
+        .map(str::trim)
+        .unwrap_or("");
+    if !matches!(mime, "application/json" | "application/reports+json")
+        && (nel || mime != "application/csp-report")
+    {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Unsupported browser report content type",
+        )
+            .into_response();
+    }
+    let Some(key) = extract_dsn_key(&headers, &params) else {
+        return (StatusCode::UNAUTHORIZED, "Missing DSN key").into_response();
+    };
+    if state.rate_limiter.unresolved_budget_exhausted().await {
+        return rate_limited_response();
+    }
+    let dsn = match state.dsn_service.get_project_by_public_key(&key).await {
+        Ok(Some(dsn)) if dsn.project_id == project_id => dsn,
+        Ok(_) => {
+            state.rate_limiter.record_unresolved_attempt().await;
+            return (StatusCode::UNAUTHORIZED, "Invalid project DSN").into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "60")],
+                "DSN authentication temporarily unavailable",
+            )
+                .into_response()
+        }
+    };
+    match dsn_origin_verdict(&dsn, &headers) {
+        OriginVerdict::Allowed => {}
+        OriginVerdict::Denied => {
+            return (StatusCode::FORBIDDEN, "Origin not allowed by this DSN").into_response()
+        }
+        OriginVerdict::Malformed => return malformed_allowed_origins_response(),
+    }
+    let auth = auth_from_dsn(&dsn);
+    if !state
+        .rate_limiter
+        .check(auth.project_id, auth.rate_limit_per_minute)
+        .await
+    {
+        return rate_limited_response();
+    }
+    let body = match decompress_if_needed(&headers, &body) {
+        Ok(body) => body,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "Invalid compressed browser report").into_response()
+        }
+    };
+    let envelope = match super::security::frame_browser_reports(&body, nel, &params) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
+    let peer = connect_info.map(|ext| ext.0 .0);
+    let client_ip = temps_auth::resolve_client_ip(&headers, peer);
+    process_parsed_envelope(state, &auth, &envelope, &client_ip, &headers, true).await
 }
 
 /// Ingest a browser-tunneled Sentry envelope.
@@ -509,7 +639,15 @@ async fn ingest_tunneled_envelope(
         };
 
         let client_ip = temps_auth::resolve_client_ip(&headers, peer);
-        return process_parsed_envelope(&state, &auth, &decompressed_body, &client_ip, true).await;
+        return process_parsed_envelope(
+            &state,
+            &auth,
+            &decompressed_body,
+            &client_ip,
+            &headers,
+            true,
+        )
+        .await;
     }
 
     // ── Path 2: no explicit credential ──────────────────────────────────
@@ -654,6 +792,7 @@ async fn ingest_tunneled_envelope(
         &auth,
         &decompressed_body,
         &client_ip,
+        &headers,
         dsn_authenticated,
     )
     .await
@@ -1015,13 +1154,16 @@ async fn process_parsed_envelope(
     auth: &AuthContext,
     decompressed_body: &Bytes,
     client_ip: &str,
+    headers: &HeaderMap,
     dsn_authenticated: bool,
 ) -> Response {
+    let request = super::inference::RequestInference::new(client_ip, headers);
     // Decode and validate all supported items before any durable writes.
-    let batch = match state
-        .sentry_provider
-        .parse_envelope(decompressed_body, auth)
-    {
+    let batch = match state.sentry_provider.parse_envelope_with_request(
+        decompressed_body,
+        auth,
+        Some(&request),
+    ) {
         Ok(batch) => batch,
         Err(crate::providers::ProviderError::LogBatch(error)) => {
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
@@ -1035,12 +1177,13 @@ async fn process_parsed_envelope(
                 .into_response();
         }
     };
-    let has_telemetry = !batch.logs.is_empty()
+    let has_telemetry = !batch.feedback.is_empty()
+        || !batch.logs.is_empty()
         || !batch.check_ins.is_empty()
         || !batch.spans.is_empty()
         || !batch.metrics.is_empty()
         || batch.replay.is_some();
-    if has_telemetry && !dsn_authenticated {
+    if (has_telemetry || !batch.client_outcomes.is_empty()) && !dsn_authenticated {
         return (
             StatusCode::UNAUTHORIZED,
             "A valid Sentry DSN is required for telemetry",
@@ -1112,6 +1255,93 @@ async fn process_parsed_envelope(
         }
         response
     };
+    let mut domains = DomainReceipts::default();
+    if !batch.client_outcomes.is_empty() {
+        match state
+            .error_tracking_service
+            .client_outcomes
+            .ingest_reports(
+                auth.project_id,
+                auth.environment_id,
+                auth.deployment_id,
+                batch.client_outcomes,
+            )
+            .await
+        {
+            Ok(receipt) => {
+                domains.client_outcomes = receipt.accepted;
+                domains.client_outcome_duplicates = receipt.duplicates;
+            }
+            Err(error) => {
+                let status = match error {
+                    crate::services::types::ErrorTrackingError::Validation(_) => {
+                        StatusCode::BAD_REQUEST
+                    }
+                    crate::services::types::ErrorTrackingError::Database(db) => {
+                        if crate::services::client_outcome_service::ClientOutcomeService::is_receipt_capacity_error(&db)
+                            || temps_otel::OtelError::Database(db).is_transient() {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                tracing::warn!(
+                    project_id = auth.project_id,
+                    error_class = "client_outcome_storage",
+                    "Client outcome storage failed"
+                );
+                return domains.apply(with_check_ins(envelope_outcome(
+                    status,
+                    0,
+                    0,
+                    unsupported,
+                    &unsupported_types,
+                )));
+            }
+        }
+    }
+    if !batch.feedback.is_empty() {
+        match state
+            .error_tracking_service
+            .feedback
+            .ingest(
+                auth.project_id,
+                auth.environment_id,
+                auth.deployment_id,
+                batch.feedback,
+            )
+            .await
+        {
+            Ok(receipt) => {
+                domains.feedback = receipt.stored;
+                domains.feedback_duplicates = receipt.duplicates;
+            }
+            Err(error) => {
+                let status = match error {
+                    crate::services::types::ErrorTrackingError::Validation(_) => {
+                        StatusCode::BAD_REQUEST
+                    }
+                    crate::services::types::ErrorTrackingError::Database(db) => {
+                        if temps_otel::OtelError::Database(db).is_transient() {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                return domains.apply(with_check_ins(envelope_outcome(
+                    status,
+                    0,
+                    0,
+                    unsupported,
+                    &unsupported_types,
+                )));
+            }
+        }
+    }
     let mut errors_stored = 0;
     // Store each event using the error tracking service
     for mut event in batch.events {
@@ -1124,26 +1354,41 @@ async fn process_parsed_envelope(
         )
         .await;
 
-        if state
+        match state
             .error_tracking_service
-            .process_error_event(event.error_data)
+            .process_error_event_with_receipt(event.error_data)
             .await
-            .is_err()
         {
-            tracing::error!(
-                project_id = auth.project_id,
-                error_class = "error_storage",
-                "Failed to store Sentry error event"
-            );
-            return with_check_ins(envelope_outcome(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                errors_stored,
-                0,
-                unsupported,
-                &unsupported_types,
-            ));
+            Ok(receipt) if receipt.stored => errors_stored += 1,
+            Ok(_) => domains.errors_duplicates += 1,
+            Err(error) => {
+                let status = match error {
+                    crate::services::types::ErrorTrackingError::Validation(_) => {
+                        StatusCode::BAD_REQUEST
+                    }
+                    crate::services::types::ErrorTrackingError::Database(db) => {
+                        if temps_otel::OtelError::Database(db).is_transient() {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                tracing::error!(
+                    project_id = auth.project_id,
+                    error_class = "error_storage",
+                    "Failed to store Sentry error event"
+                );
+                return domains.apply(with_check_ins(envelope_outcome(
+                    status,
+                    errors_stored,
+                    0,
+                    unsupported,
+                    &unsupported_types,
+                )));
+            }
         }
-        errors_stored += 1;
 
         // Once-per-instance: "error tracking is in use here". report_once is
         // idempotent and durably deduped, so no per-request flag is needed —
@@ -1157,7 +1402,6 @@ async fn process_parsed_envelope(
         );
     }
 
-    let mut domains = DomainReceipts::default();
     if !batch.spans.is_empty() {
         match state.otel_service.ingest_spans(batch.spans).await {
             Ok(n) => domains.spans = n,
@@ -1285,6 +1529,11 @@ async fn process_parsed_envelope(
 
 #[derive(Default)]
 struct DomainReceipts {
+    client_outcomes: u64,
+    client_outcome_duplicates: u64,
+    feedback: u64,
+    feedback_duplicates: u64,
+    errors_duplicates: u64,
     spans: u64,
     metrics: u64,
     replay_segments: u64,
@@ -1293,6 +1542,20 @@ struct DomainReceipts {
 impl DomainReceipts {
     fn apply(&self, mut response: Response) -> Response {
         for (name, count) in [
+            (
+                "x-temps-sentry-client-outcomes-accepted",
+                self.client_outcomes,
+            ),
+            (
+                "x-temps-sentry-client-outcomes-duplicates",
+                self.client_outcome_duplicates,
+            ),
+            ("x-temps-sentry-feedback-stored", self.feedback),
+            (
+                "x-temps-sentry-feedback-duplicates",
+                self.feedback_duplicates,
+            ),
+            ("x-temps-sentry-errors-duplicates", self.errors_duplicates),
             ("x-temps-sentry-spans-stored", self.spans),
             ("x-temps-sentry-metrics-stored", self.metrics),
             (
@@ -1312,8 +1575,9 @@ impl DomainReceipts {
 /// Counts confirm durable domain records or check-in updates, not decoded items.
 /// Idempotent check-in replays acknowledge the existing run; these are not unique
 /// row counts. On failure a backend may have committed more than it confirmed.
-/// Retrying a mixed envelope can duplicate errors/logs; envelopes have no shared
-/// idempotency key or cross-domain transaction.
+/// Native identified telemetry retries are deduplicated within their receipt
+/// window. Anonymous observations and external destinations retain their native
+/// delivery semantics; no cross-domain transaction is implied.
 fn envelope_outcome(
     status: StatusCode,
     errors: u64,
@@ -1324,11 +1588,14 @@ fn envelope_outcome(
     let mut response = (
         status,
         [
+            ("x-temps-sentry-client-outcomes-accepted", "0".to_string()),
+            ("x-temps-sentry-client-outcomes-duplicates", "0".to_string()),
             ("x-temps-sentry-spans-stored", "0".to_string()),
             ("x-temps-sentry-metrics-stored", "0".to_string()),
             ("x-temps-sentry-replay-segments-accepted", "0".to_string()),
             ("x-temps-sentry-replay-events-stored", "0".to_string()),
             ("x-temps-sentry-errors-stored", errors.to_string()),
+            ("x-temps-sentry-errors-duplicates", "0".to_string()),
             ("x-temps-sentry-logs-stored", logs.to_string()),
             ("x-temps-sentry-check-ins-stored", "0".to_string()),
             ("x-temps-sentry-check-ins-pending-config", "0".to_string()),
@@ -1380,20 +1647,19 @@ const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
 /// SECURITY: Uses a size-limited reader to prevent decompression bomb attacks where
 /// a small compressed payload expands to consume all available memory.
 fn decompress_if_needed(headers: &HeaderMap, body: &Bytes) -> Result<Bytes, String> {
-    // Check Content-Encoding header
-    let is_gzip = headers
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_lowercase().contains("gzip"))
-        .unwrap_or(false);
-
-    if !is_gzip {
-        // Not compressed, return as-is
-        return Ok(body.clone());
+    let encodings: Vec<_> = headers.get_all(header::CONTENT_ENCODING).iter().collect();
+    match encodings.as_slice() {
+        [] => return Ok(body.clone()),
+        [value] => match value.to_str().map(str::trim) {
+            Ok(value) if value.eq_ignore_ascii_case("identity") => return Ok(body.clone()),
+            Ok(value) if value.eq_ignore_ascii_case("gzip") => {}
+            _ => return Err("Unsupported content encoding; use identity or gzip".into()),
+        },
+        _ => return Err("Multiple content encodings are unsupported".into()),
     }
 
     // Decompress gzip data with size limit to prevent decompression bombs
-    let decoder = GzDecoder::new(&body[..]);
+    let decoder = flate2::read::MultiGzDecoder::new(&body[..]);
     let mut limited_reader = decoder.take(MAX_DECOMPRESSED_SIZE as u64 + 1);
     let mut decompressed = Vec::new();
 
@@ -1600,6 +1866,7 @@ mod tests {
     fn native_log_query(project_id: i32) -> temps_otel::types::LogQuery {
         temps_otel::types::LogQuery {
             project_id,
+            attribute_filter: None,
             severity: None,
             service_name: None,
             search: None,
@@ -1609,6 +1876,546 @@ mod tests {
             limit: Some(100),
             offset: None,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn client_outcomes_http_validates_and_reports_storage_failure_before_acknowledging() {
+        use sea_orm::ConnectionTrait;
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let url = format!("/{}/envelope/?sentry_key={}", ctx.project_id, ctx.dsn_key);
+        let valid="{}\n{\"type\":\"client_report\"}\n{\"discarded_events\":[{\"reason\":\"before_send\",\"category\":\"error\",\"quantity\":3}]}\n";
+        let response = server.post(&url).text(valid).await;
+        response.assert_status_ok();
+        assert_eq!(
+            response.header("x-temps-sentry-client-outcomes-accepted"),
+            "1"
+        );
+        assert_eq!(response.header("x-temps-sentry-unsupported-items"), "0");
+        let invalid = valid.replace("\"quantity\":3", "\"quantity\":-1");
+        server
+            .post(&url)
+            .text(invalid)
+            .await
+            .assert_status_bad_request();
+        ctx._db
+            .connection()
+            .execute_unprepared(
+                "CREATE FUNCTION synthetic_transient_outcome_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Synthetic retryable failure' USING ERRCODE='40001'; END $$; CREATE TRIGGER synthetic_outcome_failure BEFORE INSERT ON telemetry_client_outcomes FOR EACH STATEMENT EXECUTE FUNCTION synthetic_transient_outcome_failure()",
+            )
+            .await
+            .unwrap();
+        let failed = server.post(&url).text(valid).await;
+        assert_eq!(failed.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(failed.header("retry-after"), "60");
+        assert_eq!(
+            failed.header("x-temps-sentry-client-outcomes-accepted"),
+            "0"
+        );
+        ctx._db
+            .connection()
+            .execute_unprepared(
+                "DROP TRIGGER synthetic_outcome_failure ON telemetry_client_outcomes; DROP FUNCTION synthetic_transient_outcome_failure()",
+            )
+            .await
+            .unwrap();
+        server.post(&url).text(valid).await.assert_status_ok();
+        let stored = ctx
+            .app_state
+            .error_tracking_service
+            .client_outcomes
+            .list(ctx.project_id, 1, 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(stored.items[0].quantity, "6");
+        ctx._db.connection().execute_unprepared("ALTER TABLE telemetry_client_outcomes ADD CONSTRAINT synthetic_outcome_write_failure CHECK(quantity=0) NOT VALID").await.unwrap();
+        let failed = server.post(&url).text(valid).await;
+        assert_eq!(failed.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            failed.header("x-temps-sentry-client-outcomes-accepted"),
+            "0"
+        );
+        assert_eq!(
+            ctx.app_state
+                .error_tracking_service
+                .client_outcomes
+                .list(ctx.project_id, 1, 1, 20)
+                .await
+                .unwrap()
+                .items[0]
+                .quantity,
+            "6"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn telemetry_identified_http_partial_failure_retries_preserve_native_counts() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let ctx = create_test_context().await;
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let url = format!("/{}/envelope/?sentry_key={}", ctx.project_id, ctx.dsn_key);
+        let timestamp = Utc::now().timestamp();
+        let id = "1234567890abcdef1234567890abcdef";
+        let trace = "11111111111111111111111111111111";
+        let mut envelope=format!("{{\"event_id\":\"{id}\"}}\n{{\"type\":\"event\"}}\n{{\"message\":\"Synthetic atomic telemetry\",\"platform\":\"javascript\",\"level\":\"error\"}}\n");
+        for (ty, content, items) in [
+            (
+                "span",
+                "application/vnd.sentry.items.span.v2+json",
+                serde_json::json!([{"name":"Synthetic root","trace_id":trace,"span_id":"2222222222222222","start_timestamp":timestamp,"end_timestamp":timestamp+1,"attributes":{}}]),
+            ),
+            (
+                "trace_metric",
+                "application/vnd.sentry.items.trace-metric+json",
+                serde_json::json!([{"name":"synthetic.atomic.counter","type":"counter","value":3,"timestamp":timestamp,"trace_id":trace,"attributes":{}}]),
+            ),
+            (
+                "log",
+                "application/vnd.sentry.items.log+json",
+                serde_json::json!([{"body":"Synthetic atomic log","level":"info","timestamp":timestamp,"trace_id":trace,"attributes":{}}]),
+            ),
+        ] {
+            envelope.push_str(&format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":ty,"content_type":content,"item_count":1}),
+                serde_json::json!({"version":2,"items":items})
+            ));
+        }
+        let db = ctx._db.connection();
+        // The last domain fails after errors/spans/metrics have committed.
+        db.execute_unprepared("CREATE FUNCTION synthetic_telemetry_abort() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Synthetic log abort' USING ERRCODE='40001'; END $$; CREATE TRIGGER synthetic_telemetry_abort BEFORE INSERT ON otel_log_events FOR EACH STATEMENT EXECUTE FUNCTION synthetic_telemetry_abort()").await.unwrap();
+        let failed = server.post(&url).text(envelope.clone()).await;
+        assert_eq!(failed.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(failed.header("retry-after"), "60");
+        for signal in ["errors", "spans", "metrics"] {
+            assert_eq!(
+                failed.header(&format!("x-temps-sentry-{signal}-stored")),
+                "1"
+            );
+        }
+        assert_eq!(failed.header("x-temps-sentry-logs-stored"), "0");
+        db.execute_unprepared("DROP TRIGGER synthetic_telemetry_abort ON otel_log_events; DROP FUNCTION synthetic_telemetry_abort()").await.unwrap();
+        let recovered = server.post(&url).text(envelope.clone()).await;
+        recovered.assert_status_ok();
+        for signal in ["errors", "spans", "metrics"] {
+            assert_eq!(
+                recovered.header(&format!("x-temps-sentry-{signal}-stored")),
+                "0"
+            );
+        }
+        assert_eq!(recovered.header("x-temps-sentry-errors-duplicates"), "1");
+        assert_eq!(recovered.header("x-temps-sentry-logs-stored"), "1");
+        // Simulate a successful response being lost; replay the complete request.
+        let retry = server.post(&url).text(envelope.clone()).await;
+        retry.assert_status_ok();
+        for signal in ["errors", "spans", "metrics", "logs"] {
+            assert_eq!(
+                retry.header(&format!("x-temps-sentry-{signal}-stored")),
+                "0"
+            );
+        }
+        let counts=db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,"SELECT (SELECT count(*) FROM error_events WHERE project_id=$1) AS errors,(SELECT count(*) FROM otel_spans WHERE project_id=$1) AS spans,(SELECT count(*) FROM otel_log_events WHERE project_id=$1) AS logs,(SELECT sum(value)::float8 FROM otel_metrics WHERE project_id=$1) AS metric_total,(SELECT span_count FROM otel_trace_summaries WHERE project_id=$1 AND trace_id=$2) AS summary_count",[ctx.project_id.into(),trace.into()])).await.unwrap().unwrap();
+        for signal in ["errors", "spans", "logs", "summary_count"] {
+            assert_eq!(counts.try_get::<i64>("", signal).unwrap(), 1);
+        }
+        assert_eq!(counts.try_get::<f64>("", "metric_total").unwrap(), 3.0);
+        // Permanent failures remain failures, with no claimed identity left behind.
+        db.execute_unprepared("ALTER TABLE otel_log_events ADD CONSTRAINT synthetic_telemetry_permanent CHECK(body='unreachable') NOT VALID").await.unwrap();
+        let fresh = envelope.replace(id, "2234567890abcdef1234567890abcdef");
+        let failed = server.post(&url).text(fresh.clone()).await;
+        assert_eq!(failed.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failed.header("x-temps-sentry-logs-stored"), "0");
+        db.execute_unprepared(
+            "ALTER TABLE otel_log_events DROP CONSTRAINT synthetic_telemetry_permanent",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            server
+                .post(&url)
+                .text(fresh)
+                .await
+                .header("x-temps-sentry-logs-stored"),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn client_outcomes_identified_http_retries_and_partial_ingestion() {
+        use futures::StreamExt;
+        use sea_orm::ConnectionTrait;
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let url = format!("/{}/envelope/?sentry_key={}", ctx.project_id, ctx.dsn_key);
+        let id = "1234567890abcdef1234567890abcdef";
+        let report = "{\"type\":\"client_report\"}\n{\"discarded_events\":[{\"reason\":\"sample_rate\",\"category\":\"error\",\"quantity\":3}]}\n";
+        let envelope = format!("{{\"event_id\":\"{id}\"}}\n{report}");
+        let responses = futures::stream::iter(0..16)
+            .map(|_| async { server.post(&url).text(envelope.clone()).await })
+            .buffer_unordered(2)
+            .collect::<Vec<_>>()
+            .await;
+        let mut accepted = 0u64;
+        let mut duplicates = 0u64;
+        for response in responses {
+            response.assert_status_ok();
+            accepted += response
+                .header("x-temps-sentry-client-outcomes-accepted")
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            duplicates += response
+                .header("x-temps-sentry-client-outcomes-duplicates")
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+        }
+        assert_eq!((accepted, duplicates), (1, 15));
+        // A different event ID is an independent context, and two equal report
+        // items in one envelope remain distinct by position.
+        let other = envelope.replace(id, "2234567890abcdef1234567890abcdef");
+        server.post(&url).text(other).await.assert_status_ok();
+        let response = server.post(&url).text(format!("{envelope}{report}")).await;
+        assert_eq!(
+            response.header("x-temps-sentry-client-outcomes-accepted"),
+            "1"
+        );
+        assert_eq!(
+            response.header("x-temps-sentry-client-outcomes-duplicates"),
+            "1"
+        );
+        // Matching report content without an event identity must both count.
+        for _ in 0..2 {
+            server
+                .post(&url)
+                .text(format!("{{}}\n{report}"))
+                .await
+                .assert_status_ok();
+        }
+        assert_eq!(
+            ctx.app_state
+                .error_tracking_service
+                .client_outcomes
+                .list(ctx.project_id, 1, 1, 20)
+                .await
+                .unwrap()
+                .items[0]
+                .quantity,
+            "15"
+        );
+
+        // Force the counter write to abort after claiming a new identity. The
+        // receipt must roll back as well, allowing the retry to increment once.
+        let retry = envelope.replace(id, "3234567890abcdef1234567890abcdef");
+        ctx._db.connection().execute_unprepared("CREATE FUNCTION synthetic_client_outcome_abort() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Synthetic counter abort' USING ERRCODE='40001'; END $$; CREATE TRIGGER synthetic_client_outcome_abort BEFORE INSERT ON telemetry_client_outcomes FOR EACH STATEMENT EXECUTE FUNCTION synthetic_client_outcome_abort()").await.unwrap();
+        let failed = server.post(&url).text(retry.clone()).await;
+        assert_eq!(failed.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            failed.header("x-temps-sentry-client-outcomes-accepted"),
+            "0"
+        );
+        ctx._db.connection().execute_unprepared("DROP TRIGGER synthetic_client_outcome_abort ON telemetry_client_outcomes; DROP FUNCTION synthetic_client_outcome_abort()").await.unwrap();
+        let retried = server.post(&url).text(retry).await;
+        retried.assert_status_ok();
+        assert_eq!(
+            retried.header("x-temps-sentry-client-outcomes-accepted"),
+            "1"
+        );
+
+        // The report commits first, then the error store fails. Replaying the
+        // whole mixed envelope must not increment the report a second time.
+        let mixed = format!("{{\"event_id\":\"4234567890abcdef1234567890abcdef\"}}\n{report}{{\"type\":\"event\"}}\n{{\"message\":\"Synthetic partial outcome\",\"platform\":\"javascript\",\"level\":\"error\"}}\n");
+        ctx._db.connection().execute_unprepared("CREATE FUNCTION synthetic_error_after_outcome() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Synthetic error abort' USING ERRCODE='40001'; END $$; CREATE TRIGGER synthetic_error_after_outcome BEFORE INSERT ON error_events FOR EACH STATEMENT EXECUTE FUNCTION synthetic_error_after_outcome()").await.unwrap();
+        let failed = server.post(&url).text(mixed.clone()).await;
+        assert_eq!(failed.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            failed.header("x-temps-sentry-client-outcomes-accepted"),
+            "1"
+        );
+        ctx._db.connection().execute_unprepared("DROP TRIGGER synthetic_error_after_outcome ON error_events; DROP FUNCTION synthetic_error_after_outcome()").await.unwrap();
+        let retried = server.post(&url).text(mixed).await;
+        retried.assert_status_ok();
+        assert_eq!(
+            retried.header("x-temps-sentry-client-outcomes-accepted"),
+            "0"
+        );
+        assert_eq!(
+            retried.header("x-temps-sentry-client-outcomes-duplicates"),
+            "1"
+        );
+        assert_eq!(retried.header("x-temps-sentry-errors-stored"), "1");
+        assert_eq!(
+            ctx.app_state
+                .error_tracking_service
+                .client_outcomes
+                .list(ctx.project_id, 1, 1, 20)
+                .await
+                .unwrap()
+                .items[0]
+                .quantity,
+            "21"
+        );
+        let (other_project, other_key) = create_second_project_with_dsn(&ctx).await;
+        let other_url = format!("/{other_project}/envelope/?sentry_key={other_key}");
+        let independent = server.post(&other_url).text(envelope.clone()).await;
+        independent.assert_status_ok();
+        assert_eq!(
+            independent.header("x-temps-sentry-client-outcomes-accepted"),
+            "1"
+        );
+        assert_eq!(
+            ctx.app_state
+                .error_tracking_service
+                .client_outcomes
+                .list(other_project, 1, 1, 20)
+                .await
+                .unwrap()
+                .items[0]
+                .quantity,
+            "3"
+        );
+
+        use sea_orm::{ActiveModelTrait, Set};
+        let scope = uuid::Uuid::new_v4().to_string();
+        let environment = temps_entities::environments::ActiveModel {
+            project_id: Set(ctx.project_id),
+            name: Set("Synthetic outcome scope".into()),
+            slug: Set(scope.clone()),
+            subdomain: Set(scope),
+            host: Set("synthetic.example".into()),
+            upstreams: Set(Default::default()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(ctx._db.connection())
+        .await
+        .unwrap();
+        let deployment = temps_entities::deployments::ActiveModel {
+            project_id: Set(ctx.project_id),
+            environment_id: Set(environment.id),
+            slug: Set(uuid::Uuid::new_v4().to_string()),
+            state: Set("completed".into()),
+            metadata: Set(Some(Default::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(ctx._db.connection())
+        .await
+        .unwrap();
+        let payload =
+            br#"{"discarded_events":[{"reason":"sample_rate","category":"error","quantity":3}]}"#;
+        for deployment_id in [None, Some(deployment.id)] {
+            for expected in [1, 0] {
+                let receipt = ctx
+                    .app_state
+                    .error_tracking_service
+                    .client_outcomes
+                    .ingest_reports(
+                        ctx.project_id,
+                        Some(environment.id),
+                        deployment_id,
+                        vec![
+                            super::super::client_reports::decode_report(payload, Some(id), 0)
+                                .unwrap(),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.accepted, expected);
+                assert_eq!(receipt.duplicates, 1 - expected);
+            }
+        }
+        // Expiry is checked on admission as well as by indexed bounded cleanup.
+        let expired = ctx
+            ._db
+            .connection()
+            .execute_unprepared(
+                "UPDATE telemetry_client_outcome_receipts SET expires_at=NOW()-INTERVAL '1 second'",
+            )
+            .await
+            .unwrap()
+            .rows_affected();
+        let again = server.post(&url).text(envelope.clone()).await;
+        again.assert_status_ok();
+        assert_eq!(again.header("x-temps-sentry-client-outcomes-accepted"), "1");
+        assert_eq!(
+            ctx.app_state
+                .error_tracking_service
+                .client_outcomes
+                .cleanup()
+                .await
+                .unwrap(),
+            expired - 1
+        );
+        // Capacity admission must be atomic too. Existing receipts still
+        // acknowledge successfully, and unidentified reports need no budget.
+        ctx._db.connection().execute_unprepared("UPDATE telemetry_client_outcome_receipt_budgets SET used=32768 WHERE project_id IS NOT NULL").await.unwrap();
+        let new_identity = envelope.replace(id, "5234567890abcdef1234567890abcdef");
+        let full = server.post(&url).text(new_identity.clone()).await;
+        assert_eq!(full.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(full.header("retry-after"), "60");
+        assert_eq!(full.header("x-temps-sentry-client-outcomes-accepted"), "0");
+        let duplicate = server.post(&url).text(envelope.clone()).await;
+        duplicate.assert_status_ok();
+        assert_eq!(
+            duplicate.header("x-temps-sentry-client-outcomes-duplicates"),
+            "1"
+        );
+        server
+            .post(&url)
+            .text(format!("{{}}\n{report}"))
+            .await
+            .assert_status_ok();
+        ctx._db
+            .connection()
+            .execute_unprepared("UPDATE telemetry_client_outcome_receipt_budgets SET used=0")
+            .await
+            .unwrap();
+        let recovered = server.post(&url).text(new_identity).await;
+        recovered.assert_status_ok();
+        assert_eq!(
+            recovered.header("x-temps-sentry-client-outcomes-accepted"),
+            "1"
+        );
+        ctx._db.connection().execute_unprepared("UPDATE telemetry_client_outcome_receipt_budgets SET used=131072 WHERE project_id IS NULL").await.unwrap();
+        let global_new = envelope.replace(id, "6234567890abcdef1234567890abcdef");
+        let full = server.post(&url).text(global_new.clone()).await;
+        assert_eq!(full.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        ctx._db
+            .connection()
+            .execute_unprepared("UPDATE telemetry_client_outcome_receipt_budgets SET used=0")
+            .await
+            .unwrap();
+        let recovered = server.post(&url).text(global_new).await;
+        recovered.assert_status_ok();
+        assert_eq!(
+            recovered.header("x-temps-sentry-client-outcomes-accepted"),
+            "1"
+        );
+        let totals = ctx
+            .app_state
+            .error_tracking_service
+            .client_outcomes
+            .list(ctx.project_id, 1, 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            totals
+                .items
+                .iter()
+                .find(|row| row.environment_id.is_none())
+                .unwrap()
+                .quantity,
+            "33"
+        );
+        // Expiration cleanup and a renewed claim can race. Every successful
+        // renewal must retain its receipt so the next retry remains a duplicate.
+        let source_key = super::super::client_reports::decode_report(payload, Some(id), 0)
+            .unwrap()
+            .source_key
+            .unwrap();
+        for _ in 0..8 {
+            let expired = ctx._db.connection().execute(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+                "UPDATE telemetry_client_outcome_receipts SET expires_at=NOW()-INTERVAL '1 second' WHERE project_id=$1 AND environment_id IS NULL AND deployment_id IS NULL AND source_key=$2",
+                [ctx.project_id.into(),source_key.clone().into()])).await.unwrap().rows_affected();
+            assert_eq!(expired, 1);
+            let (renewed, cleanup) = tokio::join!(
+                async { server.post(&url).text(envelope.clone()).await },
+                ctx.app_state
+                    .error_tracking_service
+                    .client_outcomes
+                    .cleanup()
+            );
+            assert_eq!(renewed.status_code(), StatusCode::OK);
+            assert_eq!(
+                renewed.header("x-temps-sentry-client-outcomes-accepted"),
+                "1"
+            );
+            cleanup.unwrap();
+            let duplicate = server.post(&url).text(envelope.clone()).await;
+            assert_eq!(duplicate.status_code(), StatusCode::OK);
+            assert_eq!(
+                duplicate.header("x-temps-sentry-client-outcomes-accepted"),
+                "0"
+            );
+            assert_eq!(
+                duplicate.header("x-temps-sentry-client-outcomes-duplicates"),
+                "1"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn browser_report_http_routes_use_native_services_and_scoped_dsns() {
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let csp = serde_json::json!({"csp-report":{"effective-directive":"script-src","violated-directive":"script-src","blocked-uri":"inline","document-uri":"https://synthetic.example/page"}});
+        let endpoint = format!("/{}/security/?sentry_key={}", ctx.project_id, ctx.dsn_key);
+        let response = server
+            .post(&endpoint)
+            .text(csp.to_string())
+            .content_type("application/csp-report")
+            .await;
+        response.assert_status_ok();
+        assert_eq!(response.header("x-temps-sentry-errors-stored"), "1");
+        server
+            .post(&format!(
+                "/{}/security/?sentry_key={}",
+                ctx.project_id + 1,
+                ctx.dsn_key
+            ))
+            .text(csp.to_string())
+            .content_type("application/csp-report")
+            .await
+            .assert_status_unauthorized();
+        let nel = serde_json::json!([{ "type":"network-error","url":"https://synthetic.example/api","body":{"type":"dns.failed","phase":"dns","elapsed_time":12,"status_code":0}}]);
+        let endpoint = format!("/{}/nel/?sentry_key={}", ctx.project_id, ctx.dsn_key);
+        let response = server
+            .post(&endpoint)
+            .text(nel.to_string())
+            .content_type("application/reports+json")
+            .await;
+        response.assert_status_ok();
+        assert_eq!(response.header("x-temps-sentry-logs-stored"), "1");
+        let logs = ctx
+            .app_state
+            .otel_service
+            .query_logs(native_log_query(ctx.project_id))
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].resource.service_name, "sentry.nel");
+        assert_eq!(logs[0].attributes["nel.type"], "dns.failed");
+        assert_eq!(
+            logs[0].attribute_types["http.response.status_code"],
+            temps_otel::types::LogAttributeType::Integer
+        );
+        let response = server
+            .post(&endpoint)
+            .content_type("text/plain")
+            .text(nel.to_string())
+            .await;
+        assert_eq!(response.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        server
+            .post(&endpoint)
+            .text("invalid")
+            .content_type("application/reports+json")
+            .await
+            .assert_status_bad_request();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2019,7 +2826,7 @@ mod tests {
             return;
         };
         let path = format!("/{}/envelope/?sentry_key={}", ctx.project_id, ctx.dsn_key);
-        let envelope=Bytes::from_static(br#"{}
+        let envelope=Bytes::from_static(br#"{"event_id":"1234567890abcdef1234567890abcdef"}
 {"type":"span"}
 {"trace_id":"11111111111111111111111111111111","span_id":"2222222222222222","start_timestamp":1790000000,"timestamp":1790000001,"description":"Synthetic span"}
 {"type":"trace_metric","item_count":1,"content_type":"application/vnd.sentry.items.trace-metric+json"}
@@ -2061,7 +2868,12 @@ mod tests {
                 );
                 continue;
             }
-            assert_eq!(response.header("x-temps-sentry-spans-stored"), "1");
+            // The span commits before metric failure. Later attempts carry
+            // the same trace/span identity and must not inflate its count.
+            assert_eq!(
+                response.header("x-temps-sentry-spans-stored"),
+                if scenario == "permanent" { "1" } else { "0" }
+            );
             if scenario == "recover" {
                 response.assert_status_ok();
                 assert_eq!(response.header("x-temps-sentry-metrics-stored"), "1");
@@ -2136,15 +2948,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Official SDK prerequisites: scripts/sentry-acceptance.sh sdk"]
     #[serial_test::serial]
     async fn official_sdk_traces_metrics_and_replay_reach_native_queries() {
         use sea_orm::ConnectionTrait;
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_otel::types::{MetricAggregation, MetricQuery, TraceQuery};
-        let Ok(entry) = std::env::var("TEMPS_SENTRY_SIGNALS_SDK") else {
-            eprintln!("Signal conformance not run: TEMPS_SENTRY_SIGNALS_SDK unset");
-            return;
-        };
+        let entry = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_SIGNALS_SDK");
         let Some(ctx) = conformance_test_context().await else {
             return;
         };
@@ -2152,7 +2962,9 @@ mod tests {
             .nest("/api", configure_routes())
             .layer(axum::middleware::from_fn(inject_test_request_metadata))
             .with_state(ctx.app_state.clone());
-        let server = TestServer::builder().http_transport().build(router);
+        let server = TestServer::builder()
+            .http_transport()
+            .build(router.into_make_service_with_connect_info::<SocketAddr>());
         let base = server.server_address().unwrap();
         let dsn = format!(
             "http://{}@{}/{}",
@@ -2178,8 +2990,7 @@ mod tests {
                 .unwrap();
             assert!(
                 output.status.success(),
-                "Official SDK scenario {mode} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "Official SDK scenario {mode} failed (credential-bearing output suppressed)"
             );
             let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             if mode.starts_with("replay") {
@@ -2482,15 +3293,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Official SDK prerequisites: scripts/sentry-acceptance.sh sdk"]
     #[serial_test::serial]
     async fn official_sdk_ingestion_reaches_native_queries_and_reports_unsupported() {
         // Explicit opt-in supplies a temporary installation, never customer data.
         // Run separately for each pinned SDK entry point. Absence is a reported
         // live conformance blocker, never proof of SDK compatibility.
-        let Ok(entry) = std::env::var("TEMPS_SENTRY_CONFORMANCE_SDK") else {
-            eprintln!("SDK conformance not run: TEMPS_SENTRY_CONFORMANCE_SDK is not set");
-            return;
-        };
+        let entry = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_CONFORMANCE_SDK");
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         let Some(ctx) = conformance_test_context().await else {
             return;
@@ -2499,7 +3308,9 @@ mod tests {
             .nest("/api", configure_routes())
             .layer(axum::middleware::from_fn(inject_test_request_metadata))
             .with_state(ctx.app_state.clone());
-        let server = TestServer::builder().http_transport().build(router);
+        let server = TestServer::builder()
+            .http_transport()
+            .build(router.into_make_service_with_connect_info::<SocketAddr>());
         let base = server.server_address().unwrap();
         let dsn = format!(
             "http://{}@{}/{id}",
@@ -2544,10 +3355,34 @@ mod tests {
                 .unwrap();
             assert!(
                 output.status.success(),
-                "synthetic SDK {mode}: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "synthetic SDK {mode} failed (credential-bearing output suppressed)"
             );
             let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if mode.starts_with("browser") {
+                assert_eq!(summary["deliveries"], serde_json::json!([200]));
+            } else {
+                let outcomes = summary["outcomes"].as_array().unwrap();
+                assert!(!outcomes.is_empty());
+                assert!(outcomes
+                    .iter()
+                    .all(|o| o["status"] == 200 && o["types"] == ""));
+                let total = |key: &str| {
+                    outcomes
+                        .iter()
+                        .map(|o| o[key].as_u64().unwrap())
+                        .sum::<u64>()
+                };
+                assert_eq!(
+                    total("errors"),
+                    summary["events"].as_array().unwrap().len() as u64
+                );
+                assert_eq!(total("logs"), summary["logs"].as_u64().unwrap());
+                assert_eq!(total("check_ins"), summary["check_ins"].as_u64().unwrap());
+                assert_eq!(total("unsupported"), 0);
+                if mode.starts_with("errors") {
+                    assert!(outcomes.iter().all(|o| o["gzip"] == true));
+                }
+            }
             ctx.app_state
                 .cron_monitor_service
                 .sync_alarms(&alarms)
@@ -2751,16 +3586,23 @@ mod tests {
             let mut query = native_log_query(ctx.project_id);
             query.trace_id = Some(summary["trace_id"].as_str().unwrap().to_owned());
             let logs = ctx.app_state.otel_service.query_logs(query).await.unwrap();
-            if mode == "browser-auto" {
-                assert!(logs.is_empty(), "unsupported inference must not write logs");
-                eprintln!("SDK 11.8.0 browser-auto: rejected 400 with no native logs");
-                continue;
-            }
             assert_eq!(
                 logs.len(),
                 2,
                 "{mode}: SDK -> HTTP -> native storage -> trace query"
             );
+            if mode.starts_with("browser") {
+                for log in &logs {
+                    if mode == "browser-auto" {
+                        assert_eq!(log.attributes["user.ip_address"], "127.0.0.1");
+                        assert_eq!(log.attributes["browser.name"], "Chrome");
+                        assert!(log.attributes.contains_key("browser.version"));
+                    } else {
+                        assert!(!log.attributes.contains_key("user.ip_address"));
+                        assert!(!log.attributes.contains_key("browser.name"));
+                    }
+                }
+            }
             assert_eq!(
                 logs[0].resource.service_version.as_deref(),
                 Some("synthetic-release-1")
@@ -2787,6 +3629,46 @@ mod tests {
                 summary["sdk"]
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repeated_telemetry_batches_store_together_through_native_services() {
+        let Some(ctx) = conformance_test_context().await else {
+            return;
+        };
+        let server = TestServer::new(configure_routes().with_state(ctx.app_state.clone()));
+        let path = format!("/{}/envelope/?sentry_key={}", ctx.project_id, ctx.dsn_key);
+        let mut envelope = synthetic_log_envelope().to_vec();
+        let metric = br#"{"type":"trace_metric","item_count":1,"content_type":"application/vnd.sentry.items.trace-metric+json"}
+{"items":[{"timestamp":1790000000,"trace_id":"11111111111111111111111111111111","name":"synthetic.repeated","type":"counter","value":3}]}
+"#;
+        envelope.extend_from_slice(metric);
+        envelope.extend_from_slice(&synthetic_log_envelope()[3..]);
+        envelope.extend_from_slice(metric);
+        let response = server.post(&path).bytes(Bytes::from(envelope)).await;
+        response.assert_status_ok();
+        assert_eq!(response.header("x-temps-sentry-logs-stored"), "2");
+        assert_eq!(response.header("x-temps-sentry-metrics-stored"), "2");
+        let logs = ctx
+            .app_state
+            .otel_service
+            .query_logs(native_log_query(ctx.project_id))
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 2);
+        let metrics = ctx
+            .app_state
+            .otel_service
+            .query_metrics(temps_otel::types::MetricQuery {
+                project_id: ctx.project_id,
+                metric_name: Some("synthetic.repeated".into()),
+                aggregation: temps_otel::types::MetricAggregation::Sum,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(metrics.iter().map(|b| b.value).sum::<f64>(), 6.0);
     }
 
     #[tokio::test]
@@ -2821,11 +3703,17 @@ mod tests {
             .execute_sql("DROP TABLE otel_log_events CASCADE")
             .await
             .unwrap();
-        let response = server.post(&path).bytes(Bytes::from(mixed)).await;
+        let response = server.post(&path).bytes(Bytes::from(mixed.clone())).await;
         response.assert_status_internal_server_error();
         assert_eq!(response.header("x-temps-sentry-errors-stored"), "1");
         assert_eq!(response.header("x-temps-sentry-logs-stored"), "0");
         assert_eq!(ctx.app_state.otel_service.pipeline_stats().logs_dropped, 1);
+        // Retry the whole mixed envelope after its error already committed.
+        let retry = server.post(&path).bytes(Bytes::from(mixed)).await;
+        retry.assert_status_internal_server_error();
+        assert_eq!(retry.header("x-temps-sentry-errors-stored"), "0");
+        assert_eq!(retry.header("x-temps-sentry-errors-duplicates"), "1");
+        assert_eq!(error_event_project_ids(&ctx).await.len(), 1);
     }
 
     #[test]
@@ -3223,6 +4111,38 @@ mod tests {
     }
 
     // === Decompression bomb protection tests ===
+
+    #[test]
+    fn test_decompress_rejects_unknown_stacked_and_trailing_gzip_data() {
+        use std::io::Write;
+        let body = Bytes::from_static(b"{}\n");
+        for encoding in ["br", "not-gzip", "gzip, br"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_ENCODING,
+                HeaderValue::from_str(encoding).unwrap(),
+            );
+            assert!(decompress_if_needed(&headers, &body).is_err());
+        }
+        let mut headers = HeaderMap::new();
+        headers.append(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        headers.append(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(decompress_if_needed(&headers, &body).is_err());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let member = encoder.finish().unwrap();
+        let mut joined = member.clone();
+        joined.extend_from_slice(&member);
+        headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert_eq!(
+            decompress_if_needed(&headers, &Bytes::from(joined)).unwrap(),
+            Bytes::from_static(b"{}\n{}\n")
+        );
+        let mut bad = member;
+        bad.extend_from_slice(b"trailing junk");
+        assert!(decompress_if_needed(&headers, &Bytes::from(bad)).is_err());
+    }
 
     #[test]
     fn test_decompress_normal_gzip() {
@@ -4494,5 +5414,832 @@ mod tests {
             HeaderValue::from_static("DSN "),
         );
         assert_eq!(extract_dsn_key(&headers, &empty_params), None);
+    }
+    // Native assertions live in Rust. Foreign runtimes only emit official SDK
+    // traffic. Explicitly ignored unless invoked by scripts/sentry-acceptance.sh;
+    // missing prerequisites FAIL that run, rather than silently skipping it.
+    struct PrioritySdkHarness {
+        ctx: TestContext,
+        server: TestServer,
+        dsn: String,
+        tunnel: String,
+    }
+    impl PrioritySdkHarness {
+        async fn new() -> Self {
+            let ctx = create_test_context().await;
+            let router = Router::new()
+                .nest("/api", configure_routes())
+                .layer(axum::middleware::from_fn(inject_test_request_metadata))
+                .with_state(ctx.app_state.clone());
+            let server = TestServer::builder()
+                .http_transport()
+                .build(router.into_make_service_with_connect_info::<SocketAddr>());
+            let base = server.server_address().unwrap();
+            Self {
+                dsn: format!(
+                    "http://{}@{}/{}",
+                    ctx.dsn_key,
+                    base.authority(),
+                    ctx.project_id
+                ),
+                tunnel: format!("{base}api{SENTRY_TUNNEL_ROUTE_PATH}"),
+                ctx,
+                server,
+            }
+        }
+        fn fixture(name: &str) -> String {
+            format!("{}/../../scripts/{name}", env!("CARGO_MANIFEST_DIR"))
+        }
+        fn prerequisite(name: &str) -> String {
+            std::env::var(name)
+                .unwrap_or_else(|_| panic!("Missing {name}; run scripts/sentry-acceptance.sh sdk"))
+        }
+        async fn emit(
+            &self,
+            runtime: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            expected: i32,
+        ) -> serde_json::Value {
+            let mut command = tokio::process::Command::new(runtime);
+            command
+                .args(args)
+                .env("SENTRY_DSN", &self.dsn)
+                .kill_on_drop(true);
+            if let Some(path) = cwd {
+                command.current_dir(path);
+            }
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(180), command.output())
+                    .await
+                    .expect("Official SDK process timed out")
+                    .expect("Could not start official SDK runtime");
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "Official SDK fixture failed; credential-bearing output suppressed"
+            );
+            let stdout = std::str::from_utf8(&output.stdout).expect("SDK summary is not UTF8");
+            serde_json::from_str(stdout.lines().last().expect("SDK summary missing"))
+                .expect("SDK summary is not JSON")
+        }
+        async fn events(&self, run: &str) -> Vec<(i32, serde_json::Value)> {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            self.ctx._db.connection().query_all(Statement::from_sql_and_values(DbBackend::Postgres,
+                "SELECT error_group_id,data FROM error_events WHERE project_id=$1 AND data #>> '{sentry,tags,synthetic.run}'=$2 ORDER BY id",
+                [self.ctx.project_id.into(),run.into()])).await.unwrap().into_iter().map(|r|(r.try_get("","error_group_id").unwrap(),r.try_get("","data").unwrap())).collect()
+        }
+        async fn metric(
+            &self,
+            name: &str,
+            run: &str,
+            aggregation: temps_otel::types::MetricAggregation,
+            interval: &str,
+        ) -> Vec<temps_otel::types::MetricBucket> {
+            self.ctx
+                .app_state
+                .otel_service
+                .query_metrics(temps_otel::types::MetricQuery {
+                    project_id: self.ctx.project_id,
+                    metric_name: Some(name.into()),
+                    label_filters: vec![("synthetic.run".into(), run.into())],
+                    aggregation,
+                    bucket_interval: Some(interval.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Official SDK prerequisites: scripts/sentry-acceptance.sh sdk"]
+    #[serial_test::serial]
+    async fn priority_sdk_core_matrix() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let h = PrioritySdkHarness::new().await;
+        let node10 = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_NODE10_SDK");
+        let node11 = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_NODE11_SDK");
+        let browser = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_BROWSER_SDK");
+        let python = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_PYTHON");
+        let go = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_GO_WORKSPACE");
+        let rust = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_RUST_MANIFEST");
+        let mut cases = Vec::new();
+        for (runtime, entry) in [("node", node10), ("node", node11), ("bun", browser)] {
+            for tunnel in [false, true] {
+                cases.push((
+                    runtime.to_string(),
+                    vec![
+                        PrioritySdkHarness::fixture("sentry-errors-conformance.mjs"),
+                        entry.clone(),
+                        h.dsn.clone(),
+                    ],
+                    None,
+                    tunnel,
+                ));
+            }
+        }
+        cases.push((
+            python,
+            vec![PrioritySdkHarness::fixture("fixtures/sentry-errors.py")],
+            None,
+            false,
+        ));
+        cases.push(("go".into(), vec!["run".into(), ".".into()], Some(go), false));
+        cases.push((
+            "cargo".into(),
+            vec![
+                "run".into(),
+                "--quiet".into(),
+                "--manifest-path".into(),
+                rust,
+                "-j2".into(),
+                "--".into(),
+            ],
+            None,
+            false,
+        ));
+        for (runtime, mut args, cwd, tunnel) in cases {
+            let run = format!("synthetic-core-{}", uuid::Uuid::new_v4().simple());
+            args.push(run.clone());
+            if tunnel {
+                args.push(h.tunnel.clone());
+            }
+            let report = h.emit(&runtime, &args, cwd.as_deref(), 0).await;
+            let ids = report["ids"].as_array().unwrap();
+            assert_eq!(ids.len(), 4);
+            let rows = h.events(&run).await;
+            assert_eq!(rows.len(), 4);
+            let mut groups = std::collections::BTreeMap::new();
+            for (group, data) in &rows {
+                let raw = &data["sentry"];
+                assert!(ids.contains(&raw["event_id"]));
+                assert_eq!(raw["sdk"]["version"], report["sdk"]);
+                assert_eq!(data["user"]["user_id"], "synthetic-user");
+                assert_eq!(data["environment"]["release"], "synthetic-release-2");
+                assert!(data["trace"]["contexts"]["synthetic"]["nullable"].is_null());
+                assert!(data["trace"]["breadcrumbs"]
+                    .as_array()
+                    .is_some_and(|v| !v.is_empty()));
+                let (_, count) = h
+                    .ctx
+                    .app_state
+                    .error_tracking_service
+                    .crud
+                    .list_error_events_filtered(
+                        *group,
+                        h.ctx.project_id,
+                        Some(1),
+                        Some(100),
+                        &crate::services::ErrorEventFilter {
+                            user_id: Some("synthetic-user".into()),
+                            tag_key: Some("synthetic.run".into()),
+                            tag_value: Some(run.clone()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(count > 0);
+                let (_, foreign) = h
+                    .ctx
+                    .app_state
+                    .error_tracking_service
+                    .crud
+                    .list_error_events(*group, h.ctx.project_id + 1, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(foreign, 0);
+                groups.insert(*group, ());
+            }
+            assert_eq!(groups.len(), 3);
+            let group_for = |id: &serde_json::Value| {
+                rows.iter()
+                    .find(|(_, v)| v["sentry"]["event_id"] == *id)
+                    .unwrap()
+                    .0
+            };
+            assert_eq!(group_for(&ids[0]), group_for(&ids[1]));
+            let count = h
+                .ctx
+                ._db
+                .connection()
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT total_count::bigint AS total_count FROM error_groups WHERE id=$1",
+                    [group_for(&ids[0]).into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(count.try_get::<i64>("", "total_count").unwrap(), 2);
+            println!(
+                "core SDK {} {}: four native events, three groups, retries/metadata/queries passed",
+                report["sdk"],
+                if tunnel { "tunnel" } else { "direct" }
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Official SDK prerequisites: scripts/sentry-acceptance.sh sdk"]
+    #[serial_test::serial]
+    async fn priority_sdk_framework_native_acceptance() {
+        use temps_otel::types::*;
+        let h = PrioritySdkHarness::new().await;
+        let node = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_NODE11_SDK");
+        let browser = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_BROWSER_SDK");
+        let run = format!("synthetic-framework-{}", uuid::Uuid::new_v4().simple());
+        let report = h
+            .emit(
+                "bun",
+                &[
+                    PrioritySdkHarness::fixture("sentry-framework-conformance.mjs"),
+                    node.clone(),
+                    browser.clone(),
+                    run.clone(),
+                ],
+                None,
+                0,
+            )
+            .await;
+        let trace = report["trace_id"].as_str().unwrap();
+        let spans = h
+            .ctx
+            .app_state
+            .otel_service
+            .get_trace(h.ctx.project_id, trace)
+            .await
+            .unwrap();
+        assert!(spans.len() >= 4);
+        let ids: std::collections::BTreeSet<_> = spans.iter().map(|s| s.span_id.as_str()).collect();
+        assert_eq!(ids.len(), spans.len());
+        let roots: Vec<_> = spans
+            .iter()
+            .filter(|s| s.parent_span_id.is_none())
+            .collect();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name, "Synthetic browser checkout");
+        assert!(spans.iter().all(|s| s
+            .parent_span_id
+            .as_deref()
+            .is_none_or(|id| ids.contains(id))));
+        assert!(spans.iter().filter(|s| s.kind == SpanKind::Server).count() >= 2);
+        assert!(spans.iter().any(|s| s.kind == SpanKind::Client));
+        assert!(spans.iter().any(|s| s.status_code == SpanStatusCode::Error));
+        assert!(spans
+            .iter()
+            .all(|s| s.resource.service_version.as_deref() == Some(run.as_str())));
+        let rows = h.events(&run).await;
+        assert_eq!(rows.len(), 1);
+        let data = &rows[0].1;
+        assert_eq!(data["sentry"]["event_id"], report["event_id"]);
+        let exceptions = data["sentry"]["exception"]["values"].as_array().unwrap();
+        assert_eq!(exceptions.len(), 2);
+        assert_eq!(exceptions[0]["value"], "Synthetic framework cause");
+        assert_eq!(exceptions[1]["value"], "Synthetic framework outer");
+        assert!(exceptions.iter().all(|v| v["stacktrace"]["frames"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty())));
+        assert_eq!(data["trace"]["contexts"]["trace"]["trace_id"], trace);
+        assert_eq!(
+            data["trace"]["contexts"]["synthetic_context"]["nested"],
+            serde_json::json!({"number":7,"flag":true,"missing":null})
+        );
+        assert_eq!(
+            data["trace"]["contexts"]["synthetic_context"]["unicode"],
+            "Synthetic café 漢字"
+        );
+        let breadcrumb = data["trace"]["breadcrumbs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["message"] == "Synthetic checkout")
+            .unwrap();
+        assert_eq!(
+            breadcrumb["data"],
+            serde_json::json!({"count":7,"flag":true,"nested":{"empty":null}})
+        );
+        let logs = h
+            .ctx
+            .app_state
+            .otel_service
+            .query_logs(LogQuery {
+                project_id: h.ctx.project_id,
+                trace_id: Some(trace.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(ids.contains(logs[0].span_id.as_deref().unwrap()));
+        assert_eq!(logs[0].body, "Synthetic framework item 7");
+        assert_eq!(logs[0].attributes["sentry.message.parameter.0"], "7");
+        for interval in ["5min", "1h"] {
+            for (name, aggregation, expected) in [
+                ("requests", MetricAggregation::Sum, 2.0),
+                ("queue", MetricAggregation::Avg, 7.0),
+                ("duration", MetricAggregation::Sum, 25.0),
+                ("duration", MetricAggregation::Count, 5.0),
+                ("duration", MetricAggregation::Avg, 5.0),
+                ("duration", MetricAggregation::Min, 1.0),
+                ("duration", MetricAggregation::Max, 9.0),
+                ("duration", MetricAggregation::Quantile(0.5), 5.0),
+                ("duration", MetricAggregation::Quantile(0.95), 8.6),
+            ] {
+                let buckets = h
+                    .metric(
+                        &format!("synthetic.framework.{name}"),
+                        &run,
+                        aggregation,
+                        interval,
+                    )
+                    .await;
+                assert_eq!(buckets.len(), 1);
+                assert!(
+                    (buckets[0].value - expected).abs() < 1e-9,
+                    "Native {name} aggregate mismatch"
+                );
+            }
+        }
+        let releases = h
+            .ctx
+            .app_state
+            .error_tracking_service
+            .releases
+            .list(h.ctx.project_id, Some(run.clone()), 7, 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(releases.items.len(), 1);
+        let release = &releases.items[0];
+        assert_eq!(
+            (
+                release.errors,
+                release.logs,
+                release.spans,
+                release.metric_points
+            ),
+            (1, 1, report["span_count"].as_i64().unwrap(), 7)
+        );
+        let transport = h
+            .emit(
+                "node",
+                &[
+                    PrioritySdkHarness::fixture("sentry-transport-conformance.mjs"),
+                    node.clone(),
+                    run.clone(),
+                ],
+                None,
+                0,
+            )
+            .await;
+        let rows = h.events(&run).await;
+        let event_ids: Vec<_> = rows.iter().map(|(_, v)| &v["sentry"]["event_id"]).collect();
+        assert!(event_ids.contains(&&transport["recovered"]));
+        assert!(!event_ids.contains(&&transport["first"]));
+        assert!(!event_ids.contains(&&transport["suppressed"]));
+        for mode in ["uncaught", "rejection"] {
+            let fatal = h
+                .emit(
+                    "node",
+                    &[
+                        PrioritySdkHarness::fixture("sentry-framework-conformance.mjs"),
+                        node.clone(),
+                        browser.clone(),
+                        run.clone(),
+                        mode.into(),
+                    ],
+                    None,
+                    1,
+                )
+                .await;
+            let rows = h.events(&format!("{run}.{mode}")).await;
+            assert_eq!(rows.len(), 1);
+            let data = &rows[0].1;
+            assert_eq!(data["sentry"]["event_id"], fatal["id"]);
+            let exceptions = data["sentry"]["exception"]["values"].as_array().unwrap();
+            assert_eq!(exceptions.last().unwrap()["mechanism"]["handled"], false);
+            assert!(data["stack_trace"]
+                .as_array()
+                .is_some_and(|v| !v.is_empty()));
+        }
+        // Explicit wire fixture: child arrives before parent; native retry is zero new rows.
+        let wire_trace = uuid::Uuid::new_v4().simple().to_string();
+        let root = "1111111111111111";
+        let child = "2222222222222222";
+        let path = format!(
+            "/api/{}/envelope/?sentry_key={}",
+            h.ctx.project_id, h.ctx.dsn_key
+        );
+        for (id, parent, expected) in [
+            (child, Some(root), "1"),
+            (root, None, "1"),
+            (child, Some(root), "0"),
+        ] {
+            let payload = serde_json::json!({"version":2,"items":[{"name":"Synthetic ordered span","trace_id":wire_trace,"span_id":id,"parent_span_id":parent,"start_timestamp":Utc::now().timestamp()-1,"end_timestamp":Utc::now().timestamp(),"status":"ok","attributes":{}}]});
+            let header = serde_json::json!({"type":"span","item_count":1,"content_type":"application/vnd.sentry.items.span.v2+json"});
+            let response = h
+                .server
+                .post(&path)
+                .text(format!("{{}}\n{header}\n{payload}\n"))
+                .await;
+            response.assert_status_ok();
+            assert_eq!(response.header("x-temps-sentry-spans-stored"), expected);
+        }
+        let spans = h
+            .ctx
+            .app_state
+            .otel_service
+            .get_trace(h.ctx.project_id, &wire_trace)
+            .await
+            .unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            spans
+                .iter()
+                .find(|s| s.span_id == child)
+                .unwrap()
+                .parent_span_id
+                .as_deref(),
+            Some(root)
+        );
+        println!("browser/Express/downstream, fatal integrations, metadata, 18 metric aggregates, release correlation, gzip/Retry-After and out-of-order wire acceptance passed");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Official SDK prerequisites: scripts/sentry-acceptance.sh sdk"]
+    #[serial_test::serial]
+    async fn priority_sdk_cross_runtime_traces_and_typed_logs() {
+        use temps_otel::types::*;
+        let h = PrioritySdkHarness::new().await;
+        let python = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_PYTHON");
+        let go = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_GO_WORKSPACE");
+        let rust = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_RUST_MANIFEST");
+        for (runtime, args, cwd) in [
+            (
+                python.clone(),
+                vec![PrioritySdkHarness::fixture("fixtures/sentry-traces.py")],
+                None,
+            ),
+            (
+                "go".into(),
+                vec![
+                    "run".into(),
+                    PrioritySdkHarness::fixture("fixtures/sentry-traces.go"),
+                ],
+                Some(go),
+            ),
+            (
+                "cargo".into(),
+                vec![
+                    "run".into(),
+                    "--quiet".into(),
+                    "--manifest-path".into(),
+                    rust,
+                    "--example".into(),
+                    "traces".into(),
+                    "-j2".into(),
+                    "--".into(),
+                ],
+                None,
+            ),
+        ] {
+            let run = format!("synthetic-tracing-{}", uuid::Uuid::new_v4().simple());
+            let mut args = args;
+            args.push(run.clone());
+            let report = h.emit(&runtime, &args, cwd.as_deref(), 0).await;
+            let spans = h
+                .ctx
+                .app_state
+                .otel_service
+                .get_trace(h.ctx.project_id, report["trace_id"].as_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(spans.len(), 2);
+            let root = spans
+                .iter()
+                .find(|s| s.span_id == report["root_id"].as_str().unwrap())
+                .unwrap();
+            let child = spans
+                .iter()
+                .find(|s| s.span_id == report["child_id"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(root.name, "Synthetic cross SDK root");
+            assert_eq!(child.name, "Synthetic cross SDK child");
+            assert!(root.parent_span_id.is_none());
+            assert_eq!(child.parent_span_id.as_deref(), Some(root.span_id.as_str()));
+            assert_eq!(
+                (root.status_code, child.status_code),
+                (SpanStatusCode::Ok, SpanStatusCode::Error)
+            );
+            assert_eq!(
+                (root.kind, child.kind),
+                (SpanKind::Server, SpanKind::Client)
+            );
+            assert_eq!(child.status_message, "internal_error");
+            assert_eq!(child.attributes["synthetic.flag"], "true");
+            for span in spans {
+                assert!(span.duration_ms > 0.0);
+                assert_eq!(span.attributes["synthetic.run"], run);
+                assert_eq!(span.resource.service_name, "synthetic-tracing-service");
+                assert_eq!(
+                    span.resource.service_version.as_deref(),
+                    Some("synthetic-tracing-release")
+                );
+                assert_eq!(
+                    span.resource.deployment_environment.as_deref(),
+                    Some("synthetic-test")
+                );
+            }
+        }
+        let run = format!("synthetic-typed-{}", uuid::Uuid::new_v4().simple());
+        let report = h
+            .emit(
+                &python,
+                &[
+                    PrioritySdkHarness::fixture("fixtures/sentry-typed-logs.py"),
+                    run.clone(),
+                ],
+                None,
+                0,
+            )
+            .await;
+        let query = LogQuery {
+            project_id: h.ctx.project_id,
+            trace_id: Some(report["trace_id"].as_str().unwrap().into()),
+            ..Default::default()
+        };
+        let logs = h
+            .ctx
+            .app_state
+            .otel_service
+            .query_logs(query.clone())
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 3);
+        assert!(logs
+            .iter()
+            .all(|v| v.span_id.is_some() && v.attributes["synthetic.run"] == run));
+        for (key, value, ty, operator, expected) in [
+            (
+                "count",
+                "9007199254740993",
+                Some(LogAttributeType::Integer),
+                LogAttributeOperator::Eq,
+                1,
+            ),
+            (
+                "count",
+                "9007199254740992",
+                Some(LogAttributeType::Integer),
+                LogAttributeOperator::Gt,
+                1,
+            ),
+            (
+                "count",
+                "9007199254740993",
+                Some(LogAttributeType::String),
+                LogAttributeOperator::Eq,
+                1,
+            ),
+            (
+                "flag",
+                "true",
+                Some(LogAttributeType::Boolean),
+                LogAttributeOperator::Eq,
+                1,
+            ),
+            (
+                "count",
+                "9007199254740993",
+                None,
+                LogAttributeOperator::Eq,
+                2,
+            ),
+            (
+                "count' OR '1'='1",
+                "9007199254740993",
+                None,
+                LogAttributeOperator::Eq,
+                0,
+            ),
+        ] {
+            let found = h
+                .ctx
+                .app_state
+                .otel_service
+                .query_logs(LogQuery {
+                    attribute_filter: Some(LogAttributeFilter {
+                        key: key.into(),
+                        value: value.into(),
+                        ty,
+                        operator,
+                    }),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(found.len(), expected);
+            if ty == Some(LogAttributeType::Integer) {
+                assert_eq!(found[0].attributes["count"], "9007199254740993");
+                assert_eq!(found[0].attribute_types["count"], LogAttributeType::Integer);
+            }
+        }
+        assert!(h
+            .ctx
+            .app_state
+            .otel_service
+            .query_logs(LogQuery {
+                attribute_filter: Some(LogAttributeFilter {
+                    key: "count".into(),
+                    value: "9223372036854775808".into(),
+                    ty: Some(LogAttributeType::Integer),
+                    operator: LogAttributeOperator::Eq
+                }),
+                ..query
+            })
+            .await
+            .is_err());
+        println!("Python/Go/Rust native trace trees and typed int64/string/boolean/range log queries passed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Official SDK prerequisites: scripts/sentry-acceptance.sh sdk"]
+    #[serial_test::serial]
+    async fn priority_sdk_legacy_metrics_and_release_correlation() {
+        use temps_otel::types::*;
+        let h = PrioritySdkHarness::new().await;
+        let legacy = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_NODE8_SDK");
+        let node = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_NODE11_SDK");
+        let run = format!("synthetic-statsd-{}", uuid::Uuid::new_v4().simple());
+        h.emit(
+            "node",
+            &[
+                PrioritySdkHarness::fixture("sentry-statsd-conformance.mjs"),
+                legacy,
+                run.clone(),
+            ],
+            None,
+            0,
+        )
+        .await;
+        for (name, aggregation, expected) in [
+            ("requests", MetricAggregation::Sum, 2.0),
+            ("queue", MetricAggregation::Avg, 7.0),
+            ("duration", MetricAggregation::Avg, 20.0),
+        ] {
+            let buckets = h
+                .metric(&format!("synthetic.legacy.{name}"), &run, aggregation, "1h")
+                .await;
+            assert_eq!(buckets.len(), 1);
+            assert_eq!(buckets[0].value, expected);
+        }
+        let grouped = h
+            .ctx
+            .app_state
+            .otel_service
+            .query_metrics(MetricQuery {
+                project_id: h.ctx.project_id,
+                metric_name: Some("synthetic.legacy.requests".into()),
+                label_filters: vec![("synthetic.run".into(), run.clone())],
+                group_by: vec!["synthetic.escaped".into()],
+                aggregation: MetricAggregation::Sum,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            grouped[0].series_key.as_ref().unwrap()[0].1,
+            "comma,pipe|newline\nend"
+        );
+        assert!(h
+            .metric("synthetic.legacy.users", &run, MetricAggregation::Avg, "1h")
+            .await
+            .is_empty());
+        let release = format!("synthetic-release-{}", uuid::Uuid::new_v4().simple());
+        let emitted = h
+            .emit(
+                "node",
+                &[
+                    PrioritySdkHarness::fixture("sentry-release-conformance.mjs"),
+                    node.clone(),
+                    release.clone(),
+                ],
+                None,
+                0,
+            )
+            .await;
+        let service = &h.ctx.app_state.error_tracking_service.releases;
+        let observed = service
+            .list(h.ctx.project_id, Some(release.clone()), 7, 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(observed.total, 1);
+        let row = &observed.items[0];
+        assert_eq!(
+            (
+                row.errors,
+                row.logs,
+                row.spans,
+                row.metric_points,
+                row.feedback,
+                row.check_ins
+            ),
+            (1, 1, 1, 3, 1, 1)
+        );
+        assert_eq!(
+            row.example_trace_id.as_deref(),
+            emitted["trace_id"].as_str()
+        );
+        assert_eq!(
+            row.example_log_trace_id.as_deref(),
+            emitted["trace_id"].as_str()
+        );
+        assert!(
+            row.example_error_group_id.is_some()
+                && row.example_feedback_id.is_some()
+                && row.example_monitor_id.is_some()
+        );
+        for (name, expected) in [("requests", 2.0), ("queue", 7.0), ("duration", 12.5)] {
+            let points = h
+                .metric(
+                    &format!("synthetic.release.{name}"),
+                    &release,
+                    MetricAggregation::Avg,
+                    "1h",
+                )
+                .await;
+            assert_eq!(points.len(), 1);
+            assert_eq!(points[0].value, expected);
+        }
+        let late = h
+            .emit(
+                "node",
+                &[
+                    PrioritySdkHarness::fixture("sentry-release-conformance.mjs"),
+                    node,
+                    release.clone(),
+                    "late".into(),
+                ],
+                None,
+                0,
+            )
+            .await;
+        assert_eq!(late["late"], true);
+        let updated = service
+            .list(h.ctx.project_id, Some(release.clone()), 7, 1, 20)
+            .await
+            .unwrap();
+        let updated = &updated.items[0];
+        assert_eq!(
+            (
+                updated.errors,
+                updated.logs,
+                updated.spans,
+                updated.metric_points
+            ),
+            (1, 2, 1, 3)
+        );
+        assert_eq!(updated.first_seen, row.first_seen);
+        assert!(updated.last_seen >= row.last_seen);
+        assert!(service
+            .list(h.ctx.project_id, Some(release.clone()), 7, 2, 1)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(service
+            .list(h.ctx.project_id + 1, Some(release.clone()), 7, 1, 20)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(service
+            .list(h.ctx.project_id, Some("' OR '1'='1".into()), 7, 1, 20)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+        for (days, page, size) in [(32, 1, 20), (7, 0, 20), (7, 1, 101), (7, u64::MAX, 20)] {
+            assert!(service
+                .list(h.ctx.project_id, None, days, page, size)
+                .await
+                .is_err());
+        }
+        h.ctx
+            .app_state
+            .error_tracking_service
+            .feedback
+            .delete(h.ctx.project_id, row.example_feedback_id.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .list(h.ctx.project_id, Some(release), 7, 1, 20)
+                .await
+                .unwrap()
+                .items[0]
+                .feedback,
+            0
+        );
+        println!("legacy delta/gauge/distribution/escaped-label/unsupported-set and six-signal release late-arrival/scope/pagination/deletion acceptance passed");
     }
 }

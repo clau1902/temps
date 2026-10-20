@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import {
+  replayEventData,
+  replayCustomDescription,
+} from '@/lib/replay-event-description'
 import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse, SessionEventDto } from '@/api/client'
@@ -122,25 +126,27 @@ const getEventDescription = (event: SessionEventDto): string => {
   const eventInfo =
     EVENT_TYPE_INFO[event.event_type as keyof typeof EVENT_TYPE_INFO]
 
+  if (event.event_type === 5) return replayCustomDescription(event.data)
+  const data = replayEventData(event.data)
+
   // For incremental snapshots, get more detail
-  if (event.event_type === 3 && isIncrementalSnapshotData(event.data)) {
-    if (event.data.source !== undefined) {
+  if (event.event_type === 3 && isIncrementalSnapshotData(data)) {
+    if (data.source !== undefined) {
       const incrementalType =
-        INCREMENTAL_TYPES[
-          event.data.source as keyof typeof INCREMENTAL_TYPES
-        ] || 'Unknown'
+        INCREMENTAL_TYPES[data.source as keyof typeof INCREMENTAL_TYPES] ||
+        'Unknown'
       return incrementalType
     }
   }
 
   // For meta events, show URL if available
-  if (event.event_type === 4 && isMetaEventData(event.data)) {
-    if (event.data.href) {
+  if (event.event_type === 4 && isMetaEventData(data)) {
+    if (data.href) {
       try {
-        const url = new URL(event.data.href)
+        const url = new URL(data.href)
         return url.pathname
       } catch {
-        return event.data.href
+        return data.href
       }
     }
   }
@@ -149,12 +155,13 @@ const getEventDescription = (event: SessionEventDto): string => {
 }
 
 const getEventIcon = (event: SessionEventDto) => {
+  const data = replayEventData(event.data)
   const eventInfo =
     EVENT_TYPE_INFO[event.event_type as keyof typeof EVENT_TYPE_INFO]
 
   // Special icons for incremental snapshot types
-  if (event.event_type === 3 && isIncrementalSnapshotData(event.data)) {
-    if (event.data.source !== undefined) {
+  if (event.event_type === 3 && isIncrementalSnapshotData(data)) {
+    if (data.source !== undefined) {
       const iconMap: Record<
         number,
         React.ComponentType<{ className?: string }>
@@ -176,17 +183,11 @@ const getEventIcon = (event: SessionEventDto) => {
         14: TextSelect, // Selection
         15: FileCode, // Adopted Style Sheet
       }
-      return iconMap[event.data.source] || MousePointer
+      return iconMap[data.source] || MousePointer
     }
   }
 
   return eventInfo?.icon || MousePointer
-}
-
-const getEventColor = (event: SessionEventDto) => {
-  const eventInfo =
-    EVENT_TYPE_INFO[event.event_type as keyof typeof EVENT_TYPE_INFO]
-  return eventInfo?.color || 'text-gray-500'
 }
 
 export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
@@ -249,9 +250,10 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
     let currentGroup: (typeof groups)[0] | null = null
 
     events.forEach((event) => {
+      const data = replayEventData(event.data)
       const subType =
-        event.event_type === 3 && isIncrementalSnapshotData(event.data)
-          ? event.data.source
+        event.event_type === 3 && isIncrementalSnapshotData(data)
+          ? data.source
           : undefined
 
       // Check if should group with previous
@@ -357,6 +359,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
 
   // Helper function to format event data preview
   const formatEventDataPreview = (eventData: any): string => {
+    eventData = replayEventData(eventData)
     // Check for meta event with href
     if (isMetaEventData(eventData)) {
       if (eventData.href) return eventData.href
@@ -474,7 +477,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                     const firstEvent = group.events[0]
                     const firstEventData = firstEvent.data as any
                     const Icon = getEventIcon(firstEvent)
-                    const color = getEventColor(firstEvent)
+                    const color = 'text-muted-foreground'
                     const description = getEventDescription(firstEvent)
                     const isSelected = selectedEventId === String(firstEvent.id)
 

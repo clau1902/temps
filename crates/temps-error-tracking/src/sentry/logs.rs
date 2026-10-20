@@ -2,22 +2,22 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Adapter for the official batched Sentry log protocol. No OTLP encoding or
-//! secondary storage is involved. The native string attribute map exposes
-//! searchable values; `temps.sentry.attributes` preserves declared types and
-//! numeric lexemes until native typed log filtering is available.
+//! secondary storage is involved. Native type metadata accompanies the exact
+//! string values for typed queries; `temps.sentry.attributes` retains the
+//! original typed wire representation for compatibility with older readers.
 //!
 //! Contract baseline: sentry-javascript 10.17.0, source revision
 //! eb6e2946eb45583dd4c02ec92f8912e5bad51943, packages/core/src/logs/envelope.ts
 //! and types-hoist/log.ts; also 11.8.0, revision
 //! c6492ef78c7bfb97931e43075763ce84ee8fda7e. Version-2 batches are accepted
-//! without inference; automatic IP/UA inference is explicitly unsupported.
+//! with opt-in HTTP inference shared by logs, spans, and metrics.
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{de, Deserialize, Deserializer};
 use serde_json::value::RawValue;
-use temps_otel::types::{LogRecord, LogSeverity, ResourceInfo};
+use temps_otel::types::{LogAttributeType, LogRecord, LogSeverity, ResourceInfo};
 
 use super::envelope::{EnvelopeError, ItemHeader};
 use crate::providers::AuthContext;
@@ -34,7 +34,7 @@ pub(super) struct Batch<'a> {
     pub(super) ingest_settings: Option<IngestSettings>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(super) struct IngestSettings {
     pub(super) infer_ip: Option<String>,
@@ -232,16 +232,7 @@ pub fn decode_logs(
     {
         return Err(invalid("unsupported log protocol version"));
     }
-    if let Some(settings) = batch.ingest_settings {
-        if settings.infer_ip.as_deref().is_some_and(|s| s != "never")
-            || settings
-                .infer_user_agent
-                .as_deref()
-                .is_some_and(|s| s != "never")
-        {
-            return Err(invalid("automatic IP/user-agent inference is unsupported"));
-        }
-    }
+    super::inference::validate(batch.ingest_settings.as_ref())?;
     if header.item_count != Some(batch.items.len()) {
         return Err(invalid("item_count does not match items"));
     }
@@ -318,7 +309,34 @@ pub fn decode_logs(
         if let Some(id) = auth.environment_id {
             attributes.insert("temps.sentry.environment_id".into(), id.to_string());
         }
+        let mut attribute_types: BTreeMap<String, LogAttributeType> = attributes
+            .keys()
+            .map(|key| (key.clone(), LogAttributeType::String))
+            .collect();
+        for (key, raw) in &log.attributes {
+            let attribute: Attribute<'_> = serde_json::from_str(raw.get()).map_err(json_error)?;
+            let ty = match attribute.ty.as_str() {
+                "integer" => LogAttributeType::Integer,
+                "double" => LogAttributeType::Double,
+                "boolean" => LogAttributeType::Boolean,
+                "string" => LogAttributeType::String,
+                _ => return Err(invalid("unsupported attribute type")),
+            };
+            attribute_types.insert(key.clone(), ty);
+        }
+        attribute_types.insert(
+            "temps.sentry.severity_number".into(),
+            LogAttributeType::Integer,
+        );
+        attribute_types.insert("temps.sentry.timestamp".into(), LogAttributeType::Double);
+        if auth.environment_id.is_some() {
+            attribute_types.insert(
+                "temps.sentry.environment_id".into(),
+                LogAttributeType::Integer,
+            );
+        }
         records.push(LogRecord {
+            attribute_types,
             project_id: auth.project_id,
             deployment_id: auth.deployment_id,
             resource,
@@ -369,6 +387,13 @@ mod tests {
             "1790000000.123456789"
         );
         assert_eq!(record.attributes["large"], "9007199254740993");
+        assert_eq!(record.attribute_types["large"], LogAttributeType::Integer);
+        assert_eq!(record.attribute_types["fraction"], LogAttributeType::Double);
+        assert_eq!(record.attribute_types["flag"], LogAttributeType::Boolean);
+        assert_eq!(
+            record.attribute_types["sentry.message.template"],
+            LogAttributeType::String
+        );
         assert_eq!(record.attributes["fraction"], "0.1234567890123456789");
         assert!(record.attributes["temps.sentry.attributes"].contains("9007199254740993"));
         assert!(record.attributes["temps.sentry.attributes"].contains("0.1234567890123456789"));
@@ -457,7 +482,7 @@ mod tests {
         assert!(decode_logs(&header(0), br#"{"items":[],"version":2,"ingest_settings":{"infer_ip":"never","infer_user_agent":"never"}}"#, &auth()).is_ok());
         assert!(decode_logs(
             &header(0),
-            br#"{"items":[],"ingest_settings":{"infer_ip":"auto"}}"#,
+            br#"{"items":[],"ingest_settings":{"infer_ip":"invalid"}}"#,
             &auth()
         )
         .is_err());

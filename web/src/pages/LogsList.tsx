@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  LogAttributeFilter,
+  type LogAttributePredicate,
+} from '@/components/logs/LogAttributeFilter'
+import type { LogAttributeOperator, LogAttributeType } from '@/api/client'
+import { Callout } from '@temps-sdk/ds'
+import { readFailureServerDetail } from '@/lib/read-failure'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 
@@ -93,6 +100,21 @@ export default function LogsList({ project }: LogsListProps) {
   const [search, setSearch] = useState(() => searchParams.get('q') || '')
   // Trace correlation: when arriving from a trace, `?trace=<id>` pins the filter.
   const traceId = searchParams.get('trace') || ''
+  const [attributeFilter, setAttributeFilter] = useState<
+    LogAttributePredicate | undefined
+  >(() => {
+    const key = searchParams.get('attribute_key')
+    return key
+      ? {
+          key,
+          value: searchParams.get('attribute_value') ?? '',
+          type: (searchParams.get('attribute_type') ?? undefined) as
+            LogAttributeType | undefined,
+          operator: (searchParams.get('attribute_op') ??
+            'eq') as LogAttributeOperator,
+        }
+      : undefined
+  })
   const [page, setPage] = useState(1)
   const [queryClock, setQueryClock] = useState(Date.now)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
@@ -115,7 +137,14 @@ export default function LogsList({ project }: LogsListProps) {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setPage(1)
     setExpanded(new Set())
-  }, [timeRange, severity, debouncedService, debouncedSearch, traceId])
+  }, [
+    timeRange,
+    severity,
+    debouncedService,
+    debouncedSearch,
+    traceId,
+    attributeFilter,
+  ])
 
   // Persist filters to the URL.
   useEffect(() => {
@@ -125,6 +154,13 @@ export default function LogsList({ project }: LogsListProps) {
     if (debouncedService) params.set('service', debouncedService)
     if (debouncedSearch) params.set('q', debouncedSearch)
     if (traceId) params.set('trace', traceId)
+    if (attributeFilter) {
+      params.set('attribute_key', attributeFilter.key)
+      params.set('attribute_value', attributeFilter.value)
+      params.set('attribute_op', attributeFilter.operator)
+      if (attributeFilter.type)
+        params.set('attribute_type', attributeFilter.type)
+    }
     setSearchParams(params, { replace: true })
   }, [
     timeRange,
@@ -133,6 +169,7 @@ export default function LogsList({ project }: LogsListProps) {
     debouncedSearch,
     traceId,
     setSearchParams,
+    attributeFilter,
   ])
 
   const { startTime, endTime } = useMemo(() => {
@@ -140,10 +177,14 @@ export default function LogsList({ project }: LogsListProps) {
     return { startTime: range.from, endTime: range.to }
   }, [timeRange, queryClock])
 
-  const { data, isLoading, isFetching, refetch } = useQuery({
+  const { data, isLoading, isFetching, refetch, isError, error } = useQuery({
     ...queryLogsOptions({
       query: {
         project_id: project.id,
+        attribute_key: attributeFilter?.key,
+        attribute_value: attributeFilter?.value,
+        attribute_type: attributeFilter?.type,
+        attribute_op: attributeFilter?.operator,
         severity: severity !== ALL ? severity : undefined,
         service_name: debouncedService || undefined,
         search: debouncedSearch || undefined,
@@ -160,7 +201,8 @@ export default function LogsList({ project }: LogsListProps) {
 
   const logs: LogRecord[] = data?.data ?? []
   const hasMore = logs.length === PAGE_SIZE
-  const hasFilters = severity !== ALL || !!service || !!search
+  const hasFilters =
+    severity !== ALL || !!service || !!search || !!attributeFilter
 
   // Tell the assistant the user is exploring logs (+ active filters).
   const assistantContext = useMemo(() => {
@@ -294,11 +336,24 @@ export default function LogsList({ project }: LogsListProps) {
               />
             </div>
           </div>
+          <LogAttributeFilter
+            value={attributeFilter}
+            onApply={setAttributeFilter}
+            pending={isFetching}
+          />
         </CardContent>
       </Card>
 
       {/* List */}
-      {isLoading ? (
+      {isError ? (
+        <Callout tone="error" title="Could not load logs">
+          {readFailureServerDetail(error) ??
+            'Retry the request or adjust the attribute filter.'}
+          <Button variant="outline" onClick={() => void refetch()}>
+            Retry
+          </Button>
+        </Callout>
+      ) : isLoading ? (
         <div className="space-y-2">
           {Array.from({ length: 10 }).map((_, i) => (
             <Skeleton key={i} className="h-10 w-full" />
@@ -324,7 +379,7 @@ export default function LogsList({ project }: LogsListProps) {
                   <button
                     type="button"
                     onClick={() => toggleExpand(i)}
-                    className="flex w-full items-start gap-3 px-3 py-1.5 text-left hover:bg-muted/50"
+                    className="flex w-full flex-wrap items-start gap-3 px-3 py-1.5 text-left hover:bg-muted/50"
                   >
                     <span className="shrink-0 text-muted-foreground tabular-nums">
                       {format(new Date(log.timestamp), 'MMM d HH:mm:ss.SSS')}
@@ -335,7 +390,7 @@ export default function LogsList({ project }: LogsListProps) {
                     <span className="shrink-0 max-w-[140px] truncate text-muted-foreground">
                       {log.resource?.service_name || '—'}
                     </span>
-                    <span className="min-w-0 flex-1 truncate text-foreground">
+                    <span className="min-w-0 basis-full truncate text-foreground sm:basis-auto sm:flex-1">
                       {log.body}
                     </span>
                     {log.trace_id && (
@@ -379,10 +434,21 @@ export default function LogsList({ project }: LogsListProps) {
                         <div className="space-y-0.5">
                           {Object.entries(log.attributes).map(([k, v]) => (
                             <div key={k} className="flex gap-2">
-                              <span className="shrink-0 text-muted-foreground">
+                              <span className="min-w-0 basis-1/3 break-all text-muted-foreground">
                                 {k}
+                                <span className="ml-1 text-xs">
+                                  (
+                                  {log.attribute_types &&
+                                  Object.prototype.hasOwnProperty.call(
+                                    log.attribute_types,
+                                    k
+                                  )
+                                    ? log.attribute_types[k]
+                                    : 'untyped'}
+                                  )
+                                </span>
                               </span>
-                              <span className="break-all text-foreground">
+                              <span className="min-w-0 flex-1 break-all text-foreground">
                                 {String(v)}
                               </span>
                             </div>

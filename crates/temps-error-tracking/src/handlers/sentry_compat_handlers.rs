@@ -8,8 +8,8 @@
 //!
 //! ## Authentication
 //!
-//! These endpoints accept `Authorization: Bearer <dsn_public_key>` where the Bearer token
-//! is the DSN public key from a project DSN. This matches how sentry-cli sends auth tokens.
+//! These endpoints require `Authorization: Bearer <deployment_token>` with
+//! full access to the target project. Public DSNs remain ingestion-only.
 //!
 //! ## Endpoint mapping
 //!
@@ -18,7 +18,7 @@
 //! | `POST /api/0/organizations/{org}/releases/` | `create_release` (stub) |
 //! | `POST /api/0/projects/{org}/{project}/releases/{version}/files/` | `upload_release_file` |
 //! | `GET /api/0/projects/{org}/{project}/releases/{version}/files/` | `list_release_files` |
-//! | `GET /api/0/organizations/{org}/chunk-upload/` | `chunk_upload_options` (stub) |
+//! | `GET /api/0/organizations/{org}/chunk-upload/` | `chunk_upload_options` |
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
@@ -51,12 +51,16 @@ use crate::services::source_map_service::SourceMapService;
         upload_release_file,
         list_release_files,
         chunk_upload_options,
+        upload_artifact_chunk,
+        assemble_artifact_bundle,
     ),
     components(schemas(
         SentryCreateReleaseRequest,
         SentryReleaseResponse,
         SentryReleaseFileResponse,
         SentryChunkUploadResponse,
+        ArtifactAssembleRequest,
+        crate::services::source_map_service::ArtifactAssembly,
     )),
     tags(
         (name = "sentry-compat", description = "Sentry CLI-compatible API endpoints for source map uploads")
@@ -124,6 +128,15 @@ pub struct SentryChunkUploadResponse {
     pub accept: Vec<String>,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct ArtifactAssembleRequest {
+    pub checksum: String,
+    pub chunks: Vec<String>,
+    pub projects: Vec<String>,
+    pub version: Option<String>,
+    pub dist: Option<String>,
+}
+
 // --- Route configuration ---
 
 /// Maximum body size for the sentry-compat source map upload routes (50 MiB).
@@ -152,6 +165,14 @@ pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
             post(upload_release_file).get(list_release_files),
         )
         .layer(DefaultBodyLimit::max(SENTRY_UPLOAD_BODY_LIMIT));
+    let artifact_routes = Router::new()
+        .route(
+            "/0/organizations/{org_slug}/chunk-upload/",
+            post(upload_artifact_chunk),
+        )
+        .layer(DefaultBodyLimit::max(
+            crate::services::source_map_service::CHUNK_BYTES + 65536,
+        ));
 
     Router::new()
         .route(
@@ -172,6 +193,11 @@ pub fn configure_sentry_compat_routes() -> Router<Arc<SentryCompatAppState>> {
             "/0/organizations/{org_slug}/chunk-upload/",
             get(chunk_upload_options),
         )
+        .route(
+            "/0/organizations/{org_slug}/artifactbundle/assemble/",
+            post(assemble_artifact_bundle),
+        )
+        .merge(artifact_routes)
         .merge(upload_routes)
 }
 
@@ -273,6 +299,43 @@ async fn authenticate_bearer(
                 )
             })?;
 
+        let project = projects::Entity::find_by_id(dt.project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Build credential lookup temporarily unavailable".into(),
+                )
+            })?;
+        if project.is_none() {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Build credential project is inactive".into(),
+            ));
+        }
+        if dt.expires_at.is_some_and(|expires| expires <= Utc::now()) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Deployment token has expired".into(),
+            ));
+        }
+        let full_access = dt
+            .permissions
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|v| matches!(v.as_str(), Some("*") | Some("full_access")))
+            });
+        if !full_access {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Source artifact writes require a full-access project build token".into(),
+            ));
+        }
         return Ok(BearerPrincipal {
             project_id: dt.project_id,
             credential: SentryCliCredential::DeploymentToken(dt.id),
@@ -369,7 +432,7 @@ async fn create_release(
     Json(request): Json<SentryCreateReleaseRequest>,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
@@ -439,7 +502,7 @@ async fn create_project_release(
     Json(request): Json<SentryCreateReleaseRequest>,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
@@ -514,7 +577,7 @@ async fn finalize_project_release(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
@@ -592,7 +655,7 @@ async fn upload_release_file(
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
@@ -817,7 +880,7 @@ async fn list_release_files(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // Authenticate
-    let principal = match authenticate_bearer(&headers, state.db.as_ref()).await {
+    let principal = match artifact_principal(&headers, &state).await {
         Ok(principal) => principal,
         Err((status, msg)) => return (status, msg).into_response(),
     };
@@ -860,38 +923,171 @@ async fn list_release_files(
     }
 }
 
-/// Chunk upload options (stub for sentry-cli compatibility).
-///
-/// sentry-cli checks this endpoint to determine if chunk-based upload is supported.
-/// We return a response indicating that chunk upload is NOT supported, which forces
-/// sentry-cli to fall back to the standard file-by-file upload.
-#[utoipa::path(
-    tag = "sentry-compat",
-    get,
-    path = "/0/organizations/{org_slug}/chunk-upload/",
-    params(
-        ("org_slug" = String, Path, description = "Organization slug (ignored)")
-    ),
-    responses(
-        (status = 200, description = "Chunk upload options", body = SentryChunkUploadResponse),
-    ),
-)]
-async fn chunk_upload_options(Path(_org_slug): Path<String>) -> impl IntoResponse {
-    // Return options that effectively disable chunk upload
-    // sentry-cli will fall back to file-by-file upload
-    let response = SentryChunkUploadResponse {
-        url: String::new(),
-        chunk_size: 8 * 1024 * 1024, // 8MB
-        chunks_per_request: 64,
-        max_file_size: 50 * 1024 * 1024, // 50MB
-        max_request_size: 50 * 1024 * 1024,
+/// Negotiates only the artifact capability implemented here. Build credentials
+/// are required; browser DSN public keys cannot upload or read source artifacts.
+#[utoipa::path(get, path="/0/organizations/{org_slug}/chunk-upload/",tag="sentry-compat",
+    params(("org_slug"=String,Path)), responses((status=200,body=SentryChunkUploadResponse),(status=401),(status=403)))]
+async fn chunk_upload_options(
+    State(state): State<Arc<SentryCompatAppState>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SentryChunkUploadResponse>, (StatusCode, String)> {
+    artifact_principal(&headers, &state).await?;
+    if org.is_empty()
+        || org.len() > 128
+        || !org
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid organization path".into()));
+    }
+    Ok(Json(SentryChunkUploadResponse {
+        url: format!("/organizations/{org}/chunk-upload/"),
+        chunk_size: 8 * 1024 * 1024,
+        chunks_per_request: 1,
+        max_file_size: 50 * 1024 * 1024,
+        max_request_size: 8 * 1024 * 1024 + 65536,
         concurrency: 1,
-        hash_algorithm: "sha1".to_string(),
-        compression: vec!["gzip".to_string()],
-        accept: vec![], // Empty accept = no chunk upload support
-    };
-
-    Json(response)
+        hash_algorithm: "sha1".into(),
+        compression: vec![],
+        accept: vec!["artifact_bundles".into(), "artifact_bundles_v2".into()],
+    }))
+}
+async fn artifact_principal(
+    headers: &HeaderMap,
+    state: &SentryCompatAppState,
+) -> Result<BearerPrincipal, (StatusCode, String)> {
+    let principal = authenticate_bearer(headers, &state.db).await?;
+    if !matches!(
+        principal.credential,
+        SentryCliCredential::DeploymentToken(_)
+    ) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Artifact uploads require a project deployment token; public DSNs are ingestion-only"
+                .into(),
+        ));
+    }
+    Ok(principal)
+}
+fn artifact_error(
+    error: crate::services::source_map_service::ArtifactUploadError,
+) -> (StatusCode, String) {
+    use crate::services::source_map_service::ArtifactUploadError;
+    match error {
+        ArtifactUploadError::Invalid { .. } => (StatusCode::BAD_REQUEST, error.to_string()),
+        ArtifactUploadError::Quota(_) => (StatusCode::TOO_MANY_REQUESTS, error.to_string()),
+        _ => {
+            error!(error_class = "artifact_storage", "Artifact upload failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Artifact storage temporarily unavailable".into(),
+            )
+        }
+    }
+}
+#[utoipa::path(post,path="/0/organizations/{org_slug}/chunk-upload/",tag="sentry-compat",
+    params(("org_slug"=String,Path)),responses((status=200),(status=400),(status=401),(status=403),(status=429)))]
+async fn upload_artifact_chunk(
+    State(state): State<Arc<SentryCompatAppState>>,
+    Path(_org): Path<String>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<StatusCode, (StatusCode, String)> {
+    use crate::services::source_map_service::{ARTIFACT_WORKERS, CHUNK_BYTES};
+    let principal = artifact_principal(&headers, &state).await?;
+    let _permit = ARTIFACT_WORKERS.try_acquire().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Artifact upload busy; retry shortly".into(),
+        )
+    })?;
+    let mut chunks = Vec::new();
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid chunk multipart request".into(),
+        )
+    })? {
+        if !chunks.is_empty() || field.name() != Some("file") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Expected one uncompressed file chunk".into(),
+            ));
+        }
+        let checksum = field
+            .file_name()
+            .ok_or((StatusCode::BAD_REQUEST, "Missing chunk checksum".into()))?
+            .to_owned();
+        let mut bytes = Vec::new();
+        while let Some(part) = field
+            .chunk()
+            .await
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid chunk body".into()))?
+        {
+            if bytes.len() + part.len() > CHUNK_BYTES {
+                return Err((StatusCode::PAYLOAD_TOO_LARGE, "Chunk exceeds 8 MiB".into()));
+            }
+            bytes.extend_from_slice(&part);
+        }
+        chunks.push((checksum, bytes));
+    }
+    state
+        .source_map_service
+        .stage_artifact_chunks(principal.project_id, chunks)
+        .await
+        .map_err(artifact_error)?;
+    Ok(StatusCode::OK)
+}
+#[utoipa::path(post,path="/0/organizations/{org_slug}/artifactbundle/assemble/",tag="sentry-compat",
+    params(("org_slug"=String,Path)),request_body=ArtifactAssembleRequest,
+    responses((status=200,body=crate::services::source_map_service::ArtifactAssembly),(status=400),(status=401),(status=403),(status=429)))]
+async fn assemble_artifact_bundle(
+    State(state): State<Arc<SentryCompatAppState>>,
+    Path(_org): Path<String>,
+    headers: HeaderMap,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<ArtifactAssembleRequest>,
+) -> Result<Json<crate::services::source_map_service::ArtifactAssembly>, (StatusCode, String)> {
+    let principal = artifact_principal(&headers, &state).await?;
+    if request.projects.len() != 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Exactly one scoped project is required".into(),
+        ));
+    }
+    resolve_project_slug(&request.projects[0], principal.project_id, &state.db).await?;
+    let _permit = crate::services::source_map_service::ARTIFACT_WORKERS
+        .try_acquire()
+        .map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Artifact assembly busy; retry shortly".into(),
+            )
+        })?;
+    let checksum = request.checksum.clone();
+    let result = state
+        .source_map_service
+        .assemble_artifact(
+            principal.project_id,
+            request.checksum,
+            request.chunks,
+            request.version,
+            request.dist,
+        )
+        .await
+        .map_err(artifact_error)?;
+    if result.state == "ok" {
+        let audit = crate::handlers::audit::SentryArtifactBundleUploadedAudit {
+            context: sentry_cli_audit_context(principal, &metadata),
+            project_id: principal.project_id,
+            checksum,
+        };
+        if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+            error!(project_id=principal.project_id,%error,"Artifact upload audit failed");
+        }
+    }
+    Ok(Json(result))
 }
 
 #[cfg(test)]

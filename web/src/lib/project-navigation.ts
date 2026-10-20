@@ -42,7 +42,13 @@ export const PROJECT_SECTION_LINKS: Partial<
     { title: 'Request logs', url: 'request-logs', aliases: ['logs'] },
     { title: 'Telemetry logs', url: 'telemetry-logs' },
   ],
-  errors: [{ title: 'Issues', url: 'errors' }],
+  errors: [
+    { title: 'Issues', url: 'errors' },
+    { title: 'Feedback', url: 'errors/feedback' },
+    { title: 'Releases', url: 'releases' },
+    { title: 'SDK ingestion health', url: 'client-outcomes' },
+    { title: 'Source maps', url: 'errors/source-maps' },
+  ],
   traces: [
     { title: 'Traces', url: 'traces' },
     { title: 'AI traces', url: 'ai-gateway?tab=activity' },
@@ -198,6 +204,8 @@ const EXTERNAL_PROJECT_PAGES = [
   'traces',
   'ai-gateway',
   'telemetry-logs',
+  'releases',
+  'client-outcomes',
   'metrics',
   'monitors',
   'cron-jobs',

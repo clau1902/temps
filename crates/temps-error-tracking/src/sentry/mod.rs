@@ -63,3 +63,15 @@ pub mod check_ins;
 pub mod metrics;
 pub mod replay;
 pub mod traces;
+
+pub(crate) mod inference;
+
+pub mod feedback;
+
+pub mod statsd;
+
+pub mod client_reports;
+
+pub mod security;
+
+pub(crate) mod identities;
