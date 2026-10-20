@@ -2507,6 +2507,12 @@ mod tests {
     async fn initialize_session_refreshes_an_existing_visitors_last_seen() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // Session initialization claims its advisory lock before
+                // looking up or refreshing the visitor.
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .append_query_results(vec![vec![make_visitor_model(3)]])
                 .append_exec_results(vec![sea_orm::MockExecResult {
                     last_insert_id: 0,
@@ -2552,6 +2558,12 @@ mod tests {
         upserted.insert("id".to_string(), sea_orm::Value::Int(Some(9)));
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // Session initialization claims its advisory lock before
+                // looking up or refreshing the visitor.
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .append_query_results(vec![vec![make_visitor_model(3)]])
                 // The refresh matches no row: retention removed it.
                 .append_exec_results(vec![sea_orm::MockExecResult {

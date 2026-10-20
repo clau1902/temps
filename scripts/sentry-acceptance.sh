@@ -37,14 +37,11 @@ run_sdk_tests() {
 }
 case "${1:-native}" in
   native)
-    cargo test --lib -p temps-error-tracking sentry:: -j2 -- --test-threads=2
-    cargo test --lib -p temps-error-tracking sdk_ -j2 -- --test-threads=2
-    cargo test --lib -p temps-error-tracking concurrent_ -j2 -- --test-threads=2
-    cargo test --lib -p temps-error-tracking native_release_queries -j2
-    cargo test --lib -p temps-otel adapter_receipts_atomic -j2
-    cargo test --lib -p temps-otel services::otel_service::tests -j2
-    cargo test --lib -p temps-otel log_attributes -j2
-    cargo test --lib -p temps-otel ingest::decode::tests -j2
+    # One feature graph avoids recompiling the shared native services for each
+    # adapter. Run complete suites so native SDK regressions are caught too.
+    cargo test --lib -p temps-error-tracking -p temps-otel \
+      -p temps-analytics-session-replay -p temps-monitoring -p temps-migrations \
+      -j2 -- --test-threads=1
     ;;
   sdk)
     for runtime in bun node python3 go cargo; do command -v "$runtime" >/dev/null || { echo "Required SDK runtime missing: $runtime"; exit 1; }; done
