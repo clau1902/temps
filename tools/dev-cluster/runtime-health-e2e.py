@@ -17,6 +17,7 @@ from pathlib import Path
 import subprocess
 import signal
 import socket
+import ssl
 import tempfile
 import time
 import urllib.error
@@ -54,8 +55,14 @@ def main():
                 if predicate(last):
                     print(f"PASS {description}", flush=True)
                     return last
-            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, subprocess.CalledProcessError):
-                pass
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, subprocess.CalledProcessError) as error:
+                # Never print response bodies or authenticated request headers.
+                if isinstance(error, urllib.error.HTTPError):
+                    last = f"HTTP status {error.code}"
+                elif isinstance(error, urllib.error.URLError):
+                    last = type(error.reason).__name__
+                else:
+                    last = type(error).__name__
             time.sleep(2)
         raise AssertionError(f"Timed out: {description}; last bounded result: {str(last)[:256]}")
 
@@ -99,7 +106,7 @@ def main():
             # a socket mount nor a privileged container. It starts empty.
             "control-plane": {"image": args.image, "entrypoint": ["bash"],
                 "command": ["-c", "set -e; install -m 0644 /workspace/crates/temps-cli/GeoLite2-City.mmdb /var/lib/temps/GeoLite2-City.mmdb; if [ -x /usr/bin/docker ]; then mv /usr/bin/docker /run/unused-docker-cli; fi; exec bash /workspace/tools/dev-cluster/role-control-plane.sh"],
-                "environment": cp_env, "ports": [f"127.0.0.1:{cp_port}:80"],
+                "environment": cp_env, "ports": [f"127.0.0.1:{cp_port}:443"],
                 "networks": {"underlay": {"ipv4_address": subnet + ".10"}},
                 "volumes": mounts + ["cp:/var/lib/temps"],
                 "depends_on": {"postgres": {"condition": "service_healthy"}}},
@@ -113,7 +120,7 @@ def main():
                     CONTROL_PLANE_URL="https://control-plane.temps.test",
                     TEMPS_AGENT_ADDRESS="0.0.0.0:3100", TEMPS_OVERLAY_NETWORK="temps0",
                     DEV_CLUSTER_CONTROL_PLANE_CA="/run/temps-bootstrap/control-plane.crt"),
-                "ports": [f"127.0.0.1:{cohost_port}:80"] if number == 1 else [],
+                "ports": [f"127.0.0.1:{cohost_port}:443"] if number == 1 else [],
                 "extra_hosts": {"control-plane.temps.test": subnet + ".10"},
                 "networks": {"underlay": {"ipv4_address": f"{subnet}.{20 + number}"}},
                 "volumes": mounts + [f"worker{number}:/var/lib/temps", f"home{number}:/root", f"docker{number}:/var/lib/docker"],
@@ -132,6 +139,25 @@ def main():
         jar = http.cookiejar.CookieJar()
         client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
         base = None
+        tls_address = None
+        tls_context = None
+
+        class ControlPlaneTLSConnection(http.client.HTTPSConnection):
+            def connect(self):
+                if self.host != "control-plane.temps.test" or tls_address[0] != "127.0.0.1":
+                    raise ValueError("Unexpected runtime-health control-plane TLS address")
+                # Route the test hostname to this run's published loopback
+                # port while preserving SNI and certificate hostname checks.
+                raw = socket.create_connection(tls_address, self.timeout, self.source_address)
+                try:
+                    self.sock = tls_context.wrap_socket(raw, server_hostname=self.host)
+                except BaseException:
+                    raw.close()
+                    raise
+
+        class ControlPlaneTLSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, request):
+                return self.do_open(ControlPlaneTLSConnection, request, context=tls_context)
 
         def api(path, body=None, method=None):
             request = urllib.request.Request(base + "/api" + path,
@@ -147,13 +173,28 @@ def main():
 
         try:
             compose("up", "-d", "postgres", "control-plane", capture=False)
-            address = compose("port", "control-plane", "80").strip()
-            base = "http://" + address
+            address = compose("port", "control-plane", "443").strip()
+            host, port = address.rsplit(":", 1)
+            tls_address = (host, int(port))
+            base = "https://control-plane.temps.test"
+            certificate = wait("throwaway control-plane certificate is available",
+                lambda: execute("control-plane", "cat", "/run/temps-bootstrap/control-plane.crt"),
+                lambda value: "-----BEGIN CERTIFICATE-----" in value)
+            # Trust only this run's certificate and verify its test hostname.
+            # HTTPS preserves the operator-declared Secure session cookie;
+            # a plaintext client withholds it before querying nodes.
+            tls_context = ssl.create_default_context(cadata=certificate)
+            client = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                ControlPlaneTLSHandler(context=tls_context),
+                urllib.request.HTTPCookieProcessor(jar))
             wait("Docker-free control plane starts with no deployments", lambda: ready())
             execute("control-plane", "bash", "-c", "test ! -S /var/run/docker.sock && ! pgrep -x dockerd && ! command -v docker")
             credentials = execute("control-plane", "cat", "/run/temps-bootstrap/admin.txt").splitlines()
             api("/auth/login", {"email": credentials[0], "password": credentials[1]})
             credentials.clear()
+            api("/user/me")
+            print("PASS authenticated HTTPS control-plane API", flush=True)
             assert int(execute("postgres", "psql", "-U", "temps", "-d", "temps", "-tAc", "SELECT COUNT(*) FROM runtime_health_assignments").strip()) == 0
             # Both nodes consume this fresh, short-lived enrollment token;
             # runtime traffic then uses separate issued node identities.
@@ -252,7 +293,8 @@ def main():
                     "TEMPS_DATABASE_URL=" + cp_env["TEMPS_DATABASE_URL"],
                     f"TEMPS_ADDRESS={subnet}.21:80", f"TEMPS_TLS_ADDRESS={subnet}.21:443",
                     "TEMPS_SERVE_PROFILE=full", "TEMPS_DISABLE_HTTPS_REDIRECT=true")
-            base = "http://" + compose("port", "worker-1", "80").strip()
+            host, port = compose("port", "worker-1", "443").strip().rsplit(":", 1)
+            tls_address = (host, int(port))
             wait("co-located control plane starts alongside its enrolled agent", lambda: ready())
             wait("co-located and remote agents reconnect to the moved control plane", lambda: [row for row in api("/internal/nodes")["nodes"] if row["id"] > 0],
                  lambda rows: len(rows) == 2 and all(row["status"] == "active" for row in rows))
