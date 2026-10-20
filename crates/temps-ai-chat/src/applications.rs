@@ -2169,6 +2169,31 @@ impl ApplicationService {
         Ok(project_ids)
     }
 
+    /// Rename an active application. Only the display name changes: the
+    /// public id, the workspace folder and the linked projects stay as they
+    /// are, so chats and deployments keep pointing at the same application.
+    pub async fn rename(
+        &self,
+        user_id: i32,
+        public_id: &str,
+        name: &str,
+    ) -> Result<ApplicationWithProjects, ApplicationError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 200 {
+            return Err(ApplicationError::InvalidName);
+        }
+        let _mutation = self.mutation_lock.lock().await;
+        let mut application = self.get(user_id, public_id).await?;
+        if application.application.name == name {
+            return Ok(application);
+        }
+        let mut active: ai_applications::ActiveModel = application.application.clone().into();
+        active.name = Set(name.to_string());
+        active.updated_at = Set(Utc::now());
+        application.application = active.update(self.db.as_ref()).await?;
+        Ok(application)
+    }
+
     pub async fn get(
         &self,
         user_id: i32,
@@ -2980,7 +3005,10 @@ impl WorkspaceSettingsUpdate {
     }
 }
 
-pub(crate) fn validate_secret_free_payload(value: &Value, path: &str) -> Result<(), ApplicationError> {
+pub(crate) fn validate_secret_free_payload(
+    value: &Value,
+    path: &str,
+) -> Result<(), ApplicationError> {
     match value {
         Value::Object(map) => {
             for (key, child) in map {
@@ -3134,6 +3162,109 @@ mod tests {
             get_service.get(1, "app_missing").await,
             Err(ApplicationError::NotFound(id)) if id == "app_missing"
         ));
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_a_blank_or_overlong_name_before_database_access() {
+        let service = application_service();
+        for name in ["", "   ", &"a".repeat(201)] {
+            assert!(matches!(
+                service.rename(1, "app_any", name).await,
+                Err(ApplicationError::InvalidName)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_reports_a_missing_application_by_id() {
+        let service = ApplicationService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<ai_applications::Model>::new()])
+                .into_connection(),
+        ));
+        assert!(matches!(
+            service.rename(1, "app_missing", "Renamed").await,
+            Err(ApplicationError::NotFound(id)) if id == "app_missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_stores_the_trimmed_name_and_keeps_the_public_id() {
+        let now = Utc::now();
+        let current = ai_applications::Model {
+            id: 12,
+            public_id: "app_rename".to_string(),
+            name: "Old name".to_string(),
+            description: None,
+            status: "active".to_string(),
+            created_by: 7,
+            created_at: now,
+            updated_at: now,
+        };
+        let renamed = ai_applications::Model {
+            name: "New name".to_string(),
+            ..current.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![current]])
+                .append_query_results([Vec::<ai_application_projects::Model>::new()])
+                .append_query_results([vec![renamed]])
+                .into_connection(),
+        );
+        let service = ApplicationService::new(db.clone());
+
+        let application = service
+            .rename(7, "app_rename", "  New name  ")
+            .await
+            .expect("renamed application");
+        assert_eq!(application.application.name, "New name");
+        assert_eq!(application.application.public_id, "app_rename");
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log();
+        let update = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .find(|statement| statement.sql.starts_with("UPDATE"))
+            .expect("rename issues an UPDATE");
+        assert!(update.sql.contains("\"name\" = $1"), "{}", update.sql);
+    }
+
+    #[tokio::test]
+    async fn rename_to_the_same_name_writes_nothing() {
+        let now = Utc::now();
+        let current = ai_applications::Model {
+            id: 13,
+            public_id: "app_same".to_string(),
+            name: "Same".to_string(),
+            description: None,
+            status: "active".to_string(),
+            created_by: 7,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![current]])
+                .append_query_results([Vec::<ai_application_projects::Model>::new()])
+                .into_connection(),
+        );
+        let service = ApplicationService::new(db.clone());
+        service
+            .rename(7, "app_same", "Same")
+            .await
+            .expect("unchanged application");
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("release mock database")
+            .into_transaction_log();
+        assert!(!log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .any(|statement| statement.sql.starts_with("UPDATE")));
     }
 
     #[tokio::test]

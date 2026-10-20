@@ -4771,6 +4771,42 @@
         ],
         "type": "string"
       },
+      "Assessment": {
+        "description": "The score and how it was reached.",
+        "properties": {
+          "next_level": {
+            "description": "What the next level needs and why it was not reached, below the top.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "protected_paths": {
+            "description": "Paths that block a policy merge.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "score": {
+            "description": "Highest level of the confidence ladder the fix reached, 0-5.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "signals": {
+            "items": {
+              "$ref": "#/components/schemas/Signal"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "score",
+          "signals",
+          "protected_paths"
+        ],
+        "type": "object"
+      },
       "AssignRoleRequest": {
         "properties": {
           "role_type": {
@@ -5219,6 +5255,349 @@
         },
         "type": "object"
       },
+      "AutofixCapabilityResponse": {
+        "description": "Whether autofix can run for a project, and what a fix would become.",
+        "properties": {
+          "configured": {
+            "description": "An AI provider and sandboxes are available.",
+            "type": "boolean"
+          },
+          "delivery": {
+            "description": "What a fix becomes: `pull_request`, `patch` or `report`.",
+            "type": "string"
+          },
+          "delivery_reason": {
+            "description": "Why the delivery is what it is, e.g. the Git connection is missing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why autofix cannot run, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "settings": {
+            "$ref": "#/components/schemas/AutofixSettingsResponse"
+          },
+          "setup_path": {
+            "description": "Console path that fixes the missing configuration.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_kind": {
+            "description": "How the latest production deployment was built: `git`,\n`uploaded_source`, `report_only` or `none`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "source_kind",
+          "delivery",
+          "settings"
+        ],
+        "type": "object"
+      },
+      "AutofixEventListResponse": {
+        "properties": {
+          "incident_status": {
+            "description": "The incident's status when the page was read, so a poller knows when\nto stop.",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AutofixEventResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items",
+          "incident_status"
+        ],
+        "type": "object"
+      },
+      "AutofixEventResponse": {
+        "properties": {
+          "actor": {
+            "description": "`server`, `agent`, `policy` or `user:<id>`.",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "details": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EventDetails"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "actor",
+          "kind",
+          "summary",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AutofixIncidentListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AutofixIncidentResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "AutofixIncidentResponse": {
+        "properties": {
+          "assessment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Assessment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "attempts": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "base_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "description": "Confidence level reached, 0-5: see `assessment` for what it proves.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "conversation_id": {
+            "description": "Public id of the incident chat.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "decided_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decided_by_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "decision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error_group_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "failure_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_patch": {
+            "type": "boolean"
+          },
+          "head_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Public id (`afx_…`).",
+            "type": "string"
+          },
+          "is_open": {
+            "type": "boolean"
+          },
+          "owner_user_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "phase": {
+            "description": "`queued`, `prepare`, `reproduce`, `verify`, `deliver` or `done`.",
+            "type": "string"
+          },
+          "pr_number": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pr_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "sandbox_id": {
+            "description": "Public id of the sandbox while it exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`open`, `working`, `awaiting_review`, `merged`, `applied`, `rejected`,\n`failed` or `stopped`.",
+            "type": "string"
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "trigger": {
+            "description": "`manual` or `automatic`.",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "workspace_id": {
+            "description": "Public id of the workspace the chat is in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "error_group_id",
+          "title",
+          "trigger",
+          "status",
+          "is_open",
+          "phase",
+          "owner_user_id",
+          "has_patch",
+          "attempts",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "AutofixRunConfig": {
         "description": "User-chosen per-run options, persisted as JSON in `agent_runs.run_config`.\nEvery field is optional — unset fields fall back to the provider defaults\nin settings, then to built-in defaults.",
         "properties": {
@@ -5256,6 +5635,74 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "AutofixSettingsResponse": {
+        "properties": {
+          "ai_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "min_confidence": {
+            "description": "Confidence level, 0-5, an `auto_merge` fix must reach.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "mode": {
+            "description": "`off`, `propose` or `auto_merge`.",
+            "type": "string"
+          },
+          "owner_user_id": {
+            "description": "User automatic incidents act as.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "paused": {
+            "type": "boolean"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "protected_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "test_command": {
+            "description": "Command the server runs to verify a fix, in addition to the agent's\nreproduction.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "mode",
+          "min_confidence",
+          "protected_paths",
+          "paused"
+        ],
         "type": "object"
       },
       "AutofixerRunResponse": {
@@ -8449,6 +8896,18 @@
         ],
         "type": "string"
       },
+      "CloseIncidentRequest": {
+        "properties": {
+          "decision": {
+            "description": "`merged` (you merged the pull request), `applied` (you applied the\npatch) or `rejected`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision"
+        ],
+        "type": "object"
+      },
       "CloudAiCapability": {
         "properties": {
           "configured": {
@@ -9382,6 +9841,34 @@
         },
         "required": [
           "command"
+        ],
+        "type": "object"
+      },
+      "CommandOutcome": {
+        "description": "Result of a command the server ran in the sandbox.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "output_excerpt": {
+            "description": "Last bytes of stdout and stderr, at most 4 KB.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "exit_code",
+          "duration_ms",
+          "output_excerpt"
         ],
         "type": "object"
       },
@@ -22507,6 +22994,105 @@
         ],
         "type": "object"
       },
+      "EventDetails": {
+        "description": "Structured details of a timeline event. Stored as JSON; every field is\noptional because each kind uses a few of them.",
+        "properties": {
+          "attempt": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "command": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "conversation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "duration_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/FileChange"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "output_excerpt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sandbox_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "score": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "EventEntriesQuery": {
         "description": "Query parameters for the raw event entries list",
         "properties": {
@@ -24266,6 +24852,35 @@
           "name",
           "field_type",
           "nullable"
+        ],
+        "type": "object"
+      },
+      "FileChange": {
+        "description": "One changed path, from `git diff --numstat`.",
+        "properties": {
+          "added": {
+            "description": "`None` for binary files.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "removed": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path"
         ],
         "type": "object"
       },
@@ -36863,6 +37478,35 @@
         ],
         "type": "object"
       },
+      "OpenIncidentRequest": {
+        "properties": {
+          "error_group_id": {
+            "description": "The error group to fix.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "error_group_id"
+        ],
+        "type": "object"
+      },
+      "OpenIncidentResponse": {
+        "properties": {
+          "created": {
+            "description": "False when an open incident for the group already existed.",
+            "type": "boolean"
+          },
+          "incident": {
+            "$ref": "#/components/schemas/AutofixIncidentResponse"
+          }
+        },
+        "required": [
+          "incident",
+          "created"
+        ],
+        "type": "object"
+      },
       "OpenPullRequestRequest": {
         "description": "Request body for opening a pull request.",
         "properties": {
@@ -39038,6 +39682,17 @@
         },
         "required": [
           "results"
+        ],
+        "type": "object"
+      },
+      "PauseAutofixRequest": {
+        "properties": {
+          "paused": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "paused"
         ],
         "type": "object"
       },
@@ -44929,6 +45584,18 @@
         "required": [
           "id",
           "message"
+        ],
+        "type": "object"
+      },
+      "RenameApplicationRequest": {
+        "properties": {
+          "name": {
+            "description": "New name shown for the application. Trimmed; 1 to 200 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
@@ -51773,6 +52440,52 @@
         ],
         "type": "object"
       },
+      "Signal": {
+        "description": "One check behind the score, as stored on the incident and shown to the\nreviewer.",
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "level": {
+            "description": "Level of the confidence ladder this check belongs to, 1-5; `None` for\ncontext that is shown but never scored (the agent's own confidence).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "met": {
+            "description": "`Some(true)` met, `Some(false)` not met, `None` not collected.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CommandOutcome",
+                "description": "The command that produced it, when it came from one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "detail"
+        ],
+        "type": "object"
+      },
       "SilenceAlarmRequest": {
         "description": "Request body for `POST .../alarms/{alarm_id}/silence`.",
         "properties": {
@@ -57443,6 +58156,56 @@
             ]
           },
           "runtime": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateAutofixSettingsRequest": {
+        "properties": {
+          "ai_model": {
+            "description": "Empty string clears it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_provider": {
+            "description": "Empty string clears it (back to the assistant's default).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "min_confidence": {
+            "description": "Confidence level, 0-5, an `auto_merge` fix must reach.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mode": {
+            "description": "`off`, `propose` or `auto_merge`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "protected_paths": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "test_command": {
+            "description": "Empty string clears it.",
             "type": [
               "string",
               "null"
@@ -64802,6 +65565,57 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "AI Applications"
+        ],
+        "x-maturity": "experimental"
+      },
+      "patch": {
+        "description": "Changes the application's name. Its id, chats, workspace and projects are unchanged.",
+        "operationId": "rename_application",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_public_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameApplicationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The name is empty or longer than 200 characters"
+          },
+          "401": {},
+          "403": {},
+          "404": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Rename an AI application",
         "tags": [
           "AI Applications"
         ],
@@ -110779,6 +111593,947 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/autofix": {
+      "get": {
+        "operationId": "get_autofix_capability",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutofixCapabilityResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether autofix can run for the project, what a fix would become, and\nthe project's autofix policy.",
+        "tags": [
+          "Autofix"
+        ]
+      }
+    },
+    "/projects/{project_id}/autofix/incidents": {
+      "get": {
+        "operationId": "list_autofix_incidents",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, from 1. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page. Default 20, max 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`open`, `closed`, or one exact status.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only incidents of this error group.",
+            "in": "query",
+            "name": "error_group_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutofixIncidentListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The project's autofix incidents, newest first.",
+        "tags": [
+          "Autofix"
+        ]
+      },
+      "post": {
+        "operationId": "open_autofix_incident",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenIncidentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenIncidentResponse"
+                }
+              }
+            },
+            "description": "The group already had an open incident"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenIncidentResponse"
+                }
+              }
+            },
+            "description": "Incident queued"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Ask autofix to reproduce and fix an error group. Returns the open\nincident of the group when there already is one.",
+        "tags": [
+          "Autofix"
+        ]
+      }
+    },
+    "/projects/{project_id}/autofix/incidents/{incident_id}": {
+      "get": {
+        "operationId": "get_autofix_incident",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Incident public id",
+            "in": "path",
+            "name": "incident_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutofixIncidentResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One autofix incident.",
+        "tags": [
+          "Autofix"
+        ]
+      }
+    },
+    "/projects/{project_id}/autofix/incidents/{incident_id}/close": {
+      "post": {
+        "operationId": "close_autofix_incident",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Incident public id",
+            "in": "path",
+            "name": "incident_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseIncidentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutofixIncidentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Record the decision on a fix waiting for review. Closing deletes the\nsandbox and keeps the transcript, timeline and decision.",
+        "tags": [
+          "Autofix"
+        ]
+      }
+    },
+    "/projects/{project_id}/autofix/incidents/{incident_id}/events": {
+      "get": {
+        "operationId": "list_autofix_incident_events",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Incident public id",
+            "in": "path",
+            "name": "incident_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only events after this id; pass the last id seen to poll.",
+            "in": "query",
+            "name": "after_id",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Default 100, max 500.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutofixEventListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The incident's timeline: every action the server, the agent and people\ntook, oldest first.",
+        "tags": [
+          "Autofix"
+        ]
+      }
+    },
+    "/projects/{project_id}/autofix/incidents/{incident_id}/patch": {
+      "get": {
+        "operationId": "download_autofix_patch",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Incident public id",
+            "in": "path",
+            "name": "incident_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/x-diff": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Unified diff"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The fix as a unified diff, for `git apply`.",
+        "tags": [
+          "Autofix"
+        ]
+      }
+    },
+    "/projects/{project_id}/autofix/incidents/{incident_id}/stop": {
+      "post": {
+        "operationId": "stop_autofix_incident",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Incident public id",
+            "in": "path",
+            "name": "incident_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutofixIncidentResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop an incident: cancels the agent's turn, deletes the sandbox and\nkeeps the transcript and timeline.",
+        "tags": [
+          "Autofix"
+        ]
+      }
+    },
+    "/projects/{project_id}/autofix/pause": {
+      "post": {
+        "operationId": "set_autofix_paused",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PauseAutofixRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutofixSettingsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Pause or resume autofix for the project. Queued incidents wait while it\nis paused.",
+        "tags": [
+          "Autofix"
+        ]
+      }
+    },
+    "/projects/{project_id}/autofix/settings": {
+      "patch": {
+        "operationId": "update_autofix_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAutofixSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutofixSettingsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change the project's autofix policy. The caller becomes the user that\nautomatic incidents act as.",
+        "tags": [
+          "Autofix"
+        ]
+      }
+    },
     "/projects/{project_id}/autofixer/analyze": {
       "post": {
         "operationId": "start_analysis",
@@ -135822,6 +137577,10 @@
     {
       "description": "Unified observability event stream — runtime logs, requests, spans, errors, revenue",
       "name": "Observability"
+    },
+    {
+      "description": "Crash autofix incidents run as workspace chats",
+      "name": "Autofix"
     },
     {
       "description": "API key management endpoints",

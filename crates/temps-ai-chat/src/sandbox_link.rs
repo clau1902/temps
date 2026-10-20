@@ -767,10 +767,14 @@ fn is_workspace_shared_key(key: &str) -> bool {
 /// key) the other assistant chats of the same owner in the same workspace.
 /// Workspace membership is read in the statement, so a chat that just joined
 /// or left is scoped correctly without reloading it first.
+///
+/// An autofix incident chat (ADR-054) is in its workspace but keeps its own
+/// sandbox: it neither shares its link nor receives the workspace's.
 pub(crate) fn metadata_scope(conversation_param: &str, shared: bool) -> String {
     if !shared {
         return format!("id = {conversation_param}");
     }
+    let incident_key = crate::autofix::INCIDENT_METADATA_KEY;
     format!(
         "(id = {conversation_param} OR id IN ( \
             SELECT sibling.id FROM ai_conversations sibling \
@@ -779,7 +783,9 @@ pub(crate) fn metadata_scope(conversation_param: &str, shared: bool) -> String {
               AND chat.context_type = '{ASSISTANT_CONTEXT_TYPE}' \
               AND sibling.context_type = '{ASSISTANT_CONTEXT_TYPE}' \
               AND sibling.application_id = chat.application_id \
-              AND sibling.created_by = chat.created_by))"
+              AND sibling.created_by = chat.created_by \
+              AND chat.metadata -> '{incident_key}' IS NULL \
+              AND sibling.metadata -> '{incident_key}' IS NULL))"
     )
 }
 

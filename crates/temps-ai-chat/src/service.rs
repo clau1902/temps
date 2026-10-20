@@ -2860,6 +2860,24 @@ impl ConversationService {
         Ok(AuthContext::new_persisted_session(user, role, session.id))
     }
 
+    /// Authorization for work the server runs on a user's behalf with no
+    /// browser session behind it, such as an autofix incident (ADR-054). It
+    /// is re-derived from the user's current account and role on every call,
+    /// and every tool call refreshes it again, so a removed or demoted user
+    /// stops acting immediately.
+    pub async fn authorization_for_unattended(
+        &self,
+        user_id: i32,
+    ) -> Result<AuthContext, String> {
+        let user = active_user(self.db.as_ref(), user_id)
+            .await
+            .map_err(|error| format!("user {user_id} cannot act: {error}"))?;
+        let role = current_user_role(self.db.as_ref(), user.id)
+            .await
+            .map_err(|error| format!("could not read the role of user {user_id}: {error}"))?;
+        Ok(AuthContext::new_cli_token(user, role))
+    }
+
     /// Start a turn in a chat on the owner's behalf, as the goal watcher does
     /// when a check fails. Goes through the same claim and preparation as a
     /// message the user sends, so the usual one-turn-at-a-time rule holds.
@@ -4108,7 +4126,7 @@ impl ConversationService {
     /// Prefer the active OpenRouter key, so pasting that one key is the whole
     /// setup even when other gateway providers exist; fall back to the
     /// instance default otherwise.
-    async fn resolve_assistant_provider(&self) -> Result<String, ChatError> {
+    pub(crate) async fn resolve_assistant_provider(&self) -> Result<String, ChatError> {
         use temps_entities::ai_provider_keys;
 
         let openrouter = ai_provider_keys::Entity::find()
@@ -5299,6 +5317,10 @@ impl ConversationService {
         let task_auto_approve_provider_tools = auto_approve_provider_tools.clone();
         let permission_mode = Arc::new(Mutex::new(ai_permission_mode.clone()));
         let task_permission_mode = permission_mode.clone();
+        // An autofix incident chat (ADR-054) runs with nobody watching: its
+        // platform writes are refused outright instead of waiting for an
+        // approval that would never come. Read once per turn from the chat.
+        let autofix_incident = crate::autofix::incident_of_conversation(conv.metadata.as_ref());
         let application_id = conv.application_id;
         let initial_conversation_title = conv.title.clone();
         let auth = auth.clone();
@@ -5580,7 +5602,31 @@ impl ConversationService {
             let platform_auto_auth = auth.clone();
             let platform_auto_metadata = request_metadata.clone();
             let platform_auto_db = db.clone();
+            let platform_autofix_incident = autofix_incident.clone();
             let platform_interactions: PlatformInteractionExecutor = Arc::new(move |request| {
+                if let Some(incident_public_id) = platform_autofix_incident.clone() {
+                    let auth = platform_auto_auth.clone();
+                    let metadata = platform_auto_metadata.clone();
+                    let db = platform_auto_db.clone();
+                    let input = redact_value(&request.input);
+                    let tool_name = request.tool_name.clone();
+                    return Box::pin(async move {
+                        crate::autofix::record_refused_action(
+                            db.as_ref(),
+                            &incident_public_id,
+                            &tool_name,
+                            input,
+                        )
+                        .await;
+                        Ok(PermissionResolution {
+                            decision: PermissionDecision::DenyTool {
+                                reason: Some(crate::autofix::REFUSED_WRITE_REASON.to_string()),
+                            },
+                            auth,
+                            metadata,
+                        })
+                    });
+                }
                 if platform_auto_approve.load(Ordering::Acquire) {
                     if let Some(decision) = automatic_platform_decision(&request) {
                         let auth = platform_auto_auth.clone();
@@ -5666,6 +5712,7 @@ impl ConversationService {
             let executor_auth = auth.clone();
             let executor_db = db.clone();
             let executor_project_access_checker = project_access_checker.clone();
+            let executor_autofix_incident = autofix_incident.clone();
             let turn_tool_executor: ToolExecutor = Arc::new(move |call: ToolCall| {
                 let state = executor_state.clone();
                 let provider = executor_provider.clone();
@@ -5679,7 +5726,27 @@ impl ConversationService {
                 let auth = executor_auth.clone();
                 let db = executor_db.clone();
                 let project_access_checker = executor_project_access_checker.clone();
+                let autofix_incident = executor_autofix_incident.clone();
                 Box::pin(async move {
+                    if let Some(incident_public_id) = autofix_incident.as_deref() {
+                        if crate::autofix::tool_refused_in_incident(&call.name) {
+                            let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                                .map(|value| redact_value(&value))
+                                .unwrap_or(serde_json::Value::Null);
+                            crate::autofix::record_refused_action(
+                                db.as_ref(),
+                                incident_public_id,
+                                &call.name,
+                                input,
+                            )
+                            .await;
+                            return Ok(format!(
+                                "Not run: `{}` is not available in an autofix incident. {}",
+                                call.name,
+                                crate::autofix::REFUSED_WRITE_REASON
+                            ));
+                        }
+                    }
                     let auth = match refresh_tool_authorization(db.as_ref(), &auth).await {
                         Ok(auth) => auth,
                         Err(error) => {

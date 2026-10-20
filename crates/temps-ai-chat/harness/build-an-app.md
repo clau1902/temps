@@ -29,9 +29,12 @@ Use this when the user wants an app, site, API or worker built or changed.
    (`npm install && npm run build`). Older tool results are trimmed, so read a
    file again before editing it rather than recalling it.
    If it has pages people look at, read the `build-a-website` playbook
-   before writing them. Before the first deploy, read the
-   `add-temps-observability` playbook and wire Temps analytics, error
-   tracking and traces into the code, so the app reports to its own project.
+   before writing them, and the `track-app-usage` playbook: every app with
+   pages sends Temps analytics and named events for what visitors do, so
+   plan the events with the pages and wire them before the first deploy.
+   Read the `add-temps-observability` playbook too: wire error tracking and
+   traces to Temps when the code already uses Sentry or OpenTelemetry, and
+   otherwise offer them at the end instead of adding them.
 4. Check it before you say it works, with commands run this turn, and quote
    them: the build exits 0 with no type errors; the server listens on
    `0.0.0.0` at `$PORT` (default 3000); every route you added answers as
@@ -77,6 +80,10 @@ Use this when the user wants an app, site, API or worker built or changed.
     `get_deployment_job_logs`, before changing anything. If it built in the
     sandbox but fails on Temps, compare the runtime version, the lockfile and
     the build and start commands.
-11. Finish with what is live (the URL), what you checked, which of
-    analytics, error tracking and traces it reports, what is not done yet,
-    and the next step.
+11. Whenever you stop building, deployed or not, end with all of these:
+    - what is live (the URL), or where the user can see it;
+    - what you checked;
+    - the analytics events it sends: each name and when it fires;
+    - whether it reports errors and traces, and when it does not, a one-line
+      offer to add them (plain HTML cannot have them: say so instead);
+    - what is not done yet, and the next step.

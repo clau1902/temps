@@ -154,8 +154,12 @@ test('a settled goal step folds to what it did, not its raw arguments', () => {
       />
     </QueryClientProvider>
   )
-  expect(markup).toContain('Set a goal')
-  expect(markup).not.toContain('operation_id')
+  // A lone step is its own row: what it did, not a summary over it.
+  expect(markup).not.toContain('Set a goal')
+  expect(markup).toContain('>Watch<')
+  expect(markup).toContain('>Deployment 43 goes live<')
+  // The raw arguments stay in the hover title, never on screen.
+  expect(markup.replace(/ title="[^"]*"/g, '')).not.toContain('operation_id')
 })
 
 test('a proposed change is never folded away with the work', () => {
@@ -176,9 +180,22 @@ test('a proposed change is never folded away with the work', () => {
       },
     ],
   })
-  expect(markup).toContain('Ran a command')
+  expect(markup).toContain('>Run<')
   expect(markup).toContain('I will create the project. Approve below.')
   expect(markup).toContain('temps_write')
+})
+
+test('two finished steps fold under one summary', () => {
+  const markup = body({
+    role: 'assistant',
+    content: '',
+    parts: [
+      { type: 'tool', tool: command('a', 'ls', '{"exit_code":0}') },
+      { type: 'tool', tool: command('b', 'pwd', '{"exit_code":0}') },
+      { type: 'text', text: 'Both ran.' },
+    ],
+  })
+  expect(markup).toContain('Ran 2 commands')
 })
 
 test('an answer without tools has no work group', () => {

@@ -12460,6 +12460,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-error-tracking",
  "temps-git",
  "temps-logs",
  "temps-projects",

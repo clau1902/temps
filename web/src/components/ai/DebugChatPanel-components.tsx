@@ -5,6 +5,7 @@ import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 import { useQueryClient } from '@tanstack/react-query'
 import { FOCUS_COMPOSER_HINT } from './assistant-view'
 import { uploadChatAttachment } from './chat-attachment-upload'
+import { announceChatTurn } from './chat-run-state'
 import { useFocusComposerShortcut } from './useFocusComposerShortcut'
 import { invalidateChatOperations } from './chat-operations'
 import { invalidateChatResources } from './chat-resources'
@@ -210,6 +211,7 @@ import {
 } from './chat-message-parts'
 import {
   failedToolCount,
+  standaloneResultId,
   groupAssistantParts,
   liveWorkSegmentKey,
   runningTool,
@@ -226,6 +228,7 @@ import {
   shouldLoadEarlierMessages,
 } from './chat-history-pagination'
 import {
+  isTempsReadTool,
   projectCollectionFromApplicationProjectWrite,
   projectCollectionFromTool,
 } from './tool-result-presentation'
@@ -1928,6 +1931,35 @@ function AssistantWorkGroup({
           isSandboxCreateTool(tool.name) || isSandboxScopedTool(tool.name)
       )
     : []
+  // The sandbox panel follows these tools whether or not they are shown.
+  const sandboxRefreshers =
+    conversationPublicId &&
+    sandboxTools.map((tool) => (
+      <SandboxStatusRefresher
+        key={tool.id}
+        conversationPublicId={conversationPublicId}
+        done={tool.result != null}
+      />
+    ))
+
+  // One finished step says what it did on its own row; a summary line
+  // ("Ran a command") over it would only repeat it behind a click.
+  if (!live && steps.length === 1) {
+    const step = steps[0]
+    return (
+      <div className="min-w-0">
+        <TraceToolRow
+          tool={step.tool}
+          order={0}
+          selected={selectedTool === step.tool.id}
+          onSelect={() =>
+            setSelectedTool((id) => (id === step.tool.id ? null : step.tool.id))
+          }
+        />
+        {sandboxRefreshers}
+      </div>
+    )
+  }
 
   return (
     <div className="min-w-0">
@@ -2010,15 +2042,7 @@ function AssistantWorkGroup({
           )}
         </div>
       </div>
-      {/* The sandbox panel follows these tools whether or not they are shown. */}
-      {conversationPublicId &&
-        sandboxTools.map((tool) => (
-          <SandboxStatusRefresher
-            key={tool.id}
-            conversationPublicId={conversationPublicId}
-            done={tool.result != null}
-          />
-        ))}
+      {sandboxRefreshers}
     </div>
   )
 }
@@ -2063,8 +2087,13 @@ export function AssistantBody({
       <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
     ) : null
   }
+  const standaloneResult = standaloneResultId(
+    parts,
+    (tool) => isTempsReadTool(tool.name),
+    (tool) => projectCollectionFromTool(tool) !== null
+  )
   const segments = groupAssistantParts(parts, (tool) =>
-    isFoldableTool(tool, conversationPublicId)
+    isFoldableTool(tool, conversationPublicId, standaloneResult)
   )
   const liveWorkKey = liveWorkSegmentKey(segments, streaming)
 
@@ -2176,11 +2205,14 @@ export function AssistantBody({
 
 /**
  * Whether a tool's card can fold into a work group: everything except the
- * cards that ask the user for something or show a result as its own view.
+ * cards that ask the user for something, and the project list an answer that
+ * only looked things up stands on. A project list looked up mid-build is the
+ * model's own check, not news for the user, so it folds with the work.
  */
 function isFoldableTool(
   tool: ToolCall,
-  conversationPublicId: string | null
+  conversationPublicId: string | null,
+  standaloneResult: string | null
 ): boolean {
   if (isTempsWriteToolName(tool.name)) return false
   if (isAskUserTool(tool.name)) return false
@@ -2198,7 +2230,9 @@ function isFoldableTool(
   )
     return false
   if (isSandboxOfferTool(tool.name) && conversationPublicId) return false
-  return projectCollectionFromTool(tool) === null
+  return (
+    projectCollectionFromTool(tool) === null || tool.id !== standaloneResult
+  )
 }
 
 /**
@@ -2787,6 +2821,11 @@ function DebugChatPanelBody({
   const [liveUpdatesUnavailable, setLiveUpdatesUnavailable] = useState(false)
   const turnActive = streaming || wsTurnActive
   const [queuedMessages, updateQueue] = useChatMessageQueue(publicId ?? null)
+  // The chat list shows whether each chat is working; it hears about this
+  // one's turns from here instead of waiting for its next refresh.
+  useEffect(() => {
+    if (publicId) announceChatTurn(publicId, turnActive)
+  }, [publicId, turnActive])
 
   const changePermissionMode = useCallback(
     async (permissionModeId: string) => {

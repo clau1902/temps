@@ -279,6 +279,14 @@ pub struct ApplicationArchivedAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ApplicationRenamedAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub previous_name: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ApplicationRestoredAudit {
     pub context: AuditContext,
     pub application_id: String,
@@ -296,6 +304,7 @@ pub struct ThreadArtifactCreatedAudit {
 
 impl_audit_operation!(ApplicationCreatedAudit, "ai.application.created");
 impl_audit_operation!(ApplicationArchivedAudit, "ai.application.archived");
+impl_audit_operation!(ApplicationRenamedAudit, "ai.application.renamed");
 impl_audit_operation!(ApplicationRestoredAudit, "ai.application.restored");
 impl_audit_operation!(ThreadArtifactCreatedAudit, "ai.thread_artifact.created");
 
@@ -577,3 +586,58 @@ impl_audit_operation!(
     AiBlueprintBindingChangedAudit,
     "ai.blueprint.binding_changed"
 );
+
+/// An autofix incident was opened for an error group (ADR-054), by a user
+/// ("Fix this crash") or automatically for the project's autofix owner.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutofixIncidentOpenedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub error_group_id: i32,
+    pub incident_id: String,
+    pub trigger: String,
+}
+
+/// A user stopped a running or waiting autofix incident.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutofixIncidentStoppedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub incident_id: String,
+    pub previous_status: String,
+}
+
+/// A user recorded the outcome of an incident: merged, applied or rejected.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutofixIncidentClosedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub incident_id: String,
+    pub decision: String,
+    pub pr_url: Option<String>,
+}
+
+/// A project's autofix policy changed.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutofixSettingsUpdatedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub mode: String,
+    pub min_confidence: i16,
+    pub protected_paths: Vec<String>,
+    pub has_test_command: bool,
+}
+
+/// All autofix work of a project was paused or resumed.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutofixPausedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub paused: bool,
+}
+
+impl_audit_operation!(AutofixIncidentOpenedAudit, "AUTOFIX_INCIDENT_OPENED");
+impl_audit_operation!(AutofixIncidentStoppedAudit, "AUTOFIX_INCIDENT_STOPPED");
+impl_audit_operation!(AutofixIncidentClosedAudit, "AUTOFIX_INCIDENT_CLOSED");
+impl_audit_operation!(AutofixSettingsUpdatedAudit, "AUTOFIX_SETTINGS_UPDATED");
+impl_audit_operation!(AutofixPausedAudit, "AUTOFIX_PAUSED");

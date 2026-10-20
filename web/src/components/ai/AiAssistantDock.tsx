@@ -35,6 +35,7 @@ import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { useQuery } from '@tanstack/react-query'
 import { AiSettingsMenu } from './AiSettingsMenu'
 import { ConversationSandboxChip } from './ConversationSandboxChip'
+import { ChatRunBadge } from './ChatRunBadge'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -78,7 +79,14 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useEffectEvent,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { CONSOLE_HOME_PATH } from './AssistantTopBar'
@@ -99,7 +107,18 @@ import {
   chatsNotListed,
 } from './chat-page-state'
 import { DebugChatPanel } from './DebugChatPanel'
-import { OPEN_CHAT_EVENT } from './chat-blueprint'
+import {
+  CHAT_LIST_CHANGED_EVENT,
+  NEW_CHAT_IN_EVENT,
+  OPEN_CHAT_EVENT,
+  type NewChatInDetail,
+} from './chat-blueprint'
+import {
+  CHAT_TURN_EVENT,
+  chatListPollInterval,
+  withTurnStatus,
+  type ChatTurnDetail,
+} from './chat-run-state'
 import { AgentSwitcher, type SwitcherChat } from './AgentSwitcher'
 import {
   AssistantStart,
@@ -697,6 +716,54 @@ export function DockBody({
     }
   }, [initialContext, loadList])
 
+  // The open chat says when its turn starts and ends, so its row changes at
+  // once; the final state (finished or error) is read back from the server.
+  useEffect(() => {
+    const onTurn = (event: Event) => {
+      const detail = (event as CustomEvent<ChatTurnDetail>).detail
+      if (!detail?.publicId) return
+      const listed = listedChatsRef.current.find(
+        (c) => c.public_id === detail.publicId
+      )
+      if (!listed) return
+      if (detail.active) {
+        applyListedChats(
+          withTurnStatus(listedChatsRef.current, detail.publicId, 'running'),
+          hasMoreChatsRef.current
+        )
+      } else if (listed.turn_status === 'running') {
+        loadList()
+      }
+    }
+    window.addEventListener(CHAT_TURN_EVENT, onTurn)
+    return () => window.removeEventListener(CHAT_TURN_EVENT, onTurn)
+  }, [applyListedChats, loadList])
+
+  // The workspace chip moved a chat or renamed an application: the groups
+  // the list shows changed, so it reads them again now.
+  useEffect(() => {
+    const refresh = () => loadList()
+    window.addEventListener(CHAT_LIST_CHANGED_EVENT, refresh)
+    return () => window.removeEventListener(CHAT_LIST_CHANGED_EVENT, refresh)
+  }, [loadList])
+
+  // Chats keep working in the background (a goal brings one back, another
+  // tab sent a message), so the list checks again: often while one is
+  // working, rarely otherwise, and as soon as the tab is looked at again.
+  const pollInterval = chatListPollInterval(listedChats)
+  useEffect(() => {
+    if (!listReady) return
+    const refresh = () => {
+      if (document.visibilityState === 'visible') loadList()
+    }
+    const timer = window.setInterval(refresh, pollInterval)
+    document.addEventListener('visibilitychange', refresh)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', refresh)
+    }
+  }, [listReady, pollInterval, loadList])
+
   const openConversation = useCallback((c: ProjectConversation) => {
     // The list already knows this id. Setting it immediately avoids an
     // intermediate render where URL synchronization can mistake a resolved
@@ -913,6 +980,19 @@ export function DockBody({
       setSearchParams(withoutChat(liveSearchParams()), { replace: true })
     }
   }
+
+  // The workspace chip's "New chat in …" does what the list's "+ Chat" does.
+  const onNewChatIn = useEffectEvent((application: NewChatInDetail) =>
+    startAssistantIn(application)
+  )
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const application = (event as CustomEvent<NewChatInDetail>).detail
+      if (application?.public_id) onNewChatIn(application)
+    }
+    window.addEventListener(NEW_CHAT_IN_EVENT, handler)
+    return () => window.removeEventListener(NEW_CHAT_IN_EVENT, handler)
+  }, [])
 
   const handleAssistantStarted = (
     conversation: ConversationResponse,
@@ -1480,7 +1560,7 @@ export function DockBody({
           </div>
         ) : (
           <ConversationList
-            loading={loadingList}
+            loading={loadingList && conversations.length === 0}
             conversations={conversations}
             hasMore={hasMoreChats}
             loadingMore={loadingMoreChats}
@@ -1867,6 +1947,10 @@ function ConversationRow({
                 backend={c.sandbox.backend}
               />
             )}
+            <ChatRunBadge
+              turnStatus={c.turn_status}
+              failureTitle={c.failure?.title}
+            />
             <span
               className={cn(
                 'min-w-0 truncate',

@@ -327,6 +327,7 @@ mod m20261019_000001_add_ai_next_step_suggestions;
 mod m20261019_000002_create_ai_chat_operations;
 mod m20261019_000003_drop_ai_data_access_from_external_services;
 mod m20261020_000001_create_ai_blueprints;
+mod m20261020_000002_create_autofix_incidents;
 
 pub struct Migrator;
 
@@ -725,6 +726,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261019_000002_create_ai_chat_operations::Migration),
             Box::new(m20261019_000003_drop_ai_data_access_from_external_services::Migration),
             Box::new(m20261020_000001_create_ai_blueprints::Migration),
+            Box::new(m20261020_000002_create_autofix_incidents::Migration),
         ]
     }
 }

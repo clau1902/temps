@@ -16,6 +16,8 @@ pub mod attachment_upload_handlers;
 pub mod attachment_uploads;
 pub mod attachments;
 pub mod audit;
+pub mod autofix;
+pub mod autofix_handlers;
 pub mod blueprint;
 pub mod blueprint_handlers;
 pub mod chat_operations;

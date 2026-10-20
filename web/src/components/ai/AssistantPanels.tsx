@@ -50,6 +50,7 @@ import { toast } from 'sonner'
 import { z } from 'zod'
 import { FOCUS_COMPOSER_HINT } from './assistant-view'
 import { WorkspaceChip } from './WorkspaceChip'
+import { ChatProjectsLink } from './ChatProjectsLink'
 import { useChatBlueprint } from './chat-blueprint'
 import { projectRequest, type ProjectChoice } from './chat-project'
 import { NewChatProjectChip } from './NewChatProjectChip'
@@ -1074,6 +1075,7 @@ export function AssistantThread({
               <ChatOperationsIndicator
                 conversationPublicId={conversation.public_id}
               />
+              <ChatProjectsLink conversationPublicId={conversation.public_id} />
               <WorkspaceChip conversationPublicId={conversation.public_id} />
               <ChatSandbox conversationPublicId={conversation.public_id} />
               {!workView && (

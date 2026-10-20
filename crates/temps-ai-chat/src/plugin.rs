@@ -155,6 +155,7 @@ impl TempsPlugin for AiChatPlugin {
                         "AI workspace storage configuration: {error}"
                     ))
                 })?;
+            let autofix_data_dir = config_service.data_dir();
             let application_workspaces = Arc::new(
                 crate::ApplicationWorkspaceService::new(config_service.data_dir())
                     .with_local_workspaces_enabled(!stateless),
@@ -305,6 +306,21 @@ impl TempsPlugin for AiChatPlugin {
             let service = Arc::new(service);
             context.register_service(service.clone());
 
+            // ADR-054: crash autofix incidents. Sandboxes, Git and source
+            // maps are optional; without them incidents degrade to a patch
+            // or a written analysis and the capability endpoint says why.
+            let autofix = Arc::new(crate::autofix::AutofixService::new(
+                db.clone(),
+                service.clone(),
+                applications.clone(),
+                application_sandboxes.clone(),
+                context.get_service::<temps_git::GitProviderManager>(),
+                context.get_service::<temps_error_tracking::services::source_map_service::SourceMapService>(),
+                audit_service.clone(),
+                autofix_data_dir,
+            ));
+            context.register_service(autofix.clone());
+
             let project_service = context.require_service::<temps_projects::ProjectService>();
 
             let app_state = Arc::new(AppState {
@@ -351,6 +367,46 @@ impl TempsPlugin for AiChatPlugin {
             );
             tokio::spawn(Arc::new(watcher).run());
             tracing::debug!("AI goal watcher started");
+
+            // Autofix: one worker runs incidents one at a time; new and
+            // regressed error groups reach it through the job queue.
+            let autofix = context.require_service::<crate::autofix::AutofixService>();
+            if let Some(checker) = context.get_service::<dyn temps_core::ProjectAccessChecker>() {
+                autofix.bind_project_access_checker(checker);
+            }
+            tokio::spawn(autofix.clone().run_worker());
+            match context.get_service::<dyn temps_core::JobQueue>() {
+                Some(queue) => {
+                    let mut receiver = queue.subscribe();
+                    let autofix = autofix.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match receiver.recv().await {
+                                Ok(temps_core::Job::ErrorGroupOpened(job)) => {
+                                    autofix.handle_group_opened(&job).await
+                                }
+                                Ok(_) => {}
+                                Err(temps_core::QueueError::ChannelClosed) => {
+                                    tracing::warn!(
+                                        "the job queue closed; autofix stopped listening for new error groups"
+                                    );
+                                    break;
+                                }
+                                // A lagging receiver skips what it missed:
+                                // an incident not opened automatically can
+                                // still be started by hand.
+                                Err(error) => tracing::warn!(
+                                    "autofix missed error-group jobs: {error}"
+                                ),
+                            }
+                        }
+                    });
+                }
+                None => tracing::warn!(
+                    "no job queue is registered; autofix will only run when started by hand"
+                ),
+            }
+            tracing::debug!("Autofix worker started");
 
             // Erase the values of expired secret slots. Each slot is also
             // refused on use once expired, so this only bounds how long a
@@ -418,6 +474,16 @@ impl TempsPlugin for AiChatPlugin {
             .merge(crate::chat_operations_handlers::configure_routes())
             .merge(crate::blueprint_handlers::configure_routes())
             .with_state(app_state)
+            .merge(
+                crate::autofix_handlers::configure_routes().with_state(Arc::new(
+                    crate::autofix_handlers::AutofixState {
+                        autofix: context.require_service::<crate::autofix::AutofixService>(),
+                        audit_service: old.audit_service.clone(),
+                        project_access_checker: context
+                            .get_service::<dyn temps_core::ProjectAccessChecker>(),
+                    },
+                )),
+            )
             .merge(temps_ai_agent_cli::sandbox_model_relay_routes().with_state(model_relay));
         Some(PluginRoutes::new(router))
     }
@@ -444,6 +510,7 @@ impl TempsPlugin for AiChatPlugin {
             <crate::chat_operations_handlers::ChatOperationsApiDoc as OpenApiTrait>::openapi(),
         );
         document.merge(<crate::blueprint_handlers::BlueprintApiDoc as OpenApiTrait>::openapi());
+        document.merge(<crate::autofix_handlers::AutofixApiDoc as OpenApiTrait>::openapi());
         Some(document)
     }
 }

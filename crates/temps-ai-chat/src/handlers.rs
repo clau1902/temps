@@ -52,8 +52,8 @@ use temps_ai::streaming::{PermissionDecision, PermissionKind, PermissionRequest}
 use crate::applications::{is_sensitive_workspace_path, WorkspaceEntryKind};
 use crate::audit::{
     AiActionConfirmedAudit, AiActionRejectedAudit, ApplicationArchivedAudit,
-    ApplicationCreatedAudit, ApplicationPreviewLinkCreatedAudit, ApplicationRestoredAudit,
-    ApplicationTopologyChangedAudit, ApplicationWorkspaceChangedAudit,
+    ApplicationCreatedAudit, ApplicationPreviewLinkCreatedAudit, ApplicationRenamedAudit,
+    ApplicationRestoredAudit, ApplicationTopologyChangedAudit, ApplicationWorkspaceChangedAudit,
     ApplicationWorkspaceDeployedAudit, ApplicationWorkspaceFilesWrittenAudit,
     ApplicationWorkspaceSourceImportedAudit, ChatMessageSentAudit, ConversationArchivedAudit,
     ConversationAttachmentUploadedAudit, ConversationCreatedAudit,
@@ -310,6 +310,12 @@ pub struct CreateApplicationRequest {
     /// the application's persistent workspace.
     #[serde(default)]
     pub starter_project: Option<CreateApplicationProjectRequest>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RenameApplicationRequest {
+    /// New name shown for the application. Trimmed; 1 to 200 characters.
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -3386,6 +3392,59 @@ pub async fn archive_application(
         })
         .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    patch, tag = "AI Applications", path = "/ai/applications/{application_public_id}",
+    operation_id = "rename_application",
+    summary = "Rename an AI application",
+    description = "Changes the application's name. Its id, chats, workspace and projects are unchanged.",
+    params(("application_public_id" = String, Path,)),
+    request_body = RenameApplicationRequest,
+    responses(
+        (status = 200, body = ApplicationResponse),
+        (status = 400, description = "The name is empty or longer than 200 characters"),
+        (status = 401), (status = 403), (status = 404)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn rename_application(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(application_public_id): Path<String>,
+    Json(request): Json<RenameApplicationRequest>,
+) -> Result<Json<ApplicationResponse>, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    deny_deployment_token!(auth);
+    let current = authorized_application(&state, &auth, &application_public_id).await?;
+    let project_ids = current
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_permission(
+        &auth,
+        &state.project_access_checker,
+        &project_ids,
+        &Permission::ProjectsWrite,
+    )
+    .await?;
+    let renamed = state
+        .applications
+        .rename(auth.user_id(), &application_public_id, &request.name)
+        .await?;
+    if renamed.application.name != current.application.name {
+        state
+            .audit(&ApplicationRenamedAudit {
+                context: audit_context(&auth, &metadata),
+                application_id: application_public_id,
+                previous_name: current.application.name,
+                name: renamed.application.name.clone(),
+            })
+            .await;
+    }
+    Ok(Json(ApplicationResponse::from(renamed)))
 }
 
 #[utoipa::path(
@@ -10117,7 +10176,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/ai/applications/{application_public_id}",
-            get(get_application).delete(archive_application),
+            get(get_application)
+                .patch(rename_application)
+                .delete(archive_application),
         )
         .route(
             "/ai/applications/{application_public_id}/restore",
@@ -10353,6 +10414,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         list_applications,
         create_application,
         archive_application,
+        rename_application,
         restore_application,
         create_application_project,
         deploy_application_workspace_project,
@@ -10442,6 +10504,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         WriteApplicationWorkspaceFilesRequest,
         WriteApplicationWorkspaceFilesResponse,
         CreateApplicationRequest,
+        RenameApplicationRequest,
         CreateApplicationProjectRequest,
         DeployApplicationProjectRequest,
         ApplicationProjectDeploymentResponse,

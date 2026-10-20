@@ -359,7 +359,9 @@ impl WorkspaceChatService {
                        AND sibling.context_type = '{ASSISTANT_CONTEXT_TYPE}' \
                        AND jsonb_typeof(sibling.metadata) = 'object' \
                        AND sibling.metadata ? '{SANDBOX_LINK_KEY}' \
-                     ORDER BY sibling.last_activity_at DESC LIMIT 1"
+                       AND sibling.metadata -> '{}' IS NULL \
+                     ORDER BY sibling.last_activity_at DESC LIMIT 1",
+                    crate::autofix::INCIDENT_METADATA_KEY
                 ),
                 [conversation.id.into()],
             ))
@@ -1082,6 +1084,13 @@ mod tests {
         assert!(scope.contains("chat.context_type = 'assistant'"));
         assert!(scope.contains("sibling.context_type = 'assistant'"));
         assert_eq!(metadata_scope("$3", false), "id = $3");
+    }
+
+    #[test]
+    fn an_autofix_incident_chat_neither_shares_nor_receives_the_workspace_sandbox() {
+        let scope = metadata_scope("$2", true);
+        assert!(scope.contains("chat.metadata -> 'autofix_incident' IS NULL"));
+        assert!(scope.contains("sibling.metadata -> 'autofix_incident' IS NULL"));
     }
 
     #[test]

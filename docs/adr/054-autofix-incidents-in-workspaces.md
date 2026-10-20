@@ -136,31 +136,52 @@ three times and requiring all three runs to agree.
 
 ### 5. Confidence is computed from evidence the server collected
 
-| Signal | Collected by | Kind | Weight |
-|---|---|---|---|
-| Repro test fails at the deployed source | Server, in the sandbox | Hard gate: missing caps the score at 40 | 25 |
-| Same test passes after the fix | Server, in the sandbox | Hard gate: missing caps the score at 20 | 25 |
-| Suite and build pass; CI green on the PR | Server, then the Git provider | Hard gate for auto-merge | 15 |
-| Diff touches a frame from the stack trace | Server, diff against the symbolicated stack | Weighted | 10 |
-| Diff is small (under 50 lines, under 4 files) | Server, from the diff | Weighted, scaled down as it grows | 10 |
-| Replay against a sandbox preview no longer errors | Server, when the event has a replayable request | Weighted, optional | 10 |
-| Model's self-assessment | Model | Weighted | 5 |
-| Touches a protected path | Server | Blocks auto-merge; no score change | 0 |
+The score is a level from 0 to 5. Each level is a statement about what the
+server proved, and a fix reaches a level only when it meets that level's
+checks and every level below it. A sum of weighted points would let a passing
+test suite make up for a crash that was never reproduced; a ladder cannot, and
+"4/5" always means the same thing. The scale matches what reviewers already
+read in code-review tools, and a coarse scale does not claim precision the
+evidence does not have.
 
-Every signal is stored with its value, the command or source it came from, and
-an output excerpt, so the reviewer sees why the score is what it is. The
-weights are a starting point, tuned against reviewer decisions in phase 2.
+| Level | Means | Checks (server-collected) |
+|---|---|---|
+| 0 | Nothing verified | The fix does not pass its own reproduction, or nothing changed |
+| 1 | The fix passes the agent's reproduction | Same repro passes after the fix, every run |
+| 2 | The crash reproduces at the deployed source and the fix makes it pass | Repro fails at the deployed source |
+| 3 | The fix is small and changes a file from the stack trace | Diff touches a symbolicated frame; up to 50 lines in under 4 files |
+| 4 | The project's test command passes | Suite and build pass; CI green on the PR |
+| 5 | Replaying the crashing request is clean | Replay against a sandbox preview no longer errors |
+
+Two things are shown but never move the score: the model's self-assessment
+(1-5), which is not evidence, and protected paths, which block auto-merge at
+any score.
+
+Every check is stored with its result, the command or source it came from,
+and an output excerpt, and the assessment says what the next level needs ("To
+reach 4/5: the project's test command passes. No test command is configured"),
+so the reviewer sees why the score is what it is and how to raise it. The
+levels are a starting point, tuned against reviewer decisions in phase 2. The
+default merge threshold is 4: a verified, focused fix with the project's tests
+green.
 
 ### 6. The project decides what happens to a fix
 
-Three columns on `projects`, changed through the API and audit-logged like any
-other project setting (not environment variables):
+One row per project in `project_autofix_settings`, changed through the API and
+audit-logged like any other project setting (not environment variables). A
+separate table rather than columns on `projects`, so the project model and its
+many constructors stay as they are; a missing row reads as `off`.
 
 | Column | Values | Default |
 |---|---|---|
-| `autofix_mode` | `off`, `propose`, `auto_merge` | `off` |
-| `autofix_min_confidence` | 0 to 100, used by `auto_merge` only | 85 |
-| `autofix_protected_paths` | Glob list that blocks auto-merge, such as `migrations/**` | Empty |
+| `mode` | `off`, `propose`, `auto_merge` | `off` |
+| `min_confidence` | Level 0 to 5, used by `auto_merge` only | 4 |
+| `protected_paths` | Glob list that blocks auto-merge, such as `migrations/**` | Empty |
+| `test_command` | Command the server runs after the fix, besides the agent's reproduction | None |
+| `paused` | Pause switch for all autofix work of the project | `false` |
+| `owner_user_id` | User automatic incidents act as: whoever last changed the settings | None |
+| `application_id` | Workspace the incident chats go to; remembered after the first incident | None |
+| `ai_provider`, `ai_model` | Model the incident chats run on | The assistant's default |
 
 - `propose`: the PR (or patched bundle) is offered as a pending action in the
   incident chat, and a notification links to it. The engineer approves,
@@ -287,7 +308,7 @@ keeps only the record of it.
 | `phase` | text | `reproduce`, `fix`, `verify`, `deliver`, `watch` |
 | `base_revision`, `head_revision` | text | SHA, or bundle checksum for uploaded source |
 | `branch`, `pr_url`, `pr_number`, `patched_bundle_id` | text, int | The deliverable |
-| `confidence` | smallint, nullable | |
+| `confidence` | smallint, nullable | Level 0 to 5 |
 | `evidence` | jsonb | Every signal of section 5 |
 | `decision`, `decided_by_user_id`, `decided_at` | | `null` decider means "policy" |
 | `cost_cents`, `attempts` | int | |
@@ -301,17 +322,20 @@ on `(incident_id, at)`.
 
 | Method | Path | Permission | Purpose |
 |---|---|---|---|
-| GET | `/projects/{project_id}/autofix/capability` | `ProjectsRead` | `configured`, `reason`, `setup_path`, and the source kind of the latest deployment |
-| PATCH | `/projects/{project_id}/autofix/settings` | `ProjectsWrite` | Mode, threshold, protected paths; sets the owner |
+| GET | `/projects/{project_id}/autofix` | `ProjectsRead` | `configured`, `reason`, `setup_path`, the source kind and delivery of the latest production deployment, and the settings |
+| PATCH | `/projects/{project_id}/autofix/settings` | `ProjectsWrite` | Mode, threshold, protected paths, test command, model; sets the owner |
 | POST | `/projects/{project_id}/autofix/pause` | `ProjectsWrite` | Pause or resume all autofix work |
-| GET | `/projects/{project_id}/autofix/incidents` | `ProjectsRead` | Paginated, newest first, filter by status and decision |
-| POST | `/projects/{project_id}/error-groups/{group_id}/autofix` | `ProjectsWrite` | "Fix this crash": open or return the incident |
+| GET | `/projects/{project_id}/autofix/incidents` | `ProjectsRead` | Paginated, newest first, filter by status (`open`, `closed` or exact) and error group |
+| POST | `/projects/{project_id}/autofix/incidents` | `ProjectsWrite` | "Fix this crash" for `{error_group_id}`: open the incident or return the open one |
 | GET | `/projects/{project_id}/autofix/incidents/{incident_id}` | `ProjectsRead` | Incident, evidence, deliverable |
-| GET | `/projects/{project_id}/autofix/incidents/{incident_id}/events` | `ProjectsRead` | Timeline, paginated; SSE variant for live updates |
-| POST | `/projects/{project_id}/autofix/incidents/{incident_id}/stop` | `ProjectsWrite` | Stop a running incident |
+| GET | `/projects/{project_id}/autofix/incidents/{incident_id}/events` | `ProjectsRead` | Timeline, polled with an `after_id` cursor; the response carries the incident status so a poller knows when to stop |
+| GET | `/projects/{project_id}/autofix/incidents/{incident_id}/patch` | `ProjectsRead` | The fix as a unified diff, for uploaded source or a fallback from a PR |
+| POST | `/projects/{project_id}/autofix/incidents/{incident_id}/stop` | `ProjectsWrite` | Stop a queued, running or waiting incident |
+| POST | `/projects/{project_id}/autofix/incidents/{incident_id}/close` | `ProjectsWrite` | Record the decision on a fix waiting for review: `merged`, `applied` or `rejected` |
 
-Approve and reject go through the existing pending-action endpoints of the
-incident chat.
+The decision is recorded through `close` rather than the chat's pending
+actions: the deliverable already exists (the PR or the patch) when review
+starts, so there is nothing left for the chat to execute on approval.
 
 ## Consequences
 
@@ -353,8 +377,8 @@ incident chat.
 **Phase 1: propose.** Gate to phase 2: at least 20 incidents delivered, and
 reviewers accepted at least half with few edits.
 
-1. Migrations: `autofix_incidents`, `autofix_incident_events`, project columns.
-2. Incident service: open, dedup and reopen from `Job::AutopilotTrigger`;
+1. Migrations: `autofix_incidents`, `autofix_incident_events`, `project_autofix_settings`.
+2. Incident service: open and dedup from `Job::ErrorGroupOpened`, which error ingest sends for every new or regressed group;
    workspace resolution; budget, cooldown, concurrency cap and queue limit.
 3. Source resolution from the crashing deployment (section 3), Git and
    uploaded source first; report-only for the rest.
@@ -371,7 +395,7 @@ reviewers accepted at least half with few edits.
    The existing Autofix button opens the incident flow.
 
 **Phase 2: evidence.** Gate to phase 3: on 50 or more reviewed incidents,
-deliverables scoring 85 or more were accepted unchanged at least 90% of the
+deliverables scoring 4/5 or more were accepted unchanged at least 90% of the
 time.
 
 1. `sandbox_command` goal check kind; reproduce, fix and verify as goals.

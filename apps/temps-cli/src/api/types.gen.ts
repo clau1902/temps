@@ -2225,6 +2225,25 @@ export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
  */
 export type ArtifactKind = 'x509_certificate' | 'ssh_certificate' | 'openpgp_key' | 'jwt';
 
+/**
+ * The score and how it was reached.
+ */
+export type Assessment = {
+    /**
+     * What the next level needs and why it was not reached, below the top.
+     */
+    next_level?: string | null;
+    /**
+     * Paths that block a policy merge.
+     */
+    protected_paths: Array<string>;
+    /**
+     * Highest level of the confidence ladder the fix reached, 0-5.
+     */
+    score: number;
+    signals: Array<Signal>;
+};
+
 export type AssignRoleRequest = {
     role_type: string;
     user_id: number;
@@ -2445,6 +2464,127 @@ export type AutoWatchParams = {
 };
 
 /**
+ * Whether autofix can run for a project, and what a fix would become.
+ */
+export type AutofixCapabilityResponse = {
+    /**
+     * An AI provider and sandboxes are available.
+     */
+    configured: boolean;
+    /**
+     * What a fix becomes: `pull_request`, `patch` or `report`.
+     */
+    delivery: string;
+    /**
+     * Why the delivery is what it is, e.g. the Git connection is missing.
+     */
+    delivery_reason?: string | null;
+    /**
+     * Why autofix cannot run, when `configured` is false.
+     */
+    reason?: string | null;
+    settings: AutofixSettingsResponse;
+    /**
+     * Console path that fixes the missing configuration.
+     */
+    setup_path?: string | null;
+    /**
+     * How the latest production deployment was built: `git`,
+     * `uploaded_source`, `report_only` or `none`.
+     */
+    source_kind: string;
+};
+
+export type AutofixEventListResponse = {
+    /**
+     * The incident's status when the page was read, so a poller knows when
+     * to stop.
+     */
+    incident_status: string;
+    items: Array<AutofixEventResponse>;
+};
+
+export type AutofixEventResponse = {
+    /**
+     * `server`, `agent`, `policy` or `user:<id>`.
+     */
+    actor: string;
+    created_at: string;
+    details?: EventDetails | null;
+    id: number;
+    kind: string;
+    summary: string;
+};
+
+export type AutofixIncidentListResponse = {
+    items: Array<AutofixIncidentResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type AutofixIncidentResponse = {
+    assessment?: Assessment | null;
+    attempts: number;
+    base_revision?: string | null;
+    branch?: string | null;
+    closed_at?: string | null;
+    /**
+     * Confidence level reached, 0-5: see `assessment` for what it proves.
+     */
+    confidence?: number | null;
+    /**
+     * Public id of the incident chat.
+     */
+    conversation_id?: string | null;
+    created_at: string;
+    decided_at?: string | null;
+    decided_by_user_id?: number | null;
+    decision?: string | null;
+    delivery?: string | null;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    error_group_id: number;
+    failure_reason?: string | null;
+    has_patch: boolean;
+    head_revision?: string | null;
+    /**
+     * Public id (`afx_…`).
+     */
+    id: string;
+    is_open: boolean;
+    owner_user_id: number;
+    /**
+     * `queued`, `prepare`, `reproduce`, `verify`, `deliver` or `done`.
+     */
+    phase: string;
+    pr_number?: number | null;
+    pr_url?: string | null;
+    project_id: number;
+    /**
+     * Public id of the sandbox while it exists.
+     */
+    sandbox_id?: string | null;
+    source_kind?: string | null;
+    /**
+     * `open`, `working`, `awaiting_review`, `merged`, `applied`, `rejected`,
+     * `failed` or `stopped`.
+     */
+    status: string;
+    summary?: string | null;
+    title: string;
+    /**
+     * `manual` or `automatic`.
+     */
+    trigger: string;
+    updated_at: string;
+    /**
+     * Public id of the workspace the chat is in.
+     */
+    workspace_id?: string | null;
+};
+
+/**
  * User-chosen per-run options, persisted as JSON in `agent_runs.run_config`.
  * Every field is optional — unset fields fall back to the provider defaults
  * in settings, then to built-in defaults.
@@ -2470,6 +2610,32 @@ export type AutofixRunConfig = {
      * the platform default provider from agent sandbox settings.
      */
     provider?: string | null;
+};
+
+export type AutofixSettingsResponse = {
+    ai_model?: string | null;
+    ai_provider?: string | null;
+    /**
+     * Confidence level, 0-5, an `auto_merge` fix must reach.
+     */
+    min_confidence: number;
+    /**
+     * `off`, `propose` or `auto_merge`.
+     */
+    mode: string;
+    /**
+     * User automatic incidents act as.
+     */
+    owner_user_id?: number | null;
+    paused: boolean;
+    project_id: number;
+    protected_paths: Array<string>;
+    /**
+     * Command the server runs to verify a fix, in addition to the agent's
+     * reproduction.
+     */
+    test_command?: string | null;
+    updated_at?: string | null;
 };
 
 export type AutofixerRunResponse = {
@@ -3928,6 +4094,14 @@ export type CliLoginRequest = {
 
 export type ClientSurface = 'browser' | 'mobile' | 'cli' | 'third_party';
 
+export type CloseIncidentRequest = {
+    /**
+     * `merged` (you merged the pull request), `applied` (you applied the
+     * patch) or `rejected`.
+     */
+    decision: string;
+};
+
 export type CloudAiCapability = {
     configured: boolean;
     model?: string | null;
@@ -4531,6 +4705,19 @@ export type CmdKillBody = {
  */
 export type CmdResponse = {
     command: CmdInner;
+};
+
+/**
+ * Result of a command the server ran in the sandbox.
+ */
+export type CommandOutcome = {
+    command: string;
+    duration_ms: number;
+    exit_code: number;
+    /**
+     * Last bytes of stdout and stderr, at most 4 KB.
+     */
+    output_excerpt: string;
 };
 
 export type CommitExistsResponse = {
@@ -10602,6 +10789,27 @@ export type EventDetailResponse = {
 };
 
 /**
+ * Structured details of a timeline event. Stored as JSON; every field is
+ * optional because each kind uses a few of them.
+ */
+export type EventDetails = {
+    attempt?: number | null;
+    branch?: string | null;
+    command?: string | null;
+    conversation_id?: string | null;
+    duration_ms?: number | null;
+    exit_code?: number | null;
+    files?: Array<FileChange> | null;
+    output_excerpt?: string | null;
+    sandbox_id?: string | null;
+    score?: number | null;
+    sha?: string | null;
+    status?: string | null;
+    tool?: string | null;
+    url?: string | null;
+};
+
+/**
  * Query parameters for the raw event entries list
  */
 export type EventEntriesQuery = {
@@ -11438,6 +11646,18 @@ export type FieldResponse = {
      * Whether the field is nullable
      */
     nullable: boolean;
+};
+
+/**
+ * One changed path, from `git diff --numstat`.
+ */
+export type FileChange = {
+    /**
+     * `None` for binary files.
+     */
+    added?: number | null;
+    path: string;
+    removed?: number | null;
 };
 
 /**
@@ -17128,6 +17348,21 @@ export type OpenAiErrorResponse = {
     error: OpenAiError;
 };
 
+export type OpenIncidentRequest = {
+    /**
+     * The error group to fix.
+     */
+    error_group_id: number;
+};
+
+export type OpenIncidentResponse = {
+    /**
+     * False when an open incident for the group already existed.
+     */
+    created: boolean;
+    incident: AutofixIncidentResponse;
+};
+
 /**
  * Request body for opening a pull request.
  */
@@ -18065,6 +18300,10 @@ export type PathVisitorsAnalyticsQuery = {
 
 export type PathVisitorsResponse = {
     results: Array<PathVisitors>;
+};
+
+export type PauseAutofixRequest = {
+    paused: boolean;
 };
 
 /**
@@ -20949,6 +21188,13 @@ export type RemoveNodeResponse = {
      * nodes they still target.
      */
     placements_updated?: Array<NodePlacementReference>;
+};
+
+export type RenameApplicationRequest = {
+    /**
+     * New name shown for the application. Trimmed; 1 to 200 characters.
+     */
+    name: string;
 };
 
 export type RenameConversationRequest = {
@@ -24169,6 +24415,26 @@ export type SiblingRef = {
 };
 
 /**
+ * One check behind the score, as stored on the incident and shown to the
+ * reviewer.
+ */
+export type Signal = {
+    detail: string;
+    key: string;
+    label: string;
+    /**
+     * Level of the confidence ladder this check belongs to, 1-5; `None` for
+     * context that is shown but never scored (the agent's own confidence).
+     */
+    level?: number | null;
+    /**
+     * `Some(true)` met, `Some(false)` not met, `None` not collected.
+     */
+    met?: boolean | null;
+    outcome?: CommandOutcome | null;
+};
+
+/**
  * Request body for `POST .../alarms/{alarm_id}/silence`.
  */
 export type SilenceAlarmRequest = {
@@ -26816,6 +27082,30 @@ export type UpdateApplicationWorkspaceRequest = {
     memory_limit_mb?: number | null;
     pids_limit?: number | null;
     runtime?: string | null;
+};
+
+export type UpdateAutofixSettingsRequest = {
+    /**
+     * Empty string clears it.
+     */
+    ai_model?: string | null;
+    /**
+     * Empty string clears it (back to the assistant's default).
+     */
+    ai_provider?: string | null;
+    /**
+     * Confidence level, 0-5, an `auto_merge` fix must reach.
+     */
+    min_confidence?: number | null;
+    /**
+     * `off`, `propose` or `auto_merge`.
+     */
+    mode?: string | null;
+    protected_paths?: Array<string> | null;
+    /**
+     * Empty string clears it.
+     */
+    test_command?: string | null;
 };
 
 export type UpdateAutomaticDeployRequest = {
@@ -30216,6 +30506,31 @@ export type GetApplicationResponses = {
 };
 
 export type GetApplicationResponse = GetApplicationResponses[keyof GetApplicationResponses];
+
+export type RenameApplicationData = {
+    body: RenameApplicationRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}';
+};
+
+export type RenameApplicationErrors = {
+    /**
+     * The name is empty or longer than 200 characters
+     */
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type RenameApplicationResponses = {
+    200: ApplicationResponse;
+};
+
+export type RenameApplicationResponse = RenameApplicationResponses[keyof RenameApplicationResponses];
 
 export type ListApplicationConversationsData = {
     body?: never;
@@ -57489,6 +57804,338 @@ export type GetApiTimeseriesResponses = {
 };
 
 export type GetApiTimeseriesResponse = GetApiTimeseriesResponses[keyof GetApiTimeseriesResponses];
+
+export type GetAutofixCapabilityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix';
+};
+
+export type GetAutofixCapabilityErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type GetAutofixCapabilityError = GetAutofixCapabilityErrors[keyof GetAutofixCapabilityErrors];
+
+export type GetAutofixCapabilityResponses = {
+    200: AutofixCapabilityResponse;
+};
+
+export type GetAutofixCapabilityResponse = GetAutofixCapabilityResponses[keyof GetAutofixCapabilityResponses];
+
+export type ListAutofixIncidentsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Page number, from 1. Default 1.
+         */
+        page?: number;
+        /**
+         * Items per page. Default 20, max 100.
+         */
+        page_size?: number;
+        /**
+         * `open`, `closed`, or one exact status.
+         */
+        status?: string;
+        /**
+         * Only incidents of this error group.
+         */
+        error_group_id?: number;
+    };
+    url: '/projects/{project_id}/autofix/incidents';
+};
+
+export type ListAutofixIncidentsErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type ListAutofixIncidentsError = ListAutofixIncidentsErrors[keyof ListAutofixIncidentsErrors];
+
+export type ListAutofixIncidentsResponses = {
+    200: AutofixIncidentListResponse;
+};
+
+export type ListAutofixIncidentsResponse = ListAutofixIncidentsResponses[keyof ListAutofixIncidentsResponses];
+
+export type OpenAutofixIncidentData = {
+    body: OpenIncidentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents';
+};
+
+export type OpenAutofixIncidentErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    409: ProblemDetails;
+    429: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type OpenAutofixIncidentError = OpenAutofixIncidentErrors[keyof OpenAutofixIncidentErrors];
+
+export type OpenAutofixIncidentResponses = {
+    /**
+     * The group already had an open incident
+     */
+    200: OpenIncidentResponse;
+    /**
+     * Incident queued
+     */
+    201: OpenIncidentResponse;
+};
+
+export type OpenAutofixIncidentResponse = OpenAutofixIncidentResponses[keyof OpenAutofixIncidentResponses];
+
+export type GetAutofixIncidentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}';
+};
+
+export type GetAutofixIncidentErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type GetAutofixIncidentError = GetAutofixIncidentErrors[keyof GetAutofixIncidentErrors];
+
+export type GetAutofixIncidentResponses = {
+    200: AutofixIncidentResponse;
+};
+
+export type GetAutofixIncidentResponse = GetAutofixIncidentResponses[keyof GetAutofixIncidentResponses];
+
+export type CloseAutofixIncidentData = {
+    body: CloseIncidentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}/close';
+};
+
+export type CloseAutofixIncidentErrors = {
+    400: ProblemDetails;
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    409: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type CloseAutofixIncidentError = CloseAutofixIncidentErrors[keyof CloseAutofixIncidentErrors];
+
+export type CloseAutofixIncidentResponses = {
+    200: AutofixIncidentResponse;
+};
+
+export type CloseAutofixIncidentResponse = CloseAutofixIncidentResponses[keyof CloseAutofixIncidentResponses];
+
+export type ListAutofixIncidentEventsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: {
+        /**
+         * Only events after this id; pass the last id seen to poll.
+         */
+        after_id?: number;
+        /**
+         * Default 100, max 500.
+         */
+        limit?: number;
+    };
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}/events';
+};
+
+export type ListAutofixIncidentEventsErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type ListAutofixIncidentEventsError = ListAutofixIncidentEventsErrors[keyof ListAutofixIncidentEventsErrors];
+
+export type ListAutofixIncidentEventsResponses = {
+    200: AutofixEventListResponse;
+};
+
+export type ListAutofixIncidentEventsResponse = ListAutofixIncidentEventsResponses[keyof ListAutofixIncidentEventsResponses];
+
+export type DownloadAutofixPatchData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}/patch';
+};
+
+export type DownloadAutofixPatchErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    409: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type DownloadAutofixPatchError = DownloadAutofixPatchErrors[keyof DownloadAutofixPatchErrors];
+
+export type DownloadAutofixPatchResponses = {
+    /**
+     * Unified diff
+     */
+    200: string;
+};
+
+export type DownloadAutofixPatchResponse = DownloadAutofixPatchResponses[keyof DownloadAutofixPatchResponses];
+
+export type StopAutofixIncidentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}/stop';
+};
+
+export type StopAutofixIncidentErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    409: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type StopAutofixIncidentError = StopAutofixIncidentErrors[keyof StopAutofixIncidentErrors];
+
+export type StopAutofixIncidentResponses = {
+    200: AutofixIncidentResponse;
+};
+
+export type StopAutofixIncidentResponse = StopAutofixIncidentResponses[keyof StopAutofixIncidentResponses];
+
+export type SetAutofixPausedData = {
+    body: PauseAutofixRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/pause';
+};
+
+export type SetAutofixPausedErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type SetAutofixPausedError = SetAutofixPausedErrors[keyof SetAutofixPausedErrors];
+
+export type SetAutofixPausedResponses = {
+    200: AutofixSettingsResponse;
+};
+
+export type SetAutofixPausedResponse = SetAutofixPausedResponses[keyof SetAutofixPausedResponses];
+
+export type UpdateAutofixSettingsData = {
+    body: UpdateAutofixSettingsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/settings';
+};
+
+export type UpdateAutofixSettingsErrors = {
+    400: ProblemDetails;
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type UpdateAutofixSettingsError = UpdateAutofixSettingsErrors[keyof UpdateAutofixSettingsErrors];
+
+export type UpdateAutofixSettingsResponses = {
+    200: AutofixSettingsResponse;
+};
+
+export type UpdateAutofixSettingsResponse = UpdateAutofixSettingsResponses[keyof UpdateAutofixSettingsResponses];
 
 export type StartAnalysisData = {
     body: StartAnalysisRequest;

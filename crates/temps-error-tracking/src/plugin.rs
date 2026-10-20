@@ -236,6 +236,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             // Wire up autopilot callback if JobQueue is available
             if let Some(queue) = context.get_service::<dyn JobQueue>() {
                 tracing::info!("Error tracking: autopilot callback wired successfully");
+                error_tracking_service.set_job_queue(queue.clone());
                 let q = queue.clone();
                 error_tracking_service.set_autopilot_callback(Arc::new(move |alert| {
                     let q = q.clone();

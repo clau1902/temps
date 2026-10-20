@@ -26,6 +26,7 @@ temps-logs = { path = "../temps-logs" }
 temps-git = { path = "../temps-git" }
 temps-sandbox = { path = "../temps-sandbox" }
 temps-projects = { path = "../temps-projects" }
+temps-error-tracking = { path = "../temps-error-tracking" }
 tempfile = { workspace = true }
 
 axum = { workspace = true }

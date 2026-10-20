@@ -54,6 +54,32 @@ export function continueChat(conversationPublicId: string, message: string) {
   )
 }
 
+/** Asks the assistant page to start a new chat inside an application. */
+export const NEW_CHAT_IN_EVENT = 'temps:new-chat-in'
+
+export interface NewChatInDetail {
+  public_id: string
+  name: string
+}
+
+export function startChatIn(application: NewChatInDetail) {
+  window.dispatchEvent(
+    new CustomEvent<NewChatInDetail>(NEW_CHAT_IN_EVENT, {
+      detail: { public_id: application.public_id, name: application.name },
+    })
+  )
+}
+
+/**
+ * Tells the chat list to read itself again: a chat moved between
+ * applications, or an application was renamed, so its groups changed.
+ */
+export const CHAT_LIST_CHANGED_EVENT = 'temps:chat-list-changed'
+
+export function chatListChanged() {
+  window.dispatchEvent(new Event(CHAT_LIST_CHANGED_EVENT))
+}
+
 /** Asks the assistant page to open another chat. */
 export const OPEN_CHAT_EVENT = 'temps:open-chat'
 

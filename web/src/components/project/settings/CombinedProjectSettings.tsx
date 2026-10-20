@@ -21,6 +21,7 @@ import {
   Rocket,
   Settings2,
   Sparkles,
+  Wand2,
   Webhook,
 } from 'lucide-react'
 import { useEffect, type ReactNode } from 'react'
@@ -35,6 +36,7 @@ import {
   type SettingsSectionId,
 } from '@/lib/project-settings-sections'
 import { GeneralSettings } from './GeneralSettings'
+import { AutofixSettingsCard } from '@/components/autofix/AutofixSettingsCard'
 import { GitSettings } from './GitSettings'
 import { BuildDeploySettings } from './BuildDeploySettings'
 import { SecretsSettings } from './SecretsSettings'
@@ -227,6 +229,12 @@ export function CombinedProjectSettings({
           title: 'Cron jobs',
           icon: CalendarClock,
           content: <CronJobsSettings project={project} />,
+        },
+        {
+          id: 'crash-autofix',
+          title: 'Crash autofix',
+          icon: Wand2,
+          content: <AutofixSettingsCard projectId={project.id} />,
         },
         {
           id: 'autofixer',

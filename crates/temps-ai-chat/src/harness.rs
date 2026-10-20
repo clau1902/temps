@@ -69,6 +69,10 @@ const SOURCES: &[(&str, &str)] = &[
         "add-temps-observability.md",
         include_str!("../harness/add-temps-observability.md"),
     ),
+    (
+        "track-app-usage.md",
+        include_str!("../harness/track-app-usage.md"),
+    ),
 ];
 
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -474,6 +478,9 @@ mod tests {
             "NEXT_PUBLIC_SENTRY_DSN",
             "VITE_SENTRY_DSN",
             "PUBLIC_SENTRY_DSN",
+            "NEXT_PUBLIC_SENTRY_TUNNEL",
+            "VITE_SENTRY_TUNNEL",
+            "PUBLIC_SENTRY_TUNNEL",
             "SENTRY_RELEASE",
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "OTEL_EXPORTER_OTLP_PROTOCOL",
@@ -494,6 +501,40 @@ mod tests {
             .find(|playbook| playbook.name == "build-an-app")
             .expect("build-an-app is embedded");
         assert!(build.body.contains("`add-temps-observability` playbook"));
+        // Errors and traces are the user's choice unless the code already
+        // has them; the playbook must say to offer, not to add.
+        assert!(playbook.body.contains("do not add it"));
+        assert!(!playbook.body.contains("@temps-sdk/react-analytics"));
+    }
+
+    #[test]
+    fn usage_tracking_is_required_and_points_at_published_sdks() {
+        let playbook = all()
+            .iter()
+            .find(|playbook| playbook.name == "track-app-usage")
+            .expect("track-app-usage is embedded");
+        assert!(playbook.body.contains("this is not optional"));
+        for sdk in [
+            "@temps-sdk/react-analytics",
+            "@temps-sdk/vue-analytics",
+            "@temps-sdk/svelte-analytics",
+            "@temps-sdk/analytics-browser@",
+        ] {
+            assert!(
+                playbook.body.contains(sdk),
+                "the playbook does not name {sdk}"
+            );
+        }
+        // The SDKs post to the app's own `/api/_temps/*`, which the proxy
+        // answers; a playbook that asked for a route or key would break it.
+        assert!(playbook.body.contains("/api/_temps/*"));
+        assert!(playbook.body.contains("useTrackEvent"));
+        assert!(playbook.body.contains("temps-event-name"));
+        let build = all()
+            .iter()
+            .find(|playbook| playbook.name == "build-an-app")
+            .expect("build-an-app is embedded");
+        assert!(build.body.contains("`track-app-usage` playbook"));
     }
 
     #[test]

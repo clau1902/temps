@@ -14,7 +14,7 @@ import {
   listErrorEventsOptions,
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { AutofixButton } from '@/components/autofixer/AutofixButton'
+import { AutofixIncidentCard } from '@/components/autofix/AutofixIncidentCard'
 import { SentryEventDetail } from '@/components/error-tracking/SentryEventDetail'
 import { SentryListItem } from '@/components/error-tracking/SentryListItem'
 import { updateErrorGroupMutation } from '@/api/client/@tanstack/react-query.gen'
@@ -422,21 +422,12 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
-      {/* Autofix section — always rendered. When the repo/provider/sandbox
-          aren't set up yet the card onboards the user instead of vanishing. */}
+      {/* Autofix (ADR-054) — always rendered. When autofix cannot run the
+          card says why and links to the setting that fixes it. */}
       <div className="mb-6">
-        <AutofixButton
+        <AutofixIncidentCard
           projectId={project.id}
-          projectSlug={project.slug}
           errorGroupId={parseInt(errorGroupId!)}
-          git={{
-            connected: !!project.git_provider_connection_id,
-            hasRepo: !!project.repo_owner && !!project.repo_name,
-            label:
-              project.repo_owner && project.repo_name
-                ? `${project.repo_owner}/${project.repo_name}`
-                : undefined,
-          }}
         />
       </div>
 
