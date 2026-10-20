@@ -31,8 +31,8 @@ use utoipa::OpenApi;
 use super::sse_usage::UsageKind;
 use crate::error::AiGatewayError;
 use crate::handlers::gateway::{
-    credential_type_str, error_to_response, extract_ai_context, extract_byok,
-    reject_deployment_token_base_url, wrap_stream_with_usage_tracking,
+    credential_type_str, enforce_project_limits, error_to_response, extract_ai_context,
+    extract_byok, reject_deployment_token_base_url, wrap_stream_with_usage_tracking,
 };
 use crate::handlers::types::AiGatewayAppState;
 use crate::native_types::*;
@@ -185,6 +185,16 @@ fn forward(reply: UpstreamReply, credential_type: Option<CredentialType>) -> Res
             .into_response()
         }
     }
+}
+
+/// Name the provider that served a reply, like streamed replies do, so
+/// clients can tell a self-hosted reply from an OpenAI one by its headers.
+fn with_provider_header(mut response: Response, provider_id: &'static str) -> Response {
+    response.headers_mut().insert(
+        "x-temps-provider",
+        axum::http::HeaderValue::from_static(provider_id),
+    );
+    response
 }
 
 /// Batch result bytes are downloads, even if a custom provider labels them HTML/SVG.
@@ -422,12 +432,17 @@ async fn create_response(
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
     };
-    let ai_context = extract_ai_context(&headers);
+    if let Err(limit_error) =
+        enforce_project_limits(&app_state, &auth, byok.is_caller_funded()).await
+    {
+        return Ok(error_to_response(limit_error).into_response());
+    }
+    let ai_context = extract_ai_context(&headers).attributed_to(&auth);
     let start = Instant::now();
     let user_id = auth.user_id_opt();
     let model = request.model.clone();
 
-    let (outcome, credential_type) = match app_state
+    let (outcome, served_by) = match app_state
         .native_api_service
         .create_response(&request, &byok)
         .await
@@ -438,6 +453,8 @@ async fn create_response(
             return Ok(error_to_response(call_error).into_response());
         }
     };
+    let credential_type = served_by.credential_type;
+    let provider_id = served_by.provider_id;
     let is_byok = credential_type == CredentialType::Byok;
 
     app_state.telemetry.report_once(
@@ -445,7 +462,7 @@ async fn create_response(
         temps_core::telemetry::TelemetryEvent::new(
             temps_core::telemetry::TelemetryEventKind::AiGatewayFirstRequest,
         )
-        .with("provider", "openai"),
+        .with("provider", provider_id),
     );
 
     match outcome {
@@ -458,7 +475,7 @@ async fn create_response(
                     if let Err(log_error) = usage_service
                         .log_usage_with_context(
                             user_id,
-                            "openai",
+                            provider_id,
                             &model,
                             usage.input_tokens,
                             usage.output_tokens,
@@ -483,7 +500,10 @@ async fn create_response(
                 credential_type = credential_type_str(credential_type),
                 "AI gateway Responses request completed"
             );
-            Ok(forward(reply, Some(credential_type)))
+            Ok(with_provider_header(
+                forward(reply, Some(credential_type)),
+                provider_id,
+            ))
         }
         ResponsesOutcome::Stream(stream) => {
             info!(
@@ -497,7 +517,7 @@ async fn create_response(
                 stream,
                 app_state.usage_service.clone(),
                 user_id,
-                "openai".to_string(),
+                provider_id.to_string(),
                 model,
                 start,
                 is_byok,
@@ -509,7 +529,7 @@ async fn create_response(
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-store")
                 .header("x-content-type-options", "nosniff")
-                .header("x-temps-provider", "openai")
+                .header("x-temps-provider", provider_id)
                 .header(
                     "x-temps-credential-type",
                     credential_type_str(credential_type),
@@ -564,6 +584,11 @@ async fn upload_file(
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
     };
+    if let Err(limit_error) =
+        enforce_project_limits(&app_state, &auth, byok.is_caller_funded()).await
+    {
+        return Ok(error_to_response(limit_error).into_response());
+    }
 
     let _upload_slot = match app_state.native_api_service.acquire_upload_slot() {
         Ok(permit) => permit,
@@ -845,6 +870,11 @@ async fn create_batch(
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
     };
+    if let Err(limit_error) =
+        enforce_project_limits(&app_state, &auth, byok.is_caller_funded()).await
+    {
+        return Ok(error_to_response(limit_error).into_response());
+    }
     let credential_type = credential_kind(&headers);
     match app_state
         .native_api_service
@@ -1146,6 +1176,27 @@ mod tests {
                 .await
                 .unwrap(),
             payload
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_responses_replies_name_the_serving_provider() {
+        let reply = UpstreamReply {
+            status: reqwest::StatusCode::OK,
+            content_type: Some("application/json".to_string()),
+            body: bytes::Bytes::from_static(br#"{"id":"resp_1"}"#),
+        };
+        let response = with_provider_header(
+            forward(reply, Some(CredentialType::System)),
+            crate::self_hosted::OPENAI_COMPATIBLE,
+        );
+        assert_eq!(
+            response.headers().get("x-temps-provider").unwrap(),
+            "openai_compatible"
+        );
+        assert_eq!(
+            response.headers().get("x-temps-credential-type").unwrap(),
+            "system"
         );
     }
 

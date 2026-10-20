@@ -494,7 +494,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
         });
         let sentry_routes = crate::sentry::handlers::configure_routes().with_state(sentry_state);
 
-        // Public: sentry-cli compatible source map upload (used by CI/CD with DSN auth)
+        // Public route with project-scoped build-token auth for sentry-cli uploads.
         let db = context.require_service::<sea_orm::DatabaseConnection>();
         let sentry_compat_state = Arc::new(
             crate::handlers::sentry_compat_handlers::SentryCompatAppState {

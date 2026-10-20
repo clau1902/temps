@@ -220,6 +220,13 @@ pub struct NodePublicIngressChangedAudit {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeBuildLimitsChangedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub limits: temps_deployer::build_protocol::BuildLimits,
+}
+
 /// An operator removed a node, or asked to and was refused after Temps had
 /// already cleaned up containers on it. Container removal on the host is a
 /// write even when the node row stays.
@@ -410,6 +417,16 @@ pub struct TraefikDiscoveredRouteCertDeauthorizedAudit {
     pub host: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeHealthPolicyUpdatedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub enabled: bool,
+    pub paused: bool,
+    pub required_healthy: Option<i32>,
+}
+
 // ── AuditOperation implementations ──────────────────────────────────────────
 
 macro_rules! impl_audit_operation {
@@ -439,6 +456,10 @@ macro_rules! impl_audit_operation {
     };
 }
 
+impl_audit_operation!(
+    RuntimeHealthPolicyUpdatedAudit,
+    "RUNTIME_HEALTH_POLICY_UPDATED"
+);
 impl_audit_operation!(DeploymentRollbackAudit, "DEPLOYMENT_ROLLBACK");
 impl_audit_operation!(DeploymentPausedAudit, "DEPLOYMENT_PAUSED");
 impl_audit_operation!(DeploymentResumedAudit, "DEPLOYMENT_RESUMED");
@@ -523,6 +544,33 @@ pub struct NodeMeshKeyChangedAudit {
 }
 
 impl_audit_operation!(NodeMeshKeyChangedAudit, "NODE_MESH_KEY_CHANGED");
+
+impl_audit_operation!(NodeBuildLimitsChangedAudit, "NODE_BUILD_LIMITS_CHANGED");
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CiBuildAudit {
+    pub context: AuditContext,
+    pub action: String,
+    pub build_id: Option<uuid::Uuid>,
+}
+impl AuditOperation for CiBuildAudit {
+    fn operation_type(&self) -> String {
+        "CI_BUILD_DISPATCH".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        (self.context.user_id > 0).then_some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Cannot serialize CI dispatch audit: {error}"))
+    }
+}
 
 #[cfg(test)]
 mod node_audit_tests {

@@ -30,4 +30,10 @@ pub use migration::m20260921_000004_credential_catalog::Migration as CredentialC
 pub use migration::m20260922_000001_stateless_control_plane_jobs::Migration as StatelessControlPlaneJobsMigration;
 pub use migration::m20261002_000001_secret_checks_and_history::Migration as SecretChecksAndHistoryMigration;
 
+pub use migration::m20261016_000002_ci_build_dispatch::Migration as CiBuildDispatchMigration;
+
+pub use migration::m20261017_000001_retain_ci_cancellation::Migration as RetainCiCancellationMigration;
+
+pub use migration::m20261017_000002_runtime_health::Migration as RuntimeHealthMigration;
+
 pub use migration::m20261019_000002_reconcile_error_group_counts::Migration as ReconcileErrorGroupCountsMigration;

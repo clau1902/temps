@@ -61,6 +61,7 @@ export const PROJECT_SECTION_LINKS: Partial<
       url: 'cron-jobs',
       keywords: ['schedule', 'check-ins', 'missed', 'timeout'],
     },
+    { title: 'Status pages', url: 'status-pages' },
     { title: 'Alert rules', url: 'errors/alert-rules' },
   ],
   analytics: [
@@ -209,6 +210,7 @@ const EXTERNAL_PROJECT_PAGES = [
   'metrics',
   'monitors',
   'cron-jobs',
+  'status-pages',
   'settings/general',
   'settings/telemetry',
 ] as const

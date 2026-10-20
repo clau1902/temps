@@ -2955,9 +2955,7 @@ mod tests {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_otel::types::{MetricAggregation, MetricQuery, TraceQuery};
         let entry = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_SIGNALS_SDK");
-        let Some(ctx) = conformance_test_context().await else {
-            return;
-        };
+        let ctx = create_test_context().await;
         let router = Router::new()
             .nest("/api", configure_routes())
             .layer(axum::middleware::from_fn(inject_test_request_metadata))
@@ -2980,9 +2978,8 @@ mod tests {
         };
         for mode in modes {
             let output = tokio::process::Command::new("bun")
-                .arg(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../scripts/sentry-signals-conformance.mjs"
+                .arg(PrioritySdkHarness::fixture(
+                    "sentry-signals-conformance.mjs",
                 ))
                 .args([entry.as_str(), dsn.as_str(), mode, tunnel.as_str()])
                 .output()
@@ -3301,9 +3298,7 @@ mod tests {
         // live conformance blocker, never proof of SDK compatibility.
         let entry = PrioritySdkHarness::prerequisite("TEMPS_SENTRY_CONFORMANCE_SDK");
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        let Some(ctx) = conformance_test_context().await else {
-            return;
-        };
+        let ctx = create_test_context().await;
         let router = Router::new()
             .nest("/api", configure_routes())
             .layer(axum::middleware::from_fn(inject_test_request_metadata))
@@ -3340,10 +3335,7 @@ mod tests {
                 .unwrap()
                 .len();
             let output = tokio::process::Command::new("bun")
-                .arg(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../scripts/sentry-log-conformance.mjs"
-                ))
+                .arg(PrioritySdkHarness::fixture("sentry-log-conformance.mjs"))
                 .args([
                     entry.as_str(),
                     dsn.as_str(),
@@ -3461,22 +3453,32 @@ mod tests {
                         assert_eq!(raw["fingerprint"][0], "synthetic-fingerprint");
                         assert_eq!(raw["release"], "synthetic-release-1");
                         assert_eq!(raw["environment"], "synthetic-test");
-                        assert!(raw["breadcrumbs"]["values"]
+                        assert!(raw["breadcrumbs"]
                             .as_array()
-                            .unwrap()
+                            .or_else(|| raw["breadcrumbs"]["values"].as_array())
+                            .expect("SDK breadcrumb array or values wrapper must survive")
                             .iter()
                             .any(|crumb| crumb["message"] == "Synthetic breadcrumb"));
-                        assert!(raw["tags"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .any(|tag| tag[0] == "synthetic.mode" && tag[1] == mode));
+                        let tag = raw["tags"]["synthetic.mode"].as_str().or_else(|| {
+                            raw["tags"].as_array()?.iter().find_map(|tag| {
+                                if tag[0] == "synthetic.mode" {
+                                    tag[1].as_str()
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                        assert_eq!(tag, Some(mode));
                     }
-                    assert!(new_events
-                        .iter()
-                        .any(|event| event.data.as_ref().unwrap()["sentry"]["logentry"]
-                            ["formatted"]
-                            == "Synthetic SDK message"));
+                    assert!(new_events.iter().any(|event| {
+                        let raw = &event.data.as_ref().unwrap()["sentry"];
+                        let source_message = raw["logentry"]["formatted"]
+                            .as_str()
+                            .or_else(|| raw["message"].as_str());
+                        event.exception_type == "Message"
+                            && event.exception_value.as_deref() == Some("Synthetic SDK message")
+                            && source_message == Some("Synthetic SDK message")
+                    }));
                     for event in exceptions {
                         assert_eq!(
                             event.exception_value.as_deref(),
@@ -5448,7 +5450,9 @@ mod tests {
             }
         }
         fn fixture(name: &str) -> String {
-            format!("{}/../../scripts/{name}", env!("CARGO_MANIFEST_DIR"))
+            let root = std::env::var("TEMPS_SENTRY_REPO_ROOT")
+                .unwrap_or_else(|_| format!("{}/../..", env!("CARGO_MANIFEST_DIR")));
+            format!("{root}/scripts/{name}")
         }
         fn prerequisite(name: &str) -> String {
             std::env::var(name)

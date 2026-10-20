@@ -1,7 +1,16 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  ServiceGroupControl,
+  useServiceGroup,
+} from '@/components/project-groups/ServiceGroupControl'
+import { ProjectServiceSwitcher } from '@/components/project-groups/ProjectServiceSwitcher'
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
+import { listContainersOptions } from '@/api/client/@tanstack/react-query.gen'
+import { useQuery } from '@tanstack/react-query'
+import { portlessWorkerHealth } from '@/components/containers/container-workload'
+import { Status } from '@temps-sdk/ds'
 import { useEffect, useRef } from 'react'
 import {
   describeDockerSocket,
@@ -9,10 +18,10 @@ import {
 } from '@/lib/docker-socket'
 import type { ProjectDeploymentStatus } from '@/lib/project-deployment-status'
 import { isActiveDeploymentStatus } from '@/lib/recent-deployments'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
+import { ExternalBadge } from '@/components/dashboard/ProjectCard'
 import { Badge, badgeVariants } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { useProjectFailureState } from '@/hooks/useProjectFailureState'
 import { useProjectsMonitorHealth } from '@/hooks/useProjectsMonitorHealth'
@@ -76,6 +85,8 @@ interface ProjectDetailHeaderProps {
   repositoryProviderType?: string | null
   lastDeployment?: DeploymentResponse
   lastDeploymentUrl?: string | null
+  /** Environment served by lastDeploymentUrl, independently of healthEnvironment. */
+  lastDeploymentEnvironmentId?: number
   isLoadingLastDeployment?: boolean
   onDeploy: () => void
 }
@@ -101,6 +112,7 @@ export function ProjectDetailHeader({
   repositoryProviderType,
   lastDeployment,
   lastDeploymentUrl,
+  lastDeploymentEnvironmentId,
   isLoadingLastDeployment = false,
   onDeploy,
 }: ProjectDetailHeaderProps) {
@@ -123,11 +135,92 @@ export function ProjectDetailHeader({
   // field as "unknown", so the badge stays hidden rather than claiming the
   // grant is absent.
   const dockerSocket = describeDockerSocket(project.docker_socket)
-  const screenshotLocation = lastDeployment?.screenshot_location
+  const group = useServiceGroup(project.id).data?.group
+  // An app hosted elsewhere is never deployed by Temps: no deploy button and
+  // no "Not deployed", which would read as something to fix. `hosting` is the
+  // explicit flag; `source_type: 'external'` marks a monitoring-only project.
+  const isExternal =
+    project.hosting === 'external' || project.source_type === 'external'
   // Latest build and currently deployed version can be different, including
   // during builds, after failures, and following a rollback.
-  const { status: deploymentStatus, environmentsQuery } =
-    useProjectFailureState(project.id, lastDeployment)
+  const {
+    status: deploymentStatus,
+    environmentsQuery,
+    containersQuery,
+    healthEnvironment,
+  } = useProjectFailureState(project.id, lastDeployment, {
+    enabled: !isExternal,
+  })
+  const supportsWorker =
+    !isExternal &&
+    project.project_type === 'server' &&
+    project.preset !== 'docker-compose'
+  const currentDeploymentId = healthEnvironment?.current_deployment_id
+  const refetchContainers = containersQuery.refetch
+  useEffect(() => {
+    if (
+      supportsWorker &&
+      currentDeploymentId != null &&
+      !healthEnvironment?.sleeping
+    )
+      void refetchContainers()
+  }, [
+    currentDeploymentId,
+    refetchContainers,
+    supportsWorker,
+    healthEnvironment?.sleeping,
+  ])
+  const workerHealth = supportsWorker
+    ? portlessWorkerHealth(containersQuery.data?.containers)
+    : null
+  const isWorker = workerHealth !== null
+  // The site URL may belong to staging while project health follows production.
+  // Reuse the health query only when both surfaces refer to the same environment.
+  const siteEnvironmentId =
+    lastDeploymentEnvironmentId ?? lastDeployment?.environment_id
+  const siteEnvironment = environmentsQuery.data?.find(
+    (environment) => environment.id === siteEnvironmentId
+  )
+  const siteUsesHealthEnvironment =
+    siteEnvironmentId != null && siteEnvironmentId === healthEnvironment?.id
+  const siteContainersQuery = useQuery({
+    ...listContainersOptions({
+      path: { project_id: project.id, environment_id: siteEnvironmentId ?? 0 },
+    }),
+    enabled:
+      supportsWorker &&
+      !!lastDeploymentUrl &&
+      !siteUsesHealthEnvironment &&
+      siteEnvironment?.current_deployment_id != null &&
+      !siteEnvironment.sleeping,
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+    retry: false,
+  })
+  const siteCurrentDeploymentId = siteEnvironment?.current_deployment_id
+  const refetchSiteContainers = siteContainersQuery.refetch
+  useEffect(() => {
+    if (
+      supportsWorker &&
+      lastDeploymentUrl &&
+      !siteUsesHealthEnvironment &&
+      siteCurrentDeploymentId != null &&
+      !siteEnvironment?.sleeping
+    )
+      void refetchSiteContainers()
+  }, [
+    supportsWorker,
+    lastDeploymentUrl,
+    siteUsesHealthEnvironment,
+    siteCurrentDeploymentId,
+    siteEnvironment?.sleeping,
+    refetchSiteContainers,
+  ])
+  const siteIsWorker =
+    supportsWorker &&
+    (siteUsesHealthEnvironment
+      ? isWorker
+      : portlessWorkerHealth(siteContainersQuery.data?.containers) !== null)
   // When a build finishes, its environment pointer is already set; refetch at
   // once so "Deploying" turns into "Deployed" instead of briefly reading
   // "Not deployed" until the next poll.
@@ -164,27 +257,21 @@ export function ProjectDetailHeader({
   return (
     <header className="flex h-12 sm:h-16 shrink-0 items-center gap-2 border-b px-3 sm:px-4">
       <div className="flex flex-1 items-center justify-between gap-4 min-w-0">
-        <div className="flex items-center gap-4">
-          {screenshotLocation ? (
-            <div className="size-8 shrink-0 overflow-hidden rounded-md border bg-muted/30">
-              <ReloadableImage
-                src={`/api/files${
-                  screenshotLocation.startsWith('/')
-                    ? screenshotLocation
-                    : '/' + screenshotLocation
-                }`}
-                alt={`${project.slug} preview`}
-                className="h-full w-full object-cover object-top"
-              />
-            </div>
-          ) : (
-            <ProjectAvatar name={project.name} className="size-8" />
-          )}
+        <div className="flex min-w-0 items-center gap-2 sm:gap-4">
+          <ServiceIcon service={project} size="md" className="shrink-0" />
           <div className="flex items-center gap-2 min-w-0">
             <h1 className="text-base sm:text-lg font-semibold truncate">
-              {project.slug}
+              {group ? (
+                <ProjectServiceSwitcher project={project} group={group}>
+                  {project.slug}
+                </ProjectServiceSwitcher>
+              ) : (
+                project.slug
+              )}
             </h1>
-            {isProblemStatus(deploymentStatus) ? (
+            {isExternal ? (
+              <ExternalBadge />
+            ) : isProblemStatus(deploymentStatus) ? (
               // Failed / Degraded link to the overview banner that explains
               // the problem and offers the fix. Unlike the routine states it
               // stays visible on phones, where it shrinks to its icon so the
@@ -227,6 +314,7 @@ export function ProjectDetailHeader({
               // an operator needs. It degrades to an icon plus a short label
               // instead of disappearing.
               <Badge
+                role="img"
                 variant="outline"
                 className="inline-flex shrink-0 gap-1"
                 title={dockerSocket.detail}
@@ -239,21 +327,41 @@ export function ProjectDetailHeader({
                 <span className="hidden sm:inline">{dockerSocket.label}</span>
               </Badge>
             )}
-            <Link
-              to={`/projects/${project.slug}/monitors`}
-              title={`${healthIndicator.label}: ${healthIndicator.detail}`}
-              aria-label={`${healthIndicator.label}: ${healthIndicator.detail}`}
-              className="inline-flex size-6 shrink-0 items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
+            {isWorker ? (
               <span
-                aria-hidden="true"
-                className={`inline-block size-2 rounded-full ${healthToneStyles[healthIndicator.tone]}`}
-              />
-            </Link>
+                className="inline-flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+                title="Deploy-time health; runtime probing is not enabled"
+              >
+                <span className="max-sm:sr-only">Background worker</span>
+                <Status
+                  tone={
+                    workerHealth === 'healthy'
+                      ? 'ok'
+                      : workerHealth === 'unhealthy'
+                        ? 'error'
+                        : 'idle'
+                  }
+                  label={`${workerHealth} at deploy`}
+                />
+              </span>
+            ) : (
+              <Link
+                to={`/projects/${project.slug}/monitors`}
+                title={`${healthIndicator.label}: ${healthIndicator.detail}`}
+                aria-label={`${healthIndicator.label}: ${healthIndicator.detail}`}
+                className="inline-flex size-6 shrink-0 items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <span
+                  aria-hidden="true"
+                  className={`inline-block size-2 rounded-full ${healthToneStyles[healthIndicator.tone]}`}
+                />
+              </Link>
+            )}
+            <ServiceGroupControl project={project} />
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          {activeVisitorsCount !== undefined && (
+        <div className="flex shrink-0 items-center gap-2">
+          {activeVisitorsCount !== undefined && !isWorker && (
             <button
               type="button"
               onClick={handleVisitorsClick}
@@ -288,7 +396,7 @@ export function ProjectDetailHeader({
               </a>
             </Button>
           )}
-          {lastDeploymentUrl && !isLoadingLastDeployment && (
+          {lastDeploymentUrl && !isLoadingLastDeployment && !siteIsWorker && (
             <Button variant="outline" size="icon" className="size-9" asChild>
               <a
                 href={lastDeploymentUrl}
@@ -301,10 +409,12 @@ export function ProjectDetailHeader({
               </a>
             </Button>
           )}
-          <Button size="sm" onClick={onDeploy}>
-            <Rocket className="size-4" />
-            <span className="hidden sm:inline">Deploy</span>
-          </Button>
+          {!isExternal && (
+            <Button size="sm" onClick={onDeploy}>
+              <Rocket className="size-4" />
+              <span className="max-sm:sr-only">Deploy</span>
+            </Button>
+          )}
         </div>
       </div>
     </header>

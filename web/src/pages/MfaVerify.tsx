@@ -3,6 +3,7 @@
 
 'use client'
 
+import type { ProblemDetails } from '@/api/client'
 import { verifyMfaChallengeMutation } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import {
@@ -20,7 +21,9 @@ import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { consumeReturnTo } from '@/lib/return-to'
+import { isMfaChallengeEnded } from '@/lib/mfaChallengeProblem'
+import { announceMutationFailure } from '@/lib/mutation-error-toast'
+import { consumeReturnTo, rememberReturnTo } from '@/lib/return-to'
 import * as z from 'zod'
 
 const formSchema = z.object({
@@ -58,6 +61,21 @@ export const MfaVerify = () => {
     ...verifyMfaChallengeMutation(),
     meta: {
       errorTitle: 'MFA verification failed',
+    },
+    onError: (error, _variables, _onMutateResult, context) => {
+      // A per-mutation onError replaces the app-wide default one, so announce
+      // the failure here: a wrong code, a lockout and an ended sign-in all
+      // need the server's reason on screen.
+      announceMutationFailure(error as unknown as ProblemDetails, context)
+      // The sign-in attempt is over (too many wrong codes, or it expired):
+      // no further code can succeed, so return to the password step.
+      if (isMfaChallengeEnded(error)) {
+        // An SSO sign-in may carry its only destination in `?return_to=`;
+        // keep it for the next sign-in instead of dropping it here.
+        rememberReturnTo(queryReturnTo)
+        form.reset()
+        navigate('/', { replace: true })
+      }
     },
     onSuccess: async () => {
       toast.success('MFA verified successfully')

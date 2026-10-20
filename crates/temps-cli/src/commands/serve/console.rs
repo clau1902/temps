@@ -28,8 +28,8 @@ use temps_backup::BackupPlugin;
 use temps_blob::BlobPlugin;
 use temps_cloud::{
     BootstrapBackendUrlOutcome, CloudEnrollmentActor, CloudPlugin, CloudService, CloudServiceError,
-    ConsoleOidcBootstrapError, ConsoleOidcBootstrapOutcome, ManagedBackupOutcome,
-    CONSOLE_OIDC_BOOTSTRAP_FILENAME,
+    ConsentTrace, ConsoleAccessConsent, ConsoleOidcBootstrapError, ConsoleOidcBootstrapOutcome,
+    ManagedBackupOutcome, CONSOLE_OIDC_BOOTSTRAP_FILENAME,
 };
 use temps_cloud_client::FirstLinkEnrollment;
 use temps_config::ConfigPlugin;
@@ -66,6 +66,7 @@ use temps_monitoring::{
 use temps_notifications::NotificationsPlugin;
 use temps_observability::ObservabilityPlugin;
 use temps_otel::plugin::OtelPlugin;
+use temps_project_groups::ProjectGroupsPlugin;
 use temps_projects::ProjectsPlugin;
 use temps_providers::ProvidersPlugin;
 use temps_proxy::ProxyPlugin;
@@ -959,7 +960,11 @@ fn parse_cloud_backend_url_env(result: Result<String, std::env::VarError>) -> Op
 /// this file only ever exists on a Cloud-hosted instance. Applying it is an
 /// upsert, so it is safe to run on a boot where the instance is already
 /// enrolled (re-provision, image upgrade) -- it does not depend on
-/// enrollment having happened first.
+/// enrollment having happened first, and it does not need
+/// `cloud.console_access_enabled` to be on already: on a hosted plane the
+/// file is the operator's consent, so applying it turns that switch on and
+/// audits the change (ADR-045 Amendment 1). Without the file nothing here
+/// touches consent.
 async fn bootstrap_console_oidc_from_file(
     service_context: &temps_core::plugin::ServiceRegistrationContext,
     data_dir: &std::path::Path,
@@ -972,57 +977,126 @@ async fn bootstrap_console_oidc_from_file(
         return;
     };
     let path = data_dir.join(CONSOLE_OIDC_BOOTSTRAP_FILENAME);
-    let outcome = match cloud_service.apply_console_oidc_bootstrap_file(&path).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            match &error {
-                ConsoleOidcBootstrapError::Parse { .. } => error!(
-                    %error,
-                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file exists but could not be \
-                     parsed; it has been left in place for inspection. Console access will start \
-                     without the Cloud-managed SSO provider until this is fixed and the server is \
-                     restarted."
-                ),
-                ConsoleOidcBootstrapError::Read { .. }
-                | ConsoleOidcBootstrapError::Apply { .. } => {
-                    error!(
-                        %error,
-                        "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
-                         console access will start without the Cloud-managed SSO provider until \
-                         this is fixed and the server is restarted."
-                    )
-                }
-            }
-            return;
+    match cloud_service.apply_console_oidc_bootstrap_file(&path).await {
+        Ok(ConsoleOidcBootstrapOutcome::NotPresent) => {}
+        Ok(ConsoleOidcBootstrapOutcome::Applied {
+            issuer,
+            client_id,
+            consent,
+        }) => {
+            report_console_oidc_bootstrap_applied(service_context, &issuer, &client_id, &consent)
+                .await;
         }
-    };
+        Err(error) => report_console_oidc_bootstrap_error(service_context, &error).await,
+    }
+}
 
-    match outcome {
-        ConsoleOidcBootstrapOutcome::NotPresent => {}
-        ConsoleOidcBootstrapOutcome::Applied { issuer, client_id } => {
-            info!(
-                issuer = %issuer,
-                client_id = %client_id,
-                "applied the Cloud console-access OIDC bootstrap file; the managed SSO provider \
-                 is now configured"
+/// Log, and where consent was involved audit, a bootstrap file that failed to
+/// apply. Split out of [`bootstrap_console_oidc_from_file`] so the audit
+/// dispatch -- finding the registered `AuditLogger` and handing it the
+/// consent trace -- can be tested against a real service context.
+async fn report_console_oidc_bootstrap_error(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+    error: &ConsoleOidcBootstrapError,
+) {
+    match error {
+        ConsoleOidcBootstrapError::Parse { .. } => error!(
+            %error,
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file exists but could not be \
+             parsed; it has been left in place for inspection. Console access will start \
+             without the Cloud-managed SSO provider until this is fixed and the server is \
+             restarted."
+        ),
+        ConsoleOidcBootstrapError::Read { .. } => {
+            error!(
+                %error,
+                "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
+                 console access will start without the Cloud-managed SSO provider until \
+                 this is fixed and the server is restarted."
+            )
+        }
+        ConsoleOidcBootstrapError::Apply { consent, .. } => {
+            error!(
+                %error,
+                "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
+                 console access will start without the Cloud-managed SSO provider until \
+                 this is fixed and the server is restarted."
             );
-            match service_context.get_service::<dyn temps_core::AuditLogger>() {
-                Some(audit_logger) => {
-                    temps_cloud::record_console_oidc_bootstrapped_audit(
-                        audit_logger.as_ref(),
-                        CloudEnrollmentActor::UnattendedBootstrap,
-                        &issuer,
-                        &client_id,
-                    )
-                    .await;
+            // A failure that got as far as the consent write is a consent
+            // event even though the apply failed: record it.
+            if let ConsentTrace::WriteFailed {
+                restored,
+                provider_revoked,
+                ..
+            } = consent
+            {
+                error!(
+                    consent_restored = *restored,
+                    provider_revoked = *provider_revoked,
+                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap tried to turn \
+                     cloud.console_access_enabled on and failed; verify its state in \
+                     Settings > Temps Cloud"
+                );
+                match service_context.get_service::<dyn temps_core::AuditLogger>() {
+                    Some(audit_logger) => {
+                        temps_cloud::record_console_oidc_bootstrap_failure_audit(
+                            audit_logger.as_ref(),
+                            CloudEnrollmentActor::UnattendedBootstrap,
+                            consent,
+                            &error.to_string(),
+                        )
+                        .await;
+                    }
+                    None => error!(
+                        "no audit logger is registered; the \
+                         CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED audit record was not written"
+                    ),
                 }
-                None => error!(
-                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file was applied but no audit \
-                     logger is registered; the CLOUD_CONSOLE_OIDC_BOOTSTRAPPED audit record was \
-                     not written"
-                ),
             }
         }
+    }
+}
+
+/// Log and audit a bootstrap file that applied. See
+/// [`report_console_oidc_bootstrap_error`] for why this is separate.
+async fn report_console_oidc_bootstrap_applied(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+    issuer: &str,
+    client_id: &str,
+    consent: &ConsoleAccessConsent,
+) {
+    info!(
+        issuer = %issuer,
+        client_id = %client_id,
+        console_access_enabled_by_bootstrap = consent.was_granted(),
+        "applied the Cloud console-access OIDC bootstrap file; the managed SSO provider \
+         is now configured"
+    );
+    if consent.was_granted() {
+        warn!(
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file turned \
+             cloud.console_access_enabled on (ADR-045 Amendment 1: on a Cloud-hosted \
+             plane the file is the operator's consent); disable it in Settings > Temps \
+             Cloud if that is not intended"
+        );
+    }
+    match service_context.get_service::<dyn temps_core::AuditLogger>() {
+        Some(audit_logger) => {
+            temps_cloud::record_console_oidc_bootstrap_outcome_audit(
+                audit_logger.as_ref(),
+                CloudEnrollmentActor::UnattendedBootstrap,
+                issuer,
+                client_id,
+                consent,
+            )
+            .await;
+        }
+        None => error!(
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file was applied but no audit \
+             logger is registered; the CLOUD_CONSOLE_OIDC_BOOTSTRAPPED audit record \
+             (and, if consent was granted, CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP) \
+             was not written"
+        ),
     }
 }
 
@@ -1515,18 +1589,39 @@ async fn serve_original_console(req: Request) -> Response {
     serve_static_from(&WEBSITE, req)
 }
 
+/// Detail text for a request path that must never fall through to the SPA,
+/// or `None` when the console may serve it.
+///
+/// The returned text is a fixed literal (no request data), so it is safe to
+/// embed in the JSON body verbatim.
+fn unmatched_api_detail(path: &str) -> Option<&'static str> {
+    if path.starts_with("/api/") {
+        Some("No API route matched")
+    } else if path == "/ai/v1" || path.starts_with("/ai/v1/") {
+        Some(
+            "No API route matched. The AI gateway is served under /api/ai/v1, \
+             for example /api/ai/v1/chat/completions",
+        )
+    } else {
+        None
+    }
+}
+
 fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     let raw_path = req.uri().path();
 
     // Never serve the SPA for /api/ paths — those should 404 if unmatched
-    // by any API router (including external plugin proxies).
-    if raw_path.starts_with("/api/") {
+    // by any API router (including external plugin proxies). The same goes for
+    // `/ai/v1/*`: the AI gateway lives under `/api/ai/v1`, and answering a
+    // client that dropped the `/api` prefix with the console HTML (200) makes
+    // every OpenAI SDK fail with an unparsable body instead of a pointer to
+    // the right URL.
+    if let Some(detail) = unmatched_api_detail(raw_path) {
+        let body = format!(r#"{{"status":404,"title":"Not Found","detail":"{detail}"}}"#);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"status":404,"title":"Not Found","detail":"No API route matched"}"#,
-            ))
+            .body(Body::from(body))
             .unwrap();
     }
 
@@ -1959,9 +2054,18 @@ fn log_aggregator_storage_config(
 /// (`config.is_clickhouse_enabled()`). When the monitoring store is set to
 /// ClickHouse but the env vars are absent, this logs a warning and returns
 /// `None` so the caller falls back to TimescaleDB (fail-open to the default
-/// path, never silently losing metrics). Construction does no I/O; migrations
-/// are spawned separately by the caller.
-fn build_ch_metrics_store(config: &ServerConfig) -> Option<Arc<dyn temps_metrics::MetricsStore>> {
+/// path, never silently losing metrics). Construction does no I/O.
+///
+/// `compression` is the wire-compression mode every ClickHouse client of this
+/// process uses (`ConfigService::clickhouse_compression`). Migrations are
+/// applied on a detached task and retried until they apply, so a server that
+/// is still starting — or one whose responses cannot be decoded until the
+/// operator fixes it — does not leave the store without its tables until the
+/// next restart.
+fn build_ch_metrics_store(
+    config: &ServerConfig,
+    compression: temps_clickhouse::ClickHouseCompression,
+) -> Option<Arc<dyn temps_metrics::MetricsStore>> {
     use temps_metrics::{ClickHouseMetricsConfig, ClickhouseMetricsStore, MetricsStore};
 
     if !config.is_clickhouse_enabled() {
@@ -1978,46 +2082,33 @@ fn build_ch_metrics_store(config: &ServerConfig) -> Option<Arc<dyn temps_metrics
         config.clickhouse_database.clone().unwrap_or_default(),
         config.clickhouse_user.clone().unwrap_or_default(),
         config.clickhouse_password.clone().unwrap_or_default(),
-    );
+    )
+    .with_compression(compression);
     let store = Arc::new(ClickhouseMetricsStore::new(cfg));
 
-    // Run migrations in the background so startup is not blocked. If they fail,
-    // the first write/read surfaces the error per-call. Guard on the runtime
-    // handle: this is called from an async path today, but a bare tokio::spawn
-    // panics if ever invoked from a sync context (no reactor) — fall back to a
-    // short-lived current-thread runtime in that case.
+    // Run migrations in the background so startup is not blocked, retrying
+    // until they apply. `spawn_retrying` works with or without a Tokio runtime
+    // on this thread.
     let client = store.client().clone();
     let database = config.clickhouse_database.clone().unwrap_or_default();
-    let run_migrations = async move {
-        match temps_metrics::clickhouse_migrations::apply_migrations(&client, &database).await {
-            Ok(report) => debug!(
+    temps_clickhouse::spawn_retrying(
+        "resource-metrics",
+        temps_clickhouse::MigrationRetryPolicy::default(),
+        move || {
+            let client = client.clone();
+            let database = database.clone();
+            async move {
+                temps_metrics::clickhouse_migrations::apply_migrations(&client, &database).await
+            }
+        },
+        |report| {
+            debug!(
                 applied = ?report.applied,
                 skipped = report.skipped.len(),
                 "ClickHouse resource-metrics migrations applied"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "ClickHouse resource-metrics migrations failed; \
-                 metric writes/queries will surface the error per-call"
-            ),
-        }
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn(run_migrations);
-        }
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt.block_on(run_migrations),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "Could not build a runtime to apply ClickHouse resource-metrics \
-                 migrations; they will be attempted on first read/write"
-            ),
+            )
         },
-    }
+    );
 
     Some(store as Arc<dyn MetricsStore>)
 }
@@ -2065,6 +2156,81 @@ fn health_router(ready: Arc<std::sync::atomic::AtomicBool>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { (StatusCode::OK, "ok") }))
         .route("/readyz", get(readyz))
+}
+
+/// The console's public surface and nothing else (ADR-051 D4).
+///
+/// Serves the health probes and the public router under `/api`. It has no
+/// admin routes, no MCP endpoint and no dashboard fallback, so a request that
+/// reaches it cannot execute an admin handler or receive the SPA whatever its
+/// path, `Host`, forwarding headers or cookies: the boundary is what is
+/// mounted here, not a path match. The proxy sends it the public ingress
+/// hostname and every request the admin gate denies.
+///
+/// Handlers on `public_router` authenticate the request (a provider
+/// signature, a capability token in the path, a scoped API key), never the
+/// session — they have to work for callers that hold no cookie at all.
+fn public_only_app(health: Router, public_router: Router) -> Router {
+    Router::new()
+        .merge(health)
+        .nest("/api", public_router)
+        .fallback(public_only_not_found)
+        .layer(axum::middleware::from_fn(track_server_errors))
+}
+
+/// Serve the public-only app until shutdown. Resolves immediately when this
+/// process has no such listener (a split console started without
+/// `--console-ingress-address`), so callers can join it unconditionally.
+async fn serve_public_only(
+    ingress: Option<(TcpListener, Router)>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    match ingress {
+        Some((listener, app)) => {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown)
+            .await
+        }
+        None => Ok(()),
+    }
+}
+
+/// 404 for everything that is not a public route. A browser gets the same
+/// branded page the proxy renders for an unknown host, so a non-allowlisted
+/// visitor sees exactly what they saw before this listener existed; an API
+/// client gets an empty body.
+async fn public_only_not_found(req: Request) -> Response {
+    use axum::response::IntoResponse;
+
+    let headers = req.headers();
+    let wants_html = !req.uri().path().starts_with("/api/")
+        && headers
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|accept| accept.contains("text/html"));
+    if !wants_html {
+        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response();
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    (
+        StatusCode::NOT_FOUND,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+        ],
+        temps_proxy::branded_404::render(host, request_id),
+    )
+        .into_response()
 }
 
 /// ALLOWLIST for the AI `call_api` read tool — opt-in / secure by default.
@@ -3083,18 +3249,21 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let templates_override_path = config.data_dir.join("templates.yaml");
     let template_service = Arc::new(TemplateService::new(Some(templates_override_path))?);
 
-    // Load additional template files if specified
+    // Load additional template files if specified. `load_additional` warns and
+    // skips individual templates with unknown presets or other validation
+    // errors; it only returns `Err` when the file itself is missing or
+    // unparsable, which is always a boot-time configuration mistake.
     for additional_path in &additional_templates {
         info!("Loading additional templates from {:?}", additional_path);
         if let Err(e) = template_service.load_additional(additional_path).await {
             return Err(anyhow::anyhow!(
-                "❌ Failed to load additional templates from {:?}\n\n\
+                "Failed to load additional templates from {:?}\n\n\
                 Error: {}\n\n\
-                Please check the file exists and contains valid YAML with valid services.\n\
-                Valid services are: {}",
+                Check that the file exists and contains valid YAML. Templates with \
+                unrecognised presets are skipped with a warning; valid presets are: {}",
                 additional_path,
                 e,
-                temps_core::templates::VALID_SERVICES.join(", ")
+                temps_core::templates::VALID_PRESETS.join(", ")
             ));
         }
     }
@@ -3207,6 +3376,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering TeamsPlugin");
     let teams_plugin = Box::new(TeamsPlugin::new());
     plugin_manager.register_plugin(teams_plugin);
+
+    // 5.2. ProjectGroupsPlugin - optional parent grouping for projects. Its
+    // member lists are filtered through the ProjectAccessChecker above.
+    debug!("Registering ProjectGroupsPlugin");
+    plugin_manager.register_plugin(Box::new(ProjectGroupsPlugin::new()));
 
     // 6. GitPlugin - provides git functionality (depends on other services)
     debug!("Registering GitPlugin");
@@ -3990,8 +4164,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("Event-driven outage detection service started (listening to StatusCheckCompleted jobs)");
 
         // Start container health monitoring (restart count, resource usage)
-        if let Some(container_deployer) =
-            service_context.get_service::<dyn temps_deployer::ContainerDeployer>()
         {
             // Build the metrics store if monitoring is enabled, so container
             // resource metrics are written alongside the alarm logic.
@@ -4010,11 +4182,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                                 Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
                                     as Arc<dyn MetricsStore>)
                             }
-                            MetricsStoreKind::ClickHouse => build_ch_metrics_store(&config)
-                                .or_else(|| {
-                                    Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
-                                        as Arc<dyn MetricsStore>)
-                                }),
+                            MetricsStoreKind::ClickHouse => {
+                                build_ch_metrics_store(&config, cfg_svc.clickhouse_compression())
+                                    .or_else(|| {
+                                        Some(Arc::new(TimescaleMetricsStore::new(db.clone()))
+                                            as Arc<dyn MetricsStore>)
+                                    })
+                            }
                         },
                         _ => None,
                     },
@@ -4026,11 +4200,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 service_context.require_service::<dyn ContainerRuntimeResolver>();
             let mut health_monitor = ContainerHealthMonitor::new(
                 db.clone(),
-                container_deployer,
+                runtime_resolver,
                 alarm_service.clone(),
                 ContainerHealthConfig::default(),
-            )
-            .with_runtime_resolver(runtime_resolver);
+            );
 
             if let Some(ms) = container_metrics_store {
                 health_monitor = health_monitor.with_metrics_store(ms);
@@ -4042,8 +4215,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             });
 
             debug!("Container health monitor started (poll interval: 30s)");
-        } else {
-            debug!("ContainerDeployer not available - container health monitoring disabled");
         }
 
         // Start MetricsScraper for external service DB-level metrics
@@ -4069,8 +4240,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             match cfg_svc.get_settings().await {
                 Ok(settings) => {
                     let metrics_store: Arc<dyn MetricsStore> = match settings.monitoring.store {
-                        MetricsStoreKind::ClickHouse => build_ch_metrics_store(&config)
-                            .unwrap_or_else(|| Arc::new(TimescaleMetricsStore::new(db.clone()))),
+                        MetricsStoreKind::ClickHouse => {
+                            build_ch_metrics_store(&config, cfg_svc.clickhouse_compression())
+                                .unwrap_or_else(|| Arc::new(TimescaleMetricsStore::new(db.clone())))
+                        }
                         MetricsStoreKind::TimescaleDb => {
                             Arc::new(TimescaleMetricsStore::new(db.clone()))
                         }
@@ -4643,11 +4816,28 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         }
     };
 
+    // ADR-051 D4: the same public routes a second time, with nothing else
+    // around them. Bound in both listener modes: in dual-listener mode
+    // `console_address` has no admin routes, but `public_app` below still
+    // mounts the authenticated MCP endpoint, so it cannot stand in for it.
+    let ingress_app = config.public_surface_address().map(|_| {
+        // Request spans for OpenTelemetry export; a no-op unless `--otel-export`.
+        // This is the listener the proxy forwards public ingest traffic to when
+        // `console_ingress_address` is set, so it needs the same layer as
+        // `public_app` below or that traffic would never be traced.
+        crate::otel_export::layer_requests(public_only_app(
+            health_router(ready_flag.clone()),
+            public_router.clone(),
+        ))
+    });
+
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
         .merge(mcp_root_router)
         .nest("/api", public_router)
         .layer(axum::middleware::from_fn(track_server_errors));
+    // Request spans for OpenTelemetry export; a no-op unless `--otel-export`.
+    let public_app = crate::otel_export::layer_requests(public_app);
 
     // Platform-console listener: when an embedding binary overrode the root
     // bundle AND configured an address, serve the ORIGINAL console (same
@@ -4663,6 +4853,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         .nest("/api", admin_router)
         .fallback(serve_static_file)
         .layer(axum::middleware::from_fn(track_server_errors));
+    let admin_app = crate::otel_export::layer_requests(admin_app);
 
     // Defense-in-depth: the Pingora proxy is now the primary enforcer (it
     // 404s gated requests before they ever reach this listener). The axum
@@ -4804,6 +4995,21 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         .shared()
     };
 
+    // Bound before `/readyz` flips, so a proxy that is told the console is
+    // ready can already reach the public-only surface.
+    let ingress = match (config.public_surface_address(), ingress_app) {
+        (Some(address), Some(app)) => {
+            let listener = bind_console_listener(address).await?;
+            info!(
+                "Console PUBLIC-ONLY API server listening on {} (third-party callbacks, ADR-051)",
+                address
+            );
+            Some((listener, app))
+        }
+        _ => None,
+    };
+    let ingress_fut = serve_public_only(ingress, shutdown_signal.clone());
+
     match config.console_admin_address.as_deref() {
         Some(admin_addr) if !admin_addr.is_empty() => {
             // Two-listener mode: public + admin on separate addresses.
@@ -4839,7 +5045,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             )
             .with_graceful_shutdown(shutdown_signal);
 
-            tokio::try_join!(public_fut, admin_fut)?;
+            tokio::try_join!(public_fut, admin_fut, ingress_fut)?;
         }
         _ => {
             // Single-listener mode (backwards compatible): merge public + admin
@@ -4863,17 +5069,189 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 &config.data_dir,
             );
 
-            axum::serve(
+            let console_fut = axum::serve(
                 listener,
                 merged.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(shutdown_signal)
-            .await?;
+            .with_graceful_shutdown(shutdown_signal);
+
+            tokio::try_join!(console_fut, ingress_fut)?;
         }
     }
 
     info!("Console API server exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod public_only_app_tests {
+    //! ADR-051 invariant 1: a request that reaches the public-only listener
+    //! cannot execute an admin handler or receive the dashboard, whatever its
+    //! path or headers. The boundary is what `public_only_app` mounts.
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::{get, post};
+    use std::sync::atomic::AtomicBool;
+    use tower::ServiceExt; // for `oneshot`
+
+    /// A public router shaped like the real one: receivers only.
+    fn public_router() -> Router {
+        Router::new()
+            .route("/emails/{email_id}/track/open", get(|| async { "pixel" }))
+            .route("/webhook/git/gitlab/events", post(|| async { "ok" }))
+            .route("/_temps/event", post(|| async { "ok" }))
+    }
+
+    /// Routes that exist on the admin router and on the merged console
+    /// listener, and must not exist here.
+    fn admin_router() -> Router {
+        Router::new()
+            .route("/settings", get(|| async { "settings" }))
+            .route("/projects", get(|| async { "projects" }))
+            .route("/_temps/internal", get(|| async { "internal" }))
+    }
+
+    fn app() -> Router {
+        public_only_app(
+            health_router(Arc::new(AtomicBool::new(true))),
+            public_router(),
+        )
+    }
+
+    async fn send(app: Router, request: Request<Body>) -> Response {
+        app.oneshot(request).await.expect("router responds")
+    }
+
+    fn request(method: &str, path: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, "hooks.example.com")
+            .body(Body::empty())
+            .expect("request builds")
+    }
+
+    #[tokio::test]
+    async fn serves_public_receivers_and_health_probes() {
+        for (method, path) in [
+            ("GET", "/healthz"),
+            ("GET", "/readyz"),
+            (
+                "GET",
+                "/api/emails/0b5a51a2-2b0a-4c0b-9f0e-6a1f0d1c2e3f/track/open",
+            ),
+            ("POST", "/api/webhook/git/gitlab/events"),
+            ("POST", "/api/_temps/event"),
+        ] {
+            assert_eq!(
+                send(app(), request(method, path)).await.status(),
+                StatusCode::OK,
+                "{method} {path} must be served on the public-only listener"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_routes_and_the_dashboard_are_not_mounted() {
+        // Sanity check: these paths do answer on a console that mounts them,
+        // so a 404 below is the boundary and not a typo in the path.
+        let merged = Router::new()
+            .nest("/api", public_router().merge(admin_router()))
+            .fallback(|| async { "dashboard" });
+        for path in [
+            "/",
+            "/api/settings",
+            "/api/projects",
+            "/api/_temps/internal",
+        ] {
+            assert_eq!(
+                send(merged.clone(), request("GET", path)).await.status(),
+                StatusCode::OK
+            );
+        }
+
+        for path in [
+            "/",
+            "/dashboard",
+            "/index.html",
+            "/settings",
+            "/api/settings",
+            "/api/projects",
+            // An authenticated sibling of a public ingest route.
+            "/api/_temps/internal",
+            "/mcp",
+            "/mcp/tools",
+            "/api/swagger-ui",
+        ] {
+            let response = send(app(), request("GET", path)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be reachable on the public-only listener"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn headers_cannot_steer_a_request_onto_an_admin_route() {
+        let request = Request::builder()
+            .uri("/api/settings")
+            .header(header::HOST, "console.example.com")
+            .header("x-forwarded-host", "console.example.com")
+            .header("x-forwarded-for", "127.0.0.1")
+            .header(header::COOKIE, "session=valid-admin-session")
+            .header(header::AUTHORIZATION, "Bearer tk_admin")
+            .body(Body::empty())
+            .expect("request builds");
+        assert_eq!(send(app(), request).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_browser_gets_the_branded_404_and_an_api_client_an_empty_one() {
+        let browser = Request::builder()
+            .uri("/dashboard")
+            .header(header::HOST, "hooks.example.com")
+            .header(header::ACCEPT, "text/html,application/xhtml+xml")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = send(app(), browser).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("<!doctype html>"),
+            "expected the branded page"
+        );
+        assert!(html.contains("hooks.example.com"));
+        assert!(
+            !html.contains("id=\"root\""),
+            "the dashboard bundle must never be served here"
+        );
+
+        // `/api/*` never gets HTML, even from a browser.
+        let api = Request::builder()
+            .uri("/api/settings")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = send(app(), api).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(body.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -6237,6 +6615,181 @@ mod heartbeat_tests {
 }
 
 #[cfg(test)]
+mod console_oidc_bootstrap_audit_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use temps_cloud::ConsoleOidcBootstrapParseError;
+    use temps_cloud::{
+        CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED, CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP,
+        CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
+    };
+    use temps_cloud_client::CloudFeatureSwitches;
+    use temps_core::plugin::ServiceRegistrationContext;
+    use temps_core::{AuditLogger, AuditOperation};
+
+    /// Records the operation type of every audit entry it is handed.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        operations: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    impl RecordingAuditLogger {
+        fn recorded(&self) -> Vec<String> {
+            self.operations.lock().unwrap().clone()
+        }
+    }
+
+    fn context_with_logger() -> (ServiceRegistrationContext, Arc<RecordingAuditLogger>) {
+        let recorder = Arc::new(RecordingAuditLogger::default());
+        let context = ServiceRegistrationContext::new();
+        context.register_service::<dyn AuditLogger>(recorder.clone());
+        (context, recorder)
+    }
+
+    fn path() -> PathBuf {
+        PathBuf::from("/data/cloud-oidc.json")
+    }
+
+    fn apply_error(consent: ConsentTrace) -> ConsoleOidcBootstrapError {
+        ConsoleOidcBootstrapError::Apply {
+            path: path(),
+            reason: "the settings write failed".to_string(),
+            consent,
+        }
+    }
+
+    fn failed_consent_write() -> ConsentTrace {
+        ConsentTrace::WriteFailed {
+            previous: CloudFeatureSwitches::default(),
+            restored: true,
+            provider_revoked: true,
+        }
+    }
+
+    fn granted() -> ConsoleAccessConsent {
+        ConsoleAccessConsent::GrantedByBootstrap {
+            previous: CloudFeatureSwitches::default(),
+            new: CloudFeatureSwitches {
+                console_access: true,
+                ..CloudFeatureSwitches::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_consent_write_is_audited_through_the_registered_logger() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_error(&context, &apply_error(failed_consent_write())).await;
+
+        assert_eq!(
+            recorder.recorded(),
+            vec![CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_apply_failure_before_the_consent_write_is_not_audited() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_error(&context, &apply_error(ConsentTrace::Untouched)).await;
+
+        assert!(recorder.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_and_unparseable_files_are_not_audited() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_error(
+            &context,
+            &ConsoleOidcBootstrapError::Read {
+                path: path(),
+                reason: "permission denied".to_string(),
+            },
+        )
+        .await;
+        report_console_oidc_bootstrap_error(
+            &context,
+            &ConsoleOidcBootstrapError::Parse {
+                path: path(),
+                source: ConsoleOidcBootstrapParseError::EmptyField { field: "issuer" },
+            },
+        )
+        .await;
+
+        assert!(recorder.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_consent_write_without_a_registered_logger_does_not_panic() {
+        let context = ServiceRegistrationContext::new();
+
+        report_console_oidc_bootstrap_error(&context, &apply_error(failed_consent_write())).await;
+        report_console_oidc_bootstrap_applied(
+            &context,
+            "https://issuer.example",
+            "client",
+            &granted(),
+        )
+        .await;
+
+        assert!(context.get_service::<dyn AuditLogger>().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_applied_bootstrap_that_granted_consent_records_both_events() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_applied(
+            &context,
+            "https://issuer.example",
+            "client",
+            &granted(),
+        )
+        .await;
+
+        assert_eq!(
+            recorder.recorded(),
+            vec![
+                CLOUD_CONSOLE_OIDC_BOOTSTRAPPED.to_string(),
+                CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_applied_bootstrap_that_found_consent_already_on_records_only_the_apply() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_applied(
+            &context,
+            "https://issuer.example",
+            "client",
+            &ConsoleAccessConsent::AlreadyEnabled,
+        )
+        .await;
+
+        assert_eq!(
+            recorder.recorded(),
+            vec![CLOUD_CONSOLE_OIDC_BOOTSTRAPPED.to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
 mod error_telemetry_tests {
     use super::*;
     use axum::response::IntoResponse;
@@ -6520,5 +7073,58 @@ mod log_storage_config_tests {
             }
             other => panic!("expected the S3 backend, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod spa_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn api_paths_never_fall_through_to_the_spa() {
+        assert_eq!(
+            unmatched_api_detail("/api/does-not-exist"),
+            Some("No API route matched")
+        );
+    }
+
+    #[test]
+    fn ai_gateway_path_without_api_prefix_points_to_the_real_base_url() {
+        for path in ["/ai/v1", "/ai/v1/models", "/ai/v1/chat/completions"] {
+            let detail = unmatched_api_detail(path)
+                .unwrap_or_else(|| panic!("{path} must not be answered with the console HTML"));
+            assert!(
+                detail.contains("/api/ai/v1"),
+                "detail for {path} must name the correct base URL, got: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_routes_are_still_served_by_the_spa() {
+        for path in ["/", "/ai", "/ai-first", "/ai/v1x", "/projects/1/ai/v1"] {
+            assert_eq!(
+                unmatched_api_detail(path),
+                None,
+                "{path} is a console route and must keep the SPA fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_answers_ai_gateway_prefix_with_a_json_404() {
+        let request = axum::http::Request::builder()
+            .uri("/ai/v1/models")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = serve_static_from(&WEBSITE, request);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.as_bytes()),
+            Some(b"application/json".as_slice())
+        );
     }
 }

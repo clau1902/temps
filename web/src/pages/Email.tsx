@@ -6,6 +6,7 @@ import { EmailDomainsManagement } from '@/components/email/EmailDomainsManagemen
 import { EmailProvidersManagement } from '@/components/email/EmailProvidersManagement'
 import { EmailsSentList } from '@/components/email/EmailsSentList'
 import { SdkDocumentation } from '@/components/email/SdkDocumentation'
+import { PublicIngressNotice } from '@/components/settings/PublicIngressNotice'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -38,8 +39,12 @@ export function Email() {
             </p>
           </div>
 
+          <PublicIngressNotice
+            title="Opens, clicks and delivery events will not be recorded"
+          />
+
           <Tabs value={activeTab} onValueChange={handleTabChange}>
-            <TabsList className="grid w-full grid-cols-5 lg:w-auto lg:grid-cols-none lg:inline-flex">
+            <TabsList className="w-full lg:w-auto">
               <TabsTrigger value="providers">Providers</TabsTrigger>
               <TabsTrigger value="domains">Domains</TabsTrigger>
               <TabsTrigger value="emails">Sent Emails</TabsTrigger>

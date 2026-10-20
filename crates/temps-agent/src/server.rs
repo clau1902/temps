@@ -84,6 +84,7 @@ pub fn build_router(
         sandbox_host,
         config.sandbox_work_root(),
     ));
+    let runtime_docker = docker.clone();
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
@@ -96,6 +97,8 @@ pub fn build_router(
     let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
     let auth = Arc::new(AgentAuth::new(&config.token));
+
+    let runtime_health_routes = crate::runtime_health::router(runtime_docker, config, auth.clone());
 
     // API routes — all protected by bearer token auth
     let api_routes = Router::new()
@@ -112,6 +115,10 @@ pub fn build_router(
         .route(
             "/agent/containers/{id}/exec",
             post(handlers::exec_container),
+        )
+        .route(
+            "/agent/containers/{id}/health-exec",
+            post(handlers::exec_health_probe),
         )
         .route(
             "/agent/containers/{id}/terminal",
@@ -154,6 +161,11 @@ pub fn build_router(
             "/agent/images/extract",
             get(crate::build_handler::extract_image_path),
         )
+        .route(
+            "/agent/images/fetch",
+            post(crate::build_handler::fetch_registry_image),
+        )
+        .route("/agent/images/scan", post(crate::build_handler::scan_image))
         .route("/agent/images/{name}/exists", get(handlers::image_exists))
         .route("/agent/health", get(handlers::health_check))
         // Service management routes
@@ -181,6 +193,10 @@ pub fn build_router(
             post(service_handlers::runtime_env),
         )
         .route(
+            "/agent/services/revoke-s3-access",
+            post(service_handlers::revoke_s3_access),
+        )
+        .route(
             "/agent/services/health-probe",
             post(service_handlers::health_probe),
         )
@@ -200,10 +216,14 @@ pub fn build_router(
     let sandbox_routes = sandbox_router(sandbox_state, auth);
 
     // Swagger UI — no auth required so it's accessible for documentation
-    let swagger_ui =
-        SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", AgentApiDoc::openapi());
+    let mut api = AgentApiDoc::openapi();
+    api.merge(crate::runtime_health::RuntimeHealthApiDoc::openapi());
+    let swagger_ui = SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api);
 
-    api_routes.merge(sandbox_routes).merge(swagger_ui)
+    api_routes
+        .merge(sandbox_routes)
+        .merge(runtime_health_routes)
+        .merge(swagger_ui)
 }
 
 /// ADR-048 sandbox host API — same auth as every other agent route. File
@@ -267,6 +287,10 @@ fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) ->
         .route(
             "/agent/sandboxes/recover",
             post(sandbox_handlers::recover_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/release-orphaned",
+            post(sandbox_handlers::release_orphaned_sandbox_resources),
         )
         .route(
             "/agent/sandboxes/status",
@@ -1126,7 +1150,7 @@ mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 13] = [
+    const SANDBOX_ROUTES: [&str; 14] = [
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
         "/agent/sandboxes/exec-stream",
@@ -1139,6 +1163,7 @@ mod tests {
         "/agent/sandboxes/stop",
         "/agent/sandboxes/start",
         "/agent/sandboxes/recover",
+        "/agent/sandboxes/release-orphaned",
         "/agent/sandboxes/status",
     ];
     const UPLOAD_ROUTES: [&str; 2] = [

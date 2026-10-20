@@ -16,6 +16,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
@@ -29,6 +30,7 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ChevronRight,
@@ -130,6 +132,9 @@ export function SourceMaps({ project }: SourceMapsProps) {
     onError: () => {
       toast.error('Failed to delete source maps')
     },
+    // The dialog stays open (and locked) until the request settles, so the
+    // same target cannot be confirmed twice while the first delete is running.
+    onSettled: () => setDeleteConfirm(null),
   })
 
   // Delete single source map mutation
@@ -149,6 +154,7 @@ export function SourceMaps({ project }: SourceMapsProps) {
     onError: () => {
       toast.error('Failed to delete source map')
     },
+    onSettled: () => setDeleteConfirm(null),
   })
 
   const releases = releasesData?.releases ?? []
@@ -163,8 +169,9 @@ export function SourceMaps({ project }: SourceMapsProps) {
       deleteFileMutation.mutate({
         path: { project_id: project.id, source_map_id: deleteConfirm.fileId },
       })
+    } else {
+      setDeleteConfirm(null)
     }
-    setDeleteConfirm(null)
   }
 
   return (
@@ -269,11 +276,16 @@ export function SourceMaps({ project }: SourceMapsProps) {
               Manage build tokens
             </a>
             <div className="flex min-w-0 items-center gap-2">
-              <HighlightedCode
-                language="bash"
-                code={`sentry-cli sourcemaps inject ./dist\nSENTRY_URL=${window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_BUILD_TOKEN --org temps --project ${project.slug} ./dist`}
-                className="text-xs bg-muted px-3 py-2 rounded font-mono flex-1 min-w-0 overflow-x-auto block"
-              />
+              <ScrollRegion
+                className="flex-1 min-w-0"
+                regionLabel="Sentry CLI upload commands"
+              >
+                <HighlightedCode
+                  language="bash"
+                  code={`sentry-cli sourcemaps inject ./dist\nSENTRY_URL=${window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_BUILD_TOKEN --org temps --project ${project.slug} ./dist`}
+                  className="text-xs bg-muted px-3 py-2 rounded font-mono block"
+                />
+              </ScrollRegion>
               <CopyButton
                 value={`sentry-cli sourcemaps inject ./dist\nSENTRY_URL=${window.location.origin} sentry-cli sourcemaps upload --auth-token YOUR_BUILD_TOKEN --org temps --project ${project.slug} ./dist`}
                 className="h-8 w-8 p-0 hover:bg-accent hover:text-accent-foreground rounded-md shrink-0"
@@ -301,50 +313,31 @@ export function SourceMaps({ project }: SourceMapsProps) {
       />
 
       {/* Delete confirmation dialog */}
-      <Dialog
-        open={!!deleteConfirm}
-        onOpenChange={(open) => !open && setDeleteConfirm(null)}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              Delete Source Map{deleteConfirm?.type === 'release' ? 's' : ''}
-            </DialogTitle>
-            <DialogDescription>
-              {deleteConfirm?.type === 'release'
-                ? `This will delete all source maps for release "${deleteConfirm.release}". This action cannot be undone.`
-                : `This will delete the source map "${deleteConfirm?.fileName}". This action cannot be undone.`}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setDeleteConfirm(null)}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              onClick={handleConfirmDelete}
-              disabled={
-                deleteReleaseMutation.isPending || deleteFileMutation.isPending
-              }
-            >
-              {deleteReleaseMutation.isPending ||
-              deleteFileMutation.isPending ? (
-                <>
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  Deleting...
-                </>
-              ) : (
-                'Delete'
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConfirmDeleteDialog
+        open={deleteConfirm !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteConfirm(null)
+        }}
+        resourceType={
+          deleteConfirm?.type === 'release'
+            ? 'source maps for release'
+            : 'source map'
+        }
+        resourceName={
+          (deleteConfirm?.type === 'release'
+            ? deleteConfirm.release
+            : deleteConfirm?.fileName) ?? ''
+        }
+        consequences={
+          deleteConfirm?.type === 'release'
+            ? 'Every source map uploaded for this release is removed, so its stack traces are no longer symbolicated.'
+            : 'Stack traces that reference this file are no longer symbolicated.'
+        }
+        isPending={
+          deleteReleaseMutation.isPending || deleteFileMutation.isPending
+        }
+        onConfirm={handleConfirmDelete}
+      />
     </div>
   )
 }

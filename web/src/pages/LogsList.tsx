@@ -42,7 +42,8 @@ import {
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router'
+import { useNavigate } from 'react-router'
+import { useUrlSearchText, useUrlState } from '@temps-sdk/ds'
 import { LogsEmptyState } from '@/components/observability/LogsEmptyState'
 
 interface LogsListProps {
@@ -84,37 +85,56 @@ function severityBadge(severity: LogSeverity, text?: string) {
 
 export default function LogsList({ project }: LogsListProps) {
   const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const urlState = useUrlState<
+    | 'range'
+    | 'severity'
+    | 'service'
+    | 'q'
+    | 'trace'
+    | 'attribute_key'
+    | 'attribute_value'
+    | 'attribute_type'
+    | 'attribute_op'
+  >()
+  const { state, patch } = urlState
   const { setBreadcrumbs } = useBreadcrumbs()
   usePageTitle(`Logs - ${project.name}`)
 
-  const [timeRange, setTimeRange] = useState<TimeRange>(
-    () => (searchParams.get('range') as TimeRange) || '24h'
-  )
-  const [severity, setSeverity] = useState<string>(
-    () => searchParams.get('severity') || ALL
-  )
-  const [service, setService] = useState(
-    () => searchParams.get('service') || ''
-  )
-  const [search, setSearch] = useState(() => searchParams.get('q') || '')
+  // Every filter lives in the URL (replace, not push) so reload, back/forward
+  // and shared links keep it. Text boxes keep what was typed locally and mirror
+  // it to the URL, so a re-render can never drop a keystroke.
+  const timeRange = state.range || '24h'
+  const setTimeRange = (value: TimeRange) =>
+    patch({ range: value === '24h' ? undefined : value })
+  const severity = state.severity || ALL
+  const setSeverity = (value: string) =>
+    patch({ severity: value === ALL ? undefined : value })
+  const [service, setService] = useUrlSearchText('service', { urlState })
+  const [search, setSearch] = useUrlSearchText('q', { urlState })
   // Trace correlation: when arriving from a trace, `?trace=<id>` pins the filter.
-  const traceId = searchParams.get('trace') || ''
-  const [attributeFilter, setAttributeFilter] = useState<
-    LogAttributePredicate | undefined
-  >(() => {
-    const key = searchParams.get('attribute_key')
-    return key
+  const traceId = state.trace || ''
+  const attributeFilter = useMemo<LogAttributePredicate | undefined>(() => {
+    return state.attribute_key
       ? {
-          key,
-          value: searchParams.get('attribute_value') ?? '',
-          type: (searchParams.get('attribute_type') ?? undefined) as
-            LogAttributeType | undefined,
-          operator: (searchParams.get('attribute_op') ??
-            'eq') as LogAttributeOperator,
+          key: state.attribute_key,
+          value: state.attribute_value ?? '',
+          type: state.attribute_type as LogAttributeType | undefined,
+          operator: (state.attribute_op ?? 'eq') as LogAttributeOperator,
         }
       : undefined
-  })
+  }, [
+    state.attribute_key,
+    state.attribute_value,
+    state.attribute_type,
+    state.attribute_op,
+  ])
+  const setAttributeFilter = (value: LogAttributePredicate | undefined) =>
+    patch({
+      attribute_key: value?.key,
+      attribute_value: value?.value,
+      attribute_type: value?.type,
+      attribute_op: value?.operator,
+    })
   const [page, setPage] = useState(1)
   const [queryClock, setQueryClock] = useState(Date.now)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
@@ -143,32 +163,6 @@ export default function LogsList({ project }: LogsListProps) {
     debouncedService,
     debouncedSearch,
     traceId,
-    attributeFilter,
-  ])
-
-  // Persist filters to the URL.
-  useEffect(() => {
-    const params = new URLSearchParams()
-    if (timeRange !== '24h') params.set('range', timeRange)
-    if (severity !== ALL) params.set('severity', severity)
-    if (debouncedService) params.set('service', debouncedService)
-    if (debouncedSearch) params.set('q', debouncedSearch)
-    if (traceId) params.set('trace', traceId)
-    if (attributeFilter) {
-      params.set('attribute_key', attributeFilter.key)
-      params.set('attribute_value', attributeFilter.value)
-      params.set('attribute_op', attributeFilter.operator)
-      if (attributeFilter.type)
-        params.set('attribute_type', attributeFilter.type)
-    }
-    setSearchParams(params, { replace: true })
-  }, [
-    timeRange,
-    severity,
-    debouncedService,
-    debouncedSearch,
-    traceId,
-    setSearchParams,
     attributeFilter,
   ])
 
@@ -214,7 +208,7 @@ export default function LogsList({ project }: LogsListProps) {
     ].filter(Boolean)
     return [
       'The user is in the OpenTelemetry Logs explorer in the Temps console.',
-      `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+      `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
       `Time range: ${timeRange}.${filters.length ? ` Active filters: ${filters.join(', ')}.` : ''}`,
       'Fetch logs with the temps CLI: `telemetry-logs query_logs --severity/--service_name/--search/--trace_id`.',
     ].join('\n')
@@ -231,9 +225,7 @@ export default function LogsList({ project }: LogsListProps) {
   }
 
   const clearTrace = () => {
-    const params = new URLSearchParams(searchParams)
-    params.delete('trace')
-    setSearchParams(params, { replace: true })
+    patch({ trace: undefined })
   }
 
   return (
@@ -306,7 +298,10 @@ export default function LogsList({ project }: LogsListProps) {
             />
 
             <Select value={severity} onValueChange={setSeverity}>
-              <SelectTrigger className="w-full sm:w-[150px]">
+              <SelectTrigger
+                aria-label="Severity"
+                className="w-full sm:w-[150px]"
+              >
                 <SelectValue placeholder="Severity" />
               </SelectTrigger>
               <SelectContent>
@@ -337,6 +332,7 @@ export default function LogsList({ project }: LogsListProps) {
             </div>
           </div>
           <LogAttributeFilter
+            key={JSON.stringify(attributeFilter)}
             value={attributeFilter}
             onApply={setAttributeFilter}
             pending={isFetching}
@@ -379,7 +375,7 @@ export default function LogsList({ project }: LogsListProps) {
                   <button
                     type="button"
                     onClick={() => toggleExpand(i)}
-                    className="flex w-full flex-wrap items-start gap-3 px-3 py-1.5 text-left hover:bg-muted/50"
+                    className="flex w-full flex-wrap items-start gap-x-3 gap-y-1 px-3 py-1.5 text-left hover:bg-muted/50"
                   >
                     <span className="shrink-0 text-muted-foreground tabular-nums">
                       {format(new Date(log.timestamp), 'MMM d HH:mm:ss.SSS')}
@@ -390,7 +386,7 @@ export default function LogsList({ project }: LogsListProps) {
                     <span className="shrink-0 max-w-[140px] truncate text-muted-foreground">
                       {log.resource?.service_name || '—'}
                     </span>
-                    <span className="min-w-0 basis-full truncate text-foreground sm:basis-auto sm:flex-1">
+                    <span className="min-w-0 flex-1 basis-full truncate text-foreground sm:basis-0">
                       {log.body}
                     </span>
                     {log.trace_id && (

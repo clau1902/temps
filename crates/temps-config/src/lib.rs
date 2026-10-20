@@ -6,6 +6,7 @@ pub mod disk_status;
 pub mod enrollment_tokens;
 mod handler;
 mod installation_secrets;
+pub mod otel_export;
 pub mod plugin;
 mod retention;
 mod service;
@@ -25,7 +26,8 @@ pub use plugin::ConfigPlugin;
 pub use retention::{settings_retention_resolver, RETENTION_REFRESH_INTERVAL};
 pub use service::{
     anonymous_telemetry_preference, installation_mode, stateless_instance_id,
-    stateless_telemetry_anonymous_id, ClusterCaRotationResult, ClusterNetworkState, ConfigService,
-    ConfigServiceError, EffectiveTelemetryPolicies, InstallationMode, ServerConfig,
-    SettingsUpdateResult, TrustedPrivateNetworksIntent,
+    stateless_telemetry_anonymous_id, stored_clickhouse_compression, ClusterCaRotationResult,
+    ClusterNetworkState, ConfigService, ConfigServiceError, EffectiveTelemetryPolicies,
+    InstallationMode, RetentionPolicy, ServerConfig, SettingsUpdateResult,
+    TrustedPrivateNetworksIntent,
 };

@@ -8,6 +8,7 @@ mod autopack_preset;
 mod build_system;
 mod compiled_workspace;
 mod docker;
+pub mod compose_check;
 pub mod docker_compose;
 mod docker_custom;
 pub mod dockerfile_expose;
@@ -427,17 +428,6 @@ pub trait Preset: fmt::Display + Send + Sync {
         }
 
         Ok(StoredPreset { preset, config })
-    }
-
-    /// Whether this preset generates its Dockerfile with Autopack.
-    ///
-    /// A worker build never receives build-argument values, so the build job
-    /// renders every generated Dockerfile without its `ARG`s there. Other
-    /// presets refuse a worker build that would lose a variable the framework
-    /// inlines at build time; Autopack has always built without them and only
-    /// warns.
-    fn uses_autopack(&self) -> bool {
-        false
     }
 
     /// Returns the default exposed port for this preset

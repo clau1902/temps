@@ -16,7 +16,6 @@ import {
   Button,
   Callout,
   Detail,
-  EchoDialog,
   Ledger,
   PageState,
   RecordLink,
@@ -36,6 +35,8 @@ import {
   listProjectFeedbackOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { CodeBlock } from '@/components/ui/code-block'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { readFailureServerDetail } from '@/lib/read-failure'
 
 const failure = (error: unknown) =>
@@ -219,6 +220,7 @@ function FeedbackRecord({ project }: { project: ProjectResponse }) {
   })
   const remove = useMutation({
     mutationFn: () => deleteProjectFeedback({ path, throwOnError: true }),
+    onError: () => setDeleting(false),
     onSuccess: () => {
       invalidate()
       navigate(base(project))
@@ -347,21 +349,27 @@ function FeedbackRecord({ project }: { project: ProjectResponse }) {
               <summary className="cursor-pointer text-sm font-medium">
                 SDK context
               </summary>
-              <pre className="mt-2 overflow-auto whitespace-pre-wrap break-words text-xs">
-                {JSON.stringify(report.context, null, 2)}
-              </pre>
+              <ScrollRegion
+                className="mt-2 max-h-80"
+                regionLabel="Feedback SDK context"
+              >
+                <pre className="whitespace-pre-wrap break-words text-xs">
+                  {JSON.stringify(report.context, null, 2)}
+                </pre>
+              </ScrollRegion>
             </details>
           </div>
         }
       />
-      <EchoDialog
+      <ConfirmDeleteDialog
         open={deleting}
         onOpenChange={setDeleting}
-        title="Delete feedback"
-        description="This permanently deletes this report and its contact information. Its associated error and replay remain available."
-        phrase="delete feedback"
+        resourceType="feedback report"
+        resourceName={`#${report.id}`}
+        consequences="This permanently deletes this report and its contact information. Its associated error and replay remain available."
+        requireTypedName
         confirmLabel="Delete feedback"
-        busy={remove.isPending}
+        isPending={remove.isPending}
         onConfirm={() => remove.mutate()}
       />
     </>

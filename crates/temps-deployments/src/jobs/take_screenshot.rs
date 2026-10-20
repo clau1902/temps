@@ -322,6 +322,17 @@ impl WorkflowTask for TakeScreenshotJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+        if context
+            .get_output::<bool>("deploy_container", "portless")?
+            .unwrap_or(false)
+        {
+            self.log("Background worker: no screenshot URL".to_string())
+                .await?;
+            return Ok(JobResult::skipped(
+                context,
+                "Background worker has no screenshot URL".to_string(),
+            ));
+        }
         // Wait for the application to fully initialize after deployment
         // The route table needs time to be ready, and the application needs to start serving content.
         // 15 seconds provides enough time for most applications to complete their startup sequence
@@ -595,6 +606,7 @@ mod tests {
             tls_address: None,
             console_address: "127.0.0.1:0".to_string(),
             console_admin_address: None,
+            console_ingress_address: None,
             admin_allowed_ips: Vec::new(),
             admin_allowed_hosts: Vec::new(),
             admin_trust_forwarded_for: false,

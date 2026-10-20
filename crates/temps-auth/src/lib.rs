@@ -16,8 +16,11 @@ mod decorators;
 mod deployment_token_service;
 mod email_templates;
 pub mod handlers;
+#[cfg(test)]
+mod http_test_support;
 mod last_used_throttle;
 mod macros;
+mod mfa_guard;
 mod middleware;
 /// Public so other plugins (e.g. `temps-cloud`'s managed console-access
 /// provider, ADR-045 §4) can hold an `Arc<OidcService>` and reuse the same
@@ -59,7 +62,9 @@ pub use apikey_plugin::ApiKeyPlugin;
 pub use plugin::AuthPlugin;
 
 // Export services
-pub use apikey_service::{ApiKeyService, CreateApiKeyRequest, CreateApiKeyResponse};
+pub use apikey_service::{
+    cap_api_key_grant, current_owner_role, ApiKeyService, CreateApiKeyRequest, CreateApiKeyResponse,
+};
 pub use auth_service::{validate_password_complexity, AuthService, VerifiedSession};
 pub use deployment_token_service::{
     DeploymentTokenValidationError, DeploymentTokenValidationService, ValidatedDeploymentToken,

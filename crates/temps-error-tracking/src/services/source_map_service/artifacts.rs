@@ -94,9 +94,10 @@ fn decode_bundle(project_id: i32, data: &[u8]) -> Result<Vec<ArtifactMap>, Artif
         let entry = archive
             .by_index(index)
             .map_err(|_| bad("invalid ZIP entry"))?;
-        if !names.insert(entry.name().to_owned())
+        let name = entry.name().map_err(|_| bad("invalid ZIP entry name"))?;
+        if !names.insert(name.to_string())
             || entry.enclosed_name().is_none()
-            || entry.name().contains('\\')
+            || name.contains('\\')
             || entry.is_symlink()
             || entry.is_dir()
             || !matches!(
@@ -540,6 +541,23 @@ pub(super) mod tests {
         assert_eq!(scheme["sourcesContent"][0], "synthetic webpack source");
         let mut limited = serde_json::json!({"sources":["../src/original.js"]});
         assert!(hydrate_sources(&mut limited, "~/assets/app.js.map", &source, 1).is_err());
+    }
+
+    #[test]
+    fn artifact_bundle_rejects_invalid_utf8_entry_names() {
+        let mut bytes = bundle(&[("00112233-4455-4677-8899-aabbccddeeff", "synthetic source")]);
+        // Mark the first local and central-directory name as UTF-8, then
+        // replace its first byte with an invalid sequence. ZIP CRCs cover
+        // content, so this isolates filename decoding from content validity.
+        for (signature, flags, name) in [(b"PK\x03\x04", 6, 30), (b"PK\x01\x02", 8, 46)] {
+            let offset = bytes.windows(4).position(|v| v == signature).unwrap();
+            bytes[offset + flags + 1] |= 0x08;
+            bytes[offset + name] = 0xff;
+        }
+        assert!(matches!(
+            decode_bundle(7, &bytes),
+            Err(ArtifactUploadError::Invalid { project_id: 7, .. })
+        ));
     }
 
     #[test]

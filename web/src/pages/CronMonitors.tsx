@@ -17,7 +17,6 @@ import {
   Callout,
   DataTable,
   Detail,
-  EchoDialog,
   Field,
   Ledger,
   PageState,
@@ -52,6 +51,7 @@ import {
   listCronMonitorRunsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { CodeBlock } from '@/components/ui/code-block'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { readFailureServerDetail } from '@/lib/read-failure'
 
 const stamp = (value?: string | null) =>
@@ -329,6 +329,7 @@ function CronRecord({ project }: { project: ProjectResponse }) {
   })
   const remove = useMutation({
     mutationFn: () => deleteCronMonitor({ path, throwOnError: true }),
+    onError: () => setDeleting(false),
     onSuccess: () => {
       void cache.invalidateQueries({
         queryKey: listCronMonitorsOptions({ path: { project_id: project.id } })
@@ -595,14 +596,15 @@ function CronRecord({ project }: { project: ProjectResponse }) {
           </section>
         }
       />
-      <EchoDialog
+      <ConfirmDeleteDialog
         open={deleting}
         onOpenChange={setDeleting}
-        title="Delete cron monitor"
-        description="This removes the monitor and all its run history. Future SDK check-ins can recreate it. Stop sending them first to remove it permanently."
-        phrase={monitor.slug}
+        resourceType="cron monitor"
+        resourceName={monitor.slug}
+        consequences="This removes the monitor and all its run history. Future SDK check-ins can recreate it. Stop sending them first to remove it permanently."
+        requireTypedName
         confirmLabel="Delete monitor"
-        busy={remove.isPending}
+        isPending={remove.isPending}
         onConfirm={() => remove.mutate()}
       />
     </>
