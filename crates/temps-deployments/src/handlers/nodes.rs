@@ -1901,9 +1901,9 @@ async fn mesh_enroll_inner(
         return Err(problemdetails::new(StatusCode::FORBIDDEN)
             .with_title("Enrollment Token Required")
             .with_detail(
-                "Joining without an address needs a node enrollment token, not the legacy \
-                 shared join token. Create one in Worker Nodes → Add node and re-run \
-                 `temps join <url> <token>`.",
+                "Joining without an address needs a single-use node enrollment token, not \
+                 the shared join token. Click Create join command in Settings → Worker \
+                 Nodes and run the command it shows.",
             ));
     }
     let public_key = request.wg_public_key.trim();

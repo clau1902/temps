@@ -74,6 +74,9 @@ pub struct Model {
     /// The control plane is the mesh hub. Never set together with
     /// `mesh_hub_node_id`.
     pub mesh_hub_control_plane: bool,
+    /// When an operator confirmed the compute pool. The console asks once
+    /// before adding the first node; nothing on the join path reads it.
+    pub compute_pool_confirmed_at: Option<DBDateTime>,
     pub updated_at: DBDateTime,
 }
 

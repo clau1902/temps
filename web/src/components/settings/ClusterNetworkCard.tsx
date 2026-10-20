@@ -76,7 +76,14 @@ export function ClusterNetworkCard() {
   )
 }
 
-function ClusterNetworkForm({ status }: { status: ClusterNetworkStatus }) {
+export function ClusterNetworkForm({
+  status,
+  onSaved,
+}: {
+  status: ClusterNetworkStatus
+  /** Called after the pool is saved. */
+  onSaved?: () => void
+}) {
   const queryClient = useQueryClient()
   const form = useForm<ClusterNetworkFormValues>({
     resolver: zodResolver(clusterNetworkFormSchema),
@@ -105,6 +112,7 @@ function ClusterNetworkForm({ status }: { status: ClusterNetworkStatus }) {
           ? `Moved ${moved}; the nodes apply their new subnets on their next network poll.`
           : undefined,
       })
+      onSaved?.()
     },
     onError: (failure, variables: UpdateClusterNetworkRequest) => {
       if (handleSensitiveActionError(failure, () => update.mutate(variables)))

@@ -46,6 +46,8 @@ export interface ClusterNetworkStatus {
   default_compute_pool_cidr: string
   mesh_pool_cidr: string
   mesh_enabled: boolean
+  /** Confirmed by an operator, or in use. Absent on an older server. */
+  pool_confirmed?: boolean
   can_change: boolean
   change_blocked_by: string[]
   control_plane: ClusterNetworkControlPlane

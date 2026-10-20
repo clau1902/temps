@@ -20,6 +20,7 @@ import {
 import { toast } from 'sonner'
 import {
   adminListNodesOptions,
+  mintEnrollmentTokenMutation,
   nodePairingCancelMutation,
   nodePairingCreateMutation,
   nodePairingListOptions,
@@ -440,14 +441,7 @@ function UrlJoin({
   urlReachable: boolean
 }) {
   if (offersOutboundJoin(mesh, url)) {
-    return (
-      <OutboundJoin
-        mesh={mesh}
-        url={url}
-        token={token}
-        missingToken={missingToken}
-      />
-    )
+    return <OutboundJoin mesh={mesh} url={url} />
   }
   const httpsOnlyMissing =
     urlReachable &&
@@ -558,6 +552,74 @@ function UrlJoin({
 }
 
 /**
+ * The outbound join takes a per-node enrollment token, never the shared join
+ * token (the server refuses it there: it has no use count). Each command
+ * carries a fresh single-use token that expires in an hour.
+ */
+function OutboundJoinCommand({ url }: { url: string }) {
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+  const mint = useMutation({
+    ...mintEnrollmentTokenMutation(),
+    onError: (error, variables) => {
+      if (handleSensitiveActionError(error, () => mint.mutate(variables)))
+        return
+      toast.error('Could not create the join command', {
+        description: problemDetail(error, 'Try again.'),
+      })
+    },
+  })
+  const create = () =>
+    mint.mutate({ body: { max_uses: 1, ttl_secs: ENROLLMENT_TOKEN_TTL_SECS } })
+  if (!mint.data) {
+    return (
+      <div className="mt-1 space-y-2 rounded-md border bg-background p-3">
+        <p>
+          The command carries a single-use enrollment token for one worker. It
+          expires in an hour and is shown once.
+        </p>
+        <Button
+          type="button"
+          size="sm"
+          onClick={create}
+          disabled={mint.isPending}
+        >
+          {mint.isPending ? (
+            <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+          ) : (
+            <Key className="mr-1 h-4 w-4" />
+          )}
+          Create join command
+        </Button>
+        {verificationDialog}
+      </div>
+    )
+  }
+  return (
+    <>
+      <CommandLine command={outboundJoinCommand(url, mint.data.token)} />
+      <p className="mt-1 text-xs">
+        Shown once. The token registers one worker and expires{' '}
+        <TimeAgo date={mint.data.expires_at} />.{' '}
+        <Button
+          type="button"
+          variant="link"
+          size="sm"
+          className="h-auto p-0 text-xs"
+          onClick={create}
+          disabled={mint.isPending}
+        >
+          Create another
+        </Button>
+      </p>
+      {verificationDialog}
+    </>
+  )
+}
+
+const ENROLLMENT_TOKEN_TTL_SECS = 3600
+
+/**
  * The worker joins with no public address (ADR 055): it sends its WireGuard
  * key over HTTPS and dials this server, so only this server's mesh port has
  * to be open.
@@ -565,13 +627,9 @@ function UrlJoin({
 function OutboundJoin({
   mesh,
   url,
-  token,
-  missingToken,
 }: {
   mesh: WireguardMeshStatusResponse
   url: string
-  token: string | null
-  missingToken?: MissingJoinToken
 }) {
   const port = controlPlaneMeshPort(mesh)
   const peers = outboundPeerReach(mesh.hub)
@@ -594,19 +652,12 @@ function OutboundJoin({
         <CommandLine command={INSTALL_COMMAND} />
       </Step>
       <Step number={3} title="Join the cluster, as root">
-        {missingToken ? (
-          <GenerateTokenFirst missing={missingToken} />
-        ) : (
-          <>
-            <CommandLine command={outboundJoinCommand(url, token)} />
-            <p className="mt-1 text-xs">
-              The worker sends its WireGuard key to this server over HTTPS,
-              brings the mesh up by dialing{' '}
-              <code>{mesh.control_plane?.endpoint}</code> and registers under
-              its mesh address. It needs no public IP.
-            </p>
-          </>
-        )}
+        <OutboundJoinCommand url={url} />
+        <p className="mt-1 text-xs">
+          The worker sends its WireGuard key to this server over HTTPS, brings
+          the mesh up by dialing <code>{mesh.control_plane?.endpoint}</code> and
+          registers under its mesh address. It needs no public IP.
+        </p>
       </Step>
       <Step number={4} title="Start the agent, as root">
         <CommandLine command={AGENT_SERVICE_COMMAND} />

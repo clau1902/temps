@@ -20,6 +20,7 @@ pub mod m20261017_000002_runtime_health;
 mod m20261019_000001_mfa_verification_guards;
 mod m20261020_000001_node_pairings_outbound;
 mod m20261020_000002_compute_pool_collisions;
+mod m20261020_000003_compute_pool_confirmed;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -775,6 +776,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000001_node_pairings_outbound::Migration),
             // ADR 056: new default compute pool, per-node overlay status.
             Box::new(m20261020_000002_compute_pool_collisions::Migration),
+            // ADR 056: the console asks for the pool once before the first node.
+            Box::new(m20261020_000003_compute_pool_confirmed::Migration),
         ]
     }
 }

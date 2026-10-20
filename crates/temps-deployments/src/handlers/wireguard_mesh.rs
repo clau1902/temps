@@ -489,6 +489,7 @@ pub(crate) mod admin_test_support {
             node_api_port: None,
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
+            compute_pool_confirmed_at: None,
             updated_at: chrono::Utc::now(),
         }
     }

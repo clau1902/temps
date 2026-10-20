@@ -16,10 +16,15 @@ import {
   nodeOverlayStatus,
   type ClusterNetworkNode,
 } from '@/lib/cluster-network'
-import { CiBuilderPanel } from '@/components/nodes/CiBuilderPanel'
+import { AddWorkerNode } from '@/components/nodes/AddWorkerNode'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
 import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { BuilderLimitsPanel } from '@/components/nodes/BuilderLimitsPanel'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
@@ -86,6 +91,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   Box,
+  ChevronDown,
   Cpu,
   Globe,
   HardDrive,
@@ -94,6 +100,7 @@ import {
   MemoryStick,
   Pause,
   Play,
+  Plus,
   RefreshCw,
   Server,
   Shield,
@@ -1929,6 +1936,9 @@ export function NodesPage() {
   // scale-out; without them nothing can run at all and this page is the
   // onboarding step the operator must complete.
   const needsFirstNode = shouldPromptForFirstWorkerNode(capability, nodeCount)
+  // A cluster with no worker yet opens on adding one; otherwise it is a click.
+  const [addingChosen, setAdding] = useState<boolean | null>(null)
+  const adding = addingChosen ?? nodeCount === 0
 
   // This list polls, so it is the first thing in the console to learn that a
   // worker finished `temps join` (or dropped out). Re-read the capability
@@ -1989,7 +1999,14 @@ export function NodesPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
-          <JoinTokenSection />
+          {adding ? (
+            <AddWorkerNode otherWays={<JoinTokenSection />} />
+          ) : (
+            <Button onClick={() => setAdding(true)}>
+              <Plus className="mr-1 h-4 w-4" />
+              Add a worker node
+            </Button>
+          )}
 
           {stranded.length > 0 && (
             <Alert className="border-amber-500/30 bg-amber-500/5">
@@ -2001,7 +2018,7 @@ export function NodesPage() {
               <AlertDescription className="text-amber-700 dark:text-amber-300">
                 {mesh?.state === 'starting'
                   ? 'They move onto the WireGuard mesh as soon as it is up.'
-                  : 'Without the WireGuard mesh they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Enable it under “Over the internet” above.'}
+                  : 'Without the private network they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Turn it on under “Add a worker node” above.'}
               </AlertDescription>
             </Alert>
           )}
@@ -2058,17 +2075,24 @@ export function NodesPage() {
         </CardContent>
       </Card>
 
-      <MeshHubCard
-        mesh={mesh}
-        isLoading={meshLoading}
-        error={meshError}
-        onRetry={() => void refetchMesh()}
-        retrying={meshFetching}
-      />
-      <CiBuilderPanel />
-      <ClusterNetworkCard />
-      <ClusterDnsCard />
-      <ClusterTrustCard />
+      <Collapsible>
+        <CollapsibleTrigger className="group inline-flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
+          <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
+          Advanced: mesh hub, cluster network, DNS and trust
+        </CollapsibleTrigger>
+        <CollapsibleContent className="mt-6 space-y-6">
+          <MeshHubCard
+            mesh={mesh}
+            isLoading={meshLoading}
+            error={meshError}
+            onRetry={() => void refetchMesh()}
+            retrying={meshFetching}
+          />
+          <ClusterNetworkCard />
+          <ClusterDnsCard />
+          <ClusterTrustCard />
+        </CollapsibleContent>
+      </Collapsible>
     </div>
   )
 }

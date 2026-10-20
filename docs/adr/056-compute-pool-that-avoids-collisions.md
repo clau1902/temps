@@ -196,3 +196,23 @@ Where the implementation differs from, or decides beyond, the text above:
 - **Native transport.** Peer routes a native-transport overlay installs on the
   underlay device are left out of the occupied report (they are Temps'
   own); the on-node preflight is unchanged.
+
+## Amendment 1 — confirm the pool once, from the Worker Nodes page (2026-10-20)
+
+The pool can no longer change in place after a node uses it, and the
+default can collide with a range the operator's servers or VPN already use.
+So the console asks for it once, before it offers to add the first worker:
+
+- `network_config.compute_pool_confirmed_at` records the first confirmation.
+  Saving the pool through `PUT /settings/cluster-network`, changed or not, is
+  the confirmation. Clusters that already have a node, or whose control plane
+  already holds a subnet, are backfilled as confirmed.
+- `GET /settings/cluster-network` reports `pool_confirmed`: confirmed, or in
+  use by any member.
+- The Worker Nodes page leads with three steps: confirm the container address
+  range (or choose another), turn on the private network in one click, and
+  copy one command that installs Temps, joins with a single-use enrollment
+  token and starts the agent. Every other way to add a node, and the mesh hub,
+  cluster network, DNS and trust cards, sit behind collapsed sections.
+- Only the console reads the flag. `temps join`, pairing and SSH enrollment
+  never check it, so scripted joins and existing installs are unaffected.

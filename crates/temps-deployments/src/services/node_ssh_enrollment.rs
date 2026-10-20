@@ -1212,6 +1212,7 @@ mod tests {
             node_api_port: None,
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
+            compute_pool_confirmed_at: None,
             updated_at: chrono::Utc::now(),
         }
     }

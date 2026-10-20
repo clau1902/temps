@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use ipnet::Ipv4Net;
-use sea_orm::{DatabaseConnection, EntityTrait, QueryOrder};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use serde::Serialize;
 use temps_entities::{network_config, nodes};
 use temps_network::allocator::{AllocatorError, PoolChange, PostgresAllocator};
@@ -73,6 +73,9 @@ pub struct ClusterNetworkStatus {
     /// The WireGuard mesh pool; a compute pool may not overlap it.
     pub mesh_pool_cidr: String,
     pub mesh_enabled: bool,
+    /// Whether an operator has confirmed the pool, or a member already uses
+    /// it. The console asks for it once before adding the first node.
+    pub pool_confirmed: bool,
     /// Whether `PUT` can change the pool now.
     pub can_change: bool,
     /// Why it cannot: the members using the pool, or a control-plane setup
@@ -144,9 +147,26 @@ impl ClusterNetworkService {
                 reason: format!("host bits are set; did you mean {}?", pool.trunc()),
             });
         }
-        Ok(PostgresAllocator::new(self.db.clone())
+        let change = PostgresAllocator::new(self.db.clone())
             .configure_pool(pool, subnet_prefix_len)
-            .await?)
+            .await?;
+        self.confirm_pool().await?;
+        Ok(change)
+    }
+
+    /// Record that an operator chose the pool. Saving it, changed or not, is
+    /// the confirmation; the first one is kept.
+    async fn confirm_pool(&self) -> Result<(), ClusterNetworkError> {
+        network_config::Entity::update_many()
+            .col_expr(
+                network_config::Column::ComputePoolConfirmedAt,
+                sea_orm::sea_query::Expr::current_timestamp().into(),
+            )
+            .filter(network_config::Column::Id.eq(1))
+            .filter(network_config::Column::ComputePoolConfirmedAt.is_null())
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
     }
 }
 
@@ -208,6 +228,7 @@ pub(crate) fn status_of(
         default_compute_pool_cidr: network_config::DEFAULT_COMPUTE_POOL_CIDR.to_owned(),
         mesh_pool_cidr: cfg.wireguard_cidr.clone(),
         mesh_enabled: cfg.wireguard_enabled,
+        pool_confirmed: cfg.compute_pool_confirmed_at.is_some() || !change_blocked_by.is_empty(),
         can_change: change_blocked_by.is_empty(),
         change_blocked_by,
         control_plane: ClusterNetworkControlPlane {
