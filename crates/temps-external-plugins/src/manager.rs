@@ -1330,7 +1330,12 @@ mod tests {
         }; 2];
         // SAFETY: valid, correctly sized buffers for capability version 3.
         unsafe {
-            if libc::syscall(libc::SYS_capget, &header as *const Header, data.as_mut_ptr()) != 0 {
+            if libc::syscall(
+                libc::SYS_capget,
+                &header as *const Header,
+                data.as_mut_ptr(),
+            ) != 0
+            {
                 return false;
             }
             data[0].inheritable |= 1 << NET_ADMIN;

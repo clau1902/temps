@@ -1057,7 +1057,9 @@ pub async fn build_in_container(
     }
     let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
     if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(run("the container engine returned an invalid container identifier".into()));
+        return Err(run(
+            "the container engine returned an invalid container identifier".into(),
+        ));
     }
     let result = async {
         let start = Command::new(runtime.program())
@@ -1292,7 +1294,10 @@ mod tests {
         // Only the image differs: every limit and hardening flag is shared.
         assert_eq!(docker.len(), podman.len());
         let strip = |args: &[String]| -> Vec<String> {
-            args.iter().filter(|arg| !arg.ends_with(BUILDER_IMAGE)).cloned().collect()
+            args.iter()
+                .filter(|arg| !arg.ends_with(BUILDER_IMAGE))
+                .cloned()
+                .collect()
         };
         assert_eq!(strip(&docker), strip(&podman));
     }
