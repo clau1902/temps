@@ -39,7 +39,7 @@ use temps_entities::oidc_role_mappings;
 use temps_entities::types::RoleType;
 use temps_entities::users;
 
-const LOGIN_STATE_TTL_MINUTES: i64 = 10;
+pub(crate) const LOGIN_STATE_TTL_MINUTES: i64 = 10;
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// Hard cap on how long an OIDC discovery or token-exchange round-trip
 /// can take. openidconnect 4.x lets us own the `reqwest::Client`, so
@@ -208,6 +208,10 @@ pub struct OidcService {
 
 pub struct OidcLoginStart {
     pub authorize_url: String,
+    /// The `state` value sent to the issuer. The handler ties it to the
+    /// browser that started the login, so the callback can refuse a link that
+    /// another browser started.
+    pub state: String,
 }
 
 pub struct OidcLoginState {
@@ -1103,6 +1107,7 @@ impl OidcService {
 
         Ok(OidcLoginStart {
             authorize_url: authorize_url.to_string(),
+            state: csrf_token.secret().clone(),
         })
     }
 
