@@ -3470,15 +3470,40 @@ mod tests {
                         });
                         assert_eq!(tag, Some(mode));
                     }
-                    assert!(new_events.iter().any(|event| {
-                        let raw = &event.data.as_ref().unwrap()["sentry"];
-                        let source_message = raw["logentry"]["formatted"]
-                            .as_str()
-                            .or_else(|| raw["message"].as_str());
-                        event.exception_type == "Message"
-                            && event.exception_value.as_deref() == Some("Synthetic SDK message")
-                            && source_message == Some("Synthetic SDK message")
-                    }));
+                    let message_event = new_events
+                        .iter()
+                        .find(|event| {
+                            event.exception_value.as_deref() == Some("Synthetic SDK message")
+                        })
+                        .expect("the SDK message must be queryable as a native event");
+                    let raw_message = &message_event.data.as_ref().unwrap()["sentry"];
+                    assert_eq!(raw_message["message"], "Synthetic SDK message");
+                    let source_exception = raw_message["exception"]["values"]
+                        .as_array()
+                        .and_then(|values| values.last());
+                    // Node 11 attaches an untyped synthetic exception/stack to
+                    // captureMessage by default. Native mapping preserves that
+                    // exception as Error; a message without exceptions is Message.
+                    let expected_type = source_exception
+                        .map(|exception| exception["type"].as_str().unwrap_or("Error"))
+                        .unwrap_or("Message");
+                    assert_eq!(message_event.exception_type, expected_type);
+                    if let Some(exception) = source_exception {
+                        assert_eq!(exception["mechanism"]["synthetic"], true);
+                        assert!(exception["stacktrace"]["frames"]
+                            .as_array()
+                            .is_some_and(|frames| !frames.is_empty()));
+                        let native_frames = message_event.data.as_ref().unwrap()["stack_trace"]
+                            .as_array()
+                            .expect("the synthetic capture stack must reach native details");
+                        let source_frames = exception["stacktrace"]["frames"].as_array().unwrap();
+                        assert_eq!(native_frames.len(), source_frames.len());
+                        for (native, source) in native_frames.iter().zip(source_frames) {
+                            for field in ["filename", "function", "lineno", "colno", "abs_path"] {
+                                assert_eq!(native[field], source[field]);
+                            }
+                        }
+                    }
                     for event in exceptions {
                         assert_eq!(
                             event.exception_value.as_deref(),
