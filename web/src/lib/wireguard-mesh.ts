@@ -51,9 +51,10 @@ export function outboundJoinCommand(url: string, token: string | null): string {
 
 /**
  * Whether to offer the outbound-only join (ADR 055): the worker must reach
- * the join URL and dial this server's mesh endpoint, so both have to be
- * reachable from the internet. Otherwise the page keeps the joins that
- * need a worker address.
+ * the join URL over HTTPS (`temps join` refuses plain HTTP there, because
+ * the answer is what the worker trusts from then on) and dial this server's
+ * mesh endpoint, so both have to be reachable from the internet. Otherwise
+ * the page keeps the joins that need a worker address.
  */
 export function offersOutboundJoin(
   mesh: Pick<WireguardMeshStatusResponse, 'control_plane'> | undefined,
@@ -61,10 +62,35 @@ export function offersOutboundJoin(
 ): boolean {
   const controlPlane = mesh?.control_plane
   return (
+    joinUrlIsHttps(url) &&
     joinUrlReachableFromOutside(url) &&
     !!controlPlane?.endpoint?.trim() &&
     !controlPlane.endpoint_is_private
   )
+}
+
+/** Whether `url` is an `https://` URL. */
+export function joinUrlIsHttps(url: string): boolean {
+  try {
+    return new URL(url).protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * How other workers reach a worker that joined outbound only (it publishes
+ * no endpoint): through the mesh hub when one is chosen, otherwise not at
+ * all until one is (ADR 048 D4).
+ */
+export function outboundPeerReach(
+  hub: Pick<WireguardMeshStatusResponse, 'hub'>['hub']
+): { via: string } | { needsHub: true } {
+  const target = hub?.target
+  if (!target || target.kind === 'none') return { needsHub: true }
+  return {
+    via: target.kind === 'control_plane' ? 'this server' : hub.name,
+  }
 }
 
 /**

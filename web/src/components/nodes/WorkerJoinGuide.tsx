@@ -72,11 +72,13 @@ import {
   defaultJoinPath,
   joinCommand,
   joinUrl,
+  joinUrlIsHttps,
   joinUrlReachableFromOutside,
   meshConnectionLabel,
   meshProblems,
   offersOutboundJoin,
   outboundJoinCommand,
+  outboundPeerReach,
   pairingAsOf,
   pairingEnded,
   pairingProgress,
@@ -447,8 +449,30 @@ function UrlJoin({
       />
     )
   }
+  const httpsOnlyMissing =
+    urlReachable &&
+    !joinUrlIsHttps(url) &&
+    !!mesh.control_plane?.endpoint?.trim() &&
+    !mesh.control_plane.endpoint_is_private
   return (
     <>
+      {httpsOnlyMissing && (
+        <Alert className="border-amber-500/30 bg-amber-500/5">
+          <AlertTriangle className="h-4 w-4 text-amber-500" />
+          <AlertTitle className="text-amber-700 dark:text-amber-400">
+            Joining without a worker address needs HTTPS
+          </AlertTitle>
+          <AlertDescription className="text-amber-700 dark:text-amber-300">
+            {url} is plain HTTP. A worker that joins with no address trusts what
+            this server answers, so <code>temps join</code> only does it over
+            HTTPS.{' '}
+            <Link to="/settings" className="font-medium underline">
+              Set an https:// external URL
+            </Link>{' '}
+            to join workers with no public IP; until then, use the steps below.
+          </AlertDescription>
+        </Alert>
+      )}
       {!urlReachable && (
         <Alert className="border-amber-500/30 bg-amber-500/5">
           <AlertTriangle className="h-4 w-4 text-amber-500" />
@@ -550,6 +574,7 @@ function OutboundJoin({
   missingToken?: MissingJoinToken
 }) {
   const port = controlPlaneMeshPort(mesh)
+  const peers = outboundPeerReach(mesh.hub)
   return (
     <>
       <Step number={1} title="Open the mesh port on this server">
@@ -586,9 +611,20 @@ function OutboundJoin({
       <Step number={4} title="Start the agent, as root">
         <CommandLine command={AGENT_SERVICE_COMMAND} />
         <p className="mt-1 text-xs">
-          The worker shows as Connected below within a minute. {WITHOUT_SYSTEMD}{' '}
-          Other workers reach it through this server; to let them connect to it
-          directly, start it with{' '}
+          The worker shows as Connected below within a minute. {WITHOUT_SYSTEMD}
+        </p>
+        <p className="mt-1 text-xs">
+          {'via' in peers ? (
+            <>Other workers reach it through {peers.via}, the mesh hub.</>
+          ) : (
+            <>
+              With more than one worker joined this way, choose a hub in{' '}
+              <strong>Mesh hub</strong> on this page (this server is the usual
+              choice, since every such worker reaches it); without one, these
+              workers cannot reach each other.
+            </>
+          )}{' '}
+          To let other workers connect to it directly instead, start it with{' '}
           <code>
             temps agent --wg-endpoint &lt;public-ip&gt;:{mesh.listen_port}
           </code>{' '}

@@ -18,10 +18,12 @@ import {
   hubOptionValue,
   hubTargetFromOption,
   linksNeedingAttention,
+  joinUrlIsHttps,
   joinUrlReachableFromOutside,
   meshProblems,
   offersOutboundJoin,
   outboundJoinCommand,
+  outboundPeerReach,
   pairingProgress,
   pendingPairings,
   joinCommand,
@@ -159,6 +161,37 @@ describe('outbound join', () => {
         'https://app.localho.st'
       )
     ).toBe(false)
+  })
+
+  test('is not offered over plain HTTP, which `temps join` refuses', () => {
+    expect(
+      offersOutboundJoin(
+        mesh({ control_plane: dialable }),
+        'http://temps.example.com'
+      )
+    ).toBe(false)
+    expect(joinUrlIsHttps('https://temps.example.com')).toBe(true)
+    expect(joinUrlIsHttps('http://temps.example.com')).toBe(false)
+    expect(joinUrlIsHttps('not a url')).toBe(false)
+  })
+
+  test('other workers reach it only through a chosen hub', () => {
+    expect(outboundPeerReach(null)).toEqual({ needsHub: true })
+    expect(
+      outboundPeerReach({ name: 'none', target: { kind: 'none' } })
+    ).toEqual({ needsHub: true })
+    expect(
+      outboundPeerReach({
+        name: 'control-plane',
+        target: { kind: 'control_plane' },
+      })
+    ).toEqual({ via: 'this server' })
+    expect(
+      outboundPeerReach({
+        name: 'edge-1',
+        target: { kind: 'node', node_id: 3 },
+      })
+    ).toEqual({ via: 'edge-1' })
   })
 })
 

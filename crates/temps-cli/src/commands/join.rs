@@ -364,8 +364,15 @@ fn outbound_enroll_client(enroll_url: &str) -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .https_only(!loopback)
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(OUTBOUND_ENROLL_CONNECT_TIMEOUT)
+        .timeout(OUTBOUND_ENROLL_TIMEOUT)
         .build()?)
 }
+
+/// Bounds on the outbound enrollment request: a control plane that accepts
+/// the connection but never answers must not hold `temps join` forever.
+const OUTBOUND_ENROLL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const OUTBOUND_ENROLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A client for the control plane that trusts only the cluster CA in
 /// `ca_der` and verifies the control plane by its reserved name
@@ -1255,10 +1262,21 @@ impl JoinCommand {
             .send()
             .await
             .map_err(|error| {
-                anyhow::anyhow!(
-                    "Could not reach the control plane at {enroll_url}: {error}. Check the URL \
-                     and that this machine can reach it over HTTPS."
-                )
+                if error.is_timeout() {
+                    anyhow::anyhow!(
+                        "The control plane at {enroll_url} did not answer within {}s. No \
+                         network was set up on this machine. Check that the control plane is \
+                         up, then re-run `temps join`; if the token is refused as already used, \
+                         create a new one in Worker Nodes → Add node. A pending enrollment \
+                         from this machine is resumed, not duplicated.",
+                        OUTBOUND_ENROLL_TIMEOUT.as_secs()
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "Could not reach the control plane at {enroll_url}: {error}. Check the \
+                         URL and that this machine can reach it over HTTPS."
+                    )
+                }
             })?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {

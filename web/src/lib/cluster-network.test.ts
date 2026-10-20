@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  clusterNetworkFormSchema,
   nodeOverlayStatus,
   validatePoolInput,
   type ClusterNetworkNode,
@@ -37,6 +38,29 @@ describe('validatePoolInput', () => {
     expect(validatePoolInput('10.202.0.0/16', '16')).toContain('longer')
     expect(validatePoolInput('10.202.0.0/16', '31')).toContain('up to 30')
     expect(validatePoolInput('10.202.0.0/16', 'x')).toContain('up to 30')
+  })
+})
+
+describe('clusterNetworkFormSchema', () => {
+  test('puts each problem on the field it is about', () => {
+    expect(
+      clusterNetworkFormSchema.safeParse({
+        poolCidr: '10.202.0.0/16',
+        nodePrefix: '24',
+      }).success
+    ).toBe(true)
+    const pool = clusterNetworkFormSchema.safeParse({
+      poolCidr: '8.8.0.0/16',
+      nodePrefix: '24',
+    })
+    expect(pool.success).toBe(false)
+    expect(pool.error?.issues[0].path).toEqual(['poolCidr'])
+    expect(pool.error?.issues[0].message).toContain('RFC 1918')
+    const prefix = clusterNetworkFormSchema.safeParse({
+      poolCidr: '10.202.0.0/16',
+      nodePrefix: '16',
+    })
+    expect(prefix.error?.issues[0].path).toEqual(['nodePrefix'])
   })
 })
 

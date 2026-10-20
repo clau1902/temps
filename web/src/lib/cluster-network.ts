@@ -11,6 +11,7 @@
  * server) picks the endpoint up; the calls still go through the generated
  * client instance, so base URL, auth and error handling are the SDK's.
  */
+import { z } from 'zod'
 import { client } from '@/api/client/client.gen'
 
 export interface OccupiedRange {
@@ -102,20 +103,38 @@ export async function updateClusterNetwork(
 
 const IPV4_CIDR = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/
 
+/** A form field and what is wrong with it. */
+export interface PoolInputIssue {
+  field: 'poolCidr' | 'nodePrefix'
+  message: string
+}
+
 /**
- * Check the form before sending it, with the message the operator needs.
- * The server repeats every check and adds the ones that need the cluster
- * (mesh pool, node addresses, occupied ranges, allocations in use).
+ * Check the form before sending it, with the message the operator needs and
+ * the field it is about. The server repeats every check and adds the ones
+ * that need the cluster (mesh pool, node addresses, occupied ranges,
+ * allocations in use).
  */
-export function validatePoolInput(pool: string, prefix: string): string | null {
+export function poolInputIssue(
+  pool: string,
+  prefix: string
+): PoolInputIssue | null {
+  const onPool = (message: string): PoolInputIssue => ({
+    field: 'poolCidr',
+    message,
+  })
+  const onPrefix = (message: string): PoolInputIssue => ({
+    field: 'nodePrefix',
+    message,
+  })
   const match = IPV4_CIDR.exec(pool.trim())
   if (!match) {
-    return 'Enter an IPv4 network such as 10.202.0.0/16.'
+    return onPool('Enter an IPv4 network such as 10.202.0.0/16.')
   }
   const octets = match.slice(1, 5).map(Number)
   const poolLen = Number(match[5])
   if (octets.some((octet) => octet > 255) || poolLen > 32) {
-    return 'Enter an IPv4 network such as 10.202.0.0/16.'
+    return onPool('Enter an IPv4 network such as 10.202.0.0/16.')
   }
   const [a, b] = octets
   const private1918 =
@@ -123,23 +142,52 @@ export function validatePoolInput(pool: string, prefix: string): string | null {
     (a === 172 && b >= 16 && b <= 31 && poolLen >= 12) ||
     (a === 192 && b === 168 && poolLen >= 16)
   if (!private1918) {
-    return 'The pool must be private (RFC 1918) address space: inside 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16.'
+    return onPool(
+      'The pool must be private (RFC 1918) address space: inside 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16.'
+    )
   }
   const address =
     ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0
   const mask = poolLen === 0 ? 0 : (0xffffffff << (32 - poolLen)) >>> 0
   if ((address & mask) >>> 0 !== address) {
-    return 'Host bits are set: use the network address of the range (for example 10.202.0.0/16).'
+    return onPool(
+      'Host bits are set: use the network address of the range (for example 10.202.0.0/16).'
+    )
   }
   const nodePrefix = Number(prefix)
   if (!/^\d{1,2}$/.test(prefix.trim()) || nodePrefix > 30) {
-    return 'The per-node prefix must be a number up to 30, such as 24.'
+    return onPrefix(
+      'The per-node prefix must be a number up to 30, such as 24.'
+    )
   }
   if (nodePrefix <= poolLen) {
-    return `The per-node prefix must be longer than the pool's /${poolLen}, such as /24.`
+    return onPrefix(
+      `The per-node prefix must be longer than the pool's /${poolLen}, such as /24.`
+    )
   }
   return null
 }
+
+/** {@link poolInputIssue}'s message alone. */
+export function validatePoolInput(pool: string, prefix: string): string | null {
+  return poolInputIssue(pool, prefix)?.message ?? null
+}
+
+/** The Cluster network form's fields, as typed. */
+export const clusterNetworkFormSchema = z
+  .object({ poolCidr: z.string(), nodePrefix: z.string() })
+  .superRefine((values, ctx) => {
+    const issue = poolInputIssue(values.poolCidr, values.nodePrefix)
+    if (issue) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [issue.field],
+        message: issue.message,
+      })
+    }
+  })
+
+export type ClusterNetworkFormValues = z.infer<typeof clusterNetworkFormSchema>
 
 export interface OverlayStatusView {
   label: string

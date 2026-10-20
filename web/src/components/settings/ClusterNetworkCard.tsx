@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, LockKeyhole, Network } from 'lucide-react'
-import { useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -25,9 +26,10 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { problemDetail } from '@/lib/api-problem'
 import { buildMultiNodeSetupCommand } from '@/lib/cluster-network-command'
 import {
+  clusterNetworkFormSchema,
   clusterNetworkQueryKey,
   updateClusterNetwork,
-  validatePoolInput,
+  type ClusterNetworkFormValues,
   type ClusterNetworkStatus,
   type UpdateClusterNetworkRequest,
 } from '@/lib/cluster-network'
@@ -76,8 +78,18 @@ export function ClusterNetworkCard() {
 
 function ClusterNetworkForm({ status }: { status: ClusterNetworkStatus }) {
   const queryClient = useQueryClient()
-  const [poolCidr, setPoolCidr] = useState(status.compute_pool_cidr)
-  const [nodePrefix, setNodePrefix] = useState(String(status.subnet_prefix_len))
+  const form = useForm<ClusterNetworkFormValues>({
+    resolver: zodResolver(clusterNetworkFormSchema),
+    mode: 'onChange',
+    defaultValues: {
+      poolCidr: status.compute_pool_cidr,
+      nodePrefix: String(status.subnet_prefix_len),
+    },
+  })
+  const [poolCidr, nodePrefix] = useWatch({
+    control: form.control,
+    name: ['poolCidr', 'nodePrefix'],
+  })
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -103,7 +115,10 @@ function ClusterNetworkForm({ status }: { status: ClusterNetworkStatus }) {
   const unchanged =
     poolCidr.trim() === status.compute_pool_cidr &&
     nodePrefix.trim() === String(status.subnet_prefix_len)
-  const inputError = unchanged ? null : validatePoolInput(poolCidr, nodePrefix)
+  const { errors } = form.formState
+  const inputError = unchanged
+    ? null
+    : (errors.poolCidr?.message ?? errors.nodePrefix?.message ?? null)
   const locked = !status.can_change
   const setupFailure = status.control_plane.setup_failure
 
@@ -123,26 +138,24 @@ function ClusterNetworkForm({ status }: { status: ClusterNetworkStatus }) {
 
       <form
         className="space-y-4"
-        onSubmit={(event) => {
-          event.preventDefault()
-          if (locked || unchanged || inputError) return
+        onSubmit={form.handleSubmit((values) => {
+          if (locked || unchanged) return
           update.mutate({
-            compute_pool_cidr: poolCidr.trim(),
-            subnet_prefix_len: Number(nodePrefix),
+            compute_pool_cidr: values.poolCidr.trim(),
+            subnet_prefix_len: Number(values.nodePrefix),
           })
-        }}
+        })}
       >
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
             <Label htmlFor="cluster-compute-pool">Pool CIDR</Label>
             <Input
               id="cluster-compute-pool"
-              value={poolCidr}
+              {...form.register('poolCidr')}
               disabled={locked || update.isPending}
-              onChange={(event) => setPoolCidr(event.target.value)}
               spellCheck={false}
               className="font-mono"
-              aria-invalid={inputError !== null}
+              aria-invalid={!unchanged && !!errors.poolCidr}
               aria-describedby="cluster-compute-pool-help"
             />
           </div>
@@ -150,12 +163,11 @@ function ClusterNetworkForm({ status }: { status: ClusterNetworkStatus }) {
             <Label htmlFor="cluster-node-prefix">Per-node prefix</Label>
             <Input
               id="cluster-node-prefix"
-              value={nodePrefix}
+              {...form.register('nodePrefix')}
               disabled={locked || update.isPending}
-              onChange={(event) => setNodePrefix(event.target.value)}
               inputMode="numeric"
               className="font-mono"
-              aria-invalid={inputError !== null}
+              aria-invalid={!unchanged && !!errors.nodePrefix}
               aria-describedby="cluster-compute-pool-help"
             />
           </div>
@@ -219,7 +231,7 @@ function ClusterNetworkForm({ status }: { status: ClusterNetworkStatus }) {
         )}
       </form>
 
-      {!locked && !unchanged && inputError === null && (
+      {!locked && !unchanged && form.formState.isValid && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span>Or on the control-plane host:</span>
           <code className="min-w-0 truncate">

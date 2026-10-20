@@ -48,8 +48,9 @@ calls `POST {url}/api/internal/nodes/mesh-enroll` with
 `{ name, join_token, wg_public_key, labels }`, trusting public roots. Unlike a
 direct join, the answer is the join's trust anchor (the CA fingerprint the rest
 of the join pins), so the URL must be `https://` (plain HTTP only to a loopback
-address) and redirects are not followed: a redirected POST would re-send the
-token.
+address), redirects are not followed (a redirected POST would re-send the
+token), and the request is bounded (10 s to connect, 30 s in all) so a
+control plane that never answers cannot hold `temps join`.
 
 The control plane:
 
@@ -141,8 +142,11 @@ in `address` / `private_address` as "outside the pool" against it.
 (nothing on the worker), install, `temps join <url> <token>`, `temps agent
 service install`. The worker-side port, the public-IP placeholder and the NAT
 hint go away. The option is offered only when the control plane publishes an
-endpoint and the join URL is reachable; otherwise the page keeps today's
-choices.
+endpoint and the join URL is reachable over `https://`; a public plain-HTTP
+URL is explained (`temps join` refuses it for this mode) and the page keeps
+today's choices. Because such workers publish no endpoint, the guide says
+that a second one needs a mesh hub (ADR-048 D4) to reach the first, or names
+the hub when one is chosen.
 
 ## Security
 
