@@ -83,6 +83,7 @@ fn sample_span(
 ) -> SpanRecord {
     let now = Utc::now();
     SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -125,6 +126,7 @@ fn sample_log(
     trace_id: Option<&str>,
 ) -> LogRecord {
     LogRecord {
+        ingest_identity: None,
         attribute_types: Default::default(),
         project_id,
         deployment_id: None,
@@ -1523,6 +1525,7 @@ async fn test_full_trace_tree_db_roundtrip() {
     let now = Utc::now();
 
     let root = SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -1541,6 +1544,7 @@ async fn test_full_trace_tree_db_roundtrip() {
     };
 
     let child_db = SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -1559,6 +1563,7 @@ async fn test_full_trace_tree_db_roundtrip() {
     };
 
     let child_http = SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),
@@ -1577,6 +1582,7 @@ async fn test_full_trace_tree_db_roundtrip() {
     };
 
     let grandchild = SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: test_resource(),

@@ -876,10 +876,7 @@ impl OtelStorage for TimescaleDbStorage {
         super::global_traces::postgres(self.db.clone(), &query).await
     }
     async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
-        if !points
-            .iter()
-            .any(|r| r.attributes.contains_key(super::receipts::SOURCE_KEY))
-        {
+        if !points.iter().any(|r| r.ingest_identity.is_some()) {
             return self.batch_insert_metrics(self.db.as_ref(), &points).await;
         }
         let tx = self.db.begin().await?;
@@ -888,7 +885,7 @@ impl OtelStorage for TimescaleDbStorage {
             "metrics",
             &points
                 .iter()
-                .map(|r| (r.project_id, &r.attributes))
+                .map(|r| (r.project_id, r.ingest_identity.as_ref()))
                 .collect::<Vec<_>>(),
         )
         .await?;
@@ -904,16 +901,13 @@ impl OtelStorage for TimescaleDbStorage {
         }
 
         let transaction = self.db.begin().await?;
-        let spans = if spans
-            .iter()
-            .any(|r| r.attributes.contains_key(super::receipts::SOURCE_KEY))
-        {
+        let spans = if spans.iter().any(|r| r.ingest_identity.is_some()) {
             let indices = super::receipts::claim(
                 &transaction,
                 "spans",
                 &spans
                     .iter()
-                    .map(|r| (r.project_id, &r.attributes))
+                    .map(|r| (r.project_id, r.ingest_identity.as_ref()))
                     .collect::<Vec<_>>(),
             )
             .await?;
@@ -946,10 +940,7 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
-        if !records
-            .iter()
-            .any(|r| r.attributes.contains_key(super::receipts::SOURCE_KEY))
-        {
+        if !records.iter().any(|r| r.ingest_identity.is_some()) {
             return self.batch_insert_logs(self.db.as_ref(), &records).await;
         }
         let tx = self.db.begin().await?;
@@ -958,7 +949,7 @@ impl OtelStorage for TimescaleDbStorage {
             "logs",
             &records
                 .iter()
-                .map(|r| (r.project_id, &r.attributes))
+                .map(|r| (r.project_id, r.ingest_identity.as_ref()))
                 .collect::<Vec<_>>(),
         )
         .await?;
@@ -4335,6 +4326,7 @@ fn parse_span_row(row: &sea_orm::QueryResult) -> Result<SpanRecord, OtelError> {
     };
 
     Ok(SpanRecord {
+        ingest_identity: None,
         project_id: row.try_get("", "project_id").unwrap_or(0),
         deployment_id: row.try_get("", "deployment_id").ok(),
         resource: ResourceInfo {
@@ -4375,6 +4367,7 @@ fn parse_log_row(row: &sea_orm::QueryResult) -> Result<LogRecord, OtelError> {
     };
 
     Ok(LogRecord {
+        ingest_identity: None,
         attribute_types: serde_json::from_value(
             row.try_get("", "attribute_types").unwrap_or_default(),
         )
@@ -4484,6 +4477,7 @@ mod tests {
         status: SpanStatusCode,
     ) -> SpanRecord {
         SpanRecord {
+            ingest_identity: None,
             project_id,
             deployment_id: Some(7),
             resource: ResourceInfo {

@@ -1022,11 +1022,7 @@ impl OtelService {
         let count = records.len() as u64;
         let unidentified = records
             .iter()
-            .filter(|record| {
-                !record
-                    .attributes
-                    .contains_key(crate::storage::receipts::SOURCE_KEY)
-            })
+            .filter(|record| record.ingest_identity.is_none())
             .count() as u64;
         self.stats.logs_received.fetch_add(count, Ordering::Relaxed);
 
@@ -1423,6 +1419,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn confirmed_logs_use_native_retries_archival_and_failure_accounting() {
         let log = LogRecord {
+            ingest_identity: None,
             attribute_types: Default::default(),
             project_id: 1,
             deployment_id: None,
@@ -1596,6 +1593,7 @@ mod tests {
         let start_time = chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
             .expect("fixed timestamp is in range");
         SpanRecord {
+            ingest_identity: None,
             project_id: 7,
             deployment_id: None,
             resource: ResourceInfo {
@@ -2183,6 +2181,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
+            ingest_identity: None,
             attribute_types: Default::default(),
             project_id: 1,
             deployment_id: None,
@@ -2674,6 +2673,7 @@ mod tests {
 
         // Insert spans with mixed statuses
         let ok_span = SpanRecord {
+            ingest_identity: None,
             project_id: 1,
             deployment_id: None,
             resource: ResourceInfo::default(),
@@ -2725,6 +2725,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
+            ingest_identity: None,
             attribute_types: Default::default(),
             project_id: 1,
             deployment_id: None,
@@ -2976,6 +2977,7 @@ mod tests {
         genai_attrs.insert("gen_ai.usage.input_tokens".to_string(), "100".to_string());
 
         let genai_span = SpanRecord {
+            ingest_identity: None,
             project_id: 1,
             deployment_id: None,
             resource: ResourceInfo::default(),
@@ -3038,6 +3040,7 @@ mod tests {
         attrs.insert("gen_ai.usage.output_tokens".to_string(), "200".to_string());
 
         let span = SpanRecord {
+            ingest_identity: None,
             project_id: 1,
             deployment_id: None,
             resource: ResourceInfo::default(),
@@ -3098,6 +3101,7 @@ mod tests {
 
         for (tid, attrs) in [("new-trace", new_attrs), ("old-trace", old_attrs)] {
             storage.spans.lock().unwrap().push(SpanRecord {
+                ingest_identity: None,
                 project_id: 1,
                 deployment_id: None,
                 resource: ResourceInfo::default(),
@@ -3157,6 +3161,7 @@ mod tests {
                 std::collections::BTreeMap::new()
             };
             storage.spans.lock().unwrap().push(SpanRecord {
+                ingest_identity: None,
                 project_id: 1,
                 deployment_id: None,
                 resource: ResourceInfo::default(),
@@ -3431,6 +3436,7 @@ mod tests {
         // Total batch `count` = 8.  Per-project cloud count = 5.
         let now = chrono::Utc::now();
         let make_span = |project_id: i32, idx: usize| SpanRecord {
+            ingest_identity: None,
             project_id,
             deployment_id: None,
             resource: crate::types::ResourceInfo {

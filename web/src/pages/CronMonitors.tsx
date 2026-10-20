@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState, type FormEvent } from 'react'
+import { useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
 import {
   Link,
   Route,
@@ -18,6 +21,7 @@ import {
   DataTable,
   Detail,
   Field,
+  FormErrors,
   Ledger,
   PageState,
   RecordLink,
@@ -610,6 +614,79 @@ function CronRecord({ project }: { project: ProjectResponse }) {
     </>
   )
 }
+const positiveInteger = (max: number) =>
+  z
+    .string()
+    .refine(
+      (value) =>
+        /^\d+$/.test(value) &&
+        Number.isSafeInteger(Number(value)) &&
+        Number(value) >= 1 &&
+        Number(value) <= max,
+      `Enter a whole number from 1 to ${max}.`
+    )
+const cronFormSchema = z
+  .object({
+    slug: z
+      .string()
+      .regex(
+        /^[A-Za-z0-9_-]{1,128}$/,
+        'Enter 1–128 letters, digits, underscores or hyphens.'
+      ),
+    environment: z
+      .string()
+      .refine(
+        (value) =>
+          value === 'project' ||
+          (/^\d+$/.test(value) &&
+            Number(value) > 0 &&
+            Number(value) <= 2147483647),
+        'Choose a valid environment.'
+      ),
+    kind: z.enum(['crontab', 'interval']),
+    cron: z.string(),
+    interval: z.string(),
+    unit: z.enum(['minute', 'hour', 'day', 'week']),
+    timezone: z
+      .string()
+      .min(1)
+      .max(128)
+      .refine((value) => {
+        try {
+          new Intl.DateTimeFormat('en', { timeZone: value })
+          return true
+        } catch {
+          return false
+        }
+      }, 'Enter a valid IANA timezone.'),
+    margin: positiveInteger(40320),
+    runtime: positiveInteger(40320),
+    failures: positiveInteger(100),
+    recoveries: positiveInteger(100),
+  })
+  .superRefine((values, context) => {
+    if (values.kind === 'interval') {
+      const parsed = positiveInteger(525600).safeParse(values.interval)
+      if (!parsed.success)
+        context.addIssue({
+          code: 'custom',
+          path: ['interval'],
+          message: 'Enter a whole number from 1 to 525600.',
+        })
+    } else if (
+      values.cron.length > 128 ||
+      values.cron.trim().split(/\s+/).length !== 5
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['cron'],
+        message:
+          'Enter a five-field crontab expression of at most 128 characters.',
+      })
+    }
+  })
+type CronFormValues = z.infer<typeof cronFormSchema>
+
 function CronForm({
   project,
   monitor,
@@ -622,37 +699,54 @@ function CronForm({
   const environments = useQuery(
     getEnvironmentsOptions({ path: { project_id: project.id } })
   )
-  const [slug, setSlug] = useState(monitor?.slug ?? '')
-  const [environment, setEnvironment] = useState(
-    String(monitor?.environment_id ?? 'project')
-  )
   const existing = monitor?.config
-  const [kind, setKind] = useState(existing?.schedule.type ?? 'crontab')
-  const [cron, setCron] = useState(
-    existing?.schedule.type === 'crontab'
-      ? existing.schedule.value
-      : '0 * * * *'
-  )
-  const [interval, setInterval] = useState(
-    existing?.schedule.type === 'interval'
-      ? String(existing.schedule.value)
-      : '1'
-  )
-  const [unit, setUnit] = useState(
-    existing?.schedule.type === 'interval' ? existing.schedule.unit : 'hour'
-  )
-  const [timezone, setTimezone] = useState(existing?.timezone ?? 'UTC')
-  const [margin, setMargin] = useState(String(existing?.checkin_margin ?? 1))
-  const [runtime, setRuntime] = useState(String(existing?.max_runtime ?? 30))
-  const [failures, setFailures] = useState(
-    String(existing?.failure_issue_threshold ?? 1)
-  )
-  const [recoveries, setRecoveries] = useState(
-    String(existing?.recovery_threshold ?? 1)
-  )
-  const [error, setError] = useState<string>()
+  const form = useForm<CronFormValues>({
+    resolver: zodResolver(cronFormSchema),
+    defaultValues: {
+      slug: monitor?.slug ?? '',
+      environment: String(monitor?.environment_id ?? 'project'),
+      kind: existing?.schedule.type ?? 'crontab',
+      cron:
+        existing?.schedule.type === 'crontab'
+          ? existing.schedule.value
+          : '0 * * * *',
+      interval:
+        existing?.schedule.type === 'interval'
+          ? String(existing.schedule.value)
+          : '1',
+      unit:
+        existing?.schedule.type === 'interval'
+          ? (existing.schedule.unit as CronFormValues['unit'])
+          : 'hour',
+      timezone: existing?.timezone ?? 'UTC',
+      margin: String(existing?.checkin_margin ?? 1),
+      runtime: String(existing?.max_runtime ?? 30),
+      failures: String(existing?.failure_issue_threshold ?? 1),
+      recoveries: String(existing?.recovery_threshold ?? 1),
+    },
+  })
+  const [kind, environment, unit] = useWatch({
+    control: form.control,
+    name: ['kind', 'environment', 'unit'],
+  })
+  const error = form.formState.errors.root?.server?.message
   const save = useMutation({
-    mutationFn: async (config: MonitorConfig) => {
+    mutationFn: async (values: CronFormValues) => {
+      const config: MonitorConfig = {
+        schedule:
+          values.kind === 'crontab'
+            ? { type: 'crontab', value: values.cron }
+            : {
+                type: 'interval',
+                value: Number(values.interval),
+                unit: values.unit,
+              },
+        timezone: values.timezone,
+        checkin_margin: Number(values.margin),
+        max_runtime: Number(values.runtime),
+        failure_issue_threshold: Number(values.failures),
+        recovery_threshold: Number(values.recoveries),
+      }
       if (monitor) {
         const result = await updateCronMonitor({
           path: { project_id: project.id, monitor_id: monitor.id },
@@ -664,9 +758,11 @@ function CronForm({
       const result = await createCronMonitor({
         path: { project_id: project.id },
         body: {
-          slug,
+          slug: values.slug,
           environment_id:
-            environment === 'project' ? null : Number(environment),
+            values.environment === 'project'
+              ? null
+              : Number(values.environment),
           config,
         },
         throwOnError: true,
@@ -686,48 +782,18 @@ function CronForm({
       )
       navigate(`${basePath(project)}/${data.id}`)
     },
-    onError: (e) => setError(failure(e)),
+    onError: (e) => form.setError('root.server', { message: failure(e) }),
   })
-  function submit(event: FormEvent) {
-    event.preventDefault()
-    setError(undefined)
-    const values = [
-      margin,
-      runtime,
-      failures,
-      recoveries,
-      ...(kind === 'interval' ? [interval] : []),
-    ]
-    if (
-      values.some(
-        (v) =>
-          !/^\d+$/.test(v) || !Number.isSafeInteger(Number(v)) || Number(v) < 1
-      )
-    ) {
-      setError(
-        'Limits, thresholds, and intervals must be positive whole numbers.'
-      )
-      return
-    }
-    save.mutate({
-      schedule:
-        kind === 'crontab'
-          ? { type: 'crontab', value: cron }
-          : { type: 'interval', value: Number(interval), unit },
-      timezone,
-      checkin_margin: Number(margin),
-      max_runtime: Number(runtime),
-      failure_issue_threshold: Number(failures),
-      recovery_threshold: Number(recoveries),
-    })
-  }
+  const submit = form.handleSubmit((values) => {
+    form.clearErrors('root')
+    save.mutate(values)
+  })
   const numeric = (
     label: string,
-    value: string,
-    setter: (v: string) => void,
+    name: 'margin' | 'runtime' | 'failures' | 'recoveries' | 'interval',
     max: number
   ) => (
-    <Field label={label}>
+    <Field label={label} error={form.formState.errors[name]?.message}>
       {(props) => (
         <Input
           {...props}
@@ -736,8 +802,7 @@ function CronForm({
           max={max}
           step={1}
           required
-          value={value}
-          onChange={(e) => setter(e.target.value)}
+          {...form.register(name)}
         />
       )}
     </Field>
@@ -759,6 +824,13 @@ function CronForm({
           {error}
         </Callout>
       )}
+      <FormErrors
+        errors={Object.fromEntries(
+          Object.entries(form.formState.errors)
+            .filter(([key]) => key !== 'root')
+            .map(([key, value]) => [key, value?.message])
+        )}
+      />
       <div className="grid max-w-3xl gap-5 sm:grid-cols-2">
         <Field
           label="Monitor slug"
@@ -771,8 +843,7 @@ function CronForm({
               pattern="[A-Za-z0-9_-]+"
               maxLength={128}
               readOnly={!!monitor}
-              value={slug}
-              onChange={(e) => setSlug(e.target.value)}
+              {...form.register('slug')}
             />
           )}
         </Field>
@@ -792,7 +863,10 @@ function CronForm({
                 }
               />
             ) : (
-              <Select value={environment} onValueChange={setEnvironment}>
+              <Select
+                value={environment}
+                onValueChange={(value) => form.setValue('environment', value)}
+              >
                 <SelectTrigger {...props}>
                   <SelectValue />
                 </SelectTrigger>
@@ -826,7 +900,9 @@ function CronForm({
           {(props) => (
             <Select
               value={kind}
-              onValueChange={(v) => setKind(v as 'crontab' | 'interval')}
+              onValueChange={(v) =>
+                form.setValue('kind', v as CronFormValues['kind'])
+              }
             >
               <SelectTrigger {...props}>
                 <SelectValue />
@@ -848,17 +924,21 @@ function CronForm({
                 {...props}
                 required
                 maxLength={128}
-                value={cron}
-                onChange={(e) => setCron(e.target.value)}
+                {...form.register('cron')}
               />
             )}
           </Field>
         ) : (
           <>
-            {numeric('Interval', interval, setInterval, 525600)}
+            {numeric('Interval', 'interval', 525600)}
             <Field label="Interval unit">
               {(props) => (
-                <Select value={unit} onValueChange={setUnit}>
+                <Select
+                  value={unit}
+                  onValueChange={(value) =>
+                    form.setValue('unit', value as CronFormValues['unit'])
+                  }
+                >
                   <SelectTrigger {...props}>
                     <SelectValue />
                   </SelectTrigger>
@@ -883,15 +963,14 @@ function CronForm({
               {...props}
               required
               maxLength={128}
-              value={timezone}
-              onChange={(e) => setTimezone(e.target.value)}
+              {...form.register('timezone')}
             />
           )}
         </Field>
-        {numeric('Start grace (minutes)', margin, setMargin, 40320)}
-        {numeric('Maximum runtime (minutes)', runtime, setRuntime, 40320)}
-        {numeric('Failures before alert', failures, setFailures, 100)}
-        {numeric('Successes before recovery', recoveries, setRecoveries, 100)}
+        {numeric('Start grace (minutes)', 'margin', 40320)}
+        {numeric('Maximum runtime (minutes)', 'runtime', 40320)}
+        {numeric('Failures before alert', 'failures', 100)}
+        {numeric('Successes before recovery', 'recoveries', 100)}
       </div>
       <Callout tone="info" title="Managed in Temps">
         Saving makes this configuration authoritative over SDK settings and

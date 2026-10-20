@@ -33,9 +33,18 @@ impl From<CronMonitorError> for Problem {
             | CronMonitorError::StoredConfiguration { .. }
             | CronMonitorError::Alarm(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        if status.is_server_error() {
+            tracing::error!(error = %error, "Cron monitor operation failed");
+        }
+        let detail = match &error {
+            CronMonitorError::Database(_) | CronMonitorError::Alarm(_) => {
+                "Cron monitor operation failed; check the server logs for details".into()
+            }
+            _ => error.to_string(),
+        };
         problemdetails::new(status)
             .with_title("Cron monitor operation failed")
-            .with_detail(error.to_string())
+            .with_detail(detail)
     }
 }
 #[derive(Deserialize, IntoParams)]
@@ -268,6 +277,27 @@ mod tests {
     use axum::{body::Body, http::Request};
     use sea_orm::{DatabaseBackend, MockDatabase};
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn storage_and_alarm_causes_do_not_escape_http_problems() {
+        use axum::response::IntoResponse;
+        for error in [
+            CronMonitorError::from(DbErr::Custom("synthetic internal storage detail".into())),
+            CronMonitorError::from(crate::AlarmError::Database {
+                operation: "synthetic internal alarm operation".into(),
+                reason: "synthetic internal alarm detail".into(),
+            }),
+        ] {
+            let response = Problem::from(error).into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let detail = body["detail"].as_str().unwrap();
+            assert!(detail.contains("server logs"));
+            assert!(!detail.contains("synthetic internal"));
+        }
+    }
     fn session(role: temps_auth::Role) -> temps_auth::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,

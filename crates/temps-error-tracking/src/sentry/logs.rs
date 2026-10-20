@@ -336,6 +336,7 @@ pub fn decode_logs(
             );
         }
         records.push(LogRecord {
+            ingest_identity: None,
             attribute_types,
             project_id: auth.project_id,
             deployment_id: auth.deployment_id,

@@ -6,36 +6,26 @@
 //! not per-record I/O; receipts contain hashes only. OTLP keeps its old behavior.
 
 use crate::error::{OtelError, StorageErrorKind};
+use crate::types::IngestIdentity;
 use sea_orm::{ConnectionTrait, DatabaseTransaction, DbBackend, Statement};
-use std::collections::{BTreeMap, BTreeSet};
-
-pub const SOURCE_KEY: &str = "temps.ingest.source_key";
+use std::collections::BTreeSet;
 
 pub(crate) async fn claim(
     tx: &DatabaseTransaction,
     signal: &str,
-    records: &[(i32, &BTreeMap<String, String>)],
+    records: &[(i32, Option<&IngestIdentity>)],
 ) -> Result<Vec<usize>, OtelError> {
     let mut unique = BTreeSet::new();
     let mut rows = Vec::new();
     let mut accepted = Vec::new();
-    for (index, (project, attrs)) in records.iter().enumerate() {
-        match attrs.get(SOURCE_KEY) {
+    for (index, (project, identity)) in records.iter().enumerate() {
+        match identity {
             None => accepted.push(index),
-            Some(key)
-                if key.len() == 64
-                    && key
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) =>
-            {
+            Some(identity) => {
+                let key = identity.as_str();
                 if unique.insert((*project, key)) {
                     rows.push(serde_json::json!({"project":project,"key":key,"index":index}));
                 }
-            }
-            Some(_) => {
-                return Err(OtelError::Validation {
-                    message: "Invalid adapter ingest identity".into(),
-                })
             }
         }
     }
@@ -97,6 +87,7 @@ mod tests {
     };
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     // Required acceptance: fail when the isolated test database is unavailable,
@@ -122,12 +113,13 @@ mod tests {
         .unwrap();
         let storage = Arc::new(TimescaleDbStorage::new(db.clone(), None));
         let now = Utc::now();
-        let attrs = BTreeMap::from([(SOURCE_KEY.into(), "1".repeat(64))]);
+        let attrs = BTreeMap::new();
         let resource = ResourceInfo {
             service_name: "synthetic".into(),
             ..Default::default()
         };
         let span = SpanRecord {
+            ingest_identity: Some(IngestIdentity::from_digest([0x11; 32])),
             project_id: project.id,
             deployment_id: None,
             resource: resource.clone(),
@@ -145,6 +137,7 @@ mod tests {
             events: vec![],
         };
         let log = LogRecord {
+            ingest_identity: Some(IngestIdentity::from_digest([0x11; 32])),
             project_id: project.id,
             deployment_id: None,
             resource: resource.clone(),
@@ -168,6 +161,7 @@ mod tests {
             now,
             attrs,
         );
+        metric.ingest_identity = Some(IngestIdentity::from_digest([0x11; 32]));
         metric.value = Some(3.0);
         metric.unit = "millisecond".into();
         metric
@@ -229,7 +223,7 @@ mod tests {
         // A rejected native row rolls back the claim and its capacity reservation.
         db.execute_unprepared("CREATE FUNCTION synthetic_reject_log() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.body='synthetic reject' THEN RAISE EXCEPTION 'synthetic abort' USING ERRCODE='40001'; END IF; RETURN NEW; END $$; CREATE TRIGGER synthetic_reject_log BEFORE INSERT ON otel_log_events FOR EACH ROW EXECUTE FUNCTION synthetic_reject_log()").await.unwrap();
         let mut failed = log.clone();
-        failed.attributes.insert(SOURCE_KEY.into(), "3".repeat(64));
+        failed.ingest_identity = Some(IngestIdentity::from_digest([0x33; 32]));
         failed.body = "synthetic reject".into();
         assert!(storage
             .store_logs(vec![failed.clone()])
@@ -268,7 +262,7 @@ mod tests {
         .await
         .unwrap();
         let mut fresh = log.clone();
-        fresh.attributes.insert(SOURCE_KEY.into(), "4".repeat(64));
+        fresh.ingest_identity = Some(IngestIdentity::from_digest([0x44; 32]));
         let error = storage.store_logs(vec![fresh.clone()]).await.unwrap_err();
         assert!(matches!(
             error,
@@ -288,10 +282,62 @@ mod tests {
         assert_eq!(storage.store_logs(vec![fresh]).await.unwrap(), 1);
 
         let mut anonymous = log.clone();
-        anonymous.attributes.remove(SOURCE_KEY);
+        anonymous.ingest_identity = None;
         assert_eq!(
             storage
                 .store_logs(vec![anonymous.clone(), anonymous])
+                .await
+                .unwrap(),
+            2
+        );
+        // A regular application attribute is data, even when its name used to
+        // be an internal key. Invalid/repeated values cannot alter delivery.
+        for key in ["not-a-hash".to_string(), "a".repeat(64)] {
+            let mut native = log.clone();
+            native.ingest_identity = None;
+            native
+                .attributes
+                .insert("temps.ingest.source_key".into(), key);
+            assert_eq!(
+                storage
+                    .store_logs(vec![native.clone(), native.clone()])
+                    .await
+                    .unwrap(),
+                2
+            );
+            let serialized = serde_json::to_value(&native).unwrap();
+            assert!(serialized.get("ingest_identity").is_none());
+            let mut injected = serialized;
+            injected["ingest_identity"] = serde_json::json!("1".repeat(64));
+            let decoded: LogRecord = serde_json::from_value(injected).unwrap();
+            assert!(decoded.ingest_identity.is_none());
+            assert_eq!(storage.store_logs(vec![decoded]).await.unwrap(), 1);
+        }
+        let mut native_span = span.clone();
+        native_span.ingest_identity = None;
+        native_span.span_id = "e".repeat(16);
+        native_span
+            .attributes
+            .insert("temps.ingest.source_key".into(), "not-a-hash".into());
+        let mut next_span = native_span.clone();
+        next_span.span_id = "f".repeat(16);
+        assert_eq!(
+            storage
+                .store_spans(vec![native_span, next_span])
+                .await
+                .unwrap(),
+            2
+        );
+        let mut native_metric = metric.clone();
+        native_metric.ingest_identity = None;
+        native_metric
+            .attributes
+            .insert("temps.ingest.source_key".into(), "not-a-hash".into());
+        let mut next_metric = native_metric.clone();
+        next_metric.timestamp += chrono::Duration::milliseconds(1);
+        assert_eq!(
+            storage
+                .store_metrics(vec![native_metric, next_metric])
                 .await
                 .unwrap(),
             2
@@ -301,7 +347,7 @@ mod tests {
         let mut ordered = Vec::new();
         for (suffix, sequence) in [(2, 0), (1, 1), (1, 9)] {
             let mut value = log.clone();
-            value.attributes.remove(SOURCE_KEY);
+            value.ingest_identity = None;
             value.body = format!("Synthetic ordering {suffix}/{sequence}");
             value.attributes.insert(
                 "temps.sentry.timestamp".into(),

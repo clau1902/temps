@@ -1224,6 +1224,14 @@ async fn process_parsed_envelope(
             Ok(receipt) => receipt,
             Err(error) => {
                 use temps_monitoring::cron_monitors::CronMonitorError;
+                if matches!(
+                    &error,
+                    CronMonitorError::Database(_)
+                        | CronMonitorError::Alarm(_)
+                        | CronMonitorError::StoredConfiguration { .. }
+                ) {
+                    tracing::error!(project_id = auth.project_id, error = %error, "Cron check-in ingestion failed");
+                }
                 let retryable = error.is_retryable();
                 let status = match error {
                     CronMonitorError::Invalid(_) => StatusCode::BAD_REQUEST,

@@ -165,6 +165,10 @@ impl ErrorTrackingService {
         &self,
         mut error_data: CreateErrorEventData,
     ) -> Result<super::types::ErrorIngestReceipt, ErrorTrackingError> {
+        // Artifact availability and symbolication admission must never change
+        // the identity of the same SDK-submitted stack.
+        let submitted_fingerprint = (error_data.source.as_deref() == Some("sentry"))
+            .then(|| self.ingestion.generate_fingerprint(&error_data));
         // Symbolicate stack traces if source maps are available
         if let Some(sm_service) = self.source_map_service.get() {
             if let Err(e) = sm_service.symbolicate_error_event(&mut error_data).await {
@@ -180,7 +184,14 @@ impl ErrorTrackingService {
             || error_data.visitor_id.is_some();
 
         let project_id = error_data.project_id;
-        let outcome = self.ingestion.process_with_outcome(error_data).await?;
+        let outcome = match submitted_fingerprint {
+            Some(fingerprint) => {
+                self.ingestion
+                    .process_with_fingerprint(error_data, fingerprint)
+                    .await?
+            }
+            None => self.ingestion.process_with_outcome(error_data).await?,
+        };
         let group_id = outcome.group_id;
         if !outcome.inserted {
             return Ok(super::types::ErrorIngestReceipt {

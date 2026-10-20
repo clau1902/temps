@@ -239,9 +239,27 @@ pub struct Exemplar {
     pub attributes: BTreeMap<String, String>,
 }
 
+/// Trusted in-process adapter identity. User attributes and deserialized wire
+/// records cannot create this metadata or influence native delivery semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestIdentity(String);
+
+impl IngestIdentity {
+    pub fn from_digest(digest: [u8; 32]) -> Self {
+        Self(hex::encode(digest))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A single metric data point ready for storage.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetricPoint {
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub ingest_identity: Option<IngestIdentity>,
     pub project_id: i32,
     pub deployment_id: Option<i32>,
     pub resource: ResourceInfo,
@@ -331,6 +349,7 @@ impl MetricPoint {
         attributes: BTreeMap<String, String>,
     ) -> Self {
         Self {
+            ingest_identity: None,
             project_id,
             deployment_id,
             resource,
@@ -422,6 +441,9 @@ pub struct SpanEvent {
 /// A single trace span ready for storage.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SpanRecord {
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub ingest_identity: Option<IngestIdentity>,
     pub project_id: i32,
     pub deployment_id: Option<i32>,
     pub resource: ResourceInfo,
@@ -494,6 +516,9 @@ impl std::fmt::Display for LogSeverity {
 /// A single log record ready for storage.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LogRecord {
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub ingest_identity: Option<IngestIdentity>,
     pub project_id: i32,
     pub deployment_id: Option<i32>,
     pub resource: ResourceInfo,

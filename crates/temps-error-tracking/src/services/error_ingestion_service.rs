@@ -224,6 +224,15 @@ impl ErrorIngestionService {
         error_data: CreateErrorEventData,
     ) -> Result<IngestedError, ErrorTrackingError> {
         let fingerprint = self.generate_fingerprint(&error_data);
+        self.process_with_fingerprint(error_data, fingerprint).await
+    }
+
+    /// The orchestrator may capture submitted-frame identity before symbolication.
+    pub(super) async fn process_with_fingerprint(
+        &self,
+        error_data: CreateErrorEventData,
+        fingerprint: String,
+    ) -> Result<IngestedError, ErrorTrackingError> {
         let mut attempt = 0;
         loop {
             let result = self.process_once(&error_data, &fingerprint).await;
@@ -1819,6 +1828,30 @@ mod tests {
                 .await,
             Err(ErrorTrackingError::Validation(_))
         ));
+        // Historical Sentry pairs remain queryable without rewriting the raw
+        // event or requiring a data migration. Reversed pairs must not match.
+        db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "UPDATE error_events SET data=jsonb_set(data,'{trace,extra,tags}',$1::jsonb) WHERE project_id=$2 AND error_group_id=$3",
+            [serde_json::json!([["synthetic.key", "test'value"]]).into(), project.into(), group.into()])).await.unwrap();
+        assert_eq!(
+            crud.list_error_events_filtered(group, project, None, None, &filter)
+                .await
+                .unwrap()
+                .1,
+            2
+        );
+        let reversed = ErrorEventFilter {
+            tag_key: Some("test'value".into()),
+            tag_value: Some("synthetic.key".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            crud.list_error_events_filtered(group, project, None, None, &reversed)
+                .await
+                .unwrap()
+                .1,
+            0
+        );
         // Force a permanent native write failure; no group, count or receipt may leak.
         db.execute_unprepared("ALTER TABLE error_events ADD CONSTRAINT synthetic_reject CHECK (exception_type <> 'SyntheticRejected')").await.unwrap();
         assert!(service

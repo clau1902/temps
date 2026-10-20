@@ -537,6 +537,20 @@ Future<void> main() async {
   },
 ]
 
+function buildBrowserReportExample(dsn: string, projectId: number): string {
+  const url = new URL(dsn)
+  const key = url.username
+  url.username = ''
+  url.password = ''
+  url.search = ''
+  url.hash = ''
+  url.pathname = `/api/${projectId}/security/`
+  url.searchParams.set('sentry_key', key)
+  const security = url.href
+  url.pathname = `/api/${projectId}/nel/`
+  return `Content-Security-Policy-Report-Only: default-src 'self'; report-uri ${security}\nReport-To: ${JSON.stringify({ group: 'temps-nel', max_age: 86400, endpoints: [{ url: url.href }] })}\nNEL: ${JSON.stringify({ report_to: 'temps-nel', max_age: 86400, failure_fraction: 1, success_fraction: 0 })}`
+}
+
 export function ErrorTrackingSetup({ project }: ErrorTrackingSetupProps) {
   const navigate = useNavigate()
   const [wizardStep, setWizardStep] = useState<WizardStepId>('framework')
@@ -920,19 +934,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
                 <CodeBlock
                   language="text"
                   showCopy
-                  code={(() => {
-                    const url = new URL(dsn)
-                    const key = url.username
-                    url.username = ''
-                    url.password = ''
-                    url.search = ''
-                    url.hash = ''
-                    url.pathname = `/api/${project.id}/security/`
-                    url.searchParams.set('sentry_key', key)
-                    const security = url.href
-                    url.pathname = `/api/${project.id}/nel/`
-                    return `Content-Security-Policy-Report-Only: default-src 'self'; report-uri ${security}\nReport-To: ${JSON.stringify({ group: 'temps-nel', max_age: 86400, endpoints: [{ url: url.href }] })}\nNEL: ${JSON.stringify({ report_to: 'temps-nel', max_age: 86400, failure_fraction: 1, success_fraction: 0 })}`
-                  })()}
+                  code={buildBrowserReportExample(dsn, project.id)}
                 />
               ) : (
                 <p>Create a project DSN above to get the report endpoints.</p>

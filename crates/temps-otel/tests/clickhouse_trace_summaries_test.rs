@@ -222,6 +222,7 @@ fn span(
 ) -> SpanRecord {
     let start = Utc::now() - Duration::minutes(minutes_ago);
     SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id,
         resource: ResourceInfo {

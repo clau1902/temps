@@ -137,18 +137,24 @@ impl CronMonitorService {
         project: i32,
         id: i32,
     ) -> Result<CronMonitorView, CronMonitorError> {
-        Self::management_scope(self.db.as_ref(), project, None).await?;
-        CronMonitor::find_by_statement(sql(
-            "SELECT * FROM cron_monitors WHERE project_id=$1 AND id=$2",
-            vec![project.into(), id.into()],
-        ))
-        .one(self.db.as_ref())
-        .await?
-        .ok_or(CronMonitorError::NotFound {
-            project_id: project,
-            monitor_id: id,
-        })?
-        .try_into()
+        async {
+            Self::management_scope(self.db.as_ref(), project, None).await?;
+            CronMonitor::find_by_statement(sql(
+                "SELECT * FROM cron_monitors WHERE project_id=$1 AND id=$2",
+                vec![project.into(), id.into()],
+            ))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(CronMonitorError::NotFound {
+                project_id: project,
+                monitor_id: id,
+            })?
+            .try_into()
+        }
+        .await
+        .map_err(|error: CronMonitorError| {
+            error.with_context("get_monitor", Some(project), Some(id))
+        })
     }
     pub async fn list_monitors(
         &self,
@@ -156,18 +162,19 @@ impl CronMonitorService {
         page: u64,
         size: u64,
     ) -> Result<CronMonitorList, CronMonitorError> {
-        let (limit, offset) = pagination(page, size)?;
-        Self::management_scope(self.db.as_ref(), project, None).await?;
-        let total = self
-            .db
-            .query_one(sql(
-                "SELECT count(*) AS n FROM cron_monitors WHERE project_id=$1",
-                vec![project.into()],
-            ))
-            .await?
-            .ok_or_else(|| DbErr::Custom("monitor count missing".into()))?
-            .try_get::<i64>("", "n")? as u64;
-        let items = CronMonitor::find_by_statement(sql(
+        async {
+            let (limit, offset) = pagination(page, size)?;
+            Self::management_scope(self.db.as_ref(), project, None).await?;
+            let total = self
+                .db
+                .query_one(sql(
+                    "SELECT count(*) AS n FROM cron_monitors WHERE project_id=$1",
+                    vec![project.into()],
+                ))
+                .await?
+                .ok_or_else(|| DbErr::Custom("monitor count missing".into()))?
+                .try_get::<i64>("", "n")? as u64;
+            let items = CronMonitor::find_by_statement(sql(
             "SELECT * FROM cron_monitors WHERE project_id=$1 ORDER BY id DESC LIMIT $2 OFFSET $3",
             vec![project.into(), limit.into(), offset.into()],
         ))
@@ -176,12 +183,15 @@ impl CronMonitorService {
         .into_iter()
         .map(TryInto::try_into)
         .collect::<Result<Vec<_>, _>>()?;
-        Ok(CronMonitorList {
-            items,
-            total,
-            page,
-            page_size: size,
-        })
+            Ok(CronMonitorList {
+                items,
+                total,
+                page,
+                page_size: size,
+            })
+        }
+        .await
+        .map_err(|error: CronMonitorError| error.with_context("list_monitors", Some(project), None))
     }
     pub async fn list_monitor_runs(
         &self,
@@ -190,23 +200,29 @@ impl CronMonitorService {
         page: u64,
         size: u64,
     ) -> Result<CronMonitorRunList, CronMonitorError> {
-        let (limit, offset) = pagination(page, size)?;
-        self.get_monitor(project, id).await?;
-        let total = self
-            .db
-            .query_one(sql(
-                "SELECT count(*) AS n FROM cron_monitor_runs WHERE monitor_id=$1",
-                vec![id.into()],
-            ))
-            .await?
-            .ok_or_else(|| DbErr::Custom("run count missing".into()))?
-            .try_get::<i64>("", "n")? as u64;
-        let items = self.runs(project, id, limit as u64, offset as u64).await?;
-        Ok(CronMonitorRunList {
-            items,
-            total,
-            page,
-            page_size: size,
+        async {
+            let (limit, offset) = pagination(page, size)?;
+            self.get_monitor(project, id).await?;
+            let total = self
+                .db
+                .query_one(sql(
+                    "SELECT count(*) AS n FROM cron_monitor_runs WHERE monitor_id=$1",
+                    vec![id.into()],
+                ))
+                .await?
+                .ok_or_else(|| DbErr::Custom("run count missing".into()))?
+                .try_get::<i64>("", "n")? as u64;
+            let items = self.runs(project, id, limit as u64, offset as u64).await?;
+            Ok(CronMonitorRunList {
+                items,
+                total,
+                page,
+                page_size: size,
+            })
+        }
+        .await
+        .map_err(|error: CronMonitorError| {
+            error.with_context("list_monitor_runs", Some(project), Some(id))
         })
     }
     pub async fn create_monitor(
@@ -214,6 +230,7 @@ impl CronMonitorService {
         project: i32,
         input: CreateCronMonitor,
     ) -> Result<CronMonitorView, CronMonitorError> {
+        async {
         let now = Utc::now();
         input.config.validate(now)?;
         if input.slug.is_empty()
@@ -248,6 +265,8 @@ impl CronMonitorService {
         let result=CronMonitor::find_by_statement(sql("INSERT INTO cron_monitors(project_id,environment_id,slug,config,next_expected_at,next_check_at,managed_config) VALUES($1,$2,$3,$4,$5,$6,true) RETURNING *",vec![project.into(),input.environment_id.into(),input.slug.into(),config.into(),next.into(),due.into()])).one(&tx).await?.ok_or_else(||DbErr::Custom("monitor missing after insert".into()))?;
         tx.commit().await?;
         result.try_into()
+
+        }.await.map_err(|error: CronMonitorError| error.with_context("create_monitor", Some(project), None))
     }
     /// Pause keeps accepting history, but suspends health evaluation. Resume
     /// starts a fresh schedule and grants existing runs a fresh runtime budget.
@@ -257,6 +276,7 @@ impl CronMonitorService {
         id: i32,
         input: UpdateCronMonitor,
     ) -> Result<CronMonitorView, CronMonitorError> {
+        async {
         let now = Utc::now();
         if input.config.is_none() && input.enabled.is_none() {
             return Err(CronMonitorError::Invalid("supply config or enabled".into()));
@@ -305,6 +325,8 @@ impl CronMonitorService {
         let result = Self::locked_monitor(&tx, project, id).await?;
         tx.commit().await?;
         result.try_into()
+
+        }.await.map_err(|error: CronMonitorError| error.with_context("update_monitor", Some(project), Some(id)))
     }
     pub async fn delete_monitor(
         &self,
@@ -312,18 +334,24 @@ impl CronMonitorService {
         id: i32,
         alarms: &crate::AlarmService,
     ) -> Result<(), CronMonitorError> {
-        let tx = self.management_lock(project).await?;
-        let monitor = Self::locked_monitor(&tx, project, id).await?;
-        if let Some(alarm) = monitor.alarm_id {
-            alarms.resolve_alarm(alarm, Some(project)).await?;
+        async {
+            let tx = self.management_lock(project).await?;
+            let monitor = Self::locked_monitor(&tx, project, id).await?;
+            if let Some(alarm) = monitor.alarm_id {
+                alarms.resolve_alarm(alarm, Some(project)).await?;
+            }
+            tx.execute(sql(
+                "DELETE FROM cron_monitors WHERE id=$1",
+                vec![id.into()],
+            ))
+            .await?;
+            tx.commit().await?;
+            Ok(())
         }
-        tx.execute(sql(
-            "DELETE FROM cron_monitors WHERE id=$1",
-            vec![id.into()],
-        ))
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        .await
+        .map_err(|error: CronMonitorError| {
+            error.with_context("delete_monitor", Some(project), Some(id))
+        })
     }
 }
 

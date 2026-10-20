@@ -238,6 +238,7 @@ fn proxy_log_entry(
 fn span(trace_id: &str, span_id: &str, parent: Option<&str>, name: &str) -> SpanRecord {
     let start = Utc::now() - Duration::minutes(1);
     SpanRecord {
+        ingest_identity: None,
         project_id: PROJECT_ID,
         deployment_id: Some(1),
         resource: ResourceInfo {

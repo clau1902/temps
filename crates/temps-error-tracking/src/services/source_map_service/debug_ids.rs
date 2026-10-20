@@ -186,3 +186,116 @@ fn visit_stack(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::{
+        error_tracking_service::ErrorTrackingService,
+        types::{CreateErrorEventData, ExceptionData},
+    };
+    use sea_orm::{ActiveModelTrait, Set};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn grouping_survives_debug_id_upload_and_busy_symbolication() {
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test_db.connection_arc();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Synthetic grouping".into()),
+            slug: Set(format!("synthetic-grouping-{}", uuid::Uuid::new_v4())),
+            repo_name: Set("synthetic".into()),
+            repo_owner: Set("synthetic".into()),
+            directory: Set("/synthetic".into()),
+            main_branch: Set("main".into()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let maps = Arc::new(SourceMapService::new(db.clone()));
+        let service = ErrorTrackingService::new(db.clone());
+        service.set_source_map_service(maps.clone());
+        let debug_id = uuid::Uuid::new_v4().to_string();
+        let event = |custom: bool| {
+            let stack = serde_json::json!({"frames":[{"filename":"app.min.js","abs_path":"app.min.js","function":"a","lineno":1,"colno":1,"in_app":true}]});
+            let mut raw = serde_json::json!({"event_id":uuid::Uuid::new_v4().simple().to_string(),"exception":{"values":[{"type":"TypeError","value":"Synthetic failure","stacktrace":stack}]},"debug_meta":{"images":[{"type":"sourcemap","code_file":"app.min.js","debug_id":debug_id}]}});
+            if custom {
+                raw["fingerprint"] = serde_json::json!(["synthetic-bucket", "{{default}}"]);
+            }
+            CreateErrorEventData {
+                project_id: project.id,
+                source: Some("sentry".into()),
+                raw_sentry_event: Some(raw),
+                exception_type: Some("TypeError".into()),
+                exception_value: Some("Synthetic failure".into()),
+                stack_trace: Some(stack.clone()),
+                exceptions: vec![ExceptionData {
+                    exception_type: "TypeError".into(),
+                    exception_value: Some("Synthetic failure".into()),
+                    stack_trace: Some(stack),
+                    mechanism: None,
+                    module: None,
+                    thread_id: None,
+                }],
+                ..Default::default()
+            }
+        };
+        let mut groups = Vec::new();
+        for custom in [false, true] {
+            groups.push(service.process_error_event(event(custom)).await.unwrap());
+        }
+        assert_ne!(groups[0], groups[1]);
+        let map = serde_json::to_vec(&serde_json::json!({"version":3,"sources":["synthetic-original.ts"],"sourcesContent":["throw new TypeError('synthetic');"],"names":["syntheticOriginal"],"mappings":"AAAAA"})).unwrap();
+        let uploaded = maps
+            .upload(project.id, "synthetic-release", "app.min.js.map", map, None)
+            .await
+            .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE source_maps SET debug_id=$1 WHERE id=$2",
+            [debug_id.clone().into(), uploaded.id.into()],
+        ))
+        .await
+        .unwrap();
+        let mut resolved = event(false);
+        maps.symbolicate_error_event(&mut resolved).await.unwrap();
+        assert_eq!(
+            resolved.stack_trace.as_ref().unwrap()["frames"][0]["function"],
+            "syntheticOriginal"
+        );
+        for (index, custom) in [false, true].into_iter().enumerate() {
+            assert_eq!(
+                service.process_error_event(event(custom)).await.unwrap(),
+                groups[index]
+            );
+        }
+        let permits = SYMBOLICATION_WORKERS.acquire_many(2).await.unwrap();
+        for (index, custom) in [false, true].into_iter().enumerate() {
+            assert_eq!(
+                service.process_error_event(event(custom)).await.unwrap(),
+                groups[index]
+            );
+        }
+        drop(permits);
+        for group in groups {
+            let (events, count) = service
+                .crud
+                .list_error_events(group, project.id, None, None)
+                .await
+                .unwrap();
+            assert_eq!(count, 3);
+            assert_eq!(events.len(), 3);
+        }
+        let count = db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT count(*) AS n FROM error_events WHERE project_id=$1 AND data #>> '{sentry,exception,values,0,stacktrace,frames,0,function}'='syntheticOriginal'", [project.id.into()])).await.unwrap().unwrap();
+        assert_eq!(
+            count.try_get::<i64>("", "n").unwrap(),
+            2,
+            "available maps change stored display frames, not grouping"
+        );
+    }
+}

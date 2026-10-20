@@ -576,6 +576,7 @@ fn extract_span_record(
     };
 
     Some(SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id,
         resource: resource.clone(),
@@ -660,6 +661,7 @@ fn extract_log_record(
     };
 
     Some(LogRecord {
+        ingest_identity: None,
         attribute_types: kv_to_log_types(&log.attributes),
         project_id,
         deployment_id,

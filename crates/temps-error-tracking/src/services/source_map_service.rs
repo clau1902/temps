@@ -15,8 +15,10 @@ use tracing::{debug, warn};
 use super::types::CreateErrorEventData;
 
 mod artifacts;
+mod build_credentials;
 mod debug_ids;
 pub use artifacts::{ArtifactAssembly, ArtifactUploadError, ARTIFACT_WORKERS, CHUNK_BYTES};
+pub use build_credentials::{BuildCredentialError, ProjectBuildCredential};
 
 /// Maximum accepted size for one source map across HTTP uploads, deployment
 /// capture, parsing, and persistence.

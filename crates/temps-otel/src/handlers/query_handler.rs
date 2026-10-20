@@ -2231,6 +2231,7 @@ mod tests {
             project_id,
             project_name: format!("project-{project_id}"),
             span: SpanRecord {
+                ingest_identity: None,
                 project_id,
                 deployment_id: None,
                 resource: crate::types::ResourceInfo {

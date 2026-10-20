@@ -34,22 +34,74 @@ pub enum CronMonitorError {
     },
     #[error("Stored cron monitor {monitor_id} has invalid configuration")]
     StoredConfiguration { monitor_id: i32 },
-    #[error("Cron monitor alarm operation failed")]
-    Alarm(#[from] crate::AlarmError),
-    #[error("Cron monitoring storage failed")]
-    Database(#[from] DbErr),
+    #[error(transparent)]
+    Alarm(CronOperationError<crate::AlarmError>),
+    #[error(transparent)]
+    Database(CronOperationError<DbErr>),
+}
+#[derive(Debug, thiserror::Error)]
+#[error("Cron monitoring operation '{operation}' failed for project {project_id:?}, monitor {monitor_id:?}: {source}")]
+pub struct CronOperationError<E: std::error::Error + 'static> {
+    pub operation: &'static str,
+    pub project_id: Option<i32>,
+    pub monitor_id: Option<i32>,
+    #[source]
+    pub source: E,
+}
+impl From<DbErr> for CronMonitorError {
+    fn from(source: DbErr) -> Self {
+        Self::Database(CronOperationError {
+            operation: "execute storage operation",
+            project_id: None,
+            monitor_id: None,
+            source,
+        })
+    }
+}
+impl From<crate::AlarmError> for CronMonitorError {
+    fn from(source: crate::AlarmError) -> Self {
+        Self::Alarm(CronOperationError {
+            operation: "synchronize alarm",
+            project_id: None,
+            monitor_id: None,
+            source,
+        })
+    }
 }
 impl CronMonitorError {
+    fn with_context(
+        mut self,
+        operation: &'static str,
+        project: Option<i32>,
+        monitor: Option<i32>,
+    ) -> Self {
+        match &mut self {
+            Self::Database(error) => {
+                error.operation = operation;
+                error.project_id = error.project_id.or(project);
+                error.monitor_id = error.monitor_id.or(monitor);
+            }
+            Self::Alarm(error) => {
+                error.operation = operation;
+                error.project_id = error.project_id.or(project);
+                error.monitor_id = error.monitor_id.or(monitor);
+            }
+            _ => {}
+        }
+        self
+    }
+
     /// Check-in IDs make uncertain commits safe to retry. Deterministic schema,
     /// constraint and conversion failures remain server errors without retry hints.
     pub fn is_retryable(&self) -> bool {
         use sea_orm::{sqlx::Error as SqlxError, RuntimeErr};
-        match self {
-            Self::Database(DbErr::ConnectionAcquire(_) | DbErr::Conn(_)) => true,
-            Self::Database(
-                DbErr::Query(RuntimeErr::SqlxError(error))
-                | DbErr::Exec(RuntimeErr::SqlxError(error)),
-            ) => match error {
+        let Self::Database(error) = self else {
+            return false;
+        };
+        match &error.source {
+            DbErr::ConnectionAcquire(_) | DbErr::Conn(_) => true,
+            DbErr::Query(RuntimeErr::SqlxError(error))
+            | DbErr::Exec(RuntimeErr::SqlxError(error)) => match error {
                 SqlxError::Database(error) => error.code().is_some_and(|code| {
                     code.starts_with("08")
                         || [
@@ -302,6 +354,7 @@ impl CronMonitorService {
         items: Vec<MonitorCheckIn>,
         now: DateTime<Utc>,
     ) -> Result<CheckInIngestResult, CronMonitorError> {
+        async {
         if items.len() > 100 {
             return Err(CronMonitorError::Limit);
         }
@@ -456,6 +509,8 @@ impl CronMonitorService {
             accepted: items.len() as u64,
             pending_configuration: pending.values().sum(),
         })
+
+        }.await.map_err(|error: CronMonitorError| error.with_context("ingest_report_at", Some(project), None))
     }
     async fn configure_monitor(
         tx: &DatabaseTransaction,
@@ -543,6 +598,7 @@ impl CronMonitorService {
     /// Downtime coalesces missed occurrences into one failure per monitor;
     /// it never creates an unbounded historical backlog after a restart.
     pub async fn detect_due(&self, now: DateTime<Utc>) -> Result<usize, CronMonitorError> {
+        async {
         let tx = self.db.begin().await?;
         let due=CronMonitor::find_by_statement(sql("SELECT * FROM cron_monitors WHERE enabled AND next_check_at <= $1 ORDER BY next_check_at LIMIT 100 FOR UPDATE SKIP LOCKED",vec![now.into()])).all(&tx).await?;
         for monitor in &due {
@@ -559,15 +615,17 @@ impl CronMonitorService {
                         monitor_id: monitor.id,
                     }
                 })?;
-            Self::initialize_deadlines(&tx, monitor.id, &config).await?;
-            Self::evaluate_deadlines(&tx, monitor, &config, now).await?;
-            Self::reschedule(&tx, monitor.id, &config).await?;
+            Self::initialize_deadlines(&tx, monitor.id, &config).await.map_err(|error| CronMonitorError::from(error).with_context("evaluate cron deadlines", Some(monitor.project_id), Some(monitor.id)))?;
+            Self::evaluate_deadlines(&tx, monitor, &config, now).await.map_err(|error| error.with_context("evaluate cron deadlines", Some(monitor.project_id), Some(monitor.id)))?;
+            Self::reschedule(&tx, monitor.id, &config).await.map_err(|error| CronMonitorError::from(error).with_context("evaluate cron deadlines", Some(monitor.project_id), Some(monitor.id)))?;
         }
         tx.commit().await?;
         // Retention holds no monitor locks, so pruning another monitor's rows
         // cannot deadlock a multi-monitor check-in batch. At most 1000 per tick.
         self.db.execute(sql("DELETE FROM cron_monitor_runs WHERE id IN (SELECT id FROM cron_monitor_runs WHERE finished_at < $1 ORDER BY finished_at LIMIT 1000)",vec![(now-Duration::days(30)).into()])).await?;
         Ok(due.len())
+
+        }.await.map_err(|error: CronMonitorError| error.with_context("detect_due", None, None))
     }
     pub async fn list(
         &self,
@@ -575,16 +633,20 @@ impl CronMonitorService {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CronMonitor>, CronMonitorError> {
-        Ok(CronMonitor::find_by_statement(sql(
-            "SELECT * FROM cron_monitors WHERE project_id=$1 ORDER BY id LIMIT $2 OFFSET $3",
-            vec![
-                project.into(),
-                (limit.clamp(1, 100) as i64).into(),
-                (offset.min(i64::MAX as u64) as i64).into(),
-            ],
-        ))
-        .all(self.db.as_ref())
-        .await?)
+        async {
+            Ok(CronMonitor::find_by_statement(sql(
+                "SELECT * FROM cron_monitors WHERE project_id=$1 ORDER BY id LIMIT $2 OFFSET $3",
+                vec![
+                    project.into(),
+                    (limit.clamp(1, 100) as i64).into(),
+                    (offset.min(i64::MAX as u64) as i64).into(),
+                ],
+            ))
+            .all(self.db.as_ref())
+            .await?)
+        }
+        .await
+        .map_err(|error: CronMonitorError| error.with_context("list", Some(project), None))
     }
     pub async fn runs(
         &self,
@@ -593,16 +655,25 @@ impl CronMonitorService {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CronMonitorRun>, CronMonitorError> {
+        async {
         Ok(CronMonitorRun::find_by_statement(sql("SELECT r.* FROM cron_monitor_runs r JOIN cron_monitors m ON m.id=r.monitor_id WHERE m.project_id=$1 AND m.id=$2 ORDER BY r.id DESC LIMIT $3 OFFSET $4",vec![project.into(),monitor.into(),(limit.clamp(1,100) as i64).into(),(offset.min(i64::MAX as u64) as i64).into()])).all(self.db.as_ref()).await?)
+
+        }.await.map_err(|error: CronMonitorError| error.with_context("runs", Some(project), Some(monitor)))
     }
     /// Durable pending flags retry alarm publication after process/storage failures.
     /// Native alarms expose failures in the existing console and notification routes.
     pub async fn sync_alarms(&self, alarms: &crate::AlarmService) -> Result<(), CronMonitorError> {
+        async {
         let tx = self.db.begin().await?;
-        let pending=tx.query_all(sql("SELECT * FROM cron_monitors WHERE alarm_pending ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED",vec![])).await?;
+        let pending=tx.query_all(sql("SELECT m.*,a.id AS active_alarm_id FROM cron_monitors m LEFT JOIN alarms a ON a.id=m.alarm_id AND a.project_id=m.project_id AND a.alarm_type='cron_job_failed' AND a.status IN ('firing','acknowledged') AND a.metadata->>'cron_monitor_id'=m.id::text WHERE m.alarm_pending ORDER BY m.id LIMIT 100 FOR UPDATE OF m SKIP LOCKED",vec![])).await?;
         for row in pending {
             let monitor = CronMonitor::from_query_result(&row, "")?;
-            let mut alarm_id: Option<i32> = row.try_get("", "alarm_id")?;
+            let project_id = monitor.project_id;
+            let monitor_id = monitor.id;
+            async {
+            // The bounded batch joins active alarms. A manually resolved
+            // historical link cannot suppress the next failing run.
+            let mut alarm_id: Option<i32> = row.try_get("", "active_alarm_id")?;
             if monitor.enabled && monitor.status == "failing" {
                 if alarm_id.is_none() {
                     // Recover the link if the process stopped after AlarmService
@@ -618,11 +689,11 @@ impl CronMonitorService {
                         title:format!("Cron monitor {} is failing", monitor.slug),
                         message:format!("Latest run: {}. Consecutive failures: {}; consecutive successes: {}. Recovery requires {} successful runs.",recent.first().map(|run|run.status.as_str()).unwrap_or("unknown"),monitor.consecutive_failures,monitor.consecutive_successes,monitor.config["recovery_threshold"]),
                         metadata:Some(serde_json::json!({"cron_monitor_id":monitor.id,"monitor_slug":monitor.slug,"config":monitor.config,"latest_run":recent.first(),"consecutive_failures":monitor.consecutive_failures})),
-                    }).await?;
+                    }).await.map_err(|source| CronMonitorError::from(source).with_context("raise cron failure alarm", Some(monitor.project_id), Some(monitor.id)))?;
                 }
             } else if monitor.status == "ok" || monitor.status == "unknown" || !monitor.enabled {
                 if let Some(id) = alarm_id {
-                    alarms.resolve_alarm(id, Some(monitor.project_id)).await?;
+                    alarms.resolve_alarm(id, Some(monitor.project_id)).await.map_err(|source| CronMonitorError::from(source).with_context("resolve cron failure alarm", Some(monitor.project_id), Some(monitor.id)))?;
                 }
                 alarm_id = None;
             }
@@ -632,9 +703,14 @@ impl CronMonitorService {
                 vec![monitor.id.into(), alarm_id.into(), retry.into()],
             ))
             .await?;
+                Ok::<(), CronMonitorError>(())
+            }.await.map_err(|error| error.with_context("synchronize monitor alarm", Some(project_id), Some(monitor_id)))?;
+
         }
         tx.commit().await?;
         Ok(())
+
+        }.await.map_err(|error: CronMonitorError| error.with_context("sync_alarms", None, None))
     }
     pub fn start(self: &Arc<Self>, alarms: Arc<crate::AlarmService>) {
         let service = self.clone();
@@ -643,11 +719,11 @@ impl CronMonitorService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                if service.detect_due(Utc::now()).await.is_err() {
-                    tracing::error!("Cron monitor deadline detection failed");
+                if let Err(error) = service.detect_due(Utc::now()).await {
+                    tracing::error!(error = %error, "Cron monitor deadline detection failed");
                 }
-                if service.sync_alarms(&alarms).await.is_err() {
-                    tracing::error!("Cron monitor alarm synchronization failed");
+                if let Err(error) = service.sync_alarms(&alarms).await {
+                    tracing::error!(error = %error, "Cron monitor alarm synchronization failed");
                 }
             }
         });
@@ -689,6 +765,39 @@ mod tests {
             panic!("unused in cron monitor test")
         }
     }
+    #[test]
+    fn storage_errors_preserve_operation_scope_source_and_retry_policy() {
+        use std::error::Error;
+        let error = CronMonitorError::from(DbErr::Conn(sea_orm::RuntimeErr::Internal(
+            "synthetic unavailable".into(),
+        )))
+        .with_context("persist check-in", Some(17), Some(23));
+        let message = error.to_string();
+        for expected in ["persist check-in", "17", "23", "synthetic unavailable"] {
+            assert!(message.contains(expected), "{message}");
+        }
+        assert!(error.is_retryable());
+        assert!(error.source().is_some());
+        let permanent = CronMonitorError::from(DbErr::Type("synthetic invalid type".into()))
+            .with_context("read monitor", Some(17), Some(23));
+        assert!(!permanent.is_retryable());
+        let alarm = CronMonitorError::from(crate::AlarmError::Database {
+            operation: "insert alarm".into(),
+            reason: "synthetic alarm storage failure".into(),
+        })
+        .with_context("raise cron failure alarm", Some(17), Some(23));
+        for expected in [
+            "raise cron failure alarm",
+            "17",
+            "23",
+            "insert alarm",
+            "synthetic alarm storage failure",
+        ] {
+            assert!(alarm.to_string().contains(expected));
+        }
+        assert!(alarm.source().is_some());
+    }
+
     #[test]
     fn schedules_validate_timezone_units_and_minute_precision() {
         let now = DateTime::parse_from_rfc3339("2026-03-29T00:59:00Z")
@@ -882,9 +991,45 @@ mod tests {
             1,
             "alarm publication is idempotent"
         );
+        // Manual resolution is historical, not a permanent mute. A new failed
+        // run after cooldown must create a new alarm; repeated syncs reuse it.
+        let old_alarm = native_alarms[0].id;
+        alarms
+            .resolve_alarm(old_alarm, Some(project.id))
+            .await
+            .unwrap();
+        db.connection()
+            .execute(sql(
+                "UPDATE alarms SET fired_at=NOW()-INTERVAL '6 minutes' WHERE id=$1",
+                vec![old_alarm.into()],
+            ))
+            .await
+            .unwrap();
+        let failure = item(&"c".repeat(32), "error");
+        service
+            .ingest_at(
+                project.id,
+                None,
+                None,
+                vec![failure],
+                now + Duration::minutes(6),
+            )
+            .await
+            .unwrap();
+        service.sync_alarms(&alarms).await.unwrap();
+        let replacement = service.list(project.id, 100, 0).await.unwrap()[0]
+            .alarm_id
+            .unwrap();
+        assert_ne!(replacement, old_alarm);
+        service.sync_alarms(&alarms).await.unwrap();
+        assert_eq!(
+            service.list(project.id, 100, 0).await.unwrap()[0].alarm_id,
+            Some(replacement)
+        );
         let runs = service.runs(project.id, id, 100, 0).await.unwrap();
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].status, "missed");
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].status, "error");
+        assert!(runs.iter().any(|run| run.status == "missed"));
         let mut other = item(&"a".repeat(32), "error");
         other.slug = "synthetic-other-job".into();
         other.config.as_mut().unwrap().failure_issue_threshold = 1;

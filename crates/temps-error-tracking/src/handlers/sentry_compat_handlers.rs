@@ -38,11 +38,9 @@ use axum::{
     Extension, Json, Router,
 };
 use chrono::Utc;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::RequestMetadata;
-use temps_entities::{deployment_tokens, projects};
 use tracing::{debug, error, warn};
 use utoipa::{OpenApi, ToSchema};
 
@@ -50,7 +48,7 @@ use crate::handlers::audit::{
     SentryCliAuditContext, SentryCliCredential, SentryCliReleaseAction, SentryCliReleaseAudit,
     SentryCliReleaseFileUploadedAudit,
 };
-use crate::services::source_map_service::SourceMapService;
+use crate::services::source_map_service::{BuildCredentialError, SourceMapService};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -81,7 +79,6 @@ pub struct SentryCompatApiDoc;
 #[derive(Clone)]
 pub struct SentryCompatAppState {
     pub source_map_service: Arc<SourceMapService>,
-    pub db: Arc<DatabaseConnection>,
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
 }
 
@@ -294,6 +291,23 @@ fn extract_deployment_token(auth_header: &str) -> Result<&str, (StatusCode, Stri
     Ok(token)
 }
 
+fn build_credential_problem(error: BuildCredentialError) -> (StatusCode, String) {
+    let status = match &error {
+        BuildCredentialError::Unauthorized | BuildCredentialError::InactiveProject { .. } => {
+            StatusCode::UNAUTHORIZED
+        }
+        BuildCredentialError::Forbidden { .. } => StatusCode::FORBIDDEN,
+        BuildCredentialError::ProjectNotFound { .. } => StatusCode::NOT_FOUND,
+        BuildCredentialError::Storage { .. } => {
+            tracing::error!(error = %error, "Build credential service failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Build credential lookup temporarily unavailable".into(),
+            );
+        }
+    };
+    (status, error.to_string())
+}
 /// Extract project_id from Bearer token authentication.
 ///
 /// sentry-cli sends `Authorization: Bearer <auth_token>`. The only accepted
@@ -306,131 +320,34 @@ fn extract_deployment_token(auth_header: &str) -> Result<&str, (StatusCode, Stri
 /// must not authorize source map / release writes.
 async fn authenticate_bearer(
     headers: &HeaderMap,
-    db: &DatabaseConnection,
+    service: &SourceMapService,
 ) -> Result<BearerPrincipal, (StatusCode, String)> {
-    use sea_orm::Condition;
-
-    let auth_header = headers
+    let header = headers
         .get("authorization")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .ok_or((
             StatusCode::UNAUTHORIZED,
-            "Missing Authorization header".to_string(),
+            "Missing Authorization header".into(),
         ))?;
-
-    let token = extract_deployment_token(auth_header)?;
-
-    use sha2::{Digest, Sha256};
-    let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-    let token_prefix: String = token.chars().take(8).collect();
-
-    let dt = deployment_tokens::Entity::find()
-        .filter(deployment_tokens::Column::TokenHash.eq(&token_hash))
-        .filter(deployment_tokens::Column::TokenPrefix.eq(&token_prefix))
-        .filter(deployment_tokens::Column::IsActive.eq(true))
-        .filter(
-            Condition::any()
-                .add(deployment_tokens::Column::ExpiresAt.is_null())
-                .add(deployment_tokens::Column::ExpiresAt.gt(Utc::now())),
-        )
-        .one(db)
+    let token = extract_deployment_token(header)?;
+    let credential = service
+        .authenticate_build_token(token)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "Database error while authenticating deployment token {}...: {}",
-                    token_prefix, e
-                ),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                format!(
-                    "Invalid, inactive, or expired deployment token {}...",
-                    token_prefix
-                ),
-            )
-        })?;
-
-    let project = projects::Entity::find_by_id(dt.project_id)
-        .filter(projects::Column::IsDeleted.eq(false))
-        .one(db)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Build credential lookup temporarily unavailable".into(),
-            )
-        })?;
-    if project.is_none() {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Build credential project is inactive".into(),
-        ));
-    }
-    let full_access = dt
-        .permissions
-        .as_ref()
-        .and_then(|v| v.as_array())
-        .is_some_and(|values| {
-            values
-                .iter()
-                .any(|v| matches!(v.as_str(), Some("*") | Some("full_access")))
-        });
-    if !full_access {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Source artifact writes require a full-access project build token".into(),
-        ));
-    }
+        .map_err(build_credential_problem)?;
     Ok(BearerPrincipal {
-        project_id: dt.project_id,
-        credential: SentryCliCredential::DeploymentToken(dt.id),
+        project_id: credential.project_id,
+        credential: SentryCliCredential::DeploymentToken(credential.token_id),
     })
 }
-
-/// Resolve a project slug (or numeric ID) to a project_id.
-/// Also validates it matches the authenticated project.
 async fn resolve_project_slug(
-    project_slug: &str,
-    expected_project_id: i32,
-    db: &DatabaseConnection,
+    slug: &str,
+    project: i32,
+    service: &SourceMapService,
 ) -> Result<i32, (StatusCode, String)> {
-    // Try numeric ID first
-    if let Ok(id) = project_slug.parse::<i32>() {
-        if id == expected_project_id {
-            return Ok(id);
-        }
-    }
-
-    // Try slug lookup
-    let project = projects::Entity::find()
-        .filter(projects::Column::Slug.eq(project_slug))
-        .one(db)
+    service
+        .resolve_build_project(slug, project)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Project '{}' not found", project_slug),
-            )
-        })?;
-
-    if project.id != expected_project_id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Token does not have access to this project".to_string(),
-        ));
-    }
-
-    Ok(project.id)
+        .map_err(build_credential_problem)
 }
 
 // --- Handlers ---
@@ -537,8 +454,12 @@ async fn create_project_release(
     };
 
     // Validate project slug matches the authenticated token
-    if let Err((status, msg)) =
-        resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await
+    if let Err((status, msg)) = resolve_project_slug(
+        &project_slug,
+        principal.project_id,
+        state.source_map_service.as_ref(),
+    )
+    .await
     {
         return (status, msg).into_response();
     }
@@ -612,8 +533,12 @@ async fn finalize_project_release(
     };
 
     // Validate project slug matches the authenticated token
-    if let Err((status, msg)) =
-        resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await
+    if let Err((status, msg)) = resolve_project_slug(
+        &project_slug,
+        principal.project_id,
+        state.source_map_service.as_ref(),
+    )
+    .await
     {
         return (status, msg).into_response();
     }
@@ -690,11 +615,16 @@ async fn upload_release_file(
     };
 
     // Resolve project slug
-    let project_id =
-        match resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await {
-            Ok(id) => id,
-            Err((status, msg)) => return (status, msg).into_response(),
-        };
+    let project_id = match resolve_project_slug(
+        &project_slug,
+        principal.project_id,
+        state.source_map_service.as_ref(),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
 
     // Parse multipart form
     let mut file_data: Option<Vec<u8>> = None;
@@ -915,11 +845,16 @@ async fn list_release_files(
     };
 
     // Resolve project slug
-    let project_id =
-        match resolve_project_slug(&project_slug, principal.project_id, state.db.as_ref()).await {
-            Ok(id) => id,
-            Err((status, msg)) => return (status, msg).into_response(),
-        };
+    let project_id = match resolve_project_slug(
+        &project_slug,
+        principal.project_id,
+        state.source_map_service.as_ref(),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
 
     match state
         .source_map_service
@@ -986,7 +921,7 @@ async fn artifact_principal(
     headers: &HeaderMap,
     state: &SentryCompatAppState,
 ) -> Result<BearerPrincipal, (StatusCode, String)> {
-    let principal = authenticate_bearer(headers, &state.db).await?;
+    let principal = authenticate_bearer(headers, &state.source_map_service).await?;
     if !matches!(
         principal.credential,
         SentryCliCredential::DeploymentToken(_)
@@ -1085,7 +1020,12 @@ async fn assemble_artifact_bundle(
             "Exactly one scoped project is required".into(),
         ));
     }
-    resolve_project_slug(&request.projects[0], principal.project_id, &state.db).await?;
+    resolve_project_slug(
+        &request.projects[0],
+        principal.project_id,
+        &state.source_map_service,
+    )
+    .await?;
     let _permit = crate::services::source_map_service::ARTIFACT_WORKERS
         .try_acquire()
         .map_err(|_| {

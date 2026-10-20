@@ -227,6 +227,7 @@ fn map(
         attributes.insert("sentry.op".into(), op);
     }
     Ok(SpanRecord {
+        ingest_identity: None,
         project_id: auth.project_id,
         deployment_id: auth.deployment_id,
         resource,

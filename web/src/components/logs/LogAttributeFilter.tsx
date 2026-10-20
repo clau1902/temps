@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState, type FormEvent } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
 import { Button, Field, FormErrors } from '@temps-sdk/ds'
 import {
   Input,
@@ -38,6 +40,74 @@ const OPERATORS: { value: LogAttributeOperator; label: string }[] = [
   { value: 'lte', label: 'At most' },
 ]
 
+const attributeFilterSchema = z
+  .object({
+    key: z
+      .string()
+      .refine(
+        (value) =>
+          value.length > 0 &&
+          new TextEncoder().encode(value).length <= 128 &&
+          !value.includes('\0'),
+        'Enter an attribute key of 1–128 bytes.'
+      ),
+    text: z
+      .string()
+      .refine(
+        (value) =>
+          new TextEncoder().encode(value).length <= 16384 &&
+          !value.includes('\0'),
+        'Enter a value of at most 16 KiB without NUL characters.'
+      ),
+    type: z.enum([
+      ANY,
+      'string',
+      'boolean',
+      'integer',
+      'double',
+      'array',
+      'object',
+      'bytes',
+    ]),
+    operator: z.enum(['eq', 'ne', 'gt', 'gte', 'lt', 'lte']),
+  })
+  .superRefine(({ type, text, operator }, context) => {
+    let message: string | undefined
+    if (type === 'integer') {
+      try {
+        if (
+          !/^[+-]?\d+$/.test(text) ||
+          BigInt(text) < -(2n ** 63n) ||
+          BigInt(text) >= 2n ** 63n
+        )
+          message = 'Enter a signed 64-bit integer.'
+      } catch {
+        message = 'Enter a signed 64-bit integer.'
+      }
+    }
+    if (
+      type === 'double' &&
+      (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(text) ||
+        !Number.isFinite(Number(text)))
+    )
+      message = 'Enter a finite number.'
+    if (type === 'boolean' && text !== 'true' && text !== 'false')
+      message = 'Enter true or false.'
+    if (message) context.addIssue({ code: 'custom', path: ['text'], message })
+    if (
+      type !== 'integer' &&
+      type !== 'double' &&
+      operator !== 'eq' &&
+      operator !== 'ne'
+    )
+      context.addIssue({
+        code: 'custom',
+        path: ['operator'],
+        message: 'Range comparisons require a numeric type.',
+      })
+  })
+type AttributeFilterValues = z.infer<typeof attributeFilterSchema>
+
 /** Form section inside the existing log explorer; requests use its native SDK. */
 export function LogAttributeFilter({
   value,
@@ -48,58 +118,32 @@ export function LogAttributeFilter({
   onApply: (value?: LogAttributePredicate) => void
   pending: boolean
 }) {
-  const [key, setKey] = useState(value?.key ?? '')
-  const [text, setText] = useState(value?.value ?? '')
-  const [type, setType] = useState<LogAttributeType | typeof ANY>(
-    value?.type ?? ANY
-  )
-  const [operator, setOperator] = useState<LogAttributeOperator>(
-    value?.operator ?? 'eq'
-  )
-  const [errors, setErrors] = useState<Record<string, string | undefined>>({})
+  const form = useForm<AttributeFilterValues>({
+    resolver: zodResolver(attributeFilterSchema),
+    defaultValues: {
+      key: value?.key ?? '',
+      text: value?.value ?? '',
+      type: value?.type ?? ANY,
+      operator: value?.operator ?? 'eq',
+    },
+  })
+  const type = useWatch({ control: form.control, name: 'type' })
+  const operator = useWatch({ control: form.control, name: 'operator' })
+  const errors = {
+    Attribute: form.formState.errors.key?.message,
+    Value: form.formState.errors.text?.message,
+    Comparison: form.formState.errors.operator?.message,
+  }
   const numeric = type === 'integer' || type === 'double'
-  function submit(event: FormEvent) {
-    event.preventDefault()
-    const next: Record<string, string | undefined> = {}
-    if (
-      !key ||
-      new TextEncoder().encode(key).length > 128 ||
-      key.includes('\0')
-    )
-      next.Attribute = 'Enter an attribute key of 1–128 bytes.'
-    if (new TextEncoder().encode(text).length > 16384 || text.includes('\0'))
-      next.Value = 'Enter a value of at most 16 KiB without NUL characters.'
-    if (type === 'integer') {
-      try {
-        if (
-          !/^[+-]?\d+$/.test(text) ||
-          BigInt(text) < -(2n ** 63n) ||
-          BigInt(text) >= 2n ** 63n
-        )
-          next.Value = 'Enter a signed 64-bit integer.'
-      } catch {
-        next.Value = 'Enter a signed 64-bit integer.'
-      }
-    }
-    if (
-      type === 'double' &&
-      (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(text) ||
-        !Number.isFinite(Number(text)))
-    )
-      next.Value = 'Enter a finite number.'
-    if (type === 'boolean' && text !== 'true' && text !== 'false')
-      next.Value = 'Enter true or false.'
-    setErrors(next)
-    if (Object.keys(next).length) return
-    // Keep numeric input as text. Number()/JSON numeric serialization would
-    // round large int64 values before they reach the native query service.
+  const submit = form.handleSubmit(({ key, text, type, operator }) => {
+    // Preserve int64 precision across the native API boundary.
     onApply({
       key,
       value: text,
       type: type === ANY ? undefined : type,
       operator,
     })
-  }
+  })
   return (
     <form
       className="mt-3 space-y-3 border-t pt-3"
@@ -115,8 +159,7 @@ export function LogAttributeFilter({
           {(props) => (
             <Input
               {...props}
-              value={key}
-              onChange={(event) => setKey(event.target.value)}
+              {...form.register('key')}
               placeholder="order.total"
             />
           )}
@@ -126,8 +169,9 @@ export function LogAttributeFilter({
             <Select
               value={type}
               onValueChange={(value) => {
-                setType(value as LogAttributeType | typeof ANY)
-                if (value !== 'integer' && value !== 'double') setOperator('eq')
+                form.setValue('type', value as AttributeFilterValues['type'])
+                if (value !== 'integer' && value !== 'double')
+                  form.setValue('operator', 'eq')
               }}
             >
               <SelectTrigger {...props}>
@@ -149,7 +193,7 @@ export function LogAttributeFilter({
             <Select
               value={operator}
               onValueChange={(value) =>
-                setOperator(value as LogAttributeOperator)
+                form.setValue('operator', value as LogAttributeOperator)
               }
             >
               <SelectTrigger {...props}>
@@ -172,8 +216,7 @@ export function LogAttributeFilter({
           {(props) => (
             <Input
               {...props}
-              value={text}
-              onChange={(event) => setText(event.target.value)}
+              {...form.register('text')}
               placeholder={type === 'boolean' ? 'true' : 'Value'}
             />
           )}
@@ -194,11 +237,7 @@ export function LogAttributeFilter({
             type="button"
             variant="ghost"
             onClick={() => {
-              setKey('')
-              setText('')
-              setType(ANY)
-              setOperator('eq')
-              setErrors({})
+              form.reset({ key: '', text: '', type: ANY, operator: 'eq' })
               onApply(undefined)
             }}
           >

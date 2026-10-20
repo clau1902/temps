@@ -834,6 +834,7 @@ fn quota_test_span(project_id: i32, index: u32) -> SpanRecord {
         );
     }
     SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: ResourceInfo {

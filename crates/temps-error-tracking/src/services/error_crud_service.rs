@@ -747,10 +747,10 @@ impl ErrorCRUDService {
             ));
         }
         if let (Some(key), Some(value)) = (&filter.tag_key, &filter.tag_value) {
-            let value = serde_json::json!({(key):value}).to_string();
+            let object = serde_json::json!({(key):value}).to_string();
             query = query.filter(sea_orm::sea_query::Expr::cust_with_values(
-                "data #> '{trace,extra,tags}' @> CAST($1 AS jsonb)",
-                [value],
+                "(data #> '{trace,extra,tags}' @> CAST($1 AS jsonb) OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(data #> '{trace,extra,tags}')='array' THEN data #> '{trace,extra,tags}' ELSE '[]'::jsonb END) AS tag WHERE tag->>0=$2 AND tag->>1=$3))",
+                [object, key.clone(), value.clone()],
             ));
         }
         let paginator = query.paginate(self.db.as_ref(), page_size);

@@ -4,7 +4,7 @@
 //! Retry identities from protocol identities, never anonymous content alone.
 use crate::providers::AuthContext;
 use sha2::{Digest, Sha256};
-pub const KEY: &str = temps_otel::storage::receipts::SOURCE_KEY;
+use temps_otel::types::IngestIdentity;
 
 fn scoped(auth: &AuthContext, domain: &[u8]) -> Sha256 {
     let mut hash = Sha256::new();
@@ -18,11 +18,11 @@ fn scoped(auth: &AuthContext, domain: &[u8]) -> Sha256 {
     hash
 }
 
-pub fn span(auth: &AuthContext, trace: &str, span: &str) -> String {
+pub fn span(auth: &AuthContext, trace: &str, span: &str) -> IngestIdentity {
     let mut hash = scoped(auth, b"span");
     hash.update(trace.as_bytes());
     hash.update(span.as_bytes());
-    hex::encode(hash.finalize())
+    IngestIdentity::from_digest(hash.finalize().into())
 }
 
 pub fn item(
@@ -31,7 +31,7 @@ pub fn item(
     item_index: usize,
     payload: &[u8],
     record_index: usize,
-) -> Option<String> {
+) -> Option<IngestIdentity> {
     let id = uuid::Uuid::parse_str(event_id?)
         .ok()
         .filter(|id| !id.is_nil())?;
@@ -40,7 +40,7 @@ pub fn item(
     hash.update((item_index as u64).to_be_bytes());
     hash.update(Sha256::digest(payload));
     hash.update((record_index as u64).to_be_bytes());
-    Some(hex::encode(hash.finalize()))
+    Some(IngestIdentity::from_digest(hash.finalize().into()))
 }
 
 #[cfg(test)]

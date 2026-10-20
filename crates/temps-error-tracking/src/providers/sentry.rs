@@ -243,21 +243,13 @@ impl SentryProvider {
                             .map_err(ProviderError::LogBatch)?;
                     }
                     for (record_index, record) in records.iter_mut().enumerate() {
-                        let key = crate::sentry::identities::KEY;
-                        record.attributes.remove(key);
-                        record.attribute_types.remove(key);
-                        if let Some(identity) = crate::sentry::identities::item(
+                        record.ingest_identity = crate::sentry::identities::item(
                             auth,
                             envelope_id.as_deref(),
                             index,
                             payload,
                             record_index,
-                        ) {
-                            record.attributes.insert(key.into(), identity);
-                            record
-                                .attribute_types
-                                .insert(key.into(), temps_otel::types::LogAttributeType::String);
-                        }
+                        );
                         for key in [
                             "user.ip_address",
                             "browser.name",
@@ -322,14 +314,11 @@ impl SentryProvider {
                         ));
                     }
                     for record in &mut records {
-                        record.attributes.insert(
-                            crate::sentry::identities::KEY.into(),
-                            crate::sentry::identities::span(
-                                auth,
-                                &record.trace_id,
-                                &record.span_id,
-                            ),
-                        );
+                        record.ingest_identity = Some(crate::sentry::identities::span(
+                            auth,
+                            &record.trace_id,
+                            &record.span_id,
+                        ));
                     }
                     spans.extend(records);
                 }
@@ -354,18 +343,13 @@ impl SentryProvider {
                         *unsupported.entry("statsd_set").or_insert(0) += batch.unsupported_sets;
                     }
                     for (record_index, record) in batch.points.iter_mut().enumerate() {
-                        record.attributes.remove(crate::sentry::identities::KEY);
-                        if let Some(key) = crate::sentry::identities::item(
+                        record.ingest_identity = crate::sentry::identities::item(
                             auth,
                             envelope_id.as_deref(),
                             index,
                             payload,
                             record_index,
-                        ) {
-                            record
-                                .attributes
-                                .insert(crate::sentry::identities::KEY.into(), key);
-                        }
+                        );
                     }
                     metrics.extend(batch.points);
                 }
@@ -385,18 +369,13 @@ impl SentryProvider {
                         ));
                     }
                     for (record_index, record) in records.iter_mut().enumerate() {
-                        record.attributes.remove(crate::sentry::identities::KEY);
-                        if let Some(key) = crate::sentry::identities::item(
+                        record.ingest_identity = crate::sentry::identities::item(
                             auth,
                             envelope_id.as_deref(),
                             index,
                             payload,
                             record_index,
-                        ) {
-                            record
-                                .attributes
-                                .insert(crate::sentry::identities::KEY.into(), key);
-                        }
+                        );
                     }
                     metrics.extend(records);
                 }

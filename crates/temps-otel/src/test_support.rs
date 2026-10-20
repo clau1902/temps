@@ -1189,6 +1189,7 @@ pub fn metric_point(
     attributes: &[(&str, &str)],
 ) -> MetricPoint {
     MetricPoint {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: ResourceInfo {
