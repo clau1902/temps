@@ -82,6 +82,27 @@ fn enforce_permission_ceiling(auth: &AuthContext, permissions: &[String]) -> Res
     Ok(())
 }
 
+/// Ceiling for token creation. Leaving `permissions` out creates a full-access
+/// token, so it needs the same ceiling as asking for `*`.
+fn enforce_create_ceiling(
+    auth: &AuthContext,
+    permissions: Option<&[String]>,
+) -> Result<(), Problem> {
+    let full_access = ["*".to_string()];
+    enforce_permission_ceiling(auth, permissions.unwrap_or(&full_access))
+}
+
+/// Ceiling for token updates. An update that leaves `permissions` out keeps the
+/// stored permissions, so there is nothing new to grant.
+fn enforce_update_ceiling(
+    auth: &AuthContext,
+    permissions: Option<&[String]>,
+) -> Result<(), Problem> {
+    permissions.map_or(Ok(()), |requested| {
+        enforce_permission_ceiling(auth, requested)
+    })
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct ListDeploymentTokensQuery {
     #[schema(example = 1)]
@@ -207,13 +228,7 @@ async fn create_deployment_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensCreate);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
-    // Leaving `permissions` out creates a full-access token, so it needs the
-    // same ceiling as asking for `*`.
-    let full_access = ["*".to_string()];
-    enforce_permission_ceiling(
-        &auth,
-        request.permissions.as_deref().unwrap_or(&full_access),
-    )?;
+    enforce_create_ceiling(&auth, request.permissions.as_deref())?;
 
     let response = app_state
         .deployment_token_service
@@ -294,9 +309,7 @@ async fn update_deployment_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensWrite);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
-    if let Some(permissions) = request.permissions.as_deref() {
-        enforce_permission_ceiling(&auth, permissions)?;
-    }
+    enforce_update_ceiling(&auth, request.permissions.as_deref())?;
 
     let response = app_state
         .deployment_token_service
@@ -500,5 +513,85 @@ mod tests {
         let user = auth_with(Role::User);
         enforce_permission_ceiling(&user, &names(&["not-a-permission"]))
             .expect("the service answers 400 for names it cannot parse");
+    }
+
+    #[test]
+    fn refusal_matches_the_api_key_ceiling_error() {
+        let user = auth_with(Role::User);
+        let problem = enforce_permission_ceiling(&user, &names(&["visitors:enrich"]))
+            .expect_err("a user lacks analytics:write");
+
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem.body.get("error_code"),
+            Some(&serde_json::json!("PERMISSION_CEILING_EXCEEDED"))
+        );
+        assert_eq!(
+            problem.body.get("type"),
+            Some(&serde_json::json!(
+                "https://temps.sh/probs/permission-ceiling-exceeded"
+            ))
+        );
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|detail| detail.as_str())
+            .expect("the refusal explains itself");
+        assert!(
+            detail.contains("visitors:enrich") && detail.contains("analytics:write"),
+            "the detail names the requested and the missing permission: {detail}"
+        );
+    }
+
+    #[test]
+    fn refusal_names_the_first_permission_that_exceeds_the_caller() {
+        let user = auth_with(Role::User);
+        let problem = enforce_permission_ceiling(
+            &user,
+            &names(&["analytics:read", "blob:delete", "visitors:enrich"]),
+        )
+        .expect_err("blob:delete is beyond a user");
+
+        let detail = problem.body.get("detail").and_then(|d| d.as_str()).unwrap();
+        assert!(detail.contains("blob:delete"), "{detail}");
+        assert!(!detail.contains("visitors:enrich"), "{detail}");
+    }
+
+    #[test]
+    fn create_without_permissions_is_held_to_full_access() {
+        // An omitted `permissions` field creates a `*` token, so a user, who
+        // cannot hold everything, is refused and an admin is not.
+        let problem = enforce_create_ceiling(&auth_with(Role::User), None)
+            .expect_err("a user cannot create a token with full access by omission");
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+
+        enforce_create_ceiling(&auth_with(Role::Admin), None)
+            .expect("an admin holds everything a default token carries");
+    }
+
+    #[test]
+    fn create_with_an_explicit_list_is_held_to_that_list() {
+        let user = auth_with(Role::User);
+        enforce_create_ceiling(&user, Some(&names(&["kv:write"])))
+            .expect("kv:write is within the user role");
+        enforce_create_ceiling(&user, Some(&names(&["kv:delete"]))).expect_err("kv:delete is not");
+    }
+
+    #[test]
+    fn update_without_permissions_changes_nothing_and_is_not_refused() {
+        // Renaming or deactivating a token must keep working for a role that
+        // could not mint the token's permissions itself.
+        enforce_update_ceiling(&auth_with(Role::User), None)
+            .expect("no permissions in the request means nothing new is granted");
+    }
+
+    #[test]
+    fn update_that_widens_permissions_is_held_to_the_ceiling() {
+        let user = auth_with(Role::User);
+        enforce_update_ceiling(&user, Some(&names(&["analytics:read"])))
+            .expect("analytics:read is within the user role");
+        let problem = enforce_update_ceiling(&user, Some(&names(&["visitors:enrich"])))
+            .expect_err("widening to visitors:enrich exceeds a user");
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
     }
 }
