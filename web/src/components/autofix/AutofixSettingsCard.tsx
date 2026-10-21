@@ -27,7 +27,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
@@ -128,11 +128,18 @@ export function AutofixSettingsCard({ projectId }: { projectId: number }) {
   })
 
   const settings = capability.data?.settings
+  // The project the form's current baseline was loaded from.
+  const baselineProject = useRef<number | null>(null)
   // Every refetch (after a pause toggle, a save, a window refocus) brings a new
   // `settings` object. Take the server's values as the new baseline, but keep
-  // whatever the user has changed and not saved yet.
+  // whatever the user has changed and not saved yet -- only for the same
+  // project. Unsaved edits made for one project must never ride along into
+  // another project's settings, where Save would write them.
   useEffect(() => {
-    if (settings) form.reset(toForm(settings), { keepDirtyValues: true })
+    if (!settings) return
+    const sameProject = baselineProject.current === settings.project_id
+    baselineProject.current = settings.project_id
+    form.reset(toForm(settings), { keepDirtyValues: sameProject })
   }, [settings, form])
 
   const save = (values: FormValues) =>

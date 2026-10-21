@@ -5525,7 +5525,9 @@ impl ConversationService {
             == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
             .then(|| self.goal_support.clone())
             .flatten();
-        let sandbox_link_opt = self.sandbox_link_for(conv);
+        let sandbox_link_opt = self
+            .sandbox_link_for(conv)
+            .map(|link| link.with_project_access(project_access_checker.clone()));
         let blueprint_support_opt = (conv.context_type
             == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
             .then(|| self.blueprint_support.clone())

@@ -238,6 +238,61 @@ pub fn connected_project_ids(linked: &[LinkedService]) -> Vec<i32> {
     projects
 }
 
+/// The projects among a sandbox's links that `auth` can no longer reach, so
+/// the links made through them must go before the sandbox is used again.
+///
+/// A link is checked when it is made, but access can be taken away later: a
+/// member removed from a project would otherwise keep the credentials and the
+/// network route to its services for as long as the sandbox lives. Mirrors
+/// `project_access_guard!`: a credential confined to another project loses the
+/// link, instance administrators and deployment tokens are not subject to team
+/// membership, and with no team layer installed there is no membership to
+/// lose. A failed check is an `Err`, so nothing runs on an answer that could
+/// not be had.
+pub(crate) async fn revoked_link_projects(
+    auth: &AuthContext,
+    linked: &[LinkedService],
+    checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+) -> Result<Vec<i32>, String> {
+    let projects = connected_project_ids(linked);
+    let mut revoked: Vec<i32> = projects
+        .iter()
+        .copied()
+        .filter(|project_id| !auth.is_scoped_to_project(*project_id))
+        .collect();
+    if projects.is_empty()
+        || auth.is_deployment_token()
+        || auth.is_admin()
+        || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin)
+    {
+        return Ok(revoked);
+    }
+    let Some(checker) = checker else {
+        return Ok(revoked);
+    };
+    let Some(user_id) = auth.user_id_opt() else {
+        // No user to check membership for: nothing reached through a project
+        // stays linked.
+        return Ok(projects);
+    };
+    let access = checker
+        .user_can_access_projects(user_id, &projects)
+        .await
+        .map_err(|error| {
+            format!(
+                "access to projects {projects:?} could not be checked for user {user_id}: {error}"
+            )
+        })?;
+    for project_id in projects {
+        let allowed = access.get(&project_id).copied().unwrap_or(false);
+        if !allowed && !revoked.contains(&project_id) {
+            revoked.push(project_id);
+        }
+    }
+    revoked.sort_unstable();
+    Ok(revoked)
+}
+
 /// What linking the sandbox to services gave it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct SandboxConnections {
@@ -917,6 +972,9 @@ pub struct SandboxLinkService {
     /// Deploys an archive of the sandbox's files; absent on a server without
     /// the deployments plugin.
     pub(crate) source_drop: Option<Arc<dyn temps_core::SourceDropDeployer>>,
+    /// The team layer, when one is installed: every tool call re-checks that
+    /// the user can still reach each project the sandbox is linked through.
+    project_access: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     /// Credentials resolved for recent commands, by sandbox and project set.
     /// Held in memory only.
     credentials: Arc<Mutex<HashMap<String, CachedCredentials>>>,
@@ -929,6 +987,7 @@ impl SandboxLinkService {
             sandboxes,
             audit: None,
             source_drop: None,
+            project_access: None,
             credentials: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -936,6 +995,16 @@ impl SandboxLinkService {
     /// Let the assistant deploy the sandbox's files as a project's source.
     pub fn with_source_drop(mut self, deployer: Arc<dyn temps_core::SourceDropDeployer>) -> Self {
         self.source_drop = Some(deployer);
+        self
+    }
+
+    /// Check project membership again on every tool call, with the team layer's
+    /// current answer. Without one, there is no membership to check.
+    pub fn with_project_access(
+        mut self,
+        checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    ) -> Self {
+        self.project_access = checker;
         self
     }
 
@@ -1449,6 +1518,107 @@ impl SandboxLinkService {
         }
     }
 
+    /// Unlink the sandbox from every project the user can no longer reach,
+    /// before anything runs in it: that drops the project's services from the
+    /// sandbox's network and its commands' credentials. `Ok(Some(_))` is a
+    /// notice saying what was disconnected; `Err` is the complete tool result
+    /// when this could not be made sure of.
+    async fn drop_revoked_links(
+        &self,
+        conversation_id: i64,
+        link: &SandboxLink,
+        auth: &AuthContext,
+    ) -> Result<Option<String>, String> {
+        let user_id = auth.user_id();
+        let nothing_ran = |reason: String| {
+            warn!(
+                conversation_id,
+                sandbox_id = %link.sandbox_id,
+                "could not confirm the sandbox's project access: {reason}"
+            );
+            format!(
+                "Nothing ran: access to the projects this sandbox is connected to could not be \
+                 confirmed ({reason}). Tell the user and try again shortly."
+            )
+        };
+        let linked = self
+            .sandboxes
+            .linked_services(user_id, &link.sandbox_id)
+            .await
+            .map_err(|error| nothing_ran(error.to_string()))?;
+        let revoked = revoked_link_projects(auth, &linked, self.project_access.as_ref())
+            .await
+            .map_err(nothing_ran)?;
+        if revoked.is_empty() {
+            return Ok(None);
+        }
+        let mut result = Ok(());
+        for &project_id in &revoked {
+            if let Err(error) = self
+                .sandboxes
+                .unlink_project(user_id, &link.sandbox_id, project_id)
+                .await
+            {
+                result = Err(format!("unlinking project {project_id} failed: {error}"));
+                break;
+            }
+            self.audit_revoked(conversation_id, user_id, &link.sandbox_id, project_id)
+                .await;
+        }
+        // Whatever was unlinked, the cached credentials may name it.
+        self.forget_credentials(&link.sandbox_id);
+        result.map_err(nothing_ran)?;
+        info!(
+            conversation_id,
+            sandbox_id = %link.sandbox_id,
+            user_id,
+            projects = ?revoked,
+            "disconnected the sandbox from projects the user can no longer access"
+        );
+        Ok(Some(format!(
+            "The sandbox was disconnected from project(s) {revoked:?}: you no longer have access \
+             to them, so their services and credentials are gone from it."
+        )))
+    }
+
+    async fn audit_revoked(
+        &self,
+        conversation_id: i64,
+        user_id: i32,
+        sandbox_id: &str,
+        project_id: i32,
+    ) {
+        let Some(audit) = self.audit.as_ref() else {
+            return;
+        };
+        let public_id = match ai_conversations::Entity::find_by_id(conversation_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(conversation)) => conversation.public_id,
+            Ok(None) | Err(_) => conversation_id.to_string(),
+        };
+        let entry = crate::audit::AiSandboxServicesDisconnectedAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: None,
+                user_agent: "temps-ai-assistant".to_string(),
+            },
+            project_id: Some(project_id),
+            service_id: None,
+            conversation_id: public_id,
+            sandbox_id: sandbox_id.to_string(),
+        };
+        if let Err(error) = audit.create_audit_log(&entry).await {
+            warn!(
+                conversation_id,
+                sandbox_id,
+                project_id,
+                "failed to audit the sandbox disconnected from a revoked project: {error}"
+            );
+        }
+    }
+
     /// The variables a command in the chat's sandbox runs with: empty when it
     /// is linked to no service. `Err` is the complete tool result for a command
     /// that must not run without them.
@@ -1565,6 +1735,14 @@ impl SandboxLinkService {
             notice,
         } = match self.ready_sandbox(tool, conversation_id, user_id).await {
             Ok(ready) => ready,
+            Err(message) => return message,
+        };
+        let notice = match self.drop_revoked_links(conversation_id, &link, auth).await {
+            Ok(None) => notice,
+            Ok(Some(revoked)) => Some(match notice {
+                Some(earlier) => format!("{earlier}\n{revoked}"),
+                None => revoked,
+            }),
             Err(message) => return message,
         };
         let result = match tool {
@@ -2375,6 +2553,139 @@ impl SandboxLinkService {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// A team layer whose members can reach `allowed` only, or that fails.
+    struct Membership {
+        allowed: Vec<i32>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for Membership {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err(Box::new(std::io::Error::other("team store unavailable")));
+            }
+            Ok(self.allowed.contains(&project_id))
+        }
+    }
+
+    fn membership(allowed: &[i32]) -> Arc<dyn temps_core::ProjectAccessChecker> {
+        Arc::new(Membership {
+            allowed: allowed.to_vec(),
+            fail: false,
+        })
+    }
+
+    fn member_session(role: temps_auth::permissions::Role) -> AuthContext {
+        let now = chrono::Utc::now();
+        AuthContext::new_session(
+            temps_entities::users::Model {
+                id: 11,
+                name: "Team Member".to_string(),
+                email: "member@example.com".to_string(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            role,
+        )
+    }
+
+    /// Links through projects 3 and 5 (twice), and one made to a service
+    /// directly.
+    fn links() -> Vec<LinkedService> {
+        [(1, Some(3)), (2, Some(5)), (4, Some(5)), (6, None)]
+            .into_iter()
+            .map(|(service_id, project_id)| LinkedService {
+                service_id,
+                project_id,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_member_removed_from_a_project_loses_the_links_made_through_it() {
+        let auth = member_session(temps_auth::permissions::Role::User);
+        let checker = membership(&[3]);
+        let revoked = revoked_link_projects(&auth, &links(), Some(&checker))
+            .await
+            .expect("the check completes");
+        assert_eq!(revoked, vec![5]);
+    }
+
+    #[tokio::test]
+    async fn a_member_of_every_linked_project_keeps_them_all() {
+        let auth = member_session(temps_auth::permissions::Role::User);
+        let checker = membership(&[3, 5]);
+        let revoked = revoked_link_projects(&auth, &links(), Some(&checker))
+            .await
+            .expect("the check completes");
+        assert!(revoked.is_empty(), "{revoked:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_membership_check_runs_nothing() {
+        let auth = member_session(temps_auth::permissions::Role::User);
+        let checker: Arc<dyn temps_core::ProjectAccessChecker> = Arc::new(Membership {
+            allowed: vec![3, 5],
+            fail: true,
+        });
+        let message = revoked_link_projects(&auth, &links(), Some(&checker))
+            .await
+            .unwrap_err();
+        assert!(message.contains("[3, 5]"), "{message}");
+        assert!(message.contains("user 11"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn instance_admins_are_not_subject_to_team_membership() {
+        let auth = member_session(temps_auth::permissions::Role::Admin);
+        let checker = membership(&[]);
+        let revoked = revoked_link_projects(&auth, &links(), Some(&checker))
+            .await
+            .expect("the check completes");
+        assert!(revoked.is_empty(), "{revoked:?}");
+    }
+
+    #[tokio::test]
+    async fn without_a_team_layer_there_is_no_membership_to_lose() {
+        let auth = member_session(temps_auth::permissions::Role::User);
+        let revoked = revoked_link_projects(&auth, &links(), None)
+            .await
+            .expect("the check completes");
+        assert!(revoked.is_empty(), "{revoked:?}");
+    }
+
+    #[tokio::test]
+    async fn links_made_to_a_service_directly_are_not_project_access() {
+        let auth = member_session(temps_auth::permissions::Role::User);
+        let checker = membership(&[]);
+        let direct = vec![LinkedService {
+            service_id: 6,
+            project_id: None,
+        }];
+        let revoked = revoked_link_projects(&auth, &direct, Some(&checker))
+            .await
+            .expect("nothing to check");
+        assert!(revoked.is_empty(), "{revoked:?}");
+    }
 
     fn numbered(lines: usize) -> String {
         (1..=lines).map(|n| format!("line {n}\n")).collect()

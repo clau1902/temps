@@ -11,6 +11,7 @@ import {
 } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
+import { getAutofixCapabilityOptions } from '@/api/client/@tanstack/react-query.gen'
 import { client } from '@/api/client/client.gen'
 import type {
   AutofixCapabilityResponse,
@@ -29,23 +30,32 @@ afterEach(() => {
 })
 
 const PROJECT = 7
+const OTHER_PROJECT = 8
 
 /**
  * A tiny autofix backend: the capability read returns whatever the last
  * write left behind, so a pause toggle or a save is followed by a refetch
  * that hands the card a fresh `settings` object, as the real server does.
+ * Each project keeps its own settings.
  */
 function serve() {
-  let settings: AutofixSettingsResponse = {
-    project_id: PROJECT,
-    mode: 'off',
-    min_confidence: 4,
-    paused: false,
-    protected_paths: [],
-    test_command: null,
-  }
+  const stored = new Map<number, AutofixSettingsResponse>(
+    [PROJECT, OTHER_PROJECT].map((project_id) => [
+      project_id,
+      {
+        project_id,
+        mode: 'off',
+        min_confidence: 4,
+        paused: false,
+        protected_paths: [],
+        test_command: project_id === OTHER_PROJECT ? 'make check' : null,
+      },
+    ])
+  )
   const writes: Array<{ path: string; body: unknown }> = []
-  const capability = (): AutofixCapabilityResponse => ({
+  const capability = (
+    settings: AutofixSettingsResponse
+  ): AutofixCapabilityResponse => ({
     configured: true,
     delivery: 'pull_request',
     source_kind: 'github',
@@ -57,16 +67,22 @@ function serve() {
       async (input: RequestInfo | URL) => {
         const request = input instanceof Request ? input : new Request(input)
         const path = new URL(request.url).pathname
-        if (path === `/api/projects/${PROJECT}/autofix`) {
-          return Response.json(capability())
+        const match = /^\/api\/projects\/(\d+)\/autofix(\/\w+)?$/.exec(path)
+        const settings = match ? stored.get(Number(match[1])) : undefined
+        if (!match || !settings) return new Promise<Response>(() => {})
+        const save = (next: AutofixSettingsResponse) => {
+          stored.set(next.project_id, next)
+          return Response.json(next)
         }
-        if (path === `/api/projects/${PROJECT}/autofix/pause`) {
+        if (match[2] === undefined) {
+          return Response.json(capability(settings))
+        }
+        if (match[2] === '/pause') {
           const body = (await request.json()) as { paused: boolean }
           writes.push({ path, body })
-          settings = { ...settings, paused: body.paused }
-          return Response.json(settings)
+          return save({ ...settings, paused: body.paused })
         }
-        if (path === `/api/projects/${PROJECT}/autofix/settings`) {
+        if (match[2] === '/settings') {
           const body = (await request.json()) as {
             mode: string
             min_confidence: number
@@ -74,8 +90,7 @@ function serve() {
             test_command: string
           }
           writes.push({ path, body })
-          settings = { ...settings, ...body }
-          return Response.json(settings)
+          return save({ ...settings, ...body })
         }
         return new Promise<Response>(() => {})
       },
@@ -85,17 +100,20 @@ function serve() {
   return writes
 }
 
-function renderCard() {
-  const queries = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  })
-  return render(
+function renderCard(queries = newQueryClient()) {
+  const tree = (projectId: number) => (
     <QueryClientProvider client={queries}>
       <MemoryRouter>
-        <AutofixSettingsCard projectId={PROJECT} />
+        <AutofixSettingsCard projectId={projectId} />
       </MemoryRouter>
     </QueryClientProvider>
   )
+  const view = render(tree(PROJECT))
+  return { ...view, showProject: (id: number) => view.rerender(tree(id)) }
+}
+
+function newQueryClient() {
+  return new QueryClient({ defaultOptions: { queries: { retry: false } } })
 }
 
 test('pausing autofix keeps the policy edits that are not saved yet', async () => {
@@ -143,4 +161,40 @@ test('saving makes the saved values the form baseline', async () => {
   fireEvent.click(toggle)
   await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('true'))
   expect(command.value).toBe('bun test')
+})
+
+test('switching to another cached project drops the unsaved edits', async () => {
+  const writes = serve()
+  const queries = newQueryClient()
+  // The other project's settings are already in the cache, so the card gets
+  // them on the very first render after the switch.
+  await queries.prefetchQuery(
+    getAutofixCapabilityOptions({ path: { project_id: OTHER_PROJECT } })
+  )
+  const { showProject } = renderCard(queries)
+
+  const command = (await screen.findByPlaceholderText(
+    'npm test'
+  )) as HTMLInputElement
+  fireEvent.change(command, { target: { value: 'rm -rf build' } })
+  const paths = screen.getByRole('textbox', {
+    name: 'Protected paths',
+  }) as HTMLTextAreaElement
+  fireEvent.change(paths, { target: { value: 'secrets/**' } })
+
+  showProject(OTHER_PROJECT)
+
+  // The form shows the other project's own values, not the edits made for
+  // the first one, and saving writes only those.
+  await waitFor(() => expect(command.value).toBe('make check'))
+  expect(paths.value).toBe('')
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(writes).toHaveLength(1))
+  expect(writes[0]?.path).toBe(
+    `/api/projects/${OTHER_PROJECT}/autofix/settings`
+  )
+  expect(writes[0]?.body).toMatchObject({
+    test_command: 'make check',
+    protected_paths: [],
+  })
 })
