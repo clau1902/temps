@@ -19,7 +19,7 @@ use temps_network::allocator::AllocatorError;
 use tracing::error;
 use utoipa::ToSchema;
 
-use crate::handlers::audit::ClusterComputePoolChangedAudit;
+use crate::handlers::audit::{ClusterComputePoolChangedAudit, ClusterComputePoolConfirmedAudit};
 use crate::services::cluster_network::{reassignments, ClusterNetworkError, ClusterNetworkService};
 pub use crate::services::cluster_network::{
     ClusterNetworkChangeResponse, ClusterNetworkControlPlane, ClusterNetworkNode,
@@ -151,26 +151,37 @@ pub async fn update_cluster_network(
     let prefix_len = request
         .subnet_prefix_len
         .unwrap_or(before.subnet_prefix_len);
-    let change = state
+    let (change, first_confirmation) = state
         .service
         .change_pool(&request.compute_pool_cidr, prefix_len)
         .await
         .map_err(problem)?;
     let reassigned = reassignments(&change);
+    let context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+    let pool = format!(
+        "{}/{}",
+        change.config.compute_pool_cidr, change.config.subnet_prefix_len
+    );
+    if first_confirmation {
+        let audit = ClusterComputePoolConfirmedAudit {
+            context: context.clone(),
+            pool: pool.clone(),
+        };
+        if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+            error!(%error, "cluster compute pool confirmed but audit record failed");
+        }
+    }
     if before.compute_pool_cidr != change.config.compute_pool_cidr.to_string()
         || before.subnet_prefix_len != change.config.subnet_prefix_len
     {
         let audit = ClusterComputePoolChangedAudit {
-            context: AuditContext {
-                user_id: auth.user_id(),
-                ip_address: Some(metadata.ip_address.clone()),
-                user_agent: metadata.user_agent.clone(),
-            },
+            context,
             from: format!("{}/{}", before.compute_pool_cidr, before.subnet_prefix_len),
-            to: format!(
-                "{}/{}",
-                change.config.compute_pool_cidr, change.config.subnet_prefix_len
-            ),
+            to: pool,
             reassigned: reassigned
                 .iter()
                 .map(|moved| format!("{}: {} -> {}", moved.node_name, moved.from, moved.to))

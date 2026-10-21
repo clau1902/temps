@@ -1931,14 +1931,17 @@ export function NodesPage() {
   const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
   const nodeCount = nodes.length
+  // The list always includes this server itself; only workers count here.
+  const workerCount = nodes.filter((node) => node.role !== 'control-plane')
+    .length
   // "No nodes" means two very different things. With local workloads the
   // control plane runs everything itself and worker nodes are optional
   // scale-out; without them nothing can run at all and this page is the
   // onboarding step the operator must complete.
-  const needsFirstNode = shouldPromptForFirstWorkerNode(capability, nodeCount)
+  const needsFirstNode = shouldPromptForFirstWorkerNode(capability, workerCount)
   // A cluster with no worker yet opens on adding one; otherwise it is a click.
   const [addingChosen, setAdding] = useState<boolean | null>(null)
-  const adding = addingChosen ?? nodeCount === 0
+  const adding = addingChosen ?? workerCount === 0
 
   // This list polls, so it is the first thing in the console to learn that a
   // worker finished `temps join` (or dropped out). Re-read the capability

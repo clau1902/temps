@@ -45,6 +45,9 @@ chrono = { workspace = true }
 temps-providers = { path = "../temps-providers" }
 ipnet = "2.10"
 parking_lot = "0.12"
+libc = { workspace = true }
+if-addrs = "0.15"
+x25519-dalek = { workspace = true }
 rand = { workspace = true }
 # Needed for hyper::upgrade::on in the internal proxy's WS tunnel path,
 # and for the mTLS server accept loop (ADR-020 WS-2.1).

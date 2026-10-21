@@ -24,9 +24,9 @@ use tracing::{debug, error, info};
 
 use crate::errors::DnsError;
 use crate::providers::{
-    AzureProvider, BunnyProvider, CloudflareProvider, DigitalOceanProvider, DnsProvider,
-    DnsProviderType, GcpProvider, ManualDnsProvider, NamecheapProvider, PebbleDnsProvider,
-    ProviderCredentials, Route53Provider,
+    AzureProvider, BunnyProvider, CloudflareCredentials, CloudflareProvider, DigitalOceanProvider,
+    DnsProvider, DnsProviderType, GcpProvider, ManualDnsProvider, NamecheapProvider,
+    PebbleDnsProvider, ProviderCredentials, Route53Provider,
 };
 use crate::services::hostname_sync::{self, ConflictDecisions, HostnameModeResult};
 use temps_core::{AppSettings, PublicHostnameStrategy};
@@ -519,6 +519,36 @@ impl DnsProviderService {
         self.create_provider_instance(provider)
             .map(|instance| instance.capabilities().flat_hostnames)
             .unwrap_or(false)
+    }
+
+    /// The decrypted credentials of a Cloudflare provider, for callers that
+    /// drive Cloudflare APIs beyond DNS with the same token (ADR 058 tunnels).
+    pub fn cloudflare_credentials(
+        &self,
+        provider: &dns_providers::Model,
+    ) -> Result<CloudflareCredentials, DnsError> {
+        if !provider.is_active {
+            return Err(DnsError::ProviderInactive {
+                provider_id: provider.id,
+                provider_name: provider.name.clone(),
+            });
+        }
+        if DnsProviderType::from_str(&provider.provider_type)? != DnsProviderType::Cloudflare {
+            return Err(DnsError::InvalidCredentials(format!(
+                "DNS provider '{}' is {}, not Cloudflare",
+                provider.name, provider.provider_type
+            )));
+        }
+        let credentials_json = self
+            .encryption_service
+            .decrypt_string(&provider.credentials)
+            .map_err(|e| DnsError::Decryption(e.to_string()))?;
+        match serde_json::from_str::<ProviderCredentials>(&credentials_json)? {
+            ProviderCredentials::Cloudflare(credentials) => Ok(credentials),
+            _ => Err(DnsError::InvalidCredentials(
+                "Expected Cloudflare credentials".into(),
+            )),
+        }
     }
 
     pub fn create_provider_instance(

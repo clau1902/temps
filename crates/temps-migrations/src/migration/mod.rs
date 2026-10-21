@@ -21,6 +21,9 @@ mod m20261019_000001_mfa_verification_guards;
 mod m20261020_000001_node_pairings_outbound;
 mod m20261020_000002_compute_pool_collisions;
 mod m20261020_000003_compute_pool_confirmed;
+mod m20261020_000004_ingress_connectors;
+mod m20261020_000005_node_public_ingress;
+mod m20261021_000001_ingress_hostname_choices;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -778,6 +781,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000002_compute_pool_collisions::Migration),
             // ADR 056: the console asks for the pool once before the first node.
             Box::new(m20261020_000003_compute_pool_confirmed::Migration),
+            // ADR 058: ingress connectors (tunnels) and what they publish.
+            Box::new(m20261020_000004_ingress_connectors::Migration),
+            // ADR 058 D7: direct worker ingress configured from the console.
+            Box::new(m20261020_000005_node_public_ingress::Migration),
+            // ADR 058 D9: the operator decides what each tunnel publishes.
+            Box::new(m20261021_000001_ingress_hostname_choices::Migration),
         ]
     }
 }

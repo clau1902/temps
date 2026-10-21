@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  clusterNetworkGetOptions,
+  clusterNetworkUpdateMutation,
+} from '@/api/client/@tanstack/react-query.gen'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, LockKeyhole, Network } from 'lucide-react'
@@ -27,11 +31,8 @@ import { problemDetail } from '@/lib/api-problem'
 import { buildMultiNodeSetupCommand } from '@/lib/cluster-network-command'
 import {
   clusterNetworkFormSchema,
-  clusterNetworkQueryKey,
-  updateClusterNetwork,
   type ClusterNetworkFormValues,
   type ClusterNetworkStatus,
-  type UpdateClusterNetworkRequest,
 } from '@/lib/cluster-network'
 import { isForbiddenRead } from '@/lib/read-failure'
 
@@ -101,9 +102,12 @@ export function ClusterNetworkForm({
     useSensitiveActionVerification()
 
   const update = useMutation({
-    mutationFn: updateClusterNetwork,
+    ...clusterNetworkUpdateMutation(),
     onSuccess: (answer) => {
-      queryClient.setQueryData(clusterNetworkQueryKey, answer.status)
+      queryClient.setQueryData(
+        clusterNetworkGetOptions().queryKey,
+        answer.status
+      )
       const moved = answer.reassigned
         .map((node) => `${node.node_name} ${node.from} → ${node.to}`)
         .join(', ')
@@ -114,7 +118,7 @@ export function ClusterNetworkForm({
       })
       onSaved?.()
     },
-    onError: (failure, variables: UpdateClusterNetworkRequest) => {
+    onError: (failure, variables) => {
       if (handleSensitiveActionError(failure, () => update.mutate(variables)))
         return
     },
@@ -149,8 +153,10 @@ export function ClusterNetworkForm({
         onSubmit={form.handleSubmit((values) => {
           if (locked || unchanged) return
           update.mutate({
-            compute_pool_cidr: values.poolCidr.trim(),
-            subnet_prefix_len: Number(values.nodePrefix),
+            body: {
+              compute_pool_cidr: values.poolCidr.trim(),
+              subnet_prefix_len: Number(values.nodePrefix),
+            },
           })
         })}
       >
@@ -159,7 +165,7 @@ export function ClusterNetworkForm({
             <Label htmlFor="cluster-compute-pool">Pool CIDR</Label>
             <Input
               id="cluster-compute-pool"
-              {...form.register('poolCidr')}
+              {...form.register('poolCidr', { deps: ['nodePrefix'] })}
               disabled={locked || update.isPending}
               spellCheck={false}
               className="font-mono"

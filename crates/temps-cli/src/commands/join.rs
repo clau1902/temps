@@ -83,6 +83,35 @@ pub struct JoinCommand {
     /// lower than the interface reports.
     #[arg(long)]
     pub underlay_mtu: Option<u32>,
+
+    /// Whether this worker takes public traffic (ADR 058 D7): `off` (no
+    /// public ports), `fixed` (listen where --listen says) or `delegated`
+    /// (the console chooses: a tunnel, or open ports on one of this
+    /// worker's addresses). Without it a rejoin keeps the saved setting,
+    /// and a new worker starts `off`. Change it later with
+    /// `temps agent ingress`.
+    #[arg(long, value_enum)]
+    pub ingress: Option<IngressFlag>,
+
+    /// With `--ingress fixed`: local address to listen on, or `auto` for the
+    /// interface holding the default route.
+    #[arg(long, default_value = "auto")]
+    pub listen: String,
+
+    /// With `--ingress fixed`: local port for public HTTP.
+    #[arg(long, default_value_t = 80)]
+    pub ingress_http_port: u16,
+
+    /// With `--ingress fixed`: local port for public HTTPS.
+    #[arg(long, default_value_t = 443)]
+    pub ingress_https_port: u16,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressFlag {
+    Off,
+    Fixed,
+    Delegated,
 }
 
 /// Response body from the control plane registration endpoint.
@@ -820,6 +849,9 @@ impl JoinCommand {
 
     /// Save agent config to the agent data directory with restrictive permissions (0600).
     fn save_agent_config(&self, config: &temps_agent::AgentConfig) -> anyhow::Result<()> {
+        let mut config = config.clone();
+        self.apply_ingress(&mut config)?;
+        let config = &config;
         let temps_dir = crate::commands::agent::agent_data_dir();
         std::fs::create_dir_all(&temps_dir)?;
 
@@ -842,6 +874,59 @@ impl JoinCommand {
         }
 
         println!("Agent config saved to {}", config_path.display());
+        Ok(())
+    }
+
+    /// `--ingress`, else what this worker allowed before a rejoin, else off.
+    fn apply_ingress(&self, config: &mut temps_agent::AgentConfig) -> anyhow::Result<()> {
+        use temps_core::worker_ingress::{IngressMode, LocalIngress};
+        let Some(flag) = self.ingress else {
+            if config.ingress.is_none() {
+                let saved = load_saved_agent_config();
+                if let Some(saved) = saved_config_for_reenrollment(
+                    saved.as_ref(),
+                    &config.node_name,
+                    &config.control_plane_url,
+                ) {
+                    config.ingress = saved.ingress.clone();
+                }
+            }
+            return Ok(());
+        };
+        let mode = match flag {
+            IngressFlag::Off => IngressMode::Off,
+            IngressFlag::Fixed => IngressMode::Fixed,
+            IngressFlag::Delegated => IngressMode::Delegated,
+        };
+        let mut ingress = LocalIngress {
+            mode,
+            ..LocalIngress::default()
+        };
+        if mode == IngressMode::Fixed {
+            ingress.listen = match self.listen.trim() {
+                "" | "auto" => None,
+                value => {
+                    let ip: std::net::IpAddr = value.parse().map_err(|_| {
+                        anyhow::anyhow!("--listen '{value}' is not an IP address. Use an address of this machine, or `auto`.")
+                    })?;
+                    if ip.is_unspecified() || ip.is_loopback() {
+                        anyhow::bail!("--listen {ip} would not take traffic from outside this machine. Use the address of a network interface, or `auto`.");
+                    }
+                    Some(ip)
+                }
+            };
+            if self.ingress_http_port == 0
+                || self.ingress_https_port == 0
+                || self.ingress_http_port == self.ingress_https_port
+            {
+                anyhow::bail!("--ingress-http-port and --ingress-https-port must be two different, non-zero ports.");
+            }
+            ingress.http_port = self.ingress_http_port;
+            ingress.https_port = self.ingress_https_port;
+        }
+        config.ingress = Some(ingress);
+        // The legacy listen fields would disagree with an explicit mode.
+        config.public_ingress_address = None;
         Ok(())
     }
 
@@ -987,6 +1072,7 @@ impl JoinCommand {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: Some(public_ingress_private_key),
+            ingress: None,
             mesh_key_dir: crate::commands::agent::agent_data_dir().join("wireguard"),
             wg_endpoint: wg_endpoint.map(|endpoint| endpoint.to_string()),
             control_plane_trust: Some(control_plane.trust),
@@ -1132,6 +1218,7 @@ impl JoinCommand {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            ingress: None,
             mesh_key_dir: key_dir,
             wg_endpoint: Some(code.node_endpoint.to_string()),
             // Only brings the mesh up; it never calls the control plane.
@@ -1364,6 +1451,7 @@ impl JoinCommand {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            ingress: None,
             mesh_key_dir: key_dir,
             wg_endpoint: None,
             // Only brings the mesh up; it never calls the control plane.
@@ -1632,6 +1720,7 @@ impl JoinCommand {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: Some(public_ingress_private_key),
+            ingress: None,
             mesh_key_dir: crate::commands::agent::agent_data_dir().join("wireguard"),
             wg_endpoint: None,
             control_plane_trust: Some(trust.agent_trust()),
@@ -2195,6 +2284,7 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            ingress: None,
             mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
             wg_endpoint: None,
             control_plane_trust: Some(temps_agent::ControlPlaneTrust::PublicRoots),

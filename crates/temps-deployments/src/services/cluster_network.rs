@@ -128,12 +128,13 @@ impl ClusterNetworkService {
         ))
     }
 
-    /// Change the pool; see [`PostgresAllocator::configure_pool`].
+    /// Change the pool; see [`PostgresAllocator::configure_pool`]. Also
+    /// returns whether this save was the pool's first confirmation.
     pub async fn change_pool(
         &self,
         compute_pool_cidr: &str,
         subnet_prefix_len: u8,
-    ) -> Result<PoolChange, ClusterNetworkError> {
+    ) -> Result<(PoolChange, bool), ClusterNetworkError> {
         let raw = compute_pool_cidr.trim();
         let pool: Ipv4Net = raw.parse().map_err(|error: ipnet::AddrParseError| {
             ClusterNetworkError::InvalidCidr {
@@ -150,14 +151,14 @@ impl ClusterNetworkService {
         let change = PostgresAllocator::new(self.db.clone())
             .configure_pool(pool, subnet_prefix_len)
             .await?;
-        self.confirm_pool().await?;
-        Ok(change)
+        let first_confirmation = self.confirm_pool().await?;
+        Ok((change, first_confirmation))
     }
 
     /// Record that an operator chose the pool. Saving it, changed or not, is
-    /// the confirmation; the first one is kept.
-    async fn confirm_pool(&self) -> Result<(), ClusterNetworkError> {
-        network_config::Entity::update_many()
+    /// the confirmation; the first one is kept. True when this was it.
+    async fn confirm_pool(&self) -> Result<bool, ClusterNetworkError> {
+        let result = network_config::Entity::update_many()
             .col_expr(
                 network_config::Column::ComputePoolConfirmedAt,
                 sea_orm::sea_query::Expr::current_timestamp().into(),
@@ -166,7 +167,7 @@ impl ClusterNetworkService {
             .filter(network_config::Column::ComputePoolConfirmedAt.is_null())
             .exec(self.db.as_ref())
             .await?;
-        Ok(())
+        Ok(result.rows_affected > 0)
     }
 }
 

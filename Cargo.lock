@@ -12225,7 +12225,9 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "if-addrs",
  "ipnet",
+ "libc",
  "parking_lot",
  "rand 0.10.3",
  "reqwest 0.12.28",
@@ -12257,6 +12259,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "x25519-dalek",
  "x509-parser",
 ]
 
@@ -12945,6 +12948,7 @@ dependencies = [
  "temps-git",
  "temps-import",
  "temps-infra",
+ "temps-ingress",
  "temps-kv",
  "temps-log-aggregator",
  "temps-logs",
@@ -14193,6 +14197,33 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tower",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
+name = "temps-ingress"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "temps-auth",
+ "temps-core",
+ "temps-dns",
+ "temps-entities",
+ "temps-routes",
+ "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "utoipa",
 ]

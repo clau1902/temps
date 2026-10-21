@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod project_change_listener;
+pub mod public_ingress_sync;
 pub mod route_reload_subscriber;
 pub mod route_sync;
 pub mod route_table;

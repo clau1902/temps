@@ -649,6 +649,9 @@ pub struct ClusterDnsStatusResponse {
         admin_remove_node,
         admin_drain_status,
         admin_set_node_public_ingress,
+        crate::handlers::node_public_ingress::get_public_ingress_settings,
+        crate::handlers::node_public_ingress::update_public_ingress_settings,
+        crate::handlers::node_public_ingress::check_public_ingress,
         admin_set_node_build_limits,
         cluster_dns_status,
         node_docker_disk_usage,
@@ -733,6 +736,13 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::node_ssh::NodeSshEnrollmentListResponse,
         SetNodePublicIngressRequest,
         SetNodePublicIngressResponse,
+        crate::handlers::node_public_ingress::PublicIngressSettings,
+        crate::handlers::node_public_ingress::PublicIngressInterface,
+        crate::handlers::node_public_ingress::PublicIngressCheck,
+        crate::handlers::node_public_ingress::PublicIngressCheckStep,
+        crate::handlers::node_public_ingress::UpdatePublicIngressSettingsRequest,
+        temps_core::worker_ingress::AddressScope,
+        temps_core::worker_ingress::IngressMode,
     )),
     info(
         title = "Node Registration API",
@@ -790,6 +800,15 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         .route(
             "/internal/nodes/{node_id}/public-ingress",
             axum::routing::patch(admin_set_node_public_ingress),
+        )
+        .route(
+            "/internal/nodes/{node_id}/public-ingress/settings",
+            get(crate::handlers::node_public_ingress::get_public_ingress_settings)
+                .put(crate::handlers::node_public_ingress::update_public_ingress_settings),
+        )
+        .route(
+            "/internal/nodes/{node_id}/public-ingress/check",
+            axum::routing::post(crate::handlers::node_public_ingress::check_public_ingress),
         )
         .route(
             "/internal/nodes/{node_id}/drain",
@@ -6896,7 +6915,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let problem = problem_of(response).await;
         assert_eq!(problem["title"], "Enrollment Token Required");
-        assert!(problem["detail"].as_str().unwrap().contains("Add node"));
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Create join command"));
     }
 
     #[tokio::test]

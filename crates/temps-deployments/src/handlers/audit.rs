@@ -220,6 +220,29 @@ pub struct NodePublicIngressChangedAudit {
     pub enabled: bool,
 }
 
+/// ADR 058 D7: an operator checked whether a worker is reachable from the
+/// internet (an outbound dial to its public address).
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePublicIngressCheckedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub target: Option<String>,
+    pub ok: bool,
+}
+
+/// ADR 058 D7: where a worker listens for public traffic and what DNS should
+/// point at changed.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePublicIngressSettingsChangedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub enabled: bool,
+    pub listen_address: Option<String>,
+    pub http_port: u16,
+    pub https_port: u16,
+    pub public_address: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeBuildLimitsChangedAudit {
     pub context: AuditContext,
@@ -319,6 +342,15 @@ pub struct ClusterComputePoolChangedAudit {
     pub to: String,
     /// `<node>: <old subnet> -> <new subnet>` per moved allocation.
     pub reassigned: Vec<String>,
+}
+
+/// An operator confirmed the cluster compute pool for the first time
+/// (ADR 056), whether or not they changed it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterComputePoolConfirmedAudit {
+    pub context: AuditContext,
+    /// `<pool>/<per-node prefix>` as confirmed.
+    pub pool: String,
 }
 
 /// An operator started adding a server over SSH (ADR 048 D2c). The
@@ -514,6 +546,11 @@ impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
 impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
 impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGED");
+impl_audit_operation!(
+    NodePublicIngressSettingsChangedAudit,
+    "NODE_PUBLIC_INGRESS_SETTINGS_CHANGED"
+);
+impl_audit_operation!(NodePublicIngressCheckedAudit, "NODE_PUBLIC_INGRESS_CHECKED");
 impl_audit_operation!(NodeRemovalAudit, "NODE_REMOVAL");
 impl_audit_operation!(NodeDrainAudit, "NODE_DRAIN");
 impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");
@@ -521,6 +558,10 @@ impl_audit_operation!(WireguardMeshHubChangedAudit, "WIREGUARD_MESH_HUB_CHANGED"
 impl_audit_operation!(
     ClusterComputePoolChangedAudit,
     "CLUSTER_COMPUTE_POOL_CHANGED"
+);
+impl_audit_operation!(
+    ClusterComputePoolConfirmedAudit,
+    "CLUSTER_COMPUTE_POOL_CONFIRMED"
 );
 impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
 impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");

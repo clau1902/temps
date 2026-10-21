@@ -32,6 +32,17 @@ pub struct AppSettings {
     #[serde(default)]
     pub public_ingress_url: Option<String>,
     pub preview_domain: String,
+    /// Label of a new environment's generated hostname under `preview_domain`,
+    /// from `{project}` and `{env}` (ADR 058 D9). `None` means
+    /// [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+    /// environments created after it is set; existing ones keep their names.
+    #[serde(default)]
+    pub environment_hostname_template: Option<String>,
+    /// Label for an environment named `production`, when it should differ
+    /// (e.g. `{project}` for `app.example.com`). `None` uses
+    /// `environment_hostname_template`.
+    #[serde(default)]
+    pub production_hostname_template: Option<String>,
     /// Public edge target that generated DNS records point at when a managed
     /// domain opts into automatic record sync. An IPv4/IPv6 address produces an
     /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
@@ -2311,6 +2322,8 @@ impl Default for AppSettings {
             internal_url: None,
             public_ingress_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
+            environment_hostname_template: None,
+            production_hostname_template: None,
             edge_target: None,
             cloudflare_new_projects: false,
             bunny_new_projects: false,

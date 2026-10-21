@@ -13,6 +13,7 @@ pub mod external_images;
 pub mod failure_report;
 pub mod network;
 pub mod node_pairings;
+pub mod node_public_ingress;
 pub mod node_ssh;
 pub mod nodes;
 pub mod remote_deployments;

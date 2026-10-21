@@ -2,106 +2,22 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * The cluster compute pool and each node's cross-node overlay (ADR 056),
- * as served by `GET/PUT /settings/cluster-network`.
- *
- * The shapes mirror `ClusterNetworkStatus` and friends in
- * `temps-deployments/src/services/cluster_network.rs`. They are declared
- * here until the generated client (`bun run openapi-ts` against a running
- * server) picks the endpoint up; the calls still go through the generated
- * client instance, so base URL, auth and error handling are the SDK's.
+ * The cluster compute pool and each node's cross-node overlay (ADR 056):
+ * form rules and display helpers over the generated
+ * `GET/PUT /settings/cluster-network` bindings.
  */
 import { z } from 'zod'
-import { client } from '@/api/client/client.gen'
 
-export interface OccupiedRange {
-  cidr: string
-  /** `route` (a host route) or `docker` (a Docker network's subnet). */
-  source: string
-  name: string
-}
+import type { ClusterNetworkNode } from '@/api/client/types.gen'
 
-export interface ClusterNetworkNode {
-  id: number
-  name: string
-  compute_cidr?: string | null
-  /** `ready`, `unavailable`, or null when its agent never reported it. */
-  overlay_status?: string | null
-  overlay_last_error?: string | null
-  overlay_remediation?: string | null
-  in_use: boolean
-  in_use_reason?: string | null
-  occupied_ranges: OccupiedRange[]
-}
-
-export interface ClusterNetworkControlPlane {
-  compute_cidr?: string | null
-  overlay_ready: boolean
-  setup_failure?: string | null
-}
-
-export interface ClusterNetworkStatus {
-  compute_pool_cidr: string
-  subnet_prefix_len: number
-  default_compute_pool_cidr: string
-  mesh_pool_cidr: string
-  mesh_enabled: boolean
-  /** Confirmed by an operator, or in use. Absent on an older server. */
-  pool_confirmed?: boolean
-  can_change: boolean
-  change_blocked_by: string[]
-  control_plane: ClusterNetworkControlPlane
-  nodes: ClusterNetworkNode[]
-}
-
-export interface ClusterNetworkReassignment {
-  node_id: number
-  node_name: string
-  from: string
-  to: string
-}
-
-export interface ClusterNetworkChangeResponse {
-  reassigned: ClusterNetworkReassignment[]
-  status: ClusterNetworkStatus
-}
-
-export interface UpdateClusterNetworkRequest {
-  compute_pool_cidr: string
-  subnet_prefix_len?: number | null
-}
-
-export const clusterNetworkQueryKey = ['settings', 'cluster-network'] as const
-
-export async function fetchClusterNetwork(): Promise<ClusterNetworkStatus> {
-  const { data } = await client.get<
-    { 200: ClusterNetworkStatus },
-    unknown,
-    true
-  >({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/settings/cluster-network',
-    throwOnError: true,
-  })
-  return data
-}
-
-export async function updateClusterNetwork(
-  body: UpdateClusterNetworkRequest
-): Promise<ClusterNetworkChangeResponse> {
-  const { data } = await client.put<
-    { 200: ClusterNetworkChangeResponse },
-    unknown,
-    true
-  >({
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/settings/cluster-network',
-    body,
-    headers: { 'Content-Type': 'application/json' },
-    throwOnError: true,
-  })
-  return data
-}
+export type {
+  ClusterNetworkChangeResponse,
+  ClusterNetworkControlPlane,
+  ClusterNetworkNode,
+  ClusterNetworkReassignment,
+  ClusterNetworkStatus,
+  UpdateClusterNetworkRequest,
+} from '@/api/client/types.gen'
 
 const IPV4_CIDR = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/
 
