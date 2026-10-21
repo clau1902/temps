@@ -265,6 +265,17 @@ impl ModelDetails {
     /// entry carries none of them, so providers that list only ids store
     /// nothing instead of an empty object.
     pub fn from_catalog_entry(entry: &serde_json::Value) -> Option<Self> {
+        Self::from_entry(entry, "name")
+    }
+
+    /// As [`Self::from_catalog_entry`], for a Gemini `/models` entry. Its
+    /// `name` is the resource path (`models/<id>`), not a label; the label is
+    /// `displayName`, so a model without one keeps its id as its name.
+    pub fn from_gemini_catalog_entry(entry: &serde_json::Value) -> Option<Self> {
+        Self::from_entry(entry, "displayName")
+    }
+
+    fn from_entry(entry: &serde_json::Value, name_field: &str) -> Option<Self> {
         let strings = |value: Option<&serde_json::Value>| -> Vec<String> {
             value
                 .and_then(serde_json::Value::as_array)
@@ -306,7 +317,7 @@ impl ModelDetails {
             // The name doubles as the model row's display name, so it must
             // fit that column and render as one line.
             name: entry
-                .get("name")
+                .get(name_field)
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
                 .filter(|name| {
@@ -476,6 +487,21 @@ mod model_details_tests {
         assert_eq!(details.context_length, Some(1_048_576));
         assert_eq!(details.input_modalities, vec!["text", "image"]);
         assert_eq!(details.output_modalities, vec!["text"]);
+    }
+
+    #[test]
+    fn a_gemini_entry_is_named_by_its_display_name_not_its_resource_path() {
+        let entry = json!({
+            "name": "models/gemini-3.1-pro",
+            "displayName": "Gemini 3.1 Pro"
+        });
+        let details = ModelDetails::from_gemini_catalog_entry(&entry).expect("details");
+        assert_eq!(details.name.as_deref(), Some("Gemini 3.1 Pro"));
+        // Without a label there is nothing to store; the id stays the name.
+        assert_eq!(
+            ModelDetails::from_gemini_catalog_entry(&json!({ "name": "models/gemini-3.1-pro" })),
+            None
+        );
     }
 
     #[test]

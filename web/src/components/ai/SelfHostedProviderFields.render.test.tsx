@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useState } from 'react'
 import { MemoryRouter } from 'react-router'
@@ -44,14 +44,14 @@ function serveDiscovery(answer: () => Response) {
   return requests
 }
 
-function Form({ baseUrl }: { baseUrl: string }) {
+function Form({ baseUrl, apiKey }: { baseUrl: string; apiKey: string }) {
   const [discovery, setDiscovery] = useState<SelfHostedDiscovery | null>(null)
   const [defaultModel, setDefaultModel] = useState('')
   return (
     <SelfHostedProviderFields
       open
       baseUrl={baseUrl}
-      apiKey=""
+      apiKey={apiKey}
       trustPrivateAddress={false}
       onTrustPrivateAddressChange={() => {}}
       canTrustPrivateAddress
@@ -65,14 +65,14 @@ function Form({ baseUrl }: { baseUrl: string }) {
   )
 }
 
-function renderForm(baseUrl: string) {
+function renderForm(baseUrl: string, apiKey = '') {
   const queries = new QueryClient({
     defaultOptions: { mutations: { retry: false } },
   })
   return render(
     <QueryClientProvider client={queries}>
       <MemoryRouter>
-        <Form baseUrl={baseUrl} />
+        <Form baseUrl={baseUrl} apiKey={apiKey} />
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -128,4 +128,26 @@ test('a half-typed URL sends no request', async () => {
   await new Promise((resolve) => setTimeout(resolve, 900))
   expect(requests).toHaveLength(0)
   expect(screen.getByText('Enter the base URL to load its models')).toBeTruthy()
+})
+
+test('a typed API key is only sent when the models are loaded by hand', async () => {
+  const requests = serveDiscovery(() =>
+    Response.json({ models: [{ id: 'model-a', name: null }] })
+  )
+  // A pause on a prefix of the intended URL can name someone else's host.
+  renderForm('https://llm.example.co', 'sk-test-key')
+
+  await new Promise((resolve) => setTimeout(resolve, 900))
+  expect(requests).toHaveLength(0)
+
+  fireEvent.click(screen.getByRole('button', { name: /Load models/ }))
+  await screen.findByText(/Connected: 1 model found/, undefined, {
+    timeout: 3000,
+  })
+  expect(requests).toEqual([
+    expect.objectContaining({
+      api_key: 'sk-test-key',
+      base_url: 'https://llm.example.co',
+    }),
+  ])
 })

@@ -137,16 +137,20 @@ export function SelfHostedProviderFields({
     },
   })
 
-  // Listing the models is how the form checks the server: it runs on its own
-  // once the URL, key and trust choice stop changing, at most once per set of
-  // inputs, so a failure is shown instead of retried in a loop. The button
-  // retries it by hand.
+  // Listing the models is how the form checks the server. For a keyless
+  // server it runs on its own once the URL and trust choice stop changing, at
+  // most once per set of inputs, so a failure is shown instead of retried in a
+  // loop. With an API key it waits for the button: a pause while typing the
+  // URL leaves a prefix that is often a real, someone-else's host
+  // (`https://api.example.co` on the way to `.com`), and discovery sends the
+  // key to it as a bearer token.
   const settledSignature = useDebounce(signature, DISCOVERY_DEBOUNCE_MS)
   const { mutate: discover, variables: requestedSignature } = discoverMutation
   const discoverable = isDiscoverableBaseUrl(baseUrl)
+  const automatic = apiKey === ''
   const listed = currentModels !== null
   useEffect(() => {
-    if (!open || disabled || !discoverable || listed) return
+    if (!open || disabled || !discoverable || !automatic || listed) return
     if (settledSignature !== signature || requestedSignature === signature) {
       return
     }
@@ -155,6 +159,7 @@ export function SelfHostedProviderFields({
     open,
     disabled,
     discoverable,
+    automatic,
     listed,
     settledSignature,
     signature,
@@ -263,9 +268,11 @@ export function SelfHostedProviderFields({
               ? 'Pick the model to verify with'
               : checking
                 ? 'Loading the models your server lists...'
-                : discoverable
-                  ? 'Models load from your server'
-                  : 'Enter the base URL to load its models'
+                : !discoverable
+                  ? 'Enter the base URL to load its models'
+                  : automatic
+                    ? 'Models load from your server'
+                    : 'Load models to list what your server serves'
           }
           searchPlaceholder="Search models..."
           emptyText="No model matches."
@@ -282,7 +289,9 @@ export function SelfHostedProviderFields({
               discoveryError,
               'Could not list the models your server serves.'
             )}{' '}
-            Check the base URL and API key; the models reload as you edit them.
+            {automatic
+              ? 'Check the base URL; the models reload as you edit it.'
+              : 'Check the base URL and API key, then reload the models.'}
           </p>
         ) : currentModels ? (
           <p
@@ -300,6 +309,9 @@ export function SelfHostedProviderFields({
           <p className="text-xs text-muted-foreground">
             Temps asks your server for <code>/models</code> and lists every
             model it serves, with no name filter.
+            {automatic
+              ? null
+              : ' The API key is only sent when you load the models, once the base URL is complete.'}
           </p>
         )}
         {error && !discoveryError && !checking && (

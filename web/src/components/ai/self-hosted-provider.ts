@@ -89,8 +89,9 @@ export function selfHostedDiscoverySignature(input: {
 
 /**
  * Whether a base URL is complete enough to ask the server for its models: an
- * http(s) URL with a host. Discovery runs on its own once this holds, so a
- * half-typed URL never sends a request.
+ * http(s) URL with a host. This only rules out URLs that cannot be requested;
+ * a half-typed URL can still name a real host (`https://api.example.co` on
+ * the way to `.com`), so discovery never sends an API key on its own.
  */
 export function isDiscoverableBaseUrl(url: string): boolean {
   const trimmed = url.trim()

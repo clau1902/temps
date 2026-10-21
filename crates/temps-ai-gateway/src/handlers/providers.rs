@@ -502,7 +502,10 @@ fn requested_key_trust(
 /// verified with that vendor's own model names, so pointing it at another
 /// vendor's OpenAI-compatible API (DeepSeek, Groq, ...) fails with an
 /// unknown-model error. `custom_vendor_base_url` carries the provider id in
-/// that case so the message says which provider to use instead.
+/// that case so the message says which provider to use instead. The hint is
+/// only added when the server rejected the request itself (400, 404, 422),
+/// which is how an unknown model comes back; a rejected key (401/403), a
+/// server failure or an unreachable host has another fix.
 fn verification_error(
     error: AiGatewayError,
     custom_vendor_base_url: Option<&str>,
@@ -510,8 +513,15 @@ fn verification_error(
     match error {
         AiGatewayError::InvalidProviderUrl { .. } => error,
         other => {
+            let model_rejected = matches!(
+                other,
+                AiGatewayError::UpstreamError {
+                    status: 400 | 404 | 422,
+                    ..
+                }
+            );
             let mut message = format!("API key verification failed: {}", other.summary());
-            if let Some(provider) = custom_vendor_base_url {
+            if let Some(provider) = custom_vendor_base_url.filter(|_| model_rejected) {
                 message.push_str(&format!(
                     ". The custom base URL on a '{provider}' key must serve {provider}'s own \
                      models; for any other API that speaks the OpenAI protocol (DeepSeek, \
@@ -1315,9 +1325,33 @@ mod tests {
     use super::*;
 
     fn upstream_error() -> AiGatewayError {
-        AiGatewayError::Validation {
-            message: "Upstream provider error for model 'gpt-5-nano': 400 unknown model"
-                .to_string(),
+        upstream_status(400, "unknown model")
+    }
+
+    fn upstream_status(status: u16, message: &str) -> AiGatewayError {
+        AiGatewayError::UpstreamError {
+            model: "gpt-5-nano".to_string(),
+            status,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn verification_error_hints_only_when_the_model_was_rejected() {
+        let message = |error: AiGatewayError| match verification_error(error, Some("openai")) {
+            AiGatewayError::Validation { message } => message,
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+        assert!(message(upstream_status(404, "model_not_found")).contains("OpenAI-compatible"));
+        // A wrong key, a failing server or an unreachable host is fixed
+        // elsewhere, not by changing the provider type.
+        for error in [
+            upstream_status(401, "invalid api key"),
+            upstream_status(503, "overloaded"),
+            AiGatewayError::HttpClient("connection refused".to_string()),
+        ] {
+            let message = message(error);
+            assert!(!message.contains("OpenAI-compatible"), "{message}");
         }
     }
 

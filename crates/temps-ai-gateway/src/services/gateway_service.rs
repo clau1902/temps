@@ -1181,7 +1181,11 @@ pub(crate) fn parse_model_catalog_details(
                 .unwrap_or(provider_id)
                 .to_string();
             Some(DiscoveredModel {
-                details: ModelDetails::from_catalog_entry(entry),
+                details: if provider_id == "gemini" {
+                    ModelDetails::from_gemini_catalog_entry(entry)
+                } else {
+                    ModelDetails::from_catalog_entry(entry)
+                },
                 info: ModelInfo {
                     id: id.to_string(),
                     object: "model".to_string(),
@@ -1877,6 +1881,25 @@ mod tests {
         let body = serde_json::json!({"models": [{"name": "models/gemini-3.1-pro"}]});
         let models = parse_model_catalog("gemini", &body, |_| true).unwrap();
         assert_eq!(models[0].id, "gemini-3.1-pro");
+    }
+
+    #[test]
+    fn gemini_discovery_never_names_a_model_by_its_resource_path() {
+        let body = serde_json::json!({"models": [
+            {"name": "models/gemini-3.1-pro", "displayName": "Gemini 3.1 Pro"},
+            {"name": "models/gemini-3.1-flash"}
+        ]});
+        let models = parse_model_catalog_details("gemini", &body, |_| true).unwrap();
+        let names: Vec<_> = models
+            .iter()
+            .map(|model| {
+                model
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.name.as_deref())
+            })
+            .collect();
+        assert_eq!(names, vec![None, Some("Gemini 3.1 Pro")]);
     }
 
     #[test]
