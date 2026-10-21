@@ -223,6 +223,33 @@ pub enum GitProviderManagerError {
         base_branch: String,
     },
 
+    /// Files the commit would replace were changed on the branch since the
+    /// revision the new content was written against, so committing them
+    /// whole would undo those changes.
+    #[error(
+        "Cannot commit to branch '{branch}' of '{repository}' (connection {connection_id}): {} changed on the branch since commit {since_revision}, and committing the whole files would undo those changes",
+        .paths.join(", ")
+    )]
+    FilesChangedSince {
+        connection_id: i32,
+        repository: String,
+        branch: String,
+        since_revision: String,
+        paths: Vec<String>,
+    },
+
+    /// The revision the files were checked against is not in the remote's
+    /// history (rewritten or never pushed).
+    #[error(
+        "Cannot check branch '{branch}' of '{repository}' (connection {connection_id}) against commit {revision}: the remote has no such commit"
+    )]
+    RevisionNotFound {
+        connection_id: i32,
+        repository: String,
+        branch: String,
+        revision: String,
+    },
+
     /// Every requested file already has the requested content on the branch.
     #[error(
         "Nothing to commit to branch '{branch}' of '{repository}' (connection {connection_id}): the {file_count} requested file(s) already match commit {parent_sha}"
@@ -341,6 +368,11 @@ struct GitPushRequest<'a> {
     /// Branch a `branch` that does not exist yet starts from; `None`: the
     /// repository's default branch.
     base_branch: Option<&'a str>,
+    /// Revision the files' new content was written against. When set, the
+    /// commit is refused with [`GitProviderManagerError::FilesChangedSince`]
+    /// if any of the files differs between it and the tree the commit is
+    /// built on.
+    unchanged_since: Option<&'a str>,
     commit_message: &'a str,
     author_name: &'a str,
     author_email: &'a str,
@@ -382,6 +414,55 @@ const GIT_MODE_BLOB: i32 = 0o100644;
 const GIT_MODE_BLOB_EXECUTABLE: i32 = 0o100755;
 const GIT_MODE_SYMLINK: i32 = 0o120000;
 const GIT_MODE_SUBMODULE: i32 = 0o160000;
+
+/// Why [`paths_changed_since`] could not compare.
+#[derive(Debug)]
+enum ChangedSinceError {
+    /// `revision` is not a commit in the repository.
+    RevisionNotFound,
+    Git(git2::Error),
+}
+
+/// The paths of `files` whose entry in `tree` (the tree a commit is about to
+/// be built on; `None` for an empty repository) differs from their entry at
+/// commit `revision`: other content, another mode, or present in one and not
+/// the other. Empty when committing the files whole replaces exactly what
+/// `revision` had.
+fn paths_changed_since(
+    repo: &git2::Repository,
+    revision: &str,
+    tree: Option<&git2::Tree<'_>>,
+    files: &[(String, Vec<u8>)],
+) -> Result<Vec<String>, ChangedSinceError> {
+    let oid = git2::Oid::from_str(revision).map_err(|_| ChangedSinceError::RevisionNotFound)?;
+    let since = match repo.find_commit(oid) {
+        Ok(commit) => commit.tree().map_err(ChangedSinceError::Git)?,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {
+            return Err(ChangedSinceError::RevisionNotFound)
+        }
+        Err(e) => return Err(ChangedSinceError::Git(e)),
+    };
+    let entry = |tree: &git2::Tree<'_>,
+                 path: &str|
+     -> Result<Option<(git2::Oid, i32)>, ChangedSinceError> {
+        match tree.get_path(std::path::Path::new(path)) {
+            Ok(entry) => Ok(Some((entry.id(), entry.filemode()))),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+            Err(e) => Err(ChangedSinceError::Git(e)),
+        }
+    };
+    let mut changed = Vec::new();
+    for (path, _) in files {
+        let now = match tree {
+            Some(tree) => entry(tree, path)?,
+            None => None,
+        };
+        if now != entry(&since, path)? {
+            changed.push(path.clone());
+        }
+    }
+    Ok(changed)
+}
 
 /// Build the tree for a commit: `base` (the branch tip's tree, if any) with
 /// every file in `files` written as a regular blob.
@@ -656,6 +737,11 @@ fn validate_repository_ref(
 /// Check everything a caller supplies to a commit before any credentialed
 /// call: paths must stay inside the repository and out of `.git`, and the
 /// whole commit is bounded in file count and bytes.
+/// Whether `revision` is a full SHA-1 or SHA-256 commit id.
+fn is_commit_id(revision: &str) -> bool {
+    matches!(revision.len(), 40 | 64) && revision.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn validate_commit_request(
     connection_id: i32,
     owner: &str,
@@ -5780,6 +5866,32 @@ impl GitProviderManager {
             .transpose()
             .map_err(|e| failed("read the branch tree", &e))?;
 
+        if let Some(revision) = request.unchanged_since {
+            let changed = paths_changed_since(&repo, revision, base_tree.as_ref(), &files)
+                .map_err(|e| match e {
+                    ChangedSinceError::RevisionNotFound => {
+                        GitProviderManagerError::RevisionNotFound {
+                            connection_id: request.connection_id,
+                            repository: request.repository.to_string(),
+                            branch: branch.to_string(),
+                            revision: revision.to_string(),
+                        }
+                    }
+                    ChangedSinceError::Git(e) => {
+                        failed(&format!("compare the files with commit {revision}"), &e)
+                    }
+                })?;
+            if !changed.is_empty() {
+                return Err(GitProviderManagerError::FilesChangedSince {
+                    connection_id: request.connection_id,
+                    repository: request.repository.to_string(),
+                    branch: branch.to_string(),
+                    since_revision: revision.to_string(),
+                    paths: changed,
+                });
+            }
+        }
+
         info!("Staging {} files onto branch '{}'", files.len(), branch);
         let tree_oid =
             stage_files_onto(&repo, base_tree.as_ref(), &files).map_err(|e| match e {
@@ -5983,8 +6095,15 @@ impl GitProviderManager {
     /// repository's default branch), so existing history is never rewritten.
     /// A branch that does not exist yet is started from `base_branch`'s tip
     /// (default: the default branch's); a `base_branch` the remote lacks is
-    /// refused rather than replaced by the default branch. Returns the new
-    /// commit's SHA and the branch it landed on.
+    /// refused rather than replaced by the default branch.
+    ///
+    /// `unchanged_since` is the revision the files' new content was written
+    /// against. The files are compared between it and the tree the commit is
+    /// built on, in the same fresh clone, and the commit is refused with
+    /// [`GitProviderManagerError::FilesChangedSince`] when any differs, since
+    /// replacing them whole would undo those changes. The push is a
+    /// fast-forward from that tree, so the tree checked is the one the commit
+    /// lands on. Returns the new commit's SHA and the branch it landed on.
     #[allow(clippy::too_many_arguments)]
     pub async fn commit_files_for_user(
         &self,
@@ -5994,12 +6113,21 @@ impl GitProviderManager {
         repo: &str,
         branch: Option<&str>,
         base_branch: Option<&str>,
+        unchanged_since: Option<&str>,
         files: Vec<(String, Vec<u8>)>,
         commit_message: &str,
     ) -> Result<(String, String), GitProviderManagerError> {
         validate_commit_request(connection_id, owner, repo, branch, &files, commit_message)?;
         if let Some(base) = base_branch {
             validate_branch_name(connection_id, &format!("{owner}/{repo}"), base)?;
+        }
+        if let Some(revision) = unchanged_since {
+            if !is_commit_id(revision) {
+                return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                    "Commit to '{owner}/{repo}' (connection {connection_id}) must be checked against a full commit id (40 or 64 hex characters), got '{}'",
+                    revision.escape_debug()
+                )));
+            }
         }
         let (connection, provider_service, access_token) = self
             .usable_connection_for_user(connection_id, user_id)
@@ -6024,6 +6152,7 @@ impl GitProviderManager {
         let token = access_token.clone();
         let target_branch = branch.clone();
         let base_branch = base_branch.map(str::to_string);
+        let unchanged_since = unchanged_since.map(str::to_string);
         let message = commit_message.to_string();
         let file_count = files.len();
         let cancellation = Arc::new(CommitCancellation::default());
@@ -6042,6 +6171,7 @@ impl GitProviderManager {
                 access_token: &token,
                 branch: &target_branch,
                 base_branch: base_branch.as_deref(),
+                unchanged_since: unchanged_since.as_deref(),
                 commit_message: &message,
                 author_name: &author_name,
                 author_email: "bot@temps.sh",
@@ -6060,6 +6190,8 @@ impl GitProviderManager {
             Ok(Ok(Err(
                 e @ (GitProviderManagerError::CommitPathRejected { .. }
                 | GitProviderManagerError::BaseBranchNotFound { .. }
+                | GitProviderManagerError::FilesChangedSince { .. }
+                | GitProviderManagerError::RevisionNotFound { .. }
                 | GitProviderManagerError::NothingToCommit { .. }
                 | GitProviderManagerError::PushRejected { .. }
                 | GitProviderManagerError::CommitTimedOut { .. }),
@@ -6288,6 +6420,7 @@ impl GitProviderManager {
             access_token: &access_token,
             branch: &new_repo.default_branch,
             base_branch: None,
+            unchanged_since: None,
             commit_message: &commit_message,
             author_name,
             author_email,
@@ -7972,7 +8105,7 @@ mod tests {
         );
 
         let commit = manager
-            .commit_files_for_user(9, 5, "acme", "app", None, None, one_file("../x"), "m")
+            .commit_files_for_user(9, 5, "acme", "app", None, None, None, one_file("../x"), "m")
             .await
             .expect_err("path traversal must be refused");
         assert!(matches!(
@@ -8026,6 +8159,7 @@ mod tests {
                 5,
                 "acme",
                 "app",
+                None,
                 None,
                 None,
                 one_file("a.txt"),
@@ -8095,6 +8229,17 @@ mod tests {
         files: Vec<(String, Vec<u8>)>,
         cancellation: &CommitCancellation,
     ) -> Result<String, GitProviderManagerError> {
+        push_checked(url, branch, base_branch, None, files, cancellation)
+    }
+
+    fn push_checked(
+        url: &str,
+        branch: &str,
+        base_branch: Option<&str>,
+        unchanged_since: Option<&str>,
+        files: Vec<(String, Vec<u8>)>,
+        cancellation: &CommitCancellation,
+    ) -> Result<String, GitProviderManagerError> {
         let request = GitPushRequest {
             connection_id: 42,
             repository: "acme/app",
@@ -8103,6 +8248,7 @@ mod tests {
             access_token: "unused-token",
             branch,
             base_branch,
+            unchanged_since,
             commit_message: "Commit files",
             author_name: "Test Author",
             author_email: "bot@example.invalid",
@@ -8261,6 +8407,148 @@ mod tests {
             Some(b"live".to_vec()),
             "main's newer content must not leak into a branch based on production"
         );
+    }
+
+    #[test]
+    fn files_edited_on_the_branch_since_the_revision_refuse_the_commit() {
+        let (_remote_dir, url) = bare_remote();
+        let crashing = seed_remote(
+            &url,
+            "main",
+            &[
+                ("app.rs", 0o100644, b"crashing"),
+                ("lib.rs", 0o100644, b"lib"),
+            ],
+        );
+        // A teammate edits app.rs and adds new.rs after the crash.
+        let newer = seed_remote(
+            &url,
+            "main",
+            &[
+                ("app.rs", 0o100644, b"teammate's edit"),
+                ("lib.rs", 0o100644, b"lib"),
+                ("new.rs", 0o100644, b"added later"),
+            ],
+        );
+
+        let error = push_checked(
+            &url,
+            "autofix/9",
+            Some("main"),
+            Some(&crashing.to_string()),
+            vec![
+                ("app.rs".to_string(), b"fixed".to_vec()),
+                ("lib.rs".to_string(), b"lib, fixed".to_vec()),
+                ("new.rs".to_string(), b"fixed".to_vec()),
+            ],
+            &CommitCancellation::default(),
+        )
+        .expect_err("replacing files edited since the crash must be refused");
+        match error {
+            GitProviderManagerError::FilesChangedSince {
+                connection_id,
+                ref branch,
+                ref since_revision,
+                ref paths,
+                ..
+            } => {
+                assert_eq!(connection_id, 42);
+                assert_eq!(branch, "autofix/9");
+                assert_eq!(since_revision, &crashing.to_string());
+                assert_eq!(paths, &["app.rs".to_string(), "new.rs".to_string()]);
+            }
+            other => panic!("expected FilesChangedSince, got {other:?}"),
+        }
+        assert!(git2::Repository::open_bare(&url)
+            .expect("open remote")
+            .find_reference("refs/heads/autofix/9")
+            .is_err());
+        assert_eq!(remote_tip(&url, "main"), newer);
+    }
+
+    #[test]
+    fn edits_to_other_files_since_the_revision_do_not_block_the_commit() {
+        let (_remote_dir, url) = bare_remote();
+        let crashing = seed_remote(
+            &url,
+            "main",
+            &[
+                ("app.rs", 0o100644, b"crashing"),
+                ("lib.rs", 0o100644, b"lib"),
+            ],
+        );
+        let newer = seed_remote(
+            &url,
+            "main",
+            &[
+                ("app.rs", 0o100644, b"crashing"),
+                ("lib.rs", 0o100644, b"lib, edited later"),
+            ],
+        );
+
+        push_checked(
+            &url,
+            "autofix/10",
+            Some("main"),
+            Some(&crashing.to_string()),
+            vec![("app.rs".to_string(), b"fixed".to_vec())],
+            &CommitCancellation::default(),
+        )
+        .expect("only app.rs is replaced and it is unchanged since the crash");
+
+        let remote = git2::Repository::open_bare(&url).expect("open remote");
+        let tip = remote
+            .find_reference("refs/heads/autofix/10")
+            .expect("branch")
+            .peel_to_commit()
+            .expect("tip");
+        assert_eq!(tip.parent_id(0).expect("parent"), newer);
+        assert_eq!(
+            entry_at(&url, "autofix/10", "lib.rs").map(|(_, content)| content),
+            Some(b"lib, edited later".to_vec()),
+            "the later edit to another file is kept"
+        );
+        assert_eq!(
+            entry_at(&url, "autofix/10", "app.rs").map(|(_, content)| content),
+            Some(b"fixed".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_revision_missing_from_the_history_is_refused() {
+        let (_remote_dir, url) = bare_remote();
+        seed_remote(&url, "main", &[("app.rs", 0o100644, b"main")]);
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+
+        let error = push_checked(
+            &url,
+            "autofix/11",
+            Some("main"),
+            Some(missing),
+            vec![("app.rs".to_string(), b"fixed".to_vec())],
+            &CommitCancellation::default(),
+        )
+        .expect_err("a revision the remote does not have cannot be checked");
+        match error {
+            GitProviderManagerError::RevisionNotFound {
+                ref branch,
+                ref revision,
+                ..
+            } => {
+                assert_eq!(branch, "autofix/11");
+                assert_eq!(revision, missing);
+            }
+            other => panic!("expected RevisionNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_full_hex_commit_ids_are_accepted_as_revisions() {
+        assert!(is_commit_id("0123456789abcdef0123456789abcdef01234567"));
+        assert!(is_commit_id(&"a".repeat(64)));
+        assert!(!is_commit_id("0123456"));
+        assert!(!is_commit_id("main"));
+        assert!(!is_commit_id(&"g".repeat(40)));
     }
 
     #[test]

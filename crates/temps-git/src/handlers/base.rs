@@ -229,6 +229,32 @@ impl From<GitProviderManagerError> for Problem {
                 .with_value("branch", branch.clone())
                 .with_value("base_branch", base_branch.clone())
                 .with_detail(error.to_string()),
+            GitProviderManagerError::FilesChangedSince {
+                connection_id,
+                ref repository,
+                ref branch,
+                ref since_revision,
+                ref paths,
+            } => problem_new(StatusCode::CONFLICT)
+                .with_title("Files Changed Since Revision")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_value("since_revision", since_revision.clone())
+                .with_value("paths", paths.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::RevisionNotFound {
+                connection_id,
+                ref repository,
+                ref branch,
+                ref revision,
+            } => problem_new(StatusCode::CONFLICT)
+                .with_title("Revision Not Found")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_value("revision", revision.clone())
+                .with_detail(error.to_string()),
             GitProviderManagerError::NothingToCommit {
                 connection_id,
                 ref repository,
@@ -1313,6 +1339,7 @@ pub async fn commit_repository_files(
             &owner,
             &repo,
             request.branch.as_deref(),
+            None,
             None,
             files,
             &request.message,

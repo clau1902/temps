@@ -31,6 +31,7 @@ use temps_entities::{
     repositories, source_bundles,
 };
 use temps_error_tracking::services::source_map_service::SourceMapService;
+use temps_git::services::git_provider_manager::GitProviderManagerError;
 use temps_git::GitProviderManager;
 use temps_sandbox::services::{CreateSandboxRequest, ExecOptions, SandboxSource};
 use temps_sandbox::SandboxService;
@@ -64,6 +65,8 @@ const REPRODUCTION_RUNS: usize = 3;
 /// explicitly; this only bounds a sandbox the worker lost track of.
 const SANDBOX_IDLE_SECS: u64 = 3 * 60 * 60;
 const MAX_PATCH_BYTES: usize = 256 * 1024;
+/// The fix as a patch `git apply` accepts, binary files included.
+const PATCH_COMMAND: &str = "git diff --cached --no-renames --binary HEAD";
 const EXCERPT_BYTES: usize = 4 * 1024;
 /// Timeline entries recorded for the agent's own tool calls, per incident.
 const MAX_TOOL_EVENTS: usize = 200;
@@ -1603,11 +1606,11 @@ impl AutofixService {
         let assessment = evidence::assess(&collected.evidence);
         let score = assessment.score;
         let assessment_json = serde_json::to_value(&assessment).ok();
-        let patch = collected.patch.clone();
+        let patch = collected.patch.complete().map(str::to_string);
         self.update_working(incident, |active| {
             active.confidence = Set(Some(score));
             active.evidence = Set(assessment_json);
-            active.patch = Set(Some(patch));
+            active.patch = Set(patch);
         })
         .await?;
         self.event(
@@ -1674,6 +1677,9 @@ impl AutofixService {
                 .await?
             }
             _ => {
+                if let PatchFile::Unavailable(reason) = &collected.patch {
+                    return Err(no_patch_to_deliver(id, reason, None));
+                }
                 self.event(
                     incident,
                     "server",
@@ -2641,23 +2647,43 @@ impl AutofixService {
                 "the agent did not change any file",
             ));
         }
+        // `--binary` so a changed binary file is in the patch rather than a
+        // "Binary files differ" line `git apply` cannot use. The size is
+        // measured in the sandbox, so a patch the command output cut short
+        // is caught rather than stored.
+        let patch_size = self
+            .run_command(
+                id,
+                sandbox_id,
+                owner,
+                work_dir,
+                &format!("{PATCH_COMMAND} | wc -c"),
+                "measure the patch",
+            )
+            .await?;
         let patch = self
             .run_command(
                 id,
                 sandbox_id,
                 owner,
                 work_dir,
-                "git diff --cached --no-renames HEAD",
+                PATCH_COMMAND,
                 "collect the patch",
             )
             .await?;
-        let mut patch_text = patch.output_excerpt_full;
-        if patch_text.len() > MAX_PATCH_BYTES {
-            patch_text = format!(
-                "{}\n# … patch truncated at {} KB\n",
-                &patch_text[..floor_boundary(&patch_text, MAX_PATCH_BYTES)],
-                MAX_PATCH_BYTES / 1024
-            );
+        let patch = PatchFile::check(
+            patch.output_excerpt_full,
+            patch_size.output_excerpt_full.trim().parse().ok(),
+        );
+        if let PatchFile::Unavailable(reason) = &patch {
+            self.event(
+                incident,
+                "server",
+                "patch_unavailable",
+                &format!("No patch to download: {reason}"),
+                EventDetails::default(),
+            )
+            .await;
         }
         let deleted = self
             .run_command(
@@ -2836,7 +2862,7 @@ impl AutofixService {
 
         Ok(CollectedEvidence {
             evidence: collected,
-            patch: patch_text,
+            patch,
             files,
             deleted,
         })
@@ -2951,13 +2977,18 @@ impl AutofixService {
         let owner = incident.owner_user_id;
         let Some(git) = self.git.as_ref() else {
             return self
-                .fall_back_to_patch(incident, "Git integration is not available on this server")
+                .fall_back_to_patch(
+                    incident,
+                    &collected.patch,
+                    "Git integration is not available on this server",
+                )
                 .await;
         };
         if !collected.deleted.is_empty() {
             return self
                 .fall_back_to_patch(
                     incident,
+                    &collected.patch,
                     &format!(
                         "the fix deletes files ({}), which Temps cannot push yet",
                         collected.deleted.join(", ")
@@ -2965,53 +2996,37 @@ impl AutofixService {
                 )
                 .await;
         }
-        // The fix was made against the crashing commit. It is pushed as
-        // whole files onto the default branch, which is only safe when those
-        // files have not changed there since.
-        let paths = collected
-            .files
-            .iter()
-            .map(|(path, _)| shell_quote(path))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let main = shell_quote(&format!("origin/{}", target.main_branch));
-        let drift = self
+        // The fix was made against the crashing commit and is pushed as
+        // whole files, which is only safe when those files have not changed
+        // since on the branch the commit is built on. The git layer checks
+        // that in the fresh clone the commit is made from, so the tree
+        // checked is the one the commit lands on; this resolves the crashing
+        // commit's full id, which the checked-out sandbox has locally.
+        let resolved = self
             .run_command(
                 id,
                 sandbox_id,
                 owner,
                 work_dir,
                 &format!(
-                    "git rev-parse --verify -q {main} >/dev/null || exit 3; git diff --quiet {} {main} -- {paths}",
-                    shell_quote(target.commit_sha)
+                    "git rev-parse --verify -q {}",
+                    shell_quote(&format!("{}^{{commit}}", target.commit_sha))
                 ),
-                "compare with the default branch",
+                "resolve the crashing commit",
             )
             .await?;
-        match drift.exit_code {
-            0 => {}
-            1 => {
-                return self
-                    .fall_back_to_patch(
-                        incident,
-                        &format!(
-                            "the changed files were edited on {} since the crashing commit, so pushing them would undo those edits",
-                            target.main_branch
-                        ),
-                    )
-                    .await
-            }
-            _ => {
-                return self
-                    .fall_back_to_patch(
-                        incident,
-                        &format!(
-                            "could not compare the fix with {}: {}",
-                            target.main_branch, drift.output_excerpt
-                        ),
-                    )
-                    .await
-            }
+        let base_revision = resolved.output_excerpt_full.trim().to_string();
+        if !resolved.passed() || !same_revision(&base_revision, target.commit_sha) {
+            return self
+                .fall_back_to_patch(
+                    incident,
+                    &collected.patch,
+                    &format!(
+                        "could not resolve the crashing commit {} in the sandbox: {}",
+                        target.commit_sha, resolved.output_excerpt
+                    ),
+                )
+                .await;
         }
 
         let branch = format!("autofix/{}", id.trim_start_matches("afx_"));
@@ -3020,22 +3035,32 @@ impl AutofixService {
             truncate_chars(&incident.title, 60),
             incident.error_group_id
         );
-        let (sha, branch) = git
+        let pushed = git
             .commit_files_for_user(
                 target.connection_id,
                 owner,
                 target.repo_owner,
                 target.repo_name,
                 Some(&branch),
-                // A first push starts the branch from the branch the drift
-                // check compared against and the pull request targets, not
-                // the repository's default branch.
+                // A first push starts the branch from the branch the pull
+                // request targets, not the repository's default branch.
                 Some(target.main_branch),
+                Some(&base_revision),
                 collected.files.clone(),
                 &message,
             )
-            .await
-            .map_err(|error| AutofixError::step(id, "push the fix", error))?;
+            .await;
+        let (sha, branch) = match pushed {
+            Ok(pushed) => pushed,
+            Err(error) => match pull_request_refusal(&error, target.main_branch) {
+                Some(reason) => {
+                    return self
+                        .fall_back_to_patch(incident, &collected.patch, &reason)
+                        .await
+                }
+                None => return Err(AutofixError::step(id, "push the fix", error)),
+            },
+        };
         self.event(
             incident,
             "server",
@@ -3098,8 +3123,16 @@ impl AutofixService {
     async fn fall_back_to_patch(
         &self,
         incident: &autofix_incidents::Model,
+        patch: &PatchFile,
         reason: &str,
     ) -> Result<&'static str, AutofixError> {
+        if let PatchFile::Unavailable(missing) = patch {
+            return Err(no_patch_to_deliver(
+                &incident.public_id,
+                missing,
+                Some(reason),
+            ));
+        }
         self.update_working(incident, |active| {
             active.delivery = Set(Some("patch".into()))
         })
@@ -3214,9 +3247,75 @@ struct PullRequestTarget<'a> {
 
 struct CollectedEvidence {
     evidence: Evidence,
-    patch: String,
+    patch: PatchFile,
     files: Vec<(String, Vec<u8>)>,
     deleted: Vec<String>,
+}
+
+/// The fix as a patch to download, which is only offered when it is whole:
+/// a patch cut inside a hunk does not apply, and one cut between files
+/// applies only part of the fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatchFile {
+    Complete(String),
+    /// Why there is no patch, for the incident's timeline and the user.
+    Unavailable(String),
+}
+
+impl PatchFile {
+    /// `text` is what the patch command printed, `measured` the size in
+    /// bytes the sandbox counted for the same command (`None` when it could
+    /// not be read).
+    fn check(text: String, measured: Option<usize>) -> Self {
+        let Some(measured) = measured else {
+            return Self::Unavailable(
+                "its size could not be measured, so a complete patch cannot be guaranteed"
+                    .to_string(),
+            );
+        };
+        if measured > MAX_PATCH_BYTES {
+            return Self::Unavailable(format!(
+                "the patch is {} KB, more than the {} KB an incident keeps",
+                measured.div_ceil(1024),
+                MAX_PATCH_BYTES / 1024
+            ));
+        }
+        if text.len() != measured {
+            return Self::Unavailable(format!(
+                "the patch came back as {} of its {measured} bytes",
+                text.len()
+            ));
+        }
+        Self::Complete(text)
+    }
+
+    fn complete(&self) -> Option<&str> {
+        match self {
+            Self::Complete(text) => Some(text),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+/// Why a pull request is not opened for `error`, when the fix should go out
+/// as a patch instead: the push would undo newer edits on `main_branch`, or
+/// the commit or branch to check against is missing. `None` for failures
+/// that should fail the push.
+fn pull_request_refusal(error: &GitProviderManagerError, main_branch: &str) -> Option<String> {
+    match error {
+        GitProviderManagerError::FilesChangedSince { paths, .. } => Some(format!(
+            "{} changed on {main_branch} since the crashing commit, so pushing the fixed files would undo those edits",
+            paths.join(", ")
+        )),
+        GitProviderManagerError::RevisionNotFound { revision, .. } => Some(format!(
+            "the crashing commit {} is not in the repository's history any more, so the fix cannot be checked against {main_branch}",
+            short_sha(revision)
+        )),
+        GitProviderManagerError::BaseBranchNotFound { base_branch, .. } => Some(format!(
+            "the repository has no branch '{base_branch}' to open a pull request into"
+        )),
+        _ => None,
+    }
 }
 
 /// A command's result with its full stdout, for the commands whose output
@@ -3330,6 +3429,20 @@ fn floor_boundary(text: &str, max: usize) -> usize {
 
 /// Whether two revisions name the same commit, allowing either to be
 /// abbreviated (at least 7 characters).
+/// The failure for a fix that can only be delivered as a patch when there is
+/// no complete one; `no_pull_request` says why a pull request was not opened.
+fn no_patch_to_deliver(
+    incident_id: &str,
+    missing: &str,
+    no_pull_request: Option<&str>,
+) -> AutofixError {
+    let reason = match no_pull_request {
+        Some(why) => format!("no pull request ({why}), and no patch to download either: {missing}"),
+        None => format!("no patch to download: {missing}"),
+    };
+    AutofixError::step(incident_id, "deliver the fix", reason)
+}
+
 fn same_revision(a: &str, b: &str) -> bool {
     let (a, b) = (a.trim(), b.trim());
     a.len().min(b.len()) >= 7 && (a.starts_with(b) || b.starts_with(a))
@@ -3920,6 +4033,97 @@ mod tests {
     fn shell_quote_survives_single_quotes() {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote("a b"), "'a b'");
+    }
+
+    #[test]
+    fn a_patch_the_sandbox_measured_whole_is_kept() {
+        let patch = "diff --git a/app.rs b/app.rs\n".to_string();
+        let measured = patch.len();
+        assert_eq!(
+            PatchFile::check(patch.clone(), Some(measured)),
+            PatchFile::Complete(patch)
+        );
+    }
+
+    #[test]
+    fn an_oversized_patch_is_not_kept_cut_short() {
+        let patch = PatchFile::check("x".repeat(16), Some(MAX_PATCH_BYTES + 1));
+        let PatchFile::Unavailable(reason) = &patch else {
+            panic!("an oversized patch must not be offered, got {patch:?}");
+        };
+        assert!(reason.contains("257 KB"), "{reason}");
+        assert!(reason.contains("256 KB"), "{reason}");
+        assert_eq!(patch.complete(), None);
+    }
+
+    #[test]
+    fn a_patch_the_command_output_cut_short_is_not_kept() {
+        let patch = PatchFile::check("diff --git".to_string(), Some(4096));
+        let PatchFile::Unavailable(reason) = &patch else {
+            panic!("a truncated patch must not be offered, got {patch:?}");
+        };
+        assert!(reason.contains("10 of its 4096 bytes"), "{reason}");
+    }
+
+    #[test]
+    fn an_unmeasured_patch_is_not_kept() {
+        assert!(matches!(
+            PatchFile::check("diff --git".to_string(), None),
+            PatchFile::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn edits_since_the_crash_send_the_fix_out_as_a_patch() {
+        let edited = GitProviderManagerError::FilesChangedSince {
+            connection_id: 3,
+            repository: "acme/app".into(),
+            branch: "autofix/1".into(),
+            since_revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            paths: vec!["src/app.rs".into(), "src/lib.rs".into()],
+        };
+        let reason = pull_request_refusal(&edited, "main").expect("falls back to a patch");
+        assert!(
+            reason.contains("src/app.rs, src/lib.rs changed on main"),
+            "{reason}"
+        );
+
+        let missing = GitProviderManagerError::RevisionNotFound {
+            connection_id: 3,
+            repository: "acme/app".into(),
+            branch: "autofix/1".into(),
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        };
+        let reason = pull_request_refusal(&missing, "main").expect("falls back to a patch");
+        assert!(reason.contains("0123456789ab"), "{reason}");
+
+        let rejected = GitProviderManagerError::PushRejected {
+            connection_id: 3,
+            repository: "acme/app".into(),
+            branch: "autofix/1".into(),
+            refname: "refs/heads/autofix/1".into(),
+            status: "protected".into(),
+        };
+        assert_eq!(pull_request_refusal(&rejected, "main"), None);
+    }
+
+    #[test]
+    fn a_fix_with_no_complete_patch_fails_with_both_reasons() {
+        let error = no_patch_to_deliver(
+            "afx_1",
+            "the patch is 300 KB, more than the 256 KB an incident keeps",
+            Some("src/app.rs changed on main since the crashing commit"),
+        );
+        let message = error.to_string();
+        assert!(message.contains("afx_1"), "{message}");
+        assert!(
+            message.contains("no pull request (src/app.rs changed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("no patch to download either: the patch is 300 KB"),
+            "{message}"
+        );
     }
 
     #[test]
