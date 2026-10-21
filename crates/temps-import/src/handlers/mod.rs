@@ -21,6 +21,7 @@ use temps_core::{AuditContext, RequestMetadata};
 use tracing::error;
 use utoipa::OpenApi;
 
+use crate::services::ImportExecutionScope;
 use temps_import_types::ImportSource;
 use types::{
     CreatePlanRequest, CreatePlanResponse, DiscoverRequest, DiscoverResponse, ExecuteImportRequest,
@@ -66,6 +67,29 @@ fn require_source_access(auth: &AuthContext, source: ImportSource) -> Result<(),
             .build());
     }
     Ok(())
+}
+
+/// Create permissions a non-dry-run execution of `scope` requires on top of
+/// `imports:create`. A dry run creates nothing, so it needs none.
+fn required_execute_permissions(
+    scope: &ImportExecutionScope,
+    dry_run: bool,
+) -> Vec<temps_auth::Permission> {
+    if dry_run {
+        return Vec::new();
+    }
+    // Every real execution creates a project and triggers its first deploy.
+    let mut permissions = vec![
+        temps_auth::Permission::ProjectsCreate,
+        temps_auth::Permission::DeploymentsCreate,
+    ];
+    if scope.creates_services {
+        permissions.push(temps_auth::Permission::ExternalServicesCreate);
+    }
+    if scope.creates_domains {
+        permissions.push(temps_auth::Permission::DomainsCreate);
+    }
+    permissions
 }
 
 /// List available import sources
@@ -177,16 +201,23 @@ async fn execute_import(
     Json(request): Json<types::ExecuteImportRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, temps_auth::Permission::ImportsCreate);
+    let dry_run = request.dry_run.unwrap_or(false);
+    let scope = state
+        .import_orchestrator
+        .execution_scope(auth.user_id(), &request.session_id)?;
     // Re-checked here, not only at plan time: the caller may have lost
     // instance-admin standing since the session was planned.
-    let source = state
-        .import_orchestrator
-        .session_source(auth.user_id(), &request.session_id)?;
-    require_source_access(&auth, source)?;
+    require_source_access(&auth, scope.source)?;
+    // An import creates the project, its services and domains, and deploys
+    // it. Each needs the permission it would need if made directly, so a
+    // role or API key scoped to `imports:create` cannot use an import to
+    // create what it was not granted.
+    for permission in required_execute_permissions(&scope, dry_run) {
+        permission_check!(auth, permission);
+    }
 
     let session_id = request.session_id.clone();
     let project_name = request.project_name.clone();
-    let dry_run = request.dry_run.unwrap_or(false);
 
     let result = state
         .import_orchestrator
@@ -347,5 +378,55 @@ mod tests {
             assert!(!source_reads_local_host(source), "{source:?}");
             assert!(require_source_access(&auth(Role::User), source).is_ok());
         }
+    }
+
+    fn scope(creates_services: bool, creates_domains: bool) -> ImportExecutionScope {
+        ImportExecutionScope {
+            source: ImportSource::Coolify,
+            creates_services,
+            creates_domains,
+        }
+    }
+
+    /// F7: `imports:create` must not stand in for the create permissions of
+    /// what the import makes.
+    #[test]
+    fn execution_requires_the_create_permissions_of_what_the_plan_makes() {
+        use temps_auth::Permission;
+
+        assert_eq!(
+            required_execute_permissions(&scope(false, false), false),
+            vec![Permission::ProjectsCreate, Permission::DeploymentsCreate]
+        );
+        assert_eq!(
+            required_execute_permissions(&scope(true, true), false),
+            vec![
+                Permission::ProjectsCreate,
+                Permission::DeploymentsCreate,
+                Permission::ExternalServicesCreate,
+                Permission::DomainsCreate,
+            ]
+        );
+        assert!(required_execute_permissions(&scope(true, true), true).is_empty());
+    }
+
+    #[test]
+    fn an_imports_only_api_key_cannot_execute_a_real_import() {
+        let mut key = auth(Role::Custom);
+        key.custom_permissions = Some(vec![
+            temps_auth::Permission::ImportsRead,
+            temps_auth::Permission::ImportsCreate,
+        ]);
+        let missing: Vec<_> = required_execute_permissions(&scope(true, true), false)
+            .into_iter()
+            .filter(|permission| !key.has_permission(permission))
+            .collect();
+        assert_eq!(missing.len(), 4, "{missing:?}");
+
+        // A full user holds every one of them, so nothing changes for it.
+        let user = auth(Role::User);
+        assert!(required_execute_permissions(&scope(true, true), false)
+            .iter()
+            .all(|permission| user.has_permission(permission)));
     }
 }
