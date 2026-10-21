@@ -110,7 +110,6 @@ import { repositoryFilePath } from '@/lib/repository-file-path'
 import {
   compareEnvironmentVariableKeys,
   groupVariableEnvironments,
-  liveEnvironmentSelection,
   setEnvironmentSelection,
   toggleEnvironmentSelection,
   variableAppliesToEnvironment,
@@ -227,9 +226,15 @@ function EnvironmentBadges({
           </PopoverTrigger>
           <PopoverContent align="start" className="w-80 space-y-3 p-3">
             <p className="text-sm font-medium">
-              {variableKey} applies to {active.length}{' '}
+              {variableKey} is linked to {active.length}{' '}
               {active.length === 1 ? 'environment' : 'environments'}
             </p>
+            {includeInPreview && (
+              <p className="text-xs text-muted-foreground">
+                Also applied to every preview environment, current and future,
+                through Include in Preview Environments.
+              </p>
+            )}
             {total > ENVIRONMENT_FILTER_THRESHOLD && (
               <Input
                 value={filter}
@@ -251,7 +256,7 @@ function EnvironmentBadges({
               <EnvironmentGroup
                 title="Deleted"
                 deleted
-                description="Not applied to any deployment. Kept so the variable comes back if the environment is restored."
+                description="These links are not used by any deployment. They are kept so the variable comes back if the environment is restored."
                 environments={groups.deleted.filter(matches)}
               />
               {needle && ![...active, ...groups.deleted].some(matches) && (
@@ -651,17 +656,17 @@ function EnvironmentVariableRow({
       },
       body: {
         value: valueField,
-        // Deleted environments cannot be picked in this form, and the server
-        // keeps a variable's links to them on its own, so only send the ones
-        // that still exist. Without the environment list we cannot tell them
-        // apart; the server accepts the variable's own links back unchanged.
-        environment_ids:
-          environmentChoicesAvailable && liveEnvironmentIds
-            ? liveEnvironmentSelection(
-                selectedEditEnvironments,
-                liveEnvironmentIds
-              )
-            : variable.environments.map((env) => env.id),
+        // Send every link the variable already has unless the operator
+        // removed it in the picker. The picker only offers environments this
+        // page believes exist, so links it does not show (deleted ones) stay
+        // in the selection untouched. Stripping them here would be unsafe:
+        // an environment restored since this page loaded is live again on
+        // the server, so leaving its id out deletes the link, and a variable
+        // that loses its last link applies to every environment. The server
+        // accepts ids of deleted environments the variable is linked to.
+        environment_ids: environmentChoicesAvailable
+          ? selectedEditEnvironments
+          : variable.environments.map((env) => env.id),
         key: variable.key,
         include_in_preview: environmentChoicesAvailable
           ? editIncludeInPreview
@@ -906,7 +911,7 @@ function EnvironmentVariableRow({
                       : `${deletedEnvironments.length} deleted environments`}{' '}
                     ({deletedEnvironments.map((env) => env.name).join(', ')}).
                     Those links are kept unchanged so the variable comes back if
-                    the environment is restored; they apply to no deployment.
+                    the environment is restored; no deployment uses them.
                   </p>
                 )}
               </div>

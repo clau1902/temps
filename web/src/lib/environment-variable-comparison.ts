@@ -37,7 +37,7 @@ export interface VariableEnvironmentGroups {
   previews: EnvironmentInfo[]
   /**
    * Bindings to deleted environments. The server keeps them so a restored
-   * environment gets its variables back, but they apply to no deployment.
+   * environment gets its variables back, but no deployment uses the links.
    */
   deleted: EnvironmentInfo[]
 }
@@ -70,18 +70,6 @@ export function groupVariableEnvironments(
     }
   }
   return groups
-}
-
-/**
- * The selection to submit: only environments that still exist. A deleted
- * environment cannot be chosen in the form, and the server keeps those
- * bindings on its own, so sending them back would only be stale input.
- */
-export function liveEnvironmentSelection(
-  selectedIds: readonly number[],
-  liveIds: ReadonlySet<number>
-): number[] {
-  return selectedIds.filter((id) => liveIds.has(id))
 }
 
 /** Add or remove one environment from a selection, keeping its order. */

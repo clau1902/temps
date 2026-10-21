@@ -9,7 +9,6 @@ import type {
 import {
   compareEnvironmentVariableKeys,
   groupVariableEnvironments,
-  liveEnvironmentSelection,
   setEnvironmentSelection,
   toggleEnvironmentSelection,
   variableAppliesToEnvironment,
@@ -113,13 +112,6 @@ describe('variable environment grouping', () => {
     expect(groups.stable.map((env) => env.id)).toEqual([1, 4])
     expect(groups.deleted).toEqual([])
   })
-
-  test('drops deleted environments from the submitted selection', () => {
-    expect(liveEnvironmentSelection([1, 9, 3], new Set([1, 2, 3]))).toEqual([
-      1, 3,
-    ])
-    expect(liveEnvironmentSelection([9], new Set([1]))).toEqual([])
-  })
 })
 
 describe('environment picker selection', () => {
@@ -131,5 +123,16 @@ describe('environment picker selection', () => {
   test('selects and clears a batch without touching the rest', () => {
     expect(setEnvironmentSelection([1], [2, 1, 3], true)).toEqual([1, 2, 3])
     expect(setEnvironmentSelection([1, 2, 5], [2, 3], false)).toEqual([1, 5])
+  })
+
+  test('keeps links the picker does not show when the operator edits', () => {
+    // 9 is a link to an environment this page thinks is deleted (it may have
+    // been restored since). Clearing or toggling what the picker shows must
+    // never drop it: losing a variable's last link makes it apply everywhere.
+    const linked = [1, 9]
+    const shown = [1, 2, 3]
+    expect(setEnvironmentSelection(linked, shown, false)).toEqual([9])
+    expect(setEnvironmentSelection(linked, shown, true)).toEqual([1, 9, 2, 3])
+    expect(toggleEnvironmentSelection(linked, 1)).toEqual([9])
   })
 })
