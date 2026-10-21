@@ -115,51 +115,13 @@ pub struct ExternalServiceStatusChangedAudit {
     pub new_status: String,
 }
 
-/// Operator changed whether the AI assistant may read this service's row data.
-///
-/// Audited because it widens what a third party (the configured AI provider)
-/// can see: rows may contain password hashes, tokens and personal data. Both
-/// directions are recorded so the trail shows when access was opened *and*
-/// closed.
-#[derive(Debug, Clone, Serialize)]
-pub struct AiDataAccessChangedAudit {
-    pub context: AuditContext,
-    pub service_id: i32,
-    pub service_name: String,
-    pub enabled: bool,
-}
-
-impl AuditOperation for AiDataAccessChangedAudit {
-    fn operation_type(&self) -> String {
-        "EXTERNAL_SERVICE_AI_DATA_ACCESS_CHANGED".to_string()
-    }
-
-    fn user_id(&self) -> Option<i32> {
-        Some(self.context.user_id)
-    }
-
-    fn ip_address(&self) -> Option<String> {
-        self.context.ip_address.clone()
-    }
-
-    fn user_agent(&self) -> &str {
-        &self.context.user_agent
-    }
-
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
-    }
-}
-
 /// The AI assistant actually read row data from a service.
 ///
-/// The `ai_data_access` toggle is audited, but the toggle only records that an
-/// operator opened the door — not what went through it. The whole reason the
-/// opt-in exists is that rows can carry password hashes, tokens and personal
-/// data, and that enabling it sends them to a third-party model provider. After
-/// a suspected prompt injection the operator's first question is "what did the
-/// model see?", and without this record there is nothing to answer it with.
+/// The assistant reads data with the user's own permissions, and rows can carry
+/// password hashes, tokens and personal data that then reach the configured
+/// model provider. After a suspected prompt injection the operator's first
+/// question is "what did the model see?", and without this record there is
+/// nothing to answer it with.
 ///
 /// Deliberately records only stable IDs and fixed categories. Service names,
 /// container paths and entity names are omitted because key-value/object

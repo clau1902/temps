@@ -40,6 +40,7 @@ pub struct ErrorTrackingService {
     source_map_service: OnceCell<Arc<SourceMapService>>,
     notification_callback: OnceCell<NotificationCallback>,
     autopilot_callback: OnceCell<NotificationCallback>,
+    job_queue: OnceCell<Arc<dyn temps_core::JobQueue>>,
 }
 
 impl ErrorTrackingService {
@@ -56,6 +57,7 @@ impl ErrorTrackingService {
             source_map_service: OnceCell::new(),
             notification_callback: OnceCell::new(),
             autopilot_callback: OnceCell::new(),
+            job_queue: OnceCell::new(),
         }
     }
 
@@ -77,6 +79,37 @@ impl ErrorTrackingService {
     /// Only notifications with trigger_type "new_issue" or "regression" are forwarded.
     pub fn set_autopilot_callback(&self, callback: NotificationCallback) {
         let _ = self.autopilot_callback.set(callback);
+    }
+
+    /// Announce new and regressed groups on the job queue (ADR-054), so
+    /// autofix can act on them without depending on an alert rule.
+    pub fn set_job_queue(&self, queue: Arc<dyn temps_core::JobQueue>) {
+        let _ = self.job_queue.set(queue);
+    }
+
+    /// Publish [`temps_core::ErrorGroupOpenedJob`]. Only new groups and
+    /// regressions reach here, so ingest pays this once per issue, not per
+    /// event; a failed send is logged and never fails the ingest.
+    async fn announce_group_opened(&self, group: &error_groups::Model, regression: bool) {
+        let Some(queue) = self.job_queue.get() else {
+            return;
+        };
+        let job = temps_core::Job::ErrorGroupOpened(temps_core::ErrorGroupOpenedJob {
+            project_id: group.project_id,
+            error_group_id: group.id,
+            environment_id: group.environment_id,
+            regression,
+        });
+        if let Err(error) = queue.send(job).await {
+            tracing::warn!(
+                project_id = group.project_id,
+                error_group_id = group.id,
+                "failed to announce error group {} of project {}: {}",
+                group.id,
+                group.project_id,
+                error
+            );
+        }
     }
 
     /// Send notifications for alert results
@@ -217,6 +250,10 @@ impl ErrorTrackingService {
 
             // Ingestion reopens regressions in the same transaction as the
             // event and count, so concurrent requests cannot each claim one.
+            if is_new_group || is_regression {
+                self.announce_group_opened(&group, is_regression).await;
+            }
+
             let notifications = if is_new_group {
                 self.alerts
                     .evaluate_new_group(&group, has_user_context)

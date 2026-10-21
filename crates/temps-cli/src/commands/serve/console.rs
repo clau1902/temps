@@ -2196,6 +2196,15 @@ fn health_router(ready: Arc<std::sync::atomic::AtomicBool>) -> Router {
         .route("/readyz", get(readyz))
 }
 
+/// Test-only: every API operation must be exposed to the assistant or withheld
+/// with a reason, so a new endpoint cannot be invisible by accident.
+#[cfg(test)]
+mod ai_tool_policy;
+
+/// Test-only: every request field that takes a credential must be flagged in
+/// the spec, so the assistant can take it through a secret slot.
+#[cfg(test)]
+mod ai_secret_fields;
 /// The console's public surface and nothing else (ADR-051 D4).
 ///
 /// Serves the health probes and the public router under `/api`. It has no
@@ -2317,7 +2326,6 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_container_metrics",
         "get_container_logs",
         "get_container_logs_by_id",
-        "get_container_info",
         "get_container_detail",
         "list_containers",
         // ── Projects: current-user-filtered metadata ──
@@ -2391,6 +2399,46 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_service_type_parameters",
         "get_cluster_health",
         "get_cluster_member",
+        // Service detail with every sensitive parameter masked
+        // (`mask_sensitive_parameter_values`); `connection_info` is never
+        // populated. Without it the assistant could not see why a service
+        // failed (`error_message`) or how its members were laid out.
+        // `reveal_service_parameter` / `reveal_service_environment_variables`
+        // stay out: those return plaintext.
+        "get_service",
+        "get_service_by_slug",
+        // ── Agentic follow-up reads: what a change did, and what to do next ──
+        "list_container_history",
+        "tail_deployment_job_logs",
+        "get_restore_run",
+        "get_external_service_backup_capability",
+        "list_renewal_attempts",
+        "get_compose_security",
+        "get_project_service_template",
+        // The public IPs and whether domains can be created: what a user needs
+        // to point a DNS record at this platform.
+        "get_access_info",
+        // Repository files fetched through the stored Git connection, so a
+        // private repo's `.env.example` / compose file can be read when
+        // planning a deployment.
+        "get_repository_env_example_live",
+        "get_repository_compose_services_live",
+        "get_public_compose_services",
+        // ── Monitoring the user already configured ──
+        "listHttpChecks",
+        "getHttpChecksCapabilities",
+        "listHttpCheckPresets",
+        "listSystemAlarms",
+        "getSystemAlarmsSummary",
+        "list_global_error_groups",
+        // ── Cross-project analytics and traces (same scope rules as the
+        //    per-project reads above). API traffic summaries, routes and
+        //    callers are deliberately absent: a test pins them out. ──
+        "get_global_analytics",
+        "get_analytics_projects",
+        "query_global_traces",
+        "query_global_trace_summaries",
+        "getUnifiedTrace",
         "getPostgresWalHealth",
         "ExternalServiceMetricsGetLatest",
         "ExternalServiceMetricsGetRange",
@@ -2523,23 +2571,13 @@ fn ai_read_allowlist() -> Vec<String> {
         // won, so this allowlist granted the agent that endpoint while the
         // comment here claimed the Docker one. Not listed: navigation is
         // already covered by `list_containers_at_path`, and it is not needed.
-        // Entity names. On SQL and MongoDB these are tables and collections —
-        // developer-chosen names, no stored values, safe on the same footing as
-        // the rest of this list. On Redis and S3 the entity name IS user data
-        // (keys embed session tokens and emails; object names are user-supplied
-        // filenames), so for those engines the handler gates this behind the
-        // same `ai_data_access` opt-in as row reads. Allowlisting it here only
-        // makes the endpoint reachable. See `entity_names_are_user_data` in
-        // temps-providers.
+        // Entities and their rows. The assistant reads data with the user's
+        // own permissions, exactly as the data browser does — the handlers
+        // check `ExternalServicesRead` and the caller's project scope — and
+        // every row read it makes is audited (`AiRowsReadAudit` in
+        // temps-providers). Row contents reach the configured AI provider.
         "list_entities",
         "get_entity_info",
-        // Row CONTENTS. Unlike every other entry here, this one *can* return
-        // secrets — password hashes, API tokens, customer PII — because it
-        // returns whatever the operator stored. It is therefore gated a
-        // second time inside the handler by the per-service `ai_data_access`
-        // column, which defaults to false: allowlisting it here only makes
-        // the endpoint reachable, it does not grant access to any service.
-        // See `read_entity_rows` in temps-providers.
         "read_entity_rows",
         // ── KV / Blob: status only, no connection strings ──
         "kv_status",
@@ -2649,8 +2687,6 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_providers_metadata",
         // Available Docker images for external services (name, version tags).
         "list_available_containers",
-        // AI data-access toggle — boolean (enabled/disabled) per service.
-        "get_ai_data_access",
         // Slow-query statistics from pg_stat_statements — parameterised query
         // text ($1/$2 placeholders), execution counts, timing. No data values.
         "get_slow_queries",
@@ -2722,6 +2758,9 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_all_conversations",
         "get_pending_action",
         "list_pending_actions",
+        // The deployments, backups and restores a chat started, filtered to the
+        // ones the caller may read. Statuses and IDs only; no secrets.
+        "list_chat_operations",
         // Instance AI-provider readiness; project access is enforced separately.
         "get_chat_readiness",
         // ── OTel dashboards ──
@@ -2865,6 +2904,10 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_repository_preset_live",
         // Git connection metadata (connection IDs, names, provider type).
         "get_provider_connections",
+        // ── Getting started: what a repository / template needs ──
+        // Preset detection and `.env.example` discovery for a public
+        // repository, and the project template catalogue. Read-only metadata.
+        "detect_public_env_example",
         // ── Log aggregator: context window — excluded ──
         // `get_log_context` is intentionally NOT included. It returns raw
         // `message`/`fields` from application stdout/stderr (arbitrary
@@ -2909,6 +2952,90 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_sandboxes",
         // Sandbox event list — lifecycle events (created, started, stopped).
         "list_events",
+        // ── Coverage audit: reads added after a DTO review (masked or no secrets) ──
+        // Projects and deployments
+        "get_cloudflare_project_capability",
+        "get_latest_deployment_media",
+        "list_managed_environment_variables",
+        "get_failure_report_preview",
+        "get_deployment_by_upload_request_id",
+        "list_operations",
+        // Backups
+        "list_s3_sources",
+        "get_s3_source",
+        // Git
+        "get_connection",
+        "validate_connection",
+        // AI applications
+        "list_applications",
+        "get_application",
+        "list_application_conversations",
+        "list_thread_artifacts",
+        "listApplicationGitConnections",
+        "get_application_workspace",
+        "get_application_workspace_changes",
+        "get_application_workspace_diff",
+        "get_application_workspace_directory",
+        "get_application_workspace_file",
+        "get_ai_provider_status",
+        // Revenue (aggregates only)
+        "revenue_metrics_customers",
+        "revenue_metrics_mrr",
+        "revenue_metrics_summary",
+        "revenue_metrics_global_mrr",
+        "revenue_metrics_global_summary",
+        "revenue_list_providers",
+        // Observability
+        "global_log_aggregate",
+        "global_log_attribute_keys",
+        "global_log_capabilities",
+        "global_log_facets_attrs",
+        "global_log_histogram",
+        "list_facets",
+        "NodeMetricsGetAlertRules",
+        "get_cloud_backfill_status",
+        "get_current_bulk_activation_job",
+        "get_bulk_activation_job",
+        "get_project_cloud_telemetry",
+        "get_cloud_telemetry_status",
+        "has_traces",
+        "get_pipeline_history",
+        "get_activity_status",
+        // Domains, DNS and delivery
+        "get_http_challenge_debug",
+        "get_record_ownership",
+        "get_visible_custom_domain_by_hostname",
+        "get_delivery_capabilities",
+        "list_delivery_profiles",
+        "get_delivery_profile",
+        "get_project_delivery_settings",
+        "list_domain_delivery_bindings",
+        "list_traefik_discovered_routes",
+        "get_traefik_discovery_status",
+        "list_discoverable_domains",
+        "list_email_domain_projects",
+        // Cluster and platform
+        "cluster_dns_status",
+        "NodeCapabilityGet",
+        "NodeDockerDiskUsageGet",
+        "admin_list_nodes",
+        "admin_get_node",
+        "admin_list_node_containers",
+        "admin_drain_status",
+        "admin_get_node_public_ingress_settings",
+        "ClusterNetworkGet",
+        "NodePairingList",
+        "WireguardMeshStatusGet",
+        "get_private_ip",
+        "get_feature_maturity",
+        "get_geo_database_status",
+        "get_telemetry_settings",
+        "get_cloud_ai_capability",
+        "get_cloud_capability",
+        "get_cloud_status",
+        // Databases and notifications
+        "get_query_container_info",
+        "get_notification_delivery_coverage",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -2996,6 +3123,125 @@ fn ai_write_allowlist() -> Vec<String> {
         //    unlinked / left running unused; nothing is deleted).
         "create_service",
         "link_service_to_project",
+        // A cluster that failed while coming up is repaired in place; the
+        // alternative is a second cluster beside the broken one. It carries no
+        // credentials and only re-runs the creation the user asked for.
+        "retry_cluster",
+        // ── Getting started: create a project and ship it ──
+        // `create_project` takes a Git URL (public) or a connected provider
+        // repository and creates the project plus its first environment.
+        // Reversible (a project can be deleted by a human) and it only
+        // starts a build the user asked for. Credentials are never part of
+        // this payload: a private repository goes through a Git connection
+        // the user added in the console, referenced by id.
+        "create_project",
+        "create_project_from_template",
+        "create_environment",
+        // Refresh the repository list of an existing Git connection.
+        "sync_repositories",
+        // Create an empty repository through a Git connection, referenced by id.
+        // The handler requires `git_repositories:create` and resolves the
+        // connection by (id, caller), so another user's connection answers 404:
+        // the assistant reaches exactly what its user could from the console,
+        // with that connection's own token. The payload carries no credential.
+        "create_repository",
+        // Commit files to a repository, and open a pull request, through the same
+        // kind of connection. Both require `git_repositories:write` and resolve
+        // the connection by (id, caller). A commit only adds history on top of
+        // the branch (it never force-pushes), is bounded in files and bytes, and
+        // is shown to the user for approval first; the token never enters the
+        // chat or a sandbox. The credential-bearing provider operations
+        // (`update_connection_token`, `create_*_pat_provider`) stay out.
+        "commit_repository_files",
+        "open_repository_pull_request",
+        // ── Getting started: backups ──
+        // Schedules reference an S3 source by id. Registering or editing a
+        // source takes the bucket secret key, so these three are proposable only
+        // because `secret_key` is a `SecretString` flagged `x-temps-secret`: the
+        // model passes a `secret_ref:` handle from `request_secret`, never the
+        // key, and the caller substitutes it server-side at confirm time. Git
+        // provider tokens (`create_*_pat_provider`, `create_generic_provider`)
+        // are not converted yet and stay out.
+        "create_s3_source",
+        "update_s3_source",
+        // Checks a candidate bucket before it is saved; the same secret_key rules.
+        "test_s3_connection_preview",
+        "create_backup_schedule",
+        "update_backup_schedule",
+        "enable_backup_schedule",
+        "disable_backup_schedule",
+        "attach_schedule_services",
+        "run_schedule_now",
+        // Connectivity probe against a stored source; reads nothing back but
+        // an ok/error result.
+        "test_s3_source_connection",
+        // ── Operating a database service ──
+        // Lifecycle and sizing of a service the user already has. None of
+        // these carry a credential. `upgrade_service`, `promote_cluster_member`
+        // (a failover), restores and Postgres upgrades are deliberately NOT
+        // here: they put data or availability at risk and are done from the
+        // console where the user sees the plan first.
+        "start_service",
+        "stop_service",
+        "update_service_resources",
+        "trigger_service_health_check",
+        "add_cluster_member",
+        "unlink_service_from_project",
+        // Removing a service is the only way to clean up a cluster that failed
+        // to come up. DELETE always waits for the user, in every mode.
+        "delete_service",
+        // ── Project configuration ──
+        // `update_project_deployment_config` is NOT here: its payload can carry
+        // a password-protection secret and arbitrary headers.
+        "update_project",
+        "update_project_settings",
+        "update_environment_subdomain",
+        // ── Backups: run and manage, never create the destination ──
+        "run_external_service_backup",
+        "cancel_backup",
+        "cancel_schedule_run",
+        "detach_schedule_service",
+        "delete_backup_schedule",
+        // ── Domains and certificates ──
+        // Registering a domain, ordering and finalizing its certificate and
+        // pointing a project at it. DNS provider credentials are stored on
+        // the provider and never travel in these payloads.
+        "create_domain",
+        "provision_domain",
+        "renew_domain",
+        "create_or_recreate_order",
+        "finalize_order",
+        "setup_dns_challenge",
+        "cancel_domain_order",
+        "create_custom_domain",
+        "update_custom_domain",
+        "delete_custom_domain",
+        "link_custom_domain_to_certificate",
+        // ── Alarms and incidents ──
+        "acknowledgeAlarm",
+        "resolveAlarm",
+        "silenceAlarm",
+        "acknowledgeSystemAlarm",
+        "resolveSystemAlarm",
+        "silenceSystemAlarm",
+        // Checks are created in the console (their payload can hold request
+        // headers); the assistant can switch one on or off and run it now.
+        "setHttpCheckEnabled",
+        "runHttpCheck",
+        "create_monitor",
+        "update_monitor",
+        "create_incident",
+        "update_incident_status",
+        // ── Feature flags, error rules and scans ──
+        "create_flag",
+        "update_flag",
+        "set_flag_environment",
+        "restore_flag",
+        "archive_flag",
+        "create_alert_rule",
+        "update_alert_rule",
+        "update_error_group",
+        "trigger_scan",
         // ── AI application topology ──
         // Composite create is the only safe way for the model to create a
         // Temps project and immediately link its generated id to the current
@@ -3042,6 +3288,128 @@ fn ai_write_allowlist() -> Vec<String> {
         "create_notification_route",
         "update_notification_route",
         "delete_notification_route",
+        // ── Coverage audit: reversible configuration and lifecycle, proposed for approval; DELETEs always wait ──
+        // Project source and deployment settings
+        "set_alternate_sources",
+        "change_project_source",
+        "update_service_template_runtime",
+        "preview_domain_delivery_binding",
+        "apply_domain_delivery_binding",
+        "delete_domain_delivery_binding",
+        "update_project_delivery_settings",
+        // Backups: set default and run now
+        "set_default_s3_source",
+        "run_backup_for_source",
+        // Git connections and providers (toggle and health only)
+        "activate_connection",
+        "deactivate_connection",
+        "activate_provider",
+        "deactivate_provider",
+        "run_connection_health_check",
+        // Databases and services
+        "ExternalServiceResetPgStatStatements",
+        "ExternalServiceMetricsToggle",
+        "DeploymentMetricsToggle",
+        "ExternalServiceMetricsCreateAlertRule",
+        "ExternalServiceMetricsUpdateAlertRule",
+        "NodeMetricsUpdateAlertRule",
+        "kv_enable",
+        "kv_update",
+        "blob_update",
+        // Domains, DNS and email
+        "add_managed_domain",
+        "update_managed_domain",
+        "verify_managed_domain",
+        "apply_hostname_mode",
+        "test_provider_connection",
+        "set_managed_record",
+        "import_managed_record",
+        "remove_managed_record",
+        "remove_managed_domain",
+        "create_email_domain",
+        "import_email_domain",
+        "setup_dns",
+        "verify_domain",
+        "authorize_email_domain_project",
+        "revoke_email_domain_project",
+        "test_provider",
+        "setup_email_tracking",
+        // Alerting, checks and notifications
+        "bulkUpdateProjectAlarms",
+        "bulkUpdateSystemAlarms",
+        "deleteHttpCheck",
+        "delete_monitor",
+        "test_notification_route",
+        "update_preferences",
+        "delete_preferences",
+        "retry_delivery",
+        "delete_webhook",
+        // Observability and analytics
+        "create_dashboard",
+        "update_dashboard",
+        "delete_dashboard",
+        "create_facet",
+        "delete_facet",
+        "retry_facet_backfill",
+        "create_funnel",
+        "update_funnel",
+        "delete_funnel",
+        "update_project_cloud_telemetry",
+        "save_activity_settings",
+        "run_activity_report",
+        "preview_activity_report",
+        "suggest_activity_goals",
+        "workflow_dry_run",
+        "validate_email",
+        // Error tracking and security
+        "start_analysis",
+        "add_context",
+        "cancel",
+        "start_fix",
+        "re_analyze",
+        "create_pr",
+        "delete_source_map",
+        "delete_release_source_maps",
+        "delete_release_source_files",
+        "delete_scan",
+        // Registered external images
+        "register_external_image",
+        "delete_external_image",
+        // AI applications
+        "create_application",
+        "archive_application",
+        "create_application_conversation",
+        "create_thread_artifact",
+        "bindApplicationGitConnection",
+        "disconnectApplicationGitConnection",
+        "create_application_preview_link",
+        "write_application_workspace_files",
+        "import_application_workspace_git",
+        "restore_application",
+        "upload_application_workspace_files",
+        // Agents, skills and MCP removal
+        "trigger_agent",
+        "cancel_run",
+        "retry_run",
+        "smoke_test_agent",
+        "delete_agent",
+        "create_skill",
+        "update_skill",
+        "delete_skill",
+        "create_global_skill",
+        "update_global_skill",
+        "delete_global_skill",
+        "delete_mcp",
+        "delete_global_mcp",
+        // AI gateway models (not keys)
+        "add_provider_model",
+        "refresh_provider_models",
+        "update_provider_model",
+        "delete_provider_model",
+        "test_provider_key_by_id",
+        // Revenue configuration
+        "revenue_update_config",
+        "revenue_delete_integration",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -3077,6 +3445,17 @@ fn ai_read_safe_posts() -> Vec<String> {
         // fired?" *before* proposing it, so a suggested alert arrives with
         // evidence attached instead of a guessed threshold.
         "preview_alert",
+        // ── Coverage audit: POSTs that write nothing (search, preview, quote) ──
+        // Read-only POST: log search and facets
+        "search_logs",
+        "search_global_logs",
+        "facet_global_logs",
+        // Read-only POST: previews and quotes
+        "preview_funnel_metrics",
+        "estimate_bulk_activation",
+        "get_repository_compose_preview",
+        "get_public_compose_preview",
+        "generate_preset_dockerfile",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -6215,6 +6594,8 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: admin_auth(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
+            origin: None,
+            secrets: None,
         };
 
         let base = "alerts create_alert --name p95 --metric_name http.server.duration \
@@ -6295,6 +6676,8 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: auth.clone(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
+            origin: None,
+            secrets: None,
         };
 
         // Discoverable by browsing, which is how the model finds anything.
@@ -6365,6 +6748,165 @@ mod ai_tool_allowlist_tests {
         }
     }
 
+    /// Creating a repository is allowed through the user's own connection and
+    /// stays a proposal; pushing, which would need a token in the request, is not
+    /// something the assistant can stage.
+    #[test]
+    fn git_repository_operations_are_proposable_but_credential_ones_are_not() {
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+        let safe: std::collections::HashSet<String> = ai_read_safe_posts().into_iter().collect();
+        for operation in [
+            "create_repository",
+            "commit_repository_files",
+            "open_repository_pull_request",
+        ] {
+            assert!(
+                writes.contains(operation),
+                "the assistant cannot stage `{operation}`"
+            );
+            assert!(
+                !safe.contains(operation),
+                "`{operation}` is a write and needs the confirm card"
+            );
+        }
+        for operation in [
+            "update_connection_token",
+            "create_github_pat_provider",
+            "create_gitlab_pat_provider",
+            "create_git_provider",
+            "delete_connection",
+        ] {
+            assert!(
+                !writes.contains(operation),
+                "`{operation}` must stay out of the assistant's write tool"
+            );
+        }
+    }
+
+    /// The assistant must be able to take a user from nothing to a deployed
+    /// project and scheduled backups. An operation whose payload carries a stored
+    /// credential is proposable only once that field is a flagged `SecretString`
+    /// (the S3 source operations); the rest still go through the console forms.
+    #[test]
+    fn getting_started_operations_are_proposable_but_unconverted_credential_forms_are_not() {
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+        for operation in [
+            "create_project",
+            "create_project_from_template",
+            "create_environment",
+            "create_backup_schedule",
+            "update_backup_schedule",
+            "run_schedule_now",
+            "test_s3_source_connection",
+            "create_s3_source",
+            "update_s3_source",
+            "test_s3_connection_preview",
+        ] {
+            assert!(
+                writes.contains(operation),
+                "getting-started flow cannot stage `{operation}`"
+            );
+        }
+        for operation in [
+            "create_github_pat_provider",
+            "create_gitlab_pat_provider",
+            "create_gitea_pat_provider",
+            "create_generic_provider",
+            "create_bitbucket_provider",
+            "update_git_provider_credentials",
+        ] {
+            assert!(
+                !writes.contains(operation),
+                "`{operation}` carries a secret and must stay out of the assistant's write tool"
+            );
+        }
+        // Both return `S3SourceResponse`, which masks the access key id and the
+        // secret key as `***` (`backup_handler.rs`, pinned by
+        // `s3_source_response_masks_both_keys` in temps-backup). They have to be
+        // readable: the backup playbook starts from "is there a source already?".
+        let reads: std::collections::HashSet<String> = ai_read_allowlist().into_iter().collect();
+        for operation in ["list_s3_sources", "get_s3_source"] {
+            assert!(
+                reads.contains(operation),
+                "`{operation}` returns only masked credentials and must be readable"
+            );
+        }
+    }
+
+    /// The assistant has to be able to run the platform it set up: see why a
+    /// service failed, repair or remove it, size it, put a domain on a project.
+    /// And the operations whose payload or response carries a secret, or that
+    /// can lose data, stay with the console. Pinning both keeps a later
+    /// addition from quietly crossing the line in either direction.
+    #[test]
+    fn operating_operations_are_proposable_and_secret_or_data_risking_ones_are_not() {
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+        let reads: std::collections::HashSet<String> = ai_read_allowlist().into_iter().collect();
+        for operation in [
+            "start_service",
+            "stop_service",
+            "update_service_resources",
+            "add_cluster_member",
+            "retry_cluster",
+            "delete_service",
+            "update_project",
+            "run_external_service_backup",
+            "create_custom_domain",
+            "provision_domain",
+            "acknowledgeAlarm",
+        ] {
+            assert!(
+                writes.contains(operation),
+                "operating flow cannot stage `{operation}`"
+            );
+        }
+        for operation in ["get_service", "get_service_by_slug", "get_access_info"] {
+            assert!(
+                reads.contains(operation),
+                "operating flow cannot read `{operation}`"
+            );
+        }
+        // Payload carries a secret, or the operation can lose data or fail over.
+        for operation in [
+            "update_project_deployment_config",
+            "createHttpCheck",
+            "updateHttpCheck",
+            "create_webhook",
+            "create_api_key",
+            "create_deployment_token",
+            "createProjectSecret",
+            "upsert_secret",
+            "create_dsn",
+            "upgrade_service",
+            "promote_cluster_member",
+            "start_restore",
+            "start_data_import",
+            "start_pg_upgrade",
+            "delete_project",
+            "delete_backup",
+        ] {
+            assert!(
+                !writes.contains(operation),
+                "`{operation}` must stay out of the assistant's write tool"
+            );
+        }
+        // Responses that return plaintext secrets.
+        for operation in [
+            "reveal_service_parameter",
+            "reveal_service_environment_variables",
+            "get_environment_variable_value",
+            "get_resolved_environment_variable_value",
+            "get_container_environment_variable",
+            "get_service_environment_variable",
+            "get_settings",
+        ] {
+            assert!(
+                !reads.contains(operation),
+                "`{operation}` returns plaintext secrets and must stay out of the read tool"
+            );
+        }
+    }
+
     #[test]
     fn application_workspace_drop_is_proposable() {
         let openapi = temps_ai_chat::handlers::AiChatApiDoc::openapi();
@@ -6418,6 +6960,10 @@ mod ai_tool_allowlist_tests {
 
     /// Every safe-POST entry must resolve to a real operation, or it silently
     /// does nothing — the same failure mode the read-allowlist test guards.
+    ///
+    /// The safe POSTs come from several crates. Those from the OpenTelemetry
+    /// crate resolve against its own document; the rest are checked against
+    /// the published API, which is where `ai_tool_policy` pins every operation.
     #[test]
     fn safe_posts_resolve_against_the_real_openapi() {
         use temps_ai_api_tools::ReadOnlyApiIndex;
@@ -6428,10 +6974,13 @@ mod ai_tool_allowlist_tests {
         let safe_refs: Vec<&str> = safe.iter().map(String::as_str).collect();
         let index =
             ReadOnlyApiIndex::from_openapi_allowlist_with_safe_posts(&openapi, &[], &safe_refs);
+        let published = super::ai_tool_policy::published_operations();
 
         for op in &safe {
+            let in_otel = index.get(op).is_some();
+            let published_post = published.get(op).is_some_and(|method| method == "POST");
             assert!(
-                index.get(op).is_some(),
+                in_otel || published_post,
                 "`{op}` is allowlisted as a read-only POST but does not resolve — \
                  check for a typo or a renamed handler"
             );
@@ -6467,6 +7016,8 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: admin_auth(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
         };
         let catalog = caller.run_cli("projects --help", &scope).await;
         assert!(catalog.contains("get_projects"), "catalog: {catalog}");
@@ -6486,6 +7037,8 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: admin_auth(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Allowed(vec![1]),
+            origin: None,
+            secrets: None,
         };
 
         let recovery = caller
@@ -6545,6 +7098,8 @@ mod ai_tool_allowlist_tests {
         let scope = ApiCallScope {
             auth: admin_auth(),
             project_scope: temps_ai_api_tools::ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
         };
         let catalog = caller.run_cli("external-services --help", &scope).await;
         assert!(catalog.contains("list_services"), "catalog: {catalog}");

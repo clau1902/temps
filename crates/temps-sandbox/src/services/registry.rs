@@ -134,6 +134,12 @@ pub struct StandaloneSandboxRegistry {
     /// generation marker remains set while the future is in flight, making
     /// cancellation fail closed; concurrent callers wait here and re-check it.
     recovery_fence_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
+    /// One handle recovery per sandbox at a time. Recovering re-checks the
+    /// container's file ownership, which takes seconds on a large workspace;
+    /// requests that arrive together (a chat opening several panels after a
+    /// restart) wait for the first recovery and reuse its handle instead of
+    /// each repeating it.
+    recover_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
     /// Stop-then-start operations the control plane itself performs. See
     /// [`PlannedDowntime`].
     planned_downtime: Arc<PlannedDowntime>,
@@ -187,6 +193,7 @@ impl StandaloneSandboxRegistry {
             runtime_compatibility: Mutex::new(HashMap::new()),
             recovered_in_this_generation: RwLock::new(HashSet::new()),
             recovery_fence_locks: Mutex::new(HashMap::new()),
+            recover_locks: Mutex::new(HashMap::new()),
             planned_downtime: Arc::new(PlannedDowntime::default()),
             nodes,
         }
@@ -400,6 +407,18 @@ impl StandaloneSandboxRegistry {
     /// ops like `start` can act on them. Callers that need the container
     /// to be running (e.g. `exec`) must check separately.
     async fn get_or_recover(&self, id: i32, public_id: &str) -> Result<SandboxHandle, AgentError> {
+        if let Some(h) = self.handles.read().await.get(&id).cloned() {
+            return Ok(h);
+        }
+        let recover_lock = {
+            let mut locks = self.recover_locks.lock().await;
+            locks
+                .entry(id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _recover_guard = recover_lock.lock().await;
+        // Whoever held the lock before us may have recovered it already.
         if let Some(h) = self.handles.read().await.get(&id).cloned() {
             return Ok(h);
         }
@@ -1158,6 +1177,33 @@ mod tests {
             vec![Some(7)]
         );
         assert_eq!(provider.stops.load(Ordering::SeqCst), 1);
+    }
+
+    /// Requests that reach a sandbox together after a restart share one
+    /// recovery instead of each re-running it.
+    #[tokio::test]
+    async fn concurrent_requests_after_a_restart_recover_the_sandbox_once() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_recovery_delay(Duration::from_millis(50)),
+        );
+        let reg = Arc::new(StandaloneSandboxRegistry::local_only(provider.clone()));
+
+        let lookups = (0..4).map(|_| {
+            let reg = reg.clone();
+            tokio::spawn(async move { reg.get(42, "sbx_abc123").await })
+        });
+        for lookup in futures::future::join_all(lookups).await {
+            let handle = lookup.expect("lookup task").expect("recovered handle");
+            assert_eq!(handle.sandbox_id, "docker-id-abc123");
+        }
+
+        assert_eq!(
+            provider.recovered_on.lock().expect("recovered_on").len(),
+            1,
+            "four concurrent lookups must share a single recovery"
+        );
     }
 
     /// When the hosting node cannot be looked up, recovery fails instead of

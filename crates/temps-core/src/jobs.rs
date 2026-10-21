@@ -313,6 +313,19 @@ pub struct AutopilotTriggerJob {
     pub error_group_id: Option<i32>,
 }
 
+/// An error group just became something to fix: it was seen for the first
+/// time, or a resolved/ignored group came back (ADR-054). Emitted by error
+/// ingest whether or not an alert rule matches; autofix decides per project
+/// whether to act on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorGroupOpenedJob {
+    pub project_id: i32,
+    pub error_group_id: i32,
+    pub environment_id: Option<i32>,
+    /// `true` when a resolved or ignored group regressed.
+    pub regression: bool,
+}
+
 /// Job for when an alarm is resolved
 ///
 /// `environment_id` and `deployment_id` are `Option` because service-scoped
@@ -510,6 +523,8 @@ pub enum Job {
     AlarmResolved(AlarmResolvedJob),
     // Autopilot events
     AutopilotTrigger(AutopilotTriggerJob),
+    /// A new or regressed error group (ADR-054).
+    ErrorGroupOpened(ErrorGroupOpenedJob),
     // Backup events — the trigger flows through the same JobQueue as
     // deployments: the HTTP handler / cron tick publishes BackupRequested,
     // the `BackupJobProcessor` consumes it and runs the engine in a
@@ -575,6 +590,7 @@ impl fmt::Display for Job {
             Job::AlarmFired(job) => write!(f, "AlarmFired(id: {}, project: {:?}, type: {}, severity: {})", job.alarm_id, job.project_id, job.alarm_type, job.severity),
             Job::AlarmResolved(job) => write!(f, "AlarmResolved(id: {}, project: {:?}, type: {})", job.alarm_id, job.project_id, job.alarm_type),
             Job::AutopilotTrigger(job) => write!(f, "AutopilotTrigger(project: {}, type: {}, source: {:?})", job.project_id, job.trigger_type, job.trigger_source_id),
+            Job::ErrorGroupOpened(job) => write!(f, "ErrorGroupOpened(project: {}, group: {}, regression: {})", job.project_id, job.error_group_id, job.regression),
             Job::BackupRequested(job) => write!(f, "BackupRequested(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupStarted(job) => write!(f, "BackupStarted(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCompleted(job) => write!(f, "BackupCompleted(backup: {}, engine: {}, size: {:?})", job.backup_id, job.engine, job.size_bytes),

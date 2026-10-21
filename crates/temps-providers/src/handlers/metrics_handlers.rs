@@ -2170,7 +2170,6 @@ mod tests {
                 consecutive_health_failures: Set(0),
                 metrics_enabled: Set(true),
                 default_backup_provisioned: Set(false),
-                ai_data_access: Set(false),
                 ..Default::default()
             }
             .insert(db.as_ref())

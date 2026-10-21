@@ -1614,7 +1614,6 @@ mod tests {
             consecutive_health_failures: Set(0),
             metrics_enabled: Set(true),
             default_backup_provisioned: Set(false),
-            ai_data_access: Set(false),
             ..Default::default()
         }
         .insert(db.as_ref())
@@ -1780,7 +1779,6 @@ mod tests {
                 consecutive_health_failures: Set(0),
                 metrics_enabled: Set(true),
                 default_backup_provisioned: Set(false),
-                ai_data_access: Set(false),
                 ..Default::default()
             }
             .insert(db.as_ref())
@@ -1936,7 +1934,6 @@ mod tests {
             metrics_enabled: false,
             default_backup_provisioned: false,
             container_name: None,
-            ai_data_access: false,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
@@ -1971,7 +1968,6 @@ mod tests {
             metrics_enabled: false,
             default_backup_provisioned: false,
             container_name: None,
-            ai_data_access: false,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,

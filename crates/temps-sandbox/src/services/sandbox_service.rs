@@ -30,8 +30,8 @@ use temps_agents::services::run_service::TERMINAL_RUN_STATUSES;
 use temps_config::ConfigService;
 use temps_entities::{
     agent_runs, ai_application_projects, ai_application_workspaces, ai_applications, environments,
-    external_services, project_services, projects, sandbox_events, sandboxes, service_members,
-    users,
+    external_services, project_services, projects, sandbox_events, sandbox_services, sandboxes,
+    service_members, users,
 };
 use temps_git::GitProviderManager;
 
@@ -3286,14 +3286,34 @@ impl SandboxService {
         let service_count = links.len();
         let mut variables = HashMap::new();
         for link in links {
-            let issued = provider
-                .issue(link.service_id, project_id, environment.id)
-                .await
-                .map_err(|error| SandboxError::RuntimeCredentialsFailed {
-                    sandbox_id: sandbox_public_id.to_string(),
-                    service_id: link.service_id,
-                    reason: error.to_string(),
-                })?;
+            // A sandbox runs code nobody reviewed, so it gets credentials of
+            // its own where the service can mint them (ADR-051). Only a
+            // service type with no such mechanism yet keeps the credentials
+            // a deployment of the environment would receive.
+            let scope = temps_core::SandboxScope {
+                sandbox_public_id: sandbox_public_id.to_string(),
+                project_id: Some(project_id),
+            };
+            let issued = match provider.issue_for_sandbox(link.service_id, &scope).await {
+                Ok(issued) => issued,
+                Err(temps_core::SandboxRuntimeCredentialsError::NoScopedCredentials { .. }) => {
+                    provider
+                        .issue(link.service_id, project_id, environment.id)
+                        .await
+                        .map_err(|error| SandboxError::RuntimeCredentialsFailed {
+                            sandbox_id: sandbox_public_id.to_string(),
+                            service_id: link.service_id,
+                            reason: error.to_string(),
+                        })?
+                }
+                Err(error) => {
+                    return Err(SandboxError::RuntimeCredentialsFailed {
+                        sandbox_id: sandbox_public_id.to_string(),
+                        service_id: link.service_id,
+                        reason: error.to_string(),
+                    })
+                }
+            };
             merge_runtime_variables(&mut variables, issued).map_err(|variable| {
                 SandboxError::RuntimeVariableConflict {
                     sandbox_id: sandbox_public_id.to_string(),
@@ -3317,6 +3337,296 @@ impl SandboxService {
         Ok(variables)
     }
 
+    /// The services `sandbox_public_id` is linked to (ADR-051), oldest first.
+    pub async fn linked_services(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+    ) -> Result<Vec<LinkedService>, SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        self.linked_services_of(row.id).await
+    }
+
+    async fn linked_services_of(
+        &self,
+        sandbox_id: i32,
+    ) -> Result<Vec<LinkedService>, SandboxError> {
+        Ok(sandbox_services::Entity::find()
+            .filter(sandbox_services::Column::SandboxId.eq(sandbox_id))
+            .order_by_asc(sandbox_services::Column::Id)
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|link| LinkedService {
+                service_id: link.service_id,
+                project_id: link.project_id,
+            })
+            .collect())
+    }
+
+    /// The services of `project_id` a sandbox can be linked to: those whose
+    /// type has a sandbox access engine and that run where a sandbox can
+    /// reach them. A service the sandbox cannot use is not offered.
+    pub async fn linkable_project_services(
+        &self,
+        project_id: i32,
+    ) -> Result<Vec<i32>, SandboxError> {
+        let service_ids = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project_id))
+            .order_by_asc(project_services::Column::ServiceId)
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|link| link.service_id)
+            .collect::<Vec<_>>();
+        let mut linkable = Vec::new();
+        for service_id in service_ids {
+            if self.service_supports_sandbox(service_id).await? {
+                linkable.push(service_id);
+            }
+        }
+        Ok(linkable)
+    }
+
+    /// Whether a sandbox can be linked to `service_id`: its type has a sandbox
+    /// access engine and it runs where a sandbox can reach it.
+    pub async fn service_supports_sandbox(&self, service_id: i32) -> Result<bool, SandboxError> {
+        let containers = self
+            .credentials_provider()?
+            .sandbox_access_containers(service_id)
+            .await
+            .map_err(|error| match error {
+                temps_core::SandboxRuntimeCredentialsError::ServiceNotFound { service_id } => {
+                    SandboxError::ServiceNotFound { service_id }
+                }
+                other => SandboxError::RuntimeCredentialsFailed {
+                    sandbox_id: String::new(),
+                    service_id,
+                    reason: other.to_string(),
+                },
+            })?;
+        Ok(!containers.is_empty())
+    }
+
+    /// Link `sandbox_public_id` to `links` and give it what it needs to use
+    /// them: the services' containers on its private network, and the
+    /// variables to run code with. A link that is already there is kept as it
+    /// is.
+    ///
+    /// Nothing is left half done: if the network or a credential fails, or two
+    /// services would set the same variable, the links this call added are
+    /// removed again and the error returned.
+    pub async fn link_services(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+        links: &[LinkedService],
+    ) -> Result<ScopedRuntime, SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
+        let _workspace_mutation = self.lock_application_workspace(key).await;
+        let existing = self.linked_services_of(row.id).await?;
+        let mut added = Vec::new();
+        for link in links {
+            if existing
+                .iter()
+                .any(|known| known.service_id == link.service_id)
+                || added.contains(&link.service_id)
+            {
+                continue;
+            }
+            sandbox_services::ActiveModel {
+                sandbox_id: Set(row.id),
+                service_id: Set(link.service_id),
+                project_id: Set(link.project_id),
+                created_by: Set(Some(user_id)),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await?;
+            added.push(link.service_id);
+        }
+        match self.rebuild_scoped(&row).await {
+            Ok(runtime) => Ok(runtime),
+            Err(error) => {
+                if !added.is_empty() {
+                    self.delete_links(row.id, &added).await?;
+                    if let Err(restore) = self.rebuild_network(&row).await {
+                        tracing::warn!(
+                            sandbox_id = %row.public_id,
+                            "could not restore the sandbox's connections after a failed link: {restore}"
+                        );
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Unlink `sandbox_public_id` from `service_ids` and take their containers
+    /// off its private network, which drops the sandbox's open connections to
+    /// them. The data in the sandbox's database or bucket stays.
+    pub async fn unlink_services(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+        service_ids: &[i32],
+    ) -> Result<ScopedRuntime, SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
+        let _workspace_mutation = self.lock_application_workspace(key).await;
+        self.delete_links(row.id, service_ids).await?;
+        self.rebuild_scoped(&row).await
+    }
+
+    /// Remove every link of `sandbox_public_id` made through `project_id`.
+    /// Returns the services that were unlinked.
+    pub async fn unlink_project(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+        project_id: i32,
+    ) -> Result<(Vec<i32>, ScopedRuntime), SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
+        let _workspace_mutation = self.lock_application_workspace(key).await;
+        let removed = self
+            .linked_services_of(row.id)
+            .await?
+            .into_iter()
+            .filter(|link| link.project_id == Some(project_id))
+            .map(|link| link.service_id)
+            .collect::<Vec<_>>();
+        self.delete_links(row.id, &removed).await?;
+        let runtime = self.rebuild_scoped(&row).await?;
+        Ok((removed, runtime))
+    }
+
+    /// The variables for running a command in `sandbox_public_id`, resolved
+    /// fresh from its links and without touching the network.
+    pub async fn scoped_runtime_variables(
+        &self,
+        user_id: i32,
+        sandbox_public_id: &str,
+    ) -> Result<ScopedRuntime, SandboxError> {
+        let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
+        self.issue_scoped(&row).await
+    }
+
+    async fn delete_links(&self, sandbox_id: i32, service_ids: &[i32]) -> Result<(), SandboxError> {
+        if service_ids.is_empty() {
+            return Ok(());
+        }
+        sandbox_services::Entity::delete_many()
+            .filter(sandbox_services::Column::SandboxId.eq(sandbox_id))
+            .filter(sandbox_services::Column::ServiceId.is_in(service_ids.iter().copied()))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    /// Rebuild the private network from the links, then issue the variables.
+    async fn rebuild_scoped(&self, row: &sandboxes::Model) -> Result<ScopedRuntime, SandboxError> {
+        self.rebuild_network(row).await?;
+        self.issue_scoped(row).await
+    }
+
+    async fn rebuild_network(&self, row: &sandboxes::Model) -> Result<(), SandboxError> {
+        let containers = self.scoped_service_containers(row).await?;
+        let network_name = sandbox_data_network_name(&row.public_id)?;
+        self.registry
+            .configure_application_network(row.id, &row.public_id, &network_name, &containers)
+            .await
+            .map_err(|error| from_agent_error(&row.public_id, error))
+    }
+
+    fn credentials_provider(
+        &self,
+    ) -> Result<&Arc<dyn temps_core::SandboxRuntimeCredentialsProvider>, SandboxError> {
+        self.runtime_credentials
+            .as_ref()
+            .ok_or_else(|| SandboxError::Unavailable {
+                reason: "runtime credential provider is not registered".to_string(),
+            })
+    }
+
+    async fn issue_scoped(&self, row: &sandboxes::Model) -> Result<ScopedRuntime, SandboxError> {
+        let mut runtime = ScopedRuntime::default();
+        let links = self.linked_services_of(row.id).await?;
+        if links.is_empty() {
+            return Ok(runtime);
+        }
+        let provider = self.credentials_provider()?;
+        for link in &links {
+            let scope = temps_core::SandboxScope {
+                sandbox_public_id: row.public_id.clone(),
+                project_id: link.project_id,
+            };
+            let issued = match provider.issue_for_sandbox(link.service_id, &scope).await {
+                Ok(issued) => issued,
+                Err(temps_core::SandboxRuntimeCredentialsError::NoScopedCredentials { .. }) => {
+                    runtime.skipped_service_ids.push(link.service_id);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(SandboxError::RuntimeCredentialsFailed {
+                        sandbox_id: row.public_id.clone(),
+                        service_id: link.service_id,
+                        reason: error.to_string(),
+                    })
+                }
+            };
+            merge_runtime_variables(&mut runtime.variables, issued).map_err(|variable| {
+                SandboxError::RuntimeVariableConflict {
+                    sandbox_id: row.public_id.clone(),
+                    variable,
+                }
+            })?;
+            runtime.connected_service_ids.push(link.service_id);
+        }
+        let mut variable_names = runtime.variable_names();
+        variable_names.sort();
+        self.record_event(
+            row.id,
+            "scoped_credentials_issued",
+            Some(serde_json::json!({
+                "service_ids": runtime.connected_service_ids,
+                "variable_names": variable_names,
+            })),
+        )
+        .await;
+        Ok(runtime)
+    }
+
+    /// The containers of the services the sandbox is linked to, as each
+    /// service's engine names them. A service no engine covers contributes
+    /// none, so it stays off the sandbox's network.
+    async fn scoped_service_containers(
+        &self,
+        row: &sandboxes::Model,
+    ) -> Result<Vec<String>, SandboxError> {
+        let links = self.linked_services_of(row.id).await?;
+        if links.is_empty() {
+            return Ok(Vec::new());
+        }
+        let provider = self.credentials_provider()?;
+        let mut containers = Vec::new();
+        for link in links {
+            let named = provider
+                .sandbox_access_containers(link.service_id)
+                .await
+                .map_err(|error| SandboxError::RuntimeCredentialsFailed {
+                    sandbox_id: row.public_id.clone(),
+                    service_id: link.service_id,
+                    reason: error.to_string(),
+                })?;
+            containers.extend(named);
+        }
+        containers.sort();
+        containers.dedup();
+        Ok(containers)
+    }
+
     async fn application_data_service_containers(
         &self,
         project_ids: &[i32],
@@ -3337,6 +3647,10 @@ impl SandboxService {
                 .all(self.db.as_ref())
                 .await?
         };
+        let service_ids = services
+            .iter()
+            .map(|service| service.id)
+            .collect::<std::collections::HashSet<_>>();
         let members = if service_ids.is_empty() {
             Vec::new()
         } else {
@@ -5336,6 +5650,46 @@ TEMPS_ASKPASS_EOF\n\
     }
 }
 
+/// A service a sandbox is linked to (ADR-051).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedService {
+    pub service_id: i32,
+    /// The project the link was made through, which names the sandbox's
+    /// database and bucket; `None` for a link made to the service directly.
+    pub project_id: Option<i32>,
+}
+
+/// What a sandbox was connected to, and the variables to run code with.
+#[derive(Default)]
+pub struct ScopedRuntime {
+    /// Secret values: never log or persist them.
+    pub variables: HashMap<String, String>,
+    /// Services the variables reach.
+    pub connected_service_ids: Vec<i32>,
+    /// Linked services left out because their type has no scoped credentials
+    /// yet.
+    pub skipped_service_ids: Vec<i32>,
+}
+
+impl ScopedRuntime {
+    pub fn variable_names(&self) -> Vec<String> {
+        self.variables.keys().cloned().collect()
+    }
+}
+
+impl std::fmt::Debug for ScopedRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names = self.variable_names();
+        names.sort();
+        formatter
+            .debug_struct("ScopedRuntime")
+            .field("variable_names", &names)
+            .field("connected_service_ids", &self.connected_service_ids)
+            .field("skipped_service_ids", &self.skipped_service_ids)
+            .finish()
+    }
+}
+
 fn merge_runtime_variables(
     destination: &mut HashMap<String, String>,
     issued: HashMap<String, String>,
@@ -5872,6 +6226,22 @@ pub(crate) mod tests {
             explicit.image.as_deref(),
             Some("ghcr.io/gotempsh/temps-sandbox-all:0.2.0")
         );
+    }
+
+    #[test]
+    fn scoped_runtime_debug_output_names_variables_but_never_values() {
+        let runtime = ScopedRuntime {
+            variables: HashMap::from([(
+                "POSTGRES_PASSWORD".to_string(),
+                "s3cr3t-value".to_string(),
+            )]),
+            connected_service_ids: vec![4],
+            skipped_service_ids: vec![9],
+        };
+        let shown = format!("{runtime:?}");
+        assert!(shown.contains("POSTGRES_PASSWORD"));
+        assert!(!shown.contains("s3cr3t-value"), "{shown}");
+        assert!(shown.contains("skipped_service_ids"));
     }
 
     #[test]
@@ -9745,5 +10115,121 @@ mod storage_cleanup_tests {
 
         assert_eq!(conflict, "DATABASE_URL");
         assert_eq!(variables["DATABASE_URL"], "postgres://one");
+    }
+
+    fn link_row(id: i32, service_id: i32, project_id: Option<i32>) -> sandbox_services::Model {
+        sandbox_services::Model {
+            id,
+            sandbox_id: 7,
+            service_id,
+            project_id,
+            created_by: Some(1),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn linked_services_lists_the_sandboxs_links_with_their_projects() {
+        let data_root = unique_data_root("linked-services");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .append_query_results([vec![link_row(1, 4, Some(9)), link_row(2, 6, None)]])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+
+        let links = service
+            .linked_services(1, PUBLIC_ID)
+            .await
+            .expect("owner reads the links");
+
+        assert_eq!(
+            links,
+            vec![
+                LinkedService {
+                    service_id: 4,
+                    project_id: Some(9)
+                },
+                LinkedService {
+                    service_id: 6,
+                    project_id: None
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn another_users_sandbox_has_no_links_to_read() {
+        let data_root = unique_data_root("linked-services-foreign");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+
+        let error = service
+            .linked_services(2, PUBLIC_ID)
+            .await
+            .expect_err("a non-owner must not see the sandbox");
+
+        assert!(
+            matches!(error, SandboxError::NotFound { ref sandbox_id } if sandbox_id == PUBLIC_ID),
+            "got {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn a_link_that_cannot_be_given_credentials_is_removed_again() {
+        let data_root = unique_data_root("link-rollback");
+        // No credential provider is registered, so building the sandbox's
+        // access fails after the row was added; the row must be taken back
+        // (the delete's exec result is consumed) rather than left linked.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .append_query_results([Vec::<sandbox_services::Model>::new()])
+            .append_query_results([vec![link_row(1, 4, Some(9))]])
+            .append_query_results([vec![link_row(1, 4, Some(9))]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+
+        let error = service
+            .link_services(
+                1,
+                PUBLIC_ID,
+                &[LinkedService {
+                    service_id: 4,
+                    project_id: Some(9),
+                }],
+            )
+            .await
+            .expect_err("no credential provider means no scoped access");
+
+        assert!(
+            matches!(error, SandboxError::Unavailable { .. }),
+            "got {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn service_support_needs_a_credential_provider() {
+        let data_root = unique_data_root("service-support");
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+
+        let error = service
+            .service_supports_sandbox(4)
+            .await
+            .expect_err("without a provider the answer is an error, not a quiet false");
+
+        assert!(
+            matches!(error, SandboxError::Unavailable { .. }),
+            "got {error:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
     }
 }

@@ -16,6 +16,10 @@ pub struct Model {
     pub model: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Part of `input_tokens` the provider served from its prompt cache
+    pub cache_read_tokens: i64,
+    /// Part of `input_tokens` the provider wrote to its prompt cache
+    pub cache_write_tokens: i64,
     pub latency_ms: i32,
     /// Estimated cost in microcents (1/10000 of a cent)
     pub estimated_cost_microcents: i64,

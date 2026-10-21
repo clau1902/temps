@@ -2,9 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { getProjectOptions } from '@/api/client/@tanstack/react-query.gen'
+import { BuildSourceIcon } from '@/components/dashboard/ProjectCard'
+import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
+import {
+  projectBuildSource,
+  projectPresetLabel,
+} from '@/components/dashboard/project-card-data'
+import { PresetIcon } from '@/components/presets/PresetIcon'
+import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { cn } from '@/lib/utils'
 import { useQueries } from '@tanstack/react-query'
-import { ArrowUpRight, FolderGit2, GitBranch, Layers3 } from 'lucide-react'
+import { ArrowUpRight, FolderGit2, GitBranch } from 'lucide-react'
 import { Link } from 'react-router'
 import type {
   ProjectCollectionItem,
@@ -42,6 +50,14 @@ export function GeneratedProjectCollection({
       retry: false,
     })),
   })
+
+  // The same image the project list shows: the latest deployment's
+  // screenshot or favicon, the service template's image, then the initial.
+  const hostedProjectIds = projectIds.filter((id) => {
+    const project = projectQueries[projectIds.indexOf(id)]?.data
+    return project != null && project.source_type !== 'external'
+  })
+  const deploymentMedia = useLatestDeploymentMedia(hostedProjectIds)
 
   return (
     <section
@@ -90,11 +106,22 @@ export function GeneratedProjectCollection({
                 : trustedProject.repo_name
               : repositoryLabel(project)
             const preset = trustedProject?.preset ?? project.preset
+            const buildSource = trustedProject
+              ? projectBuildSource(trustedProject)
+              : null
+            const media =
+              project.id === null
+                ? undefined
+                : deploymentMedia.data?.projects?.[String(project.id)]
             const row = (
               <div className="group flex min-w-0 items-center gap-3 px-3 py-2.5 transition-colors hover:bg-muted/40 sm:px-4">
-                <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted font-mono text-[11px] font-semibold uppercase text-muted-foreground">
-                  {name.slice(0, 2)}
-                </div>
+                <ProjectCardMedia
+                  name={name}
+                  className="size-9"
+                  deploymentUrl={media?.url}
+                  screenshotLocation={media?.screenshot_location}
+                  templateImageUrl={trustedProject?.service_template_image_url}
+                />
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-xs font-medium text-foreground">
                     {name}
@@ -102,14 +129,23 @@ export function GeneratedProjectCollection({
                   <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[10px] text-muted-foreground">
                     {repo && (
                       <span className="flex min-w-0 items-center gap-1 truncate font-mono">
-                        <GitBranch className="size-3 shrink-0" />
+                        {buildSource ? (
+                          <BuildSourceIcon kind={buildSource.kind} />
+                        ) : (
+                          <GitBranch className="size-3 shrink-0" />
+                        )}
                         <span className="truncate">{repo}</span>
                       </span>
                     )}
                     {preset && (
-                      <span className="flex shrink-0 items-center gap-1 capitalize">
-                        <Layers3 className="size-3" />
-                        {preset.replace(/_/g, ' ')}
+                      <span className="flex shrink-0 items-center gap-1">
+                        <PresetIcon
+                          preset={preset}
+                          label={projectPresetLabel(preset)}
+                          className="size-4 rounded"
+                          imageClassName="p-px"
+                        />
+                        {projectPresetLabel(preset)}
                       </span>
                     )}
                   </div>

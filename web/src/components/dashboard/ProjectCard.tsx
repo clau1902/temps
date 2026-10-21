@@ -97,7 +97,11 @@ function ProjectHealth({ indicator }: { indicator: ProjectHealthIndicator }) {
   )
 }
 
-function BuildSourceIcon({ kind }: { kind: ProjectBuildSource['kind'] }) {
+export function BuildSourceIcon({
+  kind,
+}: {
+  kind: ProjectBuildSource['kind']
+}) {
   if (
     kind === 'github' ||
     kind === 'gitlab' ||

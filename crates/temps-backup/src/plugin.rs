@@ -228,6 +228,7 @@ impl TempsPlugin for BackupPlugin {
                     })))
                     .register_engine(Arc::new(PostgresClusterEngine::new(PostgresClusterDeps {
                         db: db.clone(),
+                        external_service_manager: external_service_manager.clone(),
                         encryption_service: encryption_service.clone(),
                         docker: docker.as_ref().clone(),
                     })))

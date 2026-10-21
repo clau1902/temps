@@ -734,6 +734,15 @@ fn orphan_candidate_owner<'a>(
     (u64::try_from(age_secs).ok()? >= min_age.as_secs()).then_some(owner)
 }
 
+/// A sandbox container that is not running and is not about to: its isolated
+/// network can be released and recreated when it starts. A restarting
+/// container counts as running, since Docker is bringing it back up.
+fn container_is_parked(info: &bollard::models::ContainerInspectResponse) -> bool {
+    info.state.as_ref().is_some_and(|state| {
+        state.running != Some(true) && state.restarting != Some(true) && state.paused != Some(true)
+    })
+}
+
 /// Which endpoints [`DockerSandboxProvider::remove_isolated_sandbox_network_with`]
 /// disconnects before removing the network.
 #[derive(Clone, Copy)]
@@ -1827,6 +1836,66 @@ fn completed_exec_lines(bytes: &[u8], emitted: &mut usize, eof: bool) -> Vec<Str
     lines
 }
 
+/// Whether an ownership fix may cross into filesystems mounted below its root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipScope {
+    /// Stay on the root's own filesystem. The home volume has the workspace
+    /// bind-mounted inside it, which gets its own pass; without this a
+    /// home pass walks every workspace file a second time.
+    OwnFilesystem,
+    /// Follow the tree wherever it is mounted from.
+    AcrossMounts,
+}
+
+/// Root-run command giving the sandbox user everything under `root` that it
+/// does not already own.
+///
+/// It changes only what is wrong instead of `chown -R` on every file, so a
+/// recovered sandbox whose files are already right costs a directory walk
+/// rather than a write per file (a JavaScript project's dependencies alone
+/// run to tens of thousands of files). `-h` changes a symlink itself, never
+/// what it points at: a link in the workspace must not let root hand an
+/// arbitrary container file to the sandbox user.
+fn ownership_fix_command(root: &str, scope: OwnershipScope) -> Vec<String> {
+    let mut cmd = vec!["find".to_string(), root.to_string()];
+    if scope == OwnershipScope::OwnFilesystem {
+        cmd.push("-xdev".to_string());
+    }
+    cmd.extend(
+        [
+            "(",
+            "!",
+            "-uid",
+            &SANDBOX_UID.to_string(),
+            "-o",
+            "!",
+            "-gid",
+            &SANDBOX_GID.to_string(),
+            ")",
+            "-exec",
+            "chown",
+            "-h",
+            SANDBOX_CHOWN,
+            "{}",
+            "+",
+        ]
+        .iter()
+        .map(|arg| arg.to_string()),
+    );
+    cmd
+}
+
+/// Shell script, run as the sandbox user, that proves it can create a file
+/// in `dir`. Each run uses its own file name, so two checks of the same
+/// sandbox at once (two requests recovering it together) cannot delete each
+/// other's file and report a writable workspace as broken.
+fn write_probe_script(dir: &str) -> String {
+    format!(
+        "probe=$(mktemp '{}/.temps-write-probe.XXXXXX') && rm -f \"$probe\"",
+        dir
+    )
+}
+
 impl DockerSandboxProvider {
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
         Self {
@@ -1992,12 +2061,7 @@ impl DockerSandboxProvider {
                 container_id,
                 run_id,
                 "chown-home",
-                vec![
-                    "chown".to_string(),
-                    "-R".to_string(),
-                    SANDBOX_CHOWN.to_string(),
-                    SANDBOX_HOME.to_string(),
-                ],
+                ownership_fix_command(SANDBOX_HOME, OwnershipScope::OwnFilesystem),
             )
             .await?;
         if home_exit != 0 {
@@ -2029,12 +2093,7 @@ impl DockerSandboxProvider {
                 container_id,
                 run_id,
                 "chown-work",
-                vec![
-                    "chown".to_string(),
-                    "-R".to_string(),
-                    SANDBOX_CHOWN.to_string(),
-                    CONTAINER_WORK_DIR.to_string(),
-                ],
+                ownership_fix_command(CONTAINER_WORK_DIR, OwnershipScope::AcrossMounts),
             )
             .await?;
 
@@ -2042,7 +2101,6 @@ impl DockerSandboxProvider {
         // `su temps -c 'touch ...'` is the truest test — if this fails,
         // every subsequent workflow command will fail too, so refuse to
         // hand back a broken sandbox.
-        let probe_path = format!("{}/.temps-write-probe", CONTAINER_WORK_DIR);
         let probe_exit = self
             .run_root_exec(
                 container_id,
@@ -2052,7 +2110,7 @@ impl DockerSandboxProvider {
                     "su".to_string(),
                     SANDBOX_USER.to_string(),
                     "-c".to_string(),
-                    format!("touch {} && rm {}", probe_path, probe_path),
+                    write_probe_script(CONTAINER_WORK_DIR),
                 ],
             )
             .await?;
@@ -2515,6 +2573,18 @@ impl DockerSandboxProvider {
         }
 
         let _guard = self.network_lock.lock().await;
+        self.ensure_network_locked(container_name, sandbox_network, control_plane_url)
+            .await
+    }
+
+    /// [`Self::ensure_network`] for a caller that already holds
+    /// `network_lock`.
+    async fn ensure_network_locked(
+        &self,
+        container_name: &str,
+        sandbox_network: &str,
+        control_plane_url: &str,
+    ) -> Result<(), AgentError> {
         // Held until the gateway is attached, so a rename cannot land between
         // labelling this network with the gateway's name and attaching it.
         let gateway = self.config.preview_gateway_container_name.read().await;
@@ -2526,6 +2596,150 @@ impl DockerSandboxProvider {
             .await?;
         self.connect_preview_gateways(sandbox_network, &gateway)
             .await
+    }
+
+    /// Give a stopped sandbox's isolated network back to Docker.
+    ///
+    /// Every network pins a subnet from the daemon's finite address pools
+    /// (about 30 with Docker's defaults), so stopped sandboxes holding theirs
+    /// would exhaust the host long before it runs out of CPU or memory. The
+    /// stopped container keeps its configuration, which still names the
+    /// network, so the isolation policy check passes while it is parked;
+    /// [`Self::prepare_network_for_start`] recreates the network and replaces
+    /// the stale endpoint before it runs again. Best effort: a failure only
+    /// leaves the network in place for the reaper.
+    async fn release_parked_sandbox_network(&self, container_name: &str) {
+        let _guard = self.network_lock.lock().await;
+        let gateway = self
+            .config
+            .preview_gateway_container_name
+            .read()
+            .await
+            .clone();
+        let errors = self
+            .remove_isolated_sandbox_network_with(
+                container_name,
+                NetworkDetach::OnlyGateway(&gateway),
+            )
+            .await;
+        if errors.is_empty() {
+            tracing::info!(
+                sandbox = container_name,
+                "Released the isolated network of a stopped sandbox"
+            );
+        } else {
+            tracing::warn!(
+                sandbox = container_name,
+                errors = %errors.join("; "),
+                "Could not release the isolated network of a stopped sandbox; it stays reserved until the reaper frees it"
+            );
+        }
+    }
+
+    /// Make sure a sandbox about to (re)start has its isolated network, egress
+    /// proxy and gateway, and that the container's endpoint points at the
+    /// network that exists now rather than one released while it was stopped.
+    ///
+    /// Returns the `network_lock` guard: the caller holds it until the
+    /// container has started, so neither a reap nor a concurrent stop can
+    /// remove the network in between. `None` for a sandbox without a network.
+    async fn prepare_network_for_start(
+        &self,
+        handle: &SandboxHandle,
+        info: &bollard::models::ContainerInspectResponse,
+    ) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>, AgentError> {
+        let network_mode = info
+            .host_config
+            .as_ref()
+            .and_then(|config| config.network_mode.as_deref());
+        if network_mode == Some("none") {
+            return Ok(None);
+        }
+        let guard = self.network_lock.lock().await;
+        let network_name = sandbox_network_name(&handle.sandbox_name);
+        self.ensure_network_locked(
+            &handle.sandbox_name,
+            &network_name,
+            &self.config.control_plane_url,
+        )
+        .await?;
+        self.reattach_sandbox_network(handle, info, &network_name)
+            .await?;
+        Ok(Some(guard))
+    }
+
+    /// Point the container's endpoint at the current `network_name`. Docker
+    /// records a network by ID, so a container whose network was released
+    /// and recreated would otherwise fail to start with "network ... not
+    /// found". A no-op when the endpoint already matches.
+    async fn reattach_sandbox_network(
+        &self,
+        handle: &SandboxHandle,
+        info: &bollard::models::ContainerInspectResponse,
+        network_name: &str,
+    ) -> Result<(), AgentError> {
+        let current = self
+            .docker
+            .inspect_network(
+                network_name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "inspect isolated network '{network_name}' before starting sandbox '{}': {source}",
+                    handle.sandbox_name
+                ),
+            })?;
+        let endpoint_network_id = info
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .and_then(|networks| networks.get(network_name))
+            .and_then(|endpoint| endpoint.network_id.as_deref());
+        if endpoint_network_id.is_some() && endpoint_network_id == current.id.as_deref() {
+            return Ok(());
+        }
+        tracing::info!(
+            sandbox = %handle.sandbox_name,
+            network = network_name,
+            "Reattaching sandbox to its recreated isolated network"
+        );
+        if endpoint_network_id.is_some() {
+            self.docker
+                .disconnect_network(
+                    network_name,
+                    bollard::models::NetworkDisconnectRequest {
+                        container: handle.sandbox_id.clone(),
+                        force: Some(true),
+                    },
+                )
+                .await
+                .map_err(|source| AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "drop the stale endpoint of sandbox '{}' on released network '{network_name}': {source}",
+                        handle.sandbox_name
+                    ),
+                })?;
+        }
+        self.docker
+            .connect_network(
+                network_name,
+                bollard::models::NetworkConnectRequest {
+                    container: handle.sandbox_id.clone(),
+                    endpoint_config: Some(bollard::models::EndpointSettings::default()),
+                },
+            )
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "attach sandbox '{}' to its recreated network '{network_name}': {source}",
+                    handle.sandbox_name
+                ),
+            })
     }
 
     /// Stop every running managed sandbox whose immutable container config
@@ -2577,8 +2791,9 @@ impl DockerSandboxProvider {
             }
         }
         // Networks of sandboxes removed while Temps was down (or whose
-        // teardown failed) would otherwise keep their subnets until Docker
-        // runs out of address pools.
+        // teardown failed), and of sandboxes that are stopped, would
+        // otherwise keep their subnets until Docker runs out of address
+        // pools.
         let gateway = self
             .config
             .preview_gateway_container_name
@@ -2810,11 +3025,12 @@ impl DockerSandboxProvider {
     }
 
     /// Remove isolated sandbox networks whose sandbox container no longer
-    /// exists, returning how many were removed.
+    /// exists or is stopped, returning how many were removed.
     ///
     /// Every network pins a subnet from Docker's finite address pool, and a
     /// sandbox that was removed behind Temps' back (or whose teardown failed
-    /// part-way) leaves its network, and the subnet, behind. Only networks
+    /// part-way) leaves its network, and the subnet, behind. A stopped
+    /// sandbox does not need its network until `start` recreates it. Only networks
     /// carrying this provider's ownership label whose name matches the owner
     /// are candidates, and a network younger than `min_age` is skipped
     /// because its container may not have been created yet. Networks
@@ -2869,6 +3085,11 @@ impl DockerSandboxProvider {
                 .await
             {
                 Err(error) if docker_error_is_not_found(&error) => {}
+                // A stopped sandbox gets its network back from `start`, so
+                // holding the subnet while it is parked buys nothing. This
+                // also frees sandboxes stopped before `stop` released their
+                // network, or stopped behind Temps' back (a daemon restart).
+                Ok(info) if container_is_parked(&info) => {}
                 Ok(_) => continue,
                 Err(error) => {
                     tracing::warn!(
@@ -2917,7 +3138,7 @@ impl DockerSandboxProvider {
                 tracing::info!(
                     network = ?network.name,
                     sandbox = %owner,
-                    "Removed isolated network of a sandbox that no longer exists"
+                    "Removed isolated network of a sandbox that is stopped or no longer exists"
                 );
                 reaped += 1;
             }
@@ -3571,12 +3792,15 @@ impl DockerSandboxProvider {
                     .host_config
                     .as_ref()
                     .and_then(|config| config.network_mode.as_deref());
-                if network_mode != Some("none") {
+                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+                if network_mode != Some("none") && running {
                     // Recovery must reconcile sidecars too. The sandbox
                     // container's immutable proxy variables can still match
                     // while the egress sidecar predates a stricter routing
                     // policy; `ensure_network` replaces that drifted sidecar
                     // without touching the persistent workspace volumes.
+                    // A stopped sandbox is reconciled by `start` instead, so
+                    // recovering it does not take back the subnet it gave up.
                     self.ensure_network(
                         container_name,
                         &sandbox_network_name(container_name),
@@ -3584,7 +3808,6 @@ impl DockerSandboxProvider {
                     )
                     .await?;
                 }
-                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
                 let container_id = info.id.unwrap_or_default();
                 tracing::info!("Recovered sandbox {} (running={})", container_name, running);
 
@@ -4972,12 +5195,15 @@ impl SandboxProvider for DockerSandboxProvider {
             sandbox_id: handle.sandbox_id.clone(),
             reason: format!("Failed to stop container: {}", e),
         })?;
+        self.release_parked_sandbox_network(&handle.sandbox_name)
+            .await;
         Ok(())
     }
 
     async fn start(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
         tracing::info!("Starting sandbox container {}", handle.sandbox_name);
-        self.inspect_handle_policy(handle).await?;
+        let info = self.inspect_handle_policy(handle).await?;
+        let _network = self.prepare_network_for_start(handle, &info).await?;
         let result = self
             .docker
             .start_container(
@@ -5001,7 +5227,8 @@ impl SandboxProvider for DockerSandboxProvider {
 
     async fn restart(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
         tracing::info!("Restarting sandbox container {}", handle.sandbox_name);
-        self.inspect_handle_policy(handle).await?;
+        let info = self.inspect_handle_policy(handle).await?;
+        let _network = self.prepare_network_for_start(handle, &info).await?;
         self.docker
             .restart_container(
                 &handle.sandbox_id,
@@ -6888,6 +7115,54 @@ fn sandbox_egress_drop_ranges() -> Vec<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ownership_fix_changes_only_wrongly_owned_files_without_following_links() {
+        use super::{ownership_fix_command, OwnershipScope};
+
+        let home = ownership_fix_command("/home/temps", OwnershipScope::OwnFilesystem);
+        assert_eq!(
+            home,
+            [
+                "find",
+                "/home/temps",
+                "-xdev",
+                "(",
+                "!",
+                "-uid",
+                "1000",
+                "-o",
+                "!",
+                "-gid",
+                "1000",
+                ")",
+                "-exec",
+                "chown",
+                "-h",
+                "temps:temps",
+                "{}",
+                "+",
+            ]
+        );
+        assert!(!home.iter().any(|arg| arg == "-R"));
+
+        let work = ownership_fix_command("/home/temps/workspace", OwnershipScope::AcrossMounts);
+        assert_eq!(work[1], "/home/temps/workspace");
+        assert!(
+            !work.iter().any(|arg| arg == "-xdev"),
+            "the workspace pass must reach a bind-mounted workspace: {work:?}"
+        );
+        assert!(work.windows(2).any(|pair| pair == ["chown", "-h"]));
+    }
+
+    #[test]
+    fn write_probe_uses_a_fresh_file_each_time() {
+        let script = super::write_probe_script("/home/temps/workspace");
+        assert_eq!(
+            script,
+            "probe=$(mktemp '/home/temps/workspace/.temps-write-probe.XXXXXX') && rm -f \"$probe\""
+        );
+    }
+
     #[test]
     fn runtime_health_requires_harness_recovery_capability() {
         use super::has_harness_recovery_capability;
@@ -10789,6 +11064,16 @@ function response() {{
     /// already has, so the test never depends on a pull. `None` when none of
     /// them can run `sleep`.
     async fn start_throwaway_container(docker: &Docker, name: &str) -> Option<()> {
+        start_throwaway_container_on(docker, name, None).await
+    }
+
+    /// [`start_throwaway_container`] joined to `network` instead of the
+    /// default bridge.
+    async fn start_throwaway_container_on(
+        docker: &Docker,
+        name: &str,
+        network: Option<&str>,
+    ) -> Option<()> {
         let images = docker
             .list_images(None::<bollard::query_parameters::ListImagesOptions>)
             .await
@@ -10810,6 +11095,10 @@ function response() {{
                         image: Some(image.clone()),
                         entrypoint: Some(vec!["sleep".to_string()]),
                         cmd: Some(vec!["120".to_string()]),
+                        host_config: network.map(|network| bollard::models::HostConfig {
+                            network_mode: Some(network.to_string()),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     },
                 )
@@ -10837,6 +11126,315 @@ function response() {{
                 .await;
         }
         None
+    }
+
+    #[test]
+    fn only_a_stopped_container_counts_as_parked() {
+        let with_state = |running, restarting, paused| bollard::models::ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                running: Some(running),
+                restarting: Some(restarting),
+                paused: Some(paused),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(container_is_parked(&with_state(false, false, false)));
+        assert!(!container_is_parked(&with_state(true, false, false)));
+        assert!(!container_is_parked(&with_state(false, true, false)));
+        assert!(!container_is_parked(&with_state(true, false, true)));
+        // Without a state Docker has said nothing, so the network is kept.
+        assert!(!container_is_parked(
+            &bollard::models::ContainerInspectResponse::default()
+        ));
+    }
+
+    /// An isolated sandbox network with an explicit /28, so the test runs on a
+    /// daemon whose default address pools are already exhausted.
+    fn test_sandbox_network_request(
+        network: &str,
+        owner: &str,
+        gateway: &str,
+        subnet: &str,
+    ) -> bollard::models::NetworkCreateRequest {
+        let mut request = isolated_sandbox_network_request(network, owner, gateway);
+        request.ipam = Some(bollard::models::Ipam {
+            config: Some(vec![bollard::models::IpamConfig {
+                subnet: Some(subnet.to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        request
+    }
+
+    fn random_test_subnet() -> String {
+        format!(
+            "10.{}.{}.{}/28",
+            16 + rand::random::<u8>() % 200,
+            rand::random::<u8>(),
+            (rand::random::<u8>() % 16) * 16
+        )
+    }
+
+    async fn force_remove_container(docker: &Docker, name: &str) {
+        let _ = docker
+            .remove_container(
+                name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_sandbox_gives_back_its_network_and_starts_on_a_new_one() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let suffix = format!("{:016x}", rand::random::<u64>());
+        let gateway =
+            crate::preview_gateway::GatewayName::new(format!("park-test-gateway-{suffix}"));
+        let provider = DockerSandboxProvider::new(
+            docker.clone(),
+            DockerSandboxConfig {
+                preview_gateway_container_name: gateway.clone(),
+                ..Default::default()
+            },
+        );
+        let gateway_name = gateway.read().await.clone();
+        let container = format!("{SANDBOX_NAME_PREFIX}park-test-{suffix}");
+        let network = sandbox_network_name(&container);
+        let subnet = random_test_subnet();
+        if let Err(error) = create_host_isolated_network(
+            &docker,
+            test_sandbox_network_request(&network, &container, &gateway_name, &subnet),
+        )
+        .await
+        {
+            println!("Could not create a test network ({error}), skipping");
+            return;
+        }
+        if start_throwaway_container_on(&docker, &container, Some(&network))
+            .await
+            .is_none()
+        {
+            println!("No local image can run sleep, skipping");
+            let _ = provider.remove_isolated_sandbox_network(&container).await;
+            return;
+        }
+        let stopped = docker
+            .stop_container(
+                &container,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(0),
+                    signal: None,
+                }),
+            )
+            .await;
+
+        provider.release_parked_sandbox_network(&container).await;
+        let released = docker
+            .inspect_network(
+                &network,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        // The parked container still names its network, so recovering it
+        // after a server restart does not quarantine it.
+        let parked = docker
+            .inspect_container(
+                &container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
+
+        // `start` recreates the network; recreate it the same way here,
+        // without the egress proxy image, and reattach.
+        let recreated = create_host_isolated_network(
+            &docker,
+            test_sandbox_network_request(&network, &container, &gateway_name, &subnet),
+        )
+        .await;
+        let handle = SandboxHandle {
+            node_id: None,
+            sandbox_id: container.clone(),
+            sandbox_name: container.clone(),
+            work_dir: PathBuf::from(CONTAINER_WORK_DIR),
+            backend: super::super::SandboxBackend::Docker,
+            image: String::new(),
+        };
+        let reattached = match &parked {
+            Ok(info) => Some(
+                provider
+                    .reattach_sandbox_network(&handle, info, &network)
+                    .await,
+            ),
+            Err(_) => None,
+        };
+        let started = docker
+            .start_container(
+                &container,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await;
+        let running = docker
+            .inspect_container(
+                &container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
+        let again = match &running {
+            Ok(info) => Some(
+                provider
+                    .reattach_sandbox_network(&handle, info, &network)
+                    .await,
+            ),
+            Err(_) => None,
+        };
+
+        force_remove_container(&docker, &container).await;
+        let _ = provider.remove_isolated_sandbox_network(&container).await;
+
+        stopped.expect("stop the test sandbox");
+        assert!(
+            matches!(&released, Err(error) if docker_error_is_not_found(error)),
+            "a stopped sandbox must give its network back: {released:?}"
+        );
+        // The isolation policy check reads the networks a container names;
+        // the throwaway container lacks the proxy variables it also checks.
+        let networks_of = |info: &bollard::models::ContainerInspectResponse| {
+            info.network_settings
+                .as_ref()
+                .and_then(|settings| settings.networks.as_ref())
+                .map(|networks| networks.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let parked = parked.expect("inspect the parked sandbox");
+        assert_eq!(
+            networks_of(&parked),
+            vec![network.clone()],
+            "a parked sandbox must still name its network, or recovery quarantines it"
+        );
+        recreated.expect("recreate the sandbox network");
+        reattached
+            .expect("parked sandbox inspected")
+            .expect("reattach the sandbox to its recreated network");
+        started.expect("a reattached sandbox starts");
+        let running = running.expect("inspect the restarted sandbox");
+        assert_eq!(
+            running.state.as_ref().and_then(|state| state.running),
+            Some(true)
+        );
+        assert_eq!(
+            networks_of(&running),
+            vec![network.clone()],
+            "the restarted sandbox must be on its isolated network only"
+        );
+        again
+            .expect("restarted sandbox inspected")
+            .expect("reattaching a sandbox already on its network is a no-op");
+    }
+
+    #[tokio::test]
+    async fn the_reaper_frees_the_network_of_a_stopped_sandbox_but_not_a_running_one() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        let suffix = format!("{:016x}", rand::random::<u64>());
+        // Unique per run, so the reaper only ever sees this test's networks.
+        let gateway = format!("reaper-park-test-gateway-{suffix}");
+        let stopped = format!("{SANDBOX_NAME_PREFIX}reaper-stopped-{suffix}");
+        let running = format!("{SANDBOX_NAME_PREFIX}reaper-running-{suffix}");
+
+        let mut ready = true;
+        for owner in [&stopped, &running] {
+            let network = sandbox_network_name(owner);
+            if let Err(error) = create_host_isolated_network(
+                &docker,
+                test_sandbox_network_request(&network, owner, &gateway, &random_test_subnet()),
+            )
+            .await
+            {
+                println!("Could not create a test network ({error}), skipping");
+                ready = false;
+                break;
+            }
+            if start_throwaway_container_on(&docker, owner, Some(&network))
+                .await
+                .is_none()
+            {
+                println!("No local image can run sleep, skipping");
+                ready = false;
+                break;
+            }
+        }
+        let cleanup = || async {
+            for owner in [&stopped, &running] {
+                force_remove_container(&docker, owner).await;
+                let _ = provider.remove_isolated_sandbox_network(owner).await;
+            }
+        };
+        if !ready {
+            cleanup().await;
+            return;
+        }
+        let stop = docker
+            .stop_container(
+                &stopped,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(0),
+                    signal: None,
+                }),
+            )
+            .await;
+
+        let reaped = provider
+            .reap_orphaned_sandbox_networks(&gateway, std::time::Duration::ZERO)
+            .await;
+        let stopped_network = docker
+            .inspect_network(
+                &sandbox_network_name(&stopped),
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        let running_network = docker
+            .inspect_network(
+                &sandbox_network_name(&running),
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await;
+        cleanup().await;
+
+        stop.expect("stop the test sandbox");
+        assert_eq!(reaped, 1, "only the stopped sandbox's network is reaped");
+        assert!(
+            matches!(&stopped_network, Err(error) if docker_error_is_not_found(error)),
+            "the stopped sandbox's network must be freed: {stopped_network:?}"
+        );
+        assert!(
+            running_network.is_ok(),
+            "a running sandbox keeps its network: {running_network:?}"
+        );
     }
 
     #[tokio::test]

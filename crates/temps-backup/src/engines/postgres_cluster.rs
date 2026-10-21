@@ -4,9 +4,10 @@
 //! `PostgresClusterEngine`: WAL-G–based backup of a Postgres cluster
 //! (pg_auto_failover topology), implemented against `engine_v2::BackupEngine`.
 //!
-//! Same as [`PostgresWalgEngine`] but first locates the cluster's primary
-//! member in `service_members` and runs `wal-g backup-push` against THAT
-//! container's PGDATA. Replicas are never targeted directly.
+//! Same as [`PostgresWalgEngine`] but first asks the cluster's
+//! pg_auto_failover monitor which member is the current primary and runs
+//! `wal-g backup-push` against THAT container's PGDATA. Replicas are never
+//! targeted directly.
 
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use async_trait::async_trait;
 use bollard::container::LogOutput;
 use bollard::exec::StartExecResults;
 use futures::StreamExt;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
@@ -25,8 +26,21 @@ use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, Bac
 
 pub(crate) const ENGINE_KEY: &str = "postgres_cluster";
 
+/// Where every cluster data node keeps its data. The member containers run
+/// pg_autoctl with this path, which is NOT the image's `PGDATA` env
+/// (`/var/lib/postgresql/<major>/docker`), so `$PGDATA` cannot be trusted.
+const CLUSTER_PGDATA: &str = "/var/lib/postgresql/pgdata";
+
+/// The port PostgreSQL listens on inside a member container. Each member
+/// listens on its own stored port (pg_autoctl `--pgport`), not 5432.
+fn member_pg_port(member: &temps_providers::ServiceMemberInfo) -> i32 {
+    member.port.unwrap_or(5432)
+}
+
 pub struct PostgresClusterDeps {
     pub db: Arc<DatabaseConnection>,
+    /// Resolves the live primary through the cluster's monitor.
+    pub external_service_manager: Arc<temps_providers::ExternalServiceManager>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
     pub docker: bollard::Docker,
 }
@@ -58,27 +72,34 @@ impl BackupEngine for PostgresClusterEngine {
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
 
         // ── Locate the cluster primary ───────────────────────────────────────
-        let primary_member = temps_entities::service_members::Entity::find()
-            .filter(temps_entities::service_members::Column::ServiceId.eq(service_id))
-            .filter(temps_entities::service_members::Column::Role.eq("primary"))
-            .filter(temps_entities::service_members::Column::Status.eq("running"))
-            .one(deps.db.as_ref())
+        // Ask the monitor: `service_members.role` is `replica` for every data
+        // node, so it cannot say which one is writable.
+        let primary_member = deps
+            .external_service_manager
+            .get_cluster_primary_member(service_id)
             .await
+            // No trustworthy primary right now (monitor unreachable, failover
+            // in progress) can clear up on its own, so let the executor retry.
             .map_err(|e| BackupError::Failed {
-                reason: format!("db error finding primary for service {}: {}", service_id, e),
+                reason: format!(
+                    "could not locate the primary of cluster service {}: {}",
+                    service_id, e
+                ),
             })?
             .ok_or_else(|| BackupError::PermanentFailure {
                 reason: format!(
-                    "no running primary found for cluster service {}",
+                    "service {} is not a PostgreSQL cluster; the cluster backup engine cannot back it up",
                     service_id
                 ),
             })?;
         let primary_container = primary_member.container_name.clone();
+        let pg_port = member_pg_port(&primary_member);
         info!(
             backup_id,
             service_id,
             container = %primary_container,
             ordinal = primary_member.ordinal,
+            pg_port,
             "PostgresClusterEngine: primary located",
         );
 
@@ -171,7 +192,8 @@ impl BackupEngine for PostgresClusterEngine {
             format!("PGPASSWORD={}", pg.password),
             format!("PGDATABASE={}", pg.database),
             "PGHOST=localhost".to_string(),
-            "PGPORT=5432".to_string(),
+            format!("PGPORT={}", pg_port),
+            format!("PGDATA={}", CLUSTER_PGDATA),
             "WALG_UPLOAD_CONCURRENCY=4".to_string(),
             "WALG_UPLOAD_DISK_CONCURRENCY=1".to_string(),
             "WALG_UPLOAD_QUEUE=2".to_string(),
@@ -237,7 +259,7 @@ impl BackupEngine for PostgresClusterEngine {
                 None
             }
         };
-        let lsn = query_current_wal_lsn(&deps.docker, &primary_container, &pg)
+        let lsn = query_current_wal_lsn(&deps.docker, &primary_container, &pg, pg_port)
             .await
             .unwrap_or_else(|e| {
                 warn!(backup_id, error = %e, "cluster: could not query LSN");
@@ -399,7 +421,7 @@ async fn run_walg_exec(
 /// (`PGUSER`, `PGPASSWORD`, `PGDATABASE`) so a password containing
 /// `'; rm -rf /; #` can't break out of the shell. Tests below assert this
 /// invariant — do not regress it.
-fn build_lsn_exec_args(pg: &PgParams) -> (Vec<String>, Vec<String>) {
+fn build_lsn_exec_args(pg: &PgParams, pg_port: i32) -> (Vec<String>, Vec<String>) {
     let cmd = vec![
         "psql".to_string(),
         "-t".to_string(),
@@ -410,6 +432,7 @@ fn build_lsn_exec_args(pg: &PgParams) -> (Vec<String>, Vec<String>) {
         format!("PGUSER={}", pg.username),
         format!("PGPASSWORD={}", pg.password),
         format!("PGDATABASE={}", pg.database),
+        format!("PGPORT={}", pg_port),
     ];
     (cmd, env)
 }
@@ -418,8 +441,9 @@ async fn query_current_wal_lsn(
     docker: &bollard::Docker,
     container_name: &str,
     pg: &PgParams,
+    pg_port: i32,
 ) -> Result<String, BackupError> {
-    let (cmd_owned, env_owned) = build_lsn_exec_args(pg);
+    let (cmd_owned, env_owned) = build_lsn_exec_args(pg, pg_port);
     let cmd_refs: Vec<&str> = cmd_owned.iter().map(|s| s.as_str()).collect();
     let env_refs: Vec<&str> = env_owned.iter().map(|s| s.as_str()).collect();
     let exec = docker
@@ -470,7 +494,7 @@ mod tests {
             database: "production".to_string(),
         };
 
-        let (cmd, _env) = build_lsn_exec_args(&pg);
+        let (cmd, _env) = build_lsn_exec_args(&pg, 6012);
 
         for arg in &cmd {
             assert!(!arg.contains("alice"), "username leaked: {}", arg);
@@ -493,10 +517,35 @@ mod tests {
             database: "production".to_string(),
         };
 
-        let (_cmd, env) = build_lsn_exec_args(&pg);
+        let (_cmd, env) = build_lsn_exec_args(&pg, 6012);
         assert!(env.contains(&"PGUSER=alice".to_string()));
         assert!(env.contains(&"PGPASSWORD=p4ss'; rm -rf /; #".to_string()));
         assert!(env.contains(&"PGDATABASE=production".to_string()));
-        assert_eq!(env.len(), 3);
+        assert!(env.contains(&"PGPORT=6012".to_string()));
+        assert_eq!(env.len(), 4);
+    }
+
+    /// Cluster members listen on their own stored port; dialling 5432 made
+    /// every cluster backup fail with "connection refused".
+    #[test]
+    fn member_pg_port_uses_the_members_stored_port() {
+        let mut member = temps_providers::ServiceMemberInfo {
+            id: 2,
+            role: "replica".to_string(),
+            node_id: None,
+            container_name: "orders-ha-2".to_string(),
+            hostname: Some("orders-ha-2".to_string()),
+            port: Some(6012),
+            status: "running".to_string(),
+            ordinal: 2,
+            compute_ip: None,
+            provisioning_step: None,
+            provisioning_error: None,
+            live_state: Some("primary".to_string()),
+        };
+        assert_eq!(member_pg_port(&member), 6012);
+
+        member.port = None;
+        assert_eq!(member_pg_port(&member), 5432);
     }
 }

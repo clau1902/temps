@@ -9,6 +9,7 @@ use serde::Serialize;
 use slug::slugify;
 use std::sync::Arc;
 use temps_core::problemdetails::Problem;
+use temps_core::secret_string::SecretString;
 use temps_core::{
     EnvironmentCreatedJob, EnvironmentDeletedJob, Job, JobQueue, PublicHostnameStrategy,
 };
@@ -987,7 +988,7 @@ impl EnvironmentService {
         } else {
             None
         };
-        let password_hash = match settings.password.as_deref() {
+        let password_hash = match settings.password.as_ref().map(SecretString::expose) {
             Some(password) if !password.is_empty() => {
                 use argon2::{Argon2, PasswordHasher};
                 let hash = Argon2::default()

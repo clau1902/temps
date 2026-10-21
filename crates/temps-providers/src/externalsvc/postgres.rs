@@ -2190,14 +2190,20 @@ impl PostgresService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to postgres: {}", e))?;
 
-        // Check if database exists using parameterized query
-        let exists = sqlx::query("SELECT 1 FROM pg_database WHERE datname = $1")
-            .bind(name)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to check database existence: {}", e))?;
+        // Read the owner of the database, if it exists, using a parameterized
+        // query: a sandbox's database must never be handed to a deployment.
+        let owner: Option<String> =
+            sqlx::query_scalar(crate::sandbox_access::SandboxDatabasePlan::DATABASE_OWNER_QUERY)
+                .bind(name)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to check whether database '{}' exists: {}", name, e)
+                })?;
+        crate::sandbox_access::check_deployment_database(name, owner.as_deref())
+            .map_err(anyhow::Error::new)?;
 
-        if exists.is_none() {
+        if owner.is_none() {
             // CREATE DATABASE cannot use parameterized queries in PostgreSQL,
             // so we use a quoted identifier. The name has been validated above
             // to contain only [a-z0-9_] characters, making injection impossible.
@@ -2266,17 +2272,21 @@ impl PostgresService {
             .map(|c| if c.is_alphanumeric() { c } else { '_' })
             .collect::<String>();
 
-        let prefixed = if normalized.chars().next().unwrap().is_numeric() {
+        let prefixed = if normalized.chars().next().is_some_and(char::is_numeric) {
             format!("db_{}", normalized)
         } else {
             normalized
         };
 
-        if prefixed.len() > 63 {
-            prefixed[..63].to_string()
-        } else {
-            prefixed
+        // PostgreSQL identifiers are at most 63 bytes. `is_alphanumeric` keeps
+        // non-ASCII letters, so cut at the last character boundary within that
+        // limit instead of mid-character (which panicked). Every name that fit
+        // before is cut at the same place, so existing databases keep theirs.
+        let mut end = prefixed.len().min(63);
+        while !prefixed.is_char_boundary(end) {
+            end -= 1;
         }
+        prefixed[..end].to_string()
     }
 
     /// Extract PostgreSQL major version from Docker image name
@@ -5447,6 +5457,28 @@ mod data_import;
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_long_accented_name_is_cut_on_a_character_boundary() {
+        let name = format!("{}é-staging", "a".repeat(62));
+        let normalized = PostgresService::normalize_database_name(&name);
+        assert_eq!(normalized, "a".repeat(62));
+        assert!(normalized.len() <= 63);
+        // Names that already fit are unchanged, and ASCII still cuts at 63.
+        assert_eq!(
+            PostgresService::normalize_database_name("Shop-Prod"),
+            "shop_prod"
+        );
+        assert_eq!(
+            PostgresService::normalize_database_name(&"b".repeat(80)),
+            "b".repeat(63)
+        );
+        assert_eq!(
+            PostgresService::normalize_database_name("7days"),
+            "db_7days"
+        );
+        assert_eq!(PostgresService::normalize_database_name(""), "");
+    }
+
     /// Every pg_dumpall sidecar failure names the sidecar container and the
     /// database host, so the log line is enough to find what failed.
     #[test]
@@ -8364,7 +8396,6 @@ mod tests {
             health_metadata: None,
             metrics_enabled: false,
             default_backup_provisioned: false,
-            ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,

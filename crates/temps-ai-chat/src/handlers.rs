@@ -36,6 +36,10 @@ use tokio_util::io::ReaderStream;
 use tracing::{error, info};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::application_link::{
+    check_project_permission, synchronize_application_network, workspace_may_retain_data_plane,
+    ApplicationProjectLinker, LinkProjectError, NetworkSyncError, ProjectPermissionError,
+};
 use temps_auth::permissions::Permission;
 use temps_auth::{
     context::{AuthContext, AuthSource},
@@ -52,8 +56,8 @@ use temps_ai::streaming::{PermissionDecision, PermissionKind, PermissionRequest}
 use crate::applications::{is_sensitive_workspace_path, WorkspaceEntryKind};
 use crate::audit::{
     AiActionConfirmedAudit, AiActionRejectedAudit, ApplicationArchivedAudit,
-    ApplicationCreatedAudit, ApplicationPreviewLinkCreatedAudit, ApplicationRestoredAudit,
-    ApplicationTopologyChangedAudit, ApplicationWorkspaceChangedAudit,
+    ApplicationCreatedAudit, ApplicationPreviewLinkCreatedAudit, ApplicationRenamedAudit,
+    ApplicationRestoredAudit, ApplicationTopologyChangedAudit, ApplicationWorkspaceChangedAudit,
     ApplicationWorkspaceDeployedAudit, ApplicationWorkspaceFilesWrittenAudit,
     ApplicationWorkspaceSourceImportedAudit, ChatMessageSentAudit, ConversationArchivedAudit,
     ConversationAttachmentUploadedAudit, ConversationCreatedAudit,
@@ -87,6 +91,14 @@ pub struct AppState {
     /// Pending-action service (confirm/reject write proposals).
     pub pending_actions: Arc<PendingActionService>,
     pub applications: Arc<ApplicationService>,
+    /// Goals the assistant is watching for each chat.
+    pub goals: Arc<crate::goals::GoalService>,
+    /// Credentials the user provided to the assistant through a sealed form.
+    pub secret_slots: Arc<crate::secret_slots::SecretSlotService>,
+    /// Files and images attached to assistant chats, which have no workspace.
+    pub assistant_attachments: Arc<crate::attachments::AssistantAttachmentService>,
+    /// Files being uploaded in chunks, until they are complete and stored.
+    pub attachment_uploads: Arc<crate::attachment_uploads::UploadSessions>,
     pub project_service: Arc<temps_projects::ProjectService>,
     /// Derives the durable, Temps-owned directory mounted into an application
     /// harness sandbox. This never accepts a browser-supplied host path.
@@ -114,7 +126,7 @@ pub struct AppState {
 impl AppState {
     /// Emit an audit entry, best-effort: a logging failure must never fail the
     /// underlying operation (it already succeeded).
-    async fn audit(&self, op: &dyn temps_core::AuditOperation) {
+    pub(crate) async fn audit(&self, op: &dyn temps_core::AuditOperation) {
         if let Err(e) = self.audit_service.create_audit_log(op).await {
             error!("Failed to write AI-chat audit log: {e}");
         }
@@ -148,6 +160,9 @@ pub struct ConversationResponse {
     pub turn_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub application_id: Option<i64>,
+    /// The project an assistant chat was started about, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_project_id: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<ChatFailureResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +213,7 @@ impl From<ai_conversations::Model> for ConversationResponse {
     fn from(m: ai_conversations::Model) -> Self {
         let failure = conversation_failure(m.metadata.as_ref(), &m.turn_status);
         let context_usage = conversation_context_usage(m.metadata.as_ref());
+        let focus_project_id = crate::service::focus_project_id(m.metadata.as_ref());
         Self {
             public_id: m.public_id,
             kind: m.kind,
@@ -216,6 +232,7 @@ impl From<ai_conversations::Model> for ConversationResponse {
             active_turn_id: m.active_turn_id,
             turn_started_at: m.turn_started_at.map(|value| value.to_rfc3339()),
             application_id: m.application_id,
+            focus_project_id,
             failure,
             context_usage,
         }
@@ -314,6 +331,12 @@ pub struct CreateApplicationRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+pub struct RenameApplicationRequest {
+    /// New name shown for the application. Trimmed; 1 to 200 characters.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateApplicationProjectRequest {
     pub name: String,
     /// Deployment preset for the project. Defaults to `autopack`, which
@@ -370,6 +393,21 @@ pub struct CreateGlobalConversationRequest {
     pub ai_model: Option<String>,
     pub ai_thinking_level: Option<String>,
     pub ai_permission_mode: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct CreateAssistantConversationRequest {
+    /// An AI-gateway provider id (`gateway_key:<id>`). Defaults to the active
+    /// OpenRouter key, then to the instance default. Host harnesses are
+    /// rejected: the assistant has no sandbox.
+    pub ai_provider: Option<String>,
+    /// Model id to start with; defaults to the provider's default model.
+    pub ai_model: Option<String>,
+    /// A project the chat is about. The assistant is told which it is, so it
+    /// needs no searching to resolve "my app". It is a default, not a limit,
+    /// and grants nothing: the chat still acts with the user's own permissions.
+    #[serde(default)]
+    pub project_id: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -634,10 +672,39 @@ pub struct GlobalConversationResponse {
     pub ai_permission_mode: String,
     /// Server-authoritative lifecycle for the current/most recent turn.
     pub turn_status: String,
+    /// The project an assistant chat was started about, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_project_id: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<ChatFailureResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextWindowUsageResponse>,
+    /// The sandbox linked to this chat, when it is still running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<ConversationSandboxResponse>,
+    /// The workspace an assistant chat is in (ADR-053).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<ConversationWorkspaceResponse>,
+}
+
+/// The workspace a chat is in, as the conversation list shows it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConversationWorkspaceResponse {
+    /// Public id of the workspace (`app_…`).
+    pub public_id: String,
+    pub name: String,
+}
+
+/// The sandbox a chat is linked to, as the conversation list shows it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConversationSandboxResponse {
+    /// Public id of the sandbox (`sbx_…`).
+    pub sandbox_id: String,
+    pub name: String,
+    /// Isolation backend: `docker`, `firecracker` or `microsandbox`. Absent
+    /// for sandboxes created before the backend was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -707,6 +774,10 @@ pub struct MessageResponse {
     /// Files copied into the persistent workspace for this user turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<ChatAttachmentResponse>>,
+    /// Next steps already suggested after this answer, shown again on reload
+    /// without asking the model a second time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_steps: Option<Vec<String>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, ToSchema)]
@@ -815,6 +886,8 @@ impl From<ai_messages::Model> for MessageResponse {
                 serde_json::from_value::<Vec<ChatAttachmentResponse>>(value.clone()).ok()
             })
             .filter(|attachments| !attachments.is_empty());
+        let next_steps = crate::suggestions::saved_next_steps(m.metadata.as_ref())
+            .map(|saved| saved.suggestions);
         Self {
             cursor,
             role: m.role,
@@ -823,6 +896,7 @@ impl From<ai_messages::Model> for MessageResponse {
             tools,
             parts,
             attachments,
+            next_steps,
         }
     }
 }
@@ -999,6 +1073,21 @@ pub struct ConversationListQuery {
     /// Number of conversations per page (clamped to 1..=100).
     #[param(example = 20, minimum = 1, maximum = 100)]
     pub page_size: Option<u64>,
+    /// Keep only chats whose title, or whose project's name or slug, contains
+    /// this text (case-insensitive, matched literally). At most 200
+    /// characters; blank means no filter.
+    #[param(example = "landing page", max_length = 200)]
+    pub search: Option<String>,
+}
+
+/// Longest `search` accepted by the conversation list.
+const MAX_CONVERSATION_SEARCH_LEN: usize = 200;
+
+fn validate_conversation_search(search: Option<&str>) -> Result<(), Problem> {
+    if search.is_some_and(|search| search.chars().count() > MAX_CONVERSATION_SEARCH_LEN) {
+        return Err(too_long("search", MAX_CONVERSATION_SEARCH_LEN));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
@@ -1074,8 +1163,13 @@ pub struct SendMessageRequest {
     /// same id never create a second user message or harness execution.
     #[serde(default)]
     pub turn_id: Option<String>,
-    /// Optional next-turn model. The provider harness remains pinned, but its
-    /// advertised models may be changed between turns.
+    /// Optional AI gateway provider (`gateway_key:<id>`) for this and later
+    /// turns. A chat on an AI gateway provider may move to another one; a
+    /// provider harness chat stays on the provider it was created with.
+    #[serde(default)]
+    pub ai_provider: Option<String>,
+    /// Optional next-turn model, one advertised by the conversation's
+    /// provider (or by `ai_provider` when that is set).
     #[serde(default)]
     pub ai_model: Option<String>,
     /// Optional next-turn thinking level.
@@ -1279,6 +1373,41 @@ impl From<ChatError> for Problem {
                 problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
                     .with_title("Permission Decision Mismatch")
                     .with_detail(e.to_string())
+            }
+        }
+    }
+}
+
+impl From<crate::attachments::AttachmentError> for Problem {
+    fn from(error: crate::attachments::AttachmentError) -> Self {
+        use crate::attachments::AttachmentError;
+        match error {
+            AttachmentError::Empty { .. }
+            | AttachmentError::TooMany { .. }
+            | AttachmentError::Duplicate { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Attachment")
+                .with_detail(error.to_string()),
+            AttachmentError::TooLarge { .. } | AttachmentError::TooMuchText { .. } => {
+                problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Attachment Too Large")
+                    .with_detail(error.to_string())
+            }
+            AttachmentError::QuotaExceeded { .. }
+            | AttachmentError::ModelCannotSeeImages { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title(match &error {
+                        AttachmentError::ModelCannotSeeImages { .. } => "Model Cannot Read Images",
+                        _ => "Attachment Quota Reached",
+                    })
+                    .with_detail(error.to_string())
+            }
+            AttachmentError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Attachment Not Found")
+                .with_detail(error.to_string()),
+            AttachmentError::Database { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
             }
         }
     }
@@ -1557,7 +1686,7 @@ const MAX_TITLE_LEN: usize = 200;
 const DEFAULT_MESSAGE_PAGE_LIMIT: u64 = 50;
 const MAX_MESSAGE_PAGE_LIMIT: u64 = 100;
 const MAX_CHAT_ATTACHMENTS: usize = 8;
-const MAX_CHAT_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+pub(crate) const MAX_CHAT_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_UPLOAD_BYTES: usize = MAX_CHAT_ATTACHMENT_BYTES + 64 * 1024;
 
 /// Body-size limit for `resolve_permission` POST payloads (finding 3).
@@ -1712,7 +1841,7 @@ async fn has_application_project_access(
 /// permission set is authoritative; `None` preserves compatibility with
 /// checkers that only implement coarse membership. `None` for the entire map
 /// represents the OSS/admin path where every requested project is visible.
-async fn application_project_access_map(
+pub(crate) async fn application_project_access_map(
     auth: &AuthContext,
     checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     project_ids: &[i32],
@@ -1780,62 +1909,61 @@ pub(crate) async fn ensure_application_project_permission(
     project_ids: &[i32],
     required: &Permission,
 ) -> Result<(), Problem> {
-    if !auth.has_permission(required) {
-        return Err(problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Insufficient Permissions")
-            .with_detail(format!(
-                "This operation requires the {} permission.",
-                required
-            )));
-    }
-    if auth.is_admin() || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin) {
-        return Ok(());
-    }
-    let Some(checker) = checker else {
-        return Ok(());
-    };
-    let user_id = auth.user_id_opt().ok_or_else(|| {
-        problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Project Permission Denied")
-            .with_detail("A user identity is required to access an AI application.")
-    })?;
-    let permissions = checker
-        .effective_project_permissions_batch(user_id, project_ids)
+    check_project_permission(auth, checker.as_ref(), project_ids, required)
         .await
-        .map_err(|error| {
-            error!(user_id, error = %error, "failed to check AI application project permissions");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Project Permission Check Failed")
-                .with_detail("Could not verify project permissions; please try again")
-        })?;
-    let membership = checker
-        .user_can_access_projects(user_id, project_ids)
-        .await
-        .map_err(|error| {
-            error!(user_id, error = %error, "failed to check AI application project membership");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Project Access Check Failed")
-                .with_detail("Could not verify project access; please try again")
-        })?;
-    let required_name = required.to_string();
-    for project_id in project_ids {
-        let allowed = match permissions.get(project_id) {
-            Some(Some(granted)) => granted
-                .iter()
-                .any(|permission| permission == &required_name),
-            Some(None) => membership.get(project_id).copied().unwrap_or(false),
-            None => false,
-        };
-        if !allowed {
-            return Err(problemdetails::new(StatusCode::FORBIDDEN)
+        .map_err(Problem::from)
+}
+
+impl From<ProjectPermissionError> for Problem {
+    fn from(error: ProjectPermissionError) -> Self {
+        match error {
+            ProjectPermissionError::MissingInstancePermission { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Insufficient Permissions")
+                    .with_detail(error.to_string())
+            }
+            ProjectPermissionError::NoUserIdentity => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Project Permission Denied")
-                .with_detail(format!(
-                    "The {} permission is required on every project linked to this application.",
-                    required_name
-                )));
+                .with_detail(error.to_string()),
+            ProjectPermissionError::PermissionCheck { .. } => {
+                error!(error = %error, "failed to check AI application project permissions");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Project Permission Check Failed")
+                    .with_detail("Could not verify project permissions; please try again")
+            }
+            ProjectPermissionError::MembershipCheck { .. } => {
+                error!(error = %error, "failed to check AI application project membership");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Project Access Check Failed")
+                    .with_detail("Could not verify project access; please try again")
+            }
+            ProjectPermissionError::Denied { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Project Permission Denied")
+                .with_detail(error.to_string()),
         }
     }
-    Ok(())
+}
+
+impl From<LinkProjectError> for Problem {
+    fn from(error: LinkProjectError) -> Self {
+        match error {
+            LinkProjectError::Permission(error) => error.into(),
+            LinkProjectError::RuntimeLock(error) => ChatError::from(error).into(),
+            LinkProjectError::Application(error) => error.into(),
+            LinkProjectError::ProjectPermissions { source, .. } => (*source).into(),
+            LinkProjectError::Network(error) => error.into(),
+        }
+    }
+}
+
+impl From<NetworkSyncError> for Problem {
+    fn from(error: NetworkSyncError) -> Self {
+        application_workspace_provider_problem(
+            *error.source,
+            &error.application_id,
+            error.operation,
+        )
+    }
 }
 
 /// Existing projects may only be bundled when the installation can prove the
@@ -2820,112 +2948,14 @@ pub async fn link_application_project(
     permission_guard!(auth, SandboxesWrite);
     deny_deployment_token!(auth);
     let previous = authorized_application(&state, &auth, &application_public_id).await?;
-    let previous_project_ids = previous
-        .projects
-        .iter()
-        .map(|project| project.id)
-        .collect::<Vec<_>>();
-    for project_ids in [&previous_project_ids[..], &[request.project_id][..]] {
-        ensure_application_project_permission(
+    let application = project_linker(&state)
+        .link(
             &auth,
-            &state.project_access_checker,
-            project_ids,
-            &Permission::ProjectsWrite,
+            state.project_access_checker.as_ref(),
+            &previous,
+            request.project_id,
         )
         .await?;
-        ensure_application_project_permission(
-            &auth,
-            &state.project_access_checker,
-            project_ids,
-            &Permission::SandboxesWrite,
-        )
-        .await?;
-    }
-    let _runtime_gate = state
-        .service
-        .lock_application_runtime_update(&application_public_id)
-        .await
-        .map_err(Problem::from)?;
-    let application = state
-        .applications
-        .link_project(auth.user_id(), &application_public_id, request.project_id)
-        .await?;
-    if let Err(workspace_error) = state
-        .application_workspaces
-        .ensure(&application.application.public_id, &application.projects)
-        .await
-    {
-        if let Err(rollback_error) = state
-            .applications
-            .unlink_project(auth.user_id(), &application_public_id, request.project_id)
-            .await
-        {
-            tracing::error!(
-                application_id = application_public_id,
-                project_id = request.project_id,
-                error = %rollback_error,
-                "Failed to roll back project link after workspace preparation failed"
-            );
-        }
-        return Err(workspace_error.into());
-    }
-    if let Some(project) = application
-        .projects
-        .iter()
-        .find(|project| project.id == request.project_id)
-    {
-        if let Some(sandboxes) = state.application_sandboxes.as_ref() {
-            if let Err(permission_error) = sandboxes
-                .normalize_application_project_permissions(
-                    auth.user_id(),
-                    &application_public_id,
-                    &project.slug,
-                )
-                .await
-            {
-                if let Err(cleanup_error) = state
-                    .applications
-                    .unlink_project(auth.user_id(), &application_public_id, request.project_id)
-                    .await
-                {
-                    tracing::error!(
-                        project_id = request.project_id,
-                        error = %cleanup_error,
-                        "Failed to roll back linked project after workspace permission update failed"
-                    );
-                }
-                return Err(permission_error.into());
-            }
-        }
-    }
-    if let Err(network_error) =
-        synchronize_application_network_if_running(&state, &auth, &application).await
-    {
-        if let Err(cleanup_error) = state
-            .applications
-            .unlink_project(auth.user_id(), &application_public_id, request.project_id)
-            .await
-        {
-            tracing::error!(
-                project_id = request.project_id,
-                error = %cleanup_error,
-                "Failed to roll back linked project after database network update failed"
-            );
-        }
-        // The database rollback alone is insufficient: network attachment is
-        // a separate side effect. Always restore the last authorized topology
-        // before returning the failure.
-        if let Err(reconcile_error) =
-            synchronize_application_network_if_running(&state, &auth, &previous).await
-        {
-            tracing::error!(
-                application_id = application_public_id,
-                error = ?reconcile_error,
-                "Failed to restore application data network after link rollback"
-            );
-        }
-        return Err(network_error);
-    }
     state
         .audit(&ApplicationTopologyChangedAudit {
             context: audit_context(&auth, &metadata),
@@ -3320,6 +3350,59 @@ pub async fn archive_application(
         })
         .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    patch, tag = "AI Applications", path = "/ai/applications/{application_public_id}",
+    operation_id = "rename_application",
+    summary = "Rename an AI application",
+    description = "Changes the application's name. Its id, chats, workspace and projects are unchanged.",
+    params(("application_public_id" = String, Path,)),
+    request_body = RenameApplicationRequest,
+    responses(
+        (status = 200, body = ApplicationResponse),
+        (status = 400, description = "The name is empty or longer than 200 characters"),
+        (status = 401), (status = 403), (status = 404)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn rename_application(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(application_public_id): Path<String>,
+    Json(request): Json<RenameApplicationRequest>,
+) -> Result<Json<ApplicationResponse>, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    deny_deployment_token!(auth);
+    let current = authorized_application(&state, &auth, &application_public_id).await?;
+    let project_ids = current
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_permission(
+        &auth,
+        &state.project_access_checker,
+        &project_ids,
+        &Permission::ProjectsWrite,
+    )
+    .await?;
+    let renamed = state
+        .applications
+        .rename(auth.user_id(), &application_public_id, &request.name)
+        .await?;
+    if renamed.application.name != current.application.name {
+        state
+            .audit(&ApplicationRenamedAudit {
+                context: audit_context(&auth, &metadata),
+                application_id: application_public_id,
+                previous_name: current.application.name,
+                name: renamed.application.name.clone(),
+            })
+            .await;
+    }
+    Ok(Json(ApplicationResponse::from(renamed)))
 }
 
 #[utoipa::path(
@@ -5954,6 +6037,7 @@ pub async fn list_all_conversations(
     // project-scoped deployment/project token must not reach another tenant's
     // chats through it. Restrict to human/admin (user/API-key) principals.
     deny_deployment_token!(auth);
+    validate_conversation_search(query.search.as_deref())?;
     let (page, page_size) = normalize_list_pagination(query.page, query.page_size);
     let hidden_project_ids =
         hidden_conversation_project_ids(&auth, &state.project_access_checker).await?;
@@ -5978,15 +6062,47 @@ pub async fn list_all_conversations(
             page_size,
             visible_application_ids.as_deref(),
             &hidden_context_types,
+            query.search.as_deref(),
         )
         .await?;
+    // Workspace names for the assistant chats in a workspace, in one query.
+    let mut workspace_ids: Vec<i64> = items
+        .iter()
+        .filter(|item| {
+            item.conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE
+        })
+        .filter_map(|item| item.conversation.application_id)
+        .collect();
+    workspace_ids.sort_unstable();
+    workspace_ids.dedup();
+    let workspace_names = crate::workspace_chats::workspace_names(&state.db, &workspace_ids)
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(format!(
+                    "Could not read the workspaces of user {}'s chats: {error}",
+                    auth.user_id()
+                ))
+        })?;
     let mut conversations = Vec::with_capacity(items.len());
     for item in items {
+        let workspace = (item.conversation.context_type
+            == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE)
+            .then_some(item.conversation.application_id)
+            .flatten()
+            .and_then(|id| workspace_names.get(&id))
+            .map(|(public_id, name)| ConversationWorkspaceResponse {
+                public_id: public_id.clone(),
+                name: name.clone(),
+            });
         let failure = conversation_failure(
             item.conversation.metadata.as_ref(),
             &item.conversation.turn_status,
         );
         let context_usage = conversation_context_usage(item.conversation.metadata.as_ref());
+        let focus_project_id =
+            crate::service::focus_project_id(item.conversation.metadata.as_ref());
         conversations.push(GlobalConversationResponse {
             public_id: item.conversation.public_id,
             project_id: item.conversation.project_id,
@@ -6004,8 +6120,15 @@ pub async fn list_all_conversations(
             ai_thinking_level: item.conversation.ai_thinking_level,
             ai_permission_mode: item.conversation.ai_permission_mode,
             turn_status: item.conversation.turn_status,
+            focus_project_id,
             failure,
             context_usage,
+            sandbox: item.sandbox.map(|sandbox| ConversationSandboxResponse {
+                sandbox_id: sandbox.sandbox_id,
+                name: sandbox.name,
+                backend: sandbox.backend,
+            }),
+            workspace,
         });
     }
     Ok(Json(conversations))
@@ -6273,6 +6396,95 @@ pub async fn create_global_conversation(
             project_id: None,
             conversation_id: conversation.public_id.clone(),
             context_type: "global".to_string(),
+        })
+        .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ConversationResponse::from(conversation)),
+    ))
+}
+
+/// The calling client, attached to assistant-issued API calls so the audit trail
+/// of what the assistant did names who approved it and from where.
+fn request_origin(metadata: &RequestMetadata) -> temps_core::ai_tool_call::AiToolOrigin {
+    temps_core::ai_tool_call::AiToolOrigin {
+        ip_address: metadata.ip_address.clone(),
+        user_agent: metadata.user_agent.clone(),
+    }
+}
+
+/// Console path where an operator adds the AI provider key the assistant needs.
+const ASSISTANT_SETUP_PATH: &str = "/ai-gateway?add=openrouter";
+
+/// Start a chat with the Temps assistant.
+///
+/// The assistant runs on the AI gateway (an OpenRouter key is enough), has no
+/// sandbox, and acts with the calling user's own permissions: every tool call
+/// is replayed through the real router with their auth, and every change is a
+/// proposal the user confirms in the UI. When no provider is configured this
+/// answers `409` with `setup_path`, so the client can onboard instead of
+/// failing.
+#[utoipa::path(
+    post, tag = "AI Chat",
+    path = "/ai/assistant/conversations",
+    request_body = CreateAssistantConversationRequest,
+    responses(
+        (status = 201, description = "Conversation created", body = ConversationResponse),
+        (status = 400, description = "Provider is not an AI-gateway provider"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "No AI provider is configured; the problem carries `setup_path`")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_assistant_conversation(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<CreateAssistantConversationRequest>,
+) -> Result<(StatusCode, Json<ConversationResponse>), Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    if let Some(project_id) = request.project_id {
+        ensure_application_project_permission(
+            &auth,
+            &state.project_access_checker,
+            &[project_id],
+            &Permission::ProjectsRead,
+        )
+        .await?;
+    }
+    let conversation = state
+        .service
+        .create_assistant_conversation(
+            auth.user_id(),
+            request.ai_provider.as_deref(),
+            request.ai_model.as_deref(),
+            request.project_id,
+        )
+        .await
+        .map_err(|error| match error {
+            ChatError::AiUnavailable => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("AI Not Configured")
+                .with_detail(
+                    "No AI provider is configured. Add an OpenRouter API key to start managing Temps by chat.",
+                )
+                .with_value("setup_path", ASSISTANT_SETUP_PATH),
+            ChatError::Ai(message) => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Assistant Provider Not Usable")
+                .with_detail(message),
+            other => Problem::from(other),
+        })?;
+    state
+        .audit(&ConversationCreatedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id: request.project_id,
+            conversation_id: conversation.public_id.clone(),
+            context_type: "assistant".to_string(),
         })
         .await;
     Ok((
@@ -6555,10 +6767,6 @@ fn application_workspace_state<'a>(
     }
 }
 
-fn workspace_may_retain_data_plane(status: &str) -> bool {
-    matches!(status, "running" | "recovering")
-}
-
 /// Parse the `kind` of a thread-creation request.
 fn requested_thread_kind(kind: Option<&str>) -> Result<ThreadKind, Problem> {
     ThreadKind::parse(kind).map_err(|error| match error {
@@ -6624,7 +6832,7 @@ async fn authorized_application_with_status(
     .await
 }
 
-async fn authorized_application_for_permissions(
+pub(crate) async fn authorized_application_for_permissions(
     state: &AppState,
     auth: &AuthContext,
     application_public_id: &str,
@@ -6742,48 +6950,28 @@ async fn quarantine_application_workspace(state: &AppState, user_id: i32, applic
     }
 }
 
+/// The linker the HTTP handlers share with the assistant's blueprint tool.
+fn project_linker(state: &AppState) -> ApplicationProjectLinker {
+    ApplicationProjectLinker::new(
+        state.db.clone(),
+        state.applications.clone(),
+        state.application_workspaces.clone(),
+        state.application_sandboxes.clone(),
+    )
+}
+
 async fn synchronize_application_network_if_running(
     state: &AppState,
     auth: &AuthContext,
     application: &crate::applications::ApplicationWithProjects,
 ) -> Result<(), Problem> {
-    let Some(sandboxes) = state.application_sandboxes.as_ref() else {
-        return Ok(());
-    };
-    let Some(summary) = sandboxes
-        .application_workspace_summary(auth.user_id(), &application.application.public_id)
-        .await
-        .map_err(|error| {
-            application_workspace_provider_problem(
-                error,
-                &application.application.public_id,
-                "inspect before data-network synchronization",
-            )
-        })?
-        .filter(|summary| workspace_may_retain_data_plane(&summary.status))
-    else {
-        return Ok(());
-    };
-    sandboxes
-        .synchronize_application_data_network(
-            auth.user_id(),
-            &application.application.public_id,
-            &summary.public_id,
-            &application
-                .projects
-                .iter()
-                .map(|project| project.id)
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(|error| {
-            application_workspace_provider_problem(
-                error,
-                &application.application.public_id,
-                "synchronize data network",
-            )
-        })?;
-    Ok(())
+    synchronize_application_network(
+        state.application_sandboxes.as_ref(),
+        auth.user_id(),
+        application,
+    )
+    .await
+    .map_err(Problem::from)
 }
 
 #[utoipa::path(
@@ -7539,7 +7727,7 @@ pub async fn get_conversation(
     }))
 }
 
-async fn ensure_user_conversation_access(
+pub(crate) async fn ensure_user_conversation_access(
     state: &AppState,
     auth: &AuthContext,
     conversation: &ai_conversations::Model,
@@ -7657,6 +7845,44 @@ pub async fn get_user_conversation(
         },
         pending_permission,
     }))
+}
+
+/// What this conversation has cost so far.
+///
+/// Read from the AI gateway's usage log for the conversation's owner only.
+/// Figures are estimates: requests to a model with no known price are counted
+/// in `unpriced_requests` instead of being silently priced at zero.
+#[utoipa::path(
+    get,
+    operation_id = "getUserConversationUsage",
+    tag = "AI Chat",
+    path = "/ai/conversations/{public_id}/usage",
+    params(("public_id" = String, Path,)),
+    responses(
+        (status = 200, body = crate::usage::ConversationUsage),
+        (status = 401),
+        (status = 403),
+        (status = 404),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_user_conversation_usage(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(public_id): Path<String>,
+) -> Result<Json<crate::usage::ConversationUsage>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let conversation = state
+        .service
+        .get_owned_by_public_id(auth.user_id(), &public_id)
+        .await?;
+    ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    let usage = state
+        .service
+        .usage_for_owned_conversation(&conversation, auth.user_id())
+        .await?;
+    Ok(Json(usage))
 }
 
 /// Export the bounded, server-redacted diagnostic state Temps currently owns.
@@ -8000,13 +8226,17 @@ pub async fn send_message(
         .ai_permission_mode
         .as_deref()
         .unwrap_or(&conv.ai_permission_mode);
-    ensure_runtime_permission(&auth, Some(&conv.ai_provider), Some(effective_permission))?;
-    ensure_enabled(&state, Some(&conv.ai_provider)).await?;
+    // A gateway chat may move to another gateway key; the service rejects any
+    // other provider change. Gate on the provider the turn will run on.
+    let effective_provider = req.ai_provider.as_deref().unwrap_or(&conv.ai_provider);
+    ensure_runtime_permission(&auth, Some(effective_provider), Some(effective_permission))?;
+    ensure_enabled(&state, Some(effective_provider)).await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     conv = state
         .service
-        .update_runtime_options(
+        .update_runtime_selection(
             &conv,
+            req.ai_provider.as_deref(),
             req.ai_model.as_deref(),
             req.ai_thinking_level.as_deref(),
             req.ai_permission_mode.as_deref(),
@@ -8036,6 +8266,7 @@ pub async fn send_message(
             &req.content,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             page_context,
             &auth,
@@ -8154,33 +8385,74 @@ pub async fn send_user_message(
         .ai_permission_mode
         .as_deref()
         .unwrap_or(&conversation.ai_permission_mode);
-    ensure_runtime_permission(
-        &auth,
-        Some(&conversation.ai_provider),
-        Some(effective_permission),
-    )?;
+    // A gateway chat may move to another gateway key; the service rejects any
+    // other provider change. Gate on the provider the turn will run on.
+    let effective_provider = req
+        .ai_provider
+        .as_deref()
+        .unwrap_or(&conversation.ai_provider);
+    ensure_runtime_permission(&auth, Some(effective_provider), Some(effective_permission))?;
+    if effective_provider != conversation.ai_provider {
+        ensure_enabled(&state, Some(effective_provider)).await?;
+    }
     conversation = state
         .service
-        .update_runtime_options(
+        .update_runtime_selection(
             &conversation,
+            req.ai_provider.as_deref(),
             req.ai_model.as_deref(),
             req.ai_thinking_level.as_deref(),
             req.ai_permission_mode.as_deref(),
         )
         .await?;
-    let attachments =
-        resolve_chat_attachments(&state, &auth, &conversation, &req.attachments).await?;
+    let ResolvedAttachments {
+        responses: attachments,
+        context: attachment_context,
+        sandbox: sandbox_attachments,
+        images: message_images,
+    } = if conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+        resolve_assistant_attachments(&state, &auth, &conversation, &req.attachments).await?
+    } else {
+        let attachments =
+            resolve_chat_attachments(&state, &auth, &conversation, &req.attachments).await?;
+        // A gateway model has no sandbox to read the files from, so it gets
+        // the images as image parts as well. Host adapters stage the files
+        // and read them natively, so they must not get a second copy.
+        let images = if conversation
+            .ai_provider
+            .starts_with(crate::service::GATEWAY_PROVIDER_PREFIX)
+            && attachments.iter().any(|attachment| attachment.is_image)
+        {
+            let support = state
+                .assistant_attachments
+                .image_support(&conversation.ai_provider, Some(&conversation.ai_model))
+                .await;
+            crate::attachments::workspace_chat_images(
+                attachments
+                    .iter()
+                    .map(|attachment| (attachment.name.as_str(), attachment.contents.as_slice())),
+                support,
+                &conversation.ai_model,
+            )?
+        } else {
+            Vec::new()
+        };
+        ResolvedAttachments {
+            context: attachment_prompt_context(&attachments),
+            sandbox: attachments
+                .iter()
+                .map(|attachment| temps_ai::SandboxAttachment {
+                    name: attachment.name.clone(),
+                    bytes: Arc::from(attachment.contents.clone()),
+                    is_image: attachment.is_image,
+                })
+                .collect(),
+            responses: attachments,
+            images,
+        }
+    };
     let attachment_metadata =
         (!attachments.is_empty()).then(|| serde_json::json!({ "attachments": attachments }));
-    let attachment_context = attachment_prompt_context(&attachments);
-    let sandbox_attachments = attachments
-        .iter()
-        .map(|attachment| temps_ai::SandboxAttachment {
-            name: attachment.name.clone(),
-            bytes: Arc::from(attachment.contents.clone()),
-            is_image: attachment.is_image,
-        })
-        .collect();
     let page_context = req
         .page_context
         .as_deref()
@@ -8200,6 +8472,7 @@ pub async fn send_user_message(
             attachment_metadata,
             attachment_context.as_deref(),
             sandbox_attachments,
+            message_images,
             page_context,
             &auth,
             &metadata,
@@ -8218,6 +8491,13 @@ pub async fn send_user_message(
             );
         }
         return Err(error.into());
+    }
+    if conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+        let ids: Vec<String> = req.attachments.iter().map(|a| a.id.clone()).collect();
+        state
+            .assistant_attachments
+            .mark_sent(conversation.id, &ids)
+            .await;
     }
     info!(
         component = "ai_turn_timing",
@@ -8250,7 +8530,7 @@ pub async fn send_user_message(
     ))
 }
 
-fn sanitized_attachment_name(value: Option<&str>) -> String {
+pub(crate) fn sanitized_attachment_name(value: Option<&str>) -> String {
     let candidate = value.unwrap_or("attachment.bin");
     let mut sanitized = candidate
         .chars()
@@ -8386,6 +8666,112 @@ async fn resolve_chat_attachments(
     Ok(attachments)
 }
 
+/// Everything a send needs from the files a message refers to.
+struct ResolvedAttachments {
+    responses: Vec<ChatAttachmentResponse>,
+    context: Option<String>,
+    sandbox: Vec<temps_ai::SandboxAttachment>,
+    images: Vec<temps_ai::ChatImage>,
+}
+
+/// Resolve the files of an assistant message from the database store, and
+/// refuse images the chat's model cannot read. Text files are quoted into the
+/// prompt; images travel as image parts. Nothing is mounted in a sandbox.
+async fn resolve_assistant_attachments(
+    state: &AppState,
+    auth: &AuthContext,
+    conversation: &ai_conversations::Model,
+    references: &[ChatAttachmentReference],
+) -> Result<ResolvedAttachments, Problem> {
+    let references: Vec<(String, String)> = references
+        .iter()
+        .map(|reference| (reference.id.clone(), reference.name.clone()))
+        .collect();
+    let loaded = state
+        .assistant_attachments
+        .load_for_message(conversation.id, &references)
+        .await?;
+    if loaded.is_empty() {
+        return Ok(ResolvedAttachments {
+            responses: Vec::new(),
+            context: None,
+            sandbox: Vec::new(),
+            images: Vec::new(),
+        });
+    }
+    let support = state
+        .assistant_attachments
+        .image_support(&conversation.ai_provider, Some(&conversation.ai_model))
+        .await;
+    crate::attachments::ensure_images_readable(&loaded, support, &conversation.ai_model)?;
+    let mut context = crate::attachments::prompt_context(&loaded)?;
+    // A chat with a linked sandbox also gets the files there, so shell tools
+    // can open them. Only a chat the user may run commands in is told about
+    // the copies, and only about the ones that were really written.
+    let sandbox_paths = if auth.has_permission(&Permission::SandboxesExec) {
+        let files: Vec<crate::sandbox_link::SandboxFile<'_>> = loaded
+            .iter()
+            .map(|attachment| crate::sandbox_link::SandboxFile {
+                id: &attachment.public_id,
+                name: &attachment.name,
+                bytes: &attachment.bytes,
+            })
+            .collect();
+        state
+            .service
+            .place_attachments_in_sandbox(conversation, auth.user_id(), &files)
+            .await
+    } else {
+        vec![None; loaded.len()]
+    };
+    if let Some(notes) = sandbox_copy_notes(&loaded, &sandbox_paths) {
+        context = Some(match context {
+            Some(existing) => format!("{existing}{notes}"),
+            None => notes,
+        });
+    }
+    let responses = loaded
+        .iter()
+        .zip(&sandbox_paths)
+        .map(|(attachment, sandbox_path)| ChatAttachmentResponse {
+            id: attachment.public_id.clone(),
+            name: attachment.name.clone(),
+            mime_type: attachment.mime_type.clone(),
+            size_bytes: attachment.bytes.len() as u64,
+            sandbox_path: sandbox_path.clone().unwrap_or_default(),
+            is_image: matches!(
+                attachment.kind,
+                crate::attachments::AttachmentKind::Image { .. }
+            ),
+            contents: Vec::new(),
+        })
+        .collect();
+    Ok(ResolvedAttachments {
+        responses,
+        context,
+        sandbox: Vec::new(),
+        images: crate::attachments::chat_images(&loaded),
+    })
+}
+
+/// Tell the model where the sandbox copies of this message's files are.
+fn sandbox_copy_notes(
+    loaded: &[crate::attachments::LoadedAttachment],
+    paths: &[Option<String>],
+) -> Option<String> {
+    let mut notes = String::new();
+    for (attachment, path) in loaded.iter().zip(paths) {
+        if let Some(path) = path {
+            notes.push_str(&format!(
+                "- A copy of \"{}\" is also in your linked sandbox at {path}, for shell tools; \
+                 its contents above are already complete.\n",
+                attachment.name.replace('"', "'")
+            ));
+        }
+    }
+    (!notes.is_empty()).then_some(notes)
+}
+
 fn attachment_prompt_context(attachments: &[ChatAttachmentResponse]) -> Option<String> {
     if attachments.is_empty() {
         return None;
@@ -8402,11 +8788,54 @@ fn attachment_prompt_context(attachments: &[ChatAttachmentResponse]) -> Option<S
     Some(context)
 }
 
+/// Who may attach a file to this chat, and where the file lives: `None` for an
+/// assistant chat (its files are kept in the database), the workspace id for
+/// every other chat. Shared by the single-request upload and the chunked one,
+/// so the two cannot drift apart on permissions.
+pub(crate) async fn authorize_attachment_upload(
+    state: &AppState,
+    auth: &AuthContext,
+    public_id: &str,
+) -> Result<(ai_conversations::Model, Option<String>), Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let conversation = state
+        .service
+        .get_owned_by_public_id(auth.user_id(), public_id)
+        .await?;
+    ensure_user_conversation_mutation_access(state, auth, &conversation).await?;
+    // Assistant chats keep their files in the database and never touch a
+    // sandbox, so they need no sandbox permission; every other chat does.
+    let assistant =
+        conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
+    let workspace_id = if assistant {
+        None
+    } else {
+        permission_guard!(auth, SandboxesWrite);
+        ensure_application_conversation_permission(
+            state,
+            auth,
+            &conversation,
+            &Permission::SandboxesWrite,
+        )
+        .await?;
+        ensure_application_conversation_permission(
+            state,
+            auth,
+            &conversation,
+            &Permission::ProjectsWrite,
+        )
+        .await?;
+        Some(conversation_workspace_id(state, auth, &conversation).await?)
+    };
+    Ok((conversation, workspace_id))
+}
+
 #[utoipa::path(
     post, tag = "AI Chat", path = "/ai/conversations/{public_id}/attachments",
     params(("public_id" = String, Path,)),
     request_body(content = ChatAttachmentUpload, content_type = "multipart/form-data"),
-    responses((status = 201, body = ChatAttachmentResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 413)),
+    responses((status = 201, body = ChatAttachmentResponse), (status = 400), (status = 401), (status = 403), (status = 404), (status = 409), (status = 413)),
     security(("bearer_auth" = []))
 )]
 pub async fn upload_user_conversation_attachment(
@@ -8416,29 +8845,8 @@ pub async fn upload_user_conversation_attachment(
     Path(public_id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<ChatAttachmentResponse>), Problem> {
-    permission_guard!(auth, ProjectsRead);
-    permission_guard!(auth, SandboxesWrite);
-    deny_deployment_token!(auth);
-    let conversation = state
-        .service
-        .get_owned_by_public_id(auth.user_id(), &public_id)
-        .await?;
-    ensure_user_conversation_mutation_access(&state, &auth, &conversation).await?;
-    ensure_application_conversation_permission(
-        &state,
-        &auth,
-        &conversation,
-        &Permission::SandboxesWrite,
-    )
-    .await?;
-    ensure_application_conversation_permission(
-        &state,
-        &auth,
-        &conversation,
-        &Permission::ProjectsWrite,
-    )
-    .await?;
-    let workspace_id = conversation_workspace_id(&state, &auth, &conversation).await?;
+    let (conversation, workspace_id) =
+        authorize_attachment_upload(&state, &auth, &public_id).await?;
 
     let field = multipart
         .next_field()
@@ -8495,6 +8903,58 @@ pub async fn upload_user_conversation_attachment(
             ));
     }
 
+    store_attachment_bytes(
+        &state,
+        &auth,
+        &metadata,
+        conversation,
+        workspace_id,
+        name,
+        declared_mime,
+        bytes.to_vec(),
+    )
+    .await
+}
+
+/// Store a fully received, size-checked attachment and answer as the upload
+/// endpoints do. `workspace_id` is what [`authorize_attachment_upload`] returned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_attachment_bytes(
+    state: &AppState,
+    auth: &AuthContext,
+    metadata: &RequestMetadata,
+    conversation: ai_conversations::Model,
+    workspace_id: Option<String>,
+    name: String,
+    declared_mime: Option<String>,
+    bytes: Vec<u8>,
+) -> Result<(StatusCode, Json<ChatAttachmentResponse>), Problem> {
+    let Some(workspace_id) = workspace_id else {
+        let stored = state
+            .assistant_attachments
+            .store(conversation.id, &name, bytes)
+            .await?;
+        state
+            .audit(&ConversationAttachmentUploadedAudit {
+                context: audit_context(auth, metadata),
+                conversation_id: conversation.public_id.clone(),
+                attachment_id: stored.public_id.clone(),
+                size_bytes: stored.size_bytes as u64,
+            })
+            .await;
+        return Ok((
+            StatusCode::CREATED,
+            Json(ChatAttachmentResponse {
+                id: stored.public_id,
+                name: stored.name,
+                is_image: stored.mime_type.starts_with("image/"),
+                mime_type: stored.mime_type,
+                size_bytes: stored.size_bytes as u64,
+                sandbox_path: String::new(),
+                contents: Vec::new(),
+            }),
+        ));
+    };
     let attachment_id = format!("att_{}", uuid::Uuid::new_v4().simple());
     state
         .application_workspaces
@@ -8521,7 +8981,7 @@ pub async fn upload_user_conversation_attachment(
     };
     state
         .audit(&ConversationAttachmentUploadedAudit {
-            context: audit_context(&auth, &metadata),
+            context: audit_context(auth, metadata),
             conversation_id: conversation.public_id,
             attachment_id,
             size_bytes: bytes.len() as u64,
@@ -8547,13 +9007,20 @@ pub async fn get_user_conversation_attachment(
     Query(query): Query<ChatAttachmentContentQuery>,
 ) -> Result<Response, Problem> {
     permission_guard!(auth, ProjectsRead);
-    permission_guard!(auth, SandboxesRead);
     deny_deployment_token!(auth);
     let conversation = state
         .service
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    if conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+        let stored = state
+            .assistant_attachments
+            .read(conversation.id, &attachment_id)
+            .await?;
+        return attachment_http_response(&stored.name, &stored.mime_type, stored.content);
+    }
+    permission_guard!(auth, SandboxesRead);
     let workspace_id = conversation_workspace_id(&state, &auth, &conversation).await?;
     let name = sanitized_attachment_name(Some(&query.name));
     if name != query.name {
@@ -8573,8 +9040,18 @@ pub async fn get_user_conversation_attachment(
         )
         .await?;
     let mime_type = attachment_mime_type(&name, None);
+    attachment_http_response(&name, &mime_type, bytes)
+}
+
+/// Serve stored attachment bytes. Only the four image types the chat accepts
+/// are shown inline; everything else downloads, and nothing is sniffed.
+fn attachment_http_response(
+    name: &str,
+    mime_type: &str,
+    bytes: Vec<u8>,
+) -> Result<Response, Problem> {
     let safe_inline_image = matches!(
-        mime_type.as_str(),
+        mime_type,
         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
     );
     let disposition = if safe_inline_image {
@@ -8585,7 +9062,7 @@ pub async fn get_user_conversation_attachment(
     let mut response = Response::new(Body::from(bytes));
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(&mime_type).map_err(|error| {
+        HeaderValue::from_str(mime_type).map_err(|error| {
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Invalid Attachment Content Type")
                 .with_detail(format!(
@@ -8912,11 +9389,16 @@ async fn ensure_pending_permission_authorized(
 )]
 pub async fn resolve_permission(
     RequireAuth(auth): RequireAuth,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path((project_id, public_id, permission_id)): Path<(i32, String, String)>,
     Json(req): Json<ResolvePermissionRequest>,
 ) -> Result<axum::http::StatusCode, Problem> {
+    temps_core::ai_tool_call::require_human_caller(
+        ai_call.as_ref().map(|e| &e.0),
+        "resolve_permission",
+    )?;
     // Resolving a permission unblocks an AI subprocess (mutates state) → write scope.
     permission_guard!(auth, ProjectsRead);
     project_scope_guard!(auth, project_id);
@@ -9089,11 +9571,16 @@ pub async fn resolve_permission(
 )]
 pub async fn resolve_user_permission(
     RequireAuth(auth): RequireAuth,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path((public_id, permission_id)): Path<(String, String)>,
     Json(req): Json<ResolvePermissionRequest>,
 ) -> Result<StatusCode, Problem> {
+    temps_core::ai_tool_call::require_human_caller(
+        ai_call.as_ref().map(|e| &e.0),
+        "resolve_user_permission",
+    )?;
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
     let conversation = state
@@ -9337,11 +9824,16 @@ async fn persist_and_apply_permission_mode(
 )]
 pub async fn update_permission_mode(
     RequireAuth(auth): RequireAuth,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path((project_id, public_id)): Path<(i32, String)>,
     Json(request): Json<UpdatePermissionModeRequest>,
 ) -> Result<Json<ConversationResponse>, Problem> {
+    temps_core::ai_tool_call::require_human_caller(
+        ai_call.as_ref().map(|e| &e.0),
+        "update_permission_mode",
+    )?;
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -9370,11 +9862,16 @@ pub async fn update_permission_mode(
 )]
 pub async fn update_user_permission_mode(
     RequireAuth(auth): RequireAuth,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(public_id): Path<String>,
     Json(request): Json<UpdatePermissionModeRequest>,
 ) -> Result<Json<ConversationResponse>, Problem> {
+    temps_core::ai_tool_call::require_human_caller(
+        ai_call.as_ref().map(|e| &e.0),
+        "update_user_permission_mode",
+    )?;
     permission_guard!(auth, ProjectsWrite);
     deny_deployment_token!(auth);
     let conversation = state
@@ -9602,10 +10099,15 @@ pub async fn get_pending_action(
 )]
 pub async fn confirm_pending_action(
     RequireAuth(auth): RequireAuth,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path((project_id, action_public_id)): Path<(i32, String)>,
 ) -> Result<Json<PendingActionResponse>, Problem> {
+    temps_core::ai_tool_call::require_human_caller(
+        ai_call.as_ref().map(|e| &e.0),
+        "confirm_pending_action",
+    )?;
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -9623,7 +10125,13 @@ pub async fn confirm_pending_action(
     let confirmed_by = Some(auth.user_id());
     let updated = state
         .pending_actions
-        .confirm(Some(project_id), &action_public_id, &auth, confirmed_by)
+        .confirm(
+            Some(project_id),
+            &action_public_id,
+            &auth,
+            confirmed_by,
+            Some(request_origin(&metadata)),
+        )
         .await
         .map_err(Problem::from)?;
 
@@ -9663,10 +10171,15 @@ pub async fn confirm_pending_action(
 )]
 pub async fn reject_pending_action(
     RequireAuth(auth): RequireAuth,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path((project_id, action_public_id)): Path<(i32, String)>,
 ) -> Result<Json<PendingActionResponse>, Problem> {
+    temps_core::ai_tool_call::require_human_caller(
+        ai_call.as_ref().map(|e| &e.0),
+        "reject_pending_action",
+    )?;
     permission_guard!(auth, ProjectsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -9767,10 +10280,15 @@ pub async fn get_user_pending_action(
 )]
 pub async fn confirm_user_pending_action(
     RequireAuth(auth): RequireAuth,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(action_public_id): Path<String>,
 ) -> Result<Json<PendingActionResponse>, Problem> {
+    temps_core::ai_tool_call::require_human_caller(
+        ai_call.as_ref().map(|e| &e.0),
+        "confirm_user_pending_action",
+    )?;
     // The pending-action service re-checks the operation's exact permission
     // against this current auth context. A blanket project-write gate would
     // incorrectly block global actions whose authority is non-project-specific.
@@ -9793,6 +10311,7 @@ pub async fn confirm_user_pending_action(
             &action_public_id,
             &auth,
             Some(auth.user_id()),
+            Some(request_origin(&metadata)),
         )
         .await
         .map_err(Problem::from)?;
@@ -9819,10 +10338,15 @@ pub async fn confirm_user_pending_action(
 )]
 pub async fn reject_user_pending_action(
     RequireAuth(auth): RequireAuth,
+    ai_call: Option<Extension<temps_core::ai_tool_call::AiToolCall>>,
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(action_public_id): Path<String>,
 ) -> Result<Json<PendingActionResponse>, Problem> {
+    temps_core::ai_tool_call::require_human_caller(
+        ai_call.as_ref().map(|e| &e.0),
+        "reject_user_pending_action",
+    )?;
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
     let action = state
@@ -9983,7 +10507,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/ai/applications/{application_public_id}",
-            get(get_application).delete(archive_application),
+            get(get_application)
+                .patch(rename_application)
+                .delete(archive_application),
         )
         .route(
             "/ai/applications/{application_public_id}/restore",
@@ -10078,6 +10604,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             get(list_all_conversations).post(create_global_conversation),
         )
         .route(
+            "/ai/assistant/conversations",
+            post(create_assistant_conversation),
+        )
+        .route(
             "/ai/conversations/{public_id}",
             get(get_user_conversation).patch(rename_user_conversation),
         )
@@ -10088,6 +10618,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/ai/conversations/{public_id}/diagnostics",
             get(get_user_conversation_diagnostics),
+        )
+        .route(
+            "/ai/conversations/{public_id}/usage",
+            get(get_user_conversation_usage),
         )
         .route(
             "/ai/conversations/{public_id}/attachments",
@@ -10215,6 +10749,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         list_applications,
         create_application,
         archive_application,
+        rename_application,
         restore_application,
         create_application_project,
         deploy_application_workspace_project,
@@ -10255,9 +10790,11 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         list_all_conversations,
         get_workspace_activity,
         create_global_conversation,
+        create_assistant_conversation,
         get_global_ai_workspace,
         get_user_conversation,
         get_user_conversation_diagnostics,
+        get_user_conversation_usage,
         send_user_message,
         upload_user_conversation_attachment,
         get_user_conversation_attachment,
@@ -10285,6 +10822,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         reject_pending_action,
     ),
     components(schemas(
+        crate::usage::ConversationUsage,
+        crate::usage::ModelSpend,
         ApplicationProjectResponse,
         ApplicationProjectEnvironmentResponse,
         ApplicationResponse,
@@ -10302,6 +10841,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         WriteApplicationWorkspaceFilesRequest,
         WriteApplicationWorkspaceFilesResponse,
         CreateApplicationRequest,
+        RenameApplicationRequest,
         CreateApplicationProjectRequest,
         DeployApplicationProjectRequest,
         ApplicationProjectDeploymentResponse,
@@ -10311,6 +10851,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         CreateThreadArtifactRequest,
         ConversationResponse,
         GlobalConversationResponse,
+        ConversationSandboxResponse,
+        ConversationWorkspaceResponse,
         MessageResponse,
         ChatAttachmentResponse,
         ChatAttachmentReference,
@@ -10326,6 +10868,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         WorkspaceHarnessActivity,
         CreateConversationRequest,
         CreateGlobalConversationRequest,
+        CreateAssistantConversationRequest,
         RenameConversationRequest,
         UpdatePermissionModeRequest,
         SendMessageRequest,
@@ -10730,6 +11273,25 @@ mod tests {
     }
 
     #[test]
+    fn conversation_list_query_accepts_a_search_and_rejects_an_oversized_one() {
+        let uri: Uri = "/api/ai/conversations?search=landing%20page&page=1"
+            .parse()
+            .expect("valid conversation search URI");
+        let Query(query) =
+            Query::<ConversationListQuery>::try_from_uri(&uri).expect("search must deserialize");
+        assert_eq!(query.search.as_deref(), Some("landing page"));
+        assert!(validate_conversation_search(query.search.as_deref()).is_ok());
+        assert!(validate_conversation_search(None).is_ok());
+
+        // Counted in characters, not bytes: 200 multi-byte characters pass.
+        let at_limit = "é".repeat(MAX_CONVERSATION_SEARCH_LEN);
+        assert!(validate_conversation_search(Some(&at_limit)).is_ok());
+        let problem = validate_conversation_search(Some(&"a".repeat(201)))
+            .expect_err("201 characters must be rejected");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn application_status_query_deserializes_status_without_pagination() {
         let uri: Uri = "/api/ai/applications/app_123?status=archived"
             .parse()
@@ -10945,6 +11507,35 @@ mod tests {
     }
 
     #[test]
+    fn message_response_carries_saved_next_steps() {
+        let message = |metadata| {
+            MessageResponse::from(ai_messages::Model {
+                id: 9,
+                conversation_id: 1,
+                role: "assistant".to_string(),
+                content: "Deployed.".to_string(),
+                metadata,
+                tokens_in: None,
+                tokens_out: None,
+                cost_microcents: None,
+                created_at: chrono::Utc::now(),
+            })
+        };
+        let with = message(Some(serde_json::json!({
+            "next_steps": { "suggestions": ["Show the logs"], "model": "vendor/m" }
+        })));
+        assert_eq!(with.next_steps, Some(vec!["Show the logs".to_string()]));
+        let json = serde_json::to_value(&with).expect("serializes");
+        assert!(json.get("next_steps").is_some());
+        assert!(!json.to_string().contains("vendor/m"));
+
+        let without = message(None);
+        assert_eq!(without.next_steps, None);
+        let json = serde_json::to_value(&without).expect("serializes");
+        assert!(json.get("next_steps").is_none());
+    }
+
+    #[test]
     fn workspace_state_distinguishes_sleeping_from_recovery() {
         assert_eq!(
             application_workspace_state(None, "running", false, false),
@@ -11128,6 +11719,7 @@ mod tests {
             content: content.to_string(),
             attachments: Vec::new(),
             turn_id: Some("turn-1".to_string()),
+            ai_provider: None,
             ai_model: None,
             ai_thinking_level: None,
             ai_permission_mode: None,
@@ -11387,6 +11979,7 @@ mod tests {
             active_turn_id: None,
             last_turn_id: None,
             turn_started_at: None,
+            next_step_suggestions: None,
         }
     }
 
@@ -11424,12 +12017,22 @@ mod tests {
             ai_thinking_level: conversation.ai_thinking_level,
             ai_permission_mode: conversation.ai_permission_mode,
             turn_status: conversation.turn_status,
+            focus_project_id: Some(7),
             failure: None,
             context_usage: None,
+            sandbox: Some(ConversationSandboxResponse {
+                sandbox_id: "sbx_abc".to_string(),
+                name: "scratch".to_string(),
+                backend: Some("firecracker".to_string()),
+            }),
+            workspace: None,
         };
 
         let value = serde_json::to_value(response).expect("response serializes");
         assert_eq!(value["turn_status"], "failed");
+        assert_eq!(value["sandbox"]["backend"], "firecracker");
+        assert_eq!(value["sandbox"]["sandbox_id"], "sbx_abc");
+        assert_eq!(value["focus_project_id"], 7);
         // The cross-project switcher must know which threads are shells, or a
         // terminal thread would open as an empty agent conversation.
         assert_eq!(value["kind"], "terminal");
@@ -12704,6 +13307,40 @@ mod tests {
         let (value, truncated) = truncate_workspace_text("ééé".to_string(), 3);
         assert_eq!(value, "é");
         assert!(truncated);
+    }
+
+    fn loaded_text(name: &str) -> crate::attachments::LoadedAttachment {
+        crate::attachments::LoadedAttachment {
+            public_id: "att_1".to_string(),
+            name: name.to_string(),
+            mime_type: "text/plain".to_string(),
+            kind: crate::attachments::AttachmentKind::Text,
+            bytes: b"hello".to_vec(),
+            extracted_text: None,
+        }
+    }
+
+    #[test]
+    fn sandbox_copy_notes_name_only_the_files_that_were_placed() {
+        let loaded = vec![loaded_text("a.txt"), loaded_text("b \"x\".txt")];
+        let paths = vec![
+            None,
+            Some("/w/.temps/chat-attachments/c/att_1/b.txt".to_string()),
+        ];
+        let notes = sandbox_copy_notes(&loaded, &paths).expect("one file was placed");
+        assert!(!notes.contains("a.txt"));
+        assert!(notes.contains("/w/.temps/chat-attachments/c/att_1/b.txt"));
+        assert!(
+            notes.contains("b 'x'.txt"),
+            "quotes in names are neutralized: {notes}"
+        );
+    }
+
+    #[test]
+    fn no_sandbox_copies_means_no_notes() {
+        let loaded = vec![loaded_text("a.txt")];
+        assert!(sandbox_copy_notes(&loaded, &[None]).is_none());
+        assert!(sandbox_copy_notes(&[], &[]).is_none());
     }
 
     #[test]

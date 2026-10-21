@@ -1160,6 +1160,12 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['agents', 'autopilot', 'ai', 'automation', 'workflows'],
   },
   {
+    title: 'Crash autofix',
+    url: settingsSectionPath('automation', 'crash-autofix'),
+    icon: Wand2,
+    keywords: ['autofix', 'crash', 'errors', 'fix', 'incident', 'confidence'],
+  },
+  {
     title: 'Autofixer',
     url: settingsSectionPath('automation', 'autofixer'),
     icon: Wand2,

@@ -114,7 +114,7 @@ pub enum AiGatewayError {
     AmbiguousModel { model: String, candidates: String },
 
     #[error(
-        "Model '{model}' is hosted by self-hosted provider key {key_id}, which cannot serve it \
+        "Model '{model}' is hosted by OpenAI-compatible provider key {key_id}, which cannot serve it \
          right now ({reason}); it is never forwarded to another provider automatically. Make it \
          available on that key again, or send the X-Temps-Provider-Key-Id header to use another \
          key explicitly."
@@ -128,7 +128,7 @@ pub enum AiGatewayError {
     #[error(
         "Provider key {key_id} does not declare support for {capability}, so model '{model}' \
          cannot be used for it. An administrator can enable it on the provider key if the \
-         self-hosted server implements it."
+         OpenAI-compatible server implements it."
     )]
     CapabilityNotDeclared {
         key_id: i32,

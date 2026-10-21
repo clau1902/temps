@@ -29,6 +29,11 @@ import {
   TableHead,
 } from '@/components/ui/table'
 import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import { Button } from '@/components/ui/button'
 import { EnvironmentVariableValue } from './EnvironmentVariableValue'
 import { RecordLink, useUrlSearchText, useUrlState } from '@temps-sdk/ds'
@@ -96,52 +101,299 @@ import {
 import { repositoryFilePath } from '@/lib/repository-file-path'
 import {
   compareEnvironmentVariableKeys,
+  groupVariableEnvironments,
+  setEnvironmentSelection,
+  toggleEnvironmentSelection,
   variableAppliesToEnvironment,
   orderEnvironments,
-  orderVariableEnvironments,
 } from '@/lib/environment-variable-comparison'
 
+const VISIBLE_ENVIRONMENT_CHIPS = 2
+/** Above this many bindings the environment popover offers a filter. */
+const ENVIRONMENT_FILTER_THRESHOLD = 8
+
+function EnvironmentChip({
+  name,
+  deleted = false,
+}: {
+  name: string
+  deleted?: boolean
+}) {
+  return (
+    <span
+      className={cn(
+        'inline-flex max-w-[16rem] items-center truncate rounded-full px-2 py-1 text-xs font-medium',
+        deleted
+          ? 'border border-dashed text-muted-foreground line-through'
+          : 'bg-secondary text-secondary-foreground'
+      )}
+      title={deleted ? `${name} (deleted)` : name}
+    >
+      {name}
+    </span>
+  )
+}
+
+function EnvironmentGroup({
+  title,
+  environments,
+  description,
+  deleted = false,
+}: {
+  title: string
+  environments: EnvironmentInfo[]
+  description?: string
+  deleted?: boolean
+}) {
+  if (environments.length === 0) return null
+  return (
+    <section className="space-y-1.5">
+      <h4 className="text-xs font-medium text-muted-foreground">
+        {title} ({environments.length})
+      </h4>
+      {description && (
+        <p className="text-xs text-muted-foreground">{description}</p>
+      )}
+      <div className="flex flex-wrap gap-1.5">
+        {environments.map((env) => (
+          <EnvironmentChip key={env.id} name={env.name} deleted={deleted} />
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function EnvironmentBadges({
+  variableKey,
   environments,
   previewIds,
+  liveIds,
   includeInPreview,
 }: {
+  variableKey: string
   environments: EnvironmentInfo[]
   previewIds: ReadonlySet<number>
+  /** The project's current environments; undefined while not loaded. */
+  liveIds?: ReadonlySet<number>
   includeInPreview: boolean
 }) {
-  const [expanded, setExpanded] = useState(false)
-  const ordered = orderVariableEnvironments(environments, previewIds)
-  const visible = expanded ? ordered : ordered.slice(0, 2)
-  const hiddenCount = ordered.length - visible.length
+  const [filter, setFilter] = useState('')
+  const groups = groupVariableEnvironments(environments, previewIds, liveIds)
+  const active = [...groups.stable, ...groups.previews]
+  const visible = active.slice(0, VISIBLE_ENVIRONMENT_CHIPS)
+  const hiddenCount = active.length - visible.length
+  const deletedCount = groups.deleted.length
+  const total = active.length + deletedCount
+  const needle = filter.trim().toLowerCase()
+  const matches = (env: EnvironmentInfo) =>
+    !needle || env.name.toLowerCase().includes(needle)
+  const triggerLabel = [
+    hiddenCount > 0 ? `+${hiddenCount} more` : null,
+    deletedCount > 0 ? `${deletedCount} deleted` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ')
 
   return (
-    <div className="flex flex-wrap items-center gap-2">
+    <div className="flex flex-wrap items-center gap-1.5">
       {visible.map((env) => (
-        <span
-          key={env.id}
-          className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-        >
-          {env.name}
-        </span>
+        <EnvironmentChip key={env.id} name={env.name} />
       ))}
       {includeInPreview && (
         <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
           Preview
         </span>
       )}
-      {ordered.length > 2 && (
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-7 px-2 text-xs"
-          onClick={() => setExpanded((current) => !current)}
-          aria-expanded={expanded}
-          aria-label={`${expanded ? 'Show fewer' : 'Show all'} environments`}
-        >
-          {expanded ? 'Show fewer' : `Show all ${hiddenCount} more`}
-        </Button>
+      {triggerLabel && (
+        <Popover onOpenChange={(open) => !open && setFilter('')}>
+          <PopoverTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs text-muted-foreground"
+              aria-label={`Show all ${total} environments of ${variableKey}`}
+            >
+              {triggerLabel}
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="start" className="w-80 space-y-3 p-3">
+            <p className="text-sm font-medium">
+              {variableKey} is linked to {active.length}{' '}
+              {active.length === 1 ? 'environment' : 'environments'}
+            </p>
+            {includeInPreview && (
+              <p className="text-xs text-muted-foreground">
+                Also applied to every preview environment, current and future,
+                through Include in Preview Environments.
+              </p>
+            )}
+            {total > ENVIRONMENT_FILTER_THRESHOLD && (
+              <Input
+                value={filter}
+                onChange={(event) => setFilter(event.target.value)}
+                placeholder="Filter environments"
+                aria-label="Filter environments"
+                className="h-8"
+              />
+            )}
+            <div className="max-h-72 space-y-3 overflow-y-auto pr-1">
+              <EnvironmentGroup
+                title="Environments"
+                environments={groups.stable.filter(matches)}
+              />
+              <EnvironmentGroup
+                title="Preview environments"
+                environments={groups.previews.filter(matches)}
+              />
+              <EnvironmentGroup
+                title="Deleted"
+                deleted
+                description="These links are not used by any deployment. They are kept so the variable comes back if the environment is restored."
+                environments={groups.deleted.filter(matches)}
+              />
+              {needle && ![...active, ...groups.deleted].some(matches) && (
+                <p className="text-xs text-muted-foreground">
+                  No environment matches &ldquo;{filter.trim()}&rdquo;.
+                </p>
+              )}
+            </div>
+          </PopoverContent>
+        </Popover>
       )}
+    </div>
+  )
+}
+
+/**
+ * Toggle chips for choosing a variable's environments, grouped into stable
+ * and preview environments. Projects with many branch previews get a filter,
+ * a scroll area and batch select/clear for what the filter shows.
+ */
+function EnvironmentPicker({
+  environments,
+  selectedIds,
+  onChange,
+  disabled = false,
+}: {
+  environments: EnvironmentResponse[]
+  selectedIds: number[]
+  onChange: (ids: number[]) => void
+  disabled?: boolean
+}) {
+  const [filter, setFilter] = useState('')
+  const needle = filter.trim().toLowerCase()
+  const shown = orderEnvironments(environments).filter(
+    (env) => !needle || env.name.toLowerCase().includes(needle)
+  )
+  const shownIds = shown.map((env) => env.id)
+  const allShownSelected =
+    shownIds.length > 0 && shownIds.every((id) => selectedIds.includes(id))
+  const selectedCount = environments.filter((env) =>
+    selectedIds.includes(env.id)
+  ).length
+  const groups = [
+    {
+      title: 'Environments',
+      items: shown.filter((env) => !env.is_preview),
+    },
+    {
+      title: 'Preview environments',
+      items: shown.filter((env) => env.is_preview),
+    },
+  ]
+
+  if (environments.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        This project has no environments yet.
+      </p>
+    )
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs text-muted-foreground" role="status">
+          {selectedCount} of {environments.length} selected
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            disabled={disabled || shownIds.length === 0 || allShownSelected}
+            onClick={() =>
+              onChange(setEnvironmentSelection(selectedIds, shownIds, true))
+            }
+          >
+            {needle ? `Select ${shownIds.length} shown` : 'Select all'}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            disabled={
+              disabled || !shownIds.some((id) => selectedIds.includes(id))
+            }
+            onClick={() =>
+              onChange(setEnvironmentSelection(selectedIds, shownIds, false))
+            }
+          >
+            {needle ? 'Clear shown' : 'Clear'}
+          </Button>
+        </div>
+      </div>
+      {environments.length > ENVIRONMENT_FILTER_THRESHOLD && (
+        <Input
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+          placeholder="Filter environments"
+          aria-label="Filter environments"
+          className="h-8"
+        />
+      )}
+      <div className="max-h-60 space-y-3 overflow-y-auto pr-1">
+        {groups.map(
+          (group) =>
+            group.items.length > 0 && (
+              <section key={group.title} className="space-y-1.5">
+                <h4 className="text-xs font-medium text-muted-foreground">
+                  {group.title} ({group.items.length})
+                </h4>
+                <div className="flex flex-wrap gap-2">
+                  {group.items.map((env) => {
+                    const selected = selectedIds.includes(env.id)
+                    return (
+                      <Button
+                        type="button"
+                        key={env.id}
+                        disabled={disabled}
+                        variant={selected ? 'default' : 'outline'}
+                        size="sm"
+                        aria-pressed={selected}
+                        className="max-w-full"
+                        onClick={() =>
+                          onChange(
+                            toggleEnvironmentSelection(selectedIds, env.id)
+                          )
+                        }
+                      >
+                        <span className="truncate">{env.name}</span>
+                      </Button>
+                    )
+                  })}
+                </div>
+              </section>
+            )
+        )}
+        {shown.length === 0 && (
+          <p className="text-xs text-muted-foreground">
+            No environment matches &ldquo;{filter.trim()}&rdquo;.
+          </p>
+        )}
+      </div>
     </div>
   )
 }
@@ -157,6 +409,8 @@ interface EnvironmentVariableRowProps {
   checks: EnvironmentVariableCheck[]
   onManageChecks: () => void
   previewIds: ReadonlySet<number>
+  /** Ids of the project's current environments; undefined while not loaded. */
+  liveEnvironmentIds: ReadonlySet<number> | undefined
   allEnvironments: EnvironmentResponse[]
   environmentChoicesAvailable: boolean
 }
@@ -187,6 +441,7 @@ function EnvironmentVariableRow({
   checks,
   onManageChecks,
   previewIds,
+  liveEnvironmentIds,
   allEnvironments,
   environmentChoicesAvailable,
 }: EnvironmentVariableRowProps) {
@@ -337,6 +592,13 @@ function EnvironmentVariableRow({
     )
   }
 
+  const activeEnvironments = liveEnvironmentIds
+    ? variable.environments.filter((env) => liveEnvironmentIds.has(env.id))
+    : variable.environments
+  const deletedEnvironments = liveEnvironmentIds
+    ? variable.environments.filter((env) => !liveEnvironmentIds.has(env.id))
+    : []
+
   const [isEditModalOpen, setIsEditModalOpen] = useState(false)
   const [selectedEditEnvironments, setSelectedEditEnvironments] = useState<
     number[]
@@ -422,6 +684,14 @@ function EnvironmentVariableRow({
       },
       body: {
         value: valueField,
+        // Send every link the variable already has unless the operator
+        // removed it in the picker. The picker only offers environments this
+        // page believes exist, so links it does not show (deleted ones) stay
+        // in the selection untouched. Stripping them here would be unsafe:
+        // an environment restored since this page loaded is live again on
+        // the server, so leaving its id out deletes the link, and a variable
+        // that loses its last link applies to every environment. The server
+        // accepts ids of deleted environments the variable is linked to.
         environment_ids: environmentChoicesAvailable
           ? selectedEditEnvironments
           : variable.environments.map((env) => env.id),
@@ -521,8 +791,10 @@ function EnvironmentVariableRow({
         </TableCell>
         <TableCell>
           <EnvironmentBadges
+            variableKey={variable.key}
             environments={variable.environments}
             previewIds={previewIds}
+            liveIds={liveEnvironmentIds}
             includeInPreview={variable.include_in_preview}
           />
         </TableCell>
@@ -556,7 +828,7 @@ function EnvironmentVariableRow({
               onOpenChange={setIsDeleteOpen}
               resourceType="environment variable"
               resourceName={variable.key}
-              consequences={deleteConsequences(variable.environments)}
+              consequences={deleteConsequences(activeEnvironments)}
               isPending={deleteMutation.isPending}
               onConfirm={handleDelete}
             />
@@ -620,30 +892,23 @@ function EnvironmentVariableRow({
                     current assignments.
                   </p>
                 )}
-                <div className="flex flex-wrap gap-2">
-                  {(allEnvironments ?? []).map((env) => (
-                    <Button
-                      type="button"
-                      key={env.id}
-                      disabled={!environmentChoicesAvailable}
-                      variant={
-                        selectedEditEnvironments.includes(env.id)
-                          ? 'default'
-                          : 'outline'
-                      }
-                      size="sm"
-                      onClick={() => {
-                        setSelectedEditEnvironments((prev) =>
-                          prev.includes(env.id)
-                            ? prev.filter((e) => e !== env.id)
-                            : [...prev, env.id]
-                        )
-                      }}
-                    >
-                      {env.name}
-                    </Button>
-                  ))}
-                </div>
+                <EnvironmentPicker
+                  environments={allEnvironments ?? []}
+                  selectedIds={selectedEditEnvironments}
+                  onChange={setSelectedEditEnvironments}
+                  disabled={!environmentChoicesAvailable}
+                />
+                {deletedEnvironments.length > 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    Also linked to{' '}
+                    {deletedEnvironments.length === 1
+                      ? 'a deleted environment'
+                      : `${deletedEnvironments.length} deleted environments`}{' '}
+                    ({deletedEnvironments.map((env) => env.name).join(', ')}).
+                    Those links are kept unchanged so the variable comes back if
+                    the environment is restored; no deployment uses them.
+                  </p>
+                )}
               </div>
               <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
                 <div className="flex-1 space-y-1">
@@ -858,6 +1123,7 @@ function IntegrationEnvVarRow({
       </TableCell>
       <TableCell>
         <EnvironmentBadges
+          variableKey={resolved.key}
           environments={resolved.environments}
           previewIds={previewIds}
           includeInPreview={resolved.include_in_preview}
@@ -1023,30 +1289,12 @@ function AddEnvironmentVariableDialog({
                   </span>
                 )}
               </div>
-              <div className="flex flex-wrap gap-2">
-                {allEnvironments.map((env) => (
-                  <Button
-                    type="button"
-                    key={env.id}
-                    disabled={Boolean(disabledReason)}
-                    variant={
-                      selectedEnvironments.includes(env.id)
-                        ? 'default'
-                        : 'outline'
-                    }
-                    size="sm"
-                    onClick={() => {
-                      setSelectedEnvironments((prev) =>
-                        prev.includes(env.id)
-                          ? prev.filter((e) => e !== env.id)
-                          : [...prev, env.id]
-                      )
-                    }}
-                  >
-                    {env.name}
-                  </Button>
-                ))}
-              </div>
+              <EnvironmentPicker
+                environments={allEnvironments}
+                selectedIds={selectedEnvironments}
+                onChange={setSelectedEnvironments}
+                disabled={Boolean(disabledReason)}
+              />
             </div>
             <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
               <div className="flex-1 space-y-1">
@@ -1343,6 +1591,13 @@ export function EnvironmentVariablesSettings({
   const orderedEnvironments = useMemo(
     () => orderEnvironments(projectEnvironments ?? []),
     [projectEnvironments]
+  )
+  const liveEnvironmentIds = useMemo(
+    () =>
+      projectEnvironments && !environmentsFailed
+        ? new Set(projectEnvironments.map((environment) => environment.id))
+        : undefined,
+    [projectEnvironments, environmentsFailed]
   )
   const previewIds = useMemo(
     () =>
@@ -2130,6 +2385,7 @@ export function EnvironmentVariablesSettings({
                           )
                         }
                         previewIds={previewIds}
+                        liveEnvironmentIds={liveEnvironmentIds}
                         allEnvironments={projectEnvironments ?? []}
                         environmentChoicesAvailable={
                           !environmentsFailed && !environmentsPending
