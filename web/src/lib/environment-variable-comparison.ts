@@ -84,6 +84,29 @@ export function liveEnvironmentSelection(
   return selectedIds.filter((id) => liveIds.has(id))
 }
 
+/** Add or remove one environment from a selection, keeping its order. */
+export function toggleEnvironmentSelection(
+  selectedIds: readonly number[],
+  id: number
+): number[] {
+  return selectedIds.includes(id)
+    ? selectedIds.filter((selected) => selected !== id)
+    : [...selectedIds, id]
+}
+
+/**
+ * Select or clear a batch (e.g. every environment the picker's filter shows)
+ * without touching selected environments outside it.
+ */
+export function setEnvironmentSelection(
+  selectedIds: readonly number[],
+  ids: readonly number[],
+  selected: boolean
+): number[] {
+  if (!selected) return selectedIds.filter((id) => !ids.includes(id))
+  return [...selectedIds, ...ids.filter((id) => !selectedIds.includes(id))]
+}
+
 /** Explicit bindings plus inherited preview variables determine applicability. */
 export function variableAppliesToEnvironment(
   variable: Pick<

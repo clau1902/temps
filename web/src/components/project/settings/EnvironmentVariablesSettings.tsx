@@ -111,6 +111,8 @@ import {
   compareEnvironmentVariableKeys,
   groupVariableEnvironments,
   liveEnvironmentSelection,
+  setEnvironmentSelection,
+  toggleEnvironmentSelection,
   variableAppliesToEnvironment,
   orderEnvironments,
 } from '@/lib/environment-variable-comparison'
@@ -261,6 +263,140 @@ function EnvironmentBadges({
           </PopoverContent>
         </Popover>
       )}
+    </div>
+  )
+}
+
+/**
+ * Toggle chips for choosing a variable's environments, grouped into stable
+ * and preview environments. Projects with many branch previews get a filter,
+ * a scroll area and batch select/clear for what the filter shows.
+ */
+function EnvironmentPicker({
+  environments,
+  selectedIds,
+  onChange,
+  disabled = false,
+}: {
+  environments: EnvironmentResponse[]
+  selectedIds: number[]
+  onChange: (ids: number[]) => void
+  disabled?: boolean
+}) {
+  const [filter, setFilter] = useState('')
+  const needle = filter.trim().toLowerCase()
+  const shown = orderEnvironments(environments).filter(
+    (env) => !needle || env.name.toLowerCase().includes(needle)
+  )
+  const shownIds = shown.map((env) => env.id)
+  const allShownSelected =
+    shownIds.length > 0 && shownIds.every((id) => selectedIds.includes(id))
+  const selectedCount = environments.filter((env) =>
+    selectedIds.includes(env.id)
+  ).length
+  const groups = [
+    {
+      title: 'Environments',
+      items: shown.filter((env) => !env.is_preview),
+    },
+    {
+      title: 'Preview environments',
+      items: shown.filter((env) => env.is_preview),
+    },
+  ]
+
+  if (environments.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        This project has no environments yet.
+      </p>
+    )
+  }
+
+  return (
+    <div className="space-y-2 rounded-lg border p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs text-muted-foreground" role="status">
+          {selectedCount} of {environments.length} selected
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            disabled={disabled || shownIds.length === 0 || allShownSelected}
+            onClick={() =>
+              onChange(setEnvironmentSelection(selectedIds, shownIds, true))
+            }
+          >
+            {needle ? `Select ${shownIds.length} shown` : 'Select all'}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            disabled={
+              disabled || !shownIds.some((id) => selectedIds.includes(id))
+            }
+            onClick={() =>
+              onChange(setEnvironmentSelection(selectedIds, shownIds, false))
+            }
+          >
+            {needle ? 'Clear shown' : 'Clear'}
+          </Button>
+        </div>
+      </div>
+      {environments.length > ENVIRONMENT_FILTER_THRESHOLD && (
+        <Input
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+          placeholder="Filter environments"
+          aria-label="Filter environments"
+          className="h-8"
+        />
+      )}
+      <div className="max-h-60 space-y-3 overflow-y-auto pr-1">
+        {groups.map(
+          (group) =>
+            group.items.length > 0 && (
+              <section key={group.title} className="space-y-1.5">
+                <h4 className="text-xs font-medium text-muted-foreground">
+                  {group.title} ({group.items.length})
+                </h4>
+                <div className="flex flex-wrap gap-2">
+                  {group.items.map((env) => {
+                    const selected = selectedIds.includes(env.id)
+                    return (
+                      <Button
+                        type="button"
+                        key={env.id}
+                        disabled={disabled}
+                        variant={selected ? 'default' : 'outline'}
+                        size="sm"
+                        aria-pressed={selected}
+                        className="max-w-full"
+                        onClick={() =>
+                          onChange(
+                            toggleEnvironmentSelection(selectedIds, env.id)
+                          )
+                        }
+                      >
+                        <span className="truncate">{env.name}</span>
+                      </Button>
+                    )
+                  })}
+                </div>
+              </section>
+            )
+        )}
+        {shown.length === 0 && (
+          <p className="text-xs text-muted-foreground">
+            No environment matches &ldquo;{filter.trim()}&rdquo;.
+          </p>
+        )}
+      </div>
     </div>
   )
 }
@@ -756,30 +892,12 @@ function EnvironmentVariableRow({
                     current assignments.
                   </p>
                 )}
-                <div className="flex flex-wrap gap-2">
-                  {(allEnvironments ?? []).map((env) => (
-                    <Button
-                      type="button"
-                      key={env.id}
-                      disabled={!environmentChoicesAvailable}
-                      variant={
-                        selectedEditEnvironments.includes(env.id)
-                          ? 'default'
-                          : 'outline'
-                      }
-                      size="sm"
-                      onClick={() => {
-                        setSelectedEditEnvironments((prev) =>
-                          prev.includes(env.id)
-                            ? prev.filter((e) => e !== env.id)
-                            : [...prev, env.id]
-                        )
-                      }}
-                    >
-                      {env.name}
-                    </Button>
-                  ))}
-                </div>
+                <EnvironmentPicker
+                  environments={allEnvironments ?? []}
+                  selectedIds={selectedEditEnvironments}
+                  onChange={setSelectedEditEnvironments}
+                  disabled={!environmentChoicesAvailable}
+                />
                 {deletedEnvironments.length > 0 && (
                   <p className="text-xs text-muted-foreground">
                     Also linked to{' '}
@@ -1171,30 +1289,12 @@ function AddEnvironmentVariableDialog({
                   </span>
                 )}
               </div>
-              <div className="flex flex-wrap gap-2">
-                {allEnvironments.map((env) => (
-                  <Button
-                    type="button"
-                    key={env.id}
-                    disabled={Boolean(disabledReason)}
-                    variant={
-                      selectedEnvironments.includes(env.id)
-                        ? 'default'
-                        : 'outline'
-                    }
-                    size="sm"
-                    onClick={() => {
-                      setSelectedEnvironments((prev) =>
-                        prev.includes(env.id)
-                          ? prev.filter((e) => e !== env.id)
-                          : [...prev, env.id]
-                      )
-                    }}
-                  >
-                    {env.name}
-                  </Button>
-                ))}
-              </div>
+              <EnvironmentPicker
+                environments={allEnvironments}
+                selectedIds={selectedEnvironments}
+                onChange={setSelectedEnvironments}
+                disabled={Boolean(disabledReason)}
+              />
             </div>
             <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
               <div className="flex-1 space-y-1">

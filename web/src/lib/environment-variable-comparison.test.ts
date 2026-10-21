@@ -10,6 +10,8 @@ import {
   compareEnvironmentVariableKeys,
   groupVariableEnvironments,
   liveEnvironmentSelection,
+  setEnvironmentSelection,
+  toggleEnvironmentSelection,
   variableAppliesToEnvironment,
   orderEnvironments,
   orderVariableEnvironments,
@@ -117,5 +119,17 @@ describe('variable environment grouping', () => {
       1, 3,
     ])
     expect(liveEnvironmentSelection([9], new Set([1]))).toEqual([])
+  })
+})
+
+describe('environment picker selection', () => {
+  test('toggles one environment', () => {
+    expect(toggleEnvironmentSelection([1, 2], 3)).toEqual([1, 2, 3])
+    expect(toggleEnvironmentSelection([1, 2, 3], 2)).toEqual([1, 3])
+  })
+
+  test('selects and clears a batch without touching the rest', () => {
+    expect(setEnvironmentSelection([1], [2, 1, 3], true)).toEqual([1, 2, 3])
+    expect(setEnvironmentSelection([1, 2, 5], [2, 3], false)).toEqual([1, 5])
   })
 })
