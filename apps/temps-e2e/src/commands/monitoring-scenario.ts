@@ -447,13 +447,24 @@ export async function monitoringScenarioCommand(opts: MonitoringScenarioOptions)
     })
 
     await step('status overview back to fully operational', async () => {
-      const overview = unwrap(
-        await getStatusOverview({ client, path: { project_id: project.id } }),
-        'getStatusOverview',
+      // The overview rolls up BOTH monitors on the project. The recovery
+      // asserted above is the explicit monitor's; the environment's auto
+      // monitor runs its own check cycle and can still be reporting the
+      // outage from its last check, so this polls for the same reason the
+      // incident step does.
+      await pollUntil(
+        () =>
+          getStatusOverview({ client, path: { project_id: project.id } }).then((r) =>
+            unwrap(r, 'getStatusOverview'),
+          ),
+        (overview) => overview.status === 'operational',
+        {
+          timeoutMs: CHECK_CYCLE_TIMEOUT_MS,
+          intervalMs: 3000,
+          label: 'status overview recovery',
+          onPoll: (overview) => log(`    ...${overview.status}`),
+        },
       )
-      if (overview.status !== 'operational') {
-        throw new Error(`overview.status="${overview.status}", expected "operational"`)
-      }
     })
 
     await step('delete the explicit monitor: 404 afterward', async () => {

@@ -397,7 +397,7 @@ async fn inspect(
     .map_err(|_| timed_out(&lookup))?
     .map_err(|error| failure(service_id, &lookup, error))?;
     Ok(classify_database(
-        names.iter().any(|name| *name == plan.database),
+        names.contains(&plan.database),
         users_info_has_user(&answer),
         &plan.user,
     ))

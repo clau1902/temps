@@ -28,8 +28,10 @@ export function VendorBaseUrlHint({
   disabled,
 }: VendorBaseUrlHintProps) {
   if (!open) return null
+  // A note, not an alert: it is advice shown while typing, and keeping it out
+  // of the alert role leaves the dialog's alert to mean "the save failed".
   return (
-    <Alert>
+    <Alert role="note">
       <Info className="h-4 w-4" />
       <AlertDescription className="grid gap-2">
         <span>
