@@ -173,8 +173,9 @@ pub(crate) async fn lock_application_runtime(
 pub struct NetworkSyncError {
     pub application_id: String,
     pub operation: &'static str,
+    /// Boxed: a sandbox error is large, and this travels in `Result`s.
     #[source]
-    pub source: SandboxError,
+    pub source: Box<SandboxError>,
 }
 
 /// Whether a workspace in this state may keep its data-plane attachments.
@@ -198,7 +199,7 @@ pub(crate) async fn synchronize_application_network(
         move |source: SandboxError| NetworkSyncError {
             application_id: application_id.clone(),
             operation,
-            source,
+            source: Box::new(source),
         }
     };
     let Some(summary) = sandboxes
@@ -239,8 +240,9 @@ pub enum LinkProjectError {
     ProjectPermissions {
         application_id: String,
         project_id: i32,
+        /// Boxed for the same reason as [`NetworkSyncError::source`].
         #[source]
-        source: SandboxError,
+        source: Box<SandboxError>,
     },
     #[error(transparent)]
     Network(#[from] NetworkSyncError),
@@ -348,7 +350,7 @@ impl ApplicationProjectLinker {
                 return Err(LinkProjectError::ProjectPermissions {
                     application_id,
                     project_id,
-                    source,
+                    source: Box::new(source),
                 });
             }
         }

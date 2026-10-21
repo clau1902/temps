@@ -1950,7 +1950,7 @@ impl From<LinkProjectError> for Problem {
             LinkProjectError::Permission(error) => error.into(),
             LinkProjectError::RuntimeLock(error) => ChatError::from(error).into(),
             LinkProjectError::Application(error) => error.into(),
-            LinkProjectError::ProjectPermissions { source, .. } => source.into(),
+            LinkProjectError::ProjectPermissions { source, .. } => (*source).into(),
             LinkProjectError::Network(error) => error.into(),
         }
     }
@@ -1958,7 +1958,11 @@ impl From<LinkProjectError> for Problem {
 
 impl From<NetworkSyncError> for Problem {
     fn from(error: NetworkSyncError) -> Self {
-        application_workspace_provider_problem(error.source, &error.application_id, error.operation)
+        application_workspace_provider_problem(
+            *error.source,
+            &error.application_id,
+            error.operation,
+        )
     }
 }
 
