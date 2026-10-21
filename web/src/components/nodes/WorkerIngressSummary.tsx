@@ -158,7 +158,7 @@ export function WorkerIngressSummary({
     return (
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-dashed p-3">
         <p className="text-sm text-muted-foreground">
-          Visitors can't reach apps through this worker yet.
+          Visitors can&apos;t reach apps through this worker yet.
         </p>
         <Button size="sm" onClick={onChange}>
           Set up
@@ -180,7 +180,7 @@ export function WorkerIngressSummary({
       <Row label="Open ports">
         {workerOff ? (
           <p className="text-muted-foreground">
-            Off. The worker doesn't take public traffic.
+            Off. The worker doesn&apos;t take public traffic.
           </p>
         ) : !settings.enabled ? (
           <p className="text-muted-foreground">Off</p>

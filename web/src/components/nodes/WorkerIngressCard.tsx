@@ -277,8 +277,8 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
       </div>
       {mode === 'fixed' ? (
         <p className="text-sm text-muted-foreground">
-          This worker manages its own ingress, so Temps can't add a tunnel to
-          it. Hand ingress to this page with{' '}
+          This worker manages its own ingress, so Temps can&apos;t add a tunnel
+          to it. Hand ingress to this page with{' '}
           <code>{ALLOW_INGRESS_COMMANDS.delegated}</code> on the worker.
         </p>
       ) : (
@@ -302,8 +302,8 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
             {editing && (
               <p className="text-sm text-muted-foreground">
                 Take application traffic on this worker and forward it to
-                containers on any worker in the cluster. Apps' hostnames and
-                certificates are under{' '}
+                containers on any worker in the cluster. Apps&apos; hostnames
+                and certificates are under{' '}
                 <Link className="underline" to="/domains">
                   Domains
                 </Link>
@@ -349,9 +349,9 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
             {!settings.agent_reports && (
               <Alert>
                 <AlertDescription>
-                  This worker's agent hasn't reported its network addresses.
-                  Upgrade Temps on it to manage its listener from here; until
-                  then it listens only where its{' '}
+                  This worker&apos;s agent hasn&apos;t reported its network
+                  addresses. Upgrade Temps on it to manage its listener from
+                  here; until then it listens only where its{' '}
                   <code>--public-ingress-address</code> flag says.
                 </AlertDescription>
               </Alert>
@@ -360,8 +360,8 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
               <Alert>
                 <AlertDescription className="space-y-2">
                   <p>
-                    This worker doesn't take public traffic, and only the worker
-                    can change that. Run this as root on it:
+                    This worker doesn&apos;t take public traffic, and only the
+                    worker can change that. Run this as root on it:
                   </p>
                   <WorkerCommand
                     command={ALLOW_INGRESS_COMMANDS.delegated}
@@ -590,9 +590,9 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
                             />
                             <p className="text-xs text-muted-foreground md:col-span-2">
                               Change these only when port 80 or 443 is taken on
-                              this machine, or the agent can't bind ports below
-                              1024. Visitors still use 80 and 443: forward them
-                              to these ports.
+                              this machine, or the agent can&apos;t bind ports
+                              below 1024. Visitors still use 80 and 443: forward
+                              them to these ports.
                             </p>
                           </CollapsibleContent>
                         </Collapsible>
@@ -736,8 +736,8 @@ function NetworkHint({
       <Alert variant="destructive">
         <AlertDescription>
           {publicIp ?? listenIp} is behind carrier-grade NAT (100.64.0.0/10):
-          the internet can't open connections to it and no port forward helps.
-          Use a tunnel for this worker instead.
+          the internet can&apos;t open connections to it and no port forward
+          helps. Use a tunnel for this worker instead.
         </AlertDescription>
       </Alert>
     )
@@ -746,8 +746,9 @@ function NetworkHint({
     return (
       <Alert variant="destructive">
         <AlertDescription>
-          {publicIp} is a private address, so visitors on the internet can't
-          reach it. Enter the public IP of the router in front of this worker.
+          {publicIp} is a private address, so visitors on the internet
+          can&apos;t reach it. Enter the public IP of the router in front of
+          this worker.
         </AlertDescription>
       </Alert>
     )
@@ -757,7 +758,7 @@ function NetworkHint({
       <Alert>
         <AlertDescription>
           {listenIp} is a private address: this worker is behind a router. Enter
-          the router's public IP above, and on the router forward TCP 80 to{' '}
+          the router&apos;s public IP above, and on the router forward TCP 80 to{' '}
           {http} and TCP 443 to {https}. No public IP? Use a tunnel instead.
         </AlertDescription>
       </Alert>
@@ -778,8 +779,8 @@ function NetworkHint({
     return (
       <p className="text-sm text-muted-foreground">
         Visitors reach {target} directly: allow inbound TCP 80 and 443 in this
-        machine's firewall and your provider's security group, then point DNS at{' '}
-        {target}.
+        machine&apos;s firewall and your provider&apos;s security group, then
+        point DNS at {target}.
       </p>
     )
   }

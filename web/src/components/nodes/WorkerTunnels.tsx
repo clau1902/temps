@@ -819,7 +819,8 @@ function ManagedDomainSelect({
               .
             </p>
             <p>
-              Cloudflare's free certificate covers only one level below {zone}:{' '}
+              Cloudflare&apos;s free certificate covers only one level below{' '}
+              {zone}:{' '}
               <code>
                 {label}.{zone}
               </code>{' '}
@@ -827,7 +828,8 @@ function ManagedDomainSelect({
               <code>
                 app.{label}.{zone}
               </code>{' '}
-              needs Cloudflare's Advanced Certificate Manager (or Total TLS) for{' '}
+              needs Cloudflare&apos;s Advanced Certificate Manager (or Total
+              TLS) for{' '}
               <code>
                 *.{label}.{zone}
               </code>

@@ -5,7 +5,7 @@ import {
   clusterNetworkGetOptions,
   clusterNetworkUpdateMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { useRef, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -39,9 +39,7 @@ import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
 import { ClusterNetworkForm } from '@/components/settings/ClusterNetworkCard'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { useClusterNetwork } from '@/hooks/useClusterNetwork'
-import {
-  type ClusterNetworkStatus,
-} from '@/lib/cluster-network'
+import { type ClusterNetworkStatus } from '@/lib/cluster-network'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { useWireguardMesh } from '@/components/nodes/WorkerJoinGuide'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
@@ -174,7 +172,10 @@ function OutboundPeerNote({ mesh }: { mesh: WireguardMeshStatusResponse }) {
   return (
     <p className="mt-2 text-xs text-muted-foreground">
       {'via' in peers ? (
-        <>Workers joined this way reach each other through {peers.via}, the mesh hub.</>
+        <>
+          Workers joined this way reach each other through {peers.via}, the mesh
+          hub.
+        </>
       ) : (
         <>
           Adding more than one worker this way? Choose a hub in{' '}
@@ -442,7 +443,7 @@ function JoinCommandStep({ url }: { url: string }) {
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
   // The nodes present when the command was created; a new one is the worker.
-  const knownNodes = useRef<Set<number> | null>(null)
+  const [knownNodes, setKnownNodes] = useState<Set<number> | null>(null)
   const mint = useMutation({
     ...mintEnrollmentTokenMutation(),
     onError: (error, variables) => {
@@ -460,7 +461,7 @@ function JoinCommandStep({ url }: { url: string }) {
   })
   const joined = waiting
     ? (nodeList?.nodes ?? []).filter(
-        (node) => knownNodes.current && !knownNodes.current.has(node.id)
+        (node) => knownNodes && !knownNodes.has(node.id)
       )
     : []
   const [created, setCreated] = useState(0)
@@ -470,7 +471,7 @@ function JoinCommandStep({ url }: { url: string }) {
   )
 
   const create = () => {
-    knownNodes.current = new Set((nodeList?.nodes ?? []).map((n) => n.id))
+    setKnownNodes(new Set((nodeList?.nodes ?? []).map((n) => n.id)))
     setCreated((n) => n + 1)
     mint.mutate({ body: { max_uses: 1, ttl_secs: ENROLLMENT_TOKEN_TTL_SECS } })
   }
