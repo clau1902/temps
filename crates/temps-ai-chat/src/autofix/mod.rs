@@ -182,6 +182,21 @@ pub enum AutofixError {
         queued: u64,
     },
 
+    #[error("Project {project_id} already has {queued} autofix incidents waiting (at most {limit}); error group {group_id} was not queued")]
+    ProjectQueueFull {
+        project_id: i32,
+        group_id: i32,
+        queued: u64,
+        limit: u64,
+    },
+
+    #[error("Autofix for project {project_id} acts as user {owner_user_id}, who cannot act on it any more: {reason}. Someone with access must save the project's autofix settings to take it over")]
+    OwnerCannotAct {
+        project_id: i32,
+        owner_user_id: i32,
+        reason: String,
+    },
+
     #[error("Database error while {operation} for autofix: {source}")]
     Database {
         operation: &'static str,

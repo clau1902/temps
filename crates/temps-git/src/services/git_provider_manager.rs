@@ -211,6 +211,18 @@ pub enum GitProviderManagerError {
         reason: String,
     },
 
+    /// The branch does not exist yet and the base it was asked to start
+    /// from does not exist on the remote either.
+    #[error(
+        "Cannot start branch '{branch}' of '{repository}' (connection {connection_id}) from '{base_branch}': the remote has no branch '{base_branch}'"
+    )]
+    BaseBranchNotFound {
+        connection_id: i32,
+        repository: String,
+        branch: String,
+        base_branch: String,
+    },
+
     /// Every requested file already has the requested content on the branch.
     #[error(
         "Nothing to commit to branch '{branch}' of '{repository}' (connection {connection_id}): the {file_count} requested file(s) already match commit {parent_sha}"
@@ -321,11 +333,34 @@ struct GitPushRequest<'a> {
     /// `owner/name` of the target repository, for error context.
     repository: &'a str,
     clone_url: &'a str,
+    /// HTTPS username the provider expects alongside the token
+    /// (`x-access-token`, GitLab's `oauth2`, Bitbucket's `x-token-auth`).
+    clone_username: &'a str,
     access_token: &'a str,
     branch: &'a str,
+    /// Branch a `branch` that does not exist yet starts from; `None`: the
+    /// repository's default branch.
+    base_branch: Option<&'a str>,
     commit_message: &'a str,
     author_name: &'a str,
     author_email: &'a str,
+}
+
+/// `clone_url` with the provider's HTTPS `username` and `token` as its
+/// userinfo, replacing any user the provider's clone link already carries
+/// (Bitbucket's `https://user@bitbucket.org/...`). Credentials are
+/// percent-encoded. A URL that is not HTTPS is returned unchanged.
+fn authenticated_clone_url(clone_url: &str, username: &str, token: &str) -> String {
+    match url::Url::parse(clone_url) {
+        Ok(mut url) if url.scheme() == "https" => {
+            if url.set_username(username).is_ok() && url.set_password(Some(token)).is_ok() {
+                url.to_string()
+            } else {
+                clone_url.to_string()
+            }
+        }
+        _ => clone_url.to_string(),
+    }
 }
 
 /// Why a requested file could not be staged onto the branch's tree.
@@ -5630,8 +5665,11 @@ impl GitProviderManager {
     /// redirect a write onto the host, and `.gitignore` cannot drop a
     /// requested file.
     ///
-    /// A branch that does not exist on the remote is started from the default
-    /// branch's tip; an empty repository gets a root commit. A commit that
+    /// A branch that does not exist on the remote is started from the tip of
+    /// `base_branch` when one is given (refused with
+    /// [`GitProviderManagerError::BaseBranchNotFound`] when the remote has no
+    /// such branch), else from the default branch's tip; an empty repository
+    /// gets a root commit. A commit that
     /// would not change the branch's tree is refused with
     /// [`GitProviderManagerError::NothingToCommit`], and a ref update the
     /// remote refuses (protected branch, hook, non-fast-forward) with
@@ -5668,12 +5706,12 @@ impl GitProviderManager {
         let temp_dir =
             tempfile::tempdir().map_err(|e| failed("create a temporary directory", &e))?;
 
-        // Inject the token into an HTTPS clone URL:
-        // https://github.com/owner/repo.git -> https://x-access-token:TOKEN@github.com/owner/repo.git
-        let authenticated_url = match request.clone_url.strip_prefix("https://") {
-            Some(rest) => format!("https://x-access-token:{}@{rest}", request.access_token),
-            None => request.clone_url.to_string(),
-        };
+        // https://github.com/owner/repo.git -> https://USER:TOKEN@github.com/owner/repo.git
+        let authenticated_url = authenticated_clone_url(
+            request.clone_url,
+            request.clone_username,
+            request.access_token,
+        );
 
         info!(
             connection_id = request.connection_id,
@@ -5696,14 +5734,34 @@ impl GitProviderManager {
         }
         let repo = cloned.map_err(|e| failed("clone the repository", &e))?;
 
-        // The commit's parent: the branch's remote tip, else the default
-        // branch's tip, else none (an empty repository).
+        // The commit's parent: the branch's remote tip, else the requested
+        // base's tip, else the default branch's tip, else none (an empty
+        // repository).
         let parent = match repo.find_reference(&format!("refs/remotes/origin/{branch}")) {
             Ok(reference) => Some(
                 reference
                     .peel_to_commit()
                     .map_err(|e| failed("resolve the branch tip", &e))?,
             ),
+            Err(e) if e.code() == git2::ErrorCode::NotFound && request.base_branch.is_some() => {
+                let base = request.base_branch.unwrap_or_default();
+                match repo.find_reference(&format!("refs/remotes/origin/{base}")) {
+                    Ok(reference) => Some(
+                        reference
+                            .peel_to_commit()
+                            .map_err(|e| failed("resolve the base branch tip", &e))?,
+                    ),
+                    Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                        return Err(GitProviderManagerError::BaseBranchNotFound {
+                            connection_id: request.connection_id,
+                            repository: request.repository.to_string(),
+                            branch: branch.to_string(),
+                            base_branch: base.to_string(),
+                        });
+                    }
+                    Err(e) => return Err(failed("look up the base branch", &e)),
+                }
+            }
             Err(e) if e.code() == git2::ErrorCode::NotFound => {
                 match repo.head() {
                     Ok(head) => Some(
@@ -5782,7 +5840,7 @@ impl GitProviderManager {
             std::cell::RefCell::new(Vec::new());
         let mut callbacks = RemoteCallbacks::new();
         callbacks.credentials(|_url, _username_from_url, _allowed_types| {
-            Cred::userpass_plaintext("x-access-token", request.access_token)
+            Cred::userpass_plaintext(request.clone_username, request.access_token)
         });
         callbacks.push_update_reference(|refname, status| {
             if let Some(status) = status {
@@ -5923,8 +5981,10 @@ impl GitProviderManager {
     ///
     /// The commit is a normal fast-forward on top of `branch` (default: the
     /// repository's default branch), so existing history is never rewritten.
-    /// A branch that does not exist yet is started from the default branch's
-    /// tip. Returns the new commit's SHA and the branch it landed on.
+    /// A branch that does not exist yet is started from `base_branch`'s tip
+    /// (default: the default branch's); a `base_branch` the remote lacks is
+    /// refused rather than replaced by the default branch. Returns the new
+    /// commit's SHA and the branch it landed on.
     #[allow(clippy::too_many_arguments)]
     pub async fn commit_files_for_user(
         &self,
@@ -5933,10 +5993,14 @@ impl GitProviderManager {
         owner: &str,
         repo: &str,
         branch: Option<&str>,
+        base_branch: Option<&str>,
         files: Vec<(String, Vec<u8>)>,
         commit_message: &str,
     ) -> Result<(String, String), GitProviderManagerError> {
         validate_commit_request(connection_id, owner, repo, branch, &files, commit_message)?;
+        if let Some(base) = base_branch {
+            validate_branch_name(connection_id, &format!("{owner}/{repo}"), base)?;
+        }
         let (connection, provider_service, access_token) = self
             .usable_connection_for_user(connection_id, user_id)
             .await?;
@@ -5954,9 +6018,12 @@ impl GitProviderManager {
             connection.account_name.clone()
         };
         let clone_url = repository.clone_url.clone();
+        let clone_username =
+            Self::clone_username_for_provider_type(&provider_service.provider_type().to_string());
         let full_name = repository.full_name.clone();
         let token = access_token.clone();
         let target_branch = branch.clone();
+        let base_branch = base_branch.map(str::to_string);
         let message = commit_message.to_string();
         let file_count = files.len();
         let cancellation = Arc::new(CommitCancellation::default());
@@ -5971,8 +6038,10 @@ impl GitProviderManager {
                 connection_id,
                 repository: &full_name,
                 clone_url: &clone_url,
+                clone_username,
                 access_token: &token,
                 branch: &target_branch,
+                base_branch: base_branch.as_deref(),
                 commit_message: &message,
                 author_name: &author_name,
                 author_email: "bot@temps.sh",
@@ -5990,6 +6059,7 @@ impl GitProviderManager {
             // Already typed and contextual; their status codes matter.
             Ok(Ok(Err(
                 e @ (GitProviderManagerError::CommitPathRejected { .. }
+                | GitProviderManagerError::BaseBranchNotFound { .. }
                 | GitProviderManagerError::NothingToCommit { .. }
                 | GitProviderManagerError::PushRejected { .. }
                 | GitProviderManagerError::CommitTimedOut { .. }),
@@ -6208,12 +6278,16 @@ impl GitProviderManager {
 
         // Use native git operations instead of API-based blob uploads
         // This is much faster: single clone + commit + push vs N individual API calls
+        let clone_username =
+            Self::clone_username_for_provider_type(&provider_service.provider_type().to_string());
         let push_request = GitPushRequest {
             connection_id,
             repository: &new_repo.full_name,
             clone_url: &new_repo.clone_url,
+            clone_username,
             access_token: &access_token,
             branch: &new_repo.default_branch,
+            base_branch: None,
             commit_message: &commit_message,
             author_name,
             author_email,
@@ -7898,7 +7972,7 @@ mod tests {
         );
 
         let commit = manager
-            .commit_files_for_user(9, 5, "acme", "app", None, one_file("../x"), "m")
+            .commit_files_for_user(9, 5, "acme", "app", None, None, one_file("../x"), "m")
             .await
             .expect_err("path traversal must be refused");
         assert!(matches!(
@@ -7947,7 +8021,16 @@ mod tests {
         );
 
         let error = manager
-            .commit_files_for_user(11, 5, "acme", "app", None, one_file("a.txt"), "Add file")
+            .commit_files_for_user(
+                11,
+                5,
+                "acme",
+                "app",
+                None,
+                None,
+                one_file("a.txt"),
+                "Add file",
+            )
             .await
             .expect_err("a connection owned by someone else must not be usable");
         assert!(matches!(
@@ -8002,12 +8085,24 @@ mod tests {
         files: Vec<(String, Vec<u8>)>,
         cancellation: &CommitCancellation,
     ) -> Result<String, GitProviderManagerError> {
+        push_onto(url, branch, None, files, cancellation)
+    }
+
+    fn push_onto(
+        url: &str,
+        branch: &str,
+        base_branch: Option<&str>,
+        files: Vec<(String, Vec<u8>)>,
+        cancellation: &CommitCancellation,
+    ) -> Result<String, GitProviderManagerError> {
         let request = GitPushRequest {
             connection_id: 42,
             repository: "acme/app",
             clone_url: url,
+            clone_username: "x-access-token",
             access_token: "unused-token",
             branch,
+            base_branch,
             commit_message: "Commit files",
             author_name: "Test Author",
             author_email: "bot@example.invalid",
@@ -8137,6 +8232,104 @@ mod tests {
             "nothing may be written through the link"
         );
         assert_eq!(remote_tip(&url, "main"), before, "nothing was pushed");
+    }
+
+    #[test]
+    fn a_new_branch_starts_from_the_requested_base_not_the_default_branch() {
+        let (_remote_dir, url) = bare_remote();
+        seed_remote(&url, "main", &[("app.rs", 0o100644, b"newer on main")]);
+        let production = seed_remote(&url, "production", &[("app.rs", 0o100644, b"live")]);
+
+        push_onto(
+            &url,
+            "autofix/7",
+            Some("production"),
+            vec![("fix.txt".to_string(), b"fix".to_vec())],
+            &CommitCancellation::default(),
+        )
+        .expect("push onto production");
+
+        let remote = git2::Repository::open_bare(&url).expect("open remote");
+        let tip = remote
+            .find_reference("refs/heads/autofix/7")
+            .expect("branch")
+            .peel_to_commit()
+            .expect("tip");
+        assert_eq!(tip.parent_id(0).expect("parent"), production);
+        assert_eq!(
+            entry_at(&url, "autofix/7", "app.rs").map(|(_, content)| content),
+            Some(b"live".to_vec()),
+            "main's newer content must not leak into a branch based on production"
+        );
+    }
+
+    #[test]
+    fn a_missing_base_branch_is_refused_instead_of_falling_back_to_the_default() {
+        let (_remote_dir, url) = bare_remote();
+        seed_remote(&url, "main", &[("app.rs", 0o100644, b"main")]);
+
+        let error = push_onto(
+            &url,
+            "autofix/8",
+            Some("production"),
+            vec![("fix.txt".to_string(), b"fix".to_vec())],
+            &CommitCancellation::default(),
+        )
+        .expect_err("a base the remote lacks must be refused");
+        match error {
+            GitProviderManagerError::BaseBranchNotFound {
+                connection_id,
+                ref branch,
+                ref base_branch,
+                ..
+            } => {
+                assert_eq!(connection_id, 42);
+                assert_eq!(branch, "autofix/8");
+                assert_eq!(base_branch, "production");
+            }
+            other => panic!("expected BaseBranchNotFound, got {other:?}"),
+        }
+        assert!(git2::Repository::open_bare(&url)
+            .expect("open remote")
+            .find_reference("refs/heads/autofix/8")
+            .is_err());
+    }
+
+    #[test]
+    fn the_clone_url_carries_the_providers_username_and_drops_its_own() {
+        assert_eq!(
+            authenticated_clone_url("https://github.com/acme/app.git", "x-access-token", "tok"),
+            "https://x-access-token:tok@github.com/acme/app.git"
+        );
+        assert_eq!(
+            authenticated_clone_url("https://gitlab.com/acme/app.git", "oauth2", "tok"),
+            "https://oauth2:tok@gitlab.com/acme/app.git"
+        );
+        // Bitbucket's API clone link names the account in its authority.
+        assert_eq!(
+            authenticated_clone_url(
+                "https://someone@bitbucket.org/acme/app.git",
+                "x-token-auth",
+                "tok"
+            ),
+            "https://x-token-auth:tok@bitbucket.org/acme/app.git"
+        );
+        assert_eq!(
+            authenticated_clone_url("https://host/acme/app.git", "oauth2", "a/b@c"),
+            "https://oauth2:a%2Fb%40c@host/acme/app.git"
+        );
+        assert_eq!(
+            authenticated_clone_url("/srv/git/app.git", "oauth2", "tok"),
+            "/srv/git/app.git"
+        );
+        assert_eq!(
+            GitProviderManager::clone_username_for_provider_type("gitlab"),
+            "oauth2"
+        );
+        assert_eq!(
+            GitProviderManager::clone_username_for_provider_type("bitbucket"),
+            "x-token-auth"
+        );
     }
 
     #[test]

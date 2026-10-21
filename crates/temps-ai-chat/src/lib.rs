@@ -10,6 +10,7 @@
 //! deployment provider seeds from a failure diagnosis). Built on the `temps-ai`
 //! foundation; the AI is injected as `Arc<dyn AiService>`.
 
+pub mod application_link;
 pub mod applications;
 pub mod ask_user;
 pub mod attachment_upload_handlers;

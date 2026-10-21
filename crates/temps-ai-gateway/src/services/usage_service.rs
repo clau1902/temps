@@ -58,6 +58,27 @@ pub(crate) fn cost_microcents_from_details(
     Some(cost.round().clamp(0.0, i64::MAX as f64) as i64)
 }
 
+/// Cost of a request whose model the catalogue publishes no price for.
+///
+/// A vendor model goes to the built-in price list, which charges a model it
+/// does not list at the most expensive listed rate, so an unknown model can
+/// never be a way around a spend cap. A self-hosted server has no vendor price
+/// to approximate: its model ids are whatever the operator named them, and
+/// charging them as the dearest cloud model reports a bill nobody pays. It is
+/// recorded at zero instead, which reports read as "no published price" rather
+/// than as free.
+fn unlisted_cost_microcents(
+    provider: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> i64 {
+    if crate::self_hosted::is_self_hosted(provider) {
+        return 0;
+    }
+    crate::services::pricing::estimate_cost_microcents(model, input_tokens, output_tokens)
+}
+
 // ============================================================================
 // Response structs
 // ============================================================================
@@ -490,7 +511,7 @@ impl UsageService {
         // else is priced here, once, so every path records the same estimate
         // and spend caps and per-project reports have a cost to work with:
         // from the model catalogue first (it carries cache prices), then from
-        // the built-in price list. A model neither lists stays at zero. BYOK
+        // the built-in price list (see `unlisted_cost_microcents`). BYOK
         // requests are priced too; reports separate them as non-operator cost.
         let estimated_cost_microcents = if estimated_cost_microcents > 0 {
             estimated_cost_microcents
@@ -500,11 +521,7 @@ impl UsageService {
                 .await
             {
                 Some(cost) => cost,
-                None => crate::services::pricing::estimate_cost_microcents(
-                    model,
-                    input_tokens,
-                    output_tokens,
-                ),
+                None => unlisted_cost_microcents(provider, model, input_tokens, output_tokens),
             }
         };
         let record = ai_usage_logs::ActiveModel {
@@ -1472,6 +1489,28 @@ mod tests {
             .await;
 
         assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn an_unlisted_self_hosted_model_is_recorded_as_unpriced() {
+        assert_eq!(
+            unlisted_cost_microcents(
+                crate::self_hosted::OPENAI_COMPATIBLE,
+                "local-flash",
+                7_000_000,
+                100_000
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn an_unlisted_vendor_model_keeps_the_worst_case_price() {
+        assert_eq!(
+            unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200),
+            crate::services::pricing::estimate_cost_microcents("vendor/unknown", 1_000, 200)
+        );
+        assert!(unlisted_cost_microcents("openrouter", "vendor/unknown", 1_000, 200) > 0);
     }
 
     #[tokio::test]

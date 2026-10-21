@@ -30,6 +30,7 @@ use thiserror::Error;
 use tracing::warn;
 use utoipa::ToSchema;
 
+use crate::application_link::LinkProjectError;
 use crate::applications::{ApplicationError, ApplicationService};
 use crate::blueprint::{
     BlueprintDocument, BlueprintError, BlueprintService, ComponentBinding, ComponentKind,
@@ -597,6 +598,9 @@ struct BindArgs {
 #[derive(Clone)]
 pub struct BlueprintToolSupport {
     pub workspaces: WorkspaceChatService,
+    /// Adds a bound project to the workspace with the same checks and setup
+    /// as linking it from the console.
+    pub linker: crate::application_link::ApplicationProjectLinker,
     pub audit: Option<Arc<dyn AuditLogger>>,
     pub project_access: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
@@ -899,6 +903,55 @@ impl BlueprintToolSupport {
         }
     }
 
+    /// Link `project_id` into the workspace, or, when it is already linked,
+    /// check that the user may still change it. Returns the message for the
+    /// model when the project may not or could not be added.
+    async fn add_project(
+        &self,
+        auth: &AuthContext,
+        application_id: &str,
+        project_id: i32,
+    ) -> Result<(), String> {
+        let previous = self
+            .workspaces
+            .applications
+            .get(auth.user_id(), application_id)
+            .await
+            .map_err(|error| format!("Could not read the workspace: {error}"))?;
+        let checker = self.project_access.as_ref();
+        if previous
+            .projects
+            .iter()
+            .any(|project| project.id == project_id)
+        {
+            return self
+                .linker
+                .authorize(auth, checker, &previous, project_id)
+                .await
+                .map_err(|error| format!("Project {project_id} cannot be bound: {error}."));
+        }
+        match self
+            .linker
+            .link(auth, checker, &previous, project_id)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(LinkProjectError::Permission(error)) => Err(format!(
+                "Project {project_id} cannot be added to this workspace: {error}. Nothing was bound."
+            )),
+            Err(error) => {
+                warn!(
+                    application_id,
+                    project_id,
+                    "could not add a bound project to the workspace: {error}"
+                );
+                Err(format!(
+                    "Project {project_id} could not be added to this workspace, so nothing was bound: {error}"
+                ))
+            }
+        }
+    }
+
     async fn bind(
         &self,
         arguments: &str,
@@ -951,6 +1004,16 @@ impl BlueprintToolSupport {
                 return "Pass exactly one of `project_id` (for an app part) or `service_id` (for a data part).".to_string()
             }
         }
+        // Add the project to the workspace before recording the binding, so a
+        // refused or failed link leaves the architecture unchanged.
+        if let Some(project_id) = args.project_id {
+            if let Err(problem) = self
+                .add_project(auth, &application.public_id, project_id)
+                .await
+            {
+                return problem;
+            }
+        }
         let binding = ComponentBinding {
             project_id: args.project_id,
             service_id: args.service_id,
@@ -965,21 +1028,6 @@ impl BlueprintToolSupport {
                 BlueprintError::Invalid { problems, .. } => problems.join("; "),
                 other => other.to_string(),
             };
-        }
-        if let Some(project_id) = args.project_id {
-            match self
-                .workspaces
-                .applications
-                .link_project(user_id, &application.public_id, project_id)
-                .await
-            {
-                Ok(_) | Err(ApplicationError::ProjectAlreadyLinked { .. }) => {}
-                Err(error) => warn!(
-                    application_id = %application.public_id,
-                    project_id,
-                    "bound a blueprint part to a project but could not add it to the workspace: {error}"
-                ),
-            }
         }
         if let Some(audit) = &self.audit {
             let entry = crate::audit::AiBlueprintBindingChangedAudit {

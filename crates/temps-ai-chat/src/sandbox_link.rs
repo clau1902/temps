@@ -314,6 +314,40 @@ struct CachedCredentials {
     variables: Arc<HashMap<String, String>>,
 }
 
+/// The sandbox a chat stopped using when its link went from `previous` to
+/// `current`: none when it was re-linked to the same one.
+fn sandbox_left_behind<'a>(previous: &'a str, current: Option<&str>) -> Option<&'a str> {
+    (current != Some(previous)).then_some(previous)
+}
+
+/// The tool result refusing `temps_create_sandbox` in a chat whose permission
+/// mode asks before changes, or `None` when the mode allows it. The tool is
+/// only offered in such chats, but a model can emit the name anyway, so the
+/// same rule is enforced when it is called.
+fn create_refused_by_permission_mode(permission_mode: &str) -> Option<String> {
+    if crate::service::permission_mode_auto_approves_provider_tools(permission_mode) {
+        return None;
+    }
+    Some(format!(
+        "`{SANDBOX_CREATE_TOOL}` is not available: this chat asks before making changes, so \
+         the user decides whether to create a sandbox. Offer one with `{SANDBOX_OFFER_TOOL}` \
+         when a shell step is really needed."
+    ))
+}
+
+/// The key a sandbox's credentials are cached under.
+fn credential_cache_key(sandbox_id: &str) -> String {
+    sandbox_id.to_string()
+}
+
+/// Drop every cached credential of `sandbox_id`: the entry under its own key
+/// and any keyed `"{sandbox_id}:…"`.
+fn forget_cached_credentials(cache: &mut HashMap<String, CachedCredentials>, sandbox_id: &str) {
+    let key = credential_cache_key(sandbox_id);
+    let prefix = format!("{sandbox_id}:");
+    cache.retain(|cached, _| *cached != key && !cached.starts_with(&prefix));
+}
+
 /// The port the assistant last confirmed serving a page, if one is recorded.
 pub fn preview_port_from_metadata(metadata: Option<&Value>) -> Option<u16> {
     let port = metadata?.get(SANDBOX_PREVIEW_KEY)?.as_u64()?;
@@ -1184,7 +1218,10 @@ impl SandboxLinkService {
         // and neither do the services that sandbox was connected to.
         self.remove_metadata_key(conversation, SANDBOX_PREVIEW_KEY)
             .await?;
-        self.release_connections(conversation).await;
+        // `conversation` still holds the previous link: the row now holds the
+        // new one.
+        self.release_connections(conversation, Some(&link.sandbox_id))
+            .await;
         info!(
             conversation_id = %conversation.public_id,
             sandbox_id = %link.sandbox_id,
@@ -1198,11 +1235,13 @@ impl SandboxLinkService {
         &self,
         conversation: &ai_conversations::Model,
     ) -> Result<(), SandboxLinkError> {
-        self.release_connections(conversation).await;
         self.remove_metadata_key(conversation, SANDBOX_LINK_KEY)
             .await?;
         self.remove_metadata_key(conversation, SANDBOX_PREVIEW_KEY)
             .await?;
+        // Released only once the row no longer links it, so the check for
+        // other chats using the sandbox does not count this one.
+        self.release_connections(conversation, None).await;
         info!(
             conversation_id = %conversation.public_id,
             "sandbox unlinked from assistant chat"
@@ -1210,13 +1249,44 @@ impl SandboxLinkService {
         Ok(())
     }
 
-    /// Cut the sandbox the conversation is linked to off from the services it
-    /// was linked to. Best effort: the chat's link is being dropped either way,
-    /// and a sandbox nobody is working in should not keep reaching databases.
-    async fn release_connections(&self, conversation: &ai_conversations::Model) {
+    /// Cut the sandbox the conversation was linked to (`conversation` as it
+    /// was loaded, before the link changed) off from the services it was
+    /// linked to, once no chat uses it: not when the chat was re-linked to the
+    /// same sandbox (`current`), and not while another chat, such as a
+    /// workspace sibling, still links it. Best effort: the chat's link has
+    /// changed either way, and a sandbox nobody is working in should not keep
+    /// reaching databases.
+    async fn release_connections(
+        &self,
+        conversation: &ai_conversations::Model,
+        current: Option<&str>,
+    ) {
         let Some(link) = link_from_metadata(conversation.metadata.as_ref()) else {
             return;
         };
+        let Some(previous) = sandbox_left_behind(&link.sandbox_id, current) else {
+            return;
+        };
+        match self.sandbox_in_use(previous).await {
+            Ok(false) => {}
+            Ok(true) => {
+                info!(
+                    conversation_id = %conversation.public_id,
+                    sandbox_id = previous,
+                    "sandbox is still linked to another chat; keeping its service links"
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id = %conversation.public_id,
+                    sandbox_id = previous,
+                    "could not check whether another chat uses the sandbox, keeping its \
+                     service links: {error}"
+                );
+                return;
+            }
+        }
         self.release_sandbox(
             conversation.created_by,
             &link.sandbox_id,
@@ -1262,11 +1332,33 @@ impl SandboxLinkService {
         }
     }
 
+    /// Whether any chat's link names `sandbox_id`. One query, like the
+    /// workspace check for sandboxes no chat uses.
+    async fn sandbox_in_use(&self, sandbox_id: &str) -> Result<bool, DbErr> {
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT 1 AS used FROM ai_conversations \
+                     WHERE jsonb_typeof(metadata) = 'object' \
+                       AND metadata -> '{SANDBOX_LINK_KEY}' ->> 'sandbox_id' = $1 \
+                     LIMIT 1"
+                ),
+                [sandbox_id.into()],
+            ))
+            .await?;
+        Ok(row.is_some())
+    }
+
     fn forget_credentials(&self, sandbox_id: &str) {
-        self.credentials
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|key, _| !key.starts_with(&format!("{sandbox_id}:")));
+        forget_cached_credentials(
+            &mut self
+                .credentials
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            sandbox_id,
+        );
     }
 
     /// Link the chat's sandbox to the services of `project_id` that can give a
@@ -1628,7 +1720,7 @@ impl SandboxLinkService {
         link: &SandboxLink,
         user_id: i32,
     ) -> Result<Arc<HashMap<String, String>>, String> {
-        let key = link.sandbox_id.clone();
+        let key = credential_cache_key(&link.sandbox_id);
         let fresh = Duration::from_secs(CREDENTIAL_CACHE_SECS);
         if let Some(cached) = self
             .credentials
@@ -1763,8 +1855,27 @@ impl SandboxLinkService {
                 }
             }
             SANDBOX_READ_TOOL => {
-                self.run_read(arguments, conversation_id, &link, &work_dir, user_id)
-                    .await
+                // A file can hold what a command wrote from the environment
+                // (`.env`), so the read is redacted like command output.
+                match self.exec_environment(conversation_id, &link, user_id).await {
+                    Ok(environment) => {
+                        self.run_read(
+                            arguments,
+                            conversation_id,
+                            &link,
+                            &work_dir,
+                            user_id,
+                            &environment,
+                        )
+                        .await
+                    }
+                    Err(_) => format!(
+                        "Nothing was read: the credentials of the services this sandbox is \
+                         linked to could not be prepared, so a file holding them could not be \
+                         redacted. Tell the user; they can disconnect the sandbox from the \
+                         project's services in the chat's Made here tab."
+                    ),
+                }
             }
             SANDBOX_WRITE_TOOL => {
                 self.run_write(arguments, conversation_id, &link, &work_dir, user_id)
@@ -2041,6 +2152,14 @@ impl SandboxLinkService {
         };
         if !context_supports_sandbox(&conversation.context_type) {
             return format!("`{SANDBOX_CREATE_TOOL}` is not available in this kind of chat.");
+        }
+        if let Some(refusal) = create_refused_by_permission_mode(&conversation.ai_permission_mode) {
+            info!(
+                conversation_id,
+                permission_mode = %conversation.ai_permission_mode,
+                "refused a sandbox creation the chat's permission mode does not allow"
+            );
+            return refusal;
         }
         if project_for_new_sandbox(&conversation).is_some()
             && !auth.has_permission(&Permission::GitRepositoriesRead)
@@ -2332,6 +2451,7 @@ impl SandboxLinkService {
         link: &SandboxLink,
         work_dir: &str,
         user_id: i32,
+        environment: &HashMap<String, String>,
     ) -> String {
         let args: ReadArgs = match serde_json::from_str(arguments) {
             Ok(args) => args,
@@ -2348,7 +2468,13 @@ impl SandboxLinkService {
             .await
         {
             Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => read_window(&path, &text, args.offset, args.limit, MAX_READ_BYTES),
+                Ok(text) => read_window(
+                    &path,
+                    &redact_secrets(&text, environment),
+                    args.offset,
+                    args.limit,
+                    MAX_READ_BYTES,
+                ),
                 Err(error) => format!(
                     "{path} is not UTF-8 text ({} bytes). Inspect it with `{SANDBOX_EXEC_TOOL}` \
                      (for example `file` or `head -c 200 | xxd`).",
@@ -2368,7 +2494,7 @@ impl SandboxLinkService {
                         } else {
                             read_head_window(
                                 &path,
-                                &head,
+                                &redact_secrets(&head, environment),
                                 file_bytes,
                                 args.offset,
                                 args.limit,
@@ -2552,6 +2678,79 @@ impl SandboxLinkService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cached(variables: &[(&str, &str)]) -> CachedCredentials {
+        CachedCredentials {
+            resolved: Instant::now(),
+            variables: Arc::new(
+                variables
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn forgetting_a_sandbox_drops_the_credentials_cached_for_it() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            credential_cache_key("sbx_one"),
+            cached(&[("POSTGRES_PASSWORD", "hunter2-secret")]),
+        );
+        cache.insert("sbx_one:extra".to_string(), cached(&[]));
+        cache.insert(credential_cache_key("sbx_one2"), cached(&[]));
+        cache.insert(credential_cache_key("sbx_two"), cached(&[]));
+
+        forget_cached_credentials(&mut cache, "sbx_one");
+
+        let mut left: Vec<&String> = cache.keys().collect();
+        left.sort();
+        assert_eq!(left, ["sbx_one2", "sbx_two"]);
+    }
+
+    #[test]
+    fn a_read_redacts_the_linked_services_credentials() {
+        let environment: HashMap<String, String> = [
+            (
+                "DATABASE_URL".to_string(),
+                "postgres://sbx:pa55word-xyz@db:5432/app".to_string(),
+            ),
+            ("POSTGRES_PASSWORD".to_string(), "pa55word-xyz".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let file = "DATABASE_URL=postgres://sbx:pa55word-xyz@db:5432/app\nPORT=3000\n";
+        let shown = read_window(
+            ".env",
+            &redact_secrets(file, &environment),
+            None,
+            None,
+            MAX_READ_BYTES,
+        );
+        assert!(!shown.contains("pa55word-xyz"), "{shown}");
+        assert!(shown.contains("DATABASE_URL=[redacted]"), "{shown}");
+        assert!(shown.contains("PORT=3000"), "{shown}");
+    }
+
+    #[test]
+    fn relinking_the_same_sandbox_leaves_nothing_behind() {
+        assert_eq!(sandbox_left_behind("sbx_a", Some("sbx_a")), None);
+        assert_eq!(sandbox_left_behind("sbx_a", Some("sbx_b")), Some("sbx_a"));
+        assert_eq!(sandbox_left_behind("sbx_a", None), Some("sbx_a"));
+    }
+
+    #[test]
+    fn creating_a_sandbox_is_refused_unless_the_mode_approves_changes() {
+        for mode in ["auto", "full-access"] {
+            assert_eq!(create_refused_by_permission_mode(mode), None, "{mode}");
+        }
+        for mode in ["default", "ask", "plan", ""] {
+            let refusal = create_refused_by_permission_mode(mode)
+                .unwrap_or_else(|| panic!("{mode} should refuse"));
+            assert!(refusal.contains(SANDBOX_OFFER_TOOL), "{refusal}");
+        }
+    }
     use chrono::TimeZone;
 
     /// A team layer whose members can reach `allowed` only, or that fails.

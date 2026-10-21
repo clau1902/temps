@@ -276,6 +276,12 @@ impl TempsPlugin for AiChatPlugin {
                         crate::blueprint::BlueprintService::new(db.clone()),
                     )
                     .with_sandboxes(application_sandboxes.clone()),
+                    linker: crate::application_link::ApplicationProjectLinker::new(
+                        db.clone(),
+                        applications.clone(),
+                        application_workspaces.clone(),
+                        application_sandboxes.clone(),
+                    ),
                     audit: Some(audit_service.clone()),
                     project_access: None,
                 });

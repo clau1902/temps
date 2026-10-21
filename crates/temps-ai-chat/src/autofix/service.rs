@@ -22,6 +22,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
+use temps_auth::context::AuthContext;
 use temps_core::{AuditContext, AuditLogger, ErrorGroupOpenedJob, ProjectAccessChecker};
 use temps_entities::{
     ai_application_projects, ai_applications, ai_conversations, ai_messages,
@@ -46,6 +47,9 @@ use crate::{ApplicationService, ConversationService};
 /// Incidents allowed to wait behind the running one before new ones are
 /// refused (ADR-054 section 9).
 const MAX_QUEUED: u64 = 20;
+/// Incidents one project may have waiting, so a single project cannot take
+/// the whole queue from the others.
+const MAX_QUEUED_PER_PROJECT: u64 = 10;
 /// How long the agent may work on one incident, over all its turns.
 const AGENT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// Follow-up turns when the agent stops without its report.
@@ -509,6 +513,9 @@ impl AutofixService {
         trigger: &str,
     ) -> Result<(autofix_incidents::Model, bool), AutofixError> {
         self.project(project_id).await?;
+        // An automatic incident acts as the stored settings owner; one who has
+        // since lost the project must not be handed its crashes.
+        self.owner_authorization(project_id, owner_user_id).await?;
         let group = error_groups::Entity::find_by_id(group_id)
             .filter(error_groups::Column::ProjectId.eq(project_id))
             .one(self.db.as_ref())
@@ -533,18 +540,39 @@ impl AutofixService {
             });
         }
 
-        let queued = autofix_incidents::Entity::find()
-            .filter(autofix_incidents::Column::Status.eq("open"))
-            .count(self.db.as_ref())
+        // Paused projects' incidents are never claimed, so they do not take
+        // places in the shared queue (they still count towards their own
+        // project's limit).
+        let counts = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT \
+                     COUNT(*) FILTER (WHERE NOT EXISTS ( \
+                         SELECT 1 FROM project_autofix_settings settings \
+                         WHERE settings.project_id = queued.project_id AND settings.paused) \
+                     ) AS claimable, \
+                     COUNT(*) FILTER (WHERE queued.project_id = $1) AS project_queued \
+                 FROM autofix_incidents queued \
+                 WHERE queued.status = 'open'",
+                [project_id.into()],
+            ))
             .await
             .map_err(AutofixError::db("counting queued incidents"))?;
-        if queued >= MAX_QUEUED {
-            return Err(AutofixError::QueueFull {
-                project_id,
-                group_id,
-                queued,
-            });
-        }
+        let (queued, project_queued) = match counts {
+            Some(row) => (
+                row.try_get::<i64>("", "claimable")
+                    .map_err(AutofixError::db("reading the queued incident count"))?,
+                row.try_get::<i64>("", "project_queued")
+                    .map_err(AutofixError::db(
+                        "reading the project's queued incident count",
+                    ))?,
+            ),
+            None => (0, 0),
+        };
+        let queued = queued.max(0) as u64;
+        queue_refusal(project_id, group_id, queued, project_queued.max(0) as u64)
+            .map_or(Ok(()), Err)?;
 
         // The deployment that crashed most recently, so the fix is made
         // against what is actually running; the group's first-seen
@@ -645,6 +673,35 @@ impl AutofixService {
         );
         self.wake.notify_one();
         Ok((incident, true))
+    }
+
+    /// The owner's authorization, re-derived from their current account and
+    /// role, refused when they can no longer reach `project_id`.
+    async fn owner_authorization(
+        &self,
+        project_id: i32,
+        owner_user_id: i32,
+    ) -> Result<AuthContext, AutofixError> {
+        let cannot_act = |reason: String| AutofixError::OwnerCannotAct {
+            project_id,
+            owner_user_id,
+            reason,
+        };
+        let auth = self
+            .conversations
+            .authorization_for_unattended(owner_user_id)
+            .await
+            .map_err(cannot_act)?;
+        let allowed =
+            owner_may_access_project(&auth, project_id, self.project_access_checker.get())
+                .await
+                .map_err(cannot_act)?;
+        if !allowed {
+            return Err(cannot_act(format!(
+                "user {owner_user_id} no longer has access to project {project_id}"
+            )));
+        }
+        Ok(auth)
     }
 
     async fn open_incident_for_group(
@@ -1433,6 +1490,9 @@ impl AutofixService {
         let id = incident.public_id.as_str();
         let owner = incident.owner_user_id;
         let project = self.project(incident.project_id).await?;
+        // Nothing (chat, sandbox, source) is made for an owner who has lost
+        // the project since the incident was queued.
+        self.owner_authorization(project.id, owner).await?;
         let settings = self.settings_row(project.id).await?;
         let crash = self.crash_context(incident).await?;
 
@@ -2104,7 +2164,18 @@ impl AutofixService {
             .join(" ");
         match plan {
             SourcePlan::Bundle { bundle_id, archive } => {
-                let tarball = bundle_as_tar_gz(archive)
+                // Unzipping and compressing up to MAX_BUNDLE_BYTES is
+                // blocking work: keep it off the async workers.
+                let archive = archive.to_path_buf();
+                let tarball = tokio::task::spawn_blocking(move || bundle_as_tar_gz(&archive))
+                    .await
+                    .map_err(|error| {
+                        AutofixError::step(
+                            id,
+                            "read the uploaded source",
+                            format!("the repacking task failed: {error}"),
+                        )
+                    })?
                     .map_err(|reason| AutofixError::step(id, "read the uploaded source", reason))?;
                 // Written by the runtime as root: the sandbox user cannot
                 // remove it from /tmp, and it goes with the sandbox anyway.
@@ -2294,11 +2365,7 @@ impl AutofixService {
             // Every turn spends AI quota and writes to the timeline: start
             // one only while the persisted incident is still running.
             self.ensure_running(incident).await?;
-            let auth = self
-                .conversations
-                .authorization_for_unattended(owner)
-                .await
-                .map_err(|reason| AutofixError::step(id, "act as the incident owner", reason))?;
+            let auth = self.owner_authorization(incident.project_id, owner).await?;
             let conversation = ai_conversations::Entity::find_by_id(conversation.id)
                 .one(self.db.as_ref())
                 .await
@@ -2960,6 +3027,10 @@ impl AutofixService {
                 target.repo_owner,
                 target.repo_name,
                 Some(&branch),
+                // A first push starts the branch from the branch the drift
+                // check compared against and the pull request targets, not
+                // the repository's default branch.
+                Some(target.main_branch),
                 collected.files.clone(),
                 &message,
             )
@@ -3637,9 +3708,185 @@ fn pull_request_body(
     body
 }
 
+/// Why a new incident may not be queued, if it may not: the shared queue
+/// holds `queued` claimable incidents, the project `project_queued`.
+fn queue_refusal(
+    project_id: i32,
+    group_id: i32,
+    queued: u64,
+    project_queued: u64,
+) -> Option<AutofixError> {
+    if project_queued >= MAX_QUEUED_PER_PROJECT {
+        return Some(AutofixError::ProjectQueueFull {
+            project_id,
+            group_id,
+            queued: project_queued,
+            limit: MAX_QUEUED_PER_PROJECT,
+        });
+    }
+    if queued >= MAX_QUEUED {
+        return Some(AutofixError::QueueFull {
+            project_id,
+            group_id,
+            queued,
+        });
+    }
+    None
+}
+
+/// Whether the owner an incident acts as may still reach `project_id`, with
+/// the exemptions of `project_access_guard!`: a credential confined to
+/// another project may not, instance administrators and deployment tokens
+/// are not subject to team membership, and with no team layer installed
+/// there is no membership to lose. A check that fails is an `Err`.
+async fn owner_may_access_project(
+    auth: &AuthContext,
+    project_id: i32,
+    checker: Option<&Arc<dyn ProjectAccessChecker>>,
+) -> Result<bool, String> {
+    if !auth.is_scoped_to_project(project_id) {
+        return Ok(false);
+    }
+    if auth.is_deployment_token()
+        || auth.is_admin()
+        || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin)
+    {
+        return Ok(true);
+    }
+    let Some(checker) = checker else {
+        return Ok(true);
+    };
+    let Some(user_id) = auth.user_id_opt() else {
+        return Ok(false);
+    };
+    checker
+        .user_can_access_project(user_id, project_id)
+        .await
+        .map_err(|error| {
+            format!(
+                "access to project {project_id} could not be checked for user {user_id}: {error}"
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_cannot_take_the_whole_queue() {
+        assert!(queue_refusal(1, 2, 0, 0).is_none());
+        assert!(queue_refusal(1, 2, MAX_QUEUED - 1, MAX_QUEUED_PER_PROJECT - 1).is_none());
+        assert!(matches!(
+            queue_refusal(1, 2, 3, MAX_QUEUED_PER_PROJECT),
+            Some(AutofixError::ProjectQueueFull {
+                project_id: 1,
+                group_id: 2,
+                queued,
+                limit: MAX_QUEUED_PER_PROJECT,
+            }) if queued == MAX_QUEUED_PER_PROJECT
+        ));
+        assert!(matches!(
+            queue_refusal(1, 2, MAX_QUEUED, 0),
+            Some(AutofixError::QueueFull {
+                project_id: 1,
+                group_id: 2,
+                queued: MAX_QUEUED,
+            })
+        ));
+    }
+
+    /// A team layer whose members reach `allowed` only, or that fails.
+    struct Membership {
+        allowed: Vec<i32>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectAccessChecker for Membership {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err(Box::new(std::io::Error::other("team store unavailable")));
+            }
+            Ok(self.allowed.contains(&project_id))
+        }
+    }
+
+    fn checker(allowed: &[i32], fail: bool) -> Arc<dyn ProjectAccessChecker> {
+        Arc::new(Membership {
+            allowed: allowed.to_vec(),
+            fail,
+        })
+    }
+
+    fn owner(role: temps_auth::permissions::Role) -> AuthContext {
+        let now = Utc::now();
+        AuthContext::new_cli_token(
+            temps_entities::users::Model {
+                id: 11,
+                name: "Settings Owner".to_string(),
+                email: "owner@example.com".to_string(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            role,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_owner_removed_from_the_project_cannot_act_on_it() {
+        let member = owner(temps_auth::permissions::Role::User);
+        let team = checker(&[3], false);
+        assert!(owner_may_access_project(&member, 3, Some(&team))
+            .await
+            .expect("checked"));
+        assert!(!owner_may_access_project(&member, 5, Some(&team))
+            .await
+            .expect("checked"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_membership_check_is_an_error_not_access() {
+        let member = owner(temps_auth::permissions::Role::User);
+        let error = owner_may_access_project(&member, 3, Some(&checker(&[3], true)))
+            .await
+            .expect_err("the check failed");
+        assert!(
+            error.contains("project 3") && error.contains("user 11"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admins_and_instances_without_teams_keep_access() {
+        let admin = owner(temps_auth::permissions::Role::Admin);
+        assert!(
+            owner_may_access_project(&admin, 5, Some(&checker(&[], false)))
+                .await
+                .expect("checked")
+        );
+        let member = owner(temps_auth::permissions::Role::User);
+        assert!(owner_may_access_project(&member, 5, None)
+            .await
+            .expect("checked"));
+    }
 
     #[test]
     fn revisions_match_when_one_is_abbreviated() {

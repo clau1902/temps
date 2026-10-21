@@ -35,7 +35,7 @@ use crate::ToolAuthorizationRefreshError;
 // Control-plane gates only. Weak entries are reclaimed on access so historical
 // workspaces do not grow a permanent lock registry. Independent apps never wait
 // for one another; durable running-turn rows remain the source of truth.
-fn application_runtime_gate(application_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+pub(crate) fn application_runtime_gate(application_id: &str) -> Arc<tokio::sync::RwLock<()>> {
     static GATES: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>> = OnceLock::new();
     let mut gates = GATES
         .get_or_init(Mutex::default)
@@ -1161,7 +1161,7 @@ fn normalize_thinking_level(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty() && *value != "default")
 }
 
-fn permission_mode_auto_approves_provider_tools(permission_mode: &str) -> bool {
+pub(crate) fn permission_mode_auto_approves_provider_tools(permission_mode: &str) -> bool {
     matches!(permission_mode, "auto" | "full-access")
 }
 
@@ -2696,29 +2696,9 @@ impl ConversationService {
         &self,
         application_id: &str,
     ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, ChatError> {
-        let busy = || ChatError::WorkspaceRuntimeBusy {
-            application_id: application_id.to_string(),
-        };
-        let guard = application_runtime_gate(application_id)
-            .try_write_owned()
-            .map_err(|_| busy())?;
-        let active = ai_conversations::Entity::find()
-            .filter(ai_conversations::Column::ContextType.eq("application"))
-            .filter(
-                Condition::any()
-                    .add(ai_conversations::Column::ContextId.eq(application_id))
-                    .add(
-                        ai_conversations::Column::ContextId
-                            .starts_with(format!("{application_id}:")),
-                    ),
-            )
-            .filter(ai_conversations::Column::TurnStatus.eq("running"))
-            .one(self.db.as_ref())
-            .await?;
-        if active.is_some() {
-            return Err(busy());
-        }
-        Ok(guard)
+        crate::application_link::lock_application_runtime(self.db.as_ref(), application_id)
+            .await
+            .map_err(ChatError::from)
     }
 
     /// Release a claimed turn only if the opaque id still owns the row. The

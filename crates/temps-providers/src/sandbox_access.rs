@@ -277,6 +277,31 @@ impl SandboxDatabasePlan {
         )
     }
 
+    /// The administrator's databases where `PUBLIC` still holds `CONNECT`:
+    /// the ones [`Self::lockdown_statement`] is about to change. Shared by the
+    /// query that reports them and the block that changes them, so the two
+    /// cannot disagree.
+    fn open_databases_condition(&self) -> String {
+        format!(
+            "datallowconn AND NOT datistemplate AND datname <> 'postgres' \
+             AND datname <> {database_literal} \
+             AND datdba = (SELECT oid FROM pg_roles WHERE rolname = {admin_literal}) \
+             AND (datacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(datacl) a \
+             WHERE a.grantee = 0 AND a.privilege_type = 'CONNECT'))",
+            database_literal = quote_literal(&self.database),
+            admin_literal = quote_literal(&self.admin_user),
+        )
+    }
+
+    /// The names of the databases the lockdown will close to `PUBLIC`, read in
+    /// the same round trip just before it runs so the change can be logged.
+    pub fn lockdown_targets_query(&self) -> String {
+        format!(
+            "SELECT datname::text FROM pg_database WHERE {} ORDER BY datname",
+            self.open_databases_condition()
+        )
+    }
+
     /// Keep the role out of every other database.
     ///
     /// New databases let anyone connect (`PUBLIC` holds `CONNECT`), so the role
@@ -285,26 +310,43 @@ impl SandboxDatabasePlan {
     /// per-environment ones Temps creates). It leaves `postgres`, the
     /// templates, and databases owned by other roles as they were, so tools
     /// that rely on them keep working.
+    ///
+    /// Roles that could log in before reached those databases through `PUBLIC`
+    /// too, including ones an operator created by hand (a reporting or BI
+    /// role). Each of them is granted `CONNECT` explicitly before `PUBLIC`
+    /// loses it, so the lockdown only shuts out sandbox roles. A database
+    /// already closed to `PUBLIC` is skipped, so this changes nothing on the
+    /// next connect and does not undo grants an operator made since.
     pub fn lockdown_statement(&self) -> String {
         format!(
-            "DO $sbx$ DECLARE d record; BEGIN \
-             FOR d IN SELECT datname FROM pg_database \
-             WHERE datallowconn AND NOT datistemplate AND datname <> 'postgres' \
-             AND datname <> {database_literal} \
-             AND datdba = (SELECT oid FROM pg_roles WHERE rolname = {admin_literal}) \
-             LOOP EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', d.datname); \
+            "DO $sbx$ DECLARE d record; r record; BEGIN \
+             FOR d IN SELECT datname FROM pg_database WHERE {condition} \
+             LOOP \
+             FOR r IN SELECT rolname FROM pg_roles WHERE rolcanlogin \
+             AND left(rolname, {prefix_len}) <> {prefix_literal} \
+             AND left(rolname, 3) <> 'pg_' \
+             LOOP EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', d.datname, r.rolname); \
+             END LOOP; \
+             EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', d.datname); \
              END LOOP; \
              REVOKE ALL ON DATABASE \"{database}\" FROM PUBLIC; \
              END $sbx$",
-            database_literal = quote_literal(&self.database),
-            admin_literal = quote_literal(&self.admin_user),
+            condition = self.open_databases_condition(),
+            prefix_len = ROLE_PREFIX.len(),
+            prefix_literal = quote_literal(ROLE_PREFIX),
             database = self.database,
         )
     }
 
-    /// The statements that follow `CREATE`/`ALTER DATABASE`, in order.
-    pub fn finishing_statements(&self) -> Vec<String> {
-        vec![self.lockdown_statement()]
+    /// What follows `CREATE`/`ALTER DATABASE`: the databases about to be
+    /// closed, then the lockdown itself. One simple-query round trip, run as
+    /// one implicit transaction, so the reported list is exactly what changed.
+    pub fn finishing_script(&self) -> String {
+        format!(
+            "{}; {}",
+            self.lockdown_targets_query(),
+            self.lockdown_statement()
+        )
     }
 
     /// The variables the app reads, under the same names a deployment gets.
@@ -432,11 +474,25 @@ pub async fn apply(
             .await
             .map_err(failed("create the database", &plan.database))?;
     }
-    for statement in plan.finishing_statements() {
-        client
-            .batch_execute(&statement)
-            .await
-            .map_err(failed("restrict who can connect", &plan.database))?;
+    let messages = client
+        .simple_query(&plan.finishing_script())
+        .await
+        .map_err(failed("restrict who can connect", &plan.database))?;
+    let closed: Vec<&str> = messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.try_get(0).ok().flatten(),
+            _ => None,
+        })
+        .collect();
+    if !closed.is_empty() {
+        info!(
+            sandbox_database = %plan.database,
+            admin_role = %plan.admin_user,
+            databases = ?closed,
+            "Closed databases to PUBLIC CONNECT so sandbox roles cannot open them; \
+             existing login roles were granted CONNECT explicitly"
+        );
     }
     Ok(plan.clone())
 }
@@ -887,11 +943,12 @@ mod tests {
             "CREATE DATABASE \"_sandbox_shop_api\" OWNER \"sbx__sandbox_shop_api\""
         );
         // Nothing in the plan takes an existing database over.
-        let every_statement = [plan.role_statement(), plan.create_database_statement()]
-            .into_iter()
-            .chain(plan.finishing_statements())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let every_statement = [
+            plan.role_statement(),
+            plan.create_database_statement(),
+            plan.finishing_script(),
+        ]
+        .join("\n");
         assert!(!every_statement.contains("OWNER TO"), "{every_statement}");
         // The owner is read with a bound parameter, not spliced in.
         assert!(SandboxDatabasePlan::DATABASE_OWNER_QUERY.contains("datname = $1"));
@@ -944,6 +1001,48 @@ mod tests {
             legacy_of(&project(&longest)),
             Some(format!("{longest}_sandbox"))
         );
+    }
+
+    #[test]
+    fn the_lockdown_keeps_existing_login_roles_connected_before_closing_public() {
+        let statement = plan().lockdown_statement();
+        let grant = statement
+            .find("GRANT CONNECT ON DATABASE %I TO %I")
+            .expect("existing roles are granted CONNECT");
+        let revoke = statement
+            .find("REVOKE CONNECT ON DATABASE %I FROM PUBLIC")
+            .expect("PUBLIC loses CONNECT");
+        assert!(
+            grant < revoke,
+            "roles must be granted before PUBLIC is revoked"
+        );
+        // Only login roles, never sandbox or built-in ones.
+        assert!(statement.contains("WHERE rolcanlogin"));
+        assert!(statement.contains("left(rolname, 4) <> 'sbx_'"));
+        assert!(statement.contains("left(rolname, 3) <> 'pg_'"));
+    }
+
+    #[test]
+    fn the_lockdown_skips_databases_already_closed_to_public() {
+        let plan = plan();
+        let open = "(datacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(datacl) a \
+                    WHERE a.grantee = 0 AND a.privilege_type = 'CONNECT'))";
+        assert!(plan.lockdown_statement().contains(open));
+        assert!(plan.lockdown_targets_query().contains(open));
+    }
+
+    #[test]
+    fn the_finishing_script_reports_the_same_databases_it_closes() {
+        let plan = plan();
+        let script = plan.finishing_script();
+        assert!(script.starts_with(&plan.lockdown_targets_query()));
+        assert!(script.ends_with(&plan.lockdown_statement()));
+        assert!(plan
+            .lockdown_targets_query()
+            .contains(&plan.open_databases_condition()));
+        assert!(plan
+            .lockdown_statement()
+            .contains(&plan.open_databases_condition()));
     }
 
     #[test]

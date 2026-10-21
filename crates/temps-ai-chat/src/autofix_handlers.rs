@@ -77,6 +77,14 @@ impl From<AutofixError> for Problem {
             AutofixError::QueueFull { .. } => problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
                 .with_title("Autofix Queue Full")
                 .with_detail(error.to_string()),
+            AutofixError::ProjectQueueFull { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Autofix Project Queue Full")
+                    .with_detail(error.to_string())
+            }
+            AutofixError::OwnerCannotAct { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Autofix Owner Cannot Act")
+                .with_detail(error.to_string()),
             AutofixError::Database { .. } | AutofixError::Step { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -655,6 +663,23 @@ mod tests {
                 queued: 20
             }),
             429
+        );
+        assert_eq!(
+            status_of(AutofixError::ProjectQueueFull {
+                project_id: 1,
+                group_id: 2,
+                queued: 10,
+                limit: 10
+            }),
+            429
+        );
+        assert_eq!(
+            status_of(AutofixError::OwnerCannotAct {
+                project_id: 1,
+                owner_user_id: 7,
+                reason: "user 7 no longer has access to project 1".into()
+            }),
+            403
         );
         assert_eq!(
             status_of(AutofixError::Step {

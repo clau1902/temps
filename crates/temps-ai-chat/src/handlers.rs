@@ -36,6 +36,10 @@ use tokio_util::io::ReaderStream;
 use tracing::{error, info};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::application_link::{
+    check_project_permission, synchronize_application_network, workspace_may_retain_data_plane,
+    ApplicationProjectLinker, LinkProjectError, NetworkSyncError, ProjectPermissionError,
+};
 use temps_auth::permissions::Permission;
 use temps_auth::{
     context::{AuthContext, AuthSource},
@@ -1905,62 +1909,57 @@ pub(crate) async fn ensure_application_project_permission(
     project_ids: &[i32],
     required: &Permission,
 ) -> Result<(), Problem> {
-    if !auth.has_permission(required) {
-        return Err(problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Insufficient Permissions")
-            .with_detail(format!(
-                "This operation requires the {} permission.",
-                required
-            )));
-    }
-    if auth.is_admin() || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin) {
-        return Ok(());
-    }
-    let Some(checker) = checker else {
-        return Ok(());
-    };
-    let user_id = auth.user_id_opt().ok_or_else(|| {
-        problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Project Permission Denied")
-            .with_detail("A user identity is required to access an AI application.")
-    })?;
-    let permissions = checker
-        .effective_project_permissions_batch(user_id, project_ids)
+    check_project_permission(auth, checker.as_ref(), project_ids, required)
         .await
-        .map_err(|error| {
-            error!(user_id, error = %error, "failed to check AI application project permissions");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Project Permission Check Failed")
-                .with_detail("Could not verify project permissions; please try again")
-        })?;
-    let membership = checker
-        .user_can_access_projects(user_id, project_ids)
-        .await
-        .map_err(|error| {
-            error!(user_id, error = %error, "failed to check AI application project membership");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Project Access Check Failed")
-                .with_detail("Could not verify project access; please try again")
-        })?;
-    let required_name = required.to_string();
-    for project_id in project_ids {
-        let allowed = match permissions.get(project_id) {
-            Some(Some(granted)) => granted
-                .iter()
-                .any(|permission| permission == &required_name),
-            Some(None) => membership.get(project_id).copied().unwrap_or(false),
-            None => false,
-        };
-        if !allowed {
-            return Err(problemdetails::new(StatusCode::FORBIDDEN)
+        .map_err(Problem::from)
+}
+
+impl From<ProjectPermissionError> for Problem {
+    fn from(error: ProjectPermissionError) -> Self {
+        match error {
+            ProjectPermissionError::MissingInstancePermission { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Insufficient Permissions")
+                    .with_detail(error.to_string())
+            }
+            ProjectPermissionError::NoUserIdentity => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Project Permission Denied")
-                .with_detail(format!(
-                    "The {} permission is required on every project linked to this application.",
-                    required_name
-                )));
+                .with_detail(error.to_string()),
+            ProjectPermissionError::PermissionCheck { .. } => {
+                error!(error = %error, "failed to check AI application project permissions");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Project Permission Check Failed")
+                    .with_detail("Could not verify project permissions; please try again")
+            }
+            ProjectPermissionError::MembershipCheck { .. } => {
+                error!(error = %error, "failed to check AI application project membership");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Project Access Check Failed")
+                    .with_detail("Could not verify project access; please try again")
+            }
+            ProjectPermissionError::Denied { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Project Permission Denied")
+                .with_detail(error.to_string()),
         }
     }
-    Ok(())
+}
+
+impl From<LinkProjectError> for Problem {
+    fn from(error: LinkProjectError) -> Self {
+        match error {
+            LinkProjectError::Permission(error) => error.into(),
+            LinkProjectError::RuntimeLock(error) => ChatError::from(error).into(),
+            LinkProjectError::Application(error) => error.into(),
+            LinkProjectError::ProjectPermissions { source, .. } => source.into(),
+            LinkProjectError::Network(error) => error.into(),
+        }
+    }
+}
+
+impl From<NetworkSyncError> for Problem {
+    fn from(error: NetworkSyncError) -> Self {
+        application_workspace_provider_problem(error.source, &error.application_id, error.operation)
+    }
 }
 
 /// Existing projects may only be bundled when the installation can prove the
@@ -2945,112 +2944,14 @@ pub async fn link_application_project(
     permission_guard!(auth, SandboxesWrite);
     deny_deployment_token!(auth);
     let previous = authorized_application(&state, &auth, &application_public_id).await?;
-    let previous_project_ids = previous
-        .projects
-        .iter()
-        .map(|project| project.id)
-        .collect::<Vec<_>>();
-    for project_ids in [&previous_project_ids[..], &[request.project_id][..]] {
-        ensure_application_project_permission(
+    let application = project_linker(&state)
+        .link(
             &auth,
-            &state.project_access_checker,
-            project_ids,
-            &Permission::ProjectsWrite,
+            state.project_access_checker.as_ref(),
+            &previous,
+            request.project_id,
         )
         .await?;
-        ensure_application_project_permission(
-            &auth,
-            &state.project_access_checker,
-            project_ids,
-            &Permission::SandboxesWrite,
-        )
-        .await?;
-    }
-    let _runtime_gate = state
-        .service
-        .lock_application_runtime_update(&application_public_id)
-        .await
-        .map_err(Problem::from)?;
-    let application = state
-        .applications
-        .link_project(auth.user_id(), &application_public_id, request.project_id)
-        .await?;
-    if let Err(workspace_error) = state
-        .application_workspaces
-        .ensure(&application.application.public_id, &application.projects)
-        .await
-    {
-        if let Err(rollback_error) = state
-            .applications
-            .unlink_project(auth.user_id(), &application_public_id, request.project_id)
-            .await
-        {
-            tracing::error!(
-                application_id = application_public_id,
-                project_id = request.project_id,
-                error = %rollback_error,
-                "Failed to roll back project link after workspace preparation failed"
-            );
-        }
-        return Err(workspace_error.into());
-    }
-    if let Some(project) = application
-        .projects
-        .iter()
-        .find(|project| project.id == request.project_id)
-    {
-        if let Some(sandboxes) = state.application_sandboxes.as_ref() {
-            if let Err(permission_error) = sandboxes
-                .normalize_application_project_permissions(
-                    auth.user_id(),
-                    &application_public_id,
-                    &project.slug,
-                )
-                .await
-            {
-                if let Err(cleanup_error) = state
-                    .applications
-                    .unlink_project(auth.user_id(), &application_public_id, request.project_id)
-                    .await
-                {
-                    tracing::error!(
-                        project_id = request.project_id,
-                        error = %cleanup_error,
-                        "Failed to roll back linked project after workspace permission update failed"
-                    );
-                }
-                return Err(permission_error.into());
-            }
-        }
-    }
-    if let Err(network_error) =
-        synchronize_application_network_if_running(&state, &auth, &application).await
-    {
-        if let Err(cleanup_error) = state
-            .applications
-            .unlink_project(auth.user_id(), &application_public_id, request.project_id)
-            .await
-        {
-            tracing::error!(
-                project_id = request.project_id,
-                error = %cleanup_error,
-                "Failed to roll back linked project after database network update failed"
-            );
-        }
-        // The database rollback alone is insufficient: network attachment is
-        // a separate side effect. Always restore the last authorized topology
-        // before returning the failure.
-        if let Err(reconcile_error) =
-            synchronize_application_network_if_running(&state, &auth, &previous).await
-        {
-            tracing::error!(
-                application_id = application_public_id,
-                error = ?reconcile_error,
-                "Failed to restore application data network after link rollback"
-            );
-        }
-        return Err(network_error);
-    }
     state
         .audit(&ApplicationTopologyChangedAudit {
             context: audit_context(&auth, &metadata),
@@ -6862,10 +6763,6 @@ fn application_workspace_state<'a>(
     }
 }
 
-fn workspace_may_retain_data_plane(status: &str) -> bool {
-    matches!(status, "running" | "recovering")
-}
-
 /// Parse the `kind` of a thread-creation request.
 fn requested_thread_kind(kind: Option<&str>) -> Result<ThreadKind, Problem> {
     ThreadKind::parse(kind).map_err(|error| match error {
@@ -7049,48 +6946,28 @@ async fn quarantine_application_workspace(state: &AppState, user_id: i32, applic
     }
 }
 
+/// The linker the HTTP handlers share with the assistant's blueprint tool.
+fn project_linker(state: &AppState) -> ApplicationProjectLinker {
+    ApplicationProjectLinker::new(
+        state.db.clone(),
+        state.applications.clone(),
+        state.application_workspaces.clone(),
+        state.application_sandboxes.clone(),
+    )
+}
+
 async fn synchronize_application_network_if_running(
     state: &AppState,
     auth: &AuthContext,
     application: &crate::applications::ApplicationWithProjects,
 ) -> Result<(), Problem> {
-    let Some(sandboxes) = state.application_sandboxes.as_ref() else {
-        return Ok(());
-    };
-    let Some(summary) = sandboxes
-        .application_workspace_summary(auth.user_id(), &application.application.public_id)
-        .await
-        .map_err(|error| {
-            application_workspace_provider_problem(
-                error,
-                &application.application.public_id,
-                "inspect before data-network synchronization",
-            )
-        })?
-        .filter(|summary| workspace_may_retain_data_plane(&summary.status))
-    else {
-        return Ok(());
-    };
-    sandboxes
-        .synchronize_application_data_network(
-            auth.user_id(),
-            &application.application.public_id,
-            &summary.public_id,
-            &application
-                .projects
-                .iter()
-                .map(|project| project.id)
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(|error| {
-            application_workspace_provider_problem(
-                error,
-                &application.application.public_id,
-                "synchronize data network",
-            )
-        })?;
-    Ok(())
+    synchronize_application_network(
+        state.application_sandboxes.as_ref(),
+        auth.user_id(),
+        application,
+    )
+    .await
+    .map_err(Problem::from)
 }
 
 #[utoipa::path(
