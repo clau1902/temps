@@ -15,19 +15,12 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use sea_orm::sea_query::Expr;
-use sea_orm::sea_query::OnConflict;
-use sea_orm::{ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use serde::Deserialize;
 use temps_core::worker_ingress::ListenerReport;
-use temps_entities::{node_public_ingress, nodes};
 use tracing::{error, info};
 
+use crate::public_ingress_store::{KeyRegistration, PublicIngressStore};
 use crate::route_sync::{authenticate_node, RouteSyncAppState};
-
-/// Most host addresses kept from one report; a host with more is unusual and
-/// the console only needs the plausible candidates.
-const MAX_INTERFACES: usize = 64;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterIngressKeyRequest {
@@ -57,48 +50,23 @@ pub async fn post_ingress_key(
             format!("Ingress key for node {node_id} is not a valid X25519 public key: {error}"),
         ));
     }
-    match key_registration(node.edge_public_key.as_deref(), &public_key) {
+    let store = PublicIngressStore::new(state.db.as_ref());
+    match store
+        .register_edge_key(&node, &public_key)
+        .await
+        .map_err(|e| internal(node_id, "store the ingress key", e))?
+    {
         KeyRegistration::AlreadyRegistered => return Ok(StatusCode::NO_CONTENT),
         KeyRegistration::Refused => return Err((StatusCode::CONFLICT, replace_refused(node_id))),
-        KeyRegistration::Store => {}
-    }
-    // Only fills an empty key: two racing registrations cannot both win.
-    let stored = nodes::Entity::update_many()
-        .col_expr(nodes::Column::EdgePublicKey, Expr::value(public_key))
-        .filter(nodes::Column::Id.eq(node_id))
-        .filter(nodes::Column::EdgePublicKey.is_null())
-        .exec(state.db.as_ref())
-        .await
-        .map_err(|e| internal(node_id, "store the ingress key", e))?;
-    if stored.rows_affected == 0 {
-        return Err((StatusCode::CONFLICT, replace_refused(node_id)));
+        KeyRegistration::Stored => {}
     }
     info!(node_id, "worker registered its ingress key");
     // Certificate bundles are encrypted to this key: send a fresh snapshot.
-    state
-        .db
-        .execute_unprepared("SELECT pg_notify('route_table_changes', '')")
+    store
+        .announce_change()
         .await
         .map_err(|e| internal(node_id, "announce the ingress key", e))?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum KeyRegistration {
-    AlreadyRegistered,
-    Store,
-    Refused,
-}
-
-/// A node token may register the ingress key once. Replacing it would let
-/// whoever holds the token alone redirect certificate bundles to a key they
-/// control, so a different key is refused: the operator re-enrolls instead.
-fn key_registration(existing: Option<&str>, offered: &str) -> KeyRegistration {
-    match existing {
-        None => KeyRegistration::Store,
-        Some(current) if current == offered => KeyRegistration::AlreadyRegistered,
-        Some(_) => KeyRegistration::Refused,
-    }
 }
 
 fn replace_refused(node_id: i32) -> String {
@@ -114,44 +82,11 @@ pub async fn post_listener_report(
     State(state): State<Arc<RouteSyncAppState>>,
     headers: HeaderMap,
     Path(node_id): Path<i32>,
-    Json(mut report): Json<ListenerReport>,
+    Json(report): Json<ListenerReport>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     authenticate_node(&state.db, &headers, node_id).await?;
-    report.interfaces.truncate(MAX_INTERFACES);
-    let clip =
-        |value: Option<String>, max: usize| value.map(|v| v.chars().take(max).collect::<String>());
-    let listening = serde_json::json!({
-        "http": clip(report.http, 64),
-        "https": clip(report.https, 64),
-        "error": clip(report.error, 1000),
-    });
-    let now = chrono::Utc::now();
-    let row = node_public_ingress::ActiveModel {
-        node_id: Set(node_id),
-        listen_address: Set(None),
-        http_port: Set(80),
-        https_port: Set(443),
-        public_address: Set(None),
-        interfaces: Set(Some(serde_json::json!(report.interfaces))),
-        listening: Set(Some(listening)),
-        mode: Set(report.mode.map(|mode| mode.as_str().to_string())),
-        last_check: Set(None),
-        checked_at: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
-    };
-    node_public_ingress::Entity::insert(row)
-        .on_conflict(
-            OnConflict::column(node_public_ingress::Column::NodeId)
-                .update_columns([
-                    node_public_ingress::Column::Interfaces,
-                    node_public_ingress::Column::Listening,
-                    node_public_ingress::Column::Mode,
-                    node_public_ingress::Column::UpdatedAt,
-                ])
-                .to_owned(),
-        )
-        .exec(state.db.as_ref())
+    PublicIngressStore::new(state.db.as_ref())
+        .record_listener_report(node_id, report)
         .await
         .map_err(|e| internal(node_id, "store the ingress listener report", e))?;
     Ok(StatusCode::NO_CONTENT)
@@ -162,13 +97,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_node_registers_its_ingress_key_once() {
-        assert_eq!(key_registration(None, "k1"), KeyRegistration::Store);
-        assert_eq!(
-            key_registration(Some("k1"), "k1"),
-            KeyRegistration::AlreadyRegistered
-        );
-        assert_eq!(key_registration(Some("k1"), "k2"), KeyRegistration::Refused);
+    fn a_refused_key_says_how_to_recover() {
         assert!(replace_refused(7).contains("temps join"));
     }
 }

@@ -23,7 +23,7 @@ import { requireAuth } from '../../config/store.js'
 import { setupClient, getErrorMessage } from '../../lib/api-client.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable } from '../../ui/table.js'
-import { colors, header, json, keyValue, newline, success } from '../../ui/output.js'
+import { colors, header, info, json, keyValue, newline, success } from '../../ui/output.js'
 
 /** The body of a generated SDK call, or its error as a thrown message. */
 async function unwrap<T>(
@@ -80,14 +80,18 @@ export function registerTunnelsCommands(program: Command): void {
   tunnels
     .command('list')
     .description('List tunnels, what each publishes and the workers it runs on')
+    .option('--page <page>', 'Page number (1-indexed)', '1')
+    .option('--page-size <pageSize>', 'Items per page (max 100)', '20')
     .option('--json', 'Output in JSON format')
-    .action(async (options: { json?: boolean }) => {
+    .action(async (options: { page?: string; pageSize?: string; json?: boolean }) => {
       await ready()
-      const connectors = await withSpinner('Loading tunnels...', () =>
-        unwrap(listIngressConnectors())
+      const page = Number.parseInt(options.page ?? '1', 10) || 1
+      const pageSize = Number.parseInt(options.pageSize ?? '20', 10) || 20
+      const list = await withSpinner('Loading tunnels...', () =>
+        unwrap(listIngressConnectors({ query: { page, page_size: pageSize } }))
       )
-      if (options.json) return json(connectors)
-      printTable(connectors, [
+      if (options.json) return json(list)
+      printTable(list.connectors, [
         { header: 'ID', key: 'id' },
         { header: 'Name', key: 'name' },
         { header: 'Domain', accessor: (c) => `*.${c.domain}` },
@@ -98,6 +102,10 @@ export function registerTunnelsCommands(program: Command): void {
         },
         { header: 'Workers', accessor: describeWorkers },
       ])
+      if (list.total > page * pageSize) {
+        newline()
+        info(`Run with --page ${page + 1} to see more`)
+      }
     })
 
   tunnels

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post, put},
@@ -22,7 +22,7 @@ use utoipa::OpenApi;
 
 use crate::registry::{DnsHandling, FieldKind, ProviderInfo, SetupField};
 use crate::service::{
-    ConnectorLinksView, ConnectorNodeView, ConnectorView, CreateConnectorRequest,
+    ConnectorLinksView, ConnectorList, ConnectorNodeView, ConnectorView, CreateConnectorRequest,
     HostnameCandidate, HostnameMode, HostnameView, IngressConnectorService, LinkView,
     PublicationView, SetConnectorNodesRequest, SetHostnameChoiceRequest, UpdateConnectorRequest,
 };
@@ -120,6 +120,7 @@ impl IngressAudit {
         delete_ingress_connector,
     ),
     components(schemas(
+        ConnectorList,
         ConnectorView,
         ConnectorNodeView,
         PublicationView,
@@ -140,6 +141,18 @@ impl IngressAudit {
     tags((name = "Ingress", description = "Ingress connectors: tunnels into the cluster (ADR 058)"))
 )]
 pub struct IngressApiDoc;
+
+/// Which page of tunnels to return, newest first.
+#[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListConnectorsParams {
+    /// Page number (1-indexed)
+    #[param(example = 1)]
+    pub page: Option<u64>,
+    /// Number of items per page (default 20, max 100)
+    #[param(example = 20)]
+    pub page_size: Option<u64>,
+}
 
 pub fn configure_routes() -> Router<Arc<IngressAppState>> {
     Router::new()
@@ -202,15 +215,19 @@ async fn list_ingress_providers(
     get,
     path = "/ingress/connectors",
     operation_id = "list_ingress_connectors",
-    responses((status = 200, body = Vec<ConnectorView>)),
+    params(ListConnectorsParams),
+    responses((status = 200, body = ConnectorList)),
     security(("bearer_auth" = []))
 )]
 async fn list_ingress_connectors(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<IngressAppState>>,
+    Query(params): Query<ListConnectorsParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
-    Ok(Json(state.service.list().await?))
+    Ok(Json(
+        state.service.list(params.page, params.page_size).await?,
+    ))
 }
 
 /// Create a tunnel for a managed domain and run it on workers.

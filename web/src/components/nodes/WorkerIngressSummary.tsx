@@ -8,10 +8,10 @@ import { useQuery } from '@tanstack/react-query'
 import { CheckCircle2, ExternalLink, XCircle } from 'lucide-react'
 import type { ReactNode } from 'react'
 import {
-  listIngressConnectorsOptions,
   listIngressHostnamesOptions,
   listIngressProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import type {
   ConnectorView,
   NodeInfoResponse,
@@ -139,7 +139,7 @@ export function WorkerIngressSummary({
   onChange: () => void
 }) {
   const connectorsQuery = useQuery({
-    ...listIngressConnectorsOptions(),
+    ...allTunnelsOptions(),
     refetchInterval: 10_000,
   })
   const providersQuery = useQuery(listIngressProvidersOptions())

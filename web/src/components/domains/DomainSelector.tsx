@@ -3,9 +3,9 @@
 
 import {
   listDomainsOptions,
-  listIngressConnectorsOptions,
   listIngressHostnamesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import { Button } from '@/components/ui/button'
 import {
   Command,
@@ -75,7 +75,7 @@ export function DomainSelector({
   // `*.domain`, and the names picked for a tunnel. Without settings access
   // these return 403 and the group stays hidden.
   const connectorsQuery = useQuery({
-    ...listIngressConnectorsOptions(),
+    ...allTunnelsOptions(),
     enabled: open,
     retry: false,
   })

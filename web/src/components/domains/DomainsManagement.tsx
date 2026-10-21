@@ -7,10 +7,10 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
   deleteDomainMutation,
-  listIngressConnectorsOptions,
   listIngressHostnamesOptions,
   renewDomainMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import { DomainResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
@@ -181,7 +181,7 @@ export function DomainsManagement({
   // Names tunnels carry, listed with the certificates (ADR 058 D10).
   // Without settings access these 403 and the list is certificates only.
   const connectorsQuery = useQuery({
-    ...listIngressConnectorsOptions(),
+    ...allTunnelsOptions(),
     retry: false,
   })
   const hostnamesQuery = useQuery({
@@ -195,7 +195,7 @@ export function DomainsManagement({
     searchQuery
   )
   const rows = mergeDomainRows(domains ?? [], tunnels, page, sort, direction)
-    const failingTunnels = tunnels.filter(
+  const failingTunnels = tunnels.filter(
     (r) => r.kind === 'tunnel' && r.view.state === 'error'
   ).length
   // Open by default only while there is nothing to list; then it is noise.

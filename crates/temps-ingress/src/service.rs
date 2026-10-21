@@ -9,8 +9,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use temps_core::{DBDateTime, EncryptionService};
@@ -45,6 +47,11 @@ const TOKEN_HOLDERS_KEY: &str = "token_holders";
 /// How `last_error` starts when rotating the secret failed, so a later
 /// success clears only that error.
 const ROTATION_ERROR: &str = "Could not revoke the tunnel secret";
+/// A publication whose DNS record still points at a tunnel that was since
+/// replaced: it is published again, or its record removed.
+const STALE: &str = "stale";
+const DEFAULT_PAGE_SIZE: u64 = 20;
+const MAX_PAGE_SIZE: u64 = 100;
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateConnectorRequest {
@@ -158,10 +165,21 @@ pub struct ConnectorNodeView {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PublicationView {
     pub hostname: String,
+    /// `published`, `error`, or `stale` (its record points at a tunnel that
+    /// was replaced; it is being published again).
     pub state: String,
     pub last_error: Option<String>,
     #[schema(value_type = Option<String>, format = DateTime)]
     pub published_at: Option<DBDateTime>,
+}
+
+/// One page of tunnels, newest first.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ConnectorList {
+    pub connectors: Vec<ConnectorView>,
+    pub total: u64,
+    pub page: u64,
+    pub page_size: u64,
 }
 
 /// A tunnel's live connections, read from the provider on request.
@@ -197,6 +215,9 @@ pub struct IngressConnectorService {
     /// [`Self::set_request_policy`].
     request_policy: OnceLock<Arc<temps_core::RequestPolicyGateSlot>>,
     reconcile_lock: tokio::sync::Mutex<()>,
+    /// Serializes read-modify-writes of a connector's `settings` (token
+    /// holders), so a node recorded while the reconciler rotates is kept.
+    settings_lock: tokio::sync::Mutex<()>,
 }
 
 impl IngressConnectorService {
@@ -221,6 +242,7 @@ impl IngressConnectorService {
             registry: ProviderRegistry::builtin(),
             request_policy: OnceLock::new(),
             reconcile_lock: tokio::sync::Mutex::new(()),
+            settings_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -442,83 +464,84 @@ impl IngressConnectorService {
 
     // ----- admin operations --------------------------------------------
 
-    pub async fn list(&self) -> Result<Vec<ConnectorView>, IngressError> {
-        let connectors = ingress_connectors::Entity::find()
-            .order_by_asc(ingress_connectors::Column::Id)
-            .all(self.db.as_ref())
-            .await?;
-        let mut views = Vec::with_capacity(connectors.len());
-        for connector in connectors {
-            views.push(self.view(connector).await?);
-        }
-        Ok(views)
+    /// One page of tunnels, newest first: `page` from 1, `page_size` 20 by
+    /// default and at most 100.
+    pub async fn list(
+        &self,
+        page: Option<u64>,
+        page_size: Option<u64>,
+    ) -> Result<ConnectorList, IngressError> {
+        let (page, page_size) = page_bounds(page, page_size);
+        let paginator = ingress_connectors::Entity::find()
+            .order_by_desc(ingress_connectors::Column::CreatedAt)
+            .order_by_desc(ingress_connectors::Column::Id)
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator.num_items().await?;
+        let connectors = paginator.fetch_page(page - 1).await?;
+        Ok(ConnectorList {
+            connectors: self.views(connectors).await?,
+            total,
+            page,
+            page_size,
+        })
     }
 
     pub async fn get(&self, id: i32) -> Result<ConnectorView, IngressError> {
         let connector = self.find(id).await?;
-        self.view(connector).await
+        self.views(vec![connector])
+            .await?
+            .pop()
+            .ok_or(IngressError::NotFound(id))
     }
 
-    async fn view(
+    /// Views of `connectors`, in order, from three queries however many
+    /// there are.
+    async fn views(
         &self,
-        connector: ingress_connectors::Model,
-    ) -> Result<ConnectorView, IngressError> {
-        let node_rows = ingress_connector_nodes::Entity::find()
-            .filter(ingress_connector_nodes::Column::ConnectorId.eq(connector.id))
+        connectors: Vec<ingress_connectors::Model>,
+    ) -> Result<Vec<ConnectorView>, IngressError> {
+        if connectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i32> = connectors.iter().map(|c| c.id).collect();
+        let mut node_rows: HashMap<i32, Vec<ingress_connector_nodes::Model>> = HashMap::new();
+        for row in ingress_connector_nodes::Entity::find()
+            .filter(ingress_connector_nodes::Column::ConnectorId.is_in(ids.iter().copied()))
             .order_by_asc(ingress_connector_nodes::Column::NodeId)
             .all(self.db.as_ref())
-            .await?;
-        let names: HashMap<i32, String> = nodes::Entity::find()
-            .filter(nodes::Column::Id.is_in(node_rows.iter().map(|n| n.node_id)))
-            .all(self.db.as_ref())
             .await?
-            .into_iter()
-            .map(|n| (n.id, n.name))
-            .collect();
-        let publications = ingress_publications::Entity::find()
-            .filter(ingress_publications::Column::ConnectorId.eq(connector.id))
+        {
+            node_rows.entry(row.connector_id).or_default().push(row);
+        }
+        let node_ids: BTreeSet<i32> = node_rows.values().flatten().map(|n| n.node_id).collect();
+        let names: HashMap<i32, String> = if node_ids.is_empty() {
+            HashMap::new()
+        } else {
+            nodes::Entity::find()
+                .filter(nodes::Column::Id.is_in(node_ids))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|n| (n.id, n.name))
+                .collect()
+        };
+        let mut publications: HashMap<i32, Vec<ingress_publications::Model>> = HashMap::new();
+        for row in ingress_publications::Entity::find()
+            .filter(ingress_publications::Column::ConnectorId.is_in(ids))
             .order_by_asc(ingress_publications::Column::Hostname)
             .all(self.db.as_ref())
-            .await?;
-        Ok(ConnectorView {
-            id: connector.id,
-            name: connector.name,
-            provider: connector.provider,
-            dns_provider_id: connector.dns_provider_id,
-            domain: connector.domain,
-            external_id: connector.external_id,
-            dns_target: connector
-                .settings
-                .get("cname_target")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            status: connector.status,
-            last_error: connector.last_error,
-            edge_port: connector.edge_port,
-            auto_publish: connector.auto_publish,
-            nodes: node_rows
-                .into_iter()
-                .map(|n| ConnectorNodeView {
-                    node_name: names.get(&n.node_id).cloned().unwrap_or_default(),
-                    node_id: n.node_id,
-                    driver: n.driver,
-                    state: n.state,
-                    ready_connections: n.ready_connections,
-                    last_error: n.last_error,
-                    reported_at: n.reported_at,
-                })
-                .collect(),
-            publications: publications
-                .into_iter()
-                .map(|p| PublicationView {
-                    hostname: p.hostname,
-                    state: p.state,
-                    last_error: p.last_error,
-                    published_at: p.published_at,
-                })
-                .collect(),
-            created_at: connector.created_at,
-        })
+            .await?
+        {
+            publications.entry(row.connector_id).or_default().push(row);
+        }
+        Ok(connectors
+            .into_iter()
+            .map(|connector| {
+                let node_rows = node_rows.remove(&connector.id).unwrap_or_default();
+                let publications = publications.remove(&connector.id).unwrap_or_default();
+                connector_view(connector, node_rows, &names, publications)
+            })
+            .collect())
     }
 
     /// The tunnel's connections as the provider sees them, each matched to
@@ -778,7 +801,7 @@ impl IngressConnectorService {
             .all(self.db.as_ref())
             .await?;
         for publication in publications {
-            if publication.state == "published" {
+            if has_record(&publication.state) {
                 self.remove_record(&connector, &publication.hostname)
                     .await?;
             }
@@ -841,7 +864,7 @@ impl IngressConnectorService {
     }
 
     async fn replace_nodes(&self, connector_id: i32, node_ids: &[i32]) -> Result<(), IngressError> {
-        let wanted: HashSet<i32> = node_ids.iter().copied().collect();
+        let wanted: BTreeSet<i32> = node_ids.iter().copied().collect();
         // Recorded before a new node can fetch the secret, so it is rotated
         // once that node leaves even if it leaves right away.
         self.add_token_holders(connector_id, &wanted).await?;
@@ -894,6 +917,7 @@ impl IngressConnectorService {
         .await;
         // Settings the service owns may have changed while the provider was
         // called (token holders); keep the stored ones.
+        let _guard = self.settings_lock.lock().await;
         let current = self
             .find(connector.id)
             .await
@@ -906,12 +930,38 @@ impl IngressConnectorService {
                     .encryption
                     .encrypt_string(&handle.secret)
                     .map_err(|e| IngressError::Encryption(e.to_string()))?;
+                let replaced = tunnel_replaced(current.external_id.as_deref(), &handle.external_id);
                 row.external_id = Set(Some(handle.external_id));
                 row.settings = Set(keep_setup(&current.settings, handle.settings));
                 row.secret_encrypted = Set(Some(secret));
                 row.status = Set("ready".into());
                 row.last_error = Set(None);
-                row.update(self.db.as_ref()).await?;
+                let txn = self.db.begin().await?;
+                row.update(&txn).await?;
+                if replaced {
+                    // Every record points at the tunnel that is gone. Marked
+                    // stale, they are published again through the new one (or
+                    // removed) by the reconcile that follows.
+                    let stale = ingress_publications::Entity::update_many()
+                        .col_expr(ingress_publications::Column::State, Expr::value(STALE))
+                        .col_expr(
+                            ingress_publications::Column::PublishedAt,
+                            Expr::value(Option::<DBDateTime>::None),
+                        )
+                        .col_expr(
+                            ingress_publications::Column::UpdatedAt,
+                            Expr::value(Utc::now()),
+                        )
+                        .filter(ingress_publications::Column::ConnectorId.eq(connector.id))
+                        .exec(&txn)
+                        .await?;
+                    info!(
+                        connector_id = connector.id,
+                        publications = stale.rows_affected,
+                        "tunnel was replaced; republishing its hostnames"
+                    );
+                }
+                txn.commit().await?;
                 Ok(())
             }
             Err(error) => {
@@ -925,30 +975,43 @@ impl IngressConnectorService {
 
     // ----- secret rotation ---------------------------------------------
 
+    /// Record `node_ids` as holders of the connector's secret, before any of
+    /// them can fetch it.
     async fn add_token_holders(
         &self,
         connector_id: i32,
-        node_ids: &HashSet<i32>,
+        node_ids: &BTreeSet<i32>,
     ) -> Result<(), IngressError> {
-        let connector = self.find(connector_id).await?;
-        let Some(holders) = token_holders(&connector.settings) else {
-            // Never recorded: the first reconcile starts from the nodes
-            // assigned then, which includes these.
-            return Ok(());
-        };
-        let merged: BTreeSet<i32> = holders.iter().chain(node_ids).copied().collect();
-        if merged != holders {
-            self.save_token_holders(connector, &merged, None).await?;
-        }
-        Ok(())
+        let assigned: BTreeSet<i32> = ingress_connector_nodes::Entity::find()
+            .filter(ingress_connector_nodes::Column::ConnectorId.eq(connector_id))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|row| row.node_id)
+            .collect();
+        self.change_token_holders(
+            connector_id,
+            |stored| holders_with(stored, &assigned, node_ids),
+            None,
+        )
+        .await
     }
 
-    async fn save_token_holders(
+    /// Re-read the connector and replace its token holders with
+    /// `change(stored)`, storing `secret` with them when one was issued.
+    async fn change_token_holders(
         &self,
-        connector: ingress_connectors::Model,
-        holders: &BTreeSet<i32>,
+        connector_id: i32,
+        change: impl FnOnce(Option<BTreeSet<i32>>) -> BTreeSet<i32>,
         secret: Option<String>,
     ) -> Result<(), IngressError> {
+        let _guard = self.settings_lock.lock().await;
+        let connector = self.find(connector_id).await?;
+        let stored = token_holders(&connector.settings);
+        let holders = change(stored.clone());
+        if secret.is_none() && stored.as_ref() == Some(&holders) {
+            return Ok(());
+        }
         let mut settings = connector.settings.clone();
         if let serde_json::Value::Object(map) = &mut settings {
             map.insert(TOKEN_HOLDERS_KEY.into(), serde_json::json!(holders));
@@ -976,7 +1039,9 @@ impl IngressConnectorService {
     /// Rotate the secret of every tunnel a node that held it no longer runs
     /// (removed from the connector, or deleted from the cluster). The new
     /// secret changes the spec revision, so the nodes that stay restart with
-    /// it; the provider also cuts the departed nodes' open connections.
+    /// it; the provider also cuts the departed nodes' open connections, or
+    /// every connection when it cannot tell them apart. The departed nodes
+    /// stop counting as holders only once both have happened.
     async fn revoke_departed(&self) -> Result<(), IngressError> {
         let connectors = ingress_connectors::Entity::find()
             .order_by_asc(ingress_connectors::Column::Id)
@@ -995,36 +1060,40 @@ impl IngressConnectorService {
                 .collect();
             let current: BTreeSet<i32> = rows.iter().map(|row| row.node_id).collect();
             let Some(holders) = token_holders(&connector.settings) else {
-                self.save_token_holders(connector, &current, None).await?;
+                self.change_token_holders(
+                    connector.id,
+                    |stored| holders_with(stored, &current, &BTreeSet::new()),
+                    None,
+                )
+                .await?;
                 continue;
             };
-            let departed: Vec<i32> = holders.difference(&current).copied().collect();
+            let departed: BTreeSet<i32> = holders.difference(&current).copied().collect();
             if departed.is_empty() {
                 if !current.is_subset(&holders) {
-                    let merged = holders.union(&current).copied().collect();
-                    self.save_token_holders(connector, &merged, None).await?;
+                    self.add_token_holders(connector.id, &current).await?;
                 }
                 continue;
             }
             let Some(handle) = self.handle_of(&connector)? else {
                 // No secret was ever issued, so there is nothing to revoke.
-                self.save_token_holders(connector, &current, None).await?;
+                self.change_token_holders(
+                    connector.id,
+                    |stored| holders_after_revoke(stored, &departed, &current),
+                    None,
+                )
+                .await?;
                 continue;
             };
-            // Cut only connections no staying node holds, and only when every
-            // running node has said which connection is its own.
-            let keep: Option<HashSet<String>> = rows
-                .iter()
-                .filter(|row| row.state == "ready")
-                .map(|row| row.connector_ref.clone())
-                .collect();
+            let keep = connections_to_keep(&rows);
             let outcome = async {
                 self.provider_for(&connector)
                     .await?
-                    .rotate_secret(&handle, keep.as_ref())
+                    .rotate_secret(&handle, &keep)
                     .await
             }
             .await;
+            let departed_list: Vec<i32> = departed.iter().copied().collect();
             match outcome {
                 Ok(Some(secret)) => {
                     let sealed = self
@@ -1033,17 +1102,22 @@ impl IngressConnectorService {
                         .map_err(|e| IngressError::Encryption(e.to_string()))?;
                     info!(
                         connector_id = connector.id,
-                        ?departed,
+                        departed = ?departed_list,
+                        cut_all = keep.is_empty(),
                         "rotated tunnel secret after nodes left"
                     );
-                    self.save_token_holders(connector, &current, Some(sealed))
-                        .await?;
+                    self.change_token_holders(
+                        connector.id,
+                        |stored| holders_after_revoke(stored, &departed, &current),
+                        Some(sealed),
+                    )
+                    .await?;
                 }
                 Ok(None) => {
-                    let names = self.node_names(&departed).await?;
+                    let names = self.node_names(&departed_list).await?;
                     warn!(
                         connector_id = connector.id,
-                        ?departed,
+                        departed = ?departed_list,
                         "tunnel provider cannot rotate its secret"
                     );
                     self.record_rotation_error(
@@ -1055,8 +1129,8 @@ impl IngressConnectorService {
                     .await?;
                 }
                 Err(error) => {
-                    let names = self.node_names(&departed).await?;
-                    warn!(connector_id = connector.id, ?departed, %error, "could not rotate tunnel secret");
+                    let names = self.node_names(&departed_list).await?;
+                    warn!(connector_id = connector.id, departed = ?departed_list, %error, "could not rotate tunnel secret");
                     self.record_rotation_error(
                         connector,
                         format!(
@@ -1213,7 +1287,7 @@ impl IngressConnectorService {
                     if connector.model.status != "ready" || connector.zone.is_none() {
                         continue;
                     }
-                    if row.state == "published" {
+                    if has_record(&row.state) {
                         if let Ok(provider) = self.provider_for(&connector.model).await {
                             if let Some(handle) = self.handle_of(&connector.model)? {
                                 if let Err(error) = provider.unpublish(&handle, &row.hostname).await
@@ -1408,6 +1482,12 @@ impl IngressConnectorService {
             let Some(provider) = self.spec_provider(&connector.provider) else {
                 continue;
             };
+            // Recorded before the secret leaves, so removing this node later
+            // always rotates it, whatever the reconciler has seen.
+            if !token_holders(&connector.settings).is_some_and(|h| h.contains(&node_id)) {
+                self.add_token_holders(connector.id, &BTreeSet::from([node_id]))
+                    .await?;
+            }
             specs.push(provider.connector_spec(connector.id, &handle, connector.edge_port as u16));
         }
         Ok(NodeConnectorsResponse { connectors: specs })
@@ -1457,6 +1537,68 @@ impl IngressConnectorService {
             }
         });
     }
+}
+
+fn connector_view(
+    connector: ingress_connectors::Model,
+    node_rows: Vec<ingress_connector_nodes::Model>,
+    names: &HashMap<i32, String>,
+    publications: Vec<ingress_publications::Model>,
+) -> ConnectorView {
+    ConnectorView {
+        id: connector.id,
+        name: connector.name,
+        provider: connector.provider,
+        dns_provider_id: connector.dns_provider_id,
+        domain: connector.domain,
+        external_id: connector.external_id,
+        dns_target: connector
+            .settings
+            .get("cname_target")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        status: connector.status,
+        last_error: connector.last_error,
+        edge_port: connector.edge_port,
+        auto_publish: connector.auto_publish,
+        nodes: node_rows
+            .into_iter()
+            .map(|n| ConnectorNodeView {
+                node_name: names.get(&n.node_id).cloned().unwrap_or_default(),
+                node_id: n.node_id,
+                driver: n.driver,
+                state: n.state,
+                ready_connections: n.ready_connections,
+                last_error: n.last_error,
+                reported_at: n.reported_at,
+            })
+            .collect(),
+        publications: publications
+            .into_iter()
+            .map(|p| PublicationView {
+                hostname: p.hostname,
+                state: p.state,
+                last_error: p.last_error,
+                published_at: p.published_at,
+            })
+            .collect(),
+        created_at: connector.created_at,
+    }
+}
+
+/// `(page, page_size)`: page from 1, size 20 by default and at most 100.
+fn page_bounds(page: Option<u64>, page_size: Option<u64>) -> (u64, u64) {
+    (
+        page.unwrap_or(1).max(1),
+        page_size
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE),
+    )
+}
+
+/// Whether a publication in `state` has a DNS record out there.
+fn has_record(state: &str) -> bool {
+    state == "published" || state == STALE
 }
 
 /// The record name of `host` inside `domain`. Cloudflare's free certificate
@@ -1658,6 +1800,14 @@ impl Plan {
                         name_of(p.connector_id).unwrap_or_default()
                     ),
                 ),
+                Some(p) if p.state == STALE => (
+                    Some(p.connector_id),
+                    "error",
+                    format!(
+                        "{why} Its record still points at the previous instance of tunnel '{}', which no longer exists, until that is resolved.",
+                        name_of(p.connector_id).unwrap_or_default()
+                    ),
+                ),
                 _ => (connector, "not_published", why),
             },
         };
@@ -1715,6 +1865,51 @@ fn token_holders(settings: &serde_json::Value) -> Option<BTreeSet<i32>> {
     serde_json::from_value(settings.get(TOKEN_HOLDERS_KEY)?.clone()).ok()
 }
 
+/// The holders once `added` is recorded. Never recorded before, they start
+/// from every node `assigned` to the connector.
+fn holders_with(
+    stored: Option<BTreeSet<i32>>,
+    assigned: &BTreeSet<i32>,
+    added: &BTreeSet<i32>,
+) -> BTreeSet<i32> {
+    let mut holders = stored.unwrap_or_else(|| assigned.clone());
+    holders.extend(added);
+    holders
+}
+
+/// The holders once the secret is rotated away from `departed`. Nodes
+/// recorded meanwhile are kept, and so is every node still assigned.
+fn holders_after_revoke(
+    stored: Option<BTreeSet<i32>>,
+    departed: &BTreeSet<i32>,
+    current: &BTreeSet<i32>,
+) -> BTreeSet<i32> {
+    let mut holders: BTreeSet<i32> = stored
+        .unwrap_or_default()
+        .difference(departed)
+        .copied()
+        .collect();
+    holders.extend(current);
+    holders
+}
+
+/// The connections a rotation keeps: those the staying, running nodes say
+/// are theirs. When one of them has not said, nothing tells its connection
+/// from a departed node's, so none is kept and every node reconnects with
+/// the new secret.
+fn connections_to_keep(rows: &[&ingress_connector_nodes::Model]) -> HashSet<String> {
+    rows.iter()
+        .filter(|row| row.state == "ready")
+        .map(|row| row.connector_ref.clone())
+        .collect::<Option<HashSet<String>>>()
+        .unwrap_or_default()
+}
+
+/// Whether `ensure` replaced the tunnel publications point at.
+fn tunnel_replaced(before: Option<&str>, after: &str) -> bool {
+    before.is_some_and(|before| before != after)
+}
+
 /// The provider's new settings plus the keys the service owns: the setup
 /// answers and the token holders.
 fn keep_setup(old: &serde_json::Value, new: serde_json::Value) -> serde_json::Value {
@@ -1727,4 +1922,91 @@ fn keep_setup(old: &serde_json::Value, new: serde_json::Value) -> serde_json::Va
         }
     }
     serde_json::Value::Object(merged)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replica(
+        node_id: i32,
+        state: &str,
+        connector_ref: Option<&str>,
+    ) -> ingress_connector_nodes::Model {
+        ingress_connector_nodes::Model {
+            id: node_id,
+            connector_id: 1,
+            node_id,
+            driver: Some("process".into()),
+            state: state.into(),
+            ready_connections: None,
+            connector_ref: connector_ref.map(String::from),
+            last_error: None,
+            reported_at: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn set(ids: &[i32]) -> BTreeSet<i32> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn rotation_keeps_the_connections_of_running_nodes_that_named_theirs() {
+        let a = replica(1, "ready", Some("aaaa"));
+        let b = replica(2, "starting", None);
+        let keep = connections_to_keep(&[&a, &b]);
+        assert_eq!(keep, HashSet::from(["aaaa".to_string()]));
+    }
+
+    #[test]
+    fn rotation_cuts_every_connection_when_a_running_node_did_not_name_its_own() {
+        let a = replica(1, "ready", Some("aaaa"));
+        let b = replica(2, "ready", None);
+        assert!(connections_to_keep(&[&a, &b]).is_empty());
+    }
+
+    #[test]
+    fn holders_start_from_the_assignment_and_only_grow() {
+        assert_eq!(
+            holders_with(None, &set(&[1, 2]), &set(&[3])),
+            set(&[1, 2, 3])
+        );
+        assert_eq!(
+            holders_with(Some(set(&[4])), &set(&[1]), &set(&[3])),
+            set(&[3, 4])
+        );
+    }
+
+    #[test]
+    fn a_revoke_drops_only_the_departed_and_keeps_nodes_recorded_meanwhile() {
+        // 2 left; 5 fetched the secret while the provider rotated it.
+        let after = holders_after_revoke(Some(set(&[1, 2, 5])), &set(&[2]), &set(&[1]));
+        assert_eq!(after, set(&[1, 5]));
+        assert_eq!(
+            holders_after_revoke(None, &set(&[2]), &set(&[1])),
+            set(&[1])
+        );
+    }
+
+    #[test]
+    fn only_a_different_tunnel_id_marks_publications_stale() {
+        assert!(tunnel_replaced(Some("old"), "new"));
+        assert!(!tunnel_replaced(Some("same"), "same"));
+        assert!(!tunnel_replaced(None, "first"));
+    }
+
+    #[test]
+    fn stale_publications_still_have_a_record_to_remove() {
+        assert!(has_record("published"));
+        assert!(has_record(STALE));
+        assert!(!has_record("error"));
+    }
+
+    #[test]
+    fn pages_default_to_twenty_and_cap_at_one_hundred() {
+        assert_eq!(page_bounds(None, None), (1, 20));
+        assert_eq!(page_bounds(Some(0), Some(0)), (1, 1));
+        assert_eq!(page_bounds(Some(3), Some(500)), (3, 100));
+    }
 }

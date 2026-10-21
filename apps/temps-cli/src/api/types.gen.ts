@@ -5113,6 +5113,16 @@ export type ConnectorLinksView = {
     status: string;
 };
 
+/**
+ * One page of tunnels, newest first.
+ */
+export type ConnectorList = {
+    connectors: Array<ConnectorView>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
 export type ConnectorNodeView = {
     driver?: string | null;
     last_error?: string | null;
@@ -48397,12 +48407,21 @@ export type SetIncidentUpdateVisibilityResponse = SetIncidentUpdateVisibilityRes
 export type ListIngressConnectorsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (default 20, max 100)
+         */
+        page_size?: number | null;
+    };
     url: '/ingress/connectors';
 };
 
 export type ListIngressConnectorsResponses = {
-    200: Array<ConnectorView>;
+    200: ConnectorList;
 };
 
 export type ListIngressConnectorsResponse = ListIngressConnectorsResponses[keyof ListIngressConnectorsResponses];

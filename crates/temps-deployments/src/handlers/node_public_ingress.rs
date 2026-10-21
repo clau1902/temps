@@ -16,8 +16,6 @@ use std::time::Duration;
 
 use axum::extract::{Extension, Path, State};
 use axum::{http::StatusCode, response::IntoResponse, Json};
-use sea_orm::sea_query::OnConflict;
-use sea_orm::{ActiveValue::Set, EntityTrait};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
@@ -34,6 +32,7 @@ use crate::handlers::audit::{
     NodePublicIngressCheckedAudit, NodePublicIngressSettingsChangedAudit,
 };
 use crate::handlers::types::AppState;
+use crate::services::node_public_ingress::{NodePublicIngressError, PublicIngressChange};
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PublicIngressInterface {
@@ -231,24 +230,22 @@ fn view(node: &nodes::Model, row: Option<&node_public_ingress::Model>) -> Public
     }
 }
 
+impl From<NodePublicIngressError> for Problem {
+    fn from(error: NodePublicIngressError) -> Self {
+        match error {
+            NodePublicIngressError::Node(error) => Problem::from(error),
+            error @ (NodePublicIngressError::Load { .. } | NodePublicIngressError::Save { .. }) => {
+                internal(error.to_string())
+            }
+        }
+    }
+}
+
 async fn load(
     state: &AppState,
     node_id: i32,
 ) -> Result<(nodes::Model, Option<node_public_ingress::Model>), Problem> {
-    let node = state
-        .node_service
-        .get_by_id(node_id)
-        .await
-        .map_err(Problem::from)?;
-    let row = node_public_ingress::Entity::find_by_id(node_id)
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            internal(format!(
-                "Could not load ingress settings for node {node_id}: {e}"
-            ))
-        })?;
-    Ok((node, row))
+    Ok(state.node_public_ingress_service.load(node_id).await?)
 }
 
 #[utoipa::path(
@@ -361,57 +358,17 @@ pub async fn update_public_ingress_settings(
         _ => {}
     }
 
-    let now = chrono::Utc::now();
-    let row = node_public_ingress::ActiveModel {
-        node_id: Set(node_id),
-        listen_address: Set(listen_address.clone()),
-        http_port: Set(http_port as i32),
-        https_port: Set(https_port as i32),
-        public_address: Set(public_address.clone()),
-        interfaces: Set(None),
-        listening: Set(None),
-        mode: Set(None),
-        last_check: Set(None),
-        checked_at: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
+    let change = PublicIngressChange {
+        enabled: request.enabled,
+        listen_address,
+        http_port,
+        https_port,
+        public_address,
     };
-    // Turning off goes first, so no snapshot built between the two writes
-    // binds the new ports on a worker that is being turned off.
-    if !request.enabled {
-        state
-            .node_service
-            .set_public_ingress_enabled(node_id, false)
-            .await
-            .map_err(Problem::from)?;
-    }
-    node_public_ingress::Entity::insert(row)
-        .on_conflict(
-            OnConflict::column(node_public_ingress::Column::NodeId)
-                .update_columns([
-                    node_public_ingress::Column::ListenAddress,
-                    node_public_ingress::Column::HttpPort,
-                    node_public_ingress::Column::HttpsPort,
-                    node_public_ingress::Column::PublicAddress,
-                    node_public_ingress::Column::UpdatedAt,
-                ])
-                .to_owned(),
-        )
-        .exec(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            internal(format!(
-                "Could not save ingress settings for node {node_id}: {e}"
-            ))
-        })?;
-    // Also notifies agents, so the new listen settings go out at once.
-    if request.enabled {
-        state
-            .node_service
-            .set_public_ingress_enabled(node_id, true)
-            .await
-            .map_err(Problem::from)?;
-    }
+    state
+        .node_public_ingress_service
+        .save(node_id, &change)
+        .await?;
 
     let audit = NodePublicIngressSettingsChangedAudit {
         context: AuditContext {
@@ -420,11 +377,11 @@ pub async fn update_public_ingress_settings(
             user_agent: metadata.user_agent.clone(),
         },
         node_id,
-        enabled: request.enabled,
-        listen_address,
-        http_port,
-        https_port,
-        public_address,
+        enabled: change.enabled,
+        listen_address: change.listen_address,
+        http_port: change.http_port,
+        https_port: change.https_port,
+        public_address: change.public_address,
     };
     if let Err(error) = state.audit_service.create_audit_log(&audit).await {
         error!(node_id, %error, "public ingress settings changed but audit record failed");
@@ -464,31 +421,9 @@ pub async fn check_public_ingress(
         error!(node_id, %error, "public ingress checked but audit record failed");
     }
 
-    let now = chrono::Utc::now();
-    let stored = node_public_ingress::ActiveModel {
-        node_id: Set(node_id),
-        listen_address: Set(None),
-        http_port: Set(80),
-        https_port: Set(443),
-        public_address: Set(None),
-        interfaces: Set(None),
-        listening: Set(None),
-        mode: Set(None),
-        last_check: Set(Some(serde_json::json!(check))),
-        checked_at: Set(Some(now)),
-        created_at: Set(now),
-        updated_at: Set(now),
-    };
-    if let Err(e) = node_public_ingress::Entity::insert(stored)
-        .on_conflict(
-            OnConflict::column(node_public_ingress::Column::NodeId)
-                .update_columns([
-                    node_public_ingress::Column::LastCheck,
-                    node_public_ingress::Column::CheckedAt,
-                ])
-                .to_owned(),
-        )
-        .exec(state.db.as_ref())
+    if let Err(e) = state
+        .node_public_ingress_service
+        .record_check(node_id, serde_json::json!(check))
         .await
     {
         error!(node_id, error = %e, "could not store the ingress reachability check");

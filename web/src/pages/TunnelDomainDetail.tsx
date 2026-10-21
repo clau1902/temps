@@ -9,10 +9,8 @@ import { useEffect } from 'react'
 import { Link, useParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { ExternalLink } from 'lucide-react'
-import {
-  getIngressHostnameOptions,
-  listIngressConnectorsOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { getIngressHostnameOptions } from '@/api/client/@tanstack/react-query.gen'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import type { ConnectorView, HostnameView } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -34,7 +32,13 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { problemDetail } from '@/lib/api-problem'
 
-function Fact({ label, children }: { label: string; children: React.ReactNode }) {
+function Fact({
+  label,
+  children,
+}: {
+  label: string
+  children: React.ReactNode
+}) {
   return (
     <div className="grid gap-1 sm:grid-cols-[180px_1fr]">
       <dt className="text-sm text-muted-foreground">{label}</dt>
@@ -176,8 +180,8 @@ function HostnameDetail({ view }: { view: HostnameView }) {
               'Yes, on a worker'
             ) : (
               <span className="text-muted-foreground">
-                Not yet. Add it to an environment&apos;s domains and deploy
-                on a worker.
+                Not yet. Add it to an environment&apos;s domains and deploy on a
+                worker.
               </span>
             )}
           </Fact>
@@ -207,7 +211,7 @@ export function TunnelDomainDetail() {
   usePageTitle(`${hostname} - Domain Details`)
 
   const connectorsQuery = useQuery({
-    ...listIngressConnectorsOptions(),
+    ...allTunnelsOptions(),
     enabled: !!zone,
     refetchInterval: 15_000,
     retry: false,
@@ -249,7 +253,8 @@ export function TunnelDomainDetail() {
           <Alert>
             <AlertTitle>No tunnel covers {zone}</AlertTitle>
             <AlertDescription>
-              It may have been deleted. <Link to="/domains">Back to Domains</Link>
+              It may have been deleted.{' '}
+              <Link to="/domains">Back to Domains</Link>
             </AlertDescription>
           </Alert>
         )

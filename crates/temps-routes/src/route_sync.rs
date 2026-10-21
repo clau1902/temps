@@ -912,7 +912,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
 
@@ -924,7 +924,7 @@ mod tests {
     use crate::route_table::BackendEntry;
     use crate::test_utils::TestDBMockOperations;
 
-    fn test_node(public_ingress_enabled: bool) -> nodes::Model {
+    pub(crate) fn test_node(public_ingress_enabled: bool) -> nodes::Model {
         let now = chrono::Utc::now();
         nodes::Model {
             id: 7,

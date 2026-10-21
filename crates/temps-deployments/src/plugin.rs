@@ -1032,6 +1032,12 @@ impl TempsPlugin for DeploymentsPlugin {
             sensitive_action_authorizer: sensitive_action_authorizer.clone(),
         };
 
+        let node_public_ingress_service = Arc::new(
+            crate::services::node_public_ingress::NodePublicIngressService::new(
+                db.clone(),
+                node_service.clone(),
+            ),
+        );
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -1047,6 +1053,7 @@ impl TempsPlugin for DeploymentsPlugin {
             data_dir,
             image_builder,
             audit_service,
+            node_public_ingress_service,
             node_service,
             node_scheduler,
             encryption_service,

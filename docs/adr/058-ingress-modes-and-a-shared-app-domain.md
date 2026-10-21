@@ -399,13 +399,21 @@ for hosts with a certificate, and tunnel traffic arrives as plain HTTP.
   by the API after they are saved, and their use is audited.
 - A node that stops running a tunnel still holds its secret, which would let
   it keep receiving the tunnel's traffic from anywhere. So the connector
-  records every node handed the current secret; when one of them is removed
-  from the connector or deleted from the cluster, the next reconcile (within
-  a minute) rotates the secret at the provider (Cloudflare: a new
+  records every node handed the current secret, before it is handed (on
+  assignment and again when the node fetches its spec); when one of them is
+  removed from the connector or deleted from the cluster, the next reconcile
+  (within a minute) rotates the secret at the provider (Cloudflare: a new
   `tunnel_secret`). The new secret changes the spec revision, so the nodes
   that stay restart with it, and open connections no staying node reports as
-  its own are cut. A failed rotation puts the connector in error, naming the
-  nodes that still hold a working secret, and is retried every minute.
+  its own are cut. When a running node has not reported which connection is
+  its own, every connection is cut and the staying nodes reconnect with the
+  new secret. The departed nodes stop counting as holders only once the
+  secret is rotated and their connections are cut; a failed rotation puts
+  the connector in error, naming the nodes that still hold a working secret,
+  and is retried every minute.
+- A tunnel deleted at the provider is created again on sync. Every hostname
+  it carried is then marked stale and published again through the new
+  tunnel, so no DNS record keeps pointing at the one that is gone.
 - A tunnel is reused only by the id this connector stored, never adopted by
   name: two installs sharing a provider account and picking the same
   connector name would otherwise become replicas of one tunnel, one

@@ -4,11 +4,14 @@
 // Tunnels on a worker (ADR 058 D8). Everything provider-specific comes from
 // the provider's descriptor, so a new provider needs no code here.
 
+import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, Loader2, RefreshCw, Trash2, XCircle } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useForm, type UseFormReturn } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import { z } from 'zod'
 import {
   createIngressConnectorMutation,
   deleteIngressConnectorMutation,
@@ -19,6 +22,7 @@ import {
   setIngressConnectorNodesMutation,
   syncIngressConnectorMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import type {
   ConnectorNodeView,
   ConnectorView,
@@ -40,8 +44,16 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import {
   Select,
   SelectContent,
@@ -49,6 +61,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Skeleton } from '@/components/ui/skeleton'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 
@@ -89,11 +102,14 @@ export function WorkerTunnels({
     useSensitiveActionVerification()
   const providersQuery = useQuery(listIngressProvidersOptions())
   const connectorsQuery = useQuery({
-    ...listIngressConnectorsOptions(),
+    ...allTunnelsOptions(),
     // Replicas report every few seconds.
     refetchInterval: 10_000,
   })
+  // Kept after closing, so the dialog closes on the same provider and the
+  // answers survive a cancel.
   const [setupFor, setSetupFor] = useState<ProviderInfo | null>(null)
+  const [setupOpen, setSetupOpen] = useState(false)
   const [deleting, setDeleting] = useState<ConnectorView | null>(null)
 
   const refresh = () =>
@@ -149,9 +165,10 @@ export function WorkerTunnels({
 
   if (providersQuery.isLoading || connectorsQuery.isLoading) {
     return (
-      <p className="flex items-center gap-2 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" /> Loading tunnels…
-      </p>
+      <div className="grid gap-3 md:grid-cols-2" aria-busy="true">
+        <Skeleton className="h-36 w-full" />
+        <Skeleton className="h-36 w-full" />
+      </div>
     )
   }
 
@@ -289,7 +306,13 @@ export function WorkerTunnels({
                 ))}
               </ul>
               <div className="mt-auto flex items-center gap-2 pt-1">
-                <Button size="sm" onClick={() => setSetupFor(provider)}>
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setSetupFor(provider)
+                    setSetupOpen(true)
+                  }}
+                >
                   Set up
                 </Button>
                 {provider.docs_url && (
@@ -309,14 +332,13 @@ export function WorkerTunnels({
         </div>
       )}
 
-      {setupFor && (
-        <ProviderSetupDialog
-          provider={setupFor}
-          node={node}
-          onClose={() => setSetupFor(null)}
-          onCreated={refresh}
-        />
-      )}
+      <ProviderSetupDialog
+        open={setupOpen}
+        onOpenChange={setSetupOpen}
+        provider={setupFor}
+        node={node}
+        onCreated={refresh}
+      />
       <ConfirmDeleteDialog
         open={deleting !== null}
         onOpenChange={(open) => !open && setDeleting(null)}
@@ -326,7 +348,9 @@ export function WorkerTunnels({
           deleting &&
           `Apps under ${deleting.domain} stop being reachable through it, on every worker that runs it. Temps removes the tunnel and its DNS records at ${providerName(deleting.provider)}.`
         }
-        onConfirm={() => deleting && remove.mutate({ path: { id: deleting.id } })}
+        onConfirm={() =>
+          deleting && remove.mutate({ path: { id: deleting.id } })
+        }
       />
       {verificationDialog}
     </div>
@@ -360,183 +384,296 @@ function defaultName(node: NodeInfoResponse) {
   return (name || `worker-${node.id}`).slice(0, 50)
 }
 
-/** The setup form, rendered from the provider's fields. */
+/** A managed domain as picked: a zone and an optional label under it. */
+interface DomainPick {
+  zone: string
+  subdomain: string
+}
+
+const EMPTY_PICK: DomainPick = { zone: '', subdomain: '' }
+const TUNNEL_NAME = /^[A-Za-z0-9-]{1,50}$/
+const DNS_LABELS =
+  /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/
+
+function subdomainLabel(subdomain: string) {
+  return subdomain.trim().toLowerCase().replace(/\.+$/, '')
+}
+
+/** The answers for a provider: its own fields, checked against its descriptor. */
+function setupSchema(provider: ProviderInfo | null) {
+  const fields = provider?.fields ?? []
+  return z
+    .object({
+      name: z
+        .string()
+        .trim()
+        .regex(TUNNEL_NAME, 'Use 1-50 letters, digits or hyphens.'),
+      values: z.record(z.string(), z.string()),
+      picks: z.record(
+        z.string(),
+        z.object({ zone: z.string(), subdomain: z.string() })
+      ),
+    })
+    .superRefine((data, ctx) => {
+      for (const field of fields) {
+        if (field.kind.type === 'managed_domain') {
+          const pick = data.picks[field.key] ?? EMPTY_PICK
+          const label = subdomainLabel(pick.subdomain)
+          if (field.required && !pick.zone) {
+            ctx.addIssue({
+              code: 'custom',
+              path: ['picks', field.key],
+              message: 'Choose a domain.',
+            })
+          } else if (label && !DNS_LABELS.test(label)) {
+            ctx.addIssue({
+              code: 'custom',
+              path: ['picks', field.key],
+              message:
+                'The subdomain takes letters, digits, hyphens and dots only.',
+            })
+          }
+        } else if (field.required && !data.values[field.key]?.trim()) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['values', field.key],
+            message: `${field.label} is required.`,
+          })
+        }
+      }
+    })
+}
+
+type SetupValues = z.infer<ReturnType<typeof setupSchema>>
+
+function setupDefaults(node: NodeInfoResponse): SetupValues {
+  return { name: defaultName(node), values: {}, picks: {} }
+}
+
+/** The values the API takes: a picked domain becomes one hostname. */
+function providerValues(provider: ProviderInfo, answers: SetupValues) {
+  const values: Record<string, string> = {}
+  for (const [key, value] of Object.entries(answers.values)) {
+    if (value.trim()) values[key] = value
+  }
+  for (const field of provider.fields) {
+    if (field.kind.type !== 'managed_domain') continue
+    const pick = answers.picks[field.key] ?? EMPTY_PICK
+    const label = subdomainLabel(pick.subdomain)
+    const domain = pick.zone && label ? `${label}.${pick.zone}` : pick.zone
+    if (domain) values[field.key] = domain
+  }
+  return values
+}
+
+/**
+ * The setup form, rendered from the provider's fields. Stays mounted: the
+ * answers survive closing it, and are cleared once the tunnel is created
+ * or another provider is picked.
+ */
 function ProviderSetupDialog({
+  open,
+  onOpenChange,
   provider,
   node,
-  onClose,
   onCreated,
 }: {
-  provider: ProviderInfo
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  provider: ProviderInfo | null
   node: NodeInfoResponse
-  onClose: () => void
   onCreated: () => Promise<unknown>
 }) {
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
-  const [name, setName] = useState(defaultName(node))
-  const [values, setValues] = useState<Record<string, string>>({})
-  const set = (key: string, value: string) =>
-    setValues((current) => {
-      const next = { ...current, [key]: value }
-      // A domain belongs to the DNS provider it was picked under.
-      for (const field of provider.fields) {
-        if (
-          field.kind.type === 'managed_domain' &&
-          field.kind.provider_field === key
-        ) {
-          delete next[field.key]
-        }
-      }
-      return next
-    })
+  const schema = useMemo(() => setupSchema(provider), [provider])
+  const form = useForm<SetupValues>({
+    resolver: zodResolver(schema),
+    defaultValues: setupDefaults(node),
+  })
+  const providerKind = provider?.kind
+  useEffect(() => {
+    form.reset(setupDefaults(node))
+    // A different provider asks different questions; the node's name is
+    // only the starting value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providerKind])
 
   const create = useMutation({
     ...createIngressConnectorMutation(),
     onSuccess: async (connector) => {
       toast.success(
         connector.status === 'ready'
-          ? `${provider.name} created. The worker connects within a few seconds.`
-          : `${provider.name} saved`
+          ? `${provider?.name ?? 'Tunnel'} created. The worker connects within a few seconds.`
+          : `${provider?.name ?? 'Tunnel'} saved`
       )
       await onCreated()
-      onClose()
+      onOpenChange(false)
+      form.reset(setupDefaults(node))
     },
     onError: (error, variables) => {
       if (handleSensitiveActionError(error, () => create.mutate(variables)))
         return
-      toast.error(`Could not set up ${provider.name}`, {
+      toast.error(`Could not set up ${provider?.name ?? 'the tunnel'}`, {
         description: problemDetail(error, 'Check the answers and try again.'),
       })
     },
   })
 
-  const missing = provider.fields.some(
-    (f) => f.required && !values[f.key]?.trim()
-  )
+  const submit = form.handleSubmit((answers) => {
+    if (!provider) return
+    create.mutate({
+      body: {
+        name: answers.name.trim(),
+        provider: provider.kind,
+        values: providerValues(provider, answers),
+        node_ids: [node.id],
+      },
+    })
+  })
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Set up {provider.name}</DialogTitle>
-          <DialogDescription>{provider.summary}</DialogDescription>
-        </DialogHeader>
-        <div className="space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="tunnel-name">Name</Label>
-            <Input
-              id="tunnel-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              Lowercase letters, digits and hyphens. Other workers can run the
-              same tunnel later for failover.
-            </p>
-          </div>
-          {provider.fields.map((field) => (
-            <SetupFieldInput
-              key={field.key}
-              field={field}
-              values={values}
-              onChange={(value) => set(field.key, value)}
-            />
-          ))}
-        </div>
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            disabled={missing || !name.trim() || create.isPending}
-            onClick={() =>
-              create.mutate({
-                body: {
-                  name: name.trim(),
-                  provider: provider.kind,
-                  values,
-                  node_ids: [node.id],
-                },
-              })
-            }
-          >
-            {create.isPending && (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            )}
-            Create and run on {node.name}
-          </Button>
-        </DialogFooter>
-        {verificationDialog}
-      </DialogContent>
-    </Dialog>
+    <>
+      <Dialog open={open && provider !== null} onOpenChange={onOpenChange}>
+        <DialogContent>
+          {provider && (
+            <Form {...form}>
+              <form onSubmit={submit} className="space-y-4">
+                <DialogHeader>
+                  <DialogTitle>Set up {provider.name}</DialogTitle>
+                  <DialogDescription>{provider.summary}</DialogDescription>
+                </DialogHeader>
+                <FormField
+                  control={form.control}
+                  name="name"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Name</FormLabel>
+                      <FormControl>
+                        <Input autoComplete="off" {...field} />
+                      </FormControl>
+                      <FormDescription>
+                        Lowercase letters, digits and hyphens. Other workers can
+                        run the same tunnel later for failover.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                {provider.fields.map((field) => (
+                  <SetupFieldInput
+                    key={field.key}
+                    field={field}
+                    provider={provider}
+                    form={form}
+                  />
+                ))}
+                <DialogFooter>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    onClick={() => onOpenChange(false)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button type="submit" disabled={create.isPending}>
+                    {create.isPending && (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    )}
+                    Create and run on {node.name}
+                  </Button>
+                </DialogFooter>
+              </form>
+            </Form>
+          )}
+        </DialogContent>
+      </Dialog>
+      {verificationDialog}
+    </>
   )
 }
 
 function SetupFieldInput({
   field,
-  values,
-  onChange,
+  provider,
+  form,
 }: {
   field: SetupField
-  values: Record<string, string>
-  onChange: (value: string) => void
+  provider: ProviderInfo
+  form: UseFormReturn<SetupValues>
 }) {
-  const id = `setup-${field.key}`
-  const value = values[field.key] ?? ''
-  let control: React.ReactNode
-  switch (field.kind.type) {
-    case 'dns_provider':
-      control = (
-        <DnsProviderSelect
-          id={id}
-          providerType={field.kind.provider_type ?? null}
-          value={value}
-          onChange={onChange}
-        />
-      )
-      break
-    case 'managed_domain':
-      control = (
-        <ManagedDomainSelect
-          key={values[field.kind.provider_field] ?? ''}
-          id={id}
-          providerId={Number(values[field.kind.provider_field]) || null}
-          allowSubdomain={field.kind.allow_subdomain ?? false}
-          onChange={onChange}
-        />
-      )
-      break
-    default:
-      control = (
-        <Input
-          id={id}
-          type={field.kind.type === 'secret' ? 'password' : 'text'}
-          autoComplete="off"
-          placeholder={field.placeholder ?? undefined}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-        />
-      )
+  const help = field.help && <FormDescription>{field.help}</FormDescription>
+  if (field.kind.type === 'managed_domain') {
+    const providerField = field.kind.provider_field
+    const allowSubdomain = field.kind.allow_subdomain ?? false
+    return (
+      <FormField
+        control={form.control}
+        name={`picks.${field.key}`}
+        render={({ field: control }) => (
+          <FormItem>
+            <FormLabel>{field.label}</FormLabel>
+            <ManagedDomainSelect
+              providerId={Number(form.watch(`values.${providerField}`)) || null}
+              allowSubdomain={allowSubdomain}
+              value={control.value ?? EMPTY_PICK}
+              onChange={control.onChange}
+            />
+            {help}
+            <FormMessage />
+          </FormItem>
+        )}
+      />
+    )
   }
   return (
-    <div className="space-y-1.5">
-      <Label htmlFor={id}>{field.label}</Label>
-      {control}
-      {field.help && (
-        <p className="text-xs text-muted-foreground">{field.help}</p>
+    <FormField
+      control={form.control}
+      name={`values.${field.key}`}
+      render={({ field: control }) => (
+        <FormItem>
+          <FormLabel>{field.label}</FormLabel>
+          {field.kind.type === 'dns_provider' ? (
+            <DnsProviderSelect
+              providerType={field.kind.provider_type ?? null}
+              value={control.value ?? ''}
+              onChange={(value) => {
+                control.onChange(value)
+                // A domain belongs to the DNS provider it was picked under.
+                for (const other of provider.fields) {
+                  if (
+                    other.kind.type === 'managed_domain' &&
+                    other.kind.provider_field === field.key
+                  ) {
+                    form.setValue(`picks.${other.key}`, EMPTY_PICK)
+                  }
+                }
+              }}
+            />
+          ) : (
+            <FormControl>
+              <Input
+                type={field.kind.type === 'secret' ? 'password' : 'text'}
+                autoComplete="off"
+                placeholder={field.placeholder ?? undefined}
+                {...control}
+                value={control.value ?? ''}
+              />
+            </FormControl>
+          )}
+          {help}
+          <FormMessage />
+        </FormItem>
       )}
-    </div>
+    />
   )
 }
 
 function DnsProviderSelect({
-  id,
   providerType,
   value,
   onChange,
 }: {
-  id: string
   providerType: string | null
   value: string
   onChange: (value: string) => void
@@ -548,7 +685,7 @@ function DnsProviderSelect({
       (!providerType || p.provider_type.toLowerCase() === providerType)
   )
   if (query.isLoading) {
-    return <p className="text-sm text-muted-foreground">Loading…</p>
+    return <Skeleton className="h-9 w-full" />
   }
   if (providers.length === 0) {
     return (
@@ -565,9 +702,11 @@ function DnsProviderSelect({
   }
   return (
     <Select value={value} onValueChange={onChange}>
-      <SelectTrigger id={id}>
-        <SelectValue placeholder="Choose…" />
-      </SelectTrigger>
+      <FormControl>
+        <SelectTrigger>
+          <SelectValue placeholder="Choose…" />
+        </SelectTrigger>
+      </FormControl>
       <SelectContent>
         {providers.map((p) => (
           <SelectItem key={p.id} value={String(p.id)}>
@@ -580,39 +719,34 @@ function DnsProviderSelect({
 }
 
 function ManagedDomainSelect({
-  id,
   providerId,
   allowSubdomain,
+  value,
   onChange,
 }: {
-  id: string
   providerId: number | null
   allowSubdomain: boolean
-  onChange: (value: string) => void
+  value: DomainPick
+  onChange: (value: DomainPick) => void
 }) {
   const query = useQuery({
     ...listManagedDomainsOptions({ path: { id: providerId ?? 0 } }),
     enabled: providerId != null,
   })
-  const [zone, setZone] = useState('')
-  const [subdomain, setSubdomain] = useState('')
-  const pick = (nextZone: string, nextSubdomain: string) => {
-    setZone(nextZone)
-    setSubdomain(nextSubdomain)
-    const label = nextSubdomain.trim().toLowerCase().replace(/\.+$/, '')
-    onChange(nextZone && label ? `${label}.${nextZone}` : nextZone)
-  }
+  const { zone, subdomain } = value
   if (providerId == null) {
     return (
       <Select disabled>
-        <SelectTrigger id={id}>
-          <SelectValue placeholder="Choose the account first" />
-        </SelectTrigger>
+        <FormControl>
+          <SelectTrigger>
+            <SelectValue placeholder="Choose the account first" />
+          </SelectTrigger>
+        </FormControl>
       </Select>
     )
   }
   if (query.isLoading) {
-    return <p className="text-sm text-muted-foreground">Loading…</p>
+    return <Skeleton className="h-9 w-full" />
   }
   const domains = query.data ?? []
   if (domains.length === 0) {
@@ -628,7 +762,7 @@ function ManagedDomainSelect({
       </Alert>
     )
   }
-  const label = subdomain.trim().toLowerCase().replace(/\.+$/, '')
+  const label = subdomainLabel(subdomain)
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2">
@@ -640,15 +774,20 @@ function ManagedDomainSelect({
               placeholder="subdomain"
               autoComplete="off"
               value={subdomain}
-              onChange={(e) => pick(zone, e.target.value)}
+              onChange={(e) => onChange({ zone, subdomain: e.target.value })}
             />
             <span className="text-muted-foreground">.</span>
           </>
         )}
-        <Select value={zone} onValueChange={(next) => pick(next, subdomain)}>
-          <SelectTrigger id={id} className="flex-1">
-            <SelectValue placeholder="Choose…" />
-          </SelectTrigger>
+        <Select
+          value={zone}
+          onValueChange={(next) => onChange({ zone: next, subdomain })}
+        >
+          <FormControl>
+            <SelectTrigger className="flex-1">
+              <SelectValue placeholder="Choose…" />
+            </SelectTrigger>
+          </FormControl>
           <SelectContent>
             {domains.map((d) => (
               <SelectItem key={d.id} value={d.domain}>

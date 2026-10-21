@@ -29,6 +29,8 @@ List tunnels, what each publishes and the workers it runs on
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--page <page>` | Page number (1-indexed) | `1` | No |
+| `--page-size <pageSize>` | Items per page (max 100) | `20` | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `tunnels workers`

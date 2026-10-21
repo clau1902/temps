@@ -1666,22 +1666,34 @@ impl NodeService {
             occupied_changed = node.occupied_ranges.as_ref() != Some(&value);
             active.occupied_ranges = Set(Some(value));
         }
-        active.update(self.db.as_ref()).await?;
-        if let Some(cidr) = ready_cidr {
-            // Only while it is still this node's allocation: a pool change or
-            // a remediation may have re-assigned it after this agent applied
-            // it. Recording the old subnet as ready then would let the next
-            // pool change treat the new one as free. The pool change holds
-            // this row locked, so the two cannot interleave.
-            nodes::Entity::update_many()
-                .col_expr(
-                    nodes::Column::OverlayReadyCidr,
-                    sea_orm::sea_query::Expr::value(Some(cidr.clone())),
-                )
-                .filter(nodes::Column::Id.eq(node_id))
-                .filter(nodes::Column::ComputeCidr.eq(cidr))
-                .exec(self.db.as_ref())
-                .await?;
+        match ready_cidr {
+            // The ready status and the subnet it was reported on commit
+            // together: a pool change that saw "ready" without the applied
+            // subnet would treat a running overlay as never applied and move
+            // it.
+            Some(cidr) => {
+                let txn = self.db.begin().await?;
+                active.update(&txn).await?;
+                // Only while it is still this node's allocation: a pool
+                // change or a remediation may have re-assigned it after this
+                // agent applied it. Recording the old subnet as ready then
+                // would let the next pool change treat the new one as free.
+                // The update above holds this row locked until commit, and
+                // the pool change locks it too, so the two cannot interleave.
+                nodes::Entity::update_many()
+                    .col_expr(
+                        nodes::Column::OverlayReadyCidr,
+                        sea_orm::sea_query::Expr::value(Some(cidr.clone())),
+                    )
+                    .filter(nodes::Column::Id.eq(node_id))
+                    .filter(nodes::Column::ComputeCidr.eq(cidr))
+                    .exec(&txn)
+                    .await?;
+                txn.commit().await?;
+            }
+            None => {
+                active.update(self.db.as_ref()).await?;
+            }
         }
         if occupied_changed {
             self.remediate_overlay_allocation(node_id).await;

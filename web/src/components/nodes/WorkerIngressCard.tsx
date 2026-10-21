@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ScrollRegion } from '@/components/ui/scroll-region'
+import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CheckCircle2,
@@ -11,17 +12,19 @@ import {
   Radar,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import { z } from 'zod'
 import {
   adminCheckNodePublicIngressMutation,
   adminGetNodeOptions,
   adminGetNodePublicIngressSettingsOptions,
   adminListNodesOptions,
   adminUpdateNodePublicIngressSettingsMutation,
-  listIngressConnectorsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import type {
   NodeInfoResponse,
   PublicIngressCheck,
@@ -37,8 +40,16 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import {
   Select,
   SelectContent,
@@ -46,6 +57,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { WorkerIngressSummary } from '@/components/nodes/WorkerIngressSummary'
 import { WorkerTunnels } from '@/components/nodes/WorkerTunnels'
@@ -61,12 +73,47 @@ import {
 
 const AUTOMATIC = '__automatic__'
 
-interface Draft {
-  enabled: boolean
-  listen: string
-  publicAddress: string
-  httpPort: string
-  httpsPort: string
+const port = z
+  .string()
+  .trim()
+  .regex(/^\d+$/, 'Enter a port number.')
+  .refine(
+    (p) => Number(p) >= 1 && Number(p) <= 65535,
+    'Use a port from 1 to 65535.'
+  )
+
+/** The open-ports settings, checked as the API checks them. */
+const draftSchema = z
+  .object({
+    enabled: z.boolean(),
+    listen: z.string(),
+    publicAddress: z
+      .string()
+      .trim()
+      .refine(
+        (a) => !a || addressScope(a) !== undefined,
+        'Enter an IP address: the one your DNS A or AAAA record points at.'
+      )
+      .refine((a) => {
+        const scope = a ? addressScope(a) : undefined
+        return scope === undefined || scope === 'public'
+      }, 'Visitors on the internet cannot reach this address. Use a public IP.'),
+    httpPort: port,
+    httpsPort: port,
+  })
+  .refine((d) => d.httpPort.trim() !== d.httpsPort.trim(), {
+    path: ['httpsPort'],
+    message: 'HTTP and HTTPS need two different ports.',
+  })
+
+type Draft = z.infer<typeof draftSchema>
+
+const EMPTY_DRAFT: Draft = {
+  enabled: false,
+  listen: AUTOMATIC,
+  publicAddress: '',
+  httpPort: '80',
+  httpsPort: '443',
 }
 
 function draftFrom(settings: PublicIngressSettings): Draft {
@@ -91,10 +138,24 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
     refetchInterval: 10_000,
   })
   const settings = settingsQuery.data
-  const [draft, setDraft] = useState<Draft | null>(null)
+  const reported = useMemo(
+    () => (settings ? draftFrom(settings) : undefined),
+    [settings]
+  )
+  const form = useForm<Draft>({
+    resolver: zodResolver(draftSchema),
+    mode: 'onChange',
+    defaultValues: EMPTY_DRAFT,
+    // Follows what the worker reports, without overwriting the operator's
+    // unsaved edits.
+    values: reported,
+    resetOptions: { keepDirtyValues: true },
+  })
+  const watched = useWatch({ control: form.control })
+  const draft: Draft | null = settings ? { ...EMPTY_DRAFT, ...watched } : null
   const [check, setCheck] = useState<PublicIngressCheck | null>(null)
   // Shared with WorkerTunnels' query, so no extra request.
-  const connectorsQuery = useQuery(listIngressConnectorsOptions())
+  const connectorsQuery = useQuery(allTunnelsOptions())
   const tunnelHere = (connectorsQuery.data ?? []).some((c) =>
     c.nodes.some((n) => n.node_id === node.id)
   )
@@ -102,10 +163,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   const [directOpen, setDirectOpen] = useState<boolean | null>(null)
   // The page reports how traffic gets in; changing it is a deliberate step.
   const [editing, setEditing] = useState(false)
-
-  useEffect(() => {
-    if (settings && draft === null) setDraft(draftFrom(settings))
-  }, [settings, draft])
+  const [portsOpen, setPortsOpen] = useState(false)
 
   const refresh = async () => {
     await Promise.all([
@@ -131,7 +189,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
           ? 'Saved. The worker applies it within a few seconds.'
           : 'Public ingress turned off'
       )
-      setDraft(draftFrom(saved))
+      form.reset(draftFrom(saved))
       setCheck(null)
       await refresh()
     },
@@ -178,12 +236,12 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   const listenScope = listenIp ? addressScope(listenIp) : undefined
   const publicIp = draft?.publicAddress.trim() || undefined
   const publicScope = publicIp ? addressScope(publicIp) : undefined
-  const dirty = useMemo(
-    () =>
-      !!settings &&
-      !!draft &&
-      JSON.stringify(draft) !== JSON.stringify(draftFrom(settings)),
-    [settings, draft]
+  const dirty = form.formState.isDirty
+  const { errors } = form.formState
+  // A port the API would refuse opens the ports so the reason is visible.
+  const portError = !!errors.httpPort || !!errors.httpsPort
+  const saveDraft = form.handleSubmit((values) =>
+    save({ ...values, enabled: true })
   )
   // The worker decides what may change here (ADR 058 D7). Agents that
   // predate modes report none and keep the old, console-managed behaviour.
@@ -263,10 +321,17 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
         </div>
 
         {settingsQuery.isLoading && (
-          <p className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" /> Loading ingress
-            settings…
-          </p>
+          <div className="space-y-3" aria-busy="true">
+            {[0, 1, 2].map((row) => (
+              <div
+                key={row}
+                className="grid gap-1 sm:grid-cols-[10rem_1fr] sm:gap-4"
+              >
+                <Skeleton className="h-4 w-24" />
+                <Skeleton className="h-4 w-full max-w-sm" />
+              </div>
+            ))}
+          </div>
         )}
 
         {settings && !editing && (
@@ -349,10 +414,16 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
                     checked={enabled}
                     disabled={!draft || update.isPending}
                     onCheckedChange={(on) => {
-                      if (!draft) return
-                      const next = { ...draft, enabled: on }
-                      setDraft(next)
-                      save(next)
+                      if (!draft || !settings) return
+                      if (on) {
+                        // Turning on saves the settings below: check them.
+                        form.setValue('enabled', true)
+                        setDirectOpen(true)
+                        void saveDraft()
+                      } else {
+                        // Turning off keeps the saved settings for next time.
+                        save({ ...draftFrom(settings), enabled: false })
+                      }
                     }}
                   />
                 </div>
@@ -384,166 +455,188 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
                       </Alert>
                     )}
 
-                    <div className="grid gap-4 md:grid-cols-2">
-                      <div className="space-y-1.5">
-                        <Label htmlFor={`ingress-listen-${node.id}`}>
-                          Listen on
-                        </Label>
-                        <Select
-                          value={draft.listen}
-                          onValueChange={(listen) =>
-                            setDraft({ ...draft, listen })
-                          }
-                          disabled={listenLocked}
-                        >
-                          <SelectTrigger id={`ingress-listen-${node.id}`}>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value={AUTOMATIC}>
-                              Automatic
-                              {automatic
-                                ? ` (${automatic.name} · ${automatic.address})`
-                                : ''}
-                            </SelectItem>
-                            {settings.interfaces.map((i) => (
-                              <SelectItem
-                                key={`${i.name}-${i.address}`}
-                                value={i.address}
-                              >
-                                {i.name} · {i.address} · {scopeLabel(i.scope)}
-                              </SelectItem>
-                            ))}
-                            {draft.listen !== AUTOMATIC &&
-                              !settings.interfaces.some(
-                                (i) => i.address === draft.listen
-                              ) && (
-                                <SelectItem value={draft.listen}>
-                                  {draft.listen} (not reported by the worker)
-                                </SelectItem>
-                              )}
-                          </SelectContent>
-                        </Select>
-                        <p className="text-xs text-muted-foreground">
-                          An address of this machine. Automatic follows the
-                          default route.
-                        </p>
-                      </div>
-                      <div className="space-y-1.5">
-                        <Label htmlFor={`ingress-public-${node.id}`}>
-                          Public address
-                        </Label>
-                        <Input
-                          id={`ingress-public-${node.id}`}
-                          placeholder={
-                            listenScope === 'public' && listenIp
-                              ? `${listenIp} (same as listen address)`
-                              : 'Your router’s public IP, e.g. 203.0.113.7'
-                          }
-                          value={draft.publicAddress}
-                          onChange={(e) =>
-                            setDraft({
-                              ...draft,
-                              publicAddress: e.target.value,
-                            })
-                          }
+                    <Form {...form}>
+                      <form onSubmit={saveDraft} className="space-y-4">
+                        <div className="grid gap-4 md:grid-cols-2">
+                          <FormField
+                            control={form.control}
+                            name="listen"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>Listen on</FormLabel>
+                                <Select
+                                  value={field.value}
+                                  onValueChange={field.onChange}
+                                  disabled={listenLocked}
+                                >
+                                  <FormControl>
+                                    <SelectTrigger>
+                                      <SelectValue />
+                                    </SelectTrigger>
+                                  </FormControl>
+                                  <SelectContent>
+                                    <SelectItem value={AUTOMATIC}>
+                                      Automatic
+                                      {automatic
+                                        ? ` (${automatic.name} · ${automatic.address})`
+                                        : ''}
+                                    </SelectItem>
+                                    {settings.interfaces.map((i) => (
+                                      <SelectItem
+                                        key={`${i.name}-${i.address}`}
+                                        value={i.address}
+                                      >
+                                        {i.name} · {i.address} ·{' '}
+                                        {scopeLabel(i.scope)}
+                                      </SelectItem>
+                                    ))}
+                                    {field.value !== AUTOMATIC &&
+                                      !settings.interfaces.some(
+                                        (i) => i.address === field.value
+                                      ) && (
+                                        <SelectItem value={field.value}>
+                                          {field.value} (not reported by the
+                                          worker)
+                                        </SelectItem>
+                                      )}
+                                  </SelectContent>
+                                </Select>
+                                <FormDescription className="text-xs">
+                                  An address of this machine. Automatic follows
+                                  the default route.
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          <FormField
+                            control={form.control}
+                            name="publicAddress"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>Public address</FormLabel>
+                                <FormControl>
+                                  <Input
+                                    placeholder={
+                                      listenScope === 'public' && listenIp
+                                        ? `${listenIp} (same as listen address)`
+                                        : 'Your router’s public IP, e.g. 203.0.113.7'
+                                    }
+                                    {...field}
+                                  />
+                                </FormControl>
+                                <FormDescription className="text-xs">
+                                  The IP your DNS A record points at.
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                        </div>
+
+                        <NetworkHint
+                          listenIp={listenIp}
+                          listenScope={listenScope}
+                          publicIp={publicIp}
+                          publicScope={publicScope}
+                          httpPort={draft.httpPort}
+                          httpsPort={draft.httpsPort}
                         />
-                        <p className="text-xs text-muted-foreground">
-                          The IP your DNS A record points at.
-                        </p>
-                      </div>
-                    </div>
 
-                    <NetworkHint
-                      listenIp={listenIp}
-                      listenScope={listenScope}
-                      publicIp={publicIp}
-                      publicScope={publicScope}
-                      httpPort={draft.httpPort}
-                      httpsPort={draft.httpsPort}
-                    />
-
-                    <Collapsible>
-                      <CollapsibleTrigger className="group flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
-                        <ChevronRight className="h-4 w-4 transition-transform group-data-[state=open]:rotate-90" />
-                        Local ports
-                      </CollapsibleTrigger>
-                      <CollapsibleContent className="grid gap-4 pt-3 md:grid-cols-2">
-                        <div className="space-y-1.5">
-                          <Label htmlFor={`ingress-http-${node.id}`}>
-                            HTTP port
-                          </Label>
-                          <Input
-                            id={`ingress-http-${node.id}`}
-                            inputMode="numeric"
-                            value={draft.httpPort}
-                            disabled={listenLocked}
-                            onChange={(e) =>
-                              setDraft({ ...draft, httpPort: e.target.value })
-                            }
-                          />
-                        </div>
-                        <div className="space-y-1.5">
-                          <Label htmlFor={`ingress-https-${node.id}`}>
-                            HTTPS port
-                          </Label>
-                          <Input
-                            id={`ingress-https-${node.id}`}
-                            inputMode="numeric"
-                            value={draft.httpsPort}
-                            disabled={listenLocked}
-                            onChange={(e) =>
-                              setDraft({ ...draft, httpsPort: e.target.value })
-                            }
-                          />
-                        </div>
-                        <p className="text-xs text-muted-foreground md:col-span-2">
-                          Change these only when port 80 or 443 is taken on this
-                          machine, or the agent can't bind ports below 1024.
-                          Visitors still use 80 and 443: forward them to these
-                          ports.
-                        </p>
-                      </CollapsibleContent>
-                    </Collapsible>
-
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Button
-                        size="sm"
-                        disabled={!dirty || update.isPending}
-                        onClick={() => save({ ...draft, enabled: true })}
-                      >
-                        {update.isPending && (
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        )}
-                        {settings.enabled ? 'Save' : 'Save and turn on'}
-                      </Button>
-                      {dirty && (
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => setDraft(draftFrom(settings))}
+                        <Collapsible
+                          open={portsOpen || portError}
+                          onOpenChange={setPortsOpen}
                         >
-                          Discard
-                        </Button>
-                      )}
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={
-                          !settings.enabled || runCheck.isPending || dirty
-                        }
-                        onClick={() =>
-                          runCheck.mutate({ path: { node_id: node.id } })
-                        }
-                      >
-                        {runCheck.isPending ? (
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        ) : (
-                          <Radar className="mr-2 h-4 w-4" />
-                        )}
-                        Check reachability
-                      </Button>
-                    </div>
+                          <CollapsibleTrigger className="group flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+                            <ChevronRight className="h-4 w-4 transition-transform group-data-[state=open]:rotate-90" />
+                            Local ports
+                          </CollapsibleTrigger>
+                          <CollapsibleContent className="grid gap-4 pt-3 md:grid-cols-2">
+                            <FormField
+                              control={form.control}
+                              name="httpPort"
+                              render={({ field }) => (
+                                <FormItem>
+                                  <FormLabel>HTTP port</FormLabel>
+                                  <FormControl>
+                                    <Input
+                                      inputMode="numeric"
+                                      disabled={listenLocked}
+                                      {...field}
+                                    />
+                                  </FormControl>
+                                  <FormMessage />
+                                </FormItem>
+                              )}
+                            />
+                            <FormField
+                              control={form.control}
+                              name="httpsPort"
+                              render={({ field }) => (
+                                <FormItem>
+                                  <FormLabel>HTTPS port</FormLabel>
+                                  <FormControl>
+                                    <Input
+                                      inputMode="numeric"
+                                      disabled={listenLocked}
+                                      {...field}
+                                    />
+                                  </FormControl>
+                                  <FormMessage />
+                                </FormItem>
+                              )}
+                            />
+                            <p className="text-xs text-muted-foreground md:col-span-2">
+                              Change these only when port 80 or 443 is taken on
+                              this machine, or the agent can't bind ports below
+                              1024. Visitors still use 80 and 443: forward them
+                              to these ports.
+                            </p>
+                          </CollapsibleContent>
+                        </Collapsible>
+
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Button
+                            type="submit"
+                            size="sm"
+                            disabled={!dirty || update.isPending}
+                          >
+                            {update.isPending && (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            )}
+                            {settings.enabled ? 'Save' : 'Save and turn on'}
+                          </Button>
+                          {dirty && (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => form.reset(draftFrom(settings))}
+                            >
+                              Discard
+                            </Button>
+                          )}
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={
+                              !settings.enabled || runCheck.isPending || dirty
+                            }
+                            onClick={() =>
+                              runCheck.mutate({ path: { node_id: node.id } })
+                            }
+                          >
+                            {runCheck.isPending ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <Radar className="mr-2 h-4 w-4" />
+                            )}
+                            Check reachability
+                          </Button>
+                        </div>
+                      </form>
+                    </Form>
 
                     {settings.enabled && <ListenerStatus settings={settings} />}
                     {shownCheck && <CheckResult check={shownCheck} />}

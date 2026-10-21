@@ -31801,6 +31801,16 @@ export type UpdateRepositoryRequest = {
     ref_name?: string | null;
 };
 
+/**
+ * One page of tunnels, newest first.
+ */
+export type ConnectorList = {
+    connectors: Array<ConnectorView>;
+    total: number;
+    page: number;
+    page_size: number;
+};
+
 export type CiExecutorSettingsWritable = {
     control_plane_url: string;
     /**
@@ -78223,12 +78233,21 @@ export type AdminCheckNodePublicIngressResponse = AdminCheckNodePublicIngressRes
 export type ListIngressConnectorsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (default 20, max 100)
+         */
+        page_size?: number | null;
+    };
     url: '/ingress/connectors';
 };
 
 export type ListIngressConnectorsResponses = {
-    200: Array<ConnectorView>;
+    200: ConnectorList;
 };
 
 export type ListIngressConnectorsResponse = ListIngressConnectorsResponses[keyof ListIngressConnectorsResponses];

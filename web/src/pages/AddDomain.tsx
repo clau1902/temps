@@ -6,7 +6,6 @@ import {
   createDomainMutation,
   getEnvironmentsOptions,
   getProjectsOptions,
-  listIngressConnectorsOptions,
   setIngressHostnameChoiceMutation,
   updateIngressConnectorMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -56,6 +55,7 @@ import {
   levelsBelow,
   tunnelChoice,
   tunnelsCovering,
+  allTunnelsOptions,
 } from '@/lib/tunnel-domains'
 
 const domainWizardSchema = z.object({
@@ -97,7 +97,7 @@ export function AddDomain() {
   })
 
   const connectorsQuery = useQuery({
-    ...listIngressConnectorsOptions(),
+    ...allTunnelsOptions(),
     retry: false,
   })
   const [attachProject, setAttachProject] = useState<string>('')
@@ -386,7 +386,7 @@ export function AddDomain() {
                           <FormLabel>How it gets HTTPS</FormLabel>
                           <FormDescription>
                             {covering.length > 0
-                              ? 'A tunnel covers this domain, so its provider can serve HTTPS with no certificate here. Or issue one from Let\'s Encrypt.'
+                              ? "A tunnel covers this domain, so its provider can serve HTTPS with no certificate here. Or issue one from Let's Encrypt."
                               : isWildcard
                                 ? 'Wildcard domains require DNS-01 challenge'
                                 : "Choose how you want to verify domain ownership for Let's Encrypt"}
@@ -428,7 +428,9 @@ export function AddDomain() {
                                         <div className="space-y-1 text-sm">
                                           <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                             <CheckCircle className="h-4 w-4" />
-                                            <span>DNS record created for you</span>
+                                            <span>
+                                              DNS record created for you
+                                            </span>
                                           </div>
                                           <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                             <CheckCircle className="h-4 w-4" />
@@ -609,77 +611,87 @@ export function AddDomain() {
                       onEnvironmentChange={setAttachEnvironment}
                     />
                   ) : (
-                  <>
-                  <div className="rounded-lg bg-muted p-4 space-y-3">
-                    <h3 className="font-semibold">Review Your Configuration</h3>
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-muted-foreground">
-                          Domain:
-                        </span>
-                        <span className="font-medium">
-                          {watchedValues.domain}
-                        </span>
+                    <>
+                      <div className="rounded-lg bg-muted p-4 space-y-3">
+                        <h3 className="font-semibold">
+                          Review Your Configuration
+                        </h3>
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-muted-foreground">
+                              Domain:
+                            </span>
+                            <span className="font-medium">
+                              {watchedValues.domain}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-muted-foreground">
+                              Challenge Type:
+                            </span>
+                            <span className="font-medium">
+                              {watchedValues.challengeType === 'http-01'
+                                ? 'HTTP-01 (Automatic)'
+                                : 'DNS-01 (Manual)'}
+                            </span>
+                          </div>
+                        </div>
                       </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-muted-foreground">
-                          Challenge Type:
-                        </span>
-                        <span className="font-medium">
-                          {watchedValues.challengeType === 'http-01'
-                            ? 'HTTP-01 (Automatic)'
-                            : 'DNS-01 (Manual)'}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
 
-                  {watchedValues.challengeType === 'http-01' ? (
-                    <Alert>
-                      <Globe className="h-4 w-4" />
-                      <AlertDescription>
-                        <div className="space-y-2">
-                          <p className="font-medium">Next Steps (HTTP-01):</p>
-                          <ol className="list-decimal list-inside space-y-1 text-sm">
-                            <li>
-                              Point your domain&apos;s DNS A record to your
-                              server IP
-                            </li>
-                            <li>Ensure port 80 is accessible on your server</li>
-                            <li>
-                              The system will automatically validate and
-                              provision the certificate
-                            </li>
-                          </ol>
-                        </div>
-                      </AlertDescription>
-                    </Alert>
-                  ) : (
-                    <Alert>
-                      <Shield className="h-4 w-4" />
-                      <AlertDescription>
-                        <div className="space-y-2">
-                          <p className="font-medium">Next Steps (DNS-01):</p>
-                          <ol className="list-decimal list-inside space-y-1 text-sm">
-                            <li>
-                              After creation, you&apos;ll receive a DNS TXT
-                              record to add
-                            </li>
-                            <li>
-                              Add the TXT record to your domain&apos;s DNS
-                              settings
-                            </li>
-                            <li>Wait for DNS propagation (up to 24 hours)</li>
-                            <li>
-                              Complete the DNS challenge to provision the
-                              certificate
-                            </li>
-                          </ol>
-                        </div>
-                      </AlertDescription>
-                    </Alert>
-                  )}
-                  </>
+                      {watchedValues.challengeType === 'http-01' ? (
+                        <Alert>
+                          <Globe className="h-4 w-4" />
+                          <AlertDescription>
+                            <div className="space-y-2">
+                              <p className="font-medium">
+                                Next Steps (HTTP-01):
+                              </p>
+                              <ol className="list-decimal list-inside space-y-1 text-sm">
+                                <li>
+                                  Point your domain&apos;s DNS A record to your
+                                  server IP
+                                </li>
+                                <li>
+                                  Ensure port 80 is accessible on your server
+                                </li>
+                                <li>
+                                  The system will automatically validate and
+                                  provision the certificate
+                                </li>
+                              </ol>
+                            </div>
+                          </AlertDescription>
+                        </Alert>
+                      ) : (
+                        <Alert>
+                          <Shield className="h-4 w-4" />
+                          <AlertDescription>
+                            <div className="space-y-2">
+                              <p className="font-medium">
+                                Next Steps (DNS-01):
+                              </p>
+                              <ol className="list-decimal list-inside space-y-1 text-sm">
+                                <li>
+                                  After creation, you&apos;ll receive a DNS TXT
+                                  record to add
+                                </li>
+                                <li>
+                                  Add the TXT record to your domain&apos;s DNS
+                                  settings
+                                </li>
+                                <li>
+                                  Wait for DNS propagation (up to 24 hours)
+                                </li>
+                                <li>
+                                  Complete the DNS challenge to provision the
+                                  certificate
+                                </li>
+                              </ol>
+                            </div>
+                          </AlertDescription>
+                        </Alert>
+                      )}
+                    </>
                   )}
 
                   <div className="flex justify-between gap-2">
@@ -760,9 +772,9 @@ function TunnelConfirm({
           <AlertTriangle className="h-4 w-4" />
           <AlertDescription>
             Cloudflare&apos;s free certificate covers {tunnelDomain} and names
-            one level below it, such as app.{tunnelDomain}. Visitors to{' '}
-            {domain} would get a certificate error unless the zone has an
-            advanced certificate that covers it.
+            one level below it, such as app.{tunnelDomain}. Visitors to {domain}{' '}
+            would get a certificate error unless the zone has an advanced
+            certificate that covers it.
           </AlertDescription>
         </Alert>
       )}

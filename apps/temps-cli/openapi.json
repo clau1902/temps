@@ -10565,6 +10565,39 @@
         ],
         "type": "object"
       },
+      "ConnectorList": {
+        "description": "One page of tunnels, newest first.",
+        "properties": {
+          "connectors": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectorView"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "connectors",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
       "ConnectorNodeView": {
         "properties": {
           "driver": {
@@ -95567,18 +95600,48 @@
       "get": {
         "description": "A tunnel publishes apps under its `domain` without certificates or open\nports. Each node entry says whether that worker's connector is connected.",
         "operationId": "list_ingress_connectors",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Number of items per page (default 20, max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/ConnectorView"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/ConnectorList"
                 }
               }
-            }
+            },
+            "description": ""
           }
         },
         "security": [

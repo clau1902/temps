@@ -452,7 +452,7 @@ impl TunnelProvider for CloudflareTunnelProvider {
     async fn rotate_secret(
         &self,
         handle: &TunnelHandle,
-        keep_clients: Option<&HashSet<String>>,
+        keep_clients: &HashSet<String>,
     ) -> Result<Option<String>, IngressError> {
         let account = Self::account_of(handle)?;
         let id = &handle.external_id;
@@ -477,30 +477,40 @@ impl TunnelProvider for CloudflareTunnelProvider {
 
         // A connection already open survives the new secret; cut the ones
         // no remaining node holds so a removed node stops serving now.
-        if let Some(keep) = keep_clients {
-            let live: BTreeSet<String> = self
-                .get_tunnel(account, id)
-                .await?
-                .map(|t| {
-                    t.connections
-                        .into_iter()
-                        .filter_map(|c| c.client_id)
-                        .collect()
-                })
-                .unwrap_or_default();
-            for client in live.iter().filter(|c| !keep.contains(*c)) {
-                if !is_client_id(client) {
-                    continue;
-                }
-                self.call::<Value>(
-                    reqwest::Method::DELETE,
-                    &format!("/accounts/{account}/cfd_tunnel/{id}/connections?client_id={client}"),
-                    None,
-                    "disconnect a removed node's connector",
-                )
-                .await?;
-                info!(tunnel = %id, client = %client, "disconnected a connector no node runs");
-            }
+        let live: BTreeSet<String> = self
+            .get_tunnel(account, id)
+            .await?
+            .map(|t| {
+                t.connections
+                    .into_iter()
+                    .filter_map(|c| c.client_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cut: Vec<&String> = live.iter().filter(|c| !keep_clients.contains(*c)).collect();
+        if cut.iter().any(|client| !is_client_id(client)) {
+            // A client that cannot be named in a URL cannot be cut alone;
+            // cut everything, and the staying nodes reconnect with the new
+            // secret.
+            self.call::<Value>(
+                reqwest::Method::DELETE,
+                &format!("/accounts/{account}/cfd_tunnel/{id}/connections"),
+                None,
+                "disconnect the tunnel's connectors",
+            )
+            .await?;
+            info!(tunnel = %id, "disconnected every connector of the tunnel");
+            return Ok(Some(token));
+        }
+        for client in cut {
+            self.call::<Value>(
+                reqwest::Method::DELETE,
+                &format!("/accounts/{account}/cfd_tunnel/{id}/connections?client_id={client}"),
+                None,
+                "disconnect a removed node's connector",
+            )
+            .await?;
+            info!(tunnel = %id, client = %client, "disconnected a connector no node runs");
         }
         Ok(Some(token))
     }

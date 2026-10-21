@@ -24108,6 +24108,39 @@ export const listIngressConnectorsOptions = (options?: Options<ListIngressConnec
     queryKey: listIngressConnectorsQueryKey(options)
 });
 
+export const listIngressConnectorsInfiniteQueryKey = (options?: Options<ListIngressConnectorsData>): QueryKey<Options<ListIngressConnectorsData>> => createQueryKey('listIngressConnectors', options, true);
+
+/**
+ * List tunnels, the workers each runs on and their status.
+ *
+ * A tunnel publishes apps under its `domain` without certificates or open
+ * ports. Each node entry says whether that worker's connector is connected.
+ */
+export const listIngressConnectorsInfiniteOptions = (options?: Options<ListIngressConnectorsData>) => {
+    const opts = infiniteQueryOptions<ListIngressConnectorsResponse, DefaultError, InfiniteData<ListIngressConnectorsResponse>, QueryKey<Options<ListIngressConnectorsData>>, number | null | Pick<QueryKey<Options<ListIngressConnectorsData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
+    // @ts-ignore
+    {
+        queryFn: async ({ pageParam, queryKey, signal }) => {
+            // @ts-ignore
+            const page: Pick<QueryKey<Options<ListIngressConnectorsData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
+                query: {
+                    page: pageParam
+                }
+            };
+            const params = createInfiniteParams(queryKey, page);
+            const { data } = await listIngressConnectors({
+                ...options,
+                ...params,
+                signal,
+                throwOnError: true
+            });
+            return data;
+        },
+        queryKey: listIngressConnectorsInfiniteQueryKey(options)
+    });
+    return opts as Omit<typeof opts, 'initialData'>;
+};
+
 /**
  * Create a tunnel for a managed domain and run it on workers.
  *

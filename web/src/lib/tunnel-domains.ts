@@ -5,15 +5,24 @@
 // under its own domain; the wizard and the domain picker use this to offer
 // "through the tunnel" instead of a certificate.
 
-import type { ConnectorView } from '@/api/client/types.gen'
+import { listIngressConnectorsOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { ConnectorList, ConnectorView } from '@/api/client/types.gen'
+
+/**
+ * Every tunnel, for screens that match names against all of them. The list
+ * is paginated; an install runs a handful of tunnels, so one page of the
+ * maximum size holds them all.
+ */
+export function allTunnelsOptions() {
+  return {
+    ...listIngressConnectorsOptions({ query: { page_size: 100 } }),
+    select: (list: ConnectorList) => list.connectors,
+  }
+}
 
 /** `*.Example.com.` → `example.com`; `App.example.com` → `app.example.com`. */
 export function baseHost(host: string): string {
-  return host
-    .trim()
-    .toLowerCase()
-    .replace(/\.$/, '')
-    .replace(/^\*\./, '')
+  return host.trim().toLowerCase().replace(/\.$/, '').replace(/^\*\./, '')
 }
 
 /**
@@ -43,7 +52,8 @@ export function tunnelsCovering(
 export function levelsBelow(host: string, connector: ConnectorView): number {
   const base = baseHost(host)
   const domain = baseHost(connector.domain)
-  const own = base === domain ? 0 : base.slice(0, -domain.length - 1).split('.').length
+  const own =
+    base === domain ? 0 : base.slice(0, -domain.length - 1).split('.').length
   return host.trim().startsWith('*.') ? own + 1 : own
 }
 

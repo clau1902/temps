@@ -129,24 +129,43 @@ pub struct ConnectorSupervisor {
     store: SharedRouteStore,
     shutdown: Arc<Notify>,
     running: tokio::sync::Mutex<HashMap<i32, Running>>,
+    /// Connectors held back because their tunnel origin could not bind,
+    /// with the status that says why. Retried on every [`Self::apply`].
+    blocked: Mutex<HashMap<i32, ConnectorStatus>>,
     listeners: tokio::sync::Mutex<HashSet<u16>>,
 }
 
 impl ConnectorSupervisor {
     pub fn new(data_dir: PathBuf, store: SharedRouteStore, shutdown: Arc<Notify>) -> Arc<Self> {
         let drivers: Vec<Arc<dyn ConnectorDriver>> = vec![Arc::new(process::ProcessDriver::new())];
+        Self::with_drivers(drivers, data_dir, store, shutdown)
+    }
+
+    fn with_drivers(
+        drivers: Vec<Arc<dyn ConnectorDriver>>,
+        data_dir: PathBuf,
+        store: SharedRouteStore,
+        shutdown: Arc<Notify>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             drivers,
             data_dir,
             store,
             shutdown,
             running: tokio::sync::Mutex::new(HashMap::new()),
+            blocked: Mutex::new(HashMap::new()),
             listeners: tokio::sync::Mutex::new(HashSet::new()),
         })
     }
 
     /// Converge on `specs`: start new connectors, restart changed ones and
     /// stop the ones no longer assigned.
+    ///
+    /// A connector starts only once its tunnel origin listener is bound: a
+    /// provider connector with nowhere to forward would report ready while
+    /// every request fails. A bind failure is reported as the connector's
+    /// status and retried on the next call, so freeing the port recovers
+    /// without restarting the agent.
     pub async fn apply(self: &Arc<Self>, specs: Vec<NodeConnectorSpec>) {
         let wanted: HashMap<i32, NodeConnectorSpec> =
             specs.into_iter().map(|spec| (spec.id, spec)).collect();
@@ -169,12 +188,46 @@ impl ConnectorSupervisor {
             }
         }
 
+        self.blocked.lock().retain(|id, _| wanted.contains_key(id));
+
         for (id, spec) in wanted {
-            if running.contains_key(&id) {
+            if let Err(error) = self.ensure_listener(&spec).await {
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), spec.edge_port);
+                warn!(connector_id = id, %addr, %error, "tunnel origin listener failed to bind");
+                if let Some(run) = running.remove(&id) {
+                    run.stop.notify_one();
+                    let _ = run.task.await;
+                }
+                let mut blocked = self.blocked.lock();
+                let restarts = blocked.get(&id).map_or(0, |s| s.restarts + 1);
+                blocked.insert(
+                    id,
+                    ConnectorStatus {
+                        connector_id: id,
+                        driver: None,
+                        state: "down".into(),
+                        ready_connections: None,
+                        connector_ref: None,
+                        last_error: Some(format!(
+                            "The tunnel origin could not listen on {addr} ({error}), so the \
+                             connector was not started. Another process on this worker is \
+                             probably using port {port}; stop it (`ss -ltnp 'sport = :{port}'` \
+                             shows which). The agent retries on its next sync.",
+                            port = spec.edge_port,
+                        )),
+                        restarts,
+                    },
+                );
                 continue;
             }
-            if let Err(error) = self.ensure_listener(&spec).await {
-                warn!(connector_id = id, %error, "tunnel origin listener failed to bind");
+            if self.blocked.lock().remove(&id).is_some() {
+                info!(
+                    connector_id = id,
+                    "tunnel origin listener bound; starting the connector"
+                );
+            }
+            if running.contains_key(&id) {
+                continue;
             }
             let status = Arc::new(Mutex::new(ConnectorStatus {
                 connector_id: id,
@@ -205,12 +258,15 @@ impl ConnectorSupervisor {
     }
 
     pub async fn statuses(&self) -> Vec<ConnectorStatus> {
-        self.running
+        let mut statuses: Vec<ConnectorStatus> = self
+            .running
             .lock()
             .await
             .values()
             .map(|run| run.status.lock().clone())
-            .collect()
+            .collect();
+        statuses.extend(self.blocked.lock().values().cloned());
+        statuses
     }
 
     async fn ensure_listener(&self, spec: &NodeConnectorSpec) -> std::io::Result<()> {
@@ -345,5 +401,90 @@ impl ConnectorSupervisor {
             }
             backoff = (backoff * 2).min(Duration::from_secs(60));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::route_store::RouteStore;
+
+    fn spec(id: i32, edge_port: u16) -> NodeConnectorSpec {
+        NodeConnectorSpec {
+            id,
+            provider: "cloudflare".into(),
+            revision: "r1".into(),
+            edge_port,
+            client_address_header: None,
+            drivers: Vec::new(),
+            secrets: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_origin_bind_holds_the_connector_and_recovers_once_the_port_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RouteStore::new(dir.path().join("routes.json")));
+        let shutdown = Arc::new(Notify::new());
+        // No drivers: once started, the connector reports "no driver" rather
+        // than launching anything, which is all this test needs.
+        let supervisor = ConnectorSupervisor::with_drivers(
+            Vec::new(),
+            dir.path().to_path_buf(),
+            store,
+            Arc::clone(&shutdown),
+        );
+
+        let squatter = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = squatter.local_addr().unwrap().port();
+
+        supervisor.apply(vec![spec(7, port)]).await;
+        assert!(supervisor.running.lock().await.is_empty());
+        let statuses = supervisor.statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].connector_id, 7);
+        assert_eq!(statuses[0].state, "down");
+        let error = statuses[0].last_error.as_deref().unwrap();
+        assert!(error.contains(&format!("127.0.0.1:{port}")), "{error}");
+
+        // Still taken: still held, and counted as another failed attempt.
+        supervisor.apply(vec![spec(7, port)]).await;
+        assert!(supervisor.running.lock().await.is_empty());
+        assert_eq!(supervisor.statuses().await[0].restarts, 1);
+
+        drop(squatter);
+        supervisor.apply(vec![spec(7, port)]).await;
+        assert!(supervisor.blocked.lock().is_empty());
+        assert!(supervisor.running.lock().await.contains_key(&7));
+        assert!(supervisor.listeners.lock().await.contains(&port));
+        let statuses = supervisor.statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0]
+            .last_error
+            .as_deref()
+            .is_none_or(|e| !e.contains("could not listen")));
+
+        supervisor.apply(Vec::new()).await;
+        assert!(supervisor.statuses().await.is_empty());
+        shutdown.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn unassigned_blocked_connector_stops_being_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RouteStore::new(dir.path().join("routes.json")));
+        let supervisor = ConnectorSupervisor::with_drivers(
+            Vec::new(),
+            dir.path().to_path_buf(),
+            store,
+            Arc::new(Notify::new()),
+        );
+        let squatter = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = squatter.local_addr().unwrap().port();
+
+        supervisor.apply(vec![spec(9, port)]).await;
+        assert_eq!(supervisor.statuses().await.len(), 1);
+        supervisor.apply(Vec::new()).await;
+        assert!(supervisor.statuses().await.is_empty());
     }
 }

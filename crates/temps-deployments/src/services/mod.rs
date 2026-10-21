@@ -74,6 +74,7 @@ pub mod node_service;
 pub use node_service::*;
 
 pub mod node_plugin_builder;
+pub mod node_public_ingress;
 pub mod node_scheduler;
 pub use node_scheduler::*;
 

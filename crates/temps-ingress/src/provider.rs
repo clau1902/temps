@@ -95,14 +95,16 @@ pub trait TunnelProvider: Send + Sync {
 
     /// Invalidate the secret nodes run the tunnel with and return the new
     /// one: called when a node that held it stops running the tunnel, so a
-    /// removed (or compromised) node cannot keep serving its traffic. With
-    /// `keep_clients` (the `connector_ref`s of the nodes that stay), the
-    /// provider also cuts every other live connection. `None` when the
-    /// provider cannot rotate; the service then says so on the connector.
+    /// removed (or compromised) node cannot keep serving its traffic. An open
+    /// connection outlives the secret, so the provider also cuts every live
+    /// connection whose client is not in `keep_clients` (the `connector_ref`s
+    /// of the nodes that stay; empty cuts them all), and fails if it cannot.
+    /// `None` when the provider cannot rotate; the service then says so on
+    /// the connector.
     async fn rotate_secret(
         &self,
         _handle: &TunnelHandle,
-        _keep_clients: Option<&HashSet<String>>,
+        _keep_clients: &HashSet<String>,
     ) -> Result<Option<String>, IngressError> {
         Ok(None)
     }
