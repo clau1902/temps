@@ -6,7 +6,8 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Order, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, RwLock};
 
 use temps_entities::{agent_run_logs, agent_runs};
 
@@ -76,11 +77,114 @@ pub struct RunWithLogs {
 
 pub struct AgentRunService {
     db: Arc<DatabaseConnection>,
+    redactions: RwLock<SecretRedactions>,
+}
+
+/// Placeholder written in place of a secret value in persisted run output.
+pub const REDACTED_SECRET: &str = "[redacted]";
+
+/// Secret values shorter than this are not redacted: replacing every
+/// occurrence of a two-character string would shred the log, and a value that
+/// short offers no protection anyway.
+const MIN_REDACTED_SECRET_LEN: usize = 4;
+
+/// Bound on runs whose secret values are held for redaction. Entries are
+/// dropped when a run finishes; this only caps the registry if a run path
+/// ever forgets to, so memory stays constant on a small host.
+const MAX_REDACTED_RUNS: usize = 256;
+
+/// Per-run secret values that must never be persisted in run logs or run
+/// output. Agent output is arbitrary text the run's project members can read
+/// back, and an agent can print its environment, so redaction is by value
+/// rather than by a token-prefix heuristic.
+#[derive(Default)]
+struct SecretRedactions {
+    by_run: HashMap<i32, Arc<Vec<String>>>,
+    order: VecDeque<i32>,
 }
 
 impl AgentRunService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            redactions: RwLock::new(SecretRedactions::default()),
+        }
+    }
+
+    /// Register the secret values injected into `run_id`'s sandbox. From now
+    /// on every log line and output field persisted for the run has them
+    /// replaced with [`REDACTED_SECRET`].
+    pub fn register_secret_values<I>(&self, run_id: i32, values: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut values: Vec<String> = values
+            .into_iter()
+            .flat_map(|value| {
+                // A file secret (certificate, kubeconfig) can be printed line
+                // by line, so each substantial line is redacted on its own.
+                let lines: Vec<String> = if value.contains('\n') {
+                    value
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| line.chars().count() >= MIN_REDACTED_SECRET_LEN * 2)
+                        .map(str::to_string)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                std::iter::once(value).chain(lines)
+            })
+            .filter(|value| value.chars().count() >= MIN_REDACTED_SECRET_LEN)
+            .collect();
+        if values.is_empty() {
+            return;
+        }
+        // Longest first, so a value containing another is replaced whole.
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values.dedup();
+
+        let mut redactions = self
+            .redactions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if redactions.by_run.insert(run_id, Arc::new(values)).is_none() {
+            redactions.order.push_back(run_id);
+        }
+        while redactions.order.len() > MAX_REDACTED_RUNS {
+            if let Some(evicted) = redactions.order.pop_front() {
+                redactions.by_run.remove(&evicted);
+            }
+        }
+    }
+
+    /// Drop `run_id`'s registered secret values once nothing more will be
+    /// persisted for it.
+    pub fn forget_secret_values(&self, run_id: i32) {
+        let mut redactions = self
+            .redactions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if redactions.by_run.remove(&run_id).is_some() {
+            redactions.order.retain(|id| *id != run_id);
+        }
+    }
+
+    fn secret_values_for(&self, run_id: i32) -> Option<Arc<Vec<String>>> {
+        self.redactions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .by_run
+            .get(&run_id)
+            .cloned()
+    }
+
+    /// `text` with every registered secret value of `run_id` replaced.
+    pub fn redact(&self, run_id: i32, text: &str) -> String {
+        match self.secret_values_for(run_id) {
+            Some(values) => redact_values(text, &values),
+            None => text.to_string(),
+        }
     }
 
     pub async fn create_run(
@@ -214,6 +318,19 @@ impl AgentRunService {
     ) -> Result<agent_runs::Model, AgentError> {
         let run = self.get_run(run_id).await?;
         let mut active: agent_runs::ActiveModel = run.into();
+        let mut fields = fields;
+        if let Some(values) = self.secret_values_for(run_id) {
+            for text in [
+                &mut fields.error_message,
+                &mut fields.ai_output,
+                &mut fields.analysis,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *text = redact_values(text, &values);
+            }
+        }
 
         if let Some(status) = fields.status {
             active.status = Set(status);
@@ -441,10 +558,20 @@ impl AgentRunService {
         message: &str,
         metadata: Option<serde_json::Value>,
     ) -> Result<agent_run_logs::Model, AgentError> {
+        let (message, metadata) = match self.secret_values_for(run_id) {
+            Some(values) => (
+                redact_values(message, &values),
+                metadata.map(|mut metadata| {
+                    redact_json(&mut metadata, &values);
+                    metadata
+                }),
+            ),
+            None => (message.to_string(), metadata),
+        };
         let active = agent_run_logs::ActiveModel {
             run_id: Set(run_id),
             level: Set(level.to_string()),
-            message: Set(message.to_string()),
+            message: Set(message),
             metadata: Set(metadata),
             ..Default::default()
         };
@@ -584,6 +711,33 @@ impl AgentRunService {
             .map_err(AgentError::Database)?;
 
         Ok(count)
+    }
+}
+
+fn redact_values(text: &str, values: &[String]) -> String {
+    let mut redacted = text.to_string();
+    for value in values {
+        if redacted.contains(value.as_str()) {
+            redacted = redacted.replace(value.as_str(), REDACTED_SECRET);
+        }
+    }
+    redacted
+}
+
+fn redact_json(value: &mut serde_json::Value, values: &[String]) {
+    match value {
+        serde_json::Value::String(text) => *text = redact_values(text, values),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json(item, values);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                redact_json(item, values);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
 
@@ -887,5 +1041,101 @@ mod tests {
         assert_eq!(run.status, "fixing");
         assert_eq!(run.project_id, 42);
         assert_eq!(run.id, 1);
+    }
+
+    fn log_row(run_id: i32) -> agent_run_logs::Model {
+        agent_run_logs::Model {
+            id: 1,
+            run_id,
+            level: "ai_event".to_string(),
+            message: String::new(),
+            metadata: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// F1: an agent that prints its environment must not persist the secret
+    /// values into run logs the project's members can read back.
+    #[tokio::test]
+    async fn append_log_redacts_registered_secret_values_by_value() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![log_row(5)]])
+                .into_connection(),
+        );
+        let svc = AgentRunService::new(db.clone());
+        // No recognisable token prefix: a prefix scrubber would let it through.
+        svc.register_secret_values(5, ["plain-db-password-42".to_string()]);
+
+        svc.append_log(
+            5,
+            "ai_event",
+            "export DB_PASSWORD='plain-db-password-42'",
+            Some(serde_json::json!({ "tool_output": ["x", "plain-db-password-42"] })),
+        )
+        .await
+        .unwrap();
+        drop(svc);
+
+        let statements = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("service dropped")
+                .into_transaction_log()
+        );
+        assert!(!statements.contains("plain-db-password-42"), "{statements}");
+        assert!(statements.contains(REDACTED_SECRET), "{statements}");
+    }
+
+    #[test]
+    fn redaction_is_scoped_to_the_run_and_dropped_when_forgotten() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+        svc.register_secret_values(1, ["run-one-secret".to_string()]);
+
+        assert_eq!(svc.redact(1, "v=run-one-secret"), "v=[redacted]");
+        assert_eq!(svc.redact(2, "v=run-one-secret"), "v=run-one-secret");
+
+        svc.forget_secret_values(1);
+        assert_eq!(svc.redact(1, "v=run-one-secret"), "v=run-one-secret");
+    }
+
+    #[test]
+    fn redaction_handles_overlapping_multiline_and_short_values() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+        svc.register_secret_values(
+            3,
+            [
+                "abc".to_string(),
+                "token-123".to_string(),
+                "token-123-extended".to_string(),
+                "-----BEGIN KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END KEY-----"
+                    .to_string(),
+            ],
+        );
+
+        // Too short to redact without shredding unrelated text.
+        assert_eq!(svc.redact(3, "abc"), "abc");
+        // The longer value is replaced whole, not left as "[redacted]-extended".
+        assert_eq!(svc.redact(3, "token-123-extended"), "[redacted]");
+        // A single printed line of a file secret is still caught.
+        assert_eq!(
+            svc.redact(3, "line: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"),
+            "line: [redacted]"
+        );
+    }
+
+    #[test]
+    fn redaction_registry_is_bounded() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+        for run_id in 0..(MAX_REDACTED_RUNS as i32 + 10) {
+            svc.register_secret_values(run_id, [format!("secret-for-{run_id}")]);
+        }
+        let redactions = svc.redactions.read().unwrap();
+        assert_eq!(redactions.by_run.len(), MAX_REDACTED_RUNS);
+        assert_eq!(redactions.order.len(), MAX_REDACTED_RUNS);
+        assert!(!redactions.by_run.contains_key(&0));
     }
 }

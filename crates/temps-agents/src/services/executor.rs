@@ -1030,7 +1030,7 @@ impl AgentExecutor {
         //
         // The autofixer path has no `project_agents::Model` because it is not
         // a persistent agent — we still want the global config repo overlay
-        // and the project-level secrets, so we synthesize a minimal config
+        // and the project's secrets, so we synthesize a minimal config
         // when `agent_config` is None.
         let owned_synthetic;
         let config_for_injection: &temps_entities::project_agents::Model = match agent_config {
@@ -1082,7 +1082,7 @@ impl AgentExecutor {
         &self,
         run_id: i32,
         config: &temps_entities::project_agents::Model,
-        _project_id: i32,
+        project_id: i32,
         connection_id: Option<i32>,
     ) -> Result<(), AgentError> {
         // Load global AI config settings (config repo URL + branch)
@@ -1099,8 +1099,16 @@ impl AgentExecutor {
             })
             .unwrap_or_default();
 
-        // Collect all secrets up front — needed for placeholder resolution in config files
-        let secrets = self.secret_service.resolve_secrets().await?;
+        // Collect the secrets this project's runs may receive up front — needed
+        // for placeholder resolution in config files. Another project's
+        // secrets are never resolved here, so neither the sandbox nor a
+        // `${TEMPS_SECRET:...}` placeholder in project-controlled config can
+        // reach them.
+        let secrets = self.secret_service.resolve_secrets(project_id).await?;
+        // Anything the sandbox prints is persisted where the project's
+        // members can read it; redact the injected values by value.
+        self.run_service
+            .register_secret_values(run_id, secrets.iter().map(|s| s.value.clone()));
         let secret_map: std::collections::HashMap<String, String> = secrets
             .iter()
             .map(|s| (s.name.clone(), s.value.clone()))
@@ -2135,6 +2143,8 @@ impl AgentExecutor {
                 .await;
         }
         let _ = self.sandbox_registry.release(run_id).await;
+        // The sandbox is gone, so nothing more is printed for this run.
+        self.run_service.forget_secret_values(run_id);
         if work_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&work_dir).await {
                 tracing::warn!(

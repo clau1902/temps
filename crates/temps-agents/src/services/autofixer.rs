@@ -770,6 +770,7 @@ impl AutofixerService {
             }
             // Clean up sandbox + work dir since there's nothing to create a PR from
             let _ = self.sandbox_registry.release(run_id).await;
+            self.run_service.forget_secret_values(run_id);
             let _ = fs::remove_dir_all(&work_dir).await;
             return Ok(());
         }
@@ -1065,6 +1066,7 @@ impl AutofixerService {
         }
         // Release sandbox, then clean up temp dir
         let _ = self.sandbox_registry.release(run_id).await;
+        self.run_service.forget_secret_values(run_id);
         if let Err(e) = fs::remove_dir_all(&work_dir).await {
             tracing::warn!(
                 "Autofixer run {}: failed to clean up work dir {:?}: {}",
