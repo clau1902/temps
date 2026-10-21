@@ -255,7 +255,9 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   // Without an address the internet can open connections to, a tunnel is
   // the only way in: lead with it.
   const tunnelFirst = listenScope !== 'public' && publicScope !== 'public'
-  const enabled = draft?.enabled ?? node.public_ingress_enabled
+  // What the server has saved, not the draft: the switch turns on only once
+  // the save succeeds, and stays off if the settings are refused.
+  const enabled = settings?.enabled ?? node.public_ingress_enabled
   // With a tunnel already carrying this worker, open ports are a second,
   // optional way in: keep their settings folded away unless asked for.
   const showDirectSettings = directOpen ?? (enabled && !tunnelHere)
@@ -417,7 +419,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
                       if (!draft || !settings) return
                       if (on) {
                         // Turning on saves the settings below: check them.
-                        form.setValue('enabled', true)
+                        // Open, so a refused field shows its reason.
                         setDirectOpen(true)
                         void saveDraft()
                       } else {

@@ -5,19 +5,44 @@
 // under its own domain; the wizard and the domain picker use this to offer
 // "through the tunnel" instead of a certificate.
 
-import { listIngressConnectorsOptions } from '@/api/client/@tanstack/react-query.gen'
-import type { ConnectorList, ConnectorView } from '@/api/client/types.gen'
+import { queryOptions } from '@tanstack/react-query'
+import { listIngressConnectorsQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import { listIngressConnectors } from '@/api/client/sdk.gen'
+import type { ConnectorView } from '@/api/client/types.gen'
+
+const TUNNEL_PAGE_SIZE = 100
 
 /**
- * Every tunnel, for screens that match names against all of them. The list
- * is paginated; an install runs a handful of tunnels, so one page of the
- * maximum size holds them all.
+ * Every tunnel, for screens that match names against all of them: worker
+ * settings, domain choices and a tunnel's own page. The list is paginated,
+ * so this reads page after page until it has them all. The key extends the
+ * list's own, so invalidating the list refreshes this too.
  */
 export function allTunnelsOptions() {
-  return {
-    ...listIngressConnectorsOptions({ query: { page_size: 100 } }),
-    select: (list: ConnectorList) => list.connectors,
-  }
+  return queryOptions({
+    queryKey: [
+      {
+        ...listIngressConnectorsQueryKey({
+          query: { page_size: TUNNEL_PAGE_SIZE },
+        })[0],
+        allPages: true,
+      },
+    ],
+    queryFn: async ({ signal }) => {
+      const tunnels: ConnectorView[] = []
+      for (let page = 1; ; page++) {
+        const { data } = await listIngressConnectors({
+          query: { page, page_size: TUNNEL_PAGE_SIZE },
+          signal,
+          throwOnError: true,
+        })
+        tunnels.push(...data.connectors)
+        if (data.connectors.length === 0 || tunnels.length >= data.total) {
+          return tunnels
+        }
+      }
+    },
+  })
 }
 
 /** `*.Example.com.` → `example.com`; `App.example.com` → `app.example.com`. */
