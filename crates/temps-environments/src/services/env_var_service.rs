@@ -197,6 +197,36 @@ impl EnvVarService {
             .collect()
     }
 
+    /// Soft-deleted environments of `project_id` that `var_id` is still
+    /// linked to, ordered by id.
+    ///
+    /// Deleting an environment only sets `deleted_at`: the row is restored
+    /// when an environment is created again for the same branch, and its
+    /// variable links are kept so the restored environment gets its variables
+    /// back. An update must therefore leave these links alone instead of
+    /// replacing them with the requested set. Dropping them is not a neutral
+    /// cleanup either: a variable with no links at all is project-wide, so a
+    /// variable scoped only to deleted environments would widen to every
+    /// environment, production included, the moment anyone edited it.
+    async fn linked_deleted_environments(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        var_id: i32,
+    ) -> Result<Vec<environments::Model>, EnvVarError> {
+        let links = env_var_environments::Entity::find()
+            .filter(env_var_environments::Column::EnvVarId.eq(var_id))
+            .find_also_related(environments::Entity)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_not_null())
+            .order_by_asc(environments::Column::Id)
+            .all(txn)
+            .await?;
+        Ok(links
+            .into_iter()
+            .filter_map(|(_, environment)| environment)
+            .collect())
+    }
+
     pub async fn get_environment_variables(
         &self,
         project_id: i32,
@@ -443,6 +473,33 @@ impl EnvVarService {
                     let env_var = Self::lock_for_write(txn, project_id, var_id).await?.ok_or(
                         EnvVarError::Other("Environment variable not found".to_string()),
                     )?;
+                    // Links to deleted environments survive the update (see
+                    // `linked_deleted_environments`). A client that read the
+                    // variable's environments and sends them back includes
+                    // those ids; accept them as "keep as-is" rather than
+                    // failing the whole save. Only ids already linked are
+                    // tolerated: a deleted environment the variable is not
+                    // linked to, or one from another project, is still
+                    // rejected below, so no new link to a deleted or foreign
+                    // environment can be created.
+                    let preserved_environments =
+                        Self::linked_deleted_environments(txn, project_id, var_id).await?;
+                    let preserved_ids = preserved_environments
+                        .iter()
+                        .map(|environment| environment.id)
+                        .collect::<Vec<_>>();
+                    let unique_requested = environment_ids
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if unique_requested.len() != environment_ids.len() {
+                        return Err(EnvVarError::InvalidInput(
+                            "Environment IDs must not contain duplicates".to_string(),
+                        ));
+                    }
+                    let environment_ids = environment_ids
+                        .into_iter()
+                        .filter(|environment_id| !preserved_ids.contains(environment_id))
+                        .collect::<Vec<_>>();
                     let scoped_environments =
                         Self::environments_in_project(txn, project_id, &environment_ids).await?;
 
@@ -522,12 +579,27 @@ impl EnvVarService {
                     active_var.updated_at = Set(chrono::Utc::now());
                     let var = active_var.update(txn).await?;
 
-                    env_var_environments::Entity::delete_many()
-                        .filter(env_var_environments::Column::EnvVarId.eq(var_id))
-                        .exec(txn)
-                        .await?;
+                    let mut replaced_links = env_var_environments::Entity::delete_many()
+                        .filter(env_var_environments::Column::EnvVarId.eq(var_id));
+                    if !preserved_ids.is_empty() {
+                        replaced_links = replaced_links.filter(
+                            env_var_environments::Column::EnvironmentId
+                                .is_not_in(preserved_ids.iter().copied()),
+                        );
+                    }
+                    replaced_links.exec(txn).await?;
 
-                    let mut environments = Vec::new();
+                    // Report the preserved links too, so the response matches
+                    // what the next list call returns for this variable.
+                    let mut environments = preserved_environments
+                        .into_iter()
+                        .map(|env| EnvVarEnvironment {
+                            id: env.id,
+                            name: env.name,
+                            main_url: env.subdomain,
+                            current_deployment_id: env.current_deployment_id,
+                        })
+                        .collect::<Vec<_>>();
                     for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
                         let new_env_rel = env_var_environments::ActiveModel {
                             env_var_id: Set(var.id),
@@ -553,7 +625,16 @@ impl EnvVarService {
                     let value_supplied = value.is_some();
                     let value = if var.is_secret { None } else { value };
 
-                    let mut new_environment_ids = environment_ids.clone();
+                    // The final link set: the requested live environments plus
+                    // the preserved links to deleted ones, which
+                    // `previous_environment_ids` also contains. Comparing
+                    // without them would audit every edit of a variable linked
+                    // to a deleted environment as an environment change.
+                    let mut new_environment_ids = environment_ids
+                        .iter()
+                        .chain(preserved_ids.iter())
+                        .copied()
+                        .collect::<Vec<_>>();
                     new_environment_ids.sort_unstable();
                     new_environment_ids.dedup();
                     let mut changed_fields: Vec<&'static str> = Vec::new();
@@ -1186,9 +1267,15 @@ mod tests {
         }
     }
 
+    /// The links to deleted environments the update reads after locking the
+    /// variable (see `linked_deleted_environments`): none.
+    fn no_deleted_links() -> Vec<(env_var_environments::Model, Option<environments::Model>)> {
+        Vec::new()
+    }
+
     /// Building a mock that walks the update transaction: SELECT the row and
-    /// lock its checks, UPDATE ... RETURNING the new row, then DELETE the
-    /// environment links.
+    /// lock its checks, read its links to deleted environments, UPDATE ...
+    /// RETURNING the new row, then DELETE the environment links.
     /// `environment_ids` is empty in these tests so no link inserts follow.
     fn mock_update_db(
         before: env_vars::Model,
@@ -1198,6 +1285,7 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![before]])
                 .append_exec_results([checks_locked()])
+                .append_query_results([no_deleted_links()])
                 .append_query_results(vec![Vec::<env_var_environments::Model>::new()])
                 .append_query_results(vec![vec![after]])
                 .append_exec_results(vec![MockExecResult {
@@ -1215,6 +1303,7 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![before]])
                 .append_exec_results([checks_locked()])
+                .append_query_results([no_deleted_links()])
                 .append_query_results([Vec::<environments::Model>::new()])
                 .into_connection(),
         );
@@ -1247,9 +1336,114 @@ mod tests {
         assert_update_rejects_unavailable_environment(20).await;
     }
 
+    /// A deleted environment the variable is not linked to: accepting it
+    /// would create a new link to an environment that no longer exists.
     #[tokio::test]
-    async fn test_update_rejects_soft_deleted_environment() {
+    async fn test_update_rejects_unlinked_soft_deleted_environment() {
         assert_update_rejects_unavailable_environment(21).await;
+    }
+
+    fn make_deleted_environment(id: i32, project_id: i32, name: &str) -> environments::Model {
+        environments::Model {
+            id,
+            name: name.to_string(),
+            slug: name.to_string(),
+            subdomain: format!("{name}.example.test"),
+            last_deployment: None,
+            host: String::new(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            project_id,
+            current_deployment_id: None,
+            branch: Some(name.to_string()),
+            deleted_at: Some(chrono::Utc::now()),
+            deployment_config: None,
+            is_preview: true,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_keeps_link_to_deleted_environment_and_accepts_its_id() {
+        // The edit dialog sends back every environment the variable reported,
+        // deleted ones included. The save (here a promotion to secret) must
+        // succeed, and the link must survive: deleting it would leave the
+        // variable unscoped, i.e. applied to every environment.
+        let encryption_service = make_encryption_service();
+        let encrypted = encryption_service.encrypt_string("value").unwrap();
+        let before = make_env_var_model_full(9, 10, "API_KEY", &encrypted, true, false);
+        let after = make_env_var_model_full(9, 10, "API_KEY", &encrypted, true, true);
+        let link = env_var_environments::Model {
+            id: 1,
+            env_var_id: 9,
+            environment_id: 21,
+            created_at: chrono::Utc::now(),
+        };
+        let deleted = make_deleted_environment(21, 10, "removed-preview");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![before]])
+                .append_exec_results([checks_locked()])
+                .append_query_results([vec![(link.clone(), Some(deleted))]])
+                // No environment lookup: the only requested id is the
+                // preserved one, so nothing is left to validate.
+                // The previous links, read for the audited change set.
+                .append_query_results([vec![link]])
+                .append_query_results([vec![after]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db.clone(), encryption_service);
+
+        let outcome = service
+            .update_environment_variable(
+                10,
+                9,
+                "API_KEY".to_string(),
+                None,
+                vec![21],
+                false,
+                Some(true),
+            )
+            .await
+            .expect("a stale id for a linked deleted environment must not block the save");
+
+        assert!(outcome.promoted_to_secret);
+        // Echoing the preserved link back is not an environment change.
+        assert_eq!(outcome.changed_fields, vec!["is_secret"]);
+        assert_eq!(
+            outcome
+                .var
+                .environments
+                .iter()
+                .map(|environment| environment.id)
+                .collect::<Vec<_>>(),
+            vec![21]
+        );
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service dropped, so this is the only handle");
+        let statements = format!("{:?}", db.into_transaction_log());
+        let delete = statements
+            .split("Statement")
+            .find(|statement| statement.contains("DELETE FROM \\\"env_var_environments\\\""))
+            .expect("the update must replace the variable's links");
+        assert!(
+            delete.contains("NOT IN"),
+            "the link to the deleted environment must be excluded from the delete: {delete}"
+        );
+        assert!(
+            !statements.contains("INSERT INTO \\\"env_var_environments\\\""),
+            "no new link may be created for a deleted environment: {statements}"
+        );
     }
 
     #[tokio::test]
@@ -1431,6 +1625,7 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![before]])
                 .append_exec_results([checks_locked()])
+                .append_query_results([no_deleted_links()])
                 .into_connection(),
         );
         let service = EnvVarService::new(db, encryption_service);
@@ -1471,6 +1666,7 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![before]])
                 .append_exec_results([checks_locked()])
+                .append_query_results([no_deleted_links()])
                 .into_connection(),
         );
         let service = EnvVarService::new(db, encryption_service);
@@ -1506,6 +1702,7 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![before]])
                 .append_exec_results([checks_locked()])
+                .append_query_results([no_deleted_links()])
                 .into_connection(),
         );
         let service = EnvVarService::new(db, encryption_service);
@@ -1549,6 +1746,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![before]])
             .append_exec_results([checks_locked()])
+            .append_query_results([no_deleted_links()])
             .append_query_results(vec![Vec::<env_var_environments::Model>::new()])
             .append_query_results(vec![vec![after]])
             .append_exec_results(vec![MockExecResult {
@@ -1611,9 +1809,239 @@ mod integration_tests {
     use super::*;
     use chrono::Utc;
     use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
-    use temps_entities::{preset::Preset, projects};
+    use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList};
 
     const ENCRYPTION_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    async fn test_database() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker unavailable, skipping env var scoping test: {error:#}");
+                None
+            }
+            Err(error) => panic!("env var scoping test database setup failed: {error:#}"),
+        }
+    }
+
+    fn env_var_service(test_db: &TestDatabase) -> EnvVarService {
+        let encryption =
+            Arc::new(EncryptionService::new(ENCRYPTION_KEY).expect("test key should be valid"));
+        EnvVarService::new(test_db.connection_arc(), encryption)
+    }
+
+    async fn create_project(test_db: &TestDatabase, suffix: &str) -> projects::Model {
+        projects::ActiveModel {
+            name: Set(format!("Env var scoping {suffix}")),
+            repo_name: Set(format!("repo-{suffix}")),
+            repo_owner: Set("temps-tests".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("env-var-scoping-{suffix}")),
+            preset: Set(Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.connection())
+        .await
+        .expect("project fixture should insert")
+    }
+
+    async fn create_environment(
+        test_db: &TestDatabase,
+        project_id: i32,
+        suffix: &str,
+    ) -> environments::Model {
+        environments::ActiveModel {
+            project_id: Set(project_id),
+            name: Set(suffix.to_string()),
+            slug: Set(suffix.to_string()),
+            host: Set(format!("{suffix}.example.test")),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set(format!("env-var-scoping-{suffix}.example.test")),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.connection())
+        .await
+        .expect("environment fixture should insert")
+    }
+
+    async fn soft_delete_environment(test_db: &TestDatabase, environment_id: i32) {
+        test_db
+            .connection()
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE environments SET deleted_at = NOW() WHERE id = $1",
+                [environment_id.into()],
+            ))
+            .await
+            .expect("environment soft deletion should succeed");
+    }
+
+    async fn linked_environment_ids(test_db: &TestDatabase, var_id: i32) -> Vec<i32> {
+        env_var_environments::Entity::find()
+            .filter(env_var_environments::Column::EnvVarId.eq(var_id))
+            .order_by_asc(env_var_environments::Column::EnvironmentId)
+            .all(test_db.connection())
+            .await
+            .expect("links should load")
+            .into_iter()
+            .map(|link| link.environment_id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn update_of_var_linked_to_deleted_environment_succeeds_and_keeps_the_link() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "deleted-link").await;
+        let live = create_environment(&test_db, project.id, "deleted-link-live").await;
+        let removed = create_environment(&test_db, project.id, "deleted-link-removed").await;
+        let service = env_var_service(&test_db);
+        let variable = service
+            .create_environment_variable(
+                project.id,
+                vec![removed.id],
+                "SCOPED_TOKEN".into(),
+                "value".into(),
+                false,
+                false,
+            )
+            .await
+            .expect("env var fixture should insert");
+        soft_delete_environment(&test_db, removed.id).await;
+
+        // The list still reports the link, so the console can show it as
+        // deleted, and a client sends that id straight back on save.
+        let listed = service
+            .get_environment_variables(project.id, None)
+            .await
+            .expect("list should succeed");
+        let reported = listed
+            .iter()
+            .find(|listed| listed.id == variable.id)
+            .expect("the variable should be listed")
+            .environments
+            .iter()
+            .map(|environment| environment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(reported, vec![removed.id]);
+
+        // Converting to a secret with the stale id: the reported failure.
+        let outcome = service
+            .update_environment_variable(
+                project.id,
+                variable.id,
+                "SCOPED_TOKEN".into(),
+                None,
+                reported,
+                false,
+                Some(true),
+            )
+            .await
+            .expect("a stale id for a linked deleted environment must not block the save");
+        assert!(outcome.promoted_to_secret);
+        assert_eq!(
+            linked_environment_ids(&test_db, variable.id).await,
+            vec![removed.id]
+        );
+
+        // Adding a live environment keeps the deleted link alongside it.
+        service
+            .update_environment_variable(
+                project.id,
+                variable.id,
+                "SCOPED_TOKEN".into(),
+                None,
+                vec![live.id],
+                false,
+                None,
+            )
+            .await
+            .expect("adding a live environment should succeed");
+        let mut expected = vec![live.id, removed.id];
+        expected.sort();
+        assert_eq!(
+            linked_environment_ids(&test_db, variable.id).await,
+            expected
+        );
+
+        // Clearing the selection removes the live link only. Removing the
+        // deleted one too would leave no links, which means "every
+        // environment": an edit must never widen a variable's scope.
+        service
+            .update_environment_variable(
+                project.id,
+                variable.id,
+                "SCOPED_TOKEN".into(),
+                None,
+                vec![],
+                false,
+                None,
+            )
+            .await
+            .expect("clearing the live selection should succeed");
+        assert_eq!(
+            linked_environment_ids(&test_db, variable.id).await,
+            vec![removed.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_rejects_unlinked_deleted_and_foreign_environments() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let project = create_project(&test_db, "reject-owner").await;
+        let other_project = create_project(&test_db, "reject-other").await;
+        let live = create_environment(&test_db, project.id, "reject-live").await;
+        let removed = create_environment(&test_db, project.id, "reject-removed").await;
+        let foreign = create_environment(&test_db, other_project.id, "reject-foreign").await;
+        soft_delete_environment(&test_db, removed.id).await;
+        let service = env_var_service(&test_db);
+        let variable = service
+            .create_environment_variable(
+                project.id,
+                vec![live.id],
+                "REJECT_KEY".into(),
+                "value".into(),
+                false,
+                false,
+            )
+            .await
+            .expect("env var fixture should insert");
+
+        for rejected in [removed.id, foreign.id] {
+            let error = service
+                .update_environment_variable(
+                    project.id,
+                    variable.id,
+                    "REJECT_KEY".into(),
+                    None,
+                    vec![live.id, rejected],
+                    false,
+                    None,
+                )
+                .await
+                .expect_err("an environment the variable may not be linked to must be rejected");
+            assert!(
+                matches!(
+                    error,
+                    EnvVarError::EnvironmentNotFound { environment_id, project_id }
+                        if environment_id == rejected && project_id == project.id
+                ),
+                "unexpected error for environment {rejected}: {error:?}"
+            );
+            assert_eq!(
+                linked_environment_ids(&test_db, variable.id).await,
+                vec![live.id]
+            );
+        }
+    }
 
     #[tokio::test]
     async fn env_var_writes_and_running_checks_never_deadlock() {

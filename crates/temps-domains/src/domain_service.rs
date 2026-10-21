@@ -708,6 +708,10 @@ impl DomainService {
                 domain_active.expiration_time = Set(Some(cert_data.expiration_time));
                 domain_active.last_error = Set(None);
                 domain_active.last_error_type = Set(None);
+                // As in `complete_challenge`: the certificate came from an ACME
+                // order for this challenge type, so the renewal job can renew
+                // it the same way.
+                domain_active.verification_method = Set(challenge_type_str.to_string());
 
                 let domain = domain_active.update(self.db.as_ref()).await?;
 
@@ -946,6 +950,14 @@ impl DomainService {
                 domain_active.last_renewed = Set(Some(Utc::now()));
                 domain_active.last_error = Set(None);
                 domain_active.last_error_type = Set(None);
+                // Record the challenge that was actually validated. A row
+                // created as `manual` (e.g. by `temps setup`) and issued here
+                // would otherwise stay `manual`, which the renewal job never
+                // renews.
+                domain_active.verification_method = Set(match &challenge_type {
+                    ChallengeType::Http01 => "http-01".to_string(),
+                    ChallengeType::Dns01 => "dns-01".to_string(),
+                });
 
                 let txn = self.db.begin().await?;
                 let saved = async {
@@ -2864,7 +2876,7 @@ mod tests {
         async fn provision(
             &self,
             domain: &str,
-            _challenge: ChallengeType,
+            challenge: ChallengeType,
             _email: &str,
         ) -> Result<ProvisioningResult, crate::tls::ProviderError> {
             if self
@@ -2885,18 +2897,22 @@ mod tests {
                 .provisions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 + 1;
+            let dns_txt_records = match challenge {
+                ChallengeType::Dns01 => vec![crate::tls::models::DnsTxtRecord {
+                    name: format!("_acme-challenge.{domain}"),
+                    value: format!("txt-value-{n}"),
+                    validation_url: format!("https://acme.example.test/chall/{n}"),
+                }],
+                ChallengeType::Http01 => vec![],
+            };
             Ok(ProvisioningResult::Challenge(
                 crate::tls::models::ChallengeData {
-                    challenge_type: ChallengeType::Dns01,
+                    challenge_type: challenge,
                     domain: domain.to_string(),
                     token: format!("token-{n}"),
                     key_authorization: format!("key-auth-{n}"),
                     validation_url: Some(format!("https://acme.example.test/chall/{n}")),
-                    dns_txt_records: vec![crate::tls::models::DnsTxtRecord {
-                        name: format!("_acme-challenge.{domain}"),
-                        value: format!("txt-value-{n}"),
-                        validation_url: format!("https://acme.example.test/chall/{n}"),
-                    }],
+                    dns_txt_records,
                     order_url: Some(format!("https://acme.example.test/order/{n}")),
                 },
             ))
@@ -2929,7 +2945,7 @@ mod tests {
         }
 
         fn supported_challenges(&self) -> Vec<ChallengeType> {
-            vec![ChallengeType::Dns01]
+            vec![ChallengeType::Http01, ChallengeType::Dns01]
         }
 
         async fn validate_prerequisites(
@@ -3305,6 +3321,107 @@ mod tests {
             .expect("the open challenge is verified again");
         assert_eq!(active.status, "active");
         assert_eq!(provider.completions(), 2);
+    }
+
+    // ---- verification_method after an ACME issuance (#1587) ----
+
+    /// Turns `name` into a `manual` row, as `temps setup` stores its domains.
+    /// `create_domain` only accepts `http-01`/`dns-01`, so the column is
+    /// rewritten directly.
+    async fn mark_manual(db: &DatabaseConnection, name: &str) {
+        let mut active: domains::ActiveModel = domain_row(db, name).await.into();
+        active.verification_method = Set("manual".to_string());
+        active.update(db).await.unwrap();
+    }
+
+    /// Finalizing an order for a `manual` domain goes through HTTP-01, so the
+    /// row must say `http-01` afterwards — the renewal job never renews a
+    /// `manual` row.
+    #[tokio::test]
+    async fn test_finalizing_a_manual_domain_records_the_validated_challenge() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "installer.example.com";
+        let created = service.create_domain(name, "http-01").await.unwrap();
+        mark_manual(&db, name).await;
+
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let order = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("the order exists");
+        assert_eq!(
+            order.authorizations.as_ref().unwrap()["challenge_type"],
+            "http-01"
+        );
+        assert_eq!(domain_row(&db, name).await.verification_method, "manual");
+
+        let active = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect("the challenge is verified");
+
+        assert_eq!(active.status, "active");
+        assert_eq!(active.verification_method, "http-01");
+        assert_eq!(domain_row(&db, name).await.verification_method, "http-01");
+    }
+
+    /// A DNS-01 domain keeps `dns-01` after finalizing.
+    #[tokio::test]
+    async fn test_finalizing_a_dns01_domain_keeps_dns01() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, _repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "dns.example.com";
+        service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+
+        let active = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect("the challenge is verified");
+
+        assert_eq!(active.verification_method, "dns-01");
+        assert_eq!(domain_row(&db, name).await.verification_method, "dns-01");
+    }
+
+    /// When the CA hands back a certificate without a challenge (it still held
+    /// a valid authorization), a `manual` row is updated the same way.
+    #[tokio::test]
+    async fn test_immediate_certificate_for_a_manual_domain_records_the_challenge() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, _repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "cached-installer.example.com";
+        service.create_domain(name, "http-01").await.unwrap();
+        mark_manual(&db, name).await;
+        provider
+            .immediate_certificate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let issued = service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .expect("certificate issued outright");
+
+        assert_eq!(issued.status, "completed");
+        let row = domain_row(&db, name).await;
+        assert_eq!(row.status, "active");
+        assert_eq!(row.verification_method, "http-01");
     }
 
     // ---- Pure unit tests (no DB) for the on-demand helpers ----
