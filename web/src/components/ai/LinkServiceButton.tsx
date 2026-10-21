@@ -108,7 +108,7 @@ export function LinkServiceButton({
           ) : (
             <Link2 className="size-4" aria-hidden />
           )}
-          <span className="hidden sm:inline">Link</span>
+          <span className="max-sm:sr-only">Link</span>
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-80 p-0" align="end">

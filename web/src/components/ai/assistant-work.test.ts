@@ -297,12 +297,33 @@ describe('liveWorkStatus', () => {
     ).toBe('Using Deploy preview')
   })
 
-  it('counts the steps taken between steps, not the last one finished', () => {
+  it('between steps, names the last step taken and how far it has got', () => {
     const done = { tool: tool('a', 'Bash', { command: 'npm test' }), index: 0 }
-    expect(liveWorkStatus([done])).toBe('1 step so far')
-    expect(liveWorkStatus([done, { tool: tool('b', 'Bash'), index: 1 }])).toBe(
-      '2 steps so far'
+    expect(liveWorkStatus([done])).toBe('Ran npm test · 1 step so far')
+    expect(
+      liveWorkStatus([
+        done,
+        { tool: tool('b', 'temps', { command: 'projects list' }), index: 1 },
+      ])
+    ).toBe('Ran projects list · 2 steps so far')
+  })
+
+  it('says when the last step failed', () => {
+    const failed = tool('a', 'Read', { file_path: 'a.ts' }, '{"is_error":true}')
+    expect(liveWorkStatus([{ tool: failed, index: 0 }])).toMatch(
+      /^Failed: Read a\.ts · 1 step so far$/
     )
+  })
+
+  it('names the Temps operation running now', () => {
+    expect(
+      liveWorkStatus([
+        {
+          tool: running('a', 'temps', { command: 'projects get 49' }),
+          index: 0,
+        },
+      ])
+    ).toBe('Running projects get 49')
   })
 
   it('says nothing before the first step', () => {

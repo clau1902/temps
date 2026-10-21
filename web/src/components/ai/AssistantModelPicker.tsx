@@ -509,7 +509,7 @@ export function AssistantModelChip({
           size="sm"
           disabled={disabled}
           className={cn(
-            'h-8 min-w-0 max-w-44 justify-between gap-2 px-2 font-normal md:max-w-full text-muted-foreground hover:text-foreground',
+            'h-8 min-w-0 max-w-44 justify-between gap-2 px-2 font-normal text-muted-foreground hover:text-foreground @[30rem]:max-w-64 @[44rem]:max-w-96',
             roomy && 'h-9 text-sm'
           )}
           aria-label={`Model: ${label}${keyLabel ? ` on ${keyLabel}` : ''}. Change model for this chat`}
@@ -527,7 +527,9 @@ export function AssistantModelChip({
               {label}
             </span>
             {keyLabel ? (
-              <span className="hidden truncate md:inline">· {keyLabel}</span>
+              <span className="hidden truncate @[44rem]:inline">
+                · {keyLabel}
+              </span>
             ) : null}
           </span>
           <ChevronsUpDown

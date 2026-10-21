@@ -44,13 +44,22 @@ function serveDiscovery(answer: () => Response) {
   return requests
 }
 
-function Form({ baseUrl, apiKey }: { baseUrl: string; apiKey: string }) {
+function Form({
+  baseUrl,
+  apiKey,
+  committedBaseUrl,
+}: {
+  baseUrl: string
+  apiKey: string
+  committedBaseUrl?: string
+}) {
   const [discovery, setDiscovery] = useState<SelfHostedDiscovery | null>(null)
   const [defaultModel, setDefaultModel] = useState('')
   return (
     <SelfHostedProviderFields
       open
       baseUrl={baseUrl}
+      committedBaseUrl={committedBaseUrl}
       apiKey={apiKey}
       trustPrivateAddress={false}
       onTrustPrivateAddressChange={() => {}}
@@ -65,14 +74,18 @@ function Form({ baseUrl, apiKey }: { baseUrl: string; apiKey: string }) {
   )
 }
 
-function renderForm(baseUrl: string, apiKey = '') {
+function renderForm(baseUrl: string, apiKey = '', committedBaseUrl?: string) {
   const queries = new QueryClient({
     defaultOptions: { mutations: { retry: false } },
   })
   return render(
     <QueryClientProvider client={queries}>
       <MemoryRouter>
-        <Form baseUrl={baseUrl} apiKey={apiKey} />
+        <Form
+          baseUrl={baseUrl}
+          apiKey={apiKey}
+          committedBaseUrl={committedBaseUrl}
+        />
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -130,7 +143,7 @@ test('a half-typed URL sends no request', async () => {
   expect(screen.getByText('Enter the base URL to load its models')).toBeTruthy()
 })
 
-test('a typed API key is only sent when the models are loaded by hand', async () => {
+test('a typed API key is not sent to a base URL still being typed', async () => {
   const requests = serveDiscovery(() =>
     Response.json({ models: [{ id: 'model-a', name: null }] })
   )
@@ -150,4 +163,36 @@ test('a typed API key is only sent when the models are loaded by hand', async ()
       base_url: 'https://llm.example.co',
     }),
   ])
+})
+
+test('with an API key, a committed base URL loads the models without a click', async () => {
+  const requests = serveDiscovery(() =>
+    Response.json({ models: [{ id: 'model-a', name: null }] })
+  )
+  renderForm(
+    'https://llm.example.test/v1',
+    'sk-test-key',
+    'https://llm.example.test/v1'
+  )
+
+  await screen.findByText(/Connected: 1 model found/, undefined, {
+    timeout: 3000,
+  })
+  expect(requests).toEqual([
+    expect.objectContaining({
+      api_key: 'sk-test-key',
+      base_url: 'https://llm.example.test/v1',
+    }),
+  ])
+})
+
+test('with an API key, editing past the committed base URL waits again', async () => {
+  const requests = serveDiscovery(() => Response.json({ models: [] }))
+  renderForm('https://llm.example.co', 'sk-test-key', 'https://llm.example.c')
+
+  await new Promise((resolve) => setTimeout(resolve, 900))
+  expect(requests).toHaveLength(0)
+  expect(
+    screen.getByText('Models load once you finish the base URL')
+  ).toBeTruthy()
 })

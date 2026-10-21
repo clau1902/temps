@@ -242,7 +242,10 @@ export function toolActivity(tool: ToolCall): string | null {
   }
   if (kind === 'search') return 'Searching'
   if (kind === 'fetch') return 'Fetching a page'
-  if (kind === 'platform') return 'Checking Temps'
+  if (kind === 'platform') {
+    const { detail } = traceStep(tool)
+    return detail ? `Running ${detail}` : 'Checking Temps'
+  }
   if (kind === 'process') return 'Managing a process'
   if (kind === 'playbook') return 'Reading a playbook'
   if (kind === 'sandbox') return 'Starting a sandbox'
@@ -262,15 +265,44 @@ export function runningTool(steps: readonly WorkStep[]): ToolCall | null {
 
 /**
  * The one line a working group shows while it is closed: the step running
- * now ("Running npm test"), or between steps how far it has got ("3 steps so
- * far"). Null before the first step, when "Working" says it all.
+ * now ("Running npm test"), or between steps the step it last took and how
+ * far it has got ("Ran npm test · 3 steps so far"), so a pause while the model
+ * thinks never hides what it was doing. Null before the first step, when
+ * "Working" says it all.
  */
 export function liveWorkStatus(steps: readonly WorkStep[]): string | null {
   const running = runningTool(steps)
   if (running)
     return toolActivity(running) ?? `Using ${humanName(running.name)}`
-  if (steps.length === 0) return null
-  return steps.length === 1 ? '1 step so far' : `${steps.length} steps so far`
+  const last = steps[steps.length - 1]
+  if (!last) return null
+  const count =
+    steps.length === 1 ? '1 step so far' : `${steps.length} steps so far`
+  return `${finishedStep(last.tool)} · ${count}`
+}
+
+const PAST_VERBS: Record<string, string> = {
+  Run: 'Ran',
+  Read: 'Read',
+  Write: 'Wrote',
+  Edit: 'Edited',
+  Search: 'Searched',
+  Fetch: 'Fetched',
+  Temps: 'Ran',
+  Playbook: 'Read playbook',
+  'Create sandbox': 'Created sandbox',
+}
+
+/** A step that has finished, in the past tense: "Ran projects list". */
+export function finishedStep(tool: ToolCall): string {
+  const { verb, detail } = traceStep(tool)
+  const past = PAST_VERBS[verb] ?? verb
+  const text = detail
+    ? `${past} ${detail}`
+    : verb === 'Temps'
+      ? 'Checked Temps'
+      : past
+  return toolExecutionState(tool) === 'failed' ? `Failed: ${text}` : text
 }
 
 export function stepTools(steps: readonly WorkStep[]): ToolCall[] {

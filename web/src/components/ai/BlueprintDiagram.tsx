@@ -175,9 +175,14 @@ function DiagramSvg({
               />
               <text
                 x={edge.labelX}
-                y={edge.labelY - 4}
-                textAnchor="middle"
-                className="fill-muted-foreground text-[9px]"
+                y={edge.labelY}
+                textAnchor={edge.labelAnchor}
+                // A halo in the background colour keeps a label readable where
+                // another flow passes behind it.
+                paintOrder="stroke"
+                strokeWidth={3}
+                strokeLinejoin="round"
+                className="fill-muted-foreground stroke-background text-[9px]"
               >
                 {clip(flow.kind, 12)}
               </text>
@@ -227,10 +232,10 @@ function DiagramSvg({
                 y={22}
                 className="fill-foreground text-[12px] font-medium"
               >
-                {clip(component.name, 20)}
+                {clip(component.name, 22)}
               </text>
               <text x={12} y={40} className="fill-muted-foreground text-[10px]">
-                {clip(componentDetail(component), 26)}
+                {clip(componentDetail(component), 28)}
               </text>
               {state && (
                 <circle

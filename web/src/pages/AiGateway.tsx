@@ -24,7 +24,13 @@ import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
-import { Fragment, useLayoutEffect, useMemo, useState } from 'react'
+import {
+  Fragment,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  type ChangeEvent,
+} from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -4010,6 +4016,9 @@ export function AiGatewayPage() {
   // provider is fixed. Opened from the header or the onboarding prompt, the
   // dialog shows a provider choice instead.
   const [providerPreselected, setProviderPreselected] = useState(false)
+  // The base URL as last left or pasted, so an OpenAI-compatible key's
+  // models load on their own without sending the key to a half-typed host.
+  const [committedBaseUrl, setCommittedBaseUrl] = useState('')
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [selectedKey, setSelectedKey] = useState<ProviderKeyResponse | null>(
     null
@@ -4951,7 +4960,20 @@ console.log(response.choices[0].message.content);`,
                     }
                     disabled={createMutation.isPending}
                     aria-invalid={!!formErrors.base_url}
-                    {...providerKeyForm.register('base_url')}
+                    {...providerKeyForm.register('base_url', {
+                      onBlur: (event: ChangeEvent<HTMLInputElement>) =>
+                        setCommittedBaseUrl(event.target.value),
+                      onChange: (event: ChangeEvent<HTMLInputElement>) => {
+                        const { inputType } = event.nativeEvent as InputEvent
+                        // A paste or browser autofill arrives whole.
+                        if (
+                          inputType === 'insertFromPaste' ||
+                          inputType === 'insertReplacementText'
+                        ) {
+                          setCommittedBaseUrl(event.target.value)
+                        }
+                      },
+                    })}
                   />
                   {formErrors.base_url && (
                     <p className="text-xs text-destructive">
@@ -4973,6 +4995,7 @@ console.log(response.choices[0].message.content);`,
                 <SelfHostedProviderFields
                   open={newProviderIsSelfHosted}
                   baseUrl={formValues.base_url}
+                  committedBaseUrl={committedBaseUrl}
                   apiKey={formValues.api_key}
                   trustPrivateAddress={formValues.trust_private_address}
                   onTrustPrivateAddressChange={(trusted) =>

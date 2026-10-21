@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Loader2, Network, X } from 'lucide-react'
+import { Check, Loader2, Network, Pencil, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { BlueprintDiagram } from './BlueprintDiagram'
@@ -94,12 +94,33 @@ export function BlueprintProposalCard({
         conversationPublicId
       )
       setRejecting(false)
-      continueChat(
-        conversationPublicId,
-        rejectedMessage(receipt.version, reason)
-      )
     },
   })
+  // "Change something" asks the chat for a new design; a plain rejection only
+  // takes the proposal off the table and keeps whatever was accepted before.
+  const rejectAndAsk = () =>
+    reject.mutate(
+      { path },
+      {
+        onSuccess: () =>
+          continueChat(
+            conversationPublicId,
+            rejectedMessage(receipt.version, reason)
+          ),
+      }
+    )
+  const rejectOnly = () =>
+    reject.mutate(
+      { path },
+      {
+        onSuccess: (data) =>
+          toast.success(
+            data.accepted
+              ? `Version ${receipt.version} rejected. Version ${data.accepted.version} stays as it is.`
+              : `Version ${receipt.version} rejected`
+          ),
+      }
+    )
   // Compare with what was accepted when this was proposed, when that is
   // still the accepted version.
   const previous =
@@ -194,8 +215,24 @@ export function BlueprintProposalCard({
             disabled={busy}
             onClick={() => setRejecting(true)}
           >
-            <X className="size-4" />
+            <Pencil className="size-4" />
             Change something
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="gap-1.5"
+            disabled={busy}
+            onClick={rejectOnly}
+            title="Discard this proposal without asking for another one"
+          >
+            {reject.isPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <X className="size-4" />
+            )}
+            Reject
           </Button>
           <span className="text-xs text-muted-foreground">
             Nothing is built until you accept.
@@ -217,7 +254,7 @@ export function BlueprintProposalCard({
               size="sm"
               variant="outline"
               disabled={busy}
-              onClick={() => reject.mutate({ path })}
+              onClick={rejectAndAsk}
             >
               {reject.isPending && <Loader2 className="size-4 animate-spin" />}
               Reject and send

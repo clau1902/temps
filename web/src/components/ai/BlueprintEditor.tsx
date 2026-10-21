@@ -23,9 +23,13 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { zodResolver } from '@hookform/resolvers/zod'
 import { Loader2, Plus, Trash2 } from 'lucide-react'
 import { useId, useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
 import {
+  blueprintEditorSchema,
+  type BlueprintEditorValues,
   cleanDocument,
   formatHolds,
   newComponent,
@@ -102,15 +106,26 @@ function Choice<T extends string>({
   )
 }
 
+function FieldError({ id, message }: { id: string; message?: string }) {
+  if (!message) return null
+  return (
+    <p id={id} className="text-xs text-destructive">
+      {message}
+    </p>
+  )
+}
+
 function Field({
   label,
   value,
   placeholder,
+  error,
   onChange,
 }: {
   label: string
   value: string
   placeholder?: string
+  error?: string
   onChange: (value: string) => void
 }) {
   const id = useId()
@@ -123,9 +138,12 @@ function Field({
         id={id}
         value={value}
         placeholder={placeholder}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={error ? `${id}-error` : undefined}
         onChange={(event) => onChange(event.target.value)}
         className="h-8 text-xs"
       />
+      <FieldError id={`${id}-error`} message={error} />
     </div>
   )
 }
@@ -160,10 +178,12 @@ function HoldsField({
 
 function PartEditor({
   component,
+  nameError,
   onChange,
   onRemove,
 }: {
   component: Component
+  nameError?: string
   onChange: (next: Component) => void
   onRemove: () => void
 }) {
@@ -178,6 +198,7 @@ function PartEditor({
         <Field
           label="Name"
           value={component.name}
+          error={nameError}
           onChange={(name) => set({ name })}
         />
         <Choice
@@ -340,11 +361,24 @@ export function BlueprintEditor({
   onSave: (document: BlueprintDocument, changeSummary: string) => void
   onCancel: () => void
 }) {
-  const [draft, setDraft] = useState<BlueprintDocument>(() => ({
-    ...initial,
-    flows: initial.flows ?? [],
-  }))
-  const [summary, setSummary] = useState(initialChangeSummary)
+  const form = useForm<BlueprintEditorValues>({
+    resolver: zodResolver(blueprintEditorSchema),
+    defaultValues: {
+      document: { ...initial, flows: initial.flows ?? [] },
+      changeSummary: initialChangeSummary,
+    },
+  })
+  const draft = useWatch({ control: form.control, name: 'document' })
+  // Once a save was tried, every edit re-checks, so a fixed field's error
+  // goes away as the user fixes it.
+  const setDraft = (next: BlueprintDocument) =>
+    form.setValue('document', next, {
+      shouldDirty: true,
+      shouldValidate: form.formState.isSubmitted,
+    })
+  const errors = form.formState.errors.document
+  const partsError = (errors?.components as { message?: string } | undefined)
+    ?.message
   const [newKind, setNewKind] = useState<ComponentKind>('app')
   const [newName, setNewName] = useState('')
   const flows = draft.flows ?? []
@@ -377,10 +411,10 @@ export function BlueprintEditor({
   return (
     <form
       className="space-y-4"
-      onSubmit={(event) => {
-        event.preventDefault()
-        onSave(cleanDocument(draft), summary.trim())
-      }}
+      noValidate
+      onSubmit={form.handleSubmit((values) =>
+        onSave(cleanDocument(values.document), values.changeSummary.trim())
+      )}
     >
       <div className="space-y-1">
         <Label htmlFor="blueprint-summary" className="text-xs">
@@ -390,25 +424,35 @@ export function BlueprintEditor({
           id="blueprint-summary"
           rows={2}
           value={draft.summary}
+          aria-invalid={errors?.summary ? true : undefined}
+          aria-describedby={
+            errors?.summary ? 'blueprint-summary-error' : undefined
+          }
           onChange={(event) =>
             setDraft({ ...draft, summary: event.target.value })
           }
+        />
+        <FieldError
+          id="blueprint-summary-error"
+          message={errors?.summary?.message}
         />
       </div>
       <section className="space-y-2" aria-label="Parts">
         <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
           Parts
         </h3>
-        {draft.components.map((component) => (
+        {draft.components.map((component, index) => (
           <PartEditor
             key={component.id}
             component={component}
+            nameError={errors?.components?.[index]?.name?.message}
             onChange={(next) =>
               setDraft(updateComponent(draft, component.id, next))
             }
             onRemove={() => setDraft(removeComponent(draft, component.id))}
           />
         ))}
+        <FieldError id="blueprint-parts-error" message={partsError} />
         <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
           <div className="sm:w-40">
             <Choice
@@ -470,10 +514,19 @@ export function BlueprintEditor({
         </Label>
         <Input
           id="blueprint-change"
-          value={summary}
           placeholder="Moved sessions to Redis"
-          onChange={(event) => setSummary(event.target.value)}
+          aria-invalid={form.formState.errors.changeSummary ? true : undefined}
+          aria-describedby={
+            form.formState.errors.changeSummary
+              ? 'blueprint-change-error'
+              : undefined
+          }
+          {...form.register('changeSummary')}
           className="h-8 text-xs"
+        />
+        <FieldError
+          id="blueprint-change-error"
+          message={form.formState.errors.changeSummary?.message}
         />
       </div>
       {problems.length > 0 && (
@@ -492,11 +545,7 @@ export function BlueprintEditor({
         </div>
       )}
       <div className="flex flex-wrap gap-2">
-        <Button
-          type="submit"
-          size="sm"
-          disabled={saving || !summary.trim() || draft.components.length === 0}
-        >
+        <Button type="submit" size="sm" disabled={saving}>
           {saving && <Loader2 className="size-4 animate-spin" />}
           Save as a new version
         </Button>

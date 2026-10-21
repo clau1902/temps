@@ -45,6 +45,12 @@ interface SelfHostedProviderFieldsProps {
    */
   open: boolean
   baseUrl: string
+  /**
+   * The base URL as the administrator last finished entering it: the value
+   * when they left the field or pasted into it. With an API key set, models
+   * load on their own only for this URL, never for one still being typed.
+   */
+  committedBaseUrl?: string
   apiKey: string
   trustPrivateAddress: boolean
   onTrustPrivateAddressChange: (trusted: boolean) => void
@@ -75,6 +81,7 @@ const DISCOVERY_DEBOUNCE_MS = 600
 export function SelfHostedProviderFields({
   open,
   baseUrl,
+  committedBaseUrl = '',
   apiKey,
   trustPrivateAddress,
   onTrustPrivateAddressChange,
@@ -137,17 +144,19 @@ export function SelfHostedProviderFields({
     },
   })
 
-  // Listing the models is how the form checks the server. For a keyless
-  // server it runs on its own once the URL and trust choice stop changing, at
-  // most once per set of inputs, so a failure is shown instead of retried in a
-  // loop. With an API key it waits for the button: a pause while typing the
-  // URL leaves a prefix that is often a real, someone-else's host
-  // (`https://api.example.co` on the way to `.com`), and discovery sends the
-  // key to it as a bearer token.
+  // Listing the models is how the form checks the server. It runs on its own
+  // once the inputs stop changing, at most once per set of inputs, so a
+  // failure is shown instead of retried in a loop. With an API key it also
+  // waits until the base URL is committed (the field was left or pasted
+  // into): a pause while typing the URL leaves a prefix that is often a real,
+  // someone-else's host (`https://api.example.co` on the way to `.com`), and
+  // discovery sends the key to it as a bearer token.
   const settledSignature = useDebounce(signature, DISCOVERY_DEBOUNCE_MS)
   const { mutate: discover, variables: requestedSignature } = discoverMutation
   const discoverable = isDiscoverableBaseUrl(baseUrl)
-  const automatic = apiKey === ''
+  const committed =
+    baseUrl.trim() !== '' && committedBaseUrl.trim() === baseUrl.trim()
+  const automatic = apiKey === '' || committed
   const listed = currentModels !== null
   useEffect(() => {
     if (!open || disabled || !discoverable || !automatic || listed) return
@@ -272,7 +281,7 @@ export function SelfHostedProviderFields({
                   ? 'Enter the base URL to load its models'
                   : automatic
                     ? 'Models load from your server'
-                    : 'Load models to list what your server serves'
+                    : 'Models load once you finish the base URL'
           }
           searchPlaceholder="Search models..."
           emptyText="No model matches."
@@ -289,9 +298,9 @@ export function SelfHostedProviderFields({
               discoveryError,
               'Could not list the models your server serves.'
             )}{' '}
-            {automatic
+            {apiKey === ''
               ? 'Check the base URL; the models reload as you edit it.'
-              : 'Check the base URL and API key, then reload the models.'}
+              : 'Check the base URL and API key; the models reload as you edit them.'}
           </p>
         ) : currentModels ? (
           <p
@@ -311,7 +320,7 @@ export function SelfHostedProviderFields({
             model it serves, with no name filter.
             {automatic
               ? null
-              : ' The API key is only sent when you load the models, once the base URL is complete.'}
+              : ' The API key is only sent once you leave the base URL field.'}
           </p>
         )}
         {error && !discoveryError && !checking && (

@@ -34,15 +34,17 @@ export function permissionModeForAsk(ask: boolean): string {
 }
 
 /**
- * Outcomes people open the assistant for, shown before the first message. Each
- * names a goal, not a question: the assistant works out the steps itself.
+ * Things the assistant can finish on its own, shown before the first message.
+ * Each is a complete goal that needs nothing the user may not have yet (a
+ * repository, a database, a failed deployment): the assistant writes the app
+ * in a sandbox, adds the services it needs and deploys it, so the user ends
+ * with a live URL and sees what Temps does.
  */
 export const ASSISTANT_EXAMPLE_PROMPTS: readonly string[] = [
-  'Deploy my app from a Git repository URL',
-  'Set up daily backups of my databases to S3',
-  'Add a Postgres database to one of my projects',
-  'Why did my last deployment fail?',
-  'Deploy my app and keep trying to fix it until it is live',
+  'Build a calculator web app and deploy it',
+  'Build a to-do list app that saves tasks in Postgres and deploy it',
+  'Build a page with a visit counter stored in Redis and deploy it',
+  'Deploy a public Git repository and give me its URL',
 ]
 
 const LAST_MODEL_KEY = 'temps.assistant.last-model'

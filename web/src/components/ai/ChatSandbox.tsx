@@ -31,6 +31,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { linkableSandboxes, sandboxButtonLabel } from './chat-sandbox'
+import { IconWithStatus } from './IconWithStatus'
 import { useChatSandboxWake } from './chat-sandbox-wake'
 import { projectRefOf, useChatResources } from './chat-resources'
 import {
@@ -452,15 +453,12 @@ export function ChatSandbox({
                 : 'Give this chat a sandbox to run commands in'
           }
         >
-          {wake.phase === 'waking' ? (
-            <Loader2 className="size-4 shrink-0 animate-spin" />
-          ) : linked ? (
-            <Check className="size-4 shrink-0 text-emerald-600 dark:text-emerald-300" />
-          ) : (
-            <SquareTerminal className="size-4 shrink-0" />
-          )}
+          <IconWithStatus
+            icon={<SquareTerminal className="size-4 shrink-0" />}
+            tone={wake.phase === 'waking' ? 'working' : linked ? 'good' : null}
+          />
           {!iconOnly && (
-            <span className={cn('truncate', compact && 'hidden sm:inline')}>
+            <span className={cn('truncate', compact && 'max-sm:sr-only')}>
               {label}
             </span>
           )}
@@ -514,7 +512,7 @@ export function ChatSandboxPending({ compact = false }: { compact?: boolean }) {
       title="Send your first message, then give this chat a sandbox to run commands in"
     >
       <SquareTerminal className="size-4 shrink-0" />
-      <span className={cn('truncate', compact && 'hidden sm:inline')}>
+      <span className={cn('truncate', compact && 'max-sm:sr-only')}>
         Sandbox
       </span>
     </Button>

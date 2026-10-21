@@ -168,6 +168,16 @@ function DeploymentTab({
       </div>
     )
   }
+  // Following "the latest deployment" of a project that has none yet is a
+  // successful read with nothing in it: say it is waiting, not that it failed.
+  if (deploymentId === null && deployment.isSuccess && !deployment.data) {
+    return (
+      <p className="p-4 text-sm text-muted-foreground">
+        This project has no deployment yet. Its first one shows here as soon as
+        it starts.
+      </p>
+    )
+  }
   if (deployment.isError || !deployment.data) {
     return (
       <p className="p-4 text-sm text-muted-foreground">

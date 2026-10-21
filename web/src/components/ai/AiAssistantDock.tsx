@@ -24,16 +24,15 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import {
-  getProjectOptions,
-  listAllConversationsOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { listAllConversationsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useDebounce } from '@/hooks/useDebounce'
 import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
-import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { useQuery } from '@tanstack/react-query'
 import { AiSettingsMenu } from './AiSettingsMenu'
+import { ChatProjectMediaProvider } from './ChatProjectMedia'
+import { chatProjectQueryOptions } from './chat-project-media'
+import { useChatProjectMedia } from './chat-project-media-context'
 import { ConversationSandboxChip } from './ConversationSandboxChip'
 import { ChatRunBadge, ChatRunMark } from './ChatRunBadge'
 import {
@@ -242,14 +241,11 @@ function ProjectLogo({
   name: string
   className?: string
 }) {
-  const project = useQuery({
-    ...getProjectOptions({ path: { id: projectId } }),
-    retry: false,
-    staleTime: 60_000,
-  })
+  const project = useQuery(chatProjectQueryOptions(projectId))
+  // The media is loaded once for the whole list (ChatProjectMediaProvider).
+  const media = useChatProjectMedia(projectId)
   const hosted = project.data != null && project.data.source_type !== 'external'
-  const media = useLatestDeploymentMedia(hosted ? [projectId] : [])
-  const deployed = media.data?.projects?.[String(projectId)]
+  const deployed = hosted ? media : undefined
   return (
     <ProjectCardMedia
       name={project.data?.name ?? name}
@@ -580,6 +576,16 @@ export function DockBody({
         (switcherMatches.data ?? []).filter(isListedKind)
       ),
     [conversations, switcherMatches.data]
+  )
+  // Every project a logo in this view can show: the listed chats, the older
+  // matches of the switcher and the open chat.
+  const mediaProjectIds = useMemo(
+    () => [
+      ...conversations.map((c) => c.project_id),
+      ...olderMatches.map((c) => c.project_id),
+      active?.projectId,
+    ],
+    [conversations, olderMatches, active?.projectId]
   )
   // Whether the endpoint has older chats than the pages loaded so far.
   const [hasMoreChats, setHasMoreChats] = useState(false)
@@ -1687,68 +1693,74 @@ export function DockBody({
   )
 
   if (!isPage) {
-    return <div className="flex h-full flex-col gap-3 p-4">{main}</div>
+    return (
+      <ChatProjectMediaProvider projectIds={mediaProjectIds}>
+        <div className="flex h-full flex-col gap-3 p-4">{main}</div>
+      </ChatProjectMediaProvider>
+    )
   }
 
   return (
-    <div className="flex h-full min-w-0">
-      {/* Hidden, the list folds into a rail rather than disappearing (and the
+    <ChatProjectMediaProvider projectIds={mediaProjectIds}>
+      <div className="flex h-full min-w-0">
+        {/* Hidden, the list folds into a rail rather than disappearing (and the
           rail holds the way to show it again). */}
-      {isDesktop && listHidden && (
-        <ChatRail
-          conversations={conversations}
-          activeId={activePublicId}
-          onOpen={openConversation}
-          onShowList={toggleList}
-          onNew={startAssistant}
-          onFind={() => setSwitcherOpen(true)}
-        />
-      )}
-      <ResizablePanelGroup
-        orientation="horizontal"
-        className="h-full min-w-0 flex-1"
-        defaultLayout={defaultLayout}
-        onLayoutChanged={(layout, meta) => {
-          onLayoutChanged(layout, meta)
-          // Once a drag ends: a shown list never rests at zero width; hiding it
-          // is the header button's job.
-          const panel = sidebarRef.current
-          if (listShown && panel?.isCollapsed()) panel.expand()
-        }}
-      >
-        {/* Numbers are pixels in v4, strings are percentages: the list can grow
+        {isDesktop && listHidden && (
+          <ChatRail
+            conversations={conversations}
+            activeId={activePublicId}
+            onOpen={openConversation}
+            onShowList={toggleList}
+            onNew={startAssistant}
+            onFind={() => setSwitcherOpen(true)}
+          />
+        )}
+        <ResizablePanelGroup
+          orientation="horizontal"
+          className="h-full min-w-0 flex-1"
+          defaultLayout={defaultLayout}
+          onLayoutChanged={(layout, meta) => {
+            onLayoutChanged(layout, meta)
+            // Once a drag ends: a shown list never rests at zero width; hiding it
+            // is the header button's job.
+            const panel = sidebarRef.current
+            if (listShown && panel?.isCollapsed()) panel.expand()
+          }}
+        >
+          {/* Numbers are pixels in v4, strings are percentages: the list can grow
           to 40% of the screen but never crowd out the conversation. Below `lg`
           it is collapsed to nothing (see the effect above); on desktop
           it stops at the minimum so it can't be dragged away. */}
-        <ResizablePanel
-          id="chats"
-          panelRef={sidebarRef}
-          defaultSize={288}
-          minSize={260}
-          maxSize="40"
-          collapsible
-          collapsedSize={0}
-          disabled={!listShown}
-          onResize={(size) => {
-            // Collapsing is only for hiding the list (the user hid it, or the
-            // screen is narrow); a drag that empties a shown list springs back.
-            if (size.asPercentage === 0 && listShown)
-              sidebarRef.current?.expand()
-          }}
-          className="min-w-0"
-        >
-          {sidebar}
-        </ResizablePanel>
-        <ResizableHandle
-          withHandle
-          aria-label="Resize chat list"
-          className={listShown ? undefined : 'hidden'}
-        />
-        <ResizablePanel id="thread" minSize={isDesktop ? 360 : 0}>
-          {main}
-        </ResizablePanel>
-      </ResizablePanelGroup>
-    </div>
+          <ResizablePanel
+            id="chats"
+            panelRef={sidebarRef}
+            defaultSize={288}
+            minSize={260}
+            maxSize="40"
+            collapsible
+            collapsedSize={0}
+            disabled={!listShown}
+            onResize={(size) => {
+              // Collapsing is only for hiding the list (the user hid it, or the
+              // screen is narrow); a drag that empties a shown list springs back.
+              if (size.asPercentage === 0 && listShown)
+                sidebarRef.current?.expand()
+            }}
+            className="min-w-0"
+          >
+            {sidebar}
+          </ResizablePanel>
+          <ResizableHandle
+            withHandle
+            aria-label="Resize chat list"
+            className={listShown ? undefined : 'hidden'}
+          />
+          <ResizablePanel id="thread" minSize={isDesktop ? 360 : 0}>
+            {main}
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </div>
+    </ChatProjectMediaProvider>
   )
 }
 

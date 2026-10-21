@@ -13,6 +13,7 @@ import type {
   ComponentKind,
   Flow,
 } from '@/api/client/types.gen'
+import { z } from 'zod'
 
 /** A lowercase slug from a name: `Orders Worker` → `orders-worker`. */
 export function slugify(name: string): string {
@@ -158,3 +159,41 @@ export function savedProblems(error: unknown): string[] {
     ? problems.filter((p): p is string => typeof p === 'string')
     : []
 }
+
+const filled = (value: string) => value.trim().length > 0
+
+/**
+ * What the editor checks before it sends a design. The server still checks
+ * every saved version; these are the mistakes a user can make in the form
+ * itself, reported next to the field instead of as a refused save.
+ */
+export const blueprintEditorSchema = z.object({
+  document: z.custom<BlueprintDocument>().superRefine((document, ctx) => {
+    if (!filled(document.summary)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['summary'],
+        message: 'Say what the application does, and for whom',
+      })
+    }
+    if (document.components.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['components'],
+        message: 'Add at least one part',
+      })
+    }
+    document.components.forEach((component, index) => {
+      if (!filled(component.name)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['components', index, 'name'],
+          message: `Give the part ${component.id} a name`,
+        })
+      }
+    })
+  }),
+  changeSummary: z.string().refine(filled, 'Say what you changed'),
+})
+
+export type BlueprintEditorValues = z.infer<typeof blueprintEditorSchema>

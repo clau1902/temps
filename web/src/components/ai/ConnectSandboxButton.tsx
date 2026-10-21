@@ -117,7 +117,7 @@ export function ConnectSandboxButton({
       ) : (
         <Database className="size-4" aria-hidden />
       )}
-      <span className="hidden sm:inline">{connectionLabel(state)}</span>
+      <span className="max-sm:sr-only">{connectionLabel(state)}</span>
     </Button>
   )
 }

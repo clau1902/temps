@@ -109,7 +109,7 @@ test('while the turn works, the trace stays closed on the step it is taking', ()
   expect(markup.match(/role="status"/g)?.length).toBe(1)
 })
 
-test('between steps the working state counts them instead of repeating the last', () => {
+test('between steps the working state names the last step and the count', () => {
   const parts = Array.from({ length: 7 }, (_, at) => ({
     type: 'tool' as const,
     tool: command(`t${at}`, `step-${at}`, '{"exit_code":0}'),
@@ -122,8 +122,9 @@ test('between steps the working state counts them instead of repeating the last'
     },
     true
   )
-  expect(markup).toContain('7 steps so far')
-  expect(markup).not.toContain('step-6')
+  expect(markup).toContain('Ran step-6 · 7 steps so far')
+  // Only the latest step, never the whole list on one line.
+  expect(markup).not.toContain('step-5')
 })
 
 test('a settled goal step folds to what it did, not its raw arguments', () => {

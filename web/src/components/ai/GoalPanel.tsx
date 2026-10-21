@@ -48,6 +48,7 @@ import {
   visibleGoals,
   type GoalTone,
 } from './goal-presentation'
+import { IconWithStatus, type IconStatusTone } from './IconWithStatus'
 
 const TONE_CLASSES: Record<GoalTone, string> = {
   working: 'text-sky-700 dark:text-sky-300',
@@ -187,24 +188,20 @@ function useGoalActions(conversationPublicId: string) {
   return { stop, retry, busy: stop.isPending || retry.isPending }
 }
 
-const INDICATOR_CLASSES: Record<IndicatorState, string> = {
-  idle: 'text-muted-foreground',
-  working: TONE_CLASSES.working,
-  attention: TONE_CLASSES.attention,
-  failed: TONE_CLASSES.bad,
+const INDICATOR_TONES: Record<IndicatorState, IconStatusTone | null> = {
+  idle: null,
+  working: 'working',
+  attention: 'attention',
+  failed: 'bad',
 }
 
 function OperationsIcon({ state }: { state: IndicatorState }) {
-  switch (state) {
-    case 'attention':
-      return <AlertTriangle className="size-4" />
-    case 'failed':
-      return <XCircle className="size-4" />
-    case 'working':
-      return <Loader2 className="size-4 animate-spin" />
-    default:
-      return <Activity className="size-4" />
-  }
+  return (
+    <IconWithStatus
+      icon={<Activity className="size-4" />}
+      tone={INDICATOR_TONES[state]}
+    />
+  )
 }
 
 const OPERATION_TONES: Record<ChatOperationState, GoalTone> = {
@@ -334,7 +331,7 @@ export function ChatOperationsIndicator({
           type="button"
           variant="ghost"
           size="icon"
-          className={cn('size-8', INDICATOR_CLASSES[summary.state])}
+          className="size-8"
           title={`${summary.label}: deployments, backups and restores this chat started`}
           aria-label={`Activity: ${summary.label}`}
         >

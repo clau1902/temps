@@ -608,7 +608,7 @@ export function AssistantStart({
       </div>
       <form
         className={cn(
-          'rounded-2xl border border-border bg-background shadow-sm transition-shadow focus-within:shadow-md',
+          '@container rounded-2xl border border-border bg-background shadow-sm transition-shadow focus-within:shadow-md',
           roomy && 'rounded-3xl'
         )}
         onSubmit={(event) => {

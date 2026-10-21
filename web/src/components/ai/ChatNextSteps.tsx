@@ -19,10 +19,18 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Lightbulb, RefreshCw } from 'lucide-react'
+import {
+  ArrowRight,
+  Check,
+  Lightbulb,
+  Pencil,
+  RefreshCw,
+  X,
+} from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
@@ -69,7 +77,10 @@ function useSuggestionSettingsMutations() {
   return { chat, all }
 }
 
-/** "Suggest next steps?" with the three answers. Asking costs nothing. */
+/**
+ * "Suggest next steps?" with the three answers. Asking costs nothing. "Yes"
+ * turns them on for this chat, "Always" for every chat, "No" skips this answer.
+ */
 export function NextStepsOffer({
   onYes,
   onAlways,
@@ -92,6 +103,7 @@ export function NextStepsOffer({
         className="h-6 px-2 text-xs"
         disabled={disabled}
         onClick={onYes}
+        title="Suggest after every answer in this chat"
       >
         Yes
       </Button>
@@ -102,7 +114,7 @@ export function NextStepsOffer({
         className="h-6 px-2 text-xs"
         disabled={disabled}
         onClick={onAlways}
-        title="Suggest after every answer in this chat"
+        title="Suggest after every answer in all your chats, this one included"
       >
         Always
       </Button>
@@ -121,47 +133,89 @@ export function NextStepsOffer({
   )
 }
 
-/** The suggestions themselves; picking one sends it as the next message. */
+/**
+ * The suggestions themselves. Picking one sends it as the next message; the
+ * pencil puts it in the composer instead, for a step worth adjusting before it
+ * runs (a redeploy, a deletion).
+ */
 export function NextStepsChips({
   suggestions,
   onPick,
+  onEdit,
+  onDismiss,
 }: {
   suggestions: string[]
   onPick: (text: string) => void
+  onEdit?: (text: string) => void
+  onDismiss?: () => void
 }) {
   return (
-    <div
-      className="flex flex-wrap gap-2 pl-1"
-      role="group"
-      aria-label="Suggested next steps"
-    >
-      {suggestions.map((suggestion) => (
-        <Button
-          key={suggestion}
-          type="button"
-          variant="outline"
-          size="sm"
-          className="h-auto max-w-full gap-1.5 whitespace-normal rounded-full px-3 py-1 text-left text-xs font-normal"
-          onClick={() => onPick(suggestion)}
-        >
-          <Lightbulb
-            className="size-3 shrink-0 text-amber-500"
-            aria-hidden="true"
-          />
-          {suggestion}
-        </Button>
-      ))}
-    </div>
+    <section className="max-w-2xl pl-1" aria-label="Suggested next steps">
+      <div className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Lightbulb
+          className="size-3.5 shrink-0 text-amber-500"
+          aria-hidden="true"
+        />
+        <span className="font-medium">Suggested next steps</span>
+        {onDismiss && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="ml-auto size-6"
+            aria-label="Hide suggestions"
+            title="Hide suggestions"
+            onClick={onDismiss}
+          >
+            <X className="size-3.5" />
+          </Button>
+        )}
+      </div>
+      <ul className="divide-y overflow-hidden rounded-lg border bg-background">
+        {suggestions.map((suggestion) => (
+          <li key={suggestion} className="group flex items-stretch">
+            <button
+              type="button"
+              className="flex min-w-0 flex-1 items-start gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none"
+              onClick={() => onPick(suggestion)}
+              title="Send this as your next message"
+            >
+              <ArrowRight
+                className="mt-0.5 size-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground"
+                aria-hidden="true"
+              />
+              <span className="min-w-0">{suggestion}</span>
+            </button>
+            {onEdit && (
+              <button
+                type="button"
+                className="flex shrink-0 items-center px-2.5 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:bg-muted/60 focus-visible:outline-none sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100"
+                onClick={() => onEdit(suggestion)}
+                aria-label={`Edit before sending: ${suggestion}`}
+                title="Edit before sending"
+              >
+                <Pencil className="size-3.5" aria-hidden="true" />
+              </button>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
   )
 }
 
 function NextStepsSkeleton() {
   return (
-    <div className="flex flex-wrap gap-2 pl-1" role="status">
+    <div className="max-w-2xl space-y-1.5 pl-1" role="status">
       <span className="sr-only">Suggesting next steps…</span>
-      <Skeleton className="h-7 w-44 rounded-full" />
-      <Skeleton className="h-7 w-52 rounded-full" />
-      <Skeleton className="h-7 w-36 rounded-full" />
+      <Skeleton className="h-4 w-40" />
+      <div className="divide-y rounded-lg border">
+        {['w-3/4', 'w-2/3', 'w-1/2'].map((width) => (
+          <div key={width} className="px-3 py-2.5">
+            <Skeleton className={cn('h-4', width)} />
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
@@ -177,6 +231,7 @@ export function ChatNextSteps({
   saved,
   answeredWhileOpen,
   onPick,
+  onEdit,
 }: {
   conversationPublicId: string
   answerKey: string
@@ -186,11 +241,13 @@ export function ChatNextSteps({
   saved?: string[]
   answeredWhileOpen: boolean
   onPick: (text: string) => void
+  /** Put a suggestion in the composer instead of sending it. */
+  onEdit?: (text: string) => void
 }) {
   const [accepted, setAccepted] = useState(false)
   const [dismissed, setDismissed] = useState(false)
   const settings = useChatSuggestionSettings(conversationPublicId)
-  const { chat } = useSuggestionSettingsMutations()
+  const { chat, all } = useSuggestionSettingsMutations()
   const row = settings.data?.available
     ? nextStepsRow({
         mode: settings.data.mode,
@@ -211,6 +268,9 @@ export function ChatNextSteps({
       return data
     },
     enabled: row === 'load',
+    // The row explains its own failure with a retry, and suggestions are an
+    // extra: a failed set is not the page failing to load.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
     // The server saves the first set on the answer and returns it for any
     // later request, so this cache only spares a round trip.
     staleTime: Infinity,
@@ -219,15 +279,20 @@ export function ChatNextSteps({
 
   if (row === 'hidden') return null
   if (row === 'saved' && saved) {
-    return <NextStepsChips suggestions={saved} onPick={onPick} />
+    return (
+      <NextStepsChips
+        suggestions={saved}
+        onPick={onPick}
+        onEdit={onEdit}
+        onDismiss={() => setDismissed(true)}
+      />
+    )
   }
   if (row === 'offer') {
     return (
       <NextStepsOffer
-        disabled={chat.isPending}
-        onYes={() => setAccepted(true)}
-        onNo={() => setDismissed(true)}
-        onAlways={() => {
+        disabled={chat.isPending || all.isPending}
+        onYes={() => {
           setAccepted(true)
           chat.mutate(
             {
@@ -237,6 +302,27 @@ export function ChatNextSteps({
             {
               onSuccess: () =>
                 toast.success('Next steps will be suggested in this chat'),
+            }
+          )
+        }}
+        onNo={() => setDismissed(true)}
+        onAlways={() => {
+          setAccepted(true)
+          // A chat with its own setting would not follow the new default, so
+          // this chat is moved back onto the default it was just set to.
+          const chatOverride = settings.data?.chat_mode ?? null
+          all.mutate(
+            { body: { mode: 'always' } },
+            {
+              onSuccess: () => {
+                if (chatOverride !== null) {
+                  chat.mutate({
+                    path: { public_id: conversationPublicId },
+                    body: { mode: null },
+                  })
+                }
+                toast.success('Next steps will be suggested in all your chats')
+              },
             }
           )
         }}
@@ -266,7 +352,14 @@ export function ChatNextSteps({
       </div>
     )
   }
-  return <NextStepsChips suggestions={steps.data.suggestions} onPick={onPick} />
+  return (
+    <NextStepsChips
+      suggestions={steps.data.suggestions}
+      onPick={onPick}
+      onEdit={onEdit}
+      onDismiss={() => setDismissed(true)}
+    />
+  )
 }
 
 function ModeOption({

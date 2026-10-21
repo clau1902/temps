@@ -3,6 +3,7 @@
 
 import {
   getDeploymentOptions,
+  getLastDeploymentOptions,
   getProjectOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { GoalResponse } from '@/api/client/types.gen'
@@ -86,4 +87,27 @@ test('a deployment named in the address opens on that deployment', () => {
   expect(html).toMatch(
     /aria-pressed="true"[^>]*><span[^>]*>taskboard<span[^>]*> · #43/
   )
+})
+
+test('following the latest deployment of a project with none yet waits instead of failing', () => {
+  const client = new QueryClient()
+  client.setQueryData(getProjectOptions({ path: { id: 3 } }).queryKey, {
+    id: 3,
+    name: 'taskboard',
+    slug: 'taskboard',
+  } as never)
+  client.setQueryData(getLastDeploymentOptions({ path: { id: 3 } }).queryKey, {
+    deployment: null,
+  } as never)
+  const html = renderToStaticMarkup(
+    <MemoryRouter>
+      <QueryClientProvider client={client}>
+        <DeploymentSidebar
+          deployments={[{ projectId: 3, deploymentId: null, goal }]}
+        />
+      </QueryClientProvider>
+    </MemoryRouter>
+  )
+  expect(html).toContain('This project has no deployment yet.')
+  expect(html).not.toContain('could not load this deployment')
 })

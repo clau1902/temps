@@ -190,6 +190,7 @@ import {
   type ChatProviderOption,
   type ChatRuntimeSelection,
 } from './chat-runtime-options'
+import { followTranscriptGrowth } from './transcript-follow'
 import {
   CHAT_COMPOSER_COMPACT_MIN_HEIGHT,
   CHAT_COMPOSER_MIN_HEIGHT,
@@ -3865,12 +3866,26 @@ function DebugChatPanelBody({
               )
               return attachment ? [attachment] : []
             })
-            void sendRef.current(
+            const sent = sendRef.current(
               opening,
               conv.public_id,
               attachments,
               storedConversationRuntime(extended)
             )
+            // A refused opening has no other copy: the start screen is gone
+            // and the thread has no user message to retry. Put it in the
+            // composer, unless the user already started typing there.
+            void sent.then((accepted) => {
+              if (accepted || ignore) return
+              setInput((current) => (current === '' ? opening : current))
+              if (
+                attachments.length > 0 &&
+                pendingAttachmentsRef.current.length === 0
+              ) {
+                pendingAttachmentsRef.current = attachments
+                setPendingAttachments(attachments)
+              }
+            })
           }
         }
       } catch (cause) {
@@ -3987,6 +4002,14 @@ function DebugChatPanelBody({
     viewport.scrollTo({ top: viewport.scrollHeight })
   }, [messages])
 
+  // Rows that grow after they render (suggestions, cards, images) would
+  // otherwise leave a followed transcript short of its end.
+  useEffect(() => {
+    const viewport = scrollRef.current
+    if (!viewport) return
+    return followTranscriptGrowth(viewport, () => followTranscriptRef.current)
+  }, [])
+
   // Fallback for when the WebSocket connection that was open when a question was
   // asked has died by the time the user answers it (backgrounded tab, network
   // blip, server restart). `resolvePermission` still delivers the answer to
@@ -4073,8 +4096,11 @@ function DebugChatPanelBody({
   useLayoutEffect(() => {
     transcriptActions.current = { send, pollForReply }
   }, [send, pollForReply])
+  // Messages the chat sends for the user (a fix, a next step, carrying on
+  // after a form) pass their own empty attachment list: they neither take the
+  // composer's files with them nor clear the draft the user is typing.
   const fixFromTranscript = useCallback((text: string) => {
-    void transcriptActions.current.send(text)
+    void transcriptActions.current.send(text, undefined, [])
   }, [])
   const permissionResolvedInTranscript = useCallback(() => {
     transcriptActions.current.pollForReply()
@@ -4112,7 +4138,7 @@ function DebugChatPanelBody({
       return
     }
     pendingContinueRef.current = null
-    void send(message)
+    void send(message, undefined, [])
   }, [continueRequests, turnActive, starting, publicId, send])
 
   const visible = messages.filter((m) => m.role !== 'system')
@@ -4137,7 +4163,20 @@ function DebugChatPanelBody({
       ? latestAnswerKey(visible)
       : null
   const latestAnswer = visible[visible.length - 1]
-  const pickNextStep = useCallback((text: string) => void send(text), [send])
+  const pickNextStep = useCallback(
+    (text: string) => void send(text, undefined, []),
+    [send]
+  )
+  // Editing a suggestion never throws away a draft the user already started.
+  const editNextStep = useCallback((text: string) => {
+    setInput((current) => (current.trim() ? `${current}\n\n${text}` : text))
+    requestAnimationFrame(() => {
+      const composer = composerRef.current
+      if (!composer) return
+      composer.focus()
+      composer.setSelectionRange(composer.value.length, composer.value.length)
+    })
+  }, [])
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
@@ -4294,6 +4333,7 @@ function DebugChatPanelBody({
               saved={latestAnswer?.next_steps}
               answeredWhileOpen={answeredSince(visible, openedAt)}
               onPick={pickNextStep}
+              onEdit={editNextStep}
             />
           ) : null}
 
@@ -4523,7 +4563,9 @@ function DebugChatPanelBody({
       ) : (
         <div
           className={cn(
-            'shrink-0 overflow-hidden rounded-2xl border border-input bg-background',
+            // Sized by the chat's own width, not the window's: the same composer
+            // fills a full page and a narrow side dock.
+            '@container shrink-0 overflow-hidden rounded-2xl border border-input bg-background',
             // The assistant's prompt stays calm while typing, like the start
             // screen; the other chats keep the focus ring.
             contextType !== ASSISTANT_CONTEXT_TYPE &&
@@ -4561,7 +4603,7 @@ function DebugChatPanelBody({
           }}
         >
           {userScoped && publicId && persistentAttachments && (
-            <p className="px-3 pt-2 text-xs text-muted-foreground">
+            <p className="hidden truncate px-3 pt-2 text-xs text-muted-foreground @[32rem]:block">
               {attachHint(isAssistantChat, modelImageSupport, attachmentLimits)}
             </p>
           )}
@@ -4628,8 +4670,8 @@ function DebugChatPanelBody({
               }
             }}
           />
-          <div className="flex items-center justify-between gap-2 border-t px-2 py-1 sm:px-3 sm:py-2">
-            <div className="flex min-w-0 flex-1 flex-nowrap items-center gap-0.5 overflow-x-auto [scrollbar-width:none] md:flex-wrap md:gap-1 md:overflow-visible [&::-webkit-scrollbar]:hidden [&>*]:shrink-0">
+          <div className="flex items-center justify-between gap-2 border-t px-2 py-1 @[30rem]:px-3 @[30rem]:py-2">
+            <div className="flex min-w-0 flex-1 flex-nowrap items-center gap-0.5 overflow-x-auto [scrollbar-width:none] @[30rem]:gap-1 [&::-webkit-scrollbar]:hidden [&>*]:shrink-0">
               {userScoped && publicId && (
                 <SessionDiagnostics key={publicId} publicId={publicId} />
               )}
@@ -4781,7 +4823,7 @@ function DebugChatPanelBody({
                       }
                     >
                       <SelectTrigger
-                        className="h-8 w-auto max-w-28 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-64"
+                        className="h-8 w-auto max-w-28 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted @[40rem]:max-w-64"
                         title={
                           publicId
                             ? 'Provider is fixed when a conversation is created'
@@ -4871,7 +4913,7 @@ function DebugChatPanelBody({
                           <Sparkles className="mr-1 h-3.5 w-3.5 shrink-0" />
                         }
                         title="Choose the model for the next turn"
-                        className="h-8 w-auto max-w-32 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-56"
+                        className="h-8 w-auto max-w-32 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted @[40rem]:max-w-56"
                       />
                     )}
 
@@ -4891,7 +4933,7 @@ function DebugChatPanelBody({
                         disabled={turnActive || starting}
                       >
                         <SelectTrigger
-                          className="h-8 w-auto max-w-24 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-40"
+                          className="h-8 w-auto max-w-24 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted @[40rem]:max-w-40"
                           title={
                             publicId
                               ? 'Choose the reasoning level for the next turn'
@@ -4933,7 +4975,7 @@ function DebugChatPanelBody({
                         }
                       >
                         <SelectTrigger
-                          className="h-8 w-auto max-w-24 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted md:max-w-48"
+                          className="h-8 w-auto max-w-24 rounded-full border-0 bg-transparent px-2 text-xs shadow-none hover:bg-muted @[40rem]:max-w-48"
                           title={
                             turnActive
                               ? 'Switch this running sandbox turn to Auto'
@@ -5002,7 +5044,7 @@ function DebugChatPanelBody({
                 disabled={attachmentUploads > 0}
                 size="icon"
                 variant="secondary"
-                className="h-8 w-8 rounded-full md:h-9 md:w-9"
+                className="h-8 w-8 rounded-full @[30rem]:h-9 @[30rem]:w-9"
                 title={`Queue — sends when this turn finishes (${queueShortcutLabel()})`}
                 aria-label="Queue message"
               >
@@ -5015,7 +5057,7 @@ function DebugChatPanelBody({
                 onClick={stopAndReturnQueue}
                 size="icon"
                 variant="secondary"
-                className="h-8 w-8 rounded-full md:h-9 md:w-9"
+                className="h-8 w-8 rounded-full @[30rem]:h-9 @[30rem]:w-9"
                 title="Stop generating"
                 aria-label="Stop generating"
               >
@@ -5032,7 +5074,7 @@ function DebugChatPanelBody({
                   (!publicId && providerOptions.length === 0)
                 }
                 size="icon"
-                className="h-8 w-8 rounded-full md:h-9 md:w-9"
+                className="h-8 w-8 rounded-full @[30rem]:h-9 @[30rem]:w-9"
                 aria-label={
                   turnActive ? 'Interrupt and send message' : 'Send message'
                 }

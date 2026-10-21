@@ -104,11 +104,18 @@ describe('isAssistantConversation', () => {
 })
 
 describe('example prompts', () => {
-  test('cover the first things a new user wants to do', () => {
+  test('lead with an app Temps builds and deploys from nothing', () => {
+    expect(ASSISTANT_EXAMPLE_PROMPTS[0].toLowerCase()).toContain('calculator')
+    for (const prompt of ASSISTANT_EXAMPLE_PROMPTS) {
+      expect(prompt.toLowerCase()).toContain('deploy')
+    }
+  })
+
+  test('assume nothing a new user does not have yet', () => {
     const all = ASSISTANT_EXAMPLE_PROMPTS.join('\n').toLowerCase()
-    expect(all).toContain('git repository')
-    expect(all).toContain('backups')
-    expect(all).toContain('s3')
+    expect(all).not.toContain('my app')
+    expect(all).not.toContain('my databases')
+    expect(all).not.toContain('last deployment')
   })
 
   test('are concrete, non-empty questions', () => {

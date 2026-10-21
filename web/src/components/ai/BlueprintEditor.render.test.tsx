@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react'
 import type { BlueprintDocument } from '@/api/client/types.gen'
 import { installBrowserWindow } from '@/test/dom'
 import { BlueprintEditor } from './BlueprintEditor'
@@ -28,7 +34,7 @@ const document: BlueprintDocument = {
   flows: [],
 }
 
-test('the holds field shows what is typed and saves the list', () => {
+test('the holds field shows what is typed and saves the list', async () => {
   const saves: BlueprintDocument[] = []
   render(
     <BlueprintEditor
@@ -54,7 +60,40 @@ test('the holds field shows what is typed and saves the list', () => {
     target: { value: 'Store users too' },
   })
   fireEvent.click(screen.getByRole('button', { name: /Save as a new version/ }))
-  expect(saves).toHaveLength(1)
+  await waitFor(() => expect(saves).toHaveLength(1))
   const store = saves[0]?.components.find((c) => c.id === 'db')
   expect(store?.holds).toEqual(['tasks', 'users'])
+})
+
+test('an unnamed part and a missing change summary are reported next to their fields, not sent', async () => {
+  const saves: BlueprintDocument[] = []
+  render(
+    <BlueprintEditor
+      initial={document}
+      saving={false}
+      problems={[]}
+      onSave={(next) => saves.push(next)}
+      onCancel={() => {}}
+    />
+  )
+  const name = screen.getByDisplayValue('Task store') as HTMLInputElement
+  fireEvent.change(name, { target: { value: '   ' } })
+  fireEvent.click(screen.getByRole('button', { name: /Save as a new version/ }))
+
+  await screen.findByText('Give the part db a name')
+  expect(screen.getByText('Say what you changed')).toBeTruthy()
+  expect(name.getAttribute('aria-invalid')).toBe('true')
+  expect(saves).toHaveLength(0)
+
+  // Fixing the fields clears their errors and the save goes through.
+  fireEvent.change(name, { target: { value: 'Task store' } })
+  fireEvent.change(screen.getByLabelText('What you changed'), {
+    target: { value: 'Renamed nothing' },
+  })
+  await waitFor(() =>
+    expect(screen.queryByText('Give the part db a name')).toBeNull()
+  )
+  fireEvent.click(screen.getByRole('button', { name: /Save as a new version/ }))
+  await waitFor(() => expect(saves).toHaveLength(1))
+  expect(saves[0]?.components[0]?.name).toBe('Task store')
 })

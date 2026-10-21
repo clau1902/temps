@@ -71,6 +71,91 @@ describe('layoutBlueprint', () => {
   })
 })
 
+describe('layoutBlueprint flows', () => {
+  // Two apps that both use the same three stores: every flow from one app
+  // crosses a flow from the other, which is where labels used to collide.
+  const shared = [
+    { id: 'ui', kind: 'app' as const, role: 'web' },
+    { id: 'parser', kind: 'app' as const, role: 'worker' },
+    { id: 'db', kind: 'data' as const },
+    { id: 'queue', kind: 'data' as const },
+    { id: 'store', kind: 'data' as const },
+  ]
+  const sharedFlows = [
+    { from: 'ui', to: 'db' },
+    { from: 'ui', to: 'queue' },
+    { from: 'ui', to: 'store' },
+    { from: 'parser', to: 'db' },
+    { from: 'parser', to: 'queue' },
+    { from: 'parser', to: 'store' },
+  ]
+  const start = (path: string) => Number(path.split(' ')[2])
+  const end = (path: string) => {
+    const tokens = path.split(' ')
+    return Number(tokens[tokens.length - 1])
+  }
+
+  test('flows leave a part from separate points, top flow highest', () => {
+    const layout = layoutBlueprint(shared, sharedFlows)
+    const fromUi = layout.edges.filter((e) => e.from === 'ui')
+    const starts = fromUi.map((e) => start(e.path))
+    expect(new Set(starts).size).toBe(3)
+    // Ordered like the parts they go to, so the fan never crosses itself.
+    expect([...starts].sort((a, b) => a - b)).toEqual(starts)
+  })
+
+  test('flows arriving at one part get their own points too', () => {
+    const layout = layoutBlueprint(shared, sharedFlows)
+    const intoDb = layout.edges.filter((e) => e.to === 'db')
+    expect(new Set(intoDb.map((e) => end(e.path))).size).toBe(2)
+  })
+
+  test('every label sits by its own arrowhead, never on another', () => {
+    const layout = layoutBlueprint(shared, sharedFlows)
+    const spots = layout.edges.map((e) => `${e.labelX},${e.labelY}`)
+    expect(new Set(spots).size).toBe(layout.edges.length)
+    const node = (id: string) => layout.nodes.find((n) => n.id === id)
+    for (const edge of layout.edges) {
+      const target = node(edge.to)
+      expect(edge.labelAnchor).toBe('end')
+      expect(edge.labelX).toBeLessThan(target?.x ?? 0)
+      expect(edge.labelY).toBeLessThan(end(edge.path))
+    }
+  })
+
+  test('a store sits level with the app that uses it', () => {
+    const layout = layoutBlueprint(
+      [
+        { id: 'web', kind: 'app', role: 'web' },
+        { id: 'worker', kind: 'app', role: 'worker' },
+        // Listed in the opposite order to the apps that use them.
+        { id: 'jobs', kind: 'data' },
+        { id: 'pages', kind: 'data' },
+      ],
+      [
+        { from: 'web', to: 'pages' },
+        { from: 'worker', to: 'jobs' },
+      ]
+    )
+    const y = (id: string) => layout.nodes.find((n) => n.id === id)?.y ?? -1
+    expect(y('pages')).toBeLessThan(y('jobs'))
+  })
+
+  test('a flow back to an earlier column is labelled on its arrow side', () => {
+    const layout = layoutBlueprint(
+      [
+        { id: 'web', kind: 'app', role: 'web' },
+        { id: 'db', kind: 'data' },
+      ],
+      [{ from: 'db', to: 'web' }]
+    )
+    const [edge] = layout.edges
+    const web = layout.nodes.find((n) => n.id === 'web')
+    expect(edge.labelAnchor).toBe('start')
+    expect(edge.labelX).toBeGreaterThan((web?.x ?? 0) + (web?.width ?? 0))
+  })
+})
+
 describe('blueprintChanges', () => {
   test('names what a proposal adds, changes and removes', () => {
     const previous = {
