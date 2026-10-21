@@ -78,6 +78,14 @@ const DEFAULT_READ_LINES: usize = 500;
 const MAX_READ_LINES: usize = 2000;
 /// Most bytes of file content one read returns, whatever the line count.
 const MAX_READ_BYTES: usize = 48 * 1024;
+/// Most bytes of a file `sandbox_read_file` ever takes out of the sandbox
+/// (about twenty windows of [`MAX_READ_BYTES`]). A file up to this size is
+/// read whole and paged with `offset`; a larger one is never buffered whole:
+/// only its first this-many bytes are read, its windows come from that part,
+/// and the result says so and points at `sandbox_exec` for the rest.
+const MAX_READ_FILE_BYTES: usize = 1024 * 1024;
+/// How long reading the start of an oversized file may take.
+const READ_HEAD_TIMEOUT_SECS: u64 = 30;
 /// Largest file the model may write in one call.
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 120;
@@ -427,9 +435,70 @@ fn read_window(
     limit: Option<usize>,
     max_bytes: usize,
 ) -> String {
+    read_window_of(path, text, offset, limit, max_bytes, None)
+}
+
+/// The part of a file that was read, when it is only its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileHead {
+    /// Size of the whole file.
+    file_bytes: u64,
+}
+
+/// A path quoted for the shell commands the read result suggests.
+fn quoted_path(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// The window of an oversized file's first [`MAX_READ_FILE_BYTES`] bytes
+/// (`head`, as the sandbox handed them back). The last line, which the cut
+/// may have split, is dropped unless it is the only one; a character the cut
+/// split is dropped with it.
+fn read_head_window(
+    path: &str,
+    head: &str,
+    file_bytes: u64,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    max_bytes: usize,
+) -> String {
+    let complete = match head.rfind('\n') {
+        Some(end) => &head[..=end],
+        None => head.trim_end_matches('\u{FFFD}'),
+    };
+    read_window_of(
+        path,
+        complete,
+        offset,
+        limit,
+        max_bytes,
+        Some(FileHead { file_bytes }),
+    )
+}
+
+fn read_window_of(
+    path: &str,
+    text: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    max_bytes: usize,
+    head: Option<FileHead>,
+) -> String {
     let total = text.split_inclusive('\n').count();
     let start = offset.unwrap_or(1).max(1);
     let wanted = limit.unwrap_or(DEFAULT_READ_LINES).clamp(1, MAX_READ_LINES);
+    if let Some(FileHead { file_bytes }) = head {
+        if start > total {
+            return format!(
+                "{path} is {file_bytes} bytes, larger than the {MAX_READ_FILE_BYTES} bytes \
+                 `{SANDBOX_READ_TOOL}` reads, and offset {start} is past the {total} lines in \
+                 that first part. Read further with `{SANDBOX_EXEC_TOOL}`, for example \
+                 `sed -n '{start},{}p' {}`.",
+                start + wanted - 1,
+                quoted_path(path)
+            );
+        }
+    }
     if total == 0 {
         return String::new();
     }
@@ -457,6 +526,27 @@ fn read_window(
         body.push_str(line);
         last += 1;
     }
+    if let Some(FileHead { file_bytes }) = head {
+        let mut out = format!(
+            "[{path} is {file_bytes} bytes, larger than the {MAX_READ_FILE_BYTES} bytes \
+             `{SANDBOX_READ_TOOL}` reads; showing lines {start}-{last} of the {total} complete \
+             lines in its first {MAX_READ_FILE_BYTES} bytes."
+        );
+        if last < total {
+            out.push_str(&format!(
+                " Call `{SANDBOX_READ_TOOL}` again with offset={} to continue within that part;",
+                last + 1
+            ));
+        }
+        out.push_str(&format!(
+            " read past it with `{SANDBOX_EXEC_TOOL}`, for example `sed -n '{},{}p' {}`.]\n",
+            total + 1,
+            total + DEFAULT_READ_LINES,
+            quoted_path(path)
+        ));
+        out.push_str(&body);
+        return out;
+    }
     if start == 1 && last == total && !body.contains("[line cut:") {
         return body;
     }
@@ -470,6 +560,35 @@ fn read_window(
     out.push_str("]\n");
     out.push_str(&body);
     out
+}
+
+/// What the head-reading script printed: the file's size on the first line,
+/// then its first [`MAX_READ_FILE_BYTES`] bytes. `None` when the output is not
+/// that shape, or the file turned out not to be over the limit after all.
+fn parse_head_output(stdout: &str) -> Option<(u64, &str)> {
+    let (size, head) = stdout.split_once('\n')?;
+    let size: u64 = size.trim().parse().ok()?;
+    if size <= MAX_READ_FILE_BYTES as u64 {
+        return None;
+    }
+    // A shimmed `head` could print more than asked; never hand on more.
+    let mut end = head.len().min(MAX_READ_FILE_BYTES);
+    while !head.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some((size, &head[..end]))
+}
+
+/// The script that prints a regular file's size and its first
+/// [`MAX_READ_FILE_BYTES`] bytes, or exits non-zero when the path is not a
+/// regular file over that size.
+fn read_head_command(path: &str) -> String {
+    format!(
+        "f={}; [ -f \"$f\" ] || exit 3; size=$(wc -c < \"$f\") || exit 4; \
+         [ \"$size\" -gt {MAX_READ_FILE_BYTES} ] || exit 5; printf '%s\\n' \"$size\"; \
+         head -c {MAX_READ_FILE_BYTES} \"$f\"",
+        quoted_path(path)
+    )
 }
 
 /// Resolve a model-supplied path against the sandbox work dir.
@@ -2043,9 +2162,11 @@ impl SandboxLinkService {
             }
         };
         let path = resolve_path(work_dir, &args.path);
+        // Never buffer more than MAX_READ_FILE_BYTES of the file: the read
+        // stops early (and fails) on a bigger one.
         match self
             .sandboxes
-            .fs_read(&link.sandbox_id, user_id, &path)
+            .fs_read_bounded(&link.sandbox_id, user_id, &path, MAX_READ_FILE_BYTES as u64)
             .await
         {
             Ok(bytes) => match String::from_utf8(bytes) {
@@ -2056,6 +2177,38 @@ impl SandboxLinkService {
                     error.as_bytes().len()
                 ),
             },
+            // Most likely a file over the limit: show its start instead.
+            Err(error @ SandboxError::Validation { .. }) => {
+                match self.read_head(link, user_id, &path).await {
+                    Some((file_bytes, head)) => {
+                        if head.contains(['\0', '\u{FFFD}']) {
+                            format!(
+                                "{path} is {file_bytes} bytes and does not look like UTF-8 text. \
+                                 Inspect it with `{SANDBOX_EXEC_TOOL}` (for example `file` or \
+                                 `head -c 200 | xxd`)."
+                            )
+                        } else {
+                            read_head_window(
+                                &path,
+                                &head,
+                                file_bytes,
+                                args.offset,
+                                args.limit,
+                                MAX_READ_BYTES,
+                            )
+                        }
+                    }
+                    None => {
+                        self.tool_failure(
+                            &format!("Could not read {path}"),
+                            error,
+                            conversation_id,
+                            link,
+                        )
+                        .await
+                    }
+                }
+            }
             Err(error) => {
                 self.tool_failure(
                     &format!("Could not read {path}"),
@@ -2064,6 +2217,54 @@ impl SandboxLinkService {
                     link,
                 )
                 .await
+            }
+        }
+    }
+
+    /// The size and first [`MAX_READ_FILE_BYTES`] bytes of a regular file
+    /// larger than that, read with `head -c` so the rest is never copied out
+    /// of the sandbox. `None` when the path is not such a file or the read
+    /// failed; the caller then reports its original error.
+    async fn read_head(
+        &self,
+        link: &SandboxLink,
+        user_id: i32,
+        path: &str,
+    ) -> Option<(u64, String)> {
+        let options = ExecOptions {
+            cmd: vec!["sh".to_string(), "-c".to_string(), read_head_command(path)],
+            env: HashMap::new(),
+            cwd: None,
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(READ_HEAD_TIMEOUT_SECS),
+            self.sandboxes.exec(&link.sandbox_id, user_id, options),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(result)) if result.exit_code == 0 => {
+                parse_head_output(&result.stdout).map(|(size, head)| (size, head.to_string()))
+            }
+            Ok(Ok(result)) => {
+                debug!(
+                    sandbox_id = %link.sandbox_id,
+                    path,
+                    exit_code = result.exit_code,
+                    "not reading the start of a file: it is not a regular file over the read limit"
+                );
+                None
+            }
+            Ok(Err(error)) => {
+                warn!(sandbox_id = %link.sandbox_id, path, "could not read the start of a large file: {error}");
+                None
+            }
+            Err(_) => {
+                warn!(
+                    sandbox_id = %link.sandbox_id,
+                    path,
+                    "reading the start of a large file did not finish within {READ_HEAD_TIMEOUT_SECS}s"
+                );
+                None
             }
         }
     }
@@ -2236,6 +2437,72 @@ mod tests {
         assert!(piece.contains("lines 1-1 of 2"));
         assert!(piece.contains("offset=2"));
         assert!(piece.len() < 400);
+    }
+
+    #[test]
+    fn the_start_of_an_oversized_file_is_paged_and_says_it_is_only_the_start() {
+        let head = numbered(30);
+        let first = read_head_window("/w/big.log", &head, 5_000_000, None, Some(10), 4096);
+        assert!(first.starts_with("[/w/big.log is 5000000 bytes, larger than the"));
+        assert!(first.contains("showing lines 1-10 of the 30 complete lines"));
+        assert!(first.contains("offset=11"));
+        assert!(first.contains("sed -n '31,530p' '/w/big.log'"));
+        assert!(first.ends_with("line 10\n"));
+
+        // The last window of the part still points past it.
+        let last = read_head_window("/w/big.log", &head, 5_000_000, Some(25), None, 4096);
+        assert!(last.contains("showing lines 25-30 of the 30"));
+        assert!(!last.contains("offset="));
+        assert!(last.contains("sed -n '31,530p'"));
+
+        // An offset beyond the part is an instruction, not an error.
+        let past = read_head_window("/w/big.log", &head, 5_000_000, Some(40), Some(5), 4096);
+        assert!(past.contains("offset 40 is past the 30 lines"));
+        assert!(past.contains("sed -n '40,44p' '/w/big.log'"));
+    }
+
+    #[test]
+    fn a_line_the_cut_split_is_left_out() {
+        let head = format!("{}partial li", numbered(3));
+        let window = read_head_window("/w/big.log", &head, 9_000_000, None, None, 4096);
+        assert!(window.contains("of the 3 complete lines"));
+        assert!(window.ends_with("line 3\n"));
+        assert!(!window.contains("partial"));
+        // With no newline at all the single line is kept (and cut by budget).
+        let one_line = format!("{}\u{FFFD}", "x".repeat(10_000));
+        let window = read_head_window("/w/min.js", &one_line, 9_000_000, None, None, 100);
+        assert!(window.contains("[line cut"));
+        assert!(!window.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn the_head_output_is_parsed_and_never_longer_than_the_read_limit() {
+        assert_eq!(
+            parse_head_output("2000000\nhello\n"),
+            Some((2_000_000, "hello\n"))
+        );
+        // Not over the limit after all, or not the expected shape.
+        assert_eq!(parse_head_output("10\nhello"), None);
+        assert_eq!(parse_head_output("garbage"), None);
+        assert_eq!(parse_head_output("x\nhello"), None);
+        // A shim that prints more than asked is cut to the limit.
+        let flood = format!("3000000\n{}", "é".repeat(MAX_READ_FILE_BYTES));
+        let (_, head) = parse_head_output(&flood).unwrap();
+        assert!(head.len() <= MAX_READ_FILE_BYTES);
+    }
+
+    #[test]
+    fn the_head_command_quotes_the_path_and_reads_only_the_limit() {
+        let command = read_head_command("/w/it's here");
+        assert!(command.starts_with("f='/w/it'\\''s here';"));
+        assert!(command.contains(&format!("head -c {MAX_READ_FILE_BYTES} \"$f\"")));
+        assert!(command.contains(&format!("-gt {MAX_READ_FILE_BYTES} ]")));
+    }
+
+    #[test]
+    fn the_read_bound_is_a_small_multiple_of_the_window() {
+        const { assert!(MAX_READ_FILE_BYTES >= MAX_READ_BYTES) };
+        const { assert!(MAX_READ_FILE_BYTES <= 32 * MAX_READ_BYTES) };
     }
 
     #[test]

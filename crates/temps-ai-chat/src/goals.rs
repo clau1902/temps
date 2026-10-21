@@ -19,9 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    QueryOrder, QuerySelect, Set, UpdateMany,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +43,8 @@ pub const STATUS_CANCELLED: &str = "cancelled";
 
 /// Statuses the watcher still looks at.
 const WATCHED_STATUSES: [&str; 3] = [STATUS_ACTIVE, STATUS_HEALING, STATUS_NEEDS_YOU];
+/// Statuses the user may give a fresh budget with retry.
+const RETRYABLE_STATUSES: [&str; 2] = [STATUS_FAILED, STATUS_NEEDS_YOU];
 
 /// Goals a chat may have open at once. Each costs a check per interval.
 pub const MAX_OPEN_GOALS_PER_CONVERSATION: u64 = 5;
@@ -526,22 +529,55 @@ impl GoalService {
         }
         let now = Utc::now();
         let minutes = input.deadline_minutes.unwrap_or(DEFAULT_DEADLINE_MINUTES);
-        let mut update: ai_goals::ActiveModel = goal.into();
-        update.check_operation = Set(input.operation_id.trim().to_string());
-        update.check_params = Set(if input.params.is_null() {
+        let params = if input.params.is_null() {
             Value::Object(Default::default())
         } else {
             input.params
-        });
-        update.success_path = Set(input.success_path);
-        update.success_values = Set(serde_json::json!(input.success_values));
-        update.failure_values = Set(serde_json::json!(input.failure_values));
-        update.status = Set(STATUS_ACTIVE.to_string());
-        update.last_observation = Set(Some("Watching the new target".to_string()));
-        update.next_check_at = Set(now + chrono::Duration::seconds(ACTIVE_CHECK_SECONDS));
-        update.deadline_at = Set(now + chrono::Duration::minutes(minutes));
-        update.updated_at = Set(now);
-        Ok(update.update(self.db.as_ref()).await?)
+        };
+        // The status is re-checked by the update itself: a goal the user
+        // cancelled while the fix turn was working stays cancelled.
+        let updated = ai_goals::Entity::update_many()
+            .col_expr(
+                ai_goals::Column::CheckOperation,
+                Expr::value(input.operation_id.trim().to_string()),
+            )
+            .col_expr(ai_goals::Column::CheckParams, Expr::value(params))
+            .col_expr(
+                ai_goals::Column::SuccessPath,
+                Expr::value(input.success_path),
+            )
+            .col_expr(
+                ai_goals::Column::SuccessValues,
+                Expr::value(serde_json::json!(input.success_values)),
+            )
+            .col_expr(
+                ai_goals::Column::FailureValues,
+                Expr::value(serde_json::json!(input.failure_values)),
+            )
+            .col_expr(ai_goals::Column::Status, Expr::value(STATUS_ACTIVE))
+            .col_expr(
+                ai_goals::Column::LastObservation,
+                Expr::value("Watching the new target"),
+            )
+            .col_expr(
+                ai_goals::Column::NextCheckAt,
+                Expr::value(now + chrono::Duration::seconds(ACTIVE_CHECK_SECONDS)),
+            )
+            .col_expr(
+                ai_goals::Column::DeadlineAt,
+                Expr::value(now + chrono::Duration::minutes(minutes)),
+            )
+            .col_expr(ai_goals::Column::UpdatedAt, Expr::value(now))
+            .filter(ai_goals::Column::Id.eq(goal.id))
+            .filter(ai_goals::Column::Status.is_not_in([STATUS_ACHIEVED, STATUS_CANCELLED]))
+            .exec_with_returning(self.db.as_ref())
+            .await?;
+        match updated.into_iter().next() {
+            Some(goal) => Ok(goal),
+            None => Err(self
+                .state_conflict(conversation_id, goal_id, "retargeted")
+                .await),
+        }
     }
 
     pub async fn cancel(
@@ -557,11 +593,27 @@ impl GoalService {
                 action: "cancelled",
             });
         }
-        let mut update: ai_goals::ActiveModel = goal.into();
-        update.status = Set(STATUS_CANCELLED.to_string());
-        update.last_observation = Set(Some("Stopped by you".to_string()));
-        update.updated_at = Set(Utc::now());
-        Ok(update.update(self.db.as_ref()).await?)
+        // The user wins: the update accepts any still-watched status, so a
+        // watcher tick that moved the goal between `active`, `healing` and
+        // `needs_you` meanwhile cannot make the cancel fail or be undone (its
+        // own writes are conditional on the row it loaded, see `record`).
+        let updated = ai_goals::Entity::update_many()
+            .col_expr(ai_goals::Column::Status, Expr::value(STATUS_CANCELLED))
+            .col_expr(
+                ai_goals::Column::LastObservation,
+                Expr::value("Stopped by you"),
+            )
+            .col_expr(ai_goals::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(ai_goals::Column::Id.eq(goal.id))
+            .filter(ai_goals::Column::Status.is_in(WATCHED_STATUSES))
+            .exec_with_returning(self.db.as_ref())
+            .await?;
+        match updated.into_iter().next() {
+            Some(goal) => Ok(goal),
+            None => Err(self
+                .state_conflict(conversation_id, goal_id, "cancelled")
+                .await),
+        }
     }
 
     /// Give a goal that ran out of attempts, time or patience a fresh budget.
@@ -571,7 +623,7 @@ impl GoalService {
         goal_id: &str,
     ) -> Result<ai_goals::Model, GoalError> {
         let goal = self.get(conversation_id, goal_id).await?;
-        if !matches!(goal.status.as_str(), STATUS_FAILED | STATUS_NEEDS_YOU) {
+        if !RETRYABLE_STATUSES.contains(&goal.status.as_str()) {
             return Err(GoalError::InvalidState {
                 goal_id: goal_id.to_string(),
                 status: goal.status,
@@ -579,14 +631,45 @@ impl GoalService {
             });
         }
         let now = Utc::now();
-        let mut update: ai_goals::ActiveModel = goal.into();
-        update.status = Set(STATUS_ACTIVE.to_string());
-        update.attempts = Set(0);
-        update.last_observation = Set(Some("Retrying".to_string()));
-        update.next_check_at = Set(now);
-        update.deadline_at = Set(now + chrono::Duration::minutes(DEFAULT_DEADLINE_MINUTES));
-        update.updated_at = Set(now);
-        Ok(update.update(self.db.as_ref()).await?)
+        let updated = ai_goals::Entity::update_many()
+            .col_expr(ai_goals::Column::Status, Expr::value(STATUS_ACTIVE))
+            .col_expr(ai_goals::Column::Attempts, Expr::value(0))
+            .col_expr(ai_goals::Column::LastObservation, Expr::value("Retrying"))
+            .col_expr(ai_goals::Column::NextCheckAt, Expr::value(now))
+            .col_expr(
+                ai_goals::Column::DeadlineAt,
+                Expr::value(now + chrono::Duration::minutes(DEFAULT_DEADLINE_MINUTES)),
+            )
+            .col_expr(ai_goals::Column::UpdatedAt, Expr::value(now))
+            .filter(ai_goals::Column::Id.eq(goal.id))
+            .filter(ai_goals::Column::Status.is_in(RETRYABLE_STATUSES))
+            .exec_with_returning(self.db.as_ref())
+            .await?;
+        match updated.into_iter().next() {
+            Some(goal) => Ok(goal),
+            None => Err(self
+                .state_conflict(conversation_id, goal_id, "retried")
+                .await),
+        }
+    }
+
+    /// The error for a user action whose conditional update matched nothing
+    /// because the goal changed after it was read: names the status it has
+    /// now, or that it is gone.
+    async fn state_conflict(
+        &self,
+        conversation_id: i64,
+        goal_id: &str,
+        action: &'static str,
+    ) -> GoalError {
+        match self.get(conversation_id, goal_id).await {
+            Ok(current) => GoalError::InvalidState {
+                goal_id: goal_id.to_string(),
+                status: current.status,
+                action,
+            },
+            Err(error) => error,
+        }
     }
 
     async fn due(&self, now: DateTime<Utc>) -> Result<Vec<ai_goals::Model>, GoalError> {
@@ -599,65 +682,118 @@ impl GoalService {
             .await?)
     }
 
+    /// Write what a check saw, but only onto the row exactly as the watcher
+    /// loaded it: same status and same `updated_at`. Every write to a goal
+    /// sets `updated_at`, so a cancel, retry or retarget that landed while
+    /// the check was running makes this match nothing, and the newer write
+    /// stands. Returns the stored row, or `None` when the goal changed under
+    /// the watcher; callers must then stop, not start any follow-up.
     async fn record(
         &self,
-        goal: ai_goals::Model,
+        goal: &ai_goals::Model,
         status: &str,
         observation: &str,
         next_check_in: Option<i64>,
-    ) -> Result<ai_goals::Model, GoalError> {
+    ) -> Result<Option<ai_goals::Model>, GoalError> {
         let now = Utc::now();
-        let mut update: ai_goals::ActiveModel = goal.into();
-        update.status = Set(status.to_string());
-        update.last_observation = Set(Some(clip(observation)));
-        update.last_checked_at = Set(Some(now));
+        let mut update = ai_goals::Entity::update_many()
+            .col_expr(ai_goals::Column::Status, Expr::value(status))
+            .col_expr(
+                ai_goals::Column::LastObservation,
+                Expr::value(clip(observation)),
+            )
+            .col_expr(ai_goals::Column::LastCheckedAt, Expr::value(now))
+            .col_expr(ai_goals::Column::UpdatedAt, Expr::value(now));
         if let Some(seconds) = next_check_in {
-            update.next_check_at = Set(now + chrono::Duration::seconds(seconds));
+            update = update.col_expr(
+                ai_goals::Column::NextCheckAt,
+                Expr::value(now + chrono::Duration::seconds(seconds)),
+            );
         }
-        update.updated_at = Set(now);
-        Ok(update.update(self.db.as_ref()).await?)
+        let stored = unchanged_since_loaded(update, goal)
+            .exec_with_returning(self.db.as_ref())
+            .await?
+            .into_iter()
+            .next();
+        if stored.is_none() {
+            tracing::info!(
+                goal_id = %goal.public_id,
+                loaded_status = %goal.status,
+                skipped_status = status,
+                "AI goal changed while it was being checked; keeping the newer state"
+            );
+        }
+        Ok(stored)
     }
 
     /// Claim the one transition from `active` to `healing`, counting the
-    /// attempt. Returns false when another tick or a user action got there
-    /// first, so a goal never starts two fix turns.
-    async fn begin_heal(&self, goal: &ai_goals::Model) -> Result<bool, GoalError> {
-        let result = ai_goals::Entity::update_many()
-            .col_expr(
-                ai_goals::Column::Status,
-                sea_orm::sea_query::Expr::value(STATUS_HEALING),
-            )
+    /// attempt. Returns `None` when another tick or a user action got there
+    /// first, so a goal never starts two fix turns, and a goal the user
+    /// stopped or re-pointed never starts one.
+    async fn begin_heal(
+        &self,
+        goal: &ai_goals::Model,
+    ) -> Result<Option<ai_goals::Model>, GoalError> {
+        let update = ai_goals::Entity::update_many()
+            .col_expr(ai_goals::Column::Status, Expr::value(STATUS_HEALING))
             .col_expr(
                 ai_goals::Column::Attempts,
-                sea_orm::sea_query::Expr::col(ai_goals::Column::Attempts).add(1),
+                Expr::col(ai_goals::Column::Attempts).add(1),
             )
-            .col_expr(
-                ai_goals::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(Utc::now()),
-            )
-            .filter(ai_goals::Column::Id.eq(goal.id))
-            .filter(ai_goals::Column::Status.eq(STATUS_ACTIVE))
-            .exec(self.db.as_ref())
-            .await?;
-        Ok(result.rows_affected == 1)
+            .col_expr(ai_goals::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(ai_goals::Column::Status.eq(STATUS_ACTIVE));
+        Ok(unchanged_since_loaded(update, goal)
+            .exec_with_returning(self.db.as_ref())
+            .await?
+            .into_iter()
+            .next())
     }
 
-    async fn undo_heal(&self, goal: &ai_goals::Model) -> Result<(), GoalError> {
-        ai_goals::Entity::update_many()
-            .col_expr(
-                ai_goals::Column::Status,
-                sea_orm::sea_query::Expr::value(STATUS_ACTIVE),
-            )
+    /// Hand back the attempt [`Self::begin_heal`] claimed when its fix turn
+    /// could not start, and record why, in one write conditional on the
+    /// `healing` row `begin_heal` returned.
+    async fn abandon_heal(
+        &self,
+        healing: &ai_goals::Model,
+        observation: &str,
+    ) -> Result<Option<ai_goals::Model>, GoalError> {
+        let now = Utc::now();
+        let update = ai_goals::Entity::update_many()
+            .col_expr(ai_goals::Column::Status, Expr::value(STATUS_ACTIVE))
             .col_expr(
                 ai_goals::Column::Attempts,
-                sea_orm::sea_query::Expr::col(ai_goals::Column::Attempts).sub(1),
+                Expr::col(ai_goals::Column::Attempts).sub(1),
             )
-            .filter(ai_goals::Column::Id.eq(goal.id))
-            .filter(ai_goals::Column::Status.eq(STATUS_HEALING))
-            .exec(self.db.as_ref())
-            .await?;
-        Ok(())
+            .col_expr(
+                ai_goals::Column::LastObservation,
+                Expr::value(clip(observation)),
+            )
+            .col_expr(ai_goals::Column::LastCheckedAt, Expr::value(now))
+            .col_expr(
+                ai_goals::Column::NextCheckAt,
+                Expr::value(now + chrono::Duration::seconds(ACTIVE_CHECK_SECONDS)),
+            )
+            .col_expr(ai_goals::Column::UpdatedAt, Expr::value(now))
+            .filter(ai_goals::Column::Status.eq(STATUS_HEALING));
+        Ok(unchanged_since_loaded(update, healing)
+            .exec_with_returning(self.db.as_ref())
+            .await?
+            .into_iter()
+            .next())
     }
+}
+
+/// Restrict a watcher write to the goal row as it was read: same id, status
+/// and `updated_at`. `updated_at` is compared with the value read back from
+/// the database, so it matches to the microsecond.
+fn unchanged_since_loaded(
+    update: UpdateMany<ai_goals::Entity>,
+    goal: &ai_goals::Model,
+) -> UpdateMany<ai_goals::Entity> {
+    update
+        .filter(ai_goals::Column::Id.eq(goal.id))
+        .filter(ai_goals::Column::Status.eq(goal.status.as_str()))
+        .filter(ai_goals::Column::UpdatedAt.eq(goal.updated_at))
 }
 
 /// Everything the assistant's `temps_goal` tool needs.
@@ -859,7 +995,7 @@ impl GoalWatcher {
         if goal.deadline_at <= now && waits_for_live_check(&goal) {
             self.goals
                 .record(
-                    goal,
+                    &goal,
                     STATUS_ACHIEVED,
                     "Reached; the live app was not checked because the chat stayed busy",
                     None,
@@ -870,7 +1006,7 @@ impl GoalWatcher {
         if goal.deadline_at <= now {
             self.goals
                 .record(
-                    goal,
+                    &goal,
                     STATUS_FAILED,
                     "Gave up: the goal was not reached before its deadline",
                     None,
@@ -883,13 +1019,13 @@ impl GoalWatcher {
             .await?;
         let Some(conversation) = conversation else {
             self.goals
-                .record(goal, STATUS_CANCELLED, "The chat no longer exists", None)
+                .record(&goal, STATUS_CANCELLED, "The chat no longer exists", None)
                 .await?;
             return Ok(());
         };
         if conversation.status != "active" {
             self.goals
-                .record(goal, STATUS_CANCELLED, "The chat was archived", None)
+                .record(&goal, STATUS_CANCELLED, "The chat was archived", None)
                 .await?;
             return Ok(());
         }
@@ -898,7 +1034,7 @@ impl GoalWatcher {
             // The fix turn is still working; look again later.
             self.goals
                 .record(
-                    goal,
+                    &goal,
                     STATUS_HEALING,
                     "Working on a fix",
                     Some(ACTIVE_CHECK_SECONDS),
@@ -912,7 +1048,7 @@ impl GoalWatcher {
             Err(reason) => {
                 self.goals
                     .record(
-                        goal,
+                        &goal,
                         STATUS_NEEDS_YOU,
                         &format!("Watching paused: {reason}. Open the chat to continue."),
                         Some(NEEDS_YOU_CHECK_SECONDS),
@@ -933,7 +1069,7 @@ impl GoalWatcher {
                     STATUS_NEEDS_YOU => (STATUS_NEEDS_YOU, NEEDS_YOU_CHECK_SECONDS),
                     _ => (STATUS_ACTIVE, ACTIVE_CHECK_SECONDS),
                 };
-                self.goals.record(goal, status, &text, Some(next)).await?;
+                self.goals.record(&goal, status, &text, Some(next)).await?;
             }
             Observation::Failed(text) => self.on_failed(goal, conversation, auth, text).await?,
         }
@@ -979,10 +1115,9 @@ impl GoalWatcher {
                 STATUS_NEEDS_YOU
             } else {
                 goal.status.as_str()
-            }
-            .to_string();
+            };
             self.goals
-                .record(goal, &status, &observation, Some(NEEDS_YOU_CHECK_SECONDS))
+                .record(&goal, status, &observation, Some(NEEDS_YOU_CHECK_SECONDS))
                 .await?;
             return Ok(());
         }
@@ -991,14 +1126,14 @@ impl GoalWatcher {
                 "Gave up after {} fix attempts. Last check: {observation}",
                 goal.attempts
             );
-            self.goals.record(goal, STATUS_FAILED, &text, None).await?;
+            self.goals.record(&goal, STATUS_FAILED, &text, None).await?;
             return Ok(());
         }
         if conversation.turn_status == "running" {
             // The user is mid-conversation; do not talk over them.
             self.goals
                 .record(
-                    goal,
+                    &goal,
                     STATUS_ACTIVE,
                     &format!("{observation}. Waiting for the current reply to finish"),
                     Some(ACTIVE_CHECK_SECONDS),
@@ -1006,13 +1141,11 @@ impl GoalWatcher {
                 .await?;
             return Ok(());
         }
-        if !self.goals.begin_heal(&goal).await? {
+        // Conditional on the row as loaded: a goal the user cancelled or
+        // re-pointed while its check was running starts no fix turn.
+        let Some(goal) = self.goals.begin_heal(&goal).await? else {
             return Ok(());
-        }
-        let goal = self
-            .goals
-            .get(goal.conversation_id, &goal.public_id)
-            .await?;
+        };
         let prompt = heal_prompt(&goal, &observation);
         let metadata = serde_json::json!({
             "origin": "goal",
@@ -1039,9 +1172,11 @@ impl GoalWatcher {
                     "AI goal failed; started a fix turn as the owner"
                 );
                 self.audit_heal(&goal, &conversation).await;
+                // A retarget from the fix turn, or a cancel, may already have
+                // landed; `record` then leaves that newer state alone.
                 self.goals
                     .record(
-                        goal,
+                        &goal,
                         STATUS_HEALING,
                         &format!("{observation}. Working on a fix"),
                         Some(ACTIVE_CHECK_SECONDS),
@@ -1054,14 +1189,8 @@ impl GoalWatcher {
                     conversation_id = conversation.id,
                     "could not start a fix turn: {error}"
                 );
-                self.goals.undo_heal(&goal).await?;
                 self.goals
-                    .record(
-                        goal,
-                        STATUS_ACTIVE,
-                        &format!("{observation}. Could not start a fix yet"),
-                        Some(ACTIVE_CHECK_SECONDS),
-                    )
+                    .abandon_heal(&goal, &format!("{observation}. Could not start a fix yet"))
                     .await?;
             }
         }
@@ -1077,7 +1206,7 @@ impl GoalWatcher {
     ) -> Result<(), GoalError> {
         if !wants_live_check(&goal) {
             self.goals
-                .record(goal, STATUS_ACHIEVED, &observation, None)
+                .record(&goal, STATUS_ACHIEVED, &observation, None)
                 .await?;
             return Ok(());
         }
@@ -1085,7 +1214,7 @@ impl GoalWatcher {
             // The user is mid-conversation; check once the reply is done.
             self.goals
                 .record(
-                    goal,
+                    &goal,
                     STATUS_ACTIVE,
                     &format!("{LIVE_CHECK_WAITING}. {observation}"),
                     Some(ACTIVE_CHECK_SECONDS),
@@ -1094,11 +1223,16 @@ impl GoalWatcher {
             return Ok(());
         }
         // Close the goal first: an achieved goal is never looked at again, so
-        // the check starts at most once whatever happens to the turn.
-        let goal = self
+        // the check starts at most once whatever happens to the turn. When the
+        // goal changed while it was checked (the user stopped it), nothing
+        // was closed and no live check starts.
+        let Some(goal) = self
             .goals
-            .record(goal, STATUS_ACHIEVED, &observation, None)
-            .await?;
+            .record(&goal, STATUS_ACHIEVED, &observation, None)
+            .await?
+        else {
+            return Ok(());
+        };
         let prompt = live_check_prompt(&goal, &observation);
         let metadata = serde_json::json!({
             "origin": "goal",
@@ -1133,7 +1267,7 @@ impl GoalWatcher {
                 );
                 self.goals
                     .record(
-                        goal,
+                        &goal,
                         STATUS_ACHIEVED,
                         &format!("{observation}. The live app was not checked: {error}"),
                         None,
@@ -1584,5 +1718,309 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The SQL the mock database saw, once every holder of it is dropped.
+    fn statements(db: Arc<sea_orm::DatabaseConnection>) -> Vec<String> {
+        let db = Arc::try_unwrap(db).expect("every holder of the mock database was dropped");
+        db.into_transaction_log()
+            .iter()
+            .flat_map(|transaction| {
+                transaction
+                    .statements()
+                    .iter()
+                    .map(|statement| statement.sql.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The conditions of a statement, without its `RETURNING` column list.
+    fn where_clause(sql: &str) -> &str {
+        let conditions = sql.split_once("WHERE").map(|(_, rest)| rest).unwrap_or("");
+        conditions
+            .split_once("RETURNING")
+            .map(|(conditions, _)| conditions)
+            .unwrap_or(conditions)
+    }
+
+    fn mock(results: Vec<Vec<ai_goals::Model>>) -> Arc<sea_orm::DatabaseConnection> {
+        Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(results)
+                .into_connection(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_check_is_not_written_over_a_goal_that_changed_while_it_ran() {
+        let loaded = goal(&["completed"], &["failed"]);
+        let db = mock(vec![vec![]]);
+        let svc = GoalService::new(db.clone());
+        let stored = svc
+            .record(&loaded, STATUS_ACTIVE, "status is running", Some(15))
+            .await
+            .unwrap();
+        assert!(stored.is_none());
+        drop(svc);
+        let sql = statements(db);
+        assert_eq!(sql.len(), 1);
+        let guard = where_clause(&sql[0]);
+        assert!(guard.contains(r#""status" = $"#), "{}", sql[0]);
+        assert!(guard.contains(r#""updated_at" = $"#), "{}", sql[0]);
+    }
+
+    #[tokio::test]
+    async fn a_check_on_an_unchanged_goal_returns_the_stored_row() {
+        let loaded = goal(&["completed"], &["failed"]);
+        let mut stored = loaded.clone();
+        stored.last_observation = Some("status is running".into());
+        let svc = GoalService::new(mock(vec![vec![stored.clone()]]));
+        let written = svc
+            .record(&loaded, STATUS_ACTIVE, "status is running", Some(15))
+            .await
+            .unwrap();
+        assert_eq!(written, Some(stored));
+    }
+
+    #[tokio::test]
+    async fn cancel_wins_whatever_watched_status_the_watcher_moved_the_goal_to() {
+        let loaded = goal(&["completed"], &["failed"]);
+        let mut cancelled = loaded.clone();
+        cancelled.status = STATUS_CANCELLED.into();
+        let db = mock(vec![vec![loaded], vec![cancelled]]);
+        let svc = GoalService::new(db.clone());
+        let goal = svc.cancel(7, "goal_test").await.unwrap();
+        assert_eq!(goal.status, STATUS_CANCELLED);
+        drop(svc);
+        let sql = statements(db);
+        let update = sql.last().expect("an update was sent");
+        assert!(update.starts_with("UPDATE"), "{update}");
+        // Conditional on any open status, not on the one read a moment ago.
+        assert!(
+            where_clause(update).contains(r#""status" IN ("#),
+            "{update}"
+        );
+        assert!(!where_clause(update).contains("updated_at"), "{update}");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_lost_to_a_closing_write_names_the_new_status() {
+        let loaded = goal(&["completed"], &["failed"]);
+        let mut achieved = loaded.clone();
+        achieved.status = STATUS_ACHIEVED.into();
+        let svc = GoalService::new(mock(vec![vec![loaded], vec![], vec![achieved]]));
+        let error = svc.cancel(7, "goal_test").await.unwrap_err();
+        assert!(matches!(
+            &error,
+            GoalError::InvalidState { status, action: "cancelled", .. } if status == STATUS_ACHIEVED
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_retry_of_a_goal_cancelled_meanwhile_is_refused() {
+        let mut waiting = goal(&["completed"], &["failed"]);
+        waiting.status = STATUS_NEEDS_YOU.into();
+        let mut cancelled = waiting.clone();
+        cancelled.status = STATUS_CANCELLED.into();
+        let svc = GoalService::new(mock(vec![vec![waiting], vec![], vec![cancelled]]));
+        assert!(matches!(
+            svc.retry(7, "goal_test").await.unwrap_err(),
+            GoalError::InvalidState { status, action: "retried", .. } if status == STATUS_CANCELLED
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_retarget_of_a_goal_cancelled_meanwhile_is_refused() {
+        let healing = {
+            let mut g = goal(&["completed"], &["failed"]);
+            g.status = STATUS_HEALING.into();
+            g
+        };
+        let mut cancelled = healing.clone();
+        cancelled.status = STATUS_CANCELLED.into();
+        let db = mock(vec![vec![healing], vec![], vec![cancelled]]);
+        let svc = GoalService::new(db.clone());
+        assert!(matches!(
+            svc.retarget(7, "goal_test", input()).await.unwrap_err(),
+            GoalError::InvalidState { status, action: "retargeted", .. } if status == STATUS_CANCELLED
+        ));
+        drop(svc);
+        let sql = statements(db);
+        assert!(
+            where_clause(&sql[1]).contains(r#""status" NOT IN ("#),
+            "{}",
+            sql[1]
+        );
+    }
+
+    struct NoModel;
+
+    #[async_trait::async_trait]
+    impl temps_ai::AiService for NoModel {
+        async fn is_available(&self) -> bool {
+            false
+        }
+
+        async fn complete(
+            &self,
+            _request: temps_ai::AiRequest,
+        ) -> Result<temps_ai::AiResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn chat_stream_turn(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::ChatTurnStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+    }
+
+    struct NoAudit;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn watcher(db: &Arc<sea_orm::DatabaseConnection>) -> GoalWatcher {
+        GoalWatcher::new(
+            Arc::new(GoalService::new(db.clone())),
+            db.clone(),
+            Arc::new(ApiToolsHandle::new()),
+            Arc::new(ConversationService::new(
+                db.clone(),
+                Arc::new(NoModel),
+                Vec::new(),
+            )),
+            None,
+            Arc::new(NoAudit),
+        )
+    }
+
+    fn chat(turn_status: &str) -> ai_conversations::Model {
+        ai_conversations::Model {
+            id: 7,
+            public_id: "conv_goal_7".to_string(),
+            project_id: Some(1),
+            application_id: None,
+            context_type: "assistant".to_string(),
+            context_id: "assistant_1".to_string(),
+            title: None,
+            status: "active".to_string(),
+            kind: "ai".to_string(),
+            created_by: 3,
+            metadata: None,
+            created_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            ai_provider: "gateway".to_string(),
+            ai_model: "vendor/chat-model".to_string(),
+            ai_thinking_level: None,
+            ai_permission_mode: "ask".to_string(),
+            cli_session_id: None,
+            cli_session_fingerprint: None,
+            turn_status: turn_status.to_string(),
+            active_turn_id: None,
+            last_turn_id: None,
+            turn_started_at: None,
+            next_step_suggestions: None,
+        }
+    }
+
+    fn owner() -> AuthContext {
+        let user = temps_entities::users::Model {
+            id: 3,
+            name: "owner".to_string(),
+            email: "owner@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        AuthContext::new_session(user, temps_auth::permissions::Role::User)
+    }
+
+    #[tokio::test]
+    async fn a_goal_stopped_during_its_check_starts_no_fix_turn() {
+        // The check failed, but the conditional claim of the fix matched no
+        // row: the goal is no longer the active one the watcher read.
+        let db = mock(vec![vec![]]);
+        let w = watcher(&db);
+        w.on_failed(
+            goal(&["completed"], &["failed"]),
+            chat("idle"),
+            owner(),
+            "status is failed".into(),
+        )
+        .await
+        .unwrap();
+        drop(w);
+        let sql = statements(db);
+        assert_eq!(sql.len(), 1, "nothing follows the lost claim: {sql:?}");
+        assert!(
+            where_clause(&sql[0]).contains(r#""updated_at" = $"#),
+            "{}",
+            sql[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_goal_stopped_during_its_check_is_not_set_back_to_active() {
+        let db = mock(vec![vec![]]);
+        let w = watcher(&db);
+        // The reply is still running, so the watcher only records and waits;
+        // its write matches nothing and it does not try again.
+        w.on_failed(
+            goal(&["completed"], &["failed"]),
+            chat("running"),
+            owner(),
+            "status is failed".into(),
+        )
+        .await
+        .unwrap();
+        drop(w);
+        assert_eq!(statements(db).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_goal_stopped_during_its_check_starts_no_live_check() {
+        let db = mock(vec![vec![]]);
+        let w = watcher(&db);
+        w.on_achieved(
+            goal(&["completed"], &["failed"]),
+            chat("idle"),
+            owner(),
+            "status is completed".into(),
+        )
+        .await
+        .unwrap();
+        drop(w);
+        let sql = statements(db);
+        assert_eq!(sql.len(), 1, "no turn was claimed: {sql:?}");
+        assert!(sql[0].starts_with("UPDATE"), "{}", sql[0]);
     }
 }

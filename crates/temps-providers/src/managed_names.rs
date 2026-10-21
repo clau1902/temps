@@ -658,7 +658,8 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::ServiceNameRestoreConflict { .. }
         | ExternalServiceError::ServiceContainerRestoreConflict { .. }
         | ExternalServiceError::ServiceContainerConflict { .. }
-        | ExternalServiceError::AmbiguousServiceName { .. } => error_builder::conflict()
+        | ExternalServiceError::AmbiguousServiceName { .. }
+        | ExternalServiceError::SandboxNamespaceConflict { .. } => error_builder::conflict()
             .title(title)
             .detail(error.to_string())
             .build(),

@@ -4876,6 +4876,8 @@ impl ConversationService {
                 .tool_calling_for(Some(&conv.ai_provider), Some(&conv.ai_model))
                 .await;
         let harness_execution = harness_workspace.is_some();
+        let incident_chat =
+            crate::autofix::incident_of_conversation(conv.metadata.as_ref()).is_some();
         let provider = self.providers.get(conv.context_type.as_str()).cloned();
         let mut tools: Vec<ChatTool> = Vec::new();
         if chat_capable && !tool_calling {
@@ -4938,6 +4940,13 @@ impl ConversationService {
                 self.sandbox_tools(conv, auth, project_access_checker.as_ref())
                     .await,
             );
+            // An autofix incident chat runs with nobody watching: never offer
+            // it tools that wait on a person or start work outside the
+            // incident (dispatch refuses them too). Done before the playbooks
+            // so none is listed for a tool the chat no longer holds.
+            if incident_chat {
+                crate::autofix::withhold_refused_tools(&mut tools);
+            }
             // Playbooks follow the tools the chat holds, so one that needs the
             // sandbox is only listed once the sandbox tools are there.
             let playbooks = {
@@ -4955,6 +4964,10 @@ impl ConversationService {
                 }
             }
             let write_appendix = self.maybe_add_write_tool(&mut tools, &messages, auth);
+            if incident_chat {
+                // `request_secret` arrives with `temps_write`.
+                crate::autofix::withhold_refused_tools(&mut tools);
+            }
             if let Some(appendix) = write_appendix {
                 // Append the write-CLI section map to the system framing so the model
                 // knows what mutations are available and that they require confirmation.
@@ -5568,6 +5581,10 @@ impl ConversationService {
                 secrets: secret_support_opt.clone(),
                 sandbox: sandbox_link_opt.clone(),
                 blueprints: blueprint_support_opt.clone(),
+                incident: autofix_incident.clone().map(|public_id| IncidentToolGuard {
+                    public_id,
+                    db: db.clone(),
+                }),
                 ..Default::default()
             }));
             let interaction_conv_public_id = conv_public_id.clone();
@@ -5888,7 +5905,6 @@ impl ConversationService {
             let executor_auth = auth.clone();
             let executor_db = db.clone();
             let executor_project_access_checker = project_access_checker.clone();
-            let executor_autofix_incident = autofix_incident.clone();
             let turn_tool_executor: ToolExecutor = Arc::new(move |call: ToolCall| {
                 let state = executor_state.clone();
                 let provider = executor_provider.clone();
@@ -5902,27 +5918,10 @@ impl ConversationService {
                 let auth = executor_auth.clone();
                 let db = executor_db.clone();
                 let project_access_checker = executor_project_access_checker.clone();
-                let autofix_incident = executor_autofix_incident.clone();
                 Box::pin(async move {
-                    if let Some(incident_public_id) = autofix_incident.as_deref() {
-                        if crate::autofix::tool_refused_in_incident(&call.name) {
-                            let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                                .map(|value| redact_value(&value))
-                                .unwrap_or(serde_json::Value::Null);
-                            crate::autofix::record_refused_action(
-                                db.as_ref(),
-                                incident_public_id,
-                                &call.name,
-                                input,
-                            )
-                            .await;
-                            return Ok(format!(
-                                "Not run: `{}` is not available in an autofix incident. {}",
-                                call.name,
-                                crate::autofix::REFUSED_WRITE_REASON
-                            ));
-                        }
-                    }
+                    // Incident refusals happen inside `dispatch_conversation_tool`
+                    // (via `ToolExecutionState::incident`), shared with the
+                    // gateway rounds loop.
                     let auth = match refresh_tool_authorization(db.as_ref(), &auth).await {
                         Ok(auth) => auth,
                         Err(error) => {
@@ -8060,6 +8059,36 @@ struct ToolExecutionState {
     blueprint_proposed: bool,
     proposed_action_ids: Vec<i64>,
     seen_calls: std::collections::HashMap<String, String>,
+    /// Set when the chat belongs to an autofix incident (ADR-054): the
+    /// tools such a chat may not run are refused at dispatch, whichever
+    /// execution path (gateway rounds or harness executor) made the call.
+    incident: Option<IncidentToolGuard>,
+}
+
+/// The incident a chat belongs to, and where its refusals are recorded.
+struct IncidentToolGuard {
+    public_id: String,
+    db: Arc<DatabaseConnection>,
+}
+
+/// Refuse a tool an incident chat may not run, recording the attempt on the
+/// incident's timeline. `None` when the call may proceed.
+async fn refuse_in_incident(guard: Option<&IncidentToolGuard>, call: &ToolCall) -> Option<String> {
+    let guard = guard?;
+    if !crate::autofix::tool_refused_in_incident(&call.name) {
+        return None;
+    }
+    let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .map(|value| redact_value(&value))
+        .unwrap_or(serde_json::Value::Null);
+    tracing::info!(
+        incident_id = %guard.public_id,
+        tool = %call.name,
+        "refused a tool an autofix incident chat may not run"
+    );
+    crate::autofix::record_refused_action(guard.db.as_ref(), &guard.public_id, &call.name, input)
+        .await;
+    Some(crate::autofix::refused_tool_message(&call.name))
 }
 
 /// Whether this caller may drive the Git repo-exploration tools
@@ -8160,6 +8189,11 @@ async fn dispatch_conversation_tool(
     interactions: Option<&PlatformInteractionExecutor>,
     state: &mut ToolExecutionState,
 ) -> String {
+    // First, before the repeat guard or any routing: an incident chat's
+    // refused tools never run, however the call reached dispatch.
+    if let Some(refusal) = refuse_in_incident(state.incident.as_ref(), call).await {
+        return refusal;
+    }
     let call_key = format!("{}|{}", call.name, call.arguments.trim());
     // Shell commands and file reads legitimately repeat (`git status`, a
     // `curl` against the server just started) because the sandbox changes
@@ -12394,6 +12428,104 @@ mod tests {
         assert!(!may_follow_a_proposal(
             crate::workspace_chats::BIND_BLUEPRINT_TOOL
         ));
+    }
+
+    /// Gateway providers dispatch tool calls straight through
+    /// `dispatch_conversation_tool`, not through the harness executor, so the
+    /// incident refusal must live there: a refused tool never runs, never
+    /// sets turn state, and every attempt is looked up for the timeline.
+    #[tokio::test]
+    async fn an_incident_chat_refuses_unattended_tools_at_dispatch() {
+        let refused = [
+            crate::workspace_chats::PROPOSE_BLUEPRINT_TOOL,
+            crate::workspace_chats::BIND_BLUEPRINT_TOOL,
+            TEMPS_GOAL_TOOL_NAME,
+            crate::secret_slots::REQUEST_SECRET_TOOL,
+            crate::ask_user::ASK_USER_TOOL,
+            crate::sandbox_link::SANDBOX_OFFER_TOOL,
+            crate::sandbox_link::SANDBOX_CREATE_TOOL,
+            crate::sandbox_deploy::SANDBOX_DEPLOY_TOOL,
+        ];
+        let mut mock = MockDatabase::new(DatabaseBackend::Postgres);
+        for _ in refused {
+            // The incident lookup finds nothing, so recording stops there.
+            mock =
+                mock.append_query_results([Vec::<temps_entities::autofix_incidents::Model>::new()]);
+        }
+        let db = Arc::new(mock.into_connection());
+        let mut state = ToolExecutionState {
+            incident: Some(IncidentToolGuard {
+                public_id: "afx_test".to_string(),
+                db: db.clone(),
+            }),
+            ..Default::default()
+        };
+        for name in refused {
+            let result = dispatch_conversation_tool(
+                &ToolCall {
+                    id: format!("{name}-call"),
+                    name: name.to_string(),
+                    arguments: r#"{"title":"x"}"#.to_string(),
+                },
+                None,
+                1,
+                "assistant",
+                &test_auth(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut state,
+            )
+            .await;
+            assert_eq!(result, crate::autofix::refused_tool_message(name));
+        }
+        assert!(!state.blueprint_proposed);
+        assert!(state.seen_calls.is_empty());
+        drop(state);
+        let log = Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("the test holds the last database handle"))
+            .into_transaction_log();
+        assert_eq!(log.len(), refused.len(), "each refusal is recorded");
+    }
+
+    /// Tools the incident allows still dispatch normally.
+    #[tokio::test]
+    async fn an_incident_chat_still_runs_its_sandbox_and_read_tools() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let mut state = ToolExecutionState {
+            incident: Some(IncidentToolGuard {
+                public_id: "afx_test".to_string(),
+                db,
+            }),
+            ..Default::default()
+        };
+        let result = dispatch_conversation_tool(
+            &ToolCall {
+                id: "exec-call".to_string(),
+                name: crate::sandbox_link::SANDBOX_EXEC_TOOL.to_string(),
+                arguments: "{}".to_string(),
+            },
+            None,
+            1,
+            "assistant",
+            &test_auth(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state,
+        )
+        .await;
+        assert_eq!(result, "Sandboxes are not available in this chat.");
     }
 
     async fn ask_user(

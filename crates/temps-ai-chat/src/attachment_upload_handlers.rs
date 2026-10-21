@@ -21,7 +21,7 @@ use temps_core::{
 };
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::attachment_uploads::{UploadError, UPLOAD_CHUNK_BYTES};
+use crate::attachment_uploads::{UploadError, MAX_RESERVED_BYTES_PER_USER, UPLOAD_CHUNK_BYTES};
 use crate::handlers::{
     authorize_attachment_upload, sanitized_attachment_name, store_attachment_bytes, AppState,
     ChatAttachmentResponse, MAX_CHAT_ATTACHMENT_BYTES,
@@ -30,6 +30,10 @@ use crate::handlers::{
 /// Room for the multipart framing around one chunk.
 const CHUNK_REQUEST_BODY_LIMIT: usize = UPLOAD_CHUNK_BYTES + 8 * 1024;
 
+// A user's share of the upload budget must still admit one largest-allowed
+// file, or that file could never be uploaded at all.
+const _: () = assert!(MAX_RESERVED_BYTES_PER_USER >= MAX_CHAT_ATTACHMENT_BYTES);
+
 impl From<UploadError> for Problem {
     fn from(error: UploadError) -> Self {
         match error {
@@ -37,6 +41,7 @@ impl From<UploadError> for Problem {
                 .with_title("Upload Not Found")
                 .with_detail(error.to_string()),
             UploadError::Empty { .. }
+            | UploadError::EmptyChunk { .. }
             | UploadError::ChunkTooLarge { .. }
             | UploadError::PastDeclaredSize { .. }
             | UploadError::Incomplete { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
@@ -51,6 +56,11 @@ impl From<UploadError> for Problem {
             UploadError::TooManyActive { .. } => problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
                 .with_title("Too Many Uploads")
                 .with_detail(error.to_string()),
+            UploadError::UserOutOfCapacity { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("Too Much Upload In Progress")
+                    .with_detail(error.to_string())
+            }
             UploadError::OutOfCapacity { .. } => {
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
                     .with_title("Upload Capacity Reached")
@@ -385,6 +395,22 @@ mod tests {
         assert_eq!(
             status(UploadError::Empty { name: "a".into() }),
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(UploadError::EmptyChunk {
+                upload_id: id(),
+                offset: 0
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(UploadError::UserOutOfCapacity {
+                user_id: 1,
+                reserved: 20,
+                requested: 10,
+                limit: 24
+            }),
+            StatusCode::TOO_MANY_REQUESTS
         );
     }
 

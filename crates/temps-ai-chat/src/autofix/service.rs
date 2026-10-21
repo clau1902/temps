@@ -278,6 +278,12 @@ impl AutofixService {
                     "protected path '{bad}' must be 1 to 255 characters"
                 )));
             }
+            if let Some(problem) = paths
+                .iter()
+                .find_map(|path| evidence::protected_path_problem(path.trim()))
+            {
+                return Err(validation(problem));
+            }
         }
         if let Some(command) = &request.test_command {
             if command.len() > 1000 || command.contains('\0') {
@@ -914,6 +920,14 @@ impl AutofixService {
         )
         .await;
         self.close_out(&closed).await;
+        if previous != "working" {
+            // No run is on it, so nothing will clear the request. Should the
+            // worker have claimed it concurrently, the persisted `stopped`
+            // status still halts it (`update_working`, `ensure_running`).
+            if let Ok(mut requests) = self.stop_requests.lock() {
+                requests.remove(&closed.id);
+            }
+        }
         Ok((closed, previous))
     }
 
@@ -1088,9 +1102,11 @@ impl AutofixService {
             },
         )
         .await;
-        if let Ok(mut requests) = self.stop_requests.lock() {
-            requests.remove(&incident.id);
-        }
+        // The stop request is deliberately NOT cleared here: when the worker
+        // is still on this incident, clearing it would let the worker's next
+        // `check_stop` pass and start a follow-up turn in a closed incident.
+        // `work` clears it once the run actually ends; `stop` clears it for
+        // an incident the worker was not running.
     }
 
     async fn delete_sandbox(&self, incident: &autofix_incidents::Model) {
@@ -1358,13 +1374,42 @@ impl AutofixService {
         self.close_out(&closed).await;
     }
 
-    fn check_stop(&self, incident: &autofix_incidents::Model) -> Result<(), AutofixError> {
-        let stopped = self
-            .stop_requests
+    fn stop_requested(&self, incident: &autofix_incidents::Model) -> bool {
+        self.stop_requests
             .lock()
             .map(|requests| requests.contains(&incident.id))
-            .unwrap_or(false);
-        if stopped {
+            .unwrap_or(false)
+    }
+
+    fn check_stop(&self, incident: &autofix_incidents::Model) -> Result<(), AutofixError> {
+        if self.stop_requested(incident) {
+            return Err(AutofixError::Stopped {
+                incident_id: incident.public_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Like `check_stop`, but also re-reads the persisted status: an incident
+    /// stopped or closed by another path (or whose in-memory stop request is
+    /// gone) must never get another agent turn.
+    async fn ensure_running(
+        &self,
+        incident: &autofix_incidents::Model,
+    ) -> Result<(), AutofixError> {
+        self.check_stop(incident)?;
+        let status = match self.reload(incident).await {
+            Ok(current) => Some(current.status),
+            Err(AutofixError::IncidentNotFound { .. }) => None,
+            Err(error) => return Err(error),
+        };
+        if incident_halted(self.stop_requested(incident), status.as_deref()) {
+            tracing::info!(
+                incident_id = %incident.public_id,
+                status = status.as_deref().unwrap_or("deleted"),
+                "autofix incident {} is no longer running; not starting another agent turn",
+                incident.public_id
+            );
             return Err(AutofixError::Stopped {
                 incident_id: incident.public_id.clone(),
             });
@@ -2246,7 +2291,9 @@ impl AutofixService {
         let mut last_message_id = 0i64;
         let mut tools = ToolLog::default();
         for attempt in 0..=MAX_FOLLOW_UPS {
-            self.check_stop(incident)?;
+            // Every turn spends AI quota and writes to the timeline: start
+            // one only while the persisted incident is still running.
+            self.ensure_running(incident).await?;
             let auth = self
                 .conversations
                 .authorization_for_unattended(owner)
@@ -2382,14 +2429,24 @@ impl AutofixService {
                     "the incident chat was deleted",
                 ));
             };
-            if current.turn_status != "running" {
-                return Ok(current.turn_status);
-            }
+            // Consult the stop request before the turn's status: `stop`
+            // cancels the turn itself, so a stopped incident's turn reads as
+            // `cancelled` here and must not look like an ordinary ending
+            // that earns a follow-up.
             if self.check_stop(incident).is_err() {
-                let _ = self.conversations.cancel_turn(&current).await;
+                if current.turn_status == "running" {
+                    let _ = self.conversations.cancel_turn(&current).await;
+                }
                 return Err(AutofixError::Stopped {
                     incident_id: incident.public_id.clone(),
                 });
+            }
+            if current.turn_status != "running" {
+                // The turn ended. Before treating it as finished, confirm the
+                // incident is still the worker's: it may have been stopped or
+                // closed by a path that left no stop request behind.
+                self.ensure_running(incident).await?;
+                return Ok(current.turn_status);
             }
             if Instant::now() >= deadline {
                 let _ = self.conversations.cancel_turn(&current).await;
@@ -3166,6 +3223,13 @@ fn incident_response(
     }
 }
 
+/// Whether the worker must stop working an incident: a stop was requested,
+/// or the persisted incident (`None` when its row is gone) is no longer
+/// `working` -- stopped, failed, closed or otherwise moved on by someone else.
+fn incident_halted(stop_requested: bool, persisted_status: Option<&str>) -> bool {
+    stop_requested || persisted_status != Some("working")
+}
+
 fn normalized_paths(paths: Vec<String>) -> serde_json::Value {
     let mut seen = HashSet::new();
     let paths: Vec<String> = paths
@@ -3584,6 +3648,25 @@ mod tests {
         assert!(!same_revision("0123456789abcdef", "0123457"));
         assert!(!same_revision("", "0123456"));
         assert!(!same_revision("012", "0123456"));
+    }
+
+    /// The worker only keeps going (and only starts another agent turn) for
+    /// an incident that is still `working` with no stop request. A stopped
+    /// incident's cancelled turn must not earn a follow-up.
+    #[test]
+    fn a_stopped_or_closed_incident_gets_no_further_agent_turns() {
+        assert!(!incident_halted(false, Some("working")));
+        // `stop` was requested: halt even before the status write lands.
+        assert!(incident_halted(true, Some("working")));
+        // The stop request was cleared but the row says stopped: still halt.
+        assert!(incident_halted(false, Some("stopped")));
+        for status in super::super::CLOSED_STATUSES {
+            assert!(incident_halted(false, Some(status)), "{status}");
+        }
+        assert!(incident_halted(false, Some("open")));
+        assert!(incident_halted(false, Some("awaiting_review")));
+        // The incident row is gone.
+        assert!(incident_halted(false, None));
     }
 
     #[test]

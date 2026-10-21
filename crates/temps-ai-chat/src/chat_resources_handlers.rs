@@ -18,7 +18,7 @@ use utoipa::OpenApi;
 use crate::chat_resources::{
     ChatResource, ChatResourceError, ChatResourceKind, ChatResourceService, ChatResourcesResponse,
 };
-use crate::handlers::{ensure_user_conversation_access, AppState};
+use crate::handlers::{application_project_access_map, ensure_user_conversation_access, AppState};
 
 impl From<ChatResourceError> for Problem {
     fn from(error: ChatResourceError) -> Self {
@@ -33,7 +33,8 @@ impl From<ChatResourceError> for Problem {
 }
 
 /// The projects, databases and services, repositories and sandbox this chat
-/// made, with their current state.
+/// made, with their current state. Projects the caller can no longer read are
+/// left out, and so are services attached only to such projects.
 #[utoipa::path(
     get, tag = "AI Chat", path = "/ai/conversations/{public_id}/resources",
     params(("public_id" = String, Path, description = "Conversation public id")),
@@ -58,10 +59,20 @@ pub async fn list_chat_resources(
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
-    let resources = ChatResourceService::new(state.db.clone())
+    let listing = ChatResourceService::new(state.db.clone())
         .list(&conversation, auth.user_id())
         .await?;
-    Ok(Json(resources))
+
+    // A project, and a service attached only to projects, is shown only while
+    // the caller can still read one of those projects: the chat is theirs, but
+    // project membership can change. All of them are checked in one batch.
+    let project_ids = listing.project_ids();
+    let access = if project_ids.is_empty() {
+        None
+    } else {
+        application_project_access_map(&auth, &state.project_access_checker, &project_ids).await?
+    };
+    Ok(Json(listing.visible_to(access.as_ref())))
 }
 
 pub fn configure_routes() -> Router<Arc<AppState>> {

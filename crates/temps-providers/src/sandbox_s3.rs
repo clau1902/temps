@@ -5,7 +5,9 @@
 //!
 //! A deployment connects with the service's root key to a bucket named for its
 //! environment. A sandbox runs code nobody reviewed, so it gets a bucket of its
-//! own (`<project>-sandbox`) and a *temporary* credential that can use that
+//! own (`<project>.sandbox`, or `<sandbox>.id.sandbox` for a sandbox linked
+//! directly; see [`sandbox_bucket_name`]) and a *temporary*
+//! credential that can use that
 //! bucket and nothing else: the service's own STS `AssumeRole` is asked for a
 //! key restricted by a session policy to one bucket. Nothing is stored. The key
 //! expires by itself, and every command a sandbox runs is issued a fresh one,
@@ -28,7 +30,7 @@ use tracing::info;
 
 use crate::externalsvc::managed_s3::{ManagedS3BackendKind, ManagedS3BackendSelection};
 use crate::externalsvc::rustfs::{rustfs_container_name, DEFAULT_RUSTFS_API_PORT};
-use crate::sandbox_engines::{SandboxAccessEngine, SandboxAccessRequest};
+use crate::sandbox_engines::{SandboxAccessEngine, SandboxAccessRequest, SandboxNamespace};
 use crate::services::{ExternalServiceError, ExternalServiceManager};
 
 /// How long a temporary credential lasts. Long enough that a dev server
@@ -39,7 +41,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_REGION: &str = "us-east-1";
 /// S3 bucket names: 3 to 63 characters.
 const BUCKET_NAME_MAX: usize = 63;
-const BUCKET_SUFFIX: &str = "-sandbox";
+/// A `.` never appears in a deployment's bucket name (scopes are reduced to
+/// `[a-z0-9-]` and declared bucket names refuse dots), so no environment,
+/// project or declared bucket can be named like a sandbox's.
+const BUCKET_SUFFIX: &str = ".sandbox";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -75,25 +80,102 @@ impl std::fmt::Display for SandboxS3Error {
     }
 }
 
-/// The bucket a project's sandboxes share, named for the project and the
-/// sandbox scope the way a deployment's bucket is named for its environment.
-pub fn sandbox_bucket_name(project_slug: &str) -> Result<String, SandboxS3Error> {
-    let name = format!("{project_slug}{BUCKET_SUFFIX}")
-        .replace('_', "-")
-        .to_lowercase();
-    let valid = name.len() >= 3
-        && name.len() <= BUCKET_NAME_MAX
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-        && !name.contains("--")
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if valid {
+/// The bucket a namespace's sandboxes share on the service.
+///
+/// | namespace                     | bucket                    |
+/// |-------------------------------|---------------------------|
+/// | project, plain slug           | `<slug>.sandbox`          |
+/// | project, any other slug       | `<head>-<digest>.h.sandbox` |
+/// | sandbox linked directly       | `<id>.id.sandbox`         |
+/// | sandbox, id not plain         | `<head>-<digest>.idh.sandbox` |
+///
+/// The first label never contains a dot, so the labels after it say which
+/// row a name came from and no two rows can produce the same bucket: a
+/// project slugged like a sandbox's id gets `<id>.sandbox`, never that
+/// sandbox's `<id>.id.sandbox`. Within a row a plain value is used as it is
+/// (one-to-one), and anything else (an accented, long or odd slug) is hashed
+/// whole with 96 bits of SHA-256.
+///
+/// Sandboxes used to get `<project>-sandbox`, which is exactly the bucket a
+/// deployment gives an environment slugged `sandbox` (or a project slugged
+/// `<project>-sandbox`), so a sandbox could be handed a deployment's bucket.
+/// That old name is not reused: nothing only the root key can set marks such
+/// a bucket as a sandbox's, so a sandbox's old bucket and an environment's
+/// cannot be told apart. Its objects stay where they are; new sandbox data
+/// goes to the new bucket.
+pub fn sandbox_bucket_name(namespace: &SandboxNamespace) -> Result<String, SandboxS3Error> {
+    let (direct_marker, hashed_marker) = match namespace {
+        SandboxNamespace::Project(_) => ("", ".h"),
+        SandboxNamespace::Sandbox(_) => (".id", ".idh"),
+    };
+    let (direct, whole) = namespace.parts();
+    let direct_room = BUCKET_NAME_MAX - direct_marker.len() - BUCKET_SUFFIX.len();
+    let name = match direct.filter(|value| is_plain_bucket_label(value, direct_room)) {
+        Some(label) => format!("{label}{direct_marker}{BUCKET_SUFFIX}"),
+        None => {
+            let room = BUCKET_NAME_MAX - hashed_marker.len() - BUCKET_SUFFIX.len();
+            format!(
+                "{}{hashed_marker}{BUCKET_SUFFIX}",
+                hashed_bucket_label(whole, room)
+            )
+        }
+    };
+    // Every row above is valid by construction; this is the backstop.
+    if is_valid_sandbox_bucket(&name) {
         Ok(name)
     } else {
         Err(SandboxS3Error::UnsafeBucketName { value: name })
     }
+}
+
+/// A label used as it is: `[a-z0-9-]`, starting and ending with a letter or
+/// digit, no `--` (which also rules out the reserved `xn--`), not the
+/// reserved `sthree-`, at most `max` bytes.
+fn is_plain_bucket_label(value: &str, max: usize) -> bool {
+    crate::sandbox_engines::is_plain_slug(value)
+        && value.len() <= max
+        && !value.ends_with('-')
+        && !value.contains("--")
+        && !value.starts_with("sthree-")
+}
+
+/// `<head>-<digest>` (or `<digest>` with no usable head): a readable head
+/// from `value`'s letters and digits, and 96 bits of SHA-256 of all of it.
+fn hashed_bucket_label(value: &str, max: usize) -> String {
+    let digest = hex::encode(Sha256::digest(value.as_bytes()));
+    let digest = &digest[..crate::sandbox_engines::NAME_DIGEST_LEN];
+    let mut head = String::new();
+    for character in value
+        .chars()
+        .map(|character| character.to_ascii_lowercase())
+    {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            head.push(character);
+        } else if !head.is_empty() && !head.ends_with('-') {
+            head.push('-');
+        }
+    }
+    head.truncate(max.saturating_sub(digest.len() + 1));
+    let head = head.trim_end_matches('-');
+    if head.is_empty() || head.starts_with("sthree") {
+        digest.to_string()
+    } else {
+        format!("{head}-{digest}")
+    }
+}
+
+/// 3 to 63 bytes of `[a-z0-9.-]`, labels starting and ending with a letter or
+/// digit (so no `..`, `.-` or `-.`).
+fn is_valid_sandbox_bucket(name: &str) -> bool {
+    (3..=BUCKET_NAME_MAX).contains(&name.len())
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
 }
 
 /// The session policy: the object and listing operations of one bucket, and
@@ -667,34 +749,116 @@ mod tests {
         }
     }
 
+    fn bucket(namespace: &SandboxNamespace) -> String {
+        sandbox_bucket_name(namespace).expect("valid")
+    }
+
+    fn project(slug: &str) -> SandboxNamespace {
+        SandboxNamespace::project(slug)
+    }
+
     #[test]
     fn the_bucket_is_named_for_the_project_and_the_sandbox_scope() {
+        assert_eq!(bucket(&project("shop-api")), "shop-api.sandbox");
         assert_eq!(
-            sandbox_bucket_name("shop-api").expect("valid"),
-            "shop-api-sandbox"
-        );
-        assert_eq!(
-            sandbox_bucket_name("Shop_API").expect("valid"),
-            "shop-api-sandbox"
+            bucket(&SandboxNamespace::sandbox("sbx_ab12cd34")),
+            "ab12cd34.id.sandbox"
         );
     }
 
     #[test]
-    fn a_slug_that_cannot_make_a_bucket_name_is_rejected() {
-        for slug in ["a".repeat(60), "bad/slug".to_string(), "x y".to_string()] {
+    fn no_deployment_bucket_can_be_named_like_a_sandbox_bucket() {
+        use crate::externalsvc::managed_s3::{plan_buckets, scope_slug};
+        // The old sandbox name was an environment slugged `sandbox`'s bucket.
+        let environment = plan_buckets(&scope_slug("shop", "sandbox"), &[]);
+        let project_plan = plan_buckets(&scope_slug("shop-sandbox", ""), &[]);
+        let declared = plan_buckets(&scope_slug("shop", "prod"), &["sandbox".to_string()]);
+        let sandbox = bucket(&project("shop"));
+        for plan in environment.iter().chain(&project_plan).chain(&declared) {
+            assert_ne!(plan.physical, sandbox);
+            assert!(!plan.physical.contains('.'), "{}", plan.physical);
+        }
+        // Not even a slug or scope with dots in it produces one.
+        assert!(!scope_slug("shop.sandbox", "").contains('.'));
+    }
+
+    #[test]
+    fn a_project_slugged_like_a_sandbox_id_never_gets_that_sandboxs_bucket() {
+        let sandbox = bucket(&SandboxNamespace::sandbox("sbx_ab12"));
+        for slug in ["ab12", "sab12", "sbx-ab12", "ab12-id", "ab12.id"] {
+            assert_ne!(bucket(&project(slug)), sandbox, "{slug}");
+        }
+        // Nor through the hashed forms: a project can never end in
+        // `.id.sandbox` or `.idh.sandbox`, a sandbox never in a bare
+        // `<label>.sandbox` or `.h.sandbox`.
+        for slug in ["ab12", "café", &"a".repeat(63), "sbx_ab12", "x.id"] {
+            let name = bucket(&project(slug));
             assert!(
-                matches!(
-                    sandbox_bucket_name(&slug),
-                    Err(SandboxS3Error::UnsafeBucketName { .. })
-                ),
-                "{slug}"
+                !name.ends_with(".id.sandbox") && !name.ends_with(".idh.sandbox"),
+                "{name}"
+            );
+        }
+        for id in [
+            "sbx_ab12",
+            "ab12",
+            "sbx_AB12",
+            &format!("sbx_{}", "a".repeat(70)),
+        ] {
+            let name = bucket(&SandboxNamespace::sandbox(id));
+            assert!(
+                name.ends_with(".id.sandbox") || name.ends_with(".idh.sandbox"),
+                "{name}"
             );
         }
     }
 
     #[test]
+    fn slugs_that_are_not_plain_still_get_a_valid_bucket_of_their_own() {
+        // `slugify` keeps any Unicode letter, so accents reach here; folding
+        // them would give `café` and `cafè` one bucket.
+        let names: Vec<String> = [
+            "café",
+            "cafè",
+            "caf",
+            "a--b",
+            "a-b",
+            "shop-",
+            "-shop",
+            "",
+            "xn--shop",
+            "sthree-shop",
+            "Shop_API",
+            "bad/slug",
+            "x y",
+        ]
+        .iter()
+        .map(|slug| bucket(&project(slug)))
+        .chain([
+            bucket(&project(&"a".repeat(55))),
+            bucket(&project(&"a".repeat(56))),
+            bucket(&project(&"a".repeat(57))),
+            bucket(&project(&"é".repeat(63))),
+        ])
+        .collect();
+        for name in &names {
+            assert!(is_valid_sandbox_bucket(name), "{name}");
+            assert!(!name.contains(".-") && !name.contains("-.") && !name.contains(".."));
+            assert!(
+                !name.starts_with("xn--") && !name.starts_with("sthree-"),
+                "{name}"
+            );
+        }
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        assert_eq!(names[2], "caf.sandbox");
+        assert!(names[0].starts_with("caf-") && names[0].ends_with(".h.sandbox"));
+    }
+
+    #[test]
     fn the_session_policy_names_only_the_one_bucket() {
-        let policy = session_policy("shop-api-sandbox");
+        let policy = session_policy("shop-api.sandbox");
         let statement = &policy["Statement"][0];
         assert_eq!(statement["Effect"], "Allow");
         let resources: Vec<&str> = statement["Resource"]
@@ -706,8 +870,8 @@ mod tests {
         assert_eq!(
             resources,
             [
-                "arn:aws:s3:::shop-api-sandbox",
-                "arn:aws:s3:::shop-api-sandbox/*"
+                "arn:aws:s3:::shop-api.sandbox",
+                "arn:aws:s3:::shop-api.sandbox/*"
             ]
         );
         let actions: Vec<&str> = statement["Action"]
@@ -840,7 +1004,7 @@ mod tests {
             "rustfs-store",
             9000,
             "us-east-1",
-            "shop-api-sandbox",
+            "shop-api.sandbox",
             &credentials(),
         );
         for name in [
@@ -864,7 +1028,7 @@ mod tests {
         assert_eq!(env["S3_PORT"], "9000");
         assert_eq!(env["AWS_SESSION_TOKEN"], "tmp-session-token");
         assert_eq!(env["S3_SESSION_TOKEN"], "tmp-session-token");
-        assert_eq!(env["S3_BUCKET"], "shop-api-sandbox");
+        assert_eq!(env["S3_BUCKET"], "shop-api.sandbox");
     }
 
     #[test]

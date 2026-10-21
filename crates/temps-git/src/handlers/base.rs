@@ -204,6 +204,54 @@ impl From<GitProviderManagerError> for Problem {
             GitProviderManagerError::OAuthStateInvalid(msg) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("OAuth State Invalid")
                 .with_detail(msg),
+            GitProviderManagerError::CommitPathRejected {
+                connection_id,
+                ref repository,
+                ref branch,
+                ref path,
+                ..
+            } => problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Commit Path")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_value("path", path.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::NothingToCommit {
+                connection_id,
+                ref repository,
+                ref branch,
+                ..
+            } => problem_new(StatusCode::CONFLICT)
+                .with_title("Nothing To Commit")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::PushRejected {
+                connection_id,
+                ref repository,
+                ref branch,
+                ..
+            } => problem_new(StatusCode::CONFLICT)
+                .with_title("Push Rejected")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::CommitTimedOut {
+                connection_id,
+                ref repository,
+                ref branch,
+                push_may_have_completed,
+                ..
+            } => problem_new(StatusCode::GATEWAY_TIMEOUT)
+                .with_title("Commit Timed Out")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_value("push_may_have_completed", push_may_have_completed)
+                .with_detail(error.to_string()),
         }
     }
 }
@@ -1200,11 +1248,13 @@ pub struct CommitFilesResponse {
     request_body = CommitFilesRequest,
     responses(
         (status = 201, description = "Files committed", body = CommitFilesResponse),
-        (status = 400, description = "Invalid path, branch, message or file content, or the connection is inactive"),
+        (status = 400, description = "Invalid path (including one through a symlink tracked in the repository), branch, message or file content, or the connection is inactive"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Connection not found, or not owned by the caller"),
-        (status = 502, description = "The git provider rejected or failed the request")
+        (status = 409, description = "Nothing to commit (the files already match the branch), or the remote rejected the push (protected branch, hook, non-fast-forward)"),
+        (status = 502, description = "The git provider failed the request"),
+        (status = 504, description = "The commit timed out; `push_may_have_completed` says whether the branch must be checked before retrying")
     ),
     tag = "Git Provider Connections",
     security(
@@ -4189,6 +4239,54 @@ mod repository_creation_problem_tests {
         assert_eq!(problem.status_code, StatusCode::CONFLICT);
         assert!(detail(&problem).contains("'my-app'"));
         assert!(detail(&problem).contains("connection 12"));
+    }
+
+    #[test]
+    fn commit_outcomes_the_caller_can_act_on_are_not_bad_gateways() {
+        let path = Problem::from(GitProviderManagerError::CommitPathRejected {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            branch: "main".to_string(),
+            path: "x/file".to_string(),
+            reason: "goes through 'x', which is a symbolic link on the branch".to_string(),
+        });
+        assert_eq!(path.status_code, StatusCode::BAD_REQUEST);
+        assert!(detail(&path).contains("'x/file'") && detail(&path).contains("connection 12"));
+
+        let unchanged = Problem::from(GitProviderManagerError::NothingToCommit {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            branch: "main".to_string(),
+            file_count: 1,
+            parent_sha: "abc123".to_string(),
+        });
+        assert_eq!(unchanged.status_code, StatusCode::CONFLICT);
+
+        let rejected = Problem::from(GitProviderManagerError::PushRejected {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            branch: "main".to_string(),
+            refname: "refs/heads/main".to_string(),
+            status: "protected branch hook declined".to_string(),
+        });
+        assert_eq!(rejected.status_code, StatusCode::CONFLICT);
+        let rejected_detail = detail(&rejected);
+        assert!(rejected_detail.contains("refs/heads/main"));
+        assert!(rejected_detail.contains("protected branch hook declined"));
+
+        let timed_out = Problem::from(GitProviderManagerError::CommitTimedOut {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            branch: "main".to_string(),
+            timeout_secs: 120,
+            push_may_have_completed: true,
+        });
+        assert_eq!(timed_out.status_code, StatusCode::GATEWAY_TIMEOUT);
+        assert!(detail(&timed_out).contains("may still have completed"));
+        assert_eq!(
+            timed_out.body.get("push_may_have_completed"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 
     #[test]

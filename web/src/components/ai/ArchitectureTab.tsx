@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  getChatWorkspaceQueryKey,
   saveBlueprintVersionMutation,
   setChatWorkspaceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -99,6 +100,30 @@ function Onboarding({
   )
 }
 
+/** What an architecture is, for a chat that has none yet. */
+function DesignOnboarding() {
+  return (
+    <Onboarding
+      icon={Network}
+      title="Design the application before building it"
+    >
+      <p className="text-sm text-muted-foreground">
+        The architecture names every part (pages, an API, workers, a database, a
+        broker, outside services) and how data flows between them. You accept it
+        before anything is built, and every chat of the application builds
+        against it. For example: a Vite web app that calls a Bun API, which
+        keeps tasks in Postgres and sends email through an outside service.
+      </p>
+    </Onboarding>
+  )
+}
+
+/** A save the user sent, kept until it lands so a refused one is not lost. */
+interface SubmittedDraft {
+  document: BlueprintDocument
+  changeSummary: string
+}
+
 /**
  * The application's architecture: the parts it is made of, how data flows
  * between them, and how each built part is doing. The assistant proposes it
@@ -116,6 +141,7 @@ export function ArchitectureTab({
   const [editing, setEditing] = useState(false)
   const [workspaceName, setWorkspaceName] = useState('')
   const [selected, setSelected] = useState<string | null>(null)
+  const [submitted, setSubmitted] = useState<SubmittedDraft | null>(null)
   const createWorkspace = useMutation({
     ...setChatWorkspaceMutation(),
     meta: { errorTitle: 'Could not create the application' },
@@ -129,6 +155,7 @@ export function ArchitectureTab({
         data.application_id,
         conversationPublicId
       )
+      setSubmitted(null)
       setEditing(false)
       const version = data.accepted?.version
       toast.success(
@@ -146,6 +173,7 @@ export function ArchitectureTab({
     document: BlueprintDocument,
     changeSummary: string
   ) => {
+    setSubmitted({ document, changeSummary })
     let target = applicationId
     if (!target) {
       const name = workspaceName.trim()
@@ -160,7 +188,13 @@ export function ArchitectureTab({
         })
         .catch(() => null)
       target = created?.workspace?.public_id ?? null
-      if (!target) return
+      if (!created || !target) return
+      // The chat now has an application: show it at once rather than after
+      // the workspace read comes back.
+      queryClient.setQueryData(
+        getChatWorkspaceQueryKey({ path: { public_id: conversationPublicId } }),
+        created
+      )
       invalidateBlueprint(queryClient, target, conversationPublicId)
     }
     save.mutate({
@@ -169,7 +203,8 @@ export function ArchitectureTab({
     })
   }
 
-  if (workspace.isPending) {
+  const chatWorkspace = workspace.data
+  if (!chatWorkspace && workspace.isPending) {
     return (
       <div className="space-y-3 p-4">
         <Skeleton className="h-4 w-48" />
@@ -177,7 +212,9 @@ export function ArchitectureTab({
       </div>
     )
   }
-  if (workspace.isError) {
+  // A failed refetch keeps the data it had; only a chat that never loaded
+  // shows the error, so an open editor is not torn down by a blip.
+  if (!chatWorkspace) {
     return (
       <Onboarding icon={Network} title="The architecture could not be loaded">
         <p className="text-sm text-muted-foreground">
@@ -187,10 +224,10 @@ export function ArchitectureTab({
       </Onboarding>
     )
   }
-  if (!workspace.data.joinable) {
+  if (!chatWorkspace.joinable) {
     return (
       <Onboarding icon={Network} title="No architecture in a project chat">
-        <p className="text-sm text-muted-foreground">{workspace.data.reason}</p>
+        <p className="text-sm text-muted-foreground">{chatWorkspace.reason}</p>
       </Onboarding>
     )
   }
@@ -198,76 +235,85 @@ export function ArchitectureTab({
   const data = blueprint.data
   const accepted = data?.accepted ?? null
   const proposal = data?.proposal ?? null
-  const editor = (
-    <BlueprintEditor
-      initial={accepted?.document ?? proposal?.document ?? STARTER}
-      saving={save.isPending || createWorkspace.isPending}
-      problems={savedProblems(save.error)}
-      onSave={(document, summary) => void saveDocument(document, summary)}
-      onCancel={() => {
-        save.reset()
-        setEditing(false)
-      }}
-    />
-  )
+  const hasDesign = accepted !== null || proposal !== null
 
-  if (!applicationId || (data && !accepted && !proposal)) {
+  // One layout for the whole editing session, whatever the queries are doing:
+  // saving into a new application refetches the chat's workspace and loads a
+  // blueprint, and the editor (with the user's drawing in its state) must not
+  // unmount while that happens, or a refused save would come back as the
+  // starter design with errors describing a drawing that is gone.
+  if (editing) {
     return (
       <div className="space-y-4 p-4">
-        <Onboarding
-          icon={Network}
-          title="Design the application before building it"
-        >
-          <p className="text-sm text-muted-foreground">
-            The architecture names every part (pages, an API, workers, a
-            database, a broker, outside services) and how data flows between
-            them. You accept it before anything is built, and every chat of the
-            application builds against it. For example: a Vite web app that
-            calls a Bun API, which keeps tasks in Postgres and sends email
-            through an outside service.
+        {hasDesign && data ? (
+          <p className="text-sm font-medium">
+            Edit the architecture of {data.workspace_name}
           </p>
-        </Onboarding>
-        {editing ? (
-          <div className="space-y-3 px-4">
-            {!applicationId && (
-              <div className="space-y-1">
-                <Label htmlFor="new-application-name" className="text-xs">
-                  Application name
-                </Label>
-                <Input
-                  id="new-application-name"
-                  value={workspaceName}
-                  placeholder="Team tasks"
-                  onChange={(event) => setWorkspaceName(event.target.value)}
-                  className="h-8 text-xs"
-                />
-              </div>
-            )}
-            {editor}
-          </div>
         ) : (
-          <div className="flex flex-wrap gap-2 px-4">
-            <Button
-              type="button"
-              size="sm"
-              className="gap-1.5"
-              onClick={() => continueChat(conversationPublicId, DESIGN_REQUEST)}
-            >
-              <Sparkles className="size-4" />
-              Ask the assistant to design it
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="gap-1.5"
-              onClick={() => setEditing(true)}
-            >
-              <Pencil className="size-4" />
-              Draw it myself
-            </Button>
-          </div>
+          <DesignOnboarding />
         )}
+        <div className={cn('space-y-3', !hasDesign && 'px-4')}>
+          {!applicationId && (
+            <div className="space-y-1">
+              <Label htmlFor="new-application-name" className="text-xs">
+                Application name
+              </Label>
+              <Input
+                id="new-application-name"
+                value={workspaceName}
+                placeholder="Team tasks"
+                onChange={(event) => setWorkspaceName(event.target.value)}
+                className="h-8 text-xs"
+              />
+            </div>
+          )}
+          <BlueprintEditor
+            initial={
+              submitted?.document ??
+              accepted?.document ??
+              proposal?.document ??
+              STARTER
+            }
+            initialChangeSummary={submitted?.changeSummary}
+            saving={save.isPending || createWorkspace.isPending}
+            problems={savedProblems(save.error)}
+            onSave={(document, summary) => void saveDocument(document, summary)}
+            onCancel={() => {
+              save.reset()
+              setSubmitted(null)
+              setEditing(false)
+            }}
+          />
+        </div>
+      </div>
+    )
+  }
+
+  if (!applicationId || (data && !hasDesign)) {
+    return (
+      <div className="space-y-4 p-4">
+        <DesignOnboarding />
+        <div className="flex flex-wrap gap-2 px-4">
+          <Button
+            type="button"
+            size="sm"
+            className="gap-1.5"
+            onClick={() => continueChat(conversationPublicId, DESIGN_REQUEST)}
+          >
+            <Sparkles className="size-4" />
+            Ask the assistant to design it
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="gap-1.5"
+            onClick={() => setEditing(true)}
+          >
+            <Pencil className="size-4" />
+            Draw it myself
+          </Button>
+        </div>
       </div>
     )
   }
@@ -277,17 +323,6 @@ export function ArchitectureTab({
       <div className="space-y-3 p-4">
         <Skeleton className="h-4 w-48" />
         <Skeleton className="h-40 w-full" />
-      </div>
-    )
-  }
-
-  if (editing) {
-    return (
-      <div className="space-y-3 p-4">
-        <p className="text-sm font-medium">
-          Edit the architecture of {data.workspace_name}
-        </p>
-        {editor}
       </div>
     )
   }

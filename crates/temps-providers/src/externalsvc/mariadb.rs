@@ -1357,9 +1357,71 @@ impl MariaDbService {
         .map(|_| ())
     }
 
+    /// Run one query as root and return its rows as tab-separated text
+    /// without a header (`-N -B`).
+    async fn run_admin_query(&self, config: &MariaDbConfig, sql: &str) -> Result<String> {
+        let container_name = self.get_live_container_name(config);
+        self.run_container_command(
+            &container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "if command -v mariadb >/dev/null 2>&1; then \
+                     mariadb -uroot -N -B -e \"$TEMPS_MARIADB_SQL\"; \
+                 else \
+                     mysql -uroot -N -B -e \"$TEMPS_MARIADB_SQL\"; \
+                 fi"
+                .to_string(),
+            ],
+            Some(vec![
+                format!("MYSQL_PWD={}", config.root_password),
+                format!("MARIADB_PWD={}", config.root_password),
+                format!("TEMPS_MARIADB_SQL={}", sql),
+            ]),
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Refuse to give a deployment a sandbox's database: a name in the
+    /// sandbox namespace, or one the sandbox user its name would have exists
+    /// for (a sandbox database from before the namespace, such as
+    /// `<project>_sandbox` for an environment slugged `sandbox`). Only root
+    /// can create or drop that user, so the sandbox cannot hide it.
+    async fn check_not_a_sandbox_database(
+        &self,
+        config: &MariaDbConfig,
+        database: &str,
+    ) -> Result<()> {
+        if crate::sandbox_engines::is_reserved_sandbox_database_name(database) {
+            return crate::sandbox_engines::check_deployment_database("MariaDB", database, None)
+                .map_err(anyhow::Error::new);
+        }
+        let user = crate::sandbox_access::sandbox_role_name(database);
+        let output = self
+            .run_admin_query(
+                config,
+                &crate::sandbox_mariadb::sandbox_user_count_query(&Self::sql_string_literal(&user)),
+            )
+            .await?;
+        let count: u64 = output.trim().parse().map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to read whether a sandbox user exists for MariaDB database '{}' \
+                 (output '{}'): {}",
+                database,
+                output.trim(),
+                error
+            )
+        })?;
+        let evidence = (count > 0).then(|| format!("the sandbox user '{user}'@'%' exists for it"));
+        crate::sandbox_engines::check_deployment_database("MariaDB", database, evidence)
+            .map_err(anyhow::Error::new)
+    }
+
     async fn create_database(&self, service_config: ServiceConfig, database: &str) -> Result<()> {
         Self::validate_identifier("database", database)?;
         let config = self.get_mariadb_config(service_config)?;
+        self.check_not_a_sandbox_database(&config, database).await?;
 
         let database_ident = Self::quote_identifier(database);
         let username_literal = Self::sql_string_literal(&config.username);

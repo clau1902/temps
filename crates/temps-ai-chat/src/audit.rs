@@ -182,6 +182,22 @@ pub struct AiSuggestionChatModeUpdatedAudit {
     pub mode: Option<String>,
 }
 
+/// Next steps were suggested after an answer: a new model request was made
+/// (its cost counts toward the chat's spend) and the set saved on the answer.
+/// Records how many, never their text. Returning an already saved set writes
+/// nothing, so it is not audited.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiNextStepsSuggestedAudit {
+    pub context: AuditContext,
+    pub project_id: Option<i32>,
+    pub conversation_id: String,
+    /// The answer the suggestions were saved on.
+    pub message_id: Option<i64>,
+    pub suggestion_count: usize,
+    /// The model that wrote them.
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AiSandboxUnlinkedAudit {
     pub context: AuditContext,
@@ -491,6 +507,7 @@ impl_audit_operation!(
     AiSuggestionChatModeUpdatedAudit,
     "ai.suggestions.chat_mode_updated"
 );
+impl_audit_operation!(AiNextStepsSuggestedAudit, "ai.suggestions.generated");
 impl_audit_operation!(AiSecretProvidedAudit, "ai.secret.provided");
 impl_audit_operation!(AiSecretDiscardedAudit, "ai.secret.discarded");
 impl_audit_operation!(AiSandboxLinkedAudit, "ai.sandbox.linked");

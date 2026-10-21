@@ -131,6 +131,19 @@ impl DatabaseProvisioningConfig {
 
         match (self.mode, self.custom_database_name.as_deref()) {
             (DatabaseProvisioningMode::Custom, Some(name))
+                if crate::sandbox_engines::is_reserved_sandbox_database_name(name) =>
+            {
+                Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                    service_id,
+                    project_id,
+                    reason: format!(
+                        "custom database name '{name}' starts with '{}', which is reserved for \
+                         sandbox databases",
+                        crate::sandbox_engines::SANDBOX_DATABASE_PREFIX
+                    ),
+                })
+            }
+            (DatabaseProvisioningMode::Custom, Some(name))
                 if is_valid_custom_database_name(name) =>
             {
                 Ok(())
@@ -688,19 +701,6 @@ pub(crate) fn service_execution_route(node_id: Option<i32>) -> ServiceExecutionR
     }
 }
 
-/// The name a sandbox's database and bucket take when its link was made to a
-/// service directly, with no project to borrow a name from: a plain lowercase
-/// slug made from the sandbox's id (`sbx_ab12` becomes `sab12`).
-pub(crate) fn sandbox_namespace(sandbox_public_id: &str) -> String {
-    let id: String = sandbox_public_id
-        .trim_start_matches("sbx_")
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .map(|character| character.to_ascii_lowercase())
-        .collect();
-    format!("s{id}")
-}
-
 fn select_remote_container_name(
     persisted_name: Option<&str>,
     canonical_name: &str,
@@ -805,6 +805,15 @@ pub enum ExternalServiceError {
         service_id: i32,
         service_type: String,
         reason: String,
+    },
+
+    /// A database a sandbox or a deployment asked for belongs to the other
+    /// side, so it was left untouched (ADR-051). A conflict, not a failure:
+    /// the operator renames or removes one side.
+    #[error("Service {service_id}: {conflict}")]
+    SandboxNamespaceConflict {
+        service_id: i32,
+        conflict: crate::sandbox_engines::SandboxNamespaceConflict,
     },
 
     #[error("Service {service_id} is no longer available to claim")]
@@ -7787,18 +7796,29 @@ echo "[restore] Pre-seed complete"
             ),
         })?;
 
-        let exists: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+        // The owner, when the database exists: a sandbox's database must
+        // never be handed to a deployment.
+        let owner: Option<String> = client
+            .query_opt(
+                crate::sandbox_access::SandboxDatabasePlan::DATABASE_OWNER_QUERY,
                 &[&db_name],
             )
             .await
+            .and_then(|row| row.map(|row| row.try_get(0)).transpose())
             .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to check if database '{}' exists: {}", db_name, e),
-            })?
-            .get(0);
+                reason: format!(
+                    "Failed to check if database '{}' exists on cluster {}: {}",
+                    db_name, service_id, e
+                ),
+            })?;
+        crate::sandbox_access::check_deployment_database(db_name, owner.as_deref()).map_err(
+            |conflict| ExternalServiceError::SandboxNamespaceConflict {
+                service_id,
+                conflict,
+            },
+        )?;
 
-        if exists {
+        if owner.is_some() {
             debug!(
                 service_id,
                 db_name, "App database already exists on cluster primary; skipping CREATE"
@@ -13454,8 +13474,22 @@ echo "[restore] Pre-seed complete"
         service_instance
             .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
             .await
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to get runtime environment variables: {}", e),
+            .map_err(|e| {
+                // A sandbox's database refused to a deployment is a conflict
+                // the operator resolves, not an internal failure.
+                match e.downcast_ref::<crate::sandbox_engines::SandboxNamespaceConflict>() {
+                    Some(conflict) => ExternalServiceError::SandboxNamespaceConflict {
+                        service_id: service_id_val,
+                        conflict: conflict.clone(),
+                    },
+                    None => ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to get runtime environment variables for service {} \
+                             (project scope '{}', environment scope '{}'): {}",
+                            service_id_val, project_scope, environment_scope, e
+                        ),
+                    },
+                }
             })
     }
 
@@ -13502,13 +13536,19 @@ echo "[restore] Pre-seed complete"
                         project_id,
                     });
                 }
-                projects::Entity::find_by_id(project_id)
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?
-                    .slug
+                crate::sandbox_engines::SandboxNamespace::project(
+                    projects::Entity::find_by_id(project_id)
+                        .one(self.db.as_ref())
+                        .await?
+                        .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?
+                        .slug,
+                )
             }
-            None => sandbox_namespace(&scope.sandbox_public_id),
+            // A link made to the service directly: a namespace of the
+            // sandbox's own, named so that no project's can ever match it.
+            None => {
+                crate::sandbox_engines::SandboxNamespace::sandbox(scope.sandbox_public_id.clone())
+            }
         };
         let parameters = self.get_service_parameters(service_id_val).await?;
         engine
@@ -17099,6 +17139,31 @@ mod tests {
             if let Some(name) = name {
                 assert!(insert.contains(&name));
             }
+        }
+    }
+
+    #[test]
+    fn a_custom_database_name_in_the_sandbox_namespace_is_refused() {
+        let config = |name: &str| DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Custom,
+            custom_database_name: Some(name.to_string()),
+        };
+        let error = config("_sandbox_shop")
+            .validate(71, 10, "postgres")
+            .expect_err("the sandbox namespace is reserved");
+        match error {
+            ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id: 71,
+                project_id: 10,
+                reason,
+            } => assert!(reason.contains("reserved for sandbox"), "{reason}"),
+            other => panic!("expected InvalidDatabaseProvisioning, got {other:?}"),
+        }
+        // Names merely mentioning a sandbox are still allowed.
+        for name in ["shop_sandbox", "sandbox_shop", "_shop"] {
+            config(name)
+                .validate(71, 10, "postgres")
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
         }
     }
 
@@ -25860,20 +25925,6 @@ mod tests {
         assert!(
             manager.local_workloads_enabled(),
             "full profile must report local_workloads_enabled = true"
-        );
-    }
-
-    #[test]
-    fn a_sandbox_without_a_project_gets_a_plain_lowercase_namespace() {
-        assert_eq!(sandbox_namespace("sbx_AB12cd34"), "sab12cd34");
-        assert_eq!(
-            sandbox_namespace("sbx_deadbeef01234567"),
-            "sdeadbeef01234567"
-        );
-        // Two sandboxes never share a database or bucket on the same service.
-        assert_ne!(
-            sandbox_namespace("sbx_aaaa0000"),
-            sandbox_namespace("sbx_bbbb0000")
         );
     }
 }

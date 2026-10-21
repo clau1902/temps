@@ -75094,7 +75094,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "The projects, databases and services, repositories and sandbox this chat\nmade, with their current state.",
+        "summary": "The projects, databases and services, repositories and sandbox this chat\nmade, with their current state. Projects the caller can no longer read are\nleft out, and so are services attached only to such projects.",
         "tags": [
           "AI Chat"
         ],
@@ -99513,7 +99513,7 @@
             "description": "Files committed"
           },
           "400": {
-            "description": "Invalid path, branch, message or file content, or the connection is inactive"
+            "description": "Invalid path (including one through a symlink tracked in the repository), branch, message or file content, or the connection is inactive"
           },
           "401": {
             "description": "Unauthorized"
@@ -99524,8 +99524,14 @@
           "404": {
             "description": "Connection not found, or not owned by the caller"
           },
+          "409": {
+            "description": "Nothing to commit (the files already match the branch), or the remote rejected the push (protected branch, hook, non-fast-forward)"
+          },
           "502": {
-            "description": "The git provider rejected or failed the request"
+            "description": "The git provider failed the request"
+          },
+          "504": {
+            "description": "The commit timed out; `push_may_have_completed` says whether the branch must be checked before retrying"
           }
         },
         "security": [

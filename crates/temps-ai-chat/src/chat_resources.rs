@@ -13,7 +13,7 @@
 //! deleted drops out of the list, and one whose state changed shows its current
 //! state rather than the state at creation time.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -23,7 +23,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use temps_entities::{
-    ai_conversations, ai_pending_actions, external_services, projects, sandboxes,
+    ai_conversations, ai_pending_actions, external_services, project_services, projects, sandboxes,
 };
 use thiserror::Error;
 use utoipa::ToSchema;
@@ -104,6 +104,74 @@ pub struct ChatResourcesResponse {
     pub resources: Vec<ChatResource>,
     /// True when the chat made more pieces than this response covers.
     pub truncated: bool,
+}
+
+/// Which projects decide whether the caller may still see a listed piece.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Visibility {
+    /// A project: shown only while the caller can read it.
+    Project(i32),
+    /// A service: shown while the caller can read at least one project it is
+    /// linked to. A service linked to no project is an instance-level
+    /// resource, governed by instance permissions rather than project
+    /// membership, so it stays listed for the chat's owner as before.
+    Service { linked_projects: Vec<i32> },
+    /// Repositories (owned by the git provider) and the sandbox (owned by the
+    /// user, checked when it is read): not scoped to a project.
+    Unscoped,
+}
+
+/// The pieces a chat made, before they are narrowed to the projects the
+/// caller can still read: the chat is theirs, but project membership can
+/// change after the chat made something.
+#[derive(Debug, Clone)]
+pub struct ChatResourceListing {
+    entries: Vec<(ChatResource, Visibility)>,
+    truncated: bool,
+}
+
+impl ChatResourceListing {
+    /// Every project whose access decides what is shown, sorted and unique,
+    /// so the caller checks them in one batch.
+    pub fn project_ids(&self) -> Vec<i32> {
+        let mut ids: Vec<i32> = self
+            .entries
+            .iter()
+            .flat_map(|(_, visibility)| match visibility {
+                Visibility::Project(id) => vec![*id],
+                Visibility::Service { linked_projects } => linked_projects.clone(),
+                Visibility::Unscoped => Vec::new(),
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// The response for a caller with `access` (project id to whether they
+    /// may read it). `None` means no project restriction applies, as for an
+    /// admin. A project missing from the map is treated as not readable.
+    pub fn visible_to(self, access: Option<&BTreeMap<i32, bool>>) -> ChatResourcesResponse {
+        let can_read = |project_id: &i32| {
+            access.is_none_or(|access| access.get(project_id).copied().unwrap_or(false))
+        };
+        let resources = self
+            .entries
+            .into_iter()
+            .filter(|(_, visibility)| match visibility {
+                Visibility::Project(id) => can_read(id),
+                Visibility::Service { linked_projects } => {
+                    linked_projects.is_empty() || linked_projects.iter().any(can_read)
+                }
+                Visibility::Unscoped => true,
+            })
+            .map(|(resource, _)| resource)
+            .collect();
+        ChatResourcesResponse {
+            resources,
+            truncated: self.truncated,
+        }
+    }
 }
 
 /// What an executed action created, as far as its own record says.
@@ -187,12 +255,13 @@ impl ChatResourceService {
 
     /// The pieces `conversation` made that still exist, newest first. The
     /// caller has already shown the conversation is theirs; `user_id` limits the
-    /// linked sandbox to one they own.
+    /// linked sandbox to one they own. Narrow the listing to the projects the
+    /// caller may read with [`ChatResourceListing::visible_to`].
     pub async fn list(
         &self,
         conversation: &ai_conversations::Model,
         user_id: i32,
-    ) -> Result<ChatResourcesResponse, ChatResourceError> {
+    ) -> Result<ChatResourceListing, ChatResourceError> {
         let database = |reason: sea_orm::DbErr| ChatResourceError::Database {
             conversation_id: conversation.public_id.clone(),
             reason: reason.to_string(),
@@ -260,22 +329,43 @@ impl ChatResourceService {
                 .map(|service| (service.id, service))
                 .collect()
         };
+        // One query for the projects every live service is attached to.
+        let mut service_projects: HashMap<i32, Vec<i32>> = HashMap::new();
+        if !live_services.is_empty() {
+            let links = project_services::Entity::find()
+                .filter(
+                    project_services::Column::ServiceId
+                        .is_in(live_services.keys().copied().collect::<Vec<_>>()),
+                )
+                .all(self.db.as_ref())
+                .await
+                .map_err(database)?;
+            for link in links {
+                service_projects
+                    .entry(link.service_id)
+                    .or_default()
+                    .push(link.project_id);
+            }
+        }
 
-        let mut resources: Vec<ChatResource> = Vec::with_capacity(created.len() + 1);
+        let mut entries: Vec<(ChatResource, Visibility)> = Vec::with_capacity(created.len() + 1);
         for (made, at) in created {
-            let resource = match made {
-                Created::Project { id } => live_projects.get(&id).map(|project| ChatResource {
-                    kind: ChatResourceKind::Project,
-                    id: project.id.to_string(),
-                    name: project.name.clone(),
-                    slug: Some(project.slug.clone()),
-                    detail: Some(project.preset.display_name().to_string()),
-                    status: None,
-                    url: None,
-                    created_at: at,
+            let entry = match made {
+                Created::Project { id } => live_projects.get(&id).map(|project| {
+                    let resource = ChatResource {
+                        kind: ChatResourceKind::Project,
+                        id: project.id.to_string(),
+                        name: project.name.clone(),
+                        slug: Some(project.slug.clone()),
+                        detail: Some(project.preset.display_name().to_string()),
+                        status: None,
+                        url: None,
+                        created_at: at,
+                    };
+                    (resource, Visibility::Project(project.id))
                 }),
-                Created::Service { id, service_type } => {
-                    live_services.get(&id).map(|service| ChatResource {
+                Created::Service { id, service_type } => live_services.get(&id).map(|service| {
+                    let resource = ChatResource {
                         kind: ChatResourceKind::Service,
                         id: service.id.to_string(),
                         name: service.name.clone(),
@@ -284,31 +374,36 @@ impl ChatResourceService {
                         status: Some(service.status.clone()),
                         url: None,
                         created_at: at,
-                    })
-                }
+                    };
+                    let linked_projects = service_projects.get(&id).cloned().unwrap_or_default();
+                    (resource, Visibility::Service { linked_projects })
+                }),
                 Created::Repository {
                     full_name,
                     name,
                     private,
                     web_url,
-                } => Some(ChatResource {
-                    kind: ChatResourceKind::Repository,
-                    id: full_name,
-                    name,
-                    slug: None,
-                    detail: private
-                        .map(|private| if private { "Private" } else { "Public" }.to_string()),
-                    status: None,
-                    url: web_url,
-                    created_at: at,
-                }),
+                } => Some((
+                    ChatResource {
+                        kind: ChatResourceKind::Repository,
+                        id: full_name,
+                        name,
+                        slug: None,
+                        detail: private
+                            .map(|private| if private { "Private" } else { "Public" }.to_string()),
+                        status: None,
+                        url: web_url,
+                        created_at: at,
+                    },
+                    Visibility::Unscoped,
+                )),
             };
-            if let Some(resource) = resource {
-                if !resources
+            if let Some((resource, visibility)) = entry {
+                if !entries
                     .iter()
-                    .any(|seen| seen.kind == resource.kind && seen.id == resource.id)
+                    .any(|(seen, _)| seen.kind == resource.kind && seen.id == resource.id)
                 {
-                    resources.push(resource);
+                    entries.push((resource, visibility));
                 }
             }
         }
@@ -322,24 +417,24 @@ impl ChatResourceService {
                 .await
                 .map_err(database)?;
             if let Some(sandbox) = sandbox {
-                resources.push(ChatResource {
-                    kind: ChatResourceKind::Sandbox,
-                    id: sandbox.public_id,
-                    name: sandbox.name,
-                    slug: None,
-                    detail: sandbox.backend,
-                    status: Some(sandbox.status),
-                    url: None,
-                    created_at: link.linked_at,
-                });
+                entries.push((
+                    ChatResource {
+                        kind: ChatResourceKind::Sandbox,
+                        id: sandbox.public_id,
+                        name: sandbox.name,
+                        slug: None,
+                        detail: sandbox.backend,
+                        status: Some(sandbox.status),
+                        url: None,
+                        created_at: link.linked_at,
+                    },
+                    Visibility::Unscoped,
+                ));
             }
         }
-        resources.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        entries.sort_by_key(|(resource, _)| std::cmp::Reverse(resource.created_at));
 
-        Ok(ChatResourcesResponse {
-            resources,
-            truncated,
-        })
+        Ok(ChatResourceListing { entries, truncated })
     }
 }
 
@@ -481,6 +576,106 @@ mod tests {
                 "{operation} is queried but never parsed"
             );
         }
+    }
+
+    fn resource(kind: ChatResourceKind, id: &str) -> ChatResource {
+        ChatResource {
+            kind,
+            id: id.to_string(),
+            name: id.to_string(),
+            slug: None,
+            detail: None,
+            status: None,
+            url: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn listing() -> ChatResourceListing {
+        ChatResourceListing {
+            entries: vec![
+                (
+                    resource(ChatResourceKind::Project, "1"),
+                    Visibility::Project(1),
+                ),
+                (
+                    resource(ChatResourceKind::Project, "2"),
+                    Visibility::Project(2),
+                ),
+                // Attached only to the project the caller lost.
+                (
+                    resource(ChatResourceKind::Service, "10"),
+                    Visibility::Service {
+                        linked_projects: vec![2],
+                    },
+                ),
+                // Shared with a project the caller still reads.
+                (
+                    resource(ChatResourceKind::Service, "11"),
+                    Visibility::Service {
+                        linked_projects: vec![2, 1],
+                    },
+                ),
+                // Attached to no project at all.
+                (
+                    resource(ChatResourceKind::Service, "12"),
+                    Visibility::Service {
+                        linked_projects: vec![],
+                    },
+                ),
+                (
+                    resource(ChatResourceKind::Repository, "acme/demo"),
+                    Visibility::Unscoped,
+                ),
+                (
+                    resource(ChatResourceKind::Sandbox, "sbx_1"),
+                    Visibility::Unscoped,
+                ),
+            ],
+            truncated: true,
+        }
+    }
+
+    fn ids(response: &ChatResourcesResponse) -> Vec<&str> {
+        response
+            .resources
+            .iter()
+            .map(|resource| resource.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn every_project_a_listed_piece_depends_on_is_checked_once() {
+        assert_eq!(listing().project_ids(), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_project_the_caller_lost_and_its_only_services_are_hidden() {
+        let access = BTreeMap::from([(1, true), (2, false)]);
+        let response = listing().visible_to(Some(&access));
+        assert_eq!(ids(&response), vec!["1", "11", "12", "acme/demo", "sbx_1"]);
+        assert!(response.truncated);
+    }
+
+    #[test]
+    fn a_project_missing_from_the_access_map_is_not_readable() {
+        let access = BTreeMap::from([(1, true)]);
+        let response = listing().visible_to(Some(&access));
+        assert!(!ids(&response).contains(&"2"));
+        assert!(!ids(&response).contains(&"10"));
+    }
+
+    #[test]
+    fn without_a_project_restriction_everything_is_listed() {
+        let response = listing().visible_to(None);
+        assert_eq!(response.resources.len(), 7);
+    }
+
+    #[test]
+    fn a_caller_with_no_project_access_keeps_only_unscoped_pieces() {
+        let access = BTreeMap::from([(1, false), (2, false)]);
+        let response = listing().visible_to(Some(&access));
+        assert_eq!(ids(&response), vec!["12", "acme/demo", "sbx_1"]);
     }
 
     #[test]

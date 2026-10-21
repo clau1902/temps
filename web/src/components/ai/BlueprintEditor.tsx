@@ -27,7 +27,9 @@ import { Loader2, Plus, Trash2 } from 'lucide-react'
 import { useId, useState } from 'react'
 import {
   cleanDocument,
+  formatHolds,
   newComponent,
+  parseHolds,
   removeComponent,
   updateComponent,
   withKind,
@@ -128,6 +130,34 @@ function Field({
   )
 }
 
+/**
+ * The comma-separated list of what a data part holds. The field shows exactly
+ * what was typed (spaces, a trailing comma) and the part gets the parsed list;
+ * rebuilding the text from the list on every keystroke would add a space after
+ * each comma and throw the caret to the end. It starts from the part's list
+ * whenever it mounts, which is when the part (keyed by id) or its kind changes.
+ */
+function HoldsField({
+  holds,
+  onChange,
+}: {
+  holds: string[] | null | undefined
+  onChange: (holds: string[]) => void
+}) {
+  const [text, setText] = useState(() => formatHolds(holds))
+  return (
+    <Field
+      label="Holds (comma separated)"
+      value={text}
+      placeholder="tasks, users"
+      onChange={(next) => {
+        setText(next)
+        onChange(parseHolds(next))
+      }}
+    />
+  )
+}
+
 function PartEditor({
   component,
   onChange,
@@ -209,11 +239,9 @@ function PartEditor({
             options={ENGINES}
             onChange={(engine) => set({ engine })}
           />
-          <Field
-            label="Holds (comma separated)"
-            value={(component.holds ?? []).join(', ')}
-            placeholder="tasks, users"
-            onChange={(holds) => set({ holds: holds.split(',') })}
+          <HoldsField
+            holds={component.holds}
+            onChange={(holds) => set({ holds })}
           />
         </div>
       )}
@@ -298,12 +326,15 @@ function FlowEditor({
  */
 export function BlueprintEditor({
   initial,
+  initialChangeSummary = '',
   saving,
   problems,
   onSave,
   onCancel,
 }: {
   initial: BlueprintDocument
+  /** What the user said they changed, when resuming a refused save. */
+  initialChangeSummary?: string
   saving: boolean
   problems: string[]
   onSave: (document: BlueprintDocument, changeSummary: string) => void
@@ -313,7 +344,7 @@ export function BlueprintEditor({
     ...initial,
     flows: initial.flows ?? [],
   }))
-  const [summary, setSummary] = useState('')
+  const [summary, setSummary] = useState(initialChangeSummary)
   const [newKind, setNewKind] = useState<ComponentKind>('app')
   const [newName, setNewName] = useState('')
   const flows = draft.flows ?? []

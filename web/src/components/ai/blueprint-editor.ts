@@ -77,6 +77,25 @@ export function newComponent(
   return withKind({ id: uniqueId(name, taken), name, purpose: '', kind }, kind)
 }
 
+/**
+ * What a data part holds, from the comma-separated text the user typed:
+ * `tasks, users` → `['tasks', 'users']`. Blank entries (a trailing comma
+ * still being typed) are dropped.
+ */
+export function parseHolds(text: string): string[] {
+  return text
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+}
+
+/** The text a holds field starts from: `['tasks', 'users']` → `tasks, users`. */
+export function formatHolds(
+  holds: readonly string[] | null | undefined
+): string {
+  return (holds ?? []).join(', ')
+}
+
 /** Replace one part, keeping flows pointed at it when its id changes. */
 export function updateComponent(
   document: BlueprintDocument,

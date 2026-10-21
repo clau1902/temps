@@ -5,7 +5,9 @@ import { describe, expect, test } from 'bun:test'
 import type { BlueprintDocument } from '@/api/client/types.gen'
 import {
   cleanDocument,
+  formatHolds,
   newComponent,
+  parseHolds,
   removeComponent,
   savedProblems,
   slugify,
@@ -104,6 +106,29 @@ describe('editing parts', () => {
     expect('image' in clean.components[0]).toBe(false)
     expect(clean.components[0].name).toBe('Web')
     expect(clean.components[1].holds).toEqual(['tasks', 'users'])
+  })
+})
+
+describe('holds text', () => {
+  test('round-tripping a typed list is stable', () => {
+    const typed = 'tasks, users'
+    expect(parseHolds(typed)).toEqual(['tasks', 'users'])
+    expect(formatHolds(parseHolds(typed))).toBe(typed)
+    expect(formatHolds(parseHolds(formatHolds(parseHolds(typed))))).toBe(typed)
+  })
+
+  test('spacing and a comma still being typed do not leak into the list', () => {
+    expect(parseHolds('tasks,users')).toEqual(['tasks', 'users'])
+    expect(parseHolds('  tasks ,   users  ')).toEqual(['tasks', 'users'])
+    expect(parseHolds('tasks, ')).toEqual(['tasks'])
+    expect(parseHolds('tasks,,users')).toEqual(['tasks', 'users'])
+    expect(parseHolds('')).toEqual([])
+  })
+
+  test('an unset list starts the field empty', () => {
+    expect(formatHolds(undefined)).toBe('')
+    expect(formatHolds(null)).toBe('')
+    expect(formatHolds(['tasks'])).toBe('tasks')
   })
 })
 

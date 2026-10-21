@@ -957,7 +957,8 @@ export const resolveUserPermission = <ThrowOnError extends boolean = false>(opti
 
 /**
  * The projects, databases and services, repositories and sandbox this chat
- * made, with their current state.
+ * made, with their current state. Projects the caller can no longer read are
+ * left out, and so are services attached only to such projects.
  */
 export const listChatResources = <ThrowOnError extends boolean = false>(options: Options<ListChatResourcesData, ThrowOnError>): RequestResult<ListChatResourcesResponses, ListChatResourcesErrors, ThrowOnError> => (options.client ?? client).get<ListChatResourcesResponses, ListChatResourcesErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

@@ -97,10 +97,21 @@ export function AutofixSettingsCard({ projectId }: { projectId: number }) {
         path: { project_id: projectId },
       }),
     })
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: {
+      mode: 'off',
+      minConfidence: 4,
+      protectedPaths: '',
+      testCommand: '',
+    },
+  })
   const update = useMutation({
     ...updateAutofixSettingsMutation(),
-    onSuccess: () => {
+    onSuccess: (saved) => {
       toast.success('Autofix settings saved')
+      // What was saved is the form's new baseline: nothing is unsaved now.
+      form.reset(toForm(saved))
       invalidate()
     },
     onError: (error) =>
@@ -116,18 +127,12 @@ export function AutofixSettingsCard({ projectId }: { projectId: number }) {
       toast.error(getErrorMessage(error, 'Could not change the pause')),
   })
 
-  const form = useForm<FormValues>({
-    resolver: zodResolver(schema),
-    defaultValues: {
-      mode: 'off',
-      minConfidence: 4,
-      protectedPaths: '',
-      testCommand: '',
-    },
-  })
   const settings = capability.data?.settings
+  // Every refetch (after a pause toggle, a save, a window refocus) brings a new
+  // `settings` object. Take the server's values as the new baseline, but keep
+  // whatever the user has changed and not saved yet.
   useEffect(() => {
-    if (settings) form.reset(toForm(settings))
+    if (settings) form.reset(toForm(settings), { keepDirtyValues: true })
   }, [settings, form])
 
   const save = (values: FormValues) =>

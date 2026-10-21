@@ -63,6 +63,21 @@ pub fn tool_refused_in_incident(name: &str) -> bool {
     )
 }
 
+/// Drop the tools an incident chat may not run from the catalog offered to
+/// the model, so it is never tempted to call them. Dispatch still refuses
+/// them (see [`tool_refused_in_incident`]) for a model that names one from
+/// memory.
+pub fn withhold_refused_tools(tools: &mut Vec<temps_ai::ChatTool>) {
+    tools.retain(|tool| !tool_refused_in_incident(&tool.name));
+}
+
+/// What the model is told when it calls a tool an incident chat refuses.
+pub fn refused_tool_message(tool_name: &str) -> String {
+    format!(
+        "Not run: `{tool_name}` is not available in an autofix incident. {REFUSED_WRITE_REASON}"
+    )
+}
+
 /// Record on the incident's timeline that the agent tried something the mode
 /// blocks. Best-effort: the refusal itself never depends on this write.
 pub(crate) async fn record_refused_action<C: ConnectionTrait>(
@@ -491,6 +506,59 @@ mod tests {
         assert!(!tool_refused_in_incident(
             crate::sandbox_link::SANDBOX_WRITE_TOOL
         ));
+    }
+
+    #[test]
+    fn every_unattended_interaction_tool_is_refused_in_an_incident() {
+        for name in [
+            crate::ask_user::ASK_USER_TOOL,
+            crate::sandbox_link::SANDBOX_OFFER_TOOL,
+            crate::sandbox_link::SANDBOX_CREATE_TOOL,
+            crate::sandbox_deploy::SANDBOX_DEPLOY_TOOL,
+            crate::workspace_chats::PROPOSE_BLUEPRINT_TOOL,
+            crate::workspace_chats::BIND_BLUEPRINT_TOOL,
+            crate::secret_slots::REQUEST_SECRET_TOOL,
+            "temps_goal",
+        ] {
+            assert!(tool_refused_in_incident(name), "{name} must be refused");
+        }
+        for name in [
+            "temps",
+            "temps_write",
+            crate::sandbox_link::SANDBOX_EXEC_TOOL,
+            crate::sandbox_link::SANDBOX_READ_TOOL,
+            crate::sandbox_link::SANDBOX_WRITE_TOOL,
+        ] {
+            assert!(!tool_refused_in_incident(name), "{name} must stay usable");
+        }
+    }
+
+    #[test]
+    fn incident_chats_are_not_offered_refused_tools() {
+        let tool = |name: &str| temps_ai::ChatTool {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        };
+        let mut tools = vec![
+            tool("temps"),
+            tool(crate::ask_user::ASK_USER_TOOL),
+            tool(crate::sandbox_link::SANDBOX_EXEC_TOOL),
+            tool(crate::workspace_chats::PROPOSE_BLUEPRINT_TOOL),
+            tool(crate::secret_slots::REQUEST_SECRET_TOOL),
+            tool("temps_goal"),
+            tool(crate::sandbox_link::SANDBOX_OFFER_TOOL),
+        ];
+        withhold_refused_tools(&mut tools);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, vec!["temps", crate::sandbox_link::SANDBOX_EXEC_TOOL]);
+    }
+
+    #[test]
+    fn the_refusal_names_the_tool_and_the_reason() {
+        let message = refused_tool_message("temps_goal");
+        assert!(message.starts_with("Not run: `temps_goal`"));
+        assert!(message.contains(REFUSED_WRITE_REASON));
     }
 
     #[test]

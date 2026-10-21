@@ -17,6 +17,13 @@
 //! the model or a command wrote into the tarball, the archive that is deployed
 //! is the one this module builds.
 //!
+//! Nothing the sandbox reports is trusted for the size either. The `wc -c`
+//! that follows `tar` only lets an obviously oversized tarball be refused
+//! before it is read; the limit itself ([`MAX_PACKED_BYTES`]) is enforced by
+//! the read, which stops and fails as soon as the file grows past it, so a
+//! shimmed `wc` or a process still appending to the tarball cannot make the
+//! server buffer more.
+//!
 //! The deploy is a write to the platform, so the chat runtime asks the user to
 //! approve it (or approves it automatically in the modes that do) before
 //! [`SandboxLinkService::deploy_prepared`] runs; the approver's own permissions
@@ -39,8 +46,10 @@ use crate::sandbox_link::{resolve_path, SandboxLinkService, SANDBOX_EXEC_TOOL};
 
 pub const SANDBOX_DEPLOY_TOOL: &str = "temps_deploy_sandbox_source";
 
-/// Largest tarball taken out of a sandbox. It is held in memory once, so this
-/// is the bound on the control plane's memory for one deploy.
+/// Largest tarball taken out of a sandbox, enforced by a bounded read of the
+/// staged file (not by the size the sandbox reports). The tarball is held in
+/// memory while it is unpacked, so this bounds the control plane's memory for
+/// one deploy (the provider's transfer framing comes on top while it reads).
 const MAX_PACKED_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_SOURCE_FILES: usize = 100_000;
 const MAX_SOURCE_BYTES: u64 = 500 * 1024 * 1024;
@@ -80,6 +89,16 @@ pub enum SandboxDeployError {
         sandbox_id: String,
         directory: String,
         bytes: u64,
+        max: u64,
+    },
+
+    #[error(
+        "{directory} in sandbox {sandbox_id} packs to more than the {max} byte limit. \
+         Remove generated files (caches, build output, datasets) and try again"
+    )]
+    PackedOverLimit {
+        sandbox_id: String,
+        directory: String,
         max: u64,
     },
 
@@ -378,20 +397,33 @@ pub fn zip_from_tar_gz(
     })
 }
 
-/// Whether `auth` may deploy to `project_id` right now: the permission, and
-/// live access to the project. Checked when the tool is called and again for
-/// the user who approves.
+/// Permissions a sandbox deploy needs, both instance-wide and within the
+/// target project: it starts a deployment, and it may switch a manual project
+/// to an uploaded-source one (`promote_manual_source`), which edits the
+/// project. A project viewer holds neither within the project.
+const DEPLOY_PERMISSIONS: [Permission; 2] =
+    [Permission::DeploymentsCreate, Permission::ProjectsWrite];
+
+/// Whether `auth` may deploy to `project_id` right now: the instance
+/// permissions, and the same project-scoped permissions the uploaded-source
+/// HTTP handler checks (`project_permission_guard!` on `DeploymentsCreate`),
+/// plus `ProjectsWrite` for the source promotion. The checker is asked on
+/// every call, so this is checked when the tool is called and again, with the
+/// roles held at that moment, for the user who approves, right before the
+/// deploy runs.
 pub async fn authorize_deploy(
     auth: &AuthContext,
     project_id: i32,
     chat_project_id: Option<i32>,
     checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<(), String> {
-    if !auth.has_permission(&Permission::DeploymentsCreate) {
-        return Err(format!(
-            "`{SANDBOX_DEPLOY_TOOL}` is not available: deploying needs the {} permission.",
-            Permission::DeploymentsCreate
-        ));
+    for permission in DEPLOY_PERMISSIONS {
+        if !auth.has_permission(&permission) {
+            return Err(format!(
+                "`{SANDBOX_DEPLOY_TOOL}` is not available: deploying needs the {permission} \
+                 permission."
+            ));
+        }
     }
     if let Some(chat_project_id) = chat_project_id {
         if chat_project_id != project_id {
@@ -400,6 +432,17 @@ pub async fn authorize_deploy(
                  project, not to project {project_id}."
             ));
         }
+    }
+    // A deployment token is confined to its own project and carries no user
+    // for the team checks below (as with `project_scope_guard!`).
+    if !auth.is_scoped_to_project(project_id) {
+        return Err(format!(
+            "This credential is scoped to a different project and cannot deploy to project \
+             {project_id}. Nothing was deployed."
+        ));
+    }
+    if auth.is_deployment_token() {
+        return Ok(());
     }
     if auth.is_admin() || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin) {
         return Ok(());
@@ -413,17 +456,97 @@ pub async fn authorize_deploy(
             "`{SANDBOX_DEPLOY_TOOL}` is not available: this credential is not tied to a user."
         ));
     };
-    match checker.user_can_access_project(user_id, project_id).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(format!(
-            "You do not have access to project {project_id}, so nothing was deployed to it."
-        )),
+    match checker
+        .effective_project_permissions(user_id, project_id)
+        .await
+    {
+        Ok(Some(held)) => {
+            let missing: Vec<String> = DEPLOY_PERMISSIONS
+                .iter()
+                .map(|permission| permission.to_string())
+                .filter(|required| !held.iter().any(|p| p == required))
+                .collect();
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Your role on project {project_id} does not include {}, so nothing was \
+                     deployed to it.",
+                    missing.join(" and ")
+                ))
+            }
+        }
+        // No per-permission opinion: fall back to plain project access, as
+        // `project_permission_guard!` does.
+        Ok(None) => match checker.user_can_access_project(user_id, project_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "You do not have access to project {project_id}, so nothing was deployed to it."
+            )),
+            Err(error) => {
+                warn!(project_id, user_id, "project access check failed: {error}");
+                Err(format!(
+                    "Access to project {project_id} could not be verified, so nothing was \
+                     deployed."
+                ))
+            }
+        },
         Err(error) => {
-            warn!(project_id, user_id, "project access check failed: {error}");
+            warn!(
+                project_id,
+                user_id, "project permission check failed: {error}"
+            );
             Err(format!(
-                "Access to project {project_id} could not be verified, so nothing was deployed."
+                "Your permissions on project {project_id} could not be verified, so nothing was \
+                 deployed."
             ))
         }
+    }
+}
+
+/// The staged tarball as the bounded read returned it, or why it cannot be
+/// used. `read` was made with a [`MAX_PACKED_BYTES`] bound, which the sandbox
+/// cannot influence: a file over it fails that read as a validation error,
+/// whatever `reported_bytes` (the sandbox's own `wc -c`) claimed.
+fn bounded_tarball(
+    sandbox_id: &str,
+    directory: &str,
+    reported_bytes: u64,
+    read: Result<Vec<u8>, temps_sandbox::error::SandboxError>,
+) -> Result<Vec<u8>, SandboxDeployError> {
+    match read {
+        // Defence in depth: a provider must refuse an oversized file, but the
+        // size actually held is what decides.
+        Ok(tarball) if tarball.len() as u64 > MAX_PACKED_BYTES => {
+            Err(SandboxDeployError::PackedTooLarge {
+                sandbox_id: sandbox_id.to_string(),
+                directory: directory.to_string(),
+                bytes: tarball.len() as u64,
+                max: MAX_PACKED_BYTES,
+            })
+        }
+        Ok(tarball) => Ok(tarball),
+        Err(temps_sandbox::error::SandboxError::Validation { message }) => {
+            warn!(
+                sandbox_id,
+                directory,
+                reported_bytes,
+                "the staged tarball was refused by the bounded read: {message}"
+            );
+            Err(SandboxDeployError::PackedOverLimit {
+                sandbox_id: sandbox_id.to_string(),
+                directory: directory.to_string(),
+                max: MAX_PACKED_BYTES,
+            })
+        }
+        Err(error) => Err(SandboxDeployError::Pack {
+            sandbox_id: sandbox_id.to_string(),
+            directory: directory.to_string(),
+            reason: format!(
+                "could not read the tarball (reported as {reported_bytes} bytes) back from the \
+                 sandbox: {error}"
+            ),
+        }),
     }
 }
 
@@ -503,6 +626,9 @@ impl SandboxLinkService {
                 ))
             }),
         };
+        // `wc -c` ran in the sandbox, so its answer is only advisory: it saves
+        // reading a tarball that is plainly too big. The bounded read below is
+        // what enforces the limit.
         let bytes = match outcome {
             Ok(bytes) if bytes > MAX_PACKED_BYTES => {
                 self.remove_staging(&sandbox_id, user_id, &staging).await;
@@ -521,13 +647,13 @@ impl SandboxLinkService {
             }
         };
 
-        let tarball = self.sandboxes.fs_read(&sandbox_id, user_id, &staging).await;
+        let tarball = self
+            .sandboxes
+            .fs_read_bounded(&sandbox_id, user_id, &staging, MAX_PACKED_BYTES)
+            .await;
         self.remove_staging(&sandbox_id, user_id, &staging).await;
-        let tarball = tarball.map_err(|error| {
-            pack_error(format!(
-                "could not read the {bytes} byte tarball back from the sandbox: {error}"
-            ))
-        })?;
+        let tarball = bounded_tarball(&sandbox_id, &directory, bytes, tarball)
+            .map_err(|error| error.to_string())?;
 
         let (sandbox_for_task, directory_for_task) = (sandbox_id.clone(), directory.clone());
         let packed = tokio::task::spawn_blocking(move || {
@@ -973,5 +1099,260 @@ mod tests {
         assert_eq!(tool.name, SANDBOX_DEPLOY_TOOL);
         assert_eq!(tool.parameters["required"], json!(["project_id"]));
         assert!(crate::sandbox_link::is_sandbox_tool(SANDBOX_DEPLOY_TOOL));
+    }
+
+    #[test]
+    fn a_tarball_within_the_limit_is_used_whatever_wc_said() {
+        let read = Ok(vec![1u8, 2, 3]);
+        assert_eq!(
+            bounded_tarball("sbx_1", "/w", 999, read).expect("used"),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_tarball_the_bounded_read_refused_is_too_large_even_if_wc_said_it_was_small() {
+        // A shimmed `wc` reported 10 bytes; the bounded read saw more than the
+        // limit and refused it.
+        let read = Err(temps_sandbox::error::SandboxError::Validation {
+            message: "read_file: '/tmp/x.tgz' is larger than the limit".to_string(),
+        });
+        let error = bounded_tarball("sbx_1", "/w", 10, read).unwrap_err();
+        assert!(matches!(
+            error,
+            SandboxDeployError::PackedOverLimit { ref sandbox_id, ref directory, max }
+                if sandbox_id == "sbx_1" && directory == "/w" && max == MAX_PACKED_BYTES
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("more than the 209715200 byte limit"),
+            "{message}"
+        );
+        assert!(message.contains("sbx_1"));
+    }
+
+    #[test]
+    fn an_oversized_tarball_a_provider_returned_anyway_is_refused_by_its_real_size() {
+        let held = vec![0u8; MAX_PACKED_BYTES as usize + 1];
+        let error = bounded_tarball("sbx_1", "/w", 10, Ok(held)).unwrap_err();
+        assert!(matches!(
+            error,
+            SandboxDeployError::PackedTooLarge { bytes, max, .. }
+                if bytes == MAX_PACKED_BYTES + 1 && max == MAX_PACKED_BYTES
+        ));
+    }
+
+    #[test]
+    fn a_failed_tarball_read_is_a_pack_error_that_names_the_sandbox() {
+        let read = Err(temps_sandbox::error::SandboxError::FileOp {
+            sandbox_id: "sbx_1".to_string(),
+            op: "read".to_string(),
+            path: "/tmp/x.tgz".to_string(),
+            reason: "download failed".to_string(),
+        });
+        let error = bounded_tarball("sbx_1", "/w", 42, read).unwrap_err();
+        assert!(matches!(error, SandboxDeployError::Pack { .. }));
+        let message = error.to_string();
+        assert!(message.contains("sbx_1") && message.contains("download failed"));
+        assert!(message.contains("reported as 42 bytes"));
+    }
+
+    fn deploy_user() -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 7,
+            name: "Deploying User".to_string(),
+            email: "deployer@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn session(role: temps_auth::permissions::Role) -> AuthContext {
+        AuthContext::new_session(deploy_user(), role)
+    }
+
+    /// A team layer that answers with a project role's permissions, which the
+    /// test may change between calls (a role revoked mid-approval).
+    struct ProjectRoleChecker {
+        permissions: std::sync::Mutex<Option<Vec<String>>>,
+        member: bool,
+        fail: bool,
+    }
+
+    impl ProjectRoleChecker {
+        fn with(permissions: Option<&[Permission]>) -> Arc<Self> {
+            Arc::new(Self {
+                permissions: std::sync::Mutex::new(
+                    permissions.map(|p| p.iter().map(|p| p.to_string()).collect()),
+                ),
+                member: true,
+                fail: false,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for ProjectRoleChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.member)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err(Box::new(std::io::Error::other("team store unavailable")));
+            }
+            Ok(self
+                .permissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone())
+        }
+    }
+
+    fn as_checker(checker: &Arc<ProjectRoleChecker>) -> Arc<dyn temps_core::ProjectAccessChecker> {
+        checker.clone()
+    }
+
+    const VIEWER: &[Permission] = &[Permission::ProjectsRead, Permission::DeploymentsRead];
+    const EDITOR: &[Permission] = &[
+        Permission::ProjectsRead,
+        Permission::ProjectsWrite,
+        Permission::DeploymentsRead,
+        Permission::DeploymentsCreate,
+    ];
+
+    #[tokio::test]
+    async fn a_project_viewer_cannot_deploy_even_with_the_instance_permission() {
+        let auth = session(temps_auth::permissions::Role::User);
+        assert!(auth.has_permission(&Permission::DeploymentsCreate));
+        let checker = as_checker(&ProjectRoleChecker::with(Some(VIEWER)));
+        let message = authorize_deploy(&auth, 5, None, Some(&checker))
+            .await
+            .unwrap_err();
+        assert!(message.contains("project 5"), "{message}");
+        assert!(message.contains("deployments:create"), "{message}");
+        assert!(message.contains("nothing was deployed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_project_editor_can_deploy() {
+        let auth = session(temps_auth::permissions::Role::User);
+        let checker = as_checker(&ProjectRoleChecker::with(Some(EDITOR)));
+        authorize_deploy(&auth, 5, Some(5), Some(&checker))
+            .await
+            .expect("an editor deploys");
+    }
+
+    #[tokio::test]
+    async fn deploying_also_needs_project_write_because_it_may_promote_the_source() {
+        let auth = session(temps_auth::permissions::Role::User);
+        let deploy_only = [Permission::ProjectsRead, Permission::DeploymentsCreate];
+        let checker = as_checker(&ProjectRoleChecker::with(Some(&deploy_only)));
+        let message = authorize_deploy(&auth, 5, None, Some(&checker))
+            .await
+            .unwrap_err();
+        assert!(message.contains("projects:write"), "{message}");
+        assert!(!message.contains("deployments:create"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_role_revoked_before_approval_is_refused_at_execution() {
+        let auth = session(temps_auth::permissions::Role::User);
+        let roles = ProjectRoleChecker::with(Some(EDITOR));
+        let checker = as_checker(&roles);
+        authorize_deploy(&auth, 5, None, Some(&checker))
+            .await
+            .expect("allowed when the tool is called");
+        *roles
+            .permissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(VIEWER.iter().map(|p| p.to_string()).collect());
+        assert!(authorize_deploy(&auth, 5, None, Some(&checker))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn without_a_per_permission_answer_project_access_decides() {
+        let auth = session(temps_auth::permissions::Role::User);
+        let member = as_checker(&ProjectRoleChecker::with(None));
+        authorize_deploy(&auth, 5, None, Some(&member))
+            .await
+            .expect("a member deploys");
+        let outsider: Arc<dyn temps_core::ProjectAccessChecker> = Arc::new(ProjectRoleChecker {
+            permissions: std::sync::Mutex::new(None),
+            member: false,
+            fail: false,
+        });
+        let message = authorize_deploy(&auth, 5, None, Some(&outsider))
+            .await
+            .unwrap_err();
+        assert!(
+            message.contains("do not have access to project 5"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_permission_lookup_refuses_the_deploy() {
+        let auth = session(temps_auth::permissions::Role::User);
+        let broken: Arc<dyn temps_core::ProjectAccessChecker> = Arc::new(ProjectRoleChecker {
+            permissions: std::sync::Mutex::new(Some(Vec::new())),
+            member: true,
+            fail: true,
+        });
+        let message = authorize_deploy(&auth, 5, None, Some(&broken))
+            .await
+            .unwrap_err();
+        assert!(message.contains("could not be verified"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn instance_admins_are_not_narrowed_by_project_roles() {
+        let auth = session(temps_auth::permissions::Role::Admin);
+        let checker = as_checker(&ProjectRoleChecker::with(Some(VIEWER)));
+        authorize_deploy(&auth, 5, None, Some(&checker))
+            .await
+            .expect("an admin deploys");
+    }
+
+    #[tokio::test]
+    async fn an_instance_reader_is_refused_before_any_project_check() {
+        let auth = session(temps_auth::permissions::Role::Reader);
+        let checker = as_checker(&ProjectRoleChecker::with(Some(EDITOR)));
+        let message = authorize_deploy(&auth, 5, None, Some(&checker))
+            .await
+            .unwrap_err();
+        assert!(message.contains("deployments:create"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_project_chat_deploys_only_to_its_project() {
+        let auth = session(temps_auth::permissions::Role::Admin);
+        let message = authorize_deploy(&auth, 6, Some(5), None).await.unwrap_err();
+        assert!(message.contains("belongs to project 5"), "{message}");
     }
 }

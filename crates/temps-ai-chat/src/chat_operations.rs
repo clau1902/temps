@@ -13,13 +13,14 @@
 //! from that record each time, so it is never stale, and a record that has
 //! since been deleted drops out of the list.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, Order, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,13 +36,16 @@ use utoipa::ToSchema;
 pub const MAX_OPERATIONS: u64 = 30;
 
 /// A pipeline trigger does not say which deployment it started, so the first
-/// deployment of its environment created after the trigger is taken as that
-/// one. The deployment row can be written a moment before the trigger is
-/// recorded, so the search starts this long before it.
+/// unclaimed deployment of its environment created inside the trigger's window
+/// (see [`pipeline_window`]) is taken as that one. The deployment row can be
+/// written a moment before the trigger is recorded, so the window starts this
+/// long before it.
 const PIPELINE_MATCH_SLACK_SECS: i64 = 10;
 
 /// A pipeline trigger that has started no deployment after this long is shown
-/// as not having started one, rather than as still starting.
+/// as not having started one, rather than as still starting. It is also where
+/// the trigger's matching window ends, so a deployment created later is never
+/// attributed to it.
 const PIPELINE_START_GRACE_SECS: i64 = 120;
 
 /// The chat tool that deploys a sandbox's files.
@@ -308,6 +312,65 @@ pub struct OperationVisibility {
     pub backups: bool,
 }
 
+/// A recorded pipeline trigger that names no deployment yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PipelineTrigger {
+    row_id: i64,
+    environment_id: i32,
+    created_at: DateTime<Utc>,
+}
+
+/// A deployment that could be the one a pipeline trigger started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeploymentStart {
+    deployment_id: i32,
+    environment_id: i32,
+    created_at: DateTime<Utc>,
+}
+
+/// The creation times a deployment started by a trigger recorded at `at` can
+/// have: from a moment before it (the deployment row can be written first) to
+/// the end of the grace period after which the trigger is shown as having
+/// started nothing. Using the same bound for both keeps them consistent: a
+/// trigger shown as not started can never later claim a deployment.
+fn pipeline_window(at: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    (
+        at - Duration::seconds(PIPELINE_MATCH_SLACK_SECS),
+        at + Duration::seconds(PIPELINE_START_GRACE_SECS),
+    )
+}
+
+/// Pair each trigger with the earliest deployment of its environment inside
+/// its window that no other operation holds. Triggers are taken oldest first,
+/// so two triggers of one environment get their deployments in order, and a
+/// deployment is given to at most one trigger.
+fn match_pipeline_triggers(
+    triggers: &[PipelineTrigger],
+    candidates: &[DeploymentStart],
+    claimed: &HashSet<i32>,
+) -> HashMap<i64, i32> {
+    let mut triggers: Vec<&PipelineTrigger> = triggers.iter().collect();
+    triggers.sort_by_key(|trigger| (trigger.created_at, trigger.row_id));
+    let mut candidates: Vec<&DeploymentStart> = candidates.iter().collect();
+    candidates.sort_by_key(|start| (start.created_at, start.deployment_id));
+    let mut taken: HashSet<i32> = claimed.clone();
+    let mut matched = HashMap::new();
+    for trigger in triggers {
+        let (from, until) = pipeline_window(trigger.created_at);
+        let found = candidates.iter().find(|start| {
+            start.environment_id == trigger.environment_id
+                && start.created_at >= from
+                && start.created_at <= until
+                && !taken.contains(&start.deployment_id)
+        });
+        if let Some(start) = found {
+            taken.insert(start.deployment_id);
+            matched.insert(trigger.row_id, start.deployment_id);
+        }
+    }
+    matched
+}
+
 /// Reads the operations a conversation started.
 pub struct ChatOperationService {
     db: Arc<DatabaseConnection>,
@@ -396,53 +459,89 @@ impl ChatOperationService {
                 .map(|deployment| (deployment.id, deployment))
                 .collect()
         };
-        let unresolved: Vec<&ai_chat_operations::Model> = rows
+        let triggers: Vec<PipelineTrigger> = rows
             .iter()
             .filter(|row| {
-                row.kind == ChatOperationKind::Deployment.as_str()
-                    && row.target_id.is_none()
-                    && row.environment_id.is_some()
+                row.kind == ChatOperationKind::Deployment.as_str() && row.target_id.is_none()
+            })
+            .filter_map(|row| {
+                Some(PipelineTrigger {
+                    row_id: row.id,
+                    environment_id: row.environment_id?,
+                    created_at: row.created_at,
+                })
             })
             .collect();
         let mut matched: HashMap<i64, i32> = HashMap::new();
-        if let Some(earliest) = unresolved.iter().map(|row| row.created_at).min() {
-            let environment_ids: Vec<i32> = unresolved
-                .iter()
-                .filter_map(|row| row.environment_id)
-                .collect();
-            let candidates = deployments::Entity::find()
-                .filter(deployments::Column::EnvironmentId.is_in(environment_ids))
-                .filter(
-                    deployments::Column::CreatedAt
-                        .gte(earliest - Duration::seconds(PIPELINE_MATCH_SLACK_SECS)),
+        if !triggers.is_empty() {
+            // Only deployments inside some trigger's own window are read, so
+            // an old trigger widens nothing and cannot crowd newer ones out of
+            // the capped result.
+            let windows = triggers.iter().fold(Condition::any(), |any, trigger| {
+                let (from, until) = pipeline_window(trigger.created_at);
+                any.add(
+                    Condition::all()
+                        .add(deployments::Column::EnvironmentId.eq(trigger.environment_id))
+                        .add(deployments::Column::CreatedAt.gte(from))
+                        .add(deployments::Column::CreatedAt.lte(until)),
                 )
+            });
+            let candidates = deployments::Entity::find()
+                .filter(windows)
                 .order_by(deployments::Column::CreatedAt, Order::Asc)
+                .order_by(deployments::Column::Id, Order::Asc)
                 .limit(MAX_OPERATIONS * 4)
                 .all(db)
                 .await
                 .map_err(database)?;
-            for row in &unresolved {
-                let found = candidates.iter().find(|deployment| {
-                    Some(deployment.environment_id) == row.environment_id
-                        && deployment.created_at
-                            >= row.created_at - Duration::seconds(PIPELINE_MATCH_SLACK_SECS)
-                        && !matched.values().any(|taken| *taken == deployment.id)
-                });
-                if let Some(deployment) = found {
-                    matched.insert(row.id, deployment.id);
-                    live_deployments.insert(deployment.id, deployment.clone());
+            // A deployment another operation row already names was started by
+            // that operation, whichever chat it belongs to.
+            let candidate_ids: Vec<i32> = candidates.iter().map(|d| d.id).collect();
+            let claimed: HashSet<i32> = if candidate_ids.is_empty() {
+                HashSet::new()
+            } else {
+                ai_chat_operations::Entity::find()
+                    .select_only()
+                    .column(ai_chat_operations::Column::TargetId)
+                    .filter(
+                        ai_chat_operations::Column::Kind.eq(ChatOperationKind::Deployment.as_str()),
+                    )
+                    .filter(ai_chat_operations::Column::TargetId.is_in(candidate_ids))
+                    .into_tuple::<Option<i32>>()
+                    .all(db)
+                    .await
+                    .map_err(database)?
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            };
+            let starts: Vec<DeploymentStart> = candidates
+                .iter()
+                .map(|deployment| DeploymentStart {
+                    deployment_id: deployment.id,
+                    environment_id: deployment.environment_id,
+                    created_at: deployment.created_at,
+                })
+                .collect();
+            matched = match_pipeline_triggers(&triggers, &starts, &claimed);
+            for deployment in candidates {
+                if matched.values().any(|id| *id == deployment.id) {
+                    live_deployments.insert(deployment.id, deployment);
                 }
             }
             // Remember the match, so the next read looks the deployment up by
-            // id instead of searching again.
+            // id instead of searching again. Only a row that still names no
+            // deployment is written, so a concurrent read cannot overwrite one.
             for (row_id, deployment_id) in &matched {
-                let update = ai_chat_operations::ActiveModel {
-                    id: Set(*row_id),
-                    target_id: Set(Some(*deployment_id)),
-                    ..Default::default()
-                }
-                .update(db)
-                .await;
+                let update = ai_chat_operations::Entity::update_many()
+                    .col_expr(
+                        ai_chat_operations::Column::TargetId,
+                        Expr::value(*deployment_id),
+                    )
+                    .filter(ai_chat_operations::Column::Id.eq(*row_id))
+                    .filter(ai_chat_operations::Column::TargetId.is_null())
+                    .exec(db)
+                    .await;
                 if let Err(error) = update {
                     warn!(
                         operation = row_id,
@@ -717,6 +816,95 @@ impl ChatOperationService {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap_or_default()
+            + Duration::seconds(seconds)
+    }
+
+    fn trigger(row_id: i64, environment_id: i32, seconds: i64) -> PipelineTrigger {
+        PipelineTrigger {
+            row_id,
+            environment_id,
+            created_at: at(seconds),
+        }
+    }
+
+    fn start(deployment_id: i32, environment_id: i32, seconds: i64) -> DeploymentStart {
+        DeploymentStart {
+            deployment_id,
+            environment_id,
+            created_at: at(seconds),
+        }
+    }
+
+    #[test]
+    fn a_trigger_claims_the_first_deployment_inside_its_window() {
+        let matched = match_pipeline_triggers(
+            &[trigger(1, 5, 0)],
+            &[start(10, 5, -30), start(11, 5, -5), start(12, 5, 20)],
+            &HashSet::new(),
+        );
+        // -30s is before the slack; -5s is the deployment written just before
+        // the trigger was recorded.
+        assert_eq!(matched, HashMap::from([(1, 11)]));
+    }
+
+    #[test]
+    fn a_deployment_after_the_grace_window_is_not_attributed_to_the_trigger() {
+        let matched = match_pipeline_triggers(
+            &[trigger(1, 5, 0)],
+            &[start(10, 5, PIPELINE_START_GRACE_SECS + 1)],
+            &HashSet::new(),
+        );
+        assert!(matched.is_empty());
+        // The edge of the window still counts, so "not started" and "matched"
+        // agree on where the window ends.
+        let matched = match_pipeline_triggers(
+            &[trigger(1, 5, 0)],
+            &[start(10, 5, PIPELINE_START_GRACE_SECS)],
+            &HashSet::new(),
+        );
+        assert_eq!(matched, HashMap::from([(1, 10)]));
+    }
+
+    #[test]
+    fn a_deployment_another_operation_holds_is_never_claimed_again() {
+        let matched = match_pipeline_triggers(
+            &[trigger(1, 5, 0)],
+            &[start(10, 5, 5), start(11, 5, 8)],
+            &HashSet::from([10]),
+        );
+        assert_eq!(matched, HashMap::from([(1, 11)]));
+        let matched = match_pipeline_triggers(
+            &[trigger(1, 5, 0)],
+            &[start(10, 5, 5)],
+            &HashSet::from([10]),
+        );
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn a_stale_trigger_does_not_take_a_newer_triggers_deployment() {
+        // Trigger 1 started nothing; trigger 2 is an hour later.
+        let matched = match_pipeline_triggers(
+            &[trigger(2, 5, 3600), trigger(1, 5, 0)],
+            &[start(20, 5, 3605)],
+            &HashSet::new(),
+        );
+        assert_eq!(matched, HashMap::from([(2, 20)]));
+    }
+
+    #[test]
+    fn close_triggers_get_their_deployments_in_order_and_by_environment() {
+        let matched = match_pipeline_triggers(
+            // Given newest first, as the rows are read.
+            &[trigger(3, 6, 2), trigger(2, 5, 1), trigger(1, 5, 0)],
+            &[start(31, 6, 3), start(21, 5, 40), start(20, 5, 30)],
+            &HashSet::new(),
+        );
+        assert_eq!(matched, HashMap::from([(1, 20), (2, 21), (3, 31)]));
+    }
 
     #[test]
     fn a_source_deploy_records_the_deployment_it_started() {

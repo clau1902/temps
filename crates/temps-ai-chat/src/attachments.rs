@@ -23,10 +23,10 @@ use base64::Engine as _;
 use chrono::{Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QuerySelect, Set,
+    QuerySelect, Set, TransactionTrait,
 };
 use temps_ai::ChatImage;
-use temps_entities::{ai_chat_attachments, ai_provider_models};
+use temps_entities::{ai_chat_attachments, ai_conversations, ai_provider_models};
 use thiserror::Error;
 
 /// Largest image accepted. Images are re-sent on every tool round of a turn, so
@@ -40,10 +40,23 @@ pub const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_PDF_TEXT_BYTES: usize = 128 * 1024;
 /// How long one PDF may take to extract before it is treated as unreadable.
 const PDF_EXTRACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-/// PDF parsing is CPU-bound and runs on untrusted input, so only a couple run
-/// at once; the rest wait their turn (or give up) instead of piling onto the
-/// blocking pool.
-static PDF_EXTRACTIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// How long an upload waits for a free PDF reader before it is stored without
+/// its text (the model is then told the PDF could not be read).
+const PDF_READER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// PDF parsers that may run at once, process-wide.
+const MAX_CONCURRENT_PDF_EXTRACTIONS: usize = 2;
+/// PDF parsing is CPU-bound and runs on untrusted input, so only
+/// [`MAX_CONCURRENT_PDF_EXTRACTIONS`] run at once. The permit is owned by the
+/// blocking parse itself and released only when that parse really ends: a
+/// parse that outlives [`PDF_EXTRACTION_TIMEOUT`] is abandoned by its caller
+/// but keeps running (a blocking task cannot be cancelled), so it must keep
+/// holding its slot, or slow documents would pile parsers onto the blocking
+/// pool. A caller that cannot get a slot within [`PDF_READER_WAIT`] gives up
+/// and stores the PDF without its text.
+static PDF_EXTRACTIONS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PDF_EXTRACTIONS))
+    });
 /// Largest text file. Text is quoted into the prompt, so it is bounded by
 /// context cost rather than upload size.
 pub const MAX_TEXT_ATTACHMENT_BYTES: usize = 128 * 1024;
@@ -241,31 +254,88 @@ fn binary_media_type(bytes: &[u8]) -> &'static str {
 /// be parsed, or parsing was abandoned; an empty string means a PDF that has
 /// no text layer (a scan).
 ///
-/// Parsing runs on the blocking pool behind a small semaphore and a timeout:
-/// the input is untrusted and the parser is allowed to panic on it.
+/// Parsing runs on the blocking pool behind a small semaphore and a timeout
+/// (see [`PDF_EXTRACTIONS`]): the input is untrusted and the parser is allowed
+/// to panic on it.
 pub async fn extract_pdf_text(name: &str, bytes: Vec<u8>) -> Result<String, String> {
-    let permit = tokio::time::timeout(PDF_EXTRACTION_TIMEOUT, PDF_EXTRACTIONS.acquire())
-        .await
-        .map_err(|_| format!("'{name}' waited too long for a free PDF reader"))?
-        .map_err(|error| format!("PDF reader unavailable for '{name}': {error}"))?;
-    let task = tokio::task::spawn_blocking(move || {
-        let outcome = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes));
-        match outcome {
-            Ok(Ok(text)) => Ok(text),
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => Err("the PDF parser failed on this document".to_string()),
-        }
-    });
-    let outcome = tokio::time::timeout(PDF_EXTRACTION_TIMEOUT, task).await;
-    drop(permit);
+    let outcome = run_limited_blocking(
+        Arc::clone(&PDF_EXTRACTIONS),
+        PDF_READER_WAIT,
+        PDF_EXTRACTION_TIMEOUT,
+        move || {
+            let outcome = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes));
+            match outcome {
+                Ok(Ok(text)) => Ok(text),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("the PDF parser failed on this document".to_string()),
+            }
+        },
+    )
+    .await;
     match outcome {
-        Err(_) => Err(format!(
-            "reading '{name}' took longer than {}s",
-            PDF_EXTRACTION_TIMEOUT.as_secs()
+        Err(LimitedBlockingError::Busy { waited }) => Err(format!(
+            "'{name}' waited {}s for a free PDF reader (all {MAX_CONCURRENT_PDF_EXTRACTIONS} \
+             are busy)",
+            waited.as_secs()
         )),
-        Ok(Err(error)) => Err(format!("reading '{name}' was interrupted: {error}")),
-        Ok(Ok(Err(reason))) => Err(format!("'{name}' could not be read as a PDF: {reason}")),
-        Ok(Ok(Ok(text))) => Ok(tidy_pdf_text(&text)),
+        Err(LimitedBlockingError::Closed) => {
+            Err(format!("no PDF reader is available for '{name}'"))
+        }
+        Err(LimitedBlockingError::TimedOut { after }) => Err(format!(
+            "reading '{name}' took longer than {}s",
+            after.as_secs()
+        )),
+        Err(LimitedBlockingError::Interrupted { reason }) => {
+            Err(format!("reading '{name}' was interrupted: {reason}"))
+        }
+        Ok(Err(reason)) => Err(format!("'{name}' could not be read as a PDF: {reason}")),
+        Ok(Ok(text)) => Ok(tidy_pdf_text(&text)),
+    }
+}
+
+/// Why [`run_limited_blocking`] returned without the work's result.
+#[derive(Debug, PartialEq, Eq)]
+enum LimitedBlockingError {
+    /// No slot became free within the wait.
+    Busy { waited: std::time::Duration },
+    /// The semaphore was closed.
+    Closed,
+    /// The work did not finish in time. It keeps running in the background,
+    /// holding its slot until it ends.
+    TimedOut { after: std::time::Duration },
+    /// The blocking task panicked or was cancelled.
+    Interrupted { reason: String },
+}
+
+/// Run `work` on the blocking pool once a slot of `slots` is free, waiting at
+/// most `wait` for one and at most `run` for the work. The slot's permit moves
+/// into the blocking closure, so it is released when `work` returns, not when
+/// this call gives up on it: abandoned work still counts against the limit.
+async fn run_limited_blocking<T, F>(
+    slots: Arc<tokio::sync::Semaphore>,
+    wait: std::time::Duration,
+    run: std::time::Duration,
+    work: F,
+) -> Result<T, LimitedBlockingError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = match tokio::time::timeout(wait, slots.acquire_owned()).await {
+        Err(_) => return Err(LimitedBlockingError::Busy { waited: wait }),
+        Ok(Err(_)) => return Err(LimitedBlockingError::Closed),
+        Ok(Ok(permit)) => permit,
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    });
+    match tokio::time::timeout(run, task).await {
+        Err(_) => Err(LimitedBlockingError::TimedOut { after: run }),
+        Ok(Err(error)) => Err(LimitedBlockingError::Interrupted {
+            reason: error.to_string(),
+        }),
+        Ok(Ok(value)) => Ok(value),
     }
 }
 
@@ -500,6 +570,29 @@ pub fn ensure_images_readable(
     }
 }
 
+/// Whether a conversation that holds `files` files and `held_bytes` bytes may
+/// take one more file of `new_bytes` bytes.
+fn check_quota(
+    conversation_id: i64,
+    files: u64,
+    held_bytes: i64,
+    new_bytes: usize,
+) -> Result<(), AttachmentError> {
+    let new_bytes = i64::try_from(new_bytes).unwrap_or(i64::MAX);
+    if files >= MAX_FILES_PER_CONVERSATION
+        || held_bytes.saturating_add(new_bytes) > MAX_BYTES_PER_CONVERSATION
+    {
+        return Err(AttachmentError::QuotaExceeded {
+            conversation_id,
+            files,
+            bytes: held_bytes,
+            max_files: MAX_FILES_PER_CONVERSATION,
+            max_bytes: MAX_BYTES_PER_CONVERSATION,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct AssistantAttachmentService {
     db: Arc<DatabaseConnection>,
@@ -547,6 +640,23 @@ impl AssistantAttachmentService {
         };
         let fail = Self::database_error(conversation_id);
 
+        // The quota check and the insert must be one decision: two uploads
+        // checked side by side would each see the other's bytes missing and
+        // together pass the quota. Locking the conversation row serializes
+        // them per conversation (and only per conversation); the transaction
+        // holds no lock across the PDF parse above, only across a few short
+        // statements. `FOR NO KEY UPDATE` rather than `FOR UPDATE` so rows
+        // that merely reference the conversation (messages) are not blocked.
+        let txn = self.db.begin().await.map_err(&fail)?;
+        ai_conversations::Entity::find_by_id(conversation_id)
+            .select_only()
+            .column(ai_conversations::Column::Id)
+            .lock(sea_orm::sea_query::LockType::NoKeyUpdate)
+            .into_tuple::<i64>()
+            .one(&txn)
+            .await
+            .map_err(&fail)?;
+
         // Abandoned uploads would otherwise count against the quota forever.
         ai_chat_attachments::Entity::delete_many()
             .filter(ai_chat_attachments::Column::ConversationId.eq(conversation_id))
@@ -555,13 +665,13 @@ impl AssistantAttachmentService {
                 ai_chat_attachments::Column::CreatedAt
                     .lt(Utc::now() - Duration::hours(UNSENT_RETENTION_HOURS)),
             )
-            .exec(self.db.as_ref())
+            .exec(&txn)
             .await
             .map_err(&fail)?;
 
         let files = ai_chat_attachments::Entity::find()
             .filter(ai_chat_attachments::Column::ConversationId.eq(conversation_id))
-            .count(self.db.as_ref())
+            .count(&txn)
             .await
             .map_err(&fail)?;
         let held_bytes: Option<Option<i64>> = ai_chat_attachments::Entity::find()
@@ -577,23 +687,14 @@ impl AssistantAttachmentService {
             )
             .filter(ai_chat_attachments::Column::ConversationId.eq(conversation_id))
             .into_tuple::<Option<i64>>()
-            .one(self.db.as_ref())
+            .one(&txn)
             .await
             .map_err(&fail)?;
         let held_bytes = held_bytes.flatten().unwrap_or(0);
-        if files >= MAX_FILES_PER_CONVERSATION
-            || held_bytes + bytes.len() as i64 > MAX_BYTES_PER_CONVERSATION
-        {
-            return Err(AttachmentError::QuotaExceeded {
-                conversation_id,
-                files,
-                bytes: held_bytes,
-                max_files: MAX_FILES_PER_CONVERSATION,
-                max_bytes: MAX_BYTES_PER_CONVERSATION,
-            });
-        }
+        // An early return drops `txn`, which rolls it back and frees the lock.
+        check_quota(conversation_id, files, held_bytes, bytes.len())?;
 
-        ai_chat_attachments::ActiveModel {
+        let stored = ai_chat_attachments::ActiveModel {
             public_id: Set(format!(
                 "{ATTACHMENT_ID_PREFIX}{}",
                 uuid::Uuid::new_v4().simple()
@@ -608,9 +709,11 @@ impl AssistantAttachmentService {
             created_at: Set(Utc::now()),
             ..Default::default()
         }
-        .insert(self.db.as_ref())
+        .insert(&txn)
         .await
-        .map_err(fail)
+        .map_err(&fail)?;
+        txn.commit().await.map_err(fail)?;
+        Ok(stored)
     }
 
     /// One file of a conversation, for previews.
@@ -1169,6 +1272,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_conversation_refuses_another_file_and_says_how_full() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit_id(42)]])
             .append_exec_results([sea_orm::MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 0,
@@ -1231,6 +1335,168 @@ mod tests {
             AttachmentError::Duplicate { .. }
         ));
         assert!(service.load_for_message(1, &[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_quota_is_checked_under_a_conversation_lock_in_one_transaction() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit_id(42)]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results([[maplit_count(3)]])
+            .append_query_results([[maplit_total(MAX_BYTES_PER_CONVERSATION - 2)]])
+            .into_connection();
+        let db = Arc::new(db);
+        let service = AssistantAttachmentService::new(db.clone());
+        let error = service
+            .store(42, "notes.txt", b"hello".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AttachmentError::QuotaExceeded { .. }));
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("only the test holds the connection")
+            .into_transaction_log();
+        // Every statement ran inside one transaction, the lock first.
+        assert_eq!(log.len(), 1, "one transaction, got {log:?}");
+        let statements: Vec<String> = log[0]
+            .statements()
+            .iter()
+            .map(|statement| statement.sql.clone())
+            .collect();
+        assert!(statements[0].starts_with("BEGIN"), "{statements:?}");
+        assert!(
+            statements[1].contains("\"ai_conversations\"")
+                && statements[1].contains("FOR NO KEY UPDATE"),
+            "the conversation row is locked before anything is counted: {statements:?}"
+        );
+        assert!(statements[2].starts_with("DELETE"), "{statements:?}");
+        assert!(statements[3].contains("COUNT"), "{statements:?}");
+        assert!(statements[4].contains("SUM"), "{statements:?}");
+        // Refused: nothing was inserted and the transaction was rolled back.
+        assert!(!statements.iter().any(|sql| sql.starts_with("INSERT")));
+        assert!(
+            statements
+                .last()
+                .is_some_and(|sql| sql.starts_with("ROLLBACK")),
+            "{statements:?}"
+        );
+    }
+
+    #[test]
+    fn the_quota_counts_files_and_the_bytes_of_the_new_one() {
+        let max = MAX_BYTES_PER_CONVERSATION;
+        assert!(check_quota(1, 0, 0, 1).is_ok());
+        assert!(check_quota(1, MAX_FILES_PER_CONVERSATION - 1, max - 5, 5).is_ok());
+        assert_eq!(
+            check_quota(1, MAX_FILES_PER_CONVERSATION, 0, 1)
+                .unwrap_err()
+                .to_string(),
+            AttachmentError::QuotaExceeded {
+                conversation_id: 1,
+                files: MAX_FILES_PER_CONVERSATION,
+                bytes: 0,
+                max_files: MAX_FILES_PER_CONVERSATION,
+                max_bytes: max,
+            }
+            .to_string()
+        );
+        // 30 MiB held + 10 MiB + 1 byte would pass the 40 MiB quota.
+        let held = 30 * 1024 * 1024;
+        assert!(check_quota(7, 3, held, 10 * 1024 * 1024).is_ok());
+        assert!(matches!(
+            check_quota(7, 3, held, 10 * 1024 * 1024 + 1),
+            Err(AttachmentError::QuotaExceeded {
+                conversation_id: 7,
+                bytes,
+                ..
+            }) if bytes == held
+        ));
+        assert!(check_quota(7, 3, held, usize::MAX).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_blocking_job_keeps_its_slot_until_it_really_ends() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
+        let outcome = run_limited_blocking(
+            slots.clone(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(50),
+            move || {
+                // Stands in for a parse that outlives its timeout.
+                let _ = released.recv_timeout(std::time::Duration::from_secs(10));
+                let _ = finished_tx.send(());
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome.unwrap_err(),
+            LimitedBlockingError::TimedOut {
+                after: std::time::Duration::from_millis(50)
+            }
+        );
+        // The caller gave up, but the work still runs and still holds the slot.
+        assert_eq!(slots.available_permits(), 0);
+        // So the next caller waits its bounded time and is turned away.
+        let busy = run_limited_blocking(
+            slots.clone(),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(1),
+            || (),
+        )
+        .await;
+        assert_eq!(
+            busy.unwrap_err(),
+            LimitedBlockingError::Busy {
+                waited: std::time::Duration::from_millis(20)
+            }
+        );
+        // Once the work really ends, the slot comes back.
+        release.send(()).expect("the job is still waiting");
+        finished_rx.await.expect("the job finished");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the slot is released when the job ends");
+        assert_eq!(
+            run_limited_blocking(
+                slots.clone(),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                || 7
+            )
+            .await,
+            Ok(7)
+        );
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_blocking_job_releases_its_slot() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let outcome: Result<(), _> = run_limited_blocking(
+            slots.clone(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+            || panic!("parser exploded"),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            Err(LimitedBlockingError::Interrupted { .. })
+        ));
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    fn maplit_id(value: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        [("id".to_string(), sea_orm::Value::BigInt(Some(value)))].into()
     }
 
     // MockDatabase returns the aggregate rows as single-column results.

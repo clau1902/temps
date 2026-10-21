@@ -92,6 +92,7 @@ pub(crate) fn worker_node_required(
         | E::InvalidServiceType { .. }
         | E::ServiceNotLinkedToProject { .. }
         | E::SandboxAccessUnsupported { .. }
+        | E::SandboxNamespaceConflict { .. }
         | E::NoSandboxAccessEngine { .. }
         | E::ServiceClaimDenied { .. }
         | E::InvalidDatabaseProvisioning { .. }
@@ -154,6 +155,17 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
                 .title("Change Would Lose Data")
                 .detail(error.to_string())
                 .value("error_code", "DATA_SAFETY_REFUSAL")
+                .value("service_id", *service_id)
+                .build(),
+        ),
+        // A database that belongs to the other side (a sandbox's to a
+        // deployment, or the reverse) was left untouched: a 409 naming the
+        // database and what to rename or remove.
+        E::SandboxNamespaceConflict { service_id, .. } => Some(
+            conflict()
+                .title("Database Belongs To Something Else")
+                .detail(error.to_string())
+                .value("error_code", "SANDBOX_NAMESPACE_CONFLICT")
                 .value("service_id", *service_id)
                 .build(),
         ),
@@ -263,7 +275,8 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ClusterBusy { .. }
         | E::LockTimeout { .. }
         | E::NoSandboxAccessEngine { .. }
-        | E::SandboxAccessUnsupported { .. } => None,
+        | E::SandboxAccessUnsupported { .. }
+        | E::SandboxNamespaceConflict { .. } => None,
     }
 }
 
@@ -313,6 +326,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::InvalidServiceType { .. }
         | E::ServiceNotLinkedToProject { .. }
         | E::SandboxAccessUnsupported { .. }
+        | E::SandboxNamespaceConflict { .. }
         | E::NoSandboxAccessEngine { .. }
         | E::ServiceClaimDenied { .. }
         | E::InvalidDatabaseProvisioning { .. }
@@ -4429,6 +4443,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Choose a unique name"));
+    }
+
+    #[test]
+    fn a_database_that_belongs_to_the_other_side_is_a_conflict() {
+        let error = crate::services::ExternalServiceError::SandboxNamespaceConflict {
+            service_id: 7,
+            conflict: crate::sandbox_engines::SandboxNamespaceConflict::SandboxOwnedDatabase {
+                engine: "PostgreSQL",
+                database: "shop_sandbox".to_string(),
+                sandbox_user: "sbx_shop_sandbox".to_string(),
+                evidence: "it is owned by the sandbox role 'sbx_shop_sandbox'".to_string(),
+            },
+        };
+        let problem = external_service_problem(&error, "fallback".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(problem.body["error_code"], "SANDBOX_NAMESPACE_CONFLICT");
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("Service 7"), "{detail}");
+        assert!(detail.contains("'shop_sandbox'"), "{detail}");
     }
 
     // Guards the shared error->status mapping used by update_service /

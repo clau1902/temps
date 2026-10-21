@@ -19,11 +19,19 @@ use tracing::info;
 use crate::externalsvc::redis::redis_container_name;
 use crate::sandbox_engines::{
     derive_password, require_local, text_parameter, SandboxAccessEngine, SandboxAccessRequest,
+    SandboxNamespace,
 };
 use crate::services::{ExternalServiceError, ExternalServiceManager};
 
 const REDIS_INTERNAL_PORT: &str = "6379";
-const USER_PREFIX: &str = "sbx_";
+/// A project's sandboxes: user `sbx_<project>`, keys `sbx:<project>:`.
+const PROJECT_USER_PREFIX: &str = "sbx_";
+const PROJECT_KEY_PREFIX: &str = "sbx:";
+/// A sandbox linked directly: user `sbxid_<sandbox>`, keys `sbxid:<sandbox>:`.
+const SANDBOX_USER_PREFIX: &str = "sbxid_";
+const SANDBOX_KEY_PREFIX: &str = "sbxid:";
+/// The longest namespace part of a user or prefix.
+const NAMESPACE_MAX: usize = 48;
 const PASSWORD_TAG: &str = "temps-scoped-redis-v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,18 +60,27 @@ impl std::fmt::Debug for RedisSandboxPlan {
 }
 
 impl RedisSandboxPlan {
-    pub fn new(service_id: i32, namespace: &str, admin_password: &str) -> Result<Self, String> {
-        if namespace.is_empty()
-            || namespace.len() > 48
-            || !namespace
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        {
-            return Err(format!(
-                "the namespace '{namespace}' is not a plain lowercase slug ([a-z0-9_], at most 48 \
-                 characters)"
-            ));
-        }
+    /// The user and key prefix for `namespace`.
+    ///
+    /// Two plans never share a user, and neither's key pattern reaches the
+    /// other's keys:
+    ///
+    /// - the namespace part is `[a-z0-9_]` and one-to-one within its kind
+    ///   (see [`SandboxNamespace::component`]), so it holds no glob
+    ///   character, no space and no `:`;
+    /// - the kinds use different fixed markers that differ at their fourth
+    ///   byte: users `sbx_` / `sbxid_` (`_` against `i`), key prefixes
+    ///   `sbx:` / `sbxid:` (`:` against `i`). A project slugged like a
+    ///   sandbox's id is therefore `sbx_<id>` with keys `sbx:<id>:`, never
+    ///   `sbxid_<id>`;
+    /// - the prefix ends in `:`, which the namespace part cannot contain, so
+    ///   `~sbx:<a>:*` matches a key of `sbx:<b>:` only when `a` is `b`, and
+    ///   no `sbxid:` key starts with `sbx:`.
+    pub fn new(
+        service_id: i32,
+        namespace: &SandboxNamespace,
+        admin_password: &str,
+    ) -> Result<Self, String> {
         if admin_password.is_empty() {
             return Err(
                 "the service has no password, so every client is the default user and a sandbox \
@@ -71,10 +88,26 @@ impl RedisSandboxPlan {
                     .to_string(),
             );
         }
-        let user = format!("{USER_PREFIX}{namespace}");
+        let (user_prefix, key_prefix) = match namespace {
+            SandboxNamespace::Project(_) => (PROJECT_USER_PREFIX, PROJECT_KEY_PREFIX),
+            SandboxNamespace::Sandbox(_) => (SANDBOX_USER_PREFIX, SANDBOX_KEY_PREFIX),
+        };
+        let part = namespace.component(NAMESPACE_MAX);
+        if part.is_empty()
+            || !part
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            // `component` only produces [a-z0-9_]; this is the backstop for
+            // the glob patterns built from it.
+            return Err(format!(
+                "the {namespace} gives the namespace '{part}', which is not [a-z0-9_]"
+            ));
+        }
+        let user = format!("{user_prefix}{part}");
         Ok(Self {
             password: derive_password(admin_password, PASSWORD_TAG, service_id, &user)?,
-            key_prefix: format!("sbx:{namespace}:"),
+            key_prefix: format!("{key_prefix}{part}:"),
             user,
         })
     }
@@ -228,7 +261,7 @@ mod tests {
     use super::*;
 
     fn plan() -> RedisSandboxPlan {
-        RedisSandboxPlan::new(3, "shop", "adminpass").expect("plan")
+        RedisSandboxPlan::new(3, &SandboxNamespace::project("shop"), "adminpass").expect("plan")
     }
 
     #[test]
@@ -256,9 +289,14 @@ mod tests {
     fn the_password_is_stable_per_user_and_changes_with_the_admin_password() {
         let first = plan();
         assert_eq!(first, plan());
-        let other_admin = RedisSandboxPlan::new(3, "shop", "different").expect("plan");
-        let other_service = RedisSandboxPlan::new(4, "shop", "adminpass").expect("plan");
-        let other_namespace = RedisSandboxPlan::new(3, "cafe", "adminpass").expect("plan");
+        let other_admin = RedisSandboxPlan::new(3, &SandboxNamespace::project("shop"), "different")
+            .expect("plan");
+        let other_service =
+            RedisSandboxPlan::new(4, &SandboxNamespace::project("shop"), "adminpass")
+                .expect("plan");
+        let other_namespace =
+            RedisSandboxPlan::new(3, &SandboxNamespace::project("cafe"), "adminpass")
+                .expect("plan");
         let password = |p: &RedisSandboxPlan| p.acl_arguments()[3].clone();
         assert_ne!(password(&first), password(&other_admin));
         assert_ne!(password(&first), password(&other_service));
@@ -267,16 +305,64 @@ mod tests {
 
     #[test]
     fn a_service_without_a_password_cannot_be_scoped() {
-        let error = RedisSandboxPlan::new(3, "shop", "").expect_err("no password");
+        let error = RedisSandboxPlan::new(3, &SandboxNamespace::project("shop"), "")
+            .expect_err("no password");
         assert!(error.contains("no password"), "{error}");
     }
 
     #[test]
-    fn a_namespace_that_could_widen_the_pattern_is_refused() {
-        for bad in ["", "Shop", "a*b", "a b", "a:b", "x]", &"a".repeat(49)] {
+    fn no_namespace_can_widen_the_pattern() {
+        let mut prefixes = Vec::new();
+        for slug in [
+            "",
+            "Shop",
+            "a*b",
+            "a b",
+            "a:b",
+            "x]",
+            "a?b",
+            "café",
+            &"a".repeat(80),
+        ] {
+            let plan = RedisSandboxPlan::new(3, &SandboxNamespace::project(slug), "adminpass")
+                .expect("plan");
+            let part = &plan.key_prefix["sbx:".len()..plan.key_prefix.len() - 1];
             assert!(
-                RedisSandboxPlan::new(3, bad, "adminpass").is_err(),
-                "{bad:?}"
+                part.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{slug:?}: {}",
+                plan.key_prefix
+            );
+            assert!(!plan.user.contains(' '), "{slug:?}");
+            prefixes.push(plan.key_prefix);
+        }
+        // No prefix is the start of another's, so no pattern reaches another
+        // namespace's keys.
+        for (i, a) in prefixes.iter().enumerate() {
+            for (j, b) in prefixes.iter().enumerate() {
+                assert!(i == j || !b.starts_with(a.as_str()), "{a} covers {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_project_slugged_like_a_sandbox_id_never_gets_that_sandboxs_user_or_keys() {
+        let sandbox = RedisSandboxPlan::new(3, &SandboxNamespace::sandbox("sbx_ab12"), "adminpass")
+            .expect("plan");
+        assert_eq!(sandbox.user, "sbxid_ab12");
+        assert_eq!(sandbox.key_prefix, "sbxid:ab12:");
+        for slug in ["ab12", "sab12", "id-ab12", "sbxid-ab12", "id", "café"] {
+            let project = RedisSandboxPlan::new(3, &SandboxNamespace::project(slug), "adminpass")
+                .expect("plan");
+            assert_ne!(project.user, sandbox.user, "{slug}");
+            assert_ne!(project.password, sandbox.password, "{slug}");
+            assert!(
+                !sandbox.key_prefix.starts_with(&project.key_prefix),
+                "{slug}"
+            );
+            assert!(
+                !project.key_prefix.starts_with(&sandbox.key_prefix),
+                "{slug}"
             );
         }
     }

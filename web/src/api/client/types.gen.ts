@@ -50268,7 +50268,7 @@ export type CommitRepositoryFilesData = {
 
 export type CommitRepositoryFilesErrors = {
     /**
-     * Invalid path, branch, message or file content, or the connection is inactive
+     * Invalid path (including one through a symlink tracked in the repository), branch, message or file content, or the connection is inactive
      */
     400: unknown;
     /**
@@ -50284,9 +50284,17 @@ export type CommitRepositoryFilesErrors = {
      */
     404: unknown;
     /**
-     * The git provider rejected or failed the request
+     * Nothing to commit (the files already match the branch), or the remote rejected the push (protected branch, hook, non-fast-forward)
+     */
+    409: unknown;
+    /**
+     * The git provider failed the request
      */
     502: unknown;
+    /**
+     * The commit timed out; `push_may_have_completed` says whether the branch must be checked before retrying
+     */
+    504: unknown;
 };
 
 export type CommitRepositoryFilesResponses = {

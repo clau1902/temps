@@ -25,7 +25,9 @@ use temps_core::{
 };
 use utoipa::{OpenApi, ToSchema};
 
-use crate::audit::{AiSuggestionChatModeUpdatedAudit, AiSuggestionDefaultUpdatedAudit};
+use crate::audit::{
+    AiNextStepsSuggestedAudit, AiSuggestionChatModeUpdatedAudit, AiSuggestionDefaultUpdatedAudit,
+};
 use crate::handlers::{ensure_user_conversation_access, AppState};
 use crate::service::decode_message_before_cursor;
 use crate::suggestions::{
@@ -318,6 +320,7 @@ pub async fn update_chat_suggestion_mode(
 pub async fn suggest_next_steps(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     ai_call: Option<Extension<AiToolCall>>,
     Path(public_id): Path<String>,
     Json(request): Json<SuggestNextStepsRequest>,
@@ -345,7 +348,40 @@ pub async fn suggest_next_steps(
         .service
         .suggest_next_steps(&conversation, auth.user_id(), answer)
         .await?;
+    // Only a new set spent model quota and was written to the answer; the
+    // audit logger reports its own failure without failing the request.
+    if let Some(entry) = next_steps_audit(
+        audit_context(&auth, &metadata),
+        &conversation,
+        answer,
+        &steps,
+    ) {
+        state.audit(&entry).await;
+    }
     Ok(Json(steps))
+}
+
+/// The audit entry for a suggestion request, or `None` when the saved set was
+/// returned and nothing was spent or written.
+fn next_steps_audit(
+    context: AuditContext,
+    conversation: &temps_entities::ai_conversations::Model,
+    requested_answer: Option<i64>,
+    steps: &NextSteps,
+) -> Option<AiNextStepsSuggestedAudit> {
+    if steps.saved {
+        return None;
+    }
+    Some(AiNextStepsSuggestedAudit {
+        context,
+        project_id: conversation.project_id,
+        conversation_id: conversation.public_id.clone(),
+        message_id: decode_message_before_cursor(&steps.answer)
+            .ok()
+            .or(requested_answer),
+        suggestion_count: steps.suggestions.len(),
+        model: steps.model.clone(),
+    })
 }
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
@@ -486,5 +522,82 @@ mod tests {
         assert!(
             serde_json::from_str::<UpdateChatSuggestionModeRequest>(r#"{"mode":"later"}"#).is_err()
         );
+    }
+
+    fn conversation() -> temps_entities::ai_conversations::Model {
+        temps_entities::ai_conversations::Model {
+            id: 7,
+            public_id: "conv_test_7".to_string(),
+            project_id: Some(5),
+            application_id: None,
+            context_type: "assistant".to_string(),
+            context_id: "assistant_1".to_string(),
+            title: None,
+            status: "active".to_string(),
+            kind: "ai".to_string(),
+            created_by: 1,
+            metadata: None,
+            created_at: chrono::Utc::now(),
+            last_activity_at: chrono::Utc::now(),
+            ai_provider: "gateway".to_string(),
+            ai_model: "vendor/chat-model".to_string(),
+            ai_thinking_level: None,
+            ai_permission_mode: "ask".to_string(),
+            cli_session_id: None,
+            cli_session_fingerprint: None,
+            turn_status: "idle".to_string(),
+            active_turn_id: None,
+            last_turn_id: None,
+            turn_started_at: None,
+            next_step_suggestions: None,
+        }
+    }
+
+    fn context() -> AuditContext {
+        AuditContext {
+            user_id: 3,
+            ip_address: Some("127.0.0.1".to_string()),
+            user_agent: "test".to_string(),
+        }
+    }
+
+    fn steps(saved: bool) -> NextSteps {
+        NextSteps {
+            answer: crate::service::encode_message_before_cursor(42),
+            suggestions: vec![
+                "Check the deployment logs".to_string(),
+                "Add a custom domain".to_string(),
+            ],
+            model: "vendor/small-model".to_string(),
+            saved,
+        }
+    }
+
+    #[test]
+    fn a_new_set_of_suggestions_is_audited_by_count_not_text() {
+        use temps_core::AuditOperation;
+        let entry = next_steps_audit(context(), &conversation(), None, &steps(false))
+            .expect("a newly generated set is audited");
+        assert_eq!(entry.conversation_id, "conv_test_7");
+        assert_eq!(entry.project_id, Some(5));
+        assert_eq!(entry.message_id, Some(42));
+        assert_eq!(entry.suggestion_count, 2);
+        assert_eq!(entry.model, "vendor/small-model");
+        assert_eq!(entry.operation_type(), "ai.suggestions.generated");
+        let body = AuditOperation::serialize(&entry).expect("serialize audit");
+        assert!(!body.contains("deployment logs"), "{body}");
+    }
+
+    #[test]
+    fn returning_the_saved_set_is_not_audited() {
+        assert!(next_steps_audit(context(), &conversation(), Some(42), &steps(true)).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_answer_cursor_falls_back_to_the_requested_answer() {
+        let mut generated = steps(false);
+        generated.answer = "not-a-cursor".to_string();
+        let entry = next_steps_audit(context(), &conversation(), Some(41), &generated);
+        assert_eq!(entry.map(|entry| entry.message_id), Some(Some(41)));
     }
 }

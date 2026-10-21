@@ -136,33 +136,31 @@ pub fn changed_lines(changes: &[FileChange]) -> u32 {
 
 /// Glob match for protected paths: `*` stays within one path segment, `**`
 /// spans any number of segments, `?` is one character.
+///
+/// Both levels use the classic greedy wildcard match with a single backtrack
+/// point (the most recent star), which is O(pattern * text) in the worst
+/// case. Patterns are operator input and run on the single autofix worker,
+/// so a naive recursive matcher -- exponential in the number of stars --
+/// would let one pattern hang every incident.
 pub fn glob_matches(pattern: &str, path: &str) -> bool {
+    /// One path segment: `*` is any run of bytes, `?` exactly one byte.
     fn segment(pattern: &[u8], text: &[u8]) -> bool {
-        match (pattern.first(), text.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => {
-                segment(&pattern[1..], text) || (!text.is_empty() && segment(pattern, &text[1..]))
-            }
-            (Some(b'?'), Some(_)) => segment(&pattern[1..], &text[1..]),
-            (Some(expected), Some(actual)) if expected == actual => {
-                segment(&pattern[1..], &text[1..])
-            }
-            _ => false,
-        }
+        wildcard_match(
+            pattern,
+            text,
+            |token| *token == b'*',
+            |token, byte| *token == b'?' || token == byte,
+        )
     }
+    /// Whole path: a `**` segment is any run of segments; any other pattern
+    /// segment must match exactly one path segment.
     fn segments(pattern: &[&str], path: &[&str]) -> bool {
-        match pattern.first() {
-            None => path.is_empty(),
-            Some(&"**") => {
-                segments(&pattern[1..], path) || (!path.is_empty() && segments(pattern, &path[1..]))
-            }
-            Some(head) => match path.first() {
-                Some(first) if segment(head.as_bytes(), first.as_bytes()) => {
-                    segments(&pattern[1..], &path[1..])
-                }
-                _ => false,
-            },
-        }
+        wildcard_match(
+            pattern,
+            path,
+            |token| *token == "**",
+            |token, part| segment(token.as_bytes(), part.as_bytes()),
+        )
     }
     let pattern = pattern.trim().trim_start_matches("./");
     if pattern.is_empty() {
@@ -171,6 +169,82 @@ pub fn glob_matches(pattern: &str, path: &str) -> bool {
     let pattern: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
     let path: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     segments(&pattern, &path)
+}
+
+/// Greedy wildcard match of `pattern` against `text`. `is_star` marks a token
+/// that matches any run (including none) of text items; `matches_one` says
+/// whether a non-star token matches exactly one text item. Only the most
+/// recent star is ever backtracked to, so each text position is retried at
+/// most once per star: O(pattern.len() * text.len()) `matches_one` calls.
+fn wildcard_match<P, T>(
+    pattern: &[P],
+    text: &[T],
+    is_star: impl Fn(&P) -> bool,
+    matches_one: impl Fn(&P, &T) -> bool,
+) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    // (pattern index of the last star, text index it is currently absorbing up to)
+    let mut backtrack: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(token) if is_star(token) => {
+                // Try the star as empty first; remember where to resume.
+                backtrack = Some((p, t));
+                p += 1;
+            }
+            Some(token) if matches_one(token, &text[t]) => {
+                p += 1;
+                t += 1;
+            }
+            _ => match backtrack {
+                // Let the last star absorb one more item and retry after it.
+                Some((star, absorbed)) => {
+                    backtrack = Some((star, absorbed + 1));
+                    p = star + 1;
+                    t = absorbed + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    // Text exhausted: only trailing stars may remain.
+    pattern[p..].iter().all(is_star)
+}
+
+/// Most wildcard characters (`*`, `?`) one protected path may contain.
+pub const MAX_PROTECTED_PATH_WILDCARDS: usize = 32;
+
+/// Why a protected-path glob is refused, or `None` when it is acceptable.
+/// `*` and `**` are the only star forms; a longer run of stars has no extra
+/// meaning and is rejected rather than silently reinterpreted.
+pub fn protected_path_problem(pattern: &str) -> Option<String> {
+    let mut run = 0usize;
+    let mut longest_run = 0usize;
+    let mut wildcards = 0usize;
+    for byte in pattern.bytes() {
+        if byte == b'*' {
+            run += 1;
+            longest_run = longest_run.max(run);
+        } else {
+            run = 0;
+        }
+        if byte == b'*' || byte == b'?' {
+            wildcards += 1;
+        }
+    }
+    if longest_run > 2 {
+        return Some(format!(
+            "protected path '{pattern}' has {longest_run} consecutive '*': use '*' within a \
+             segment or '**' for any number of directories"
+        ));
+    }
+    if wildcards > MAX_PROTECTED_PATH_WILDCARDS {
+        return Some(format!(
+            "protected path '{pattern}' has {wildcards} wildcards; at most \
+             {MAX_PROTECTED_PATH_WILDCARDS} are allowed"
+        ));
+    }
+    None
 }
 
 /// Changed paths that match any protected glob.
@@ -534,6 +608,88 @@ mod tests {
         assert!(glob_matches("./.github/**", ".github/workflows/ci.yml"));
         assert!(glob_matches("package?.json", "package1.json"));
         assert!(!glob_matches("", "anything"));
+    }
+
+    #[test]
+    fn a_single_star_matches_any_run_within_one_segment() {
+        assert!(glob_matches("*", "README.md"));
+        assert!(glob_matches("*.md", ".md"));
+        assert!(glob_matches("a*b*c", "abc"));
+        assert!(glob_matches("a*b*c", "axxbyyc"));
+        assert!(glob_matches("a*b*c", "abcbc"));
+        assert!(!glob_matches("a*b*c", "axxbyy"));
+        assert!(!glob_matches("a*b", "a/b"));
+        assert!(!glob_matches("*", "src/app.ts"));
+        assert!(glob_matches("src/*", "src/app.ts"));
+        assert!(!glob_matches("src/*", "src"));
+        // Backtracking past an early partial match.
+        assert!(glob_matches("*ab", "aab"));
+        assert!(glob_matches("*.test.ts", "a.test.test.ts"));
+    }
+
+    #[test]
+    fn a_double_star_spans_any_number_of_segments() {
+        assert!(glob_matches("**", "a/b/c"));
+        assert!(glob_matches("**/x", "x"));
+        assert!(glob_matches("**/x", "a/b/x"));
+        assert!(!glob_matches("**/x", "a/b/x/y"));
+        assert!(glob_matches("a/**/b", "a/b"));
+        assert!(glob_matches("a/**/b", "a/1/2/b"));
+        assert!(glob_matches("a/**/b/**/c", "a/b/x/b/y/c"));
+        assert!(!glob_matches("a/**/b", "a/1/2/c"));
+        assert!(glob_matches("migrations/**", "migrations"));
+        // Inside a segment `**` is just a star: it never crosses `/`.
+        assert!(glob_matches("a**b", "axyb"));
+        assert!(!glob_matches("a**b", "ax/yb"));
+    }
+
+    #[test]
+    fn a_question_mark_is_exactly_one_character() {
+        assert!(glob_matches("v?.txt", "v1.txt"));
+        assert!(!glob_matches("v?.txt", "v.txt"));
+        assert!(!glob_matches("v?.txt", "v12.txt"));
+        assert!(!glob_matches("a?b", "a/b"));
+    }
+
+    /// The recursive matcher this replaced was exponential in the number of
+    /// stars: these took effectively forever. The linear matcher answers
+    /// them in microseconds; the bound is generous to stay robust on a busy
+    /// CI machine.
+    #[test]
+    fn pathological_patterns_finish_quickly() {
+        let started = std::time::Instant::now();
+        let name = "a".repeat(40);
+        assert!(!glob_matches("********************b", &name));
+        assert!(!glob_matches("*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b", &name));
+        let deep = vec!["a"; 40].join("/");
+        assert!(!glob_matches(
+            "**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/a/**/b",
+            &deep
+        ));
+        assert!(glob_matches("*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a", &name));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "glob matching took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn protected_paths_reject_star_runs_and_wildcard_floods() {
+        assert_eq!(protected_path_problem("migrations/**"), None);
+        assert_eq!(protected_path_problem("**/*.sql"), None);
+        assert_eq!(protected_path_problem("package?.json"), None);
+        let run = protected_path_problem("********************b").expect("refused");
+        assert!(run.contains("20 consecutive '*'"), "{run}");
+        assert!(run.contains("********************b"), "{run}");
+        assert!(protected_path_problem("a/***/b").is_some());
+        let flood = "*a".repeat(MAX_PROTECTED_PATH_WILDCARDS + 1);
+        let message = protected_path_problem(&flood).expect("refused");
+        assert!(message.contains("at most 32"), "{message}");
+        assert_eq!(
+            protected_path_problem(&"*a".repeat(MAX_PROTECTED_PATH_WILDCARDS)),
+            None
+        );
     }
 
     #[test]
