@@ -9,6 +9,7 @@ import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { SectionNavLayout } from '@/components/layout/SectionNavLayout'
 import {
   Activity,
+  Clock3,
   BarChart3,
   ScrollText,
   GitFork,
@@ -43,10 +44,15 @@ export const sectionIcons: Record<string, LucideIcon> = {
   'request-logs': FileText,
   'telemetry-logs': Radio,
   errors: ShieldAlert,
+  'errors/feedback': Users,
+  releases: History,
+  'client-outcomes': Activity,
+  'errors/source-maps': FileText,
   traces: GitFork,
   'ai-gateway?tab=activity': Bot,
   metrics: Gauge,
   monitors: Activity,
+  'cron-jobs': Clock3,
   'status-pages': Globe,
   'errors/alert-rules': Bell,
   analytics: BarChart3,

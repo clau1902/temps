@@ -526,6 +526,7 @@ impl From<ChSpanRow> for SpanRecord {
         };
 
         SpanRecord {
+            ingest_identity: None,
             project_id: row.project_id,
             deployment_id: row.deployment_id,
             resource,
@@ -1882,6 +1883,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                     attributes: std::collections::BTreeMap::new(),
                 };
                 SpanRecord {
+                    ingest_identity: None,
                     project_id: r.project_id,
                     deployment_id: r.deployment_id,
                     resource,
@@ -2437,6 +2439,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                     attributes: std::collections::BTreeMap::new(),
                 };
                 SpanRecord {
+                    ingest_identity: None,
                     project_id: r.project_id,
                     deployment_id: r.deployment_id,
                     resource,
@@ -4060,6 +4063,7 @@ mod tests {
 
     fn make_span() -> SpanRecord {
         SpanRecord {
+            ingest_identity: None,
             project_id: 42,
             deployment_id: Some(7),
             resource: ResourceInfo {

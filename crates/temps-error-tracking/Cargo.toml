@@ -11,7 +11,10 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
+temps-analytics-session-replay = { path = "../temps-analytics-session-replay" }
 temps-auth = { path = "../temps-auth" }
+temps-otel = { path = "../temps-otel" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-embeddings = { path = "../temps-embeddings" }
@@ -26,7 +29,7 @@ temps-routes = { path = "../temps-routes" }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 sea-orm = { workspace = true }
@@ -37,6 +40,8 @@ thiserror = { workspace = true }
 axum = { workspace = true }
 axum-macros = { workspace = true }
 sha2 = { workspace = true }
+sha1_smol = "1.0.1"
+zip = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }

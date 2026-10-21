@@ -126,6 +126,7 @@ export const projectToolGroups: ProjectToolGroup[] = [
         featureKey: 'otel-traces-metrics',
       },
       { title: 'Uptime', url: 'monitors', icon: Activity },
+      { title: 'Cron jobs', url: 'cron-jobs', icon: Activity },
       {
         title: 'Status Pages',
         url: 'status-pages',

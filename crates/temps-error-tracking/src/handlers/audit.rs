@@ -18,6 +18,31 @@ use serde::Serialize;
 pub use temps_core::AuditContext;
 use temps_core::AuditOperation;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SentryArtifactBundleUploadedAudit {
+    pub context: SentryCliAuditContext,
+    pub project_id: i32,
+    pub checksum: String,
+}
+impl AuditOperation for SentryArtifactBundleUploadedAudit {
+    fn operation_type(&self) -> String {
+        "SENTRY_ARTIFACT_BUNDLE_UPLOADED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        None
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Artifact audit serialization failed: {}", e))
+    }
+}
+
 /// Audit event for uploading a source file (native symbolication).
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceFileUploadedAudit {

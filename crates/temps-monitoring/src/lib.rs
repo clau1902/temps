@@ -32,3 +32,5 @@ pub use plugin::MonitoringPlugin;
 // services module is documentation-only, no re-exports needed
 
 pub mod http_checks;
+
+pub mod cron_monitors;
