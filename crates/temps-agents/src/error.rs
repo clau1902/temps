@@ -284,14 +284,17 @@ pub fn is_network_pool_exhausted(message: &str) -> bool {
 
 /// Build the reason for a sandbox whose isolated network could not be created
 /// because Docker has no free address pool left. `cause` is the daemon's own
-/// message. States what to do about it: the operator can widen the pools or
-/// remove sandboxes they no longer use.
+/// message. By the time this is returned, stopped sandboxes have already
+/// given their networks back, so it states what is left: running sandboxes
+/// and other containers' networks, or pools that are too small.
 pub fn network_pool_exhausted_reason(sandbox: &str, cause: &str) -> String {
     format!(
         "Docker has no free address pool left for the isolated network of sandbox '{sandbox}' \
-         ({cause}). Delete sandboxes that are no longer needed to release their networks, or \
-         raise `default-address-pools` in the Docker daemon configuration (daemon.json, for \
-         example a larger `base` range with a `size` of 24) and restart Docker."
+         ({cause}). Stopped sandboxes have already released their networks, so the address \
+         space is held by running sandboxes and other Docker networks on this host. Stop \
+         sandboxes you are not using, or raise `default-address-pools` in the Docker daemon \
+         configuration (daemon.json, for example a larger `base` range with a `size` of 24) and \
+         restart Docker."
     )
 }
 
@@ -436,7 +439,8 @@ mod image_pull_tests {
         assert!(reason.contains("temps-sandbox-abc"), "{reason}");
         assert!(reason.contains("pools fully subnetted"), "{reason}");
         assert!(reason.contains("default-address-pools"), "{reason}");
-        assert!(reason.contains("Delete sandboxes"), "{reason}");
+        assert!(reason.contains("Stopped sandboxes have already released"), "{reason}");
+        assert!(reason.contains("Stop sandboxes you are not using"), "{reason}");
         let error = AgentError::SandboxProviderUnavailable {
             provider: "docker".into(),
             reason,
