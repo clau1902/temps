@@ -1023,6 +1023,31 @@ impl MongodbService {
         let client = self.get_mongo_client().await?;
         let db = client.database(db_name);
 
+        // Never give a deployment a sandbox's database: a name in the sandbox
+        // namespace, or one the sandbox user its name would have is defined
+        // in (a sandbox database from before the namespace, such as
+        // `<project>_sandbox` for an environment slugged `sandbox`).
+        let sandbox_evidence = if crate::sandbox_engines::is_reserved_sandbox_database_name(db_name)
+        {
+            None
+        } else {
+            let user = crate::sandbox_access::sandbox_role_name(db_name);
+            let answer = db
+                .run_command(crate::sandbox_mongodb::users_info(&user, db_name))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to check whether MongoDB database '{}' belongs to a sandbox: {}",
+                        db_name,
+                        e
+                    )
+                })?;
+            crate::sandbox_mongodb::users_info_has_user(&answer)
+                .then(|| format!("the sandbox user '{user}' is defined in it"))
+        };
+        crate::sandbox_engines::check_deployment_database("MongoDB", db_name, sandbox_evidence)
+            .map_err(anyhow::Error::new)?;
+
         // Create a collection to initialize the database
         db.create_collection("_temps_init")
             .await

@@ -64,17 +64,6 @@ pub struct Model {
     /// the collector already resolves via the `temps.service_name` Docker
     /// label. Added by `m20260707_000002_add_external_services_container_name`.
     pub container_name: Option<String>,
-    /// Whether the AI agent may read *row data* from this service.
-    ///
-    /// Off by default and opted into per service by the operator. The agent's
-    /// read tool allowlist otherwise only exposes endpoints whose responses
-    /// carry no secrets; table rows are a different risk class (password
-    /// hashes, API tokens, customer PII) and enabling this ships those rows to
-    /// a third-party LLM provider. Schema browsing (databases, tables, column
-    /// names) is unaffected — only the row-reading endpoint is gated. Added by
-    /// `m20260804_000001_add_ai_data_access_to_external_services`.
-    #[sea_orm(default_value = false)]
-    pub ai_data_access: bool,
     /// Human principal that created this service through the authenticated
     /// API. This allows a newly-created, not-yet-linked service to be claimed
     /// by that same user during project creation without trusting a guessed ID.

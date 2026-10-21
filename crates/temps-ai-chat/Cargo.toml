@@ -26,6 +26,7 @@ temps-logs = { path = "../temps-logs" }
 temps-git = { path = "../temps-git" }
 temps-sandbox = { path = "../temps-sandbox" }
 temps-projects = { path = "../temps-projects" }
+temps-error-tracking = { path = "../temps-error-tracking" }
 tempfile = { workspace = true }
 
 axum = { workspace = true }
@@ -52,6 +53,11 @@ rustix = { version = "1.1.4", features = ["fs"] }
 nix = { version = "0.31", features = ["dir", "fs"] }
 walkdir = { workspace = true }
 zip = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+# Text layer of uploaded PDFs; the parse is isolated (blocking pool, timeout,
+# panic guard) because the input is untrusted.
+pdf-extract = "0.12"
 unicode-normalization = "0.1"
 unicode-casefold = "0.2"
 url = { workspace = true }
@@ -60,3 +66,6 @@ url = { workspace = true }
 # `test-util` gives the paused clock used to exercise the turn deadline without
 # a test that actually waits fifteen minutes. Dev-only — not in the binary.
 tokio = { workspace = true, features = ["test-util"] }
+# Migrated PostgreSQL for the workspace and blueprint storage tests; they skip
+# when no container runtime is available.
+temps-database = { path = "../temps-database" }

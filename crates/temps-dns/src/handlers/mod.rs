@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_check, Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditContext, AuditOperation, ForceRouteReloadJob, Job, RequestMetadata};
 use utoipa::{OpenApi, ToSchema};
 
@@ -170,18 +171,18 @@ pub struct UpdateDnsProviderRequest {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DnsProviderCredentials {
     Bunny {
-        api_key: String,
+        api_key: SecretString,
     },
     Cloudflare {
         #[schema(example = "your-api-token")]
-        api_token: String,
+        api_token: SecretString,
         account_id: Option<String>,
     },
     Namecheap {
         #[schema(example = "your-username")]
         api_user: String,
         #[schema(example = "your-api-key")]
-        api_key: String,
+        api_key: SecretString,
         client_ip: Option<String>,
         #[serde(default)]
         sandbox: bool,
@@ -190,21 +191,21 @@ pub enum DnsProviderCredentials {
         #[schema(example = "AKIAIOSFODNN7EXAMPLE")]
         access_key_id: String,
         #[schema(example = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")]
-        secret_access_key: String,
-        session_token: Option<String>,
+        secret_access_key: SecretString,
+        session_token: Option<SecretString>,
         #[schema(example = "us-east-1")]
         region: Option<String>,
     },
     #[serde(rename = "digitalocean")]
     DigitalOcean {
         #[schema(example = "dop_v1_your-token")]
-        api_token: String,
+        api_token: SecretString,
     },
     Gcp {
         #[schema(example = "dns-admin@myproject.iam.gserviceaccount.com")]
         service_account_email: String,
         #[schema(example = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----")]
-        private_key: String,
+        private_key: SecretString,
         #[schema(example = "my-gcp-project")]
         project_id: String,
     },
@@ -213,7 +214,7 @@ pub enum DnsProviderCredentials {
         tenant_id: String,
         #[schema(example = "00000000-0000-0000-0000-000000000000")]
         client_id: String,
-        client_secret: String,
+        client_secret: SecretString,
         #[schema(example = "00000000-0000-0000-0000-000000000000")]
         subscription_id: String,
         #[schema(example = "my-resource-group")]
@@ -236,13 +237,15 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
     fn from(creds: DnsProviderCredentials) -> Self {
         match creds {
             DnsProviderCredentials::Bunny { api_key } => {
-                ProviderCredentials::Bunny(BunnyCredentials { api_key })
+                ProviderCredentials::Bunny(BunnyCredentials {
+                    api_key: api_key.into_exposed(),
+                })
             }
             DnsProviderCredentials::Cloudflare {
                 api_token,
                 account_id,
             } => ProviderCredentials::Cloudflare(CloudflareCredentials {
-                api_token,
+                api_token: api_token.into_exposed(),
                 account_id,
             }),
             DnsProviderCredentials::Namecheap {
@@ -252,7 +255,7 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 sandbox,
             } => ProviderCredentials::Namecheap(NamecheapCredentials {
                 api_user,
-                api_key,
+                api_key: api_key.into_exposed(),
                 client_ip,
                 sandbox,
             }),
@@ -263,12 +266,14 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 region,
             } => ProviderCredentials::Route53(Route53Credentials {
                 access_key_id,
-                secret_access_key,
-                session_token,
+                secret_access_key: secret_access_key.into_exposed(),
+                session_token: session_token.map(SecretString::into_exposed),
                 region,
             }),
             DnsProviderCredentials::DigitalOcean { api_token } => {
-                ProviderCredentials::DigitalOcean(DigitalOceanCredentials { api_token })
+                ProviderCredentials::DigitalOcean(DigitalOceanCredentials {
+                    api_token: api_token.into_exposed(),
+                })
             }
             DnsProviderCredentials::Gcp {
                 service_account_email,
@@ -276,7 +281,7 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 project_id,
             } => ProviderCredentials::Gcp(GcpCredentials {
                 service_account_email,
-                private_key,
+                private_key: private_key.into_exposed(),
                 project_id,
             }),
             DnsProviderCredentials::Azure {
@@ -288,7 +293,7 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
             } => ProviderCredentials::Azure(AzureCredentials {
                 tenant_id,
                 client_id,
-                client_secret,
+                client_secret: client_secret.into_exposed(),
                 subscription_id,
                 resource_group,
             }),

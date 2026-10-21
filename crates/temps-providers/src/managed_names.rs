@@ -658,7 +658,8 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::ServiceNameRestoreConflict { .. }
         | ExternalServiceError::ServiceContainerRestoreConflict { .. }
         | ExternalServiceError::ServiceContainerConflict { .. }
-        | ExternalServiceError::AmbiguousServiceName { .. } => error_builder::conflict()
+        | ExternalServiceError::AmbiguousServiceName { .. }
+        | ExternalServiceError::SandboxNamespaceConflict { .. } => error_builder::conflict()
             .title(title)
             .detail(error.to_string())
             .build(),
@@ -704,7 +705,9 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::ControlPlaneAddressRequired { .. }
         | ExternalServiceError::ControlPlaneMemberUnreachable { .. }
         | ExternalServiceError::ClusterPortsUnavailable { .. }
-        | ExternalServiceError::ClusterMemberLimitExceeded { .. } => error_builder::internal_server_error()
+        | ExternalServiceError::ClusterMemberLimitExceeded { .. }
+        | ExternalServiceError::NoSandboxAccessEngine { .. }
+        | ExternalServiceError::SandboxAccessUnsupported { .. } => error_builder::internal_server_error()
             .title(title)
             .detail(format!(
                 "Could not create the {} service: {error}",

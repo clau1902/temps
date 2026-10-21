@@ -30,6 +30,10 @@ const EXEMPT: Record<string, string> = {
     'Exports a thin deleteBackup helper; its only caller (BackupDetail) owns the ConfirmDeleteDialog.',
   'src/hooks/usePlugins.ts':
     'Hook module exporting useUninstallPlugin; its only caller (PluginsPage) owns the ConfirmDeleteDialog.',
+  'src/components/ai/ChatSandbox.tsx':
+    'Calls unlinkChatSandbox, which only detaches the sandbox from the chat; the sandbox keeps running and can be linked again from the same panel.',
+  'src/components/ai/ConnectSandboxButton.tsx':
+    "Calls disconnectChatSandboxProject, which only revokes the sandbox's access to a service's databases; the same button connects it again.",
   'src/pages/Drop.tsx':
     'Calls deleteProject only to roll back the service this same Drop flow just created after a failed upload; automatic cleanup, never user-triggered.',
 }

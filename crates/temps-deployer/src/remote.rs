@@ -488,10 +488,16 @@ pub struct RemotePullCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// **Never logged or included in error messages.**
+    // Published as a credential, but a `String` here: this struct is
+    // serialized to the agent, and `SecretString` serializes as a mask.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<temps_core::secret_string::SecretString>)]
     pub password: Option<String>,
     /// **Never logged or included in error messages.**
+    // Published as a credential, but a `String` here: this struct is
+    // serialized to the agent, and `SecretString` serializes as a mask.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<temps_core::secret_string::SecretString>)]
     pub identity_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_address: Option<String>,

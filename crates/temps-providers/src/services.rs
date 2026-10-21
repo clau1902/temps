@@ -11,9 +11,9 @@ use crate::externalsvc::{
     redis::RedisService,
     rustfs::{RustfsService, DEFAULT_RUSTFS_IMAGE},
     s3::S3Service,
-    AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ExternalService, HealthProbeStatus,
-    ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection, ManagedS3Error,
-    MigrationSource, PgAutoFailoverState, ServiceConfig, ServiceType,
+    AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ClusterRole, ExternalService,
+    HealthProbeStatus, ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection,
+    ManagedS3Error, MigrationSource, PgAutoFailoverState, ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
 use crate::readiness::{
@@ -130,6 +130,19 @@ impl DatabaseProvisioningConfig {
         }
 
         match (self.mode, self.custom_database_name.as_deref()) {
+            (DatabaseProvisioningMode::Custom, Some(name))
+                if crate::sandbox_engines::is_reserved_sandbox_database_name(name) =>
+            {
+                Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                    service_id,
+                    project_id,
+                    reason: format!(
+                        "custom database name '{name}' starts with '{}', which is reserved for \
+                         sandbox databases",
+                        crate::sandbox_engines::SANDBOX_DATABASE_PREFIX
+                    ),
+                })
+            }
             (DatabaseProvisioningMode::Custom, Some(name))
                 if is_valid_custom_database_name(name) =>
             {
@@ -590,6 +603,79 @@ fn validate_cluster_member_count(name: &str, requested: usize) -> Result<(), Ext
     Ok(())
 }
 
+/// The layout a cluster gets when the request does not name its members: a
+/// monitor, a primary and one replica, all on the control plane.
+///
+/// Three members is the smallest set pg_auto_failover can fail over with, and
+/// the control plane is where every member lands when `node_id` is omitted, so
+/// "create a cluster" works on a single host. That protects against a member
+/// container dying, not against the host dying: spread members across worker
+/// nodes (`node_id`) for that.
+fn default_cluster_members() -> Vec<ClusterMemberRequest> {
+    [
+        ClusterRole::Monitor,
+        ClusterRole::Primary,
+        ClusterRole::Replica,
+    ]
+    .into_iter()
+    .map(|role| ClusterMemberRequest {
+        role: role.as_str().to_string(),
+        node_id: None,
+    })
+    .collect()
+}
+
+/// Settle the member list of a new cluster before anything is saved.
+///
+/// An empty list gets [`default_cluster_members`]. An explicit list must hold
+/// exactly one monitor and at least one data member, with known roles.
+/// Without this check a cluster with no monitor was accepted, went through
+/// "creating" and only then failed in the background with a bare "no monitor
+/// member" error that never said what a valid request looks like.
+fn resolve_cluster_members(
+    name: &str,
+    members: &[ClusterMemberRequest],
+) -> Result<Vec<ClusterMemberRequest>, ExternalServiceError> {
+    if members.is_empty() {
+        return Ok(default_cluster_members());
+    }
+    let invalid = |reason: String| ExternalServiceError::ParameterValidationFailed {
+        service_id: 0,
+        reason: format!(
+            "Invalid members for cluster '{name}': {reason}. Expected one monitor and at least \
+             one primary or replica, e.g. [{{\"role\":\"monitor\"}},{{\"role\":\"primary\"}},\
+             {{\"role\":\"replica\"}}]; omit node_id to place a member on the control plane. \
+             Omit members entirely to get that layout."
+        ),
+    };
+    let known = [
+        ClusterRole::Monitor.as_str(),
+        ClusterRole::Primary.as_str(),
+        ClusterRole::Replica.as_str(),
+    ];
+    if let Some(unknown) = members.iter().find(|m| !known.contains(&m.role.as_str())) {
+        return Err(invalid(format!(
+            "role '{}' is not one of {:?}",
+            unknown.role, known
+        )));
+    }
+    let monitors = members
+        .iter()
+        .filter(|m| m.role == ClusterRole::Monitor.as_str())
+        .count();
+    if monitors != 1 {
+        return Err(invalid(format!(
+            "found {monitors} monitor member(s), need exactly 1"
+        )));
+    }
+    if members.len() == monitors {
+        return Err(invalid(
+            "the cluster has a monitor but no data member".to_string(),
+        ));
+    }
+    Ok(members.to_vec())
+}
+
 /// Host port of the member with `ordinal` in the block starting at `base`,
 /// or `None` when the ordinal does not fit in the cluster's block.
 fn cluster_member_port(base: u16, ordinal: i32) -> Option<u16> {
@@ -600,7 +686,7 @@ fn cluster_member_port(base: u16, ordinal: i32) -> Option<u16> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServiceExecutionRoute {
+pub(crate) enum ServiceExecutionRoute {
     Local,
     Remote(i32),
 }
@@ -608,7 +694,7 @@ enum ServiceExecutionRoute {
 /// `external_services.node_id` is the ownership boundary: NULL means the
 /// control plane's Docker daemon, while a concrete ID means that worker's
 /// private daemon and network namespace.
-fn service_execution_route(node_id: Option<i32>) -> ServiceExecutionRoute {
+pub(crate) fn service_execution_route(node_id: Option<i32>) -> ServiceExecutionRoute {
     match node_id {
         Some(node_id) => ServiceExecutionRoute::Remote(node_id),
         None => ServiceExecutionRoute::Local,
@@ -705,6 +791,30 @@ pub enum ExternalServiceError {
 
     #[error("Service {service_id} is not linked to project {project_id}")]
     ServiceNotLinkedToProject { service_id: i32, project_id: i32 },
+
+    #[error("Service {service_id} ({service_type}) has no sandbox access engine: this type cannot give a sandbox credentials of its own yet")]
+    NoSandboxAccessEngine {
+        service_id: i32,
+        service_type: String,
+    },
+
+    #[error(
+        "Service {service_id} ({service_type}) cannot give a sandbox its own credentials: {reason}"
+    )]
+    SandboxAccessUnsupported {
+        service_id: i32,
+        service_type: String,
+        reason: String,
+    },
+
+    /// A database a sandbox or a deployment asked for belongs to the other
+    /// side, so it was left untouched (ADR-051). A conflict, not a failure:
+    /// the operator renames or removes one side.
+    #[error("Service {service_id}: {conflict}")]
+    SandboxNamespaceConflict {
+        service_id: i32,
+        conflict: crate::sandbox_engines::SandboxNamespaceConflict,
+    },
 
     #[error("Service {service_id} is no longer available to claim")]
     ServiceClaimDenied { service_id: i32 },
@@ -1014,8 +1124,10 @@ pub struct CreateExternalServiceRequest {
     /// Service topology: "standalone" (default, single container) or "cluster" (HA multi-member).
     #[serde(default = "default_topology")]
     pub topology: String,
-    /// Cluster member specifications. Required when topology is "cluster".
-    /// Each member specifies a role, target node, and ordinal.
+    /// Cluster member specifications for topology "cluster". Optional: when
+    /// omitted the cluster gets a monitor, a primary and a replica, all on the
+    /// control plane. When given it must hold exactly one monitor and at least
+    /// one primary or replica. Each member specifies a role and a target node.
     #[serde(default)]
     pub members: Vec<ClusterMemberRequest>,
 }
@@ -1578,6 +1690,39 @@ fn trusted_primary_member<'a>(
     Some(member)
 }
 
+/// One-line summary of what the monitor reports for each data node, for the
+/// error raised when no trustworthy primary can be picked from it: e.g.
+/// `orders-1=primary (unhealthy, 45s since report), orders-2=secondary`.
+fn describe_monitor_states(health: &ClusterHealthReport) -> String {
+    if health.members.is_empty() {
+        return "no registered data nodes".to_string();
+    }
+    health
+        .members
+        .iter()
+        .map(|member| {
+            let mut notes = Vec::new();
+            if member.health != 1 {
+                notes.push("unhealthy".to_string());
+            }
+            if member.seconds_since_report >= 30 {
+                notes.push(format!("{}s since report", member.seconds_since_report));
+            }
+            if notes.is_empty() {
+                format!("{}={}", member.nodename, member.reported_state)
+            } else {
+                format!(
+                    "{}={} ({})",
+                    member.nodename,
+                    member.reported_state,
+                    notes.join(", ")
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse a raw role string (TEXT column / spec) into the typed enum.
 /// Returns `None` for unknown values; callers should use the
 /// classification helpers below for `is_monitor()` / `is_data_member()`
@@ -1734,7 +1879,7 @@ pub(crate) fn classify_cluster_states(
     (HealthProbeStatus::Degraded, Some(message))
 }
 
-fn is_role_monitor(s: &str) -> bool {
+pub(crate) fn is_role_monitor(s: &str) -> bool {
     role_from_str(s) == Some(crate::ClusterRole::Monitor)
 }
 
@@ -3967,6 +4112,11 @@ impl ExternalServiceManager {
         created_by_user_id: Option<i32>,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         info!("Creating new external service");
+
+        let mut request = request;
+        if request.topology == "cluster" {
+            request.members = resolve_cluster_members(&request.name, &request.members)?;
+        }
 
         #[allow(deprecated)]
         if request.service_type == ServiceType::Minio {
@@ -7456,33 +7606,55 @@ echo "[restore] Pre-seed complete"
         &self,
         service_id: i32,
     ) -> Result<Option<(String, String, u16)>, ExternalServiceError> {
+        let Some(primary) = self.get_cluster_primary_member(service_id).await? else {
+            return Ok(None);
+        };
+        self.stored_member_endpoint(service_id, &primary)
+            .await
+            .map(|(host, port)| Some((primary.container_name.clone(), host, port)))
+    }
+
+    /// The member of an HA PostgreSQL cluster that pg_auto_failover currently
+    /// reports as its healthy, writable primary.
+    ///
+    /// Returns `Ok(None)` when the service is not a cluster, and an error when
+    /// it is one but no single primary can be trusted right now (monitor
+    /// unreachable, failover in progress, stale reports).
+    ///
+    /// The primary is whichever node the monitor calls primary, never what
+    /// `service_members.role` says: that column holds `replica` for every
+    /// data node, so a lookup by stored role finds no primary at all, and
+    /// before the rework it lagged behind every failover.
+    pub async fn get_cluster_primary_member(
+        &self,
+        service_id: i32,
+    ) -> Result<Option<ServiceMemberInfo>, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
         if service.topology != "cluster" {
             return Ok(None);
         }
 
-        // The primary is whichever node pg_auto_failover currently calls
-        // primary, not whatever `service_members.role` happens to say.
-        // Using the stored role here would have produced the same lag
-        // bug the UI hit — Browse Data and other callers would dial a
-        // freshly-demoted node post-failover.
         let members = self.get_service_members(service_id).await?;
         let health = self.cluster_health(&service).await;
-        let primary = healthy_writable_primary_nodename(&health)
-            .and_then(|nodename| trusted_primary_member(&members, nodename));
-
-        if let Some(primary) = primary {
-            self.stored_member_endpoint(service_id, primary)
-                .await
-                .map(|(host, port)| Some((primary.container_name.clone(), host, port)))
-        } else {
-            Err(ExternalServiceError::InternalError {
-                reason: format!(
-                    "Cluster service {} has no unique healthy, recently reporting primary data node",
-                    service_id
-                ),
-            })
+        if let Some(primary) = healthy_writable_primary_nodename(&health)
+            .and_then(|nodename| trusted_primary_member(&members, nodename))
+        {
+            return Ok(Some(primary.clone()));
         }
+
+        let reason = match &health.monitor_error {
+            Some(monitor_error) => format!(
+                "Cluster service {} '{}' has no known primary: its pg_auto_failover monitor could not be read: {}",
+                service_id, service.name, monitor_error
+            ),
+            None => format!(
+                "Cluster service {} '{}' has no unique healthy, recently reporting primary data node (monitor reports: {})",
+                service_id,
+                service.name,
+                describe_monitor_states(&health)
+            ),
+        };
+        Err(ExternalServiceError::InternalError { reason })
     }
 
     /// Connect to an HA PostgreSQL cluster's current primary as its
@@ -7624,18 +7796,29 @@ echo "[restore] Pre-seed complete"
             ),
         })?;
 
-        let exists: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+        // The owner, when the database exists: a sandbox's database must
+        // never be handed to a deployment.
+        let owner: Option<String> = client
+            .query_opt(
+                crate::sandbox_access::SandboxDatabasePlan::DATABASE_OWNER_QUERY,
                 &[&db_name],
             )
             .await
+            .and_then(|row| row.map(|row| row.try_get(0)).transpose())
             .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to check if database '{}' exists: {}", db_name, e),
-            })?
-            .get(0);
+                reason: format!(
+                    "Failed to check if database '{}' exists on cluster {}: {}",
+                    db_name, service_id, e
+                ),
+            })?;
+        crate::sandbox_access::check_deployment_database(db_name, owner.as_deref()).map_err(
+            |conflict| ExternalServiceError::SandboxNamespaceConflict {
+                service_id,
+                conflict,
+            },
+        )?;
 
-        if exists {
+        if owner.is_some() {
             debug!(
                 service_id,
                 db_name, "App database already exists on cluster primary; skipping CREATE"
@@ -7797,7 +7980,7 @@ echo "[restore] Pre-seed complete"
         Ok(Some(env_vars))
     }
 
-    async fn get_service_parameters(
+    pub(crate) async fn get_service_parameters(
         &self,
         service_id_val: i32,
     ) -> Result<HashMap<String, serde_json::Value>, ExternalServiceError> {
@@ -9736,16 +9919,19 @@ echo "[restore] Pre-seed complete"
             .await?;
 
         // Reconstruct member specs from preserved records if none were provided
-        let effective_members: Vec<ClusterMemberRequest> = if member_requests.is_empty() {
-            if leftover_members.is_empty() {
-                return Err(ExternalServiceError::ParameterValidationFailed {
-                    service_id,
-                    reason:
-                        "No member configuration provided and no previous member records found. \
-                             Please provide the members array in the retry request."
-                            .to_string(),
-                });
-            }
+        let effective_members: Vec<ClusterMemberRequest> = if !member_requests.is_empty() {
+            resolve_cluster_members(&service.name, member_requests)?
+        } else if leftover_members.is_empty() {
+            // Nothing to rebuild from: the cluster failed before any member
+            // was recorded, which is what a create without a member list used
+            // to do. Give it the default layout rather than asking the caller
+            // to guess the format.
+            info!(
+                "No member records for failed cluster {}; retrying with the default layout",
+                service_id
+            );
+            default_cluster_members()
+        } else {
             info!(
                 "Reconstructing member config from {} preserved records for service {}",
                 leftover_members.len(),
@@ -9758,8 +9944,6 @@ echo "[restore] Pre-seed complete"
                     node_id: m.node_id,
                 })
                 .collect()
-        } else {
-            member_requests.to_vec()
         };
         // Before tearing anything down: a member list that cannot fit would
         // only fail again after the leftover members were removed.
@@ -13290,9 +13474,94 @@ echo "[restore] Pre-seed complete"
         service_instance
             .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
             .await
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to get runtime environment variables: {}", e),
+            .map_err(|e| {
+                // A sandbox's database refused to a deployment is a conflict
+                // the operator resolves, not an internal failure.
+                match e.downcast_ref::<crate::sandbox_engines::SandboxNamespaceConflict>() {
+                    Some(conflict) => ExternalServiceError::SandboxNamespaceConflict {
+                        service_id: service_id_val,
+                        conflict: conflict.clone(),
+                    },
+                    None => ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to get runtime environment variables for service {} \
+                             (project scope '{}', environment scope '{}'): {}",
+                            service_id_val, project_scope, environment_scope, e
+                        ),
+                    },
+                }
             })
+    }
+
+    /// Credentials for the sandbox in `scope` to use `service_id_val`: a
+    /// namespace of its own on the service and a credential that reaches only
+    /// that namespace (ADR-051). The deployment credentials are never
+    /// returned.
+    ///
+    /// The engine for the service's type does the provisioning (see
+    /// [`crate::sandbox_engines`]); this method owns the checks every engine
+    /// shares. A type with no engine fails with
+    /// [`ExternalServiceError::NoSandboxAccessEngine`], which callers read as
+    /// "leave this service out", never as a reason to hand out the
+    /// deployment's credentials.
+    pub async fn issue_sandbox_runtime_env(
+        &self,
+        service_id_val: i32,
+        scope: &temps_core::SandboxScope,
+    ) -> Result<HashMap<String, String>, ExternalServiceError> {
+        let service = self.get_service(service_id_val).await?;
+        let engine =
+            crate::sandbox_engines::engine_for(&service.service_type).ok_or_else(|| {
+                ExternalServiceError::NoSandboxAccessEngine {
+                    service_id: service_id_val,
+                    service_type: service.service_type.clone(),
+                }
+            })?;
+        // A link made through a project must still be a link of that project:
+        // the project is what the user was allowed to reach the service by.
+        let namespace = match scope.project_id {
+            Some(project_id) => {
+                let linked = project_services::Entity::find()
+                    .filter(
+                        project_services::Column::ServiceId
+                            .eq(service_id_val)
+                            .and(project_services::Column::ProjectId.eq(project_id)),
+                    )
+                    .one(self.db.as_ref())
+                    .await?
+                    .is_some();
+                if !linked {
+                    return Err(ExternalServiceError::ServiceNotLinkedToProject {
+                        service_id: service_id_val,
+                        project_id,
+                    });
+                }
+                crate::sandbox_engines::SandboxNamespace::project(
+                    projects::Entity::find_by_id(project_id)
+                        .one(self.db.as_ref())
+                        .await?
+                        .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?
+                        .slug,
+                )
+            }
+            // A link made to the service directly: a namespace of the
+            // sandbox's own, named so that no project's can ever match it.
+            None => {
+                crate::sandbox_engines::SandboxNamespace::sandbox(scope.sandbox_public_id.clone())
+            }
+        };
+        let parameters = self.get_service_parameters(service_id_val).await?;
+        engine
+            .issue(
+                self,
+                crate::sandbox_engines::SandboxAccessRequest {
+                    service: &service,
+                    namespace: &namespace,
+                    project_id: scope.project_id,
+                    parameters: &parameters,
+                },
+            )
+            .await
     }
 
     /// Run a standalone service's provider-authenticated health probe in the
@@ -16556,6 +16825,69 @@ impl temps_core::SandboxRuntimeCredentialsProvider for ExternalServiceManager {
                 },
             })
     }
+
+    async fn sandbox_access_containers(
+        &self,
+        service_id: i32,
+    ) -> Result<Vec<String>, temps_core::SandboxRuntimeCredentialsError> {
+        let service = self
+            .get_service(service_id)
+            .await
+            .map_err(|error| match error {
+                ExternalServiceError::ServiceNotFound { id } => {
+                    temps_core::SandboxRuntimeCredentialsError::ServiceNotFound { service_id: id }
+                }
+                other => temps_core::SandboxRuntimeCredentialsError::Provider {
+                    service_id,
+                    reason: other.to_string(),
+                },
+            })?;
+        let Some(engine) = crate::sandbox_engines::engine_for(&service.service_type) else {
+            return Ok(Vec::new());
+        };
+        engine.containers(self, &service).await.map_err(|error| {
+            temps_core::SandboxRuntimeCredentialsError::Provider {
+                service_id,
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    async fn issue_for_sandbox(
+        &self,
+        service_id: i32,
+        scope: &temps_core::SandboxScope,
+    ) -> Result<HashMap<String, String>, temps_core::SandboxRuntimeCredentialsError> {
+        self.issue_sandbox_runtime_env(service_id, scope)
+            .await
+            .map_err(|error| match error {
+                ExternalServiceError::ServiceNotFound { id } => {
+                    temps_core::SandboxRuntimeCredentialsError::ServiceNotFound { service_id: id }
+                }
+                ExternalServiceError::ServiceNotLinkedToProject {
+                    service_id,
+                    project_id,
+                } => temps_core::SandboxRuntimeCredentialsError::ServiceNotLinked {
+                    service_id,
+                    project_id,
+                },
+                // Only a type with no engine falls through to the caller's
+                // choice. A service whose engine cannot reach it (another
+                // node) is a failure, never a downgrade to the shared
+                // credentials.
+                ExternalServiceError::NoSandboxAccessEngine {
+                    service_id,
+                    service_type,
+                } => temps_core::SandboxRuntimeCredentialsError::NoScopedCredentials {
+                    service_id,
+                    service_type,
+                },
+                other => temps_core::SandboxRuntimeCredentialsError::Provider {
+                    service_id,
+                    reason: other.to_string(),
+                },
+            })
+    }
 }
 
 /// Lets the metrics scraper reach HA clusters: `temps-metrics` cannot depend
@@ -16807,6 +17139,31 @@ mod tests {
             if let Some(name) = name {
                 assert!(insert.contains(&name));
             }
+        }
+    }
+
+    #[test]
+    fn a_custom_database_name_in_the_sandbox_namespace_is_refused() {
+        let config = |name: &str| DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Custom,
+            custom_database_name: Some(name.to_string()),
+        };
+        let error = config("_sandbox_shop")
+            .validate(71, 10, "postgres")
+            .expect_err("the sandbox namespace is reserved");
+        match error {
+            ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id: 71,
+                project_id: 10,
+                reason,
+            } => assert!(reason.contains("reserved for sandbox"), "{reason}"),
+            other => panic!("expected InvalidDatabaseProvisioning, got {other:?}"),
+        }
+        // Names merely mentioning a sandbox are still allowed.
+        for name in ["shop_sandbox", "sandbox_shop", "_shop"] {
+            config(name)
+                .validate(71, 10, "postgres")
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
         }
     }
 
@@ -17200,6 +17557,28 @@ mod tests {
             members: vec![cluster_member_health("orders-2", "wait_primary")],
         };
         assert!(healthy_writable_primary_nodename(&unreachable).is_none());
+    }
+
+    /// When no primary can be trusted, the error says what the monitor saw,
+    /// so a failed backup explains itself instead of claiming the cluster
+    /// simply has no primary.
+    #[test]
+    fn monitor_state_summary_names_each_node_and_why_it_was_not_trusted() {
+        let mut stale_primary = cluster_member_health("orders-1", "primary");
+        stale_primary.health = 0;
+        stale_primary.seconds_since_report = 45;
+        let report = health_report(vec![
+            stale_primary,
+            cluster_member_health("orders-2", "secondary"),
+        ]);
+        assert_eq!(
+            describe_monitor_states(&report),
+            "orders-1=primary (unhealthy, 45s since report), orders-2=secondary"
+        );
+        assert_eq!(
+            describe_monitor_states(&health_report(vec![])),
+            "no registered data nodes"
+        );
     }
 
     /// #1385: a replica removed while its provisioning task was still
@@ -21888,7 +22267,6 @@ mod tests {
             health_metadata: None,
             metrics_enabled: false,
             default_backup_provisioned: false,
-            ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
@@ -23737,15 +24115,25 @@ mod tests {
         )
         .await;
 
-        // Empty member request + no preserved members in DB
-        let result = manager.retry_cluster(service_id, &[]).await;
+        // Empty member request + no preserved members in DB: the retry falls
+        // back to the default layout instead of asking for a member list.
+        // Claimed inside a transaction that is rolled back, so no cluster is
+        // actually rebuilt.
+        let lock = manager.db.begin().await.expect("begin transaction");
+        let (leftover, members) = manager
+            .claim_cluster_retry(&lock, service_id, &[])
+            .await
+            .expect("a failed cluster with no members retries with the default layout");
+        lock.rollback().await.expect("rollback transaction");
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, ExternalServiceError::ParameterValidationFailed { .. }),
-            "Expected ParameterValidationFailed for missing members, got: {:?}",
-            err
+        assert!(leftover.is_empty());
+        let roles: Vec<_> = members
+            .iter()
+            .map(|m| (m.role.as_str(), m.node_id))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![("monitor", None), ("primary", None), ("replica", None)]
         );
     }
 
@@ -24824,6 +25212,75 @@ mod tests {
         assert!(err.to_string().contains("at most 10"), "{err}");
     }
 
+    #[test]
+    fn cluster_without_members_gets_monitor_primary_and_replica_on_the_control_plane() {
+        let members = resolve_cluster_members("ha-pg", &[]).unwrap();
+        let roles: Vec<&str> = members.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["monitor", "primary", "replica"]);
+        assert!(members.iter().all(|m| m.node_id.is_none()));
+    }
+
+    #[test]
+    fn explicit_cluster_members_are_kept_as_given() {
+        let given = vec![
+            member("monitor", None),
+            member("primary", Some(2)),
+            member("replica", Some(3)),
+        ];
+        let resolved = resolve_cluster_members("ha-pg", &given).unwrap();
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[1].node_id, Some(2));
+        assert_eq!(resolved[2].node_id, Some(3));
+    }
+
+    #[test]
+    fn cluster_without_a_monitor_is_rejected_with_the_expected_shape() {
+        let err =
+            resolve_cluster_members("ha-pg", &[member("primary", None), member("replica", None)])
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            ExternalServiceError::ParameterValidationFailed { .. }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("ha-pg"), "{msg}");
+        assert!(msg.contains("found 0 monitor"), "{msg}");
+        assert!(msg.contains("\"role\":\"monitor\""), "{msg}");
+    }
+
+    #[test]
+    fn cluster_with_two_monitors_is_rejected() {
+        let err = resolve_cluster_members(
+            "ha-pg",
+            &[
+                member("monitor", None),
+                member("monitor", None),
+                member("primary", None),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("found 2 monitor"), "{err}");
+    }
+
+    #[test]
+    fn cluster_with_only_a_monitor_is_rejected() {
+        let err = resolve_cluster_members("ha-pg", &[member("monitor", None)]).unwrap_err();
+        assert!(err.to_string().contains("no data member"), "{err}");
+    }
+
+    #[test]
+    fn cluster_with_an_unknown_role_is_rejected() {
+        let err =
+            resolve_cluster_members("ha-pg", &[member("monitor", None), member("leader", None)])
+                .unwrap_err();
+        assert!(err.to_string().contains("role 'leader'"), "{err}");
+    }
+
+    #[test]
+    fn default_cluster_layout_fits_the_port_block() {
+        assert!(validate_cluster_member_count("ha-pg", default_cluster_members().len()).is_ok());
+    }
+
     /// Regression: the ten-member limit was only enforced inside the
     /// background initialization, so an eleven-member request was accepted
     /// and became a failed service. It must be refused before any row exists.
@@ -25018,7 +25475,6 @@ mod tests {
             health_metadata: None,
             metrics_enabled: false,
             default_backup_provisioned: false,
-            ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,

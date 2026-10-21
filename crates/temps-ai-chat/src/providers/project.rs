@@ -25,7 +25,16 @@ use crate::provider::{ConversationContextProvider, ConversationSeed};
 const SYSTEM_PREAMBLE: &str = "You are an expert SRE/DevOps assistant embedded in the Temps platform, helping a developer with \
 their project. Answer questions and help debug issues across the project's deployments, build/runtime logs, distributed \
 traces, metrics, and errors. For example, inspect recent traces to find failing or slow requests, then drill into a \
-specific trace.";
+specific trace.
+
+A sandbox for shell steps: most work needs only the platform tools. When a step really needs a shell on this project's code \
+(editing and testing a change, several Git operations on a working copy, running or testing a server), if you have `temps_create_sandbox`, call it right away, without asking, whenever the user wants you to build or change \
+this project's code; otherwise call `temps_offer_sandbox` once with one sentence on what you would do there, then tell the user the same sentence and stop. \
+The user creates a sandbox, which starts as a clone of this project's repository, or links one of their own, or declines. \
+Never offer it for plain reads and changes you can make with the platform tools, and never offer it twice. Once a sandbox \
+is linked you get `sandbox_exec`, `sandbox_read_file` and `sandbox_write_file`, which work only on that sandbox. It has no \
+Git or platform credentials: do not ask the user for a token to put in it. If the user declines, carry on with the \
+platform tools and say what you could not do.";
 
 /// Seeds general, project-scoped assistant chats.
 pub struct ProjectChatProvider {
@@ -152,6 +161,10 @@ mod tests {
         assert_eq!(seed.title.as_deref(), Some("Project chat"));
         assert!(seed.system.contains("Acme"));
         assert!(seed.system.contains("owner/repo"));
+        // Project chats can be offered a sandbox for shell steps, once.
+        assert!(seed.system.contains("`temps_offer_sandbox`"));
+        assert!(seed.system.contains("`temps_create_sandbox`"));
+        assert!(seed.system.contains("never offer it twice"));
         // No first assistant turn — the user drives a general chat.
         assert!(seed.first_assistant.is_none());
     }

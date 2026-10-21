@@ -24,6 +24,7 @@ use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
 use tracing::{error, info};
 use utoipa::OpenApi;
@@ -282,18 +283,33 @@ pub struct TestProviderResponse {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+/// Request-side Slack config. Deliberately not `Serialize`: the webhook URL is
+/// a `SecretString`, which would serialize as `"***"`. Use
+/// [`SlackConfig::into_stored_value`] to build the value that gets encrypted.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SlackConfig {
-    pub webhook_url: String,
+    pub webhook_url: SecretString,
     pub channel: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+impl SlackConfig {
+    /// The JSON persisted (encrypted) for this provider, with the secret exposed.
+    pub fn into_stored_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "webhook_url": self.webhook_url.into_exposed(),
+            "channel": self.channel,
+        })
+    }
+}
+
+/// Request-side SMTP config. Not `Serialize` for the same reason as
+/// [`SlackConfig`]; use [`EmailConfig::into_stored_value`].
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct EmailConfig {
     pub smtp_host: String,
     pub smtp_port: u16,
     pub username: String,
-    pub password: String,
+    pub password: SecretString,
     pub from_name: Option<String>,
     pub from_address: String,
     pub to_addresses: Vec<String>,
@@ -303,6 +319,24 @@ pub struct EmailConfig {
     pub starttls_required: bool, // Only used when tls_mode is Starttls
     #[serde(default = "default_accept_invalid_certs")]
     pub accept_invalid_certs: bool, // Accept self-signed certificates (use with caution)
+}
+
+impl EmailConfig {
+    /// The JSON persisted (encrypted) for this provider, with the secret exposed.
+    pub fn into_stored_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "smtp_host": self.smtp_host,
+            "smtp_port": self.smtp_port,
+            "username": self.username,
+            "password": self.password.into_exposed(),
+            "from_name": self.from_name,
+            "from_address": self.from_address,
+            "to_addresses": self.to_addresses,
+            "tls_mode": self.tls_mode,
+            "starttls_required": self.starttls_required,
+            "accept_invalid_certs": self.accept_invalid_certs,
+        })
+    }
 }
 
 fn default_tls_mode() -> TlsMode {
@@ -317,28 +351,28 @@ fn default_accept_invalid_certs() -> bool {
     false // Default to secure behavior
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateSlackProviderRequest {
     pub name: String,
     pub config: SlackConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateNotificationEmailProviderRequest {
     pub name: String,
     pub config: EmailConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateSlackProviderRequest {
     pub name: Option<String>,
     pub config: SlackConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateNotificationEmailProviderRequest {
     pub name: Option<String>,
     pub config: EmailConfig,
@@ -392,14 +426,16 @@ pub struct UpdateWebhookProviderRequest {
 /// Notifications are delivered through Cloudflare's transactional Email Sending
 /// API. Only the account, token, sender and recipients are configured here —
 /// subject and body are derived from each notification.
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+/// Request-side config. Not `Serialize`: `api_token` is a `SecretString`; use
+/// [`CloudflareConfig::into_stored_value`].
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CloudflareConfig {
     /// Cloudflare account id that owns the Email Sending configuration.
     #[schema(example = "023e105f4ecef8ad9ca31a8372d0c353")]
     pub account_id: String,
     /// Cloudflare API token with the Email Sending permission. Encrypted at
     /// rest and masked in normal API responses.
-    pub api_token: String,
+    pub api_token: SecretString,
     /// Verified sender address (must belong to a domain enabled for Cloudflare
     /// Email Sending).
     #[schema(example = "welcome@infracf.example.com")]
@@ -411,14 +447,27 @@ pub struct CloudflareConfig {
     pub to_addresses: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+impl CloudflareConfig {
+    /// The JSON persisted (encrypted) for this provider, with the secret exposed.
+    pub fn into_stored_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "account_id": self.account_id,
+            "api_token": self.api_token.into_exposed(),
+            "from_address": self.from_address,
+            "from_name": self.from_name,
+            "to_addresses": self.to_addresses,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateCloudflareProviderRequest {
     pub name: String,
     pub config: CloudflareConfig,
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateCloudflareProviderRequest {
     pub name: Option<String>,
     pub config: CloudflareConfig,
@@ -964,7 +1013,7 @@ async fn create_slack_provider(
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Slack notification provider {}", request.name);
     let enabled = request.enabled.unwrap_or(true);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     match app_state
         .notification_service
         .add_provider(request.name, "slack".to_string(), config, enabled)
@@ -1033,7 +1082,7 @@ async fn create_notification_email_provider(
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Email notification provider {}", request.name);
     let enabled = request.enabled.unwrap_or(true);
-    let config = serde_json::to_value(&request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     match app_state
         .notification_service
         .add_provider(request.name, "email".to_string(), config, enabled)
@@ -1106,7 +1155,7 @@ async fn update_slack_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Slack notification provider {}", id);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
         config: Some(config),
@@ -1191,7 +1240,7 @@ async fn update_notification_email_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Email notification provider {}", id);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
         config: Some(config),
@@ -1473,7 +1522,7 @@ async fn create_cloudflare_provider(
     permission_guard!(auth, NotificationProvidersCreate);
     info!("Creating Cloudflare notification provider {}", request.name);
     let enabled = request.enabled.unwrap_or(true);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     match app_state
         .notification_service
         .add_provider(request.name, "cloudflare".to_string(), config, enabled)
@@ -1546,7 +1595,7 @@ async fn update_cloudflare_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationProvidersWrite);
     info!("Updating Cloudflare notification provider {}", id);
-    let config = serde_json::to_value(request.config).unwrap_or_default();
+    let config = request.config.into_stored_value();
     let update_request = UpdateProviderRequest {
         name: request.name,
         config: Some(config),
@@ -2657,7 +2706,7 @@ mod tests {
                 smtp_host: "localhost".to_string(),
                 smtp_port: self.mailpit_smtp_port,
                 username: "".to_string(), // Mailpit doesn't require auth
-                password: "".to_string(),
+                password: "".to_string().into(),
                 from_name: Some("Test Sender".to_string()),
                 from_address: "test@example.com".to_string(),
                 to_addresses: vec!["recipient@example.com".to_string()],
@@ -2669,7 +2718,9 @@ mod tests {
 
         fn create_test_slack_config(&self) -> SlackConfig {
             SlackConfig {
-                webhook_url: "https://hooks.slack.com/services/TEST/TEST/TEST".to_string(),
+                webhook_url: "https://hooks.slack.com/services/TEST/TEST/TEST"
+                    .to_string()
+                    .into(),
                 channel: Some("#test".to_string()),
             }
         }
@@ -2737,7 +2788,14 @@ mod tests {
             .uri("/notification-providers/email")
             .header("authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&request_body)?))?;
+            .body(Body::from(
+                serde_json::json!({
+                    "name": request_body.name,
+                    "config": request_body.config.into_stored_value(),
+                    "enabled": request_body.enabled,
+                })
+                .to_string(),
+            ))?;
 
         let response = app.oneshot(request).await?;
 
@@ -2817,7 +2875,14 @@ mod tests {
             .uri("/notification-providers/slack")
             .header("authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&request_body)?))?;
+            .body(Body::from(
+                serde_json::json!({
+                    "name": request_body.name,
+                    "config": request_body.config.into_stored_value(),
+                    "enabled": request_body.enabled,
+                })
+                .to_string(),
+            ))?;
 
         let response = app.oneshot(request).await?;
 
@@ -2864,7 +2929,9 @@ mod tests {
         let request_body = UpdateSlackProviderRequest {
             name: Some("Updated Slack Provider".to_string()),
             config: SlackConfig {
-                webhook_url: "https://hooks.slack.com/services/UPDATED/WEBHOOK/URL".to_string(),
+                webhook_url: "https://hooks.slack.com/services/UPDATED/WEBHOOK/URL"
+                    .to_string()
+                    .into(),
                 channel: Some("#updated-channel".to_string()),
             },
             enabled: Some(false),
@@ -2877,7 +2944,14 @@ mod tests {
             .uri("/notification-providers/slack/1")
             .header("authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&request_body)?))?;
+            .body(Body::from(
+                serde_json::json!({
+                    "name": request_body.name,
+                    "config": request_body.config.into_stored_value(),
+                    "enabled": request_body.enabled,
+                })
+                .to_string(),
+            ))?;
 
         let response = app.oneshot(request).await?;
 
@@ -2897,7 +2971,7 @@ mod tests {
                 smtp_host: "updated-smtp.example.com".to_string(),
                 smtp_port: 587,
                 username: "updated@example.com".to_string(),
-                password: "updated-password".to_string(),
+                password: "updated-password".to_string().into(),
                 from_name: Some("Updated Sender".to_string()),
                 from_address: "updated@example.com".to_string(),
                 to_addresses: vec!["updated-recipient@example.com".to_string()],
@@ -2915,7 +2989,14 @@ mod tests {
             .uri("/notification-providers/email/1")
             .header("authorization", "Bearer test-token")
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_string(&request_body)?))?;
+            .body(Body::from(
+                serde_json::json!({
+                    "name": request_body.name,
+                    "config": request_body.config.into_stored_value(),
+                    "enabled": request_body.enabled,
+                })
+                .to_string(),
+            ))?;
 
         let response = app.oneshot(request).await?;
 
@@ -3087,7 +3168,7 @@ mod tests {
         let setup = test_setup_or_skip!();
         let service = &setup.notification_state.notification_service;
         let routing = &setup.notification_state.notification_routing_service;
-        let email_config = serde_json::to_value(setup.create_test_email_config())?;
+        let email_config = setup.create_test_email_config().into_stored_value();
         let enabled = service
             .add_provider(
                 "Mailpit route test".to_string(),
@@ -3147,7 +3228,7 @@ mod tests {
         let setup = test_setup_or_skip!();
 
         // Create an email provider directly using the service
-        let email_config = serde_json::to_value(setup.create_test_email_config())?;
+        let email_config = setup.create_test_email_config().into_stored_value();
 
         let provider = setup
             .notification_state
@@ -3178,5 +3259,50 @@ mod tests {
 
         setup.cleanup().await?;
         Ok(())
+    }
+
+    #[test]
+    fn stored_provider_configs_keep_the_real_secret() {
+        let slack: SlackConfig = serde_json::from_value(serde_json::json!({
+            "webhook_url": "https://hooks.slack.com/services/T/B/real-secret",
+            "channel": "#ops",
+        }))
+        .unwrap();
+        assert!(!format!("{slack:?}").contains("real-secret"));
+        let stored = slack.into_stored_value();
+        assert_eq!(
+            stored["webhook_url"],
+            "https://hooks.slack.com/services/T/B/real-secret"
+        );
+        assert_eq!(stored["channel"], "#ops");
+
+        let email: EmailConfig = serde_json::from_value(serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "username": "mailer",
+            "password": "real-smtp-password",
+            "from_address": "from@example.com",
+            "to_addresses": ["to@example.com"],
+        }))
+        .unwrap();
+        assert!(!format!("{email:?}").contains("real-smtp-password"));
+        let stored = email.into_stored_value();
+        assert_eq!(stored["password"], "real-smtp-password");
+        assert_eq!(stored["tls_mode"], "Starttls");
+        assert_eq!(stored["starttls_required"], true);
+        assert_eq!(stored["accept_invalid_certs"], false);
+        assert_eq!(stored["to_addresses"][0], "to@example.com");
+
+        let cloudflare: CloudflareConfig = serde_json::from_value(serde_json::json!({
+            "account_id": "acct",
+            "api_token": "real-cf-token",
+            "from_address": "from@example.com",
+            "to_addresses": ["to@example.com"],
+        }))
+        .unwrap();
+        assert!(!format!("{cloudflare:?}").contains("real-cf-token"));
+        let stored = cloudflare.into_stored_value();
+        assert_eq!(stored["api_token"], "real-cf-token");
+        assert_eq!(stored["account_id"], "acct");
     }
 }

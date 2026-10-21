@@ -57,6 +57,7 @@ pub mod retention;
 pub mod retry;
 pub mod runtime;
 pub mod sandbox_runtime;
+pub mod secret_string;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
@@ -153,7 +154,9 @@ pub use runtime::{
     RuntimeConfigurationError, RuntimeContext, ServiceEndpoint, ServiceEndpointResolver,
     ServiceEndpointScheme, EXECUTION_ENVIRONMENT_VARIABLE, LEGACY_DEPLOYMENT_MODE_VARIABLE,
 };
-pub use sandbox_runtime::{SandboxRuntimeCredentialsError, SandboxRuntimeCredentialsProvider};
+pub use sandbox_runtime::{
+    SandboxRuntimeCredentialsError, SandboxRuntimeCredentialsProvider, SandboxScope,
+};
 pub use secrets_manager::SecretsManagerResolver;
 pub use sensitive_action::{
     SensitiveAction, SensitiveActionAuthorizationError, SensitiveActionAuthorizer,

@@ -91,6 +91,9 @@ pub(crate) fn worker_node_required(
         | E::DecryptionFailed { .. }
         | E::InvalidServiceType { .. }
         | E::ServiceNotLinkedToProject { .. }
+        | E::SandboxAccessUnsupported { .. }
+        | E::SandboxNamespaceConflict { .. }
+        | E::NoSandboxAccessEngine { .. }
         | E::ServiceClaimDenied { .. }
         | E::InvalidDatabaseProvisioning { .. }
         | E::ProjectNotFound { .. }
@@ -155,6 +158,17 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
                 .value("service_id", *service_id)
                 .build(),
         ),
+        // A database that belongs to the other side (a sandbox's to a
+        // deployment, or the reverse) was left untouched: a 409 naming the
+        // database and what to rename or remove.
+        E::SandboxNamespaceConflict { service_id, .. } => Some(
+            conflict()
+                .title("Database Belongs To Something Else")
+                .detail(error.to_string())
+                .value("error_code", "SANDBOX_NAMESPACE_CONFLICT")
+                .value("service_id", *service_id)
+                .build(),
+        ),
         // Every other condition keeps its own classification.
         E::ServiceNameConflict { .. }
         | E::ServiceNameRestoreConflict { .. }
@@ -171,6 +185,8 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::DecryptionFailed { .. }
         | E::InvalidServiceType { .. }
         | E::ServiceNotLinkedToProject { .. }
+        | E::SandboxAccessUnsupported { .. }
+        | E::NoSandboxAccessEngine { .. }
         | E::ServiceClaimDenied { .. }
         | E::InvalidDatabaseProvisioning { .. }
         | E::ProjectNotFound { .. }
@@ -257,7 +273,10 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
-        | E::LockTimeout { .. } => None,
+        | E::LockTimeout { .. }
+        | E::NoSandboxAccessEngine { .. }
+        | E::SandboxAccessUnsupported { .. }
+        | E::SandboxNamespaceConflict { .. } => None,
     }
 }
 
@@ -306,6 +325,9 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::DecryptionFailed { .. }
         | E::InvalidServiceType { .. }
         | E::ServiceNotLinkedToProject { .. }
+        | E::SandboxAccessUnsupported { .. }
+        | E::SandboxNamespaceConflict { .. }
+        | E::NoSandboxAccessEngine { .. }
         | E::ServiceClaimDenied { .. }
         | E::InvalidDatabaseProvisioning { .. }
         | E::ProjectNotFound { .. }
@@ -3865,8 +3887,6 @@ async fn update_service_resources(
         super::query_handlers::get_entity_info,
         super::query_handlers::query_data,
         super::query_handlers::read_entity_rows,
-        super::query_handlers::get_ai_data_access,
-        super::query_handlers::set_ai_data_access,
         super::query_handlers::download_object,
         super::metrics_handlers::get_service_metrics_range,
         super::metrics_handlers::get_service_metrics_latest,
@@ -3944,8 +3964,6 @@ async fn update_service_resources(
         super::query_handlers::QueryDataRequest,
         super::query_handlers::QueryDataResponse,
         super::query_handlers::ReadRowsQuery,
-        super::query_handlers::ToggleAiDataAccessRequest,
-        super::query_handlers::AiDataAccessResponse,
         super::metrics_handlers::MetricDataPoint,
         super::metrics_handlers::MetricsRangeQuery,
         super::metrics_handlers::MetricsStatusResponse,
@@ -4142,7 +4160,6 @@ mod tests {
             health_metadata: None,
             metrics_enabled: false,
             default_backup_provisioned: false,
-            ai_data_access: false,
             container_name: None,
             created_by_user_id: Some(1),
             continuous_archive_s3_source_id: None,
@@ -4427,6 +4444,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Choose a unique name"));
+    }
+
+    #[test]
+    fn a_database_that_belongs_to_the_other_side_is_a_conflict() {
+        let error = crate::services::ExternalServiceError::SandboxNamespaceConflict {
+            service_id: 7,
+            conflict: crate::sandbox_engines::SandboxNamespaceConflict::SandboxOwnedDatabase {
+                engine: "PostgreSQL",
+                database: "shop_sandbox".to_string(),
+                sandbox_user: "sbx_shop_sandbox".to_string(),
+                evidence: "it is owned by the sandbox role 'sbx_shop_sandbox'".to_string(),
+            },
+        };
+        let problem = external_service_problem(&error, "fallback".to_string());
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(problem.body["error_code"], "SANDBOX_NAMESPACE_CONFLICT");
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("Service 7"), "{detail}");
+        assert!(detail.contains("'shop_sandbox'"), "{detail}");
     }
 
     // Guards the shared error->status mapping used by update_service /
@@ -4800,7 +4836,6 @@ mod tests {
             health_metadata: None,
             metrics_enabled: false,
             default_backup_provisioned: false,
-            ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,

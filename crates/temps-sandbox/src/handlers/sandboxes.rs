@@ -37,6 +37,7 @@ use utoipa::ToSchema;
 
 use temps_auth::{permissions::Permission, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::secret_string::SecretString;
 
 use crate::error::SandboxError;
 use crate::handlers::SandboxAppState;
@@ -231,6 +232,9 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Runtime Credentials Failed")
                     .with_detail(error.to_string())
             }
+            SandboxError::ServiceNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Service Not Found")
+                .with_detail(error.to_string()),
             SandboxError::RuntimeVariableConflict { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Ambiguous Sandbox Runtime Variables")
@@ -563,7 +567,7 @@ pub struct CreateSandboxBody {
     /// gate). The plaintext is never returned; only the last-4 hint is
     /// surfaced in `SandboxResponse.preview_password_hint`.
     #[serde(default)]
-    pub preview_password: Option<String>,
+    pub preview_password: Option<SecretString>,
     /// Ports the sandbox will listen on. Each port becomes a `routes[]`
     /// entry in the create/get response so `@vercel/sandbox`'s
     /// `sandbox.domain(port)` can resolve it client-side without an
@@ -646,7 +650,7 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             disk_size_mb: b.disk_size_mb,
             allow_docker: b.allow_docker,
             source: b.source.map(SandboxSource::from),
-            preview_password: b.preview_password,
+            preview_password: b.preview_password.map(SecretString::into_exposed),
             ports: b.ports,
             backend: b.backend,
             lifecycle: b.lifecycle,
@@ -2683,7 +2687,7 @@ pub struct SetPreviewPasswordBody {
     /// Plaintext password to protect the sandbox's preview URLs. Hashed
     /// server-side with argon2id — we never persist or echo this back.
     /// Must be between 8 and 256 characters.
-    pub password: String,
+    pub password: SecretString,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2714,7 +2718,7 @@ pub async fn set_preview_password(
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
     let hint = state
         .sandbox_service
-        .set_preview_password(&id, auth.user_id(), &body.password)
+        .set_preview_password(&id, auth.user_id(), body.password.expose())
         .await?;
     Ok(Json(SetPreviewPasswordResponse {
         preview_password_hint: hint,

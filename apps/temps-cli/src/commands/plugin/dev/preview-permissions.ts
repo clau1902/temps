@@ -103,6 +103,8 @@ export const previewPermissions = {
     "git_connections:delete",
     "git_repositories:read",
     "git_repositories:sync",
+    "git_repositories:create",
+    "git_repositories:write",
     "imports:read",
     "imports:create",
     "email_providers:read",

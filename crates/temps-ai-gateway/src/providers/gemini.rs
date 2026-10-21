@@ -372,6 +372,7 @@ impl GeminiProvider {
             prompt_tokens: u.prompt_token_count,
             completion_tokens: u.candidates_token_count,
             total_tokens: u.total_token_count,
+            prompt_tokens_details: None,
         });
 
         let message_content = if text_content.is_empty() && !tool_calls.is_empty() {
@@ -511,6 +512,7 @@ impl GeminiProvider {
                     prompt_tokens: u.prompt_token_count,
                     completion_tokens: u.candidates_token_count,
                     total_tokens: u.total_token_count,
+                    prompt_tokens_details: None,
                 });
 
                 let chunk = ChatCompletionChunk {
@@ -1248,11 +1250,13 @@ mod tests {
             content: Some(MessageContent::Parts(vec![
                 ContentPart {
                     r#type: "text".to_string(),
+                    cache_control: None,
                     text: Some("What's in this image?".to_string()),
                     image_url: None,
                 },
                 ContentPart {
                     r#type: "image_url".to_string(),
+                    cache_control: None,
                     text: None,
                     image_url: Some(serde_json::json!({
                         "url": "data:image/png;base64,iVBORw0KGgo="
@@ -1287,6 +1291,7 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Parts(vec![ContentPart {
                 r#type: "image_url".to_string(),
+                cache_control: None,
                 text: None,
                 image_url: Some(serde_json::json!({
                     "url": "https://example.com/photo.png"

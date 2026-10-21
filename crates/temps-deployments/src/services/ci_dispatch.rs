@@ -66,8 +66,10 @@ pub struct CiExecutorSettings {
     pub image_repository: String,
     pub limits: BuildLimits,
     /// Write-only. Stored encrypted; omitted by the status endpoint.
+    // Published as a credential, but a `String` here: these settings are
+    // serialized for storage, and `SecretString` serializes as a mask.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(write_only)]
+    #[schema(write_only, value_type = Option<temps_core::secret_string::SecretString>)]
     pub dispatch_token: Option<String>,
     /// Repository-scoped push/pull credentials. Never included in status.
     #[serde(skip_serializing_if = "Option::is_none")]
