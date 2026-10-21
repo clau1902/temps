@@ -151,7 +151,7 @@ A backup you have never restored is a hope, not a backup. Before you rely on it:
 
 ## Secure accounts {{ anchor: true, id: 'accounts' }}
 
-- **MFA.** Admins can enroll a TOTP authenticator from their **Account** page and receive eight single-use recovery codes. (Accounts with the `user` role cannot enroll MFA in the current release.) Users with MFA must verify again for sensitive actions such as creating API keys, assigning roles, resetting passwords, deleting backups or restoring services. The API answers `428` with `STEP_UP_REQUIRED` until they do. A verification lasts five minutes.
+- **MFA.** Any account, `admin` or `user`, can enroll a TOTP authenticator from its **Account** page and receives eight single-use recovery codes. A recovery code works in place of an authenticator code, including at sign-in, so keep them somewhere other than the phone: an admin cannot remove another account's MFA. Users with MFA must verify again for sensitive actions such as creating API keys, assigning roles, resetting passwords, deleting backups or restoring services. The API answers `428` with `STEP_UP_REQUIRED` until they do. A verification lasts five minutes.
 - **Require MFA for admins.** Once every admin has enrolled, turn on `require_mfa_for_admins`. Password logins by Admin users without MFA are then rejected. The setting is not in the console yet. Set it through the settings API with an admin API key:
 
   ```bash
