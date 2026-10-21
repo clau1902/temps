@@ -68,6 +68,30 @@ export function saveLastAssistantModel(modelId: string): void {
   }
 }
 
+const LAST_KEY_KEY = 'temps.assistant.last-key'
+
+/** The provider key the user last started a chat on, if any. */
+export function loadLastAssistantKeyId(): number | null {
+  try {
+    const stored = Number(window.localStorage.getItem(LAST_KEY_KEY))
+    return Number.isInteger(stored) && stored > 0 ? stored : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Remember the provider key a new chat was started on, so the next one starts
+ * there too. Like the model, only a starting point for new chats.
+ */
+export function saveLastAssistantKeyId(keyId: number): void {
+  try {
+    window.localStorage.setItem(LAST_KEY_KEY, String(keyId))
+  } catch {
+    // Storage can be unavailable (private mode); the default key still applies.
+  }
+}
+
 export function isAssistantConversation(conversation: {
   context_type: string
 }): boolean {

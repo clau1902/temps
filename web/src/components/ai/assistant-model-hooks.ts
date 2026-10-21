@@ -18,21 +18,44 @@ import {
   type ImageSupport,
 } from './assistant-models'
 import {
+  activeAssistantKeys,
+  defaultAssistantKey,
+  resolveAssistantKey,
+} from './assistant-keys'
+import {
+  loadLastAssistantKeyId,
   loadLastAssistantModel,
+  saveLastAssistantKeyId,
   saveLastAssistantModel,
 } from './assistant-state'
 
-/** The gateway key the assistant runs on: the active OpenRouter key if there is one. */
-export function useAssistantProviderKey(enabled = true) {
-  const keys = useQuery({
+/**
+ * The gateway keys an assistant chat can run on, and the one it runs on by
+ * default: the active OpenRouter key if there is one, else the first active
+ * key.
+ */
+export function useAssistantProviderKeys(enabled = true) {
+  const query = useQuery({
     ...listProviderKeysOptions(),
     staleTime: 15_000,
     retry: false,
     enabled,
   })
-  const active = (keys.data ?? []).filter((key) => key.is_active)
-  const key = active.find((item) => item.provider === 'openrouter') ?? active[0]
-  return { key: key ?? null, isPending: keys.isPending }
+  const keys = useMemo(
+    () => activeAssistantKeys(query.data ?? []),
+    [query.data]
+  )
+  return {
+    keys,
+    defaultKey: defaultAssistantKey(keys),
+    isPending: query.isPending,
+  }
+}
+
+/** The gateway key the assistant runs on by default. */
+export function useAssistantProviderKey(enabled = true) {
+  const { defaultKey, isPending } = useAssistantProviderKeys(enabled)
+  return { key: defaultKey, isPending }
 }
 
 /** The key's models with what the provider's catalogue says about each. */
@@ -56,10 +79,13 @@ export function useProviderModels(providerKeyId: number | null) {
  */
 export function useAssistantImageSupport(
   enabled: boolean,
-  modelId: string | null
+  modelId: string | null,
+  /** The key the chat runs on; the default key when not known. */
+  providerKeyId: number | null = null
 ): ImageSupport {
   const { key } = useAssistantProviderKey(enabled)
-  const models = useProviderModels(enabled ? (key?.id ?? null) : null)
+  const keyId = providerKeyId ?? key?.id ?? null
+  const models = useProviderModels(enabled ? keyId : null)
   return useMemo(() => {
     if (!enabled || !modelId) return 'unknown'
     return imageSupport(models.options.find((m) => m.id === modelId)?.details)
@@ -117,24 +143,37 @@ export function useEffectiveDefaultModel(
 }
 
 /**
- * The model a new chat will be created with. Chosen per chat: picking one
- * changes only this chat. It starts on the model last used when that is still
- * offered, else the key's default, so the user is not asked again every time.
+ * The provider key and model a new chat will be created with. Chosen per
+ * chat: picking one changes only this chat. It starts on the key and model
+ * last used when they are still offered, else the default key and its default
+ * model, so the user is not asked again every time.
  */
 export function useNewChatModel() {
-  const { key } = useAssistantProviderKey()
+  const { keys } = useAssistantProviderKeys()
+  const [picked, setPicked] = useState<{
+    keyId: number
+    model: string
+  } | null>(null)
+  const [lastKeyId] = useState(loadLastAssistantKeyId)
+  const [lastModel] = useState(loadLastAssistantModel)
+
+  const key = resolveAssistantKey(keys, picked?.keyId ?? lastKeyId)
   const models = useProviderModels(key?.id ?? null)
   const defaultModel = useEffectiveDefaultModel(key)
-  const [picked, setPicked] = useState<string | null>(null)
-  const [last] = useState(loadLastAssistantModel)
 
   const offered = (modelId: string | null) =>
     modelId !== null && models.options.some((option) => option.id === modelId)
-  const model = picked ?? (offered(last) ? last : defaultModel)
+  const model =
+    picked && picked.keyId === key?.id
+      ? picked.model
+      : offered(lastModel)
+        ? lastModel
+        : defaultModel
 
-  const choose = useCallback((modelId: string) => {
-    setPicked(modelId)
+  const choose = useCallback((modelId: string, keyId: number) => {
+    setPicked({ keyId, model: modelId })
     saveLastAssistantModel(modelId)
+    saveLastAssistantKeyId(keyId)
   }, [])
-  return { model, choose }
+  return { keyId: key?.id ?? null, model, choose }
 }

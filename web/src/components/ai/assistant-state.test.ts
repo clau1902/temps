@@ -14,7 +14,9 @@ import {
   isAssistantConversation,
   permissionModeForAsk,
   setupPathFromProblem,
+  loadLastAssistantKeyId,
   loadLastAssistantModel,
+  saveLastAssistantKeyId,
   saveLastAssistantModel,
 } from './assistant-state'
 
@@ -180,6 +182,24 @@ describe('last assistant model', () => {
     fakeWindow('throws')
     expect(loadLastAssistantModel()).toBeNull()
     expect(() => saveLastAssistantModel('vendor/model-a')).not.toThrow()
+  })
+
+  test('remembers the provider key a chat was last started on', () => {
+    fakeWindow({})
+    expect(loadLastAssistantKeyId()).toBeNull()
+    saveLastAssistantKeyId(7)
+    expect(loadLastAssistantKeyId()).toBe(7)
+  })
+
+  test('ignores a stored key id that is not a positive integer', () => {
+    fakeWindow({ 'temps.assistant.last-key': 'abc' })
+    expect(loadLastAssistantKeyId()).toBeNull()
+  })
+
+  test('falls back quietly for the key when storage is unavailable', () => {
+    fakeWindow('throws')
+    expect(loadLastAssistantKeyId()).toBeNull()
+    expect(() => saveLastAssistantKeyId(7)).not.toThrow()
   })
 })
 

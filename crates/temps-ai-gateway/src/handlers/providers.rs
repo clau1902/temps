@@ -29,7 +29,7 @@ use crate::handlers::types::AiGatewayAppState;
 use crate::provider_url::KeyTrust;
 use crate::self_hosted::{is_self_hosted, SelfHostedCapabilities};
 use crate::services::{NewProviderKey, ProviderKeyUpdate, TrustChange, TrustRequest};
-use crate::types::ModelInfo;
+use crate::types::DiscoveredModel;
 
 // ============================================================================
 // Error conversion
@@ -441,13 +441,16 @@ pub struct DiscoverProviderModelsRequest {
 pub struct DiscoveredModelResponse {
     pub id: String,
     pub owned_by: String,
+    /// The model's human-readable name, when the server's listing gives one.
+    pub name: Option<String>,
 }
 
-impl From<ModelInfo> for DiscoveredModelResponse {
-    fn from(model: ModelInfo) -> Self {
+impl From<DiscoveredModel> for DiscoveredModelResponse {
+    fn from(model: DiscoveredModel) -> Self {
         Self {
-            id: model.id,
-            owned_by: model.owned_by,
+            id: model.info.id,
+            owned_by: model.info.owned_by,
+            name: model.details.and_then(|details| details.name),
         }
     }
 }
@@ -494,12 +497,30 @@ fn requested_key_trust(
 /// Errors from verifying a new key. A blocked base URL is reported as is,
 /// with its hint, so the form explains what to change (#1410); everything
 /// else reads as a failed verification.
-fn verification_error(error: AiGatewayError) -> AiGatewayError {
+///
+/// A vendor provider (OpenAI, Anthropic, ...) given a custom base URL is
+/// verified with that vendor's own model names, so pointing it at another
+/// vendor's OpenAI-compatible API (DeepSeek, Groq, ...) fails with an
+/// unknown-model error. `custom_vendor_base_url` carries the provider id in
+/// that case so the message says which provider to use instead.
+fn verification_error(
+    error: AiGatewayError,
+    custom_vendor_base_url: Option<&str>,
+) -> AiGatewayError {
     match error {
         AiGatewayError::InvalidProviderUrl { .. } => error,
-        other => AiGatewayError::Validation {
-            message: format!("API key verification failed: {}", other.summary()),
-        },
+        other => {
+            let mut message = format!("API key verification failed: {}", other.summary());
+            if let Some(provider) = custom_vendor_base_url {
+                message.push_str(&format!(
+                    ". The custom base URL on a '{provider}' key must serve {provider}'s own \
+                     models; for any other API that speaks the OpenAI protocol (DeepSeek, \
+                     Groq, Together, vLLM, ...) add an OpenAI-compatible provider instead, \
+                     which lists the server's models at /models"
+                ));
+            }
+            AiGatewayError::Validation { message }
+        }
     }
 }
 
@@ -582,8 +603,8 @@ async fn create_provider_key(
     let self_hosted = is_self_hosted(&request.provider);
     if self_hosted && base_url.is_none() {
         return Err(AiGatewayError::Validation {
-            message: "A base URL is required for a self-hosted (OpenAI-compatible) provider, \
-                      e.g. http://10.0.0.5:8000/v1"
+            message: "A base URL is required for an OpenAI-compatible provider, \
+                      e.g. https://api.deepseek.com/v1 or http://10.0.0.5:8000/v1"
                 .to_string(),
         }
         .into());
@@ -619,7 +640,14 @@ async fn create_provider_key(
             key_trust,
         )
         .await
-        .map_err(verification_error)?;
+        .map_err(|error| {
+            verification_error(
+                error,
+                base_url
+                    .filter(|_| !self_hosted)
+                    .map(|_| request.provider.as_str()),
+            )
+        })?;
 
     let mut key = app_state
         .provider_key_service
@@ -638,7 +666,7 @@ async fn create_provider_key(
     if let Some(models) = discovered {
         if let Err(error) = app_state
             .provider_model_service
-            .apply_discovered(key.id, models.into_iter().map(Into::into).collect())
+            .apply_discovered(key.id, models)
             .await
         {
             app_state.provider_key_service.delete(key.id).await?;
@@ -732,7 +760,7 @@ async fn discover_provider_models(
     let key_trust = requested_key_trust(&auth, request.trust_private_address, base_url)?;
     let models = app_state
         .gateway_service
-        .discover_models(
+        .discover_model_catalog(
             &request.provider,
             request.api_key.expose(),
             base_url,
@@ -1279,5 +1307,53 @@ mod replacement_check_tests {
         let update = request(r#"{"api_key":"sk-secret-value"}"#);
         let rendered = format!("{update:?}");
         assert!(!rendered.contains("sk-secret-value"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upstream_error() -> AiGatewayError {
+        AiGatewayError::Validation {
+            message: "Upstream provider error for model 'gpt-5-nano': 400 unknown model"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn verification_error_suggests_openai_compatible_for_vendor_with_custom_base_url() {
+        let error = verification_error(upstream_error(), Some("openai"));
+
+        let AiGatewayError::Validation { message } = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(
+            message.starts_with("API key verification failed:"),
+            "{message}"
+        );
+        assert!(message.contains("gpt-5-nano"), "{message}");
+        assert!(
+            message.contains("'openai' key must serve openai's own models"),
+            "{message}"
+        );
+        assert!(
+            message.contains("add an OpenAI-compatible provider"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn verification_error_without_custom_base_url_has_no_hint() {
+        let error = verification_error(upstream_error(), None);
+
+        let AiGatewayError::Validation { message } = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(
+            message.starts_with("API key verification failed:"),
+            "{message}"
+        );
+        assert!(!message.contains("OpenAI-compatible"), "{message}");
     }
 }

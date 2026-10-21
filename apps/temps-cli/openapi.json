@@ -20031,6 +20031,13 @@
           "id": {
             "type": "string"
           },
+          "name": {
+            "description": "The model's human-readable name, when the server's listing gives one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "owned_by": {
             "type": "string"
           }
@@ -54346,7 +54353,7 @@
       "SendMessageRequest": {
         "properties": {
           "ai_model": {
-            "description": "Optional next-turn model. The provider harness remains pinned, but its\nadvertised models may be changed between turns.",
+            "description": "Optional next-turn model, one advertised by the conversation's\nprovider (or by `ai_provider` when that is set).",
             "type": [
               "string",
               "null"
@@ -54354,6 +54361,13 @@
           },
           "ai_permission_mode": {
             "description": "Optional next-turn permission mode for the pinned provider harness.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ai_provider": {
+            "description": "Optional AI gateway provider (`gateway_key:<id>`) for this and later\nturns. A chat on an AI gateway provider may move to another one; a\nprovider harness chat stays on the provider it was created with.",
             "type": [
               "string",
               "null"

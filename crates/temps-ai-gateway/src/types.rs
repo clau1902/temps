@@ -288,21 +288,37 @@ impl ModelDetails {
             (per_token.is_finite() && per_token >= 0.0).then_some(per_token * 1_000_000.0)
         };
         let architecture = entry.get("architecture");
+        // OpenRouter nests modalities under `architecture`; OpenAI-compatible
+        // servers that publish them at all put them on the entry itself.
+        let modalities = |field: &str| {
+            let nested = strings(architecture.and_then(|a| a.get(field)));
+            if nested.is_empty() {
+                strings(entry.get(field))
+            } else {
+                nested
+            }
+        };
         let pricing = entry.get("pricing");
         let supported = entry
             .get("supported_parameters")
             .and_then(serde_json::Value::as_array);
         let details = Self {
+            // The name doubles as the model row's display name, so it must
+            // fit that column and render as one line.
             name: entry
                 .get("name")
                 .and_then(serde_json::Value::as_str)
-                .filter(|name| !name.trim().is_empty())
+                .map(str::trim)
+                .filter(|name| {
+                    !name.is_empty() && name.len() <= 255 && !name.chars().any(char::is_control)
+                })
                 .map(str::to_string),
             context_length: entry
                 .get("context_length")
+                .or_else(|| entry.get("context_window"))
                 .and_then(serde_json::Value::as_u64),
-            input_modalities: strings(architecture.and_then(|a| a.get("input_modalities"))),
-            output_modalities: strings(architecture.and_then(|a| a.get("output_modalities"))),
+            input_modalities: modalities("input_modalities"),
+            output_modalities: modalities("output_modalities"),
             input_price_per_million: per_million(pricing.and_then(|p| p.get("prompt"))),
             output_price_per_million: per_million(pricing.and_then(|p| p.get("completion"))),
             cache_read_price_per_million: per_million(
@@ -442,6 +458,35 @@ mod model_details_tests {
     fn variable_or_malformed_prices_are_not_reported() {
         let entry = json!({ "pricing": { "prompt": "-1", "completion": "free" } });
         assert_eq!(ModelDetails::from_catalog_entry(&entry), None);
+    }
+
+    #[test]
+    fn reads_an_openai_compatible_listing_with_flat_fields() {
+        let entry = json!({
+            "id": "example-flash",
+            "object": "model",
+            "owned_by": "example",
+            "name": "Example-V1-Flash",
+            "context_window": 1048576,
+            "input_modalities": ["text", "image"],
+            "output_modalities": ["text"]
+        });
+        let details = ModelDetails::from_catalog_entry(&entry).expect("details");
+        assert_eq!(details.name.as_deref(), Some("Example-V1-Flash"));
+        assert_eq!(details.context_length, Some(1_048_576));
+        assert_eq!(details.input_modalities, vec!["text", "image"]);
+        assert_eq!(details.output_modalities, vec!["text"]);
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_a_display_name_is_dropped() {
+        for name in ["   ", "two\nlines", &"x".repeat(256)] {
+            assert_eq!(
+                ModelDetails::from_catalog_entry(&json!({ "name": name })),
+                None,
+                "{name:?} must not become a display name"
+            );
+        }
     }
 
     #[test]

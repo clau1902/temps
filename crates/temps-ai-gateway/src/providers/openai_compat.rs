@@ -328,7 +328,7 @@ impl OpenAiCompatProvider {
         Self::new(
             ProviderInfo {
                 id: crate::self_hosted::OPENAI_COMPATIBLE,
-                display_name: "Self-hosted (OpenAI-compatible)",
+                display_name: "OpenAI-compatible",
                 default_base_url: "",
                 capabilities: &[
                     ProviderCapability::ChatCompletion,

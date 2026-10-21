@@ -9536,6 +9536,10 @@ export type DiscoverResponse = {
 
 export type DiscoveredModelResponse = {
     id: string;
+    /**
+     * The model's human-readable name, when the server's listing gives one.
+     */
+    name?: string | null;
     owned_by: string;
 };
 
@@ -25403,14 +25407,20 @@ export type SendMessageAcceptedResponse = {
 
 export type SendMessageRequest = {
     /**
-     * Optional next-turn model. The provider harness remains pinned, but its
-     * advertised models may be changed between turns.
+     * Optional next-turn model, one advertised by the conversation's
+     * provider (or by `ai_provider` when that is set).
      */
     ai_model?: string | null;
     /**
      * Optional next-turn permission mode for the pinned provider harness.
      */
     ai_permission_mode?: string | null;
+    /**
+     * Optional AI gateway provider (`gateway_key:<id>`) for this and later
+     * turns. A chat on an AI gateway provider may move to another one; a
+     * provider harness chat stays on the provider it was created with.
+     */
+    ai_provider?: string | null;
     /**
      * Optional next-turn thinking level.
      */

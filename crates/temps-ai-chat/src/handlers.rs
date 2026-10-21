@@ -1159,8 +1159,13 @@ pub struct SendMessageRequest {
     /// same id never create a second user message or harness execution.
     #[serde(default)]
     pub turn_id: Option<String>,
-    /// Optional next-turn model. The provider harness remains pinned, but its
-    /// advertised models may be changed between turns.
+    /// Optional AI gateway provider (`gateway_key:<id>`) for this and later
+    /// turns. A chat on an AI gateway provider may move to another one; a
+    /// provider harness chat stays on the provider it was created with.
+    #[serde(default)]
+    pub ai_provider: Option<String>,
+    /// Optional next-turn model, one advertised by the conversation's
+    /// provider (or by `ai_provider` when that is set).
     #[serde(default)]
     pub ai_model: Option<String>,
     /// Optional next-turn thinking level.
@@ -8340,13 +8345,17 @@ pub async fn send_message(
         .ai_permission_mode
         .as_deref()
         .unwrap_or(&conv.ai_permission_mode);
-    ensure_runtime_permission(&auth, Some(&conv.ai_provider), Some(effective_permission))?;
-    ensure_enabled(&state, Some(&conv.ai_provider)).await?;
+    // A gateway chat may move to another gateway key; the service rejects any
+    // other provider change. Gate on the provider the turn will run on.
+    let effective_provider = req.ai_provider.as_deref().unwrap_or(&conv.ai_provider);
+    ensure_runtime_permission(&auth, Some(effective_provider), Some(effective_permission))?;
+    ensure_enabled(&state, Some(effective_provider)).await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     conv = state
         .service
-        .update_runtime_options(
+        .update_runtime_selection(
             &conv,
+            req.ai_provider.as_deref(),
             req.ai_model.as_deref(),
             req.ai_thinking_level.as_deref(),
             req.ai_permission_mode.as_deref(),
@@ -8495,15 +8504,21 @@ pub async fn send_user_message(
         .ai_permission_mode
         .as_deref()
         .unwrap_or(&conversation.ai_permission_mode);
-    ensure_runtime_permission(
-        &auth,
-        Some(&conversation.ai_provider),
-        Some(effective_permission),
-    )?;
+    // A gateway chat may move to another gateway key; the service rejects any
+    // other provider change. Gate on the provider the turn will run on.
+    let effective_provider = req
+        .ai_provider
+        .as_deref()
+        .unwrap_or(&conversation.ai_provider);
+    ensure_runtime_permission(&auth, Some(effective_provider), Some(effective_permission))?;
+    if effective_provider != conversation.ai_provider {
+        ensure_enabled(&state, Some(effective_provider)).await?;
+    }
     conversation = state
         .service
-        .update_runtime_options(
+        .update_runtime_selection(
             &conversation,
+            req.ai_provider.as_deref(),
             req.ai_model.as_deref(),
             req.ai_thinking_level.as_deref(),
             req.ai_permission_mode.as_deref(),
@@ -11823,6 +11838,7 @@ mod tests {
             content: content.to_string(),
             attachments: Vec::new(),
             turn_id: Some("turn-1".to_string()),
+            ai_provider: None,
             ai_model: None,
             ai_thinking_level: None,
             ai_permission_mode: None,

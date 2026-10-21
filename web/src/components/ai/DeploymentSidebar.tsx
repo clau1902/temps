@@ -41,8 +41,10 @@ import { ChatResourcesTab } from './ChatResourcesTab'
 import { ProjectTab } from './ProjectTab'
 import type { ProjectRef } from './project-refs'
 import {
+  deploymentUrlNote,
   isActiveDeploymentStatus,
   isFailedDeploymentStatus,
+  isReadyDeploymentStatus,
 } from './deployment-card-state'
 import { JobStatusIcon, statusPresentation } from './GeneratedDeploymentCard'
 import type { WatchedDeployment } from './goal-presentation'
@@ -180,7 +182,8 @@ function DeploymentTab({
   const stages = jobs.data?.jobs ?? []
   const progress = stageProgress(stages)
   const slug = project.data?.slug
-  const live = data.status === 'completed' && data.url
+  const live = isReadyDeploymentStatus(data.status) && data.url
+  const urlNote = deploymentUrlNote(data.status)
   return (
     <div className="flex min-h-0 flex-col" aria-live="polite">
       <div className="space-y-2 px-4 py-3">
@@ -222,10 +225,14 @@ function DeploymentTab({
             ) : (
               <span
                 className="break-all text-sm text-muted-foreground"
-                title="The link opens once the deployment is live"
+                title={
+                  urlNote === 'once live'
+                    ? 'The link opens once the deployment is live'
+                    : 'This deployment is not serving traffic'
+                }
               >
                 {data.url}
-                <span className="ml-1 text-xs">(once live)</span>
+                {urlNote && <span className="ml-1 text-xs">({urlNote})</span>}
               </span>
             )}
             <CopyButton value={data.url} className="size-6 shrink-0" />
@@ -668,7 +675,7 @@ function DeploymentRow({
   const name = project.data?.name ?? `Project ${deployment.projectId}`
   const id = data?.id ?? deployment.deploymentId
   const status = data ? statusPresentation(data.status) : null
-  const live = data?.is_current === true && data.status === 'completed'
+  const live = data?.is_current === true && isReadyDeploymentStatus(data.status)
   return (
     <li>
       <button

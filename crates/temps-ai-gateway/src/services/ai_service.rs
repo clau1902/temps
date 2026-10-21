@@ -540,7 +540,7 @@ impl AiService for GatewayAiService {
         let (key, declared) = self.serving_self_hosted_key(provider, None).await?;
         (!declared.streaming).then(|| {
             format!(
-                "AI provider key {} ('{}') is a self-hosted server that does not declare \
+                "AI provider key {} ('{}') is an OpenAI-compatible server that does not declare \
                  streaming, which AI chat needs. Enable \"Streaming\" for that key under AI \
                  Gateway > AI providers if the server supports it, or choose another provider \
                  for this chat.",

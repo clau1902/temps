@@ -178,6 +178,8 @@ import {
   getAiProvider,
   providerFromAddParam,
   isSelfHostedProvider,
+  providerKeyEndpoint,
+  SELF_HOSTED_PROVIDER_ID,
 } from '@/lib/ai-providers'
 import { SelfHostedProviderFields } from '@/components/ai/SelfHostedProviderFields'
 import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
@@ -192,8 +194,11 @@ import {
   providerKeyFormSchema,
   providerKeyFormToRequest,
   selectProviderKeyFormProvider,
+  switchToOpenAiCompatible,
+  vendorHasCustomBaseUrl,
   type ProviderKeyFormValues,
 } from '@/components/ai/provider-key-form'
+import { VendorBaseUrlHint } from '@/components/ai/VendorBaseUrlHint'
 import { ProviderKeyProviderPicker } from '@/components/ai/ProviderKeyProviderPicker'
 import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -885,6 +890,40 @@ function AiTimeRange({
 // pages, and the sandbox UI.
 const SUPPORTED_PROVIDERS = AI_PROVIDERS
 const providerName = aiProviderName
+
+/** A key's custom endpoint host, shown so keys of one provider differ. */
+function KeyEndpoint({ baseUrl }: { baseUrl?: string | null }) {
+  const endpoint = providerKeyEndpoint(baseUrl)
+  if (!endpoint) return null
+  return (
+    <Badge
+      variant="outline"
+      className="h-5 shrink-0 px-1.5 font-mono text-[10px]"
+      title={baseUrl ?? undefined}
+    >
+      {endpoint}
+    </Badge>
+  )
+}
+
+/**
+ * The models column of a provider row. An OpenAI-compatible provider lists
+ * the endpoints its keys point at, since that is what tells them apart.
+ */
+function providerRowModels(
+  provider: { id: string; models: string },
+  providerKeys: { base_url?: string | null }[]
+): string {
+  if (!isSelfHostedProvider(provider.id)) return provider.models
+  const endpoints = [
+    ...new Set(
+      providerKeys
+        .map((key) => providerKeyEndpoint(key.base_url))
+        .filter((endpoint): endpoint is string => endpoint !== null)
+    ),
+  ]
+  return endpoints.length > 0 ? endpoints.join(', ') : provider.models
+}
 const providerModels = aiProviderModels
 
 // ============================================================================
@@ -4227,6 +4266,17 @@ export function AiGatewayPage() {
     )
   }
 
+  const handleSwitchToOpenAiCompatible = () => {
+    providerKeyForm.reset(
+      switchToOpenAiCompatible(
+        providerKeyForm.getValues(),
+        providerName(SELF_HOSTED_PROVIDER_ID),
+        keys.filter((k) => k.provider === SELF_HOSTED_PROVIDER_ID).length,
+        SUPPORTED_PROVIDERS.map((p) => p.name)
+      )
+    )
+  }
+
   const handleCreate = providerKeyForm.handleSubmit((values) => {
     if (createMutation.isPending) return
     createMutation.mutate(providerKeyFormToRequest(values))
@@ -4576,7 +4626,7 @@ console.log(response.choices[0].message.content);`,
                         </TableCell>
                         <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
                           <span className="line-clamp-1">
-                            {provider.models}
+                            {providerRowModels(provider, providerKeys)}
                           </span>
                         </TableCell>
                         <TableCell className="hidden sm:table-cell py-2">
@@ -4656,6 +4706,7 @@ console.log(response.choices[0].message.content);`,
                                       Disabled
                                     </Badge>
                                   )}
+                                  <KeyEndpoint baseUrl={key.base_url} />
                                   <code className="text-xs text-muted-foreground truncate">
                                     {key.api_key_masked}
                                   </code>
@@ -4895,7 +4946,7 @@ console.log(response.choices[0].message.content);`,
                     id="baseUrl"
                     placeholder={
                       newProviderIsSelfHosted
-                        ? 'http://10.0.0.5:8000/v1'
+                        ? 'https://api.deepseek.com/v1 or http://10.0.0.5:8000/v1'
                         : 'https://api.openai.com/v1'
                     }
                     disabled={createMutation.isPending}
@@ -4909,9 +4960,15 @@ console.log(response.choices[0].message.content);`,
                   )}
                   <p className="text-xs text-muted-foreground">
                     {newProviderIsSelfHosted
-                      ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
-                      : 'Override the default API endpoint for this provider.'}
+                      ? 'The OpenAI-compatible API root, including /v1: a hosted API or a server on your network. Private addresses must be trusted first.'
+                      : `Only for a proxy or gateway that serves ${providerName(newProvider)}'s own models.`}
                   </p>
+                  <VendorBaseUrlHint
+                    open={vendorHasCustomBaseUrl(formValues)}
+                    providerName={providerName(newProvider)}
+                    onSwitch={handleSwitchToOpenAiCompatible}
+                    disabled={createMutation.isPending}
+                  />
                 </div>
                 <SelfHostedProviderFields
                   open={newProviderIsSelfHosted}

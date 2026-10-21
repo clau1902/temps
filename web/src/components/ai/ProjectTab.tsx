@@ -14,7 +14,10 @@ import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowRight, ExternalLink, GitBranch } from 'lucide-react'
 import { Link } from 'react-router'
-import { isActiveDeploymentStatus } from './deployment-card-state'
+import {
+  isActiveDeploymentStatus,
+  isReadyDeploymentStatus,
+} from './deployment-card-state'
 import { statusPresentation } from './GeneratedDeploymentCard'
 
 /** A project opened from the chat: what it is and how its latest deployment is doing. */
@@ -54,7 +57,8 @@ export function ProjectTab({ projectId }: { projectId: number }) {
   const data = project.data
   const deployment = latest.data
   const status = deployment ? statusPresentation(deployment.status) : null
-  const live = deployment?.status === 'completed' && deployment.url
+  const live =
+    deployment && isReadyDeploymentStatus(deployment.status) && deployment.url
   return (
     <div className="flex min-h-0 flex-col">
       <div className="flex items-center gap-3 px-4 py-3">

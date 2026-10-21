@@ -165,6 +165,11 @@ import { useAiAssistant } from './AiAssistantContext'
 import { AskBeforeChangesToggle } from './AskBeforeChangesToggle'
 import { AssistantModelChip } from './AssistantModelPicker'
 import {
+  assistantRuntimeSelection,
+  gatewayKeyIdFromProvider,
+  gatewayKeyProviderId,
+} from './assistant-keys'
+import {
   ASSISTANT_CONTEXT_TYPE,
   saveLastAssistantModel,
 } from './assistant-state'
@@ -180,6 +185,7 @@ import {
   chatThinkingItemContent,
   reconcileChatRuntimeAfterRefresh,
   resolveChatRuntimeSelection,
+  storedConversationRuntime,
   usesHarnessCatalog,
   type ChatProviderOption,
   type ChatRuntimeSelection,
@@ -2710,7 +2716,8 @@ function DebugChatPanelBody({
     })
   const modelImageSupport = useAssistantImageSupport(
     isAssistantChat,
-    runtimeSelection.modelId
+    runtimeSelection.modelId,
+    gatewayKeyIdFromProvider(runtimeSelection.providerId)
   )
   const selectedProvider = runtimeSelection.providerId
   const selectedProviderOption = providerOptions.find(
@@ -3127,8 +3134,16 @@ function DebugChatPanelBody({
     async (
       text: string,
       conversationId?: string,
-      retryAttachments?: ChatAttachment[]
+      retryAttachments?: ChatAttachment[],
+      /**
+       * The runtime this turn asks for. A caller that has just loaded or
+       * created the conversation passes its stored runtime: the selection
+       * state it set in the same tick is not visible to this closure yet, and
+       * sending the stale one would move the chat to another provider.
+       */
+      runtime?: ChatRuntimeSelection
     ): Promise<boolean> => {
+      const turnRuntime = runtime ?? runtimeSelection
       let id = conversationId ?? publicId
       const content = text.trim()
       const attachments = retryAttachments ?? pendingAttachments
@@ -3249,10 +3264,10 @@ function DebugChatPanelBody({
             body: {
               context_type: contextType,
               context_id: ctxId,
-              ai_provider: selectedProvider,
-              ai_model: runtimeSelection.modelId,
-              ai_thinking_level: runtimeSelection.thinkingOptionId,
-              ai_permission_mode: runtimeSelection.permissionModeId,
+              ai_provider: turnRuntime.providerId,
+              ai_model: turnRuntime.modelId,
+              ai_thinking_level: turnRuntime.thinkingOptionId,
+              ai_permission_mode: turnRuntime.permissionModeId,
             },
           })
           if (!conv) {
@@ -3273,9 +3288,10 @@ function DebugChatPanelBody({
           content,
           attachments: attachments.map(({ id, name }) => ({ id, name })),
           turn_id: turnId,
-          ai_model: runtimeSelection.modelId,
-          ai_thinking_level: runtimeSelection.thinkingOptionId,
-          ai_permission_mode: runtimeSelection.permissionModeId,
+          ai_provider: turnRuntime.providerId,
+          ai_model: turnRuntime.modelId,
+          ai_thinking_level: turnRuntime.thinkingOptionId,
+          ai_permission_mode: turnRuntime.permissionModeId,
           // Ephemeral framing about the page the user is on — not stored or
           // shown; the backend attaches it to this turn only. Honours the
           // user's include toggle.
@@ -3355,10 +3371,7 @@ function DebugChatPanelBody({
       ctxId,
       pageContext,
       includeContext,
-      selectedProvider,
-      runtimeSelection.modelId,
-      runtimeSelection.thinkingOptionId,
-      runtimeSelection.permissionModeId,
+      runtimeSelection,
       pendingAttachments,
       attachmentUploads,
       onConversationStatusInvalidated,
@@ -3674,7 +3687,12 @@ function DebugChatPanelBody({
       setMessages([])
       setHistoryPage({ has_more: false, next_before: null })
       setEarlierMessagesError(null)
-      void send(startPrompt, conv.public_id)
+      void send(
+        startPrompt,
+        conv.public_id,
+        undefined,
+        storedConversationRuntime(extended)
+      )
     } catch {
       setError(
         localChatFailure(
@@ -3847,7 +3865,12 @@ function DebugChatPanelBody({
               )
               return attachment ? [attachment] : []
             })
-            void sendRef.current(opening, conv.public_id, attachments)
+            void sendRef.current(
+              opening,
+              conv.public_id,
+              attachments,
+              storedConversationRuntime(extended)
+            )
           }
         }
       } catch (cause) {
@@ -4672,17 +4695,21 @@ function DebugChatPanelBody({
                   <>
                     <AssistantModelChip
                       value={runtimeSelection.modelId}
+                      providerKeyId={gatewayKeyIdFromProvider(
+                        runtimeSelection.providerId
+                      )}
+                      // A gateway chat can move to another key between turns;
+                      // the next message carries the new provider.
+                      chooseKey
                       disabled={starting || turnActive}
-                      onChange={(modelId) => {
+                      onChange={(modelId, keyId) => {
                         saveLastAssistantModel(modelId)
                         setRuntimeSelection((selection) =>
-                          resolveChatRuntimeSelection(
+                          assistantRuntimeSelection(
                             providerOptions,
-                            selection.providerId,
-                            {
-                              modelId,
-                              permissionModeId: selection.permissionModeId,
-                            }
+                            selection,
+                            gatewayKeyProviderId(keyId),
+                            modelId
                           )
                         )
                       }}

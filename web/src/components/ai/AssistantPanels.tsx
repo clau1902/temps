@@ -56,6 +56,7 @@ import {
   setupPathFromProblem,
 } from './assistant-state'
 import { AssistantModelChip, AssistantModelSetup } from './AssistantModelPicker'
+import { gatewayKeyProviderId } from './assistant-keys'
 import { enterSendsMessage } from './chat-page-state'
 import {
   useAssistantImageSupport,
@@ -420,7 +421,11 @@ export function AssistantStart({
   useFocusComposerShortcut(inputRef)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const newChatModel = useNewChatModel()
-  const imageSupport = useAssistantImageSupport(true, newChatModel.model)
+  const imageSupport = useAssistantImageSupport(
+    true,
+    newChatModel.model,
+    newChatModel.keyId
+  )
   const [project, setProject] = useState<ProjectChoice | null>(null)
   // The workspace the created chat already joined, so a retry after a failed
   // upload does not join it twice.
@@ -432,6 +437,9 @@ export function AssistantStart({
       if (!conversation) {
         const { data, error, response } = await createAssistantConversation({
           body: {
+            ...(newChatModel.keyId !== null
+              ? { ai_provider: gatewayKeyProviderId(newChatModel.keyId) }
+              : {}),
             ...(newChatModel.model ? { ai_model: newChatModel.model } : {}),
             ...projectRequest(project),
           },
@@ -694,6 +702,8 @@ export function AssistantStart({
             <AssistantModelChip
               value={newChatModel.model}
               onChange={newChatModel.choose}
+              providerKeyId={newChatModel.keyId}
+              chooseKey
               disabled={start.isPending || created !== null}
               roomy={roomy}
             />

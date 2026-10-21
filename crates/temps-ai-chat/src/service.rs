@@ -4306,9 +4306,9 @@ impl ConversationService {
     }
 
     /// Change turn-level runtime options while keeping the conversation's
-    /// provider harness pinned. Models, reasoning, and permission modes are
-    /// validated against that provider's current capabilities and persisted so
-    /// reloads and subsequent turns use the same selection.
+    /// provider pinned. Models, reasoning, and permission modes are validated
+    /// against that provider's current capabilities and persisted so reloads
+    /// and subsequent turns use the same selection.
     pub async fn update_runtime_options(
         &self,
         conv: &ai_conversations::Model,
@@ -4316,8 +4316,37 @@ impl ConversationService {
         thinking_level: Option<&str>,
         permission_mode: Option<&str>,
     ) -> Result<ai_conversations::Model, ChatError> {
+        self.update_runtime_selection(conv, None, model, thinking_level, permission_mode)
+            .await
+    }
+
+    /// [`Self::update_runtime_options`], plus moving the conversation to
+    /// another provider. Only AI-gateway chats may switch, and only to
+    /// another AI-gateway provider: a gateway turn replays the stored history,
+    /// so nothing provider-specific is lost, while a host harness keeps its
+    /// own session and sandbox and stays pinned to the provider it started on.
+    pub async fn update_runtime_selection(
+        &self,
+        conv: &ai_conversations::Model,
+        provider: Option<&str>,
+        model: Option<&str>,
+        thinking_level: Option<&str>,
+        permission_mode: Option<&str>,
+    ) -> Result<ai_conversations::Model, ChatError> {
+        let desired_provider = provider.unwrap_or(&conv.ai_provider);
+        let provider_changed = desired_provider != conv.ai_provider;
+        if provider_changed
+            && !(conv.ai_provider.starts_with(GATEWAY_PROVIDER_PREFIX)
+                && desired_provider.starts_with(GATEWAY_PROVIDER_PREFIX))
+        {
+            return Err(ChatError::Ai(format!(
+                "conversation {} runs on '{}' and cannot switch to '{desired_provider}': \
+                 only an AI gateway chat can move to another AI gateway provider",
+                conv.public_id, conv.ai_provider
+            )));
+        }
         let desired_model = model.unwrap_or(&conv.ai_model);
-        let model_changed = desired_model != conv.ai_model;
+        let model_changed = provider_changed || desired_model != conv.ai_model;
         let current_thinking = normalize_thinking_level(conv.ai_thinking_level.as_deref());
         let desired_thinking = normalize_thinking_level(thinking_level)
             .or_else(|| (!model_changed).then_some(current_thinking).flatten());
@@ -4326,16 +4355,17 @@ impl ConversationService {
         let runtime = self
             .resolve_conversation_runtime(
                 conv.created_by,
-                Some(&conv.ai_provider),
+                Some(desired_provider),
                 Some(desired_model),
                 desired_thinking,
                 Some(desired_permission),
             )
             .await?;
-        if runtime.provider != conv.ai_provider {
-            return Err(ChatError::Ai(
-                "conversation provider cannot be changed after creation".to_string(),
-            ));
+        if runtime.provider != desired_provider {
+            return Err(ChatError::Ai(format!(
+                "conversation {} asked for provider '{desired_provider}' but it resolved to '{}'",
+                conv.public_id, runtime.provider
+            )));
         }
         // A provider's model inventory can change after the conversation was
         // created (account policy, entitlement, CLI upgrade, or model
@@ -4343,32 +4373,37 @@ impl ConversationService {
         // the persisted selection against the current cached capabilities
         // before allowing another turn. The former early return let a stale
         // model bypass this guard and fail much later inside the provider CLI.
-        let resolved_options_unchanged = runtime.model == conv.ai_model
+        let resolved_options_unchanged = !provider_changed
+            && runtime.model == conv.ai_model
             && runtime.thinking_level == conv.ai_thinking_level
             && runtime.permission_mode == conv.ai_permission_mode;
         if resolved_options_unchanged {
             return Ok(conv.clone());
         }
-        let metadata = if runtime.model == conv.ai_model {
+        let same_route = !provider_changed && runtime.model == conv.ai_model;
+        let metadata = if same_route {
             conv.metadata.clone()
         } else {
             conversation_metadata_without_context_usage(conv.metadata.as_ref())
         };
         ai_conversations::ActiveModel {
             id: Set(conv.id),
-            // Provider sessions are model-specific. Starting a new harness
-            // session makes the changed model deterministic; send_message then
+            // Provider sessions are model- and provider-specific. Starting a
+            // new session makes the change deterministic; send_message then
             // replays the persisted history into that fresh session.
             cli_session_id: Set(cli_session_after_model_change(
                 &conv.ai_model,
                 &runtime.model,
                 conv.cli_session_id.as_deref(),
-            )),
+            )
+            .filter(|_| !provider_changed)),
             cli_session_fingerprint: Set(cli_session_fingerprint_after_model_change(
                 &conv.ai_model,
                 &runtime.model,
                 conv.cli_session_fingerprint.as_deref(),
-            )),
+            )
+            .filter(|_| !provider_changed)),
+            ai_provider: Set(runtime.provider),
             ai_model: Set(runtime.model),
             ai_thinking_level: Set(runtime.thinking_level),
             ai_permission_mode: Set(runtime.permission_mode),
@@ -13150,6 +13185,84 @@ mod tests {
             result.cli_session_fingerprint.as_deref(),
             Some("v1:fingerprint")
         );
+    }
+
+    #[tokio::test]
+    async fn update_runtime_selection_moves_a_gateway_chat_to_another_gateway_key() {
+        let mut conversation = test_conversation();
+        conversation.ai_provider = "gateway_key:1".to_string();
+        conversation.ai_model = "gpt-4o-mini".to_string();
+        conversation.cli_session_id = Some("session-1".to_string());
+        conversation.cli_session_fingerprint = Some("v1:fingerprint".to_string());
+
+        let mut updated = conversation.clone();
+        updated.ai_provider = "gateway_key:2".to_string();
+        updated.cli_session_id = None;
+        updated.cli_session_fingerprint = None;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[updated]])
+                .into_connection(),
+        );
+
+        // Same model id on the new key: the provider change alone must still
+        // persist and start a fresh provider session.
+        let result = db_service_from_arc(db.clone())
+            .update_runtime_selection(
+                &conversation,
+                Some("gateway_key:2"),
+                Some("gpt-4o-mini"),
+                None,
+                None,
+            )
+            .await
+            .expect("a gateway chat may move to another gateway key");
+        assert_eq!(result.ai_provider, "gateway_key:2");
+
+        let db = Arc::try_unwrap(db).expect("service dropped its handle");
+        let log = db.into_transaction_log();
+        let statements = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].sql.contains("UPDATE \"ai_conversations\""));
+        assert!(statements[0].sql.contains("\"ai_provider\""));
+        let statement = format!("{:?}", statements[0]);
+        assert!(statement.contains("gateway_key:2"));
+        assert!(!statement.contains("session-1"));
+        assert!(!statement.contains("v1:fingerprint"));
+    }
+
+    #[tokio::test]
+    async fn update_runtime_selection_keeps_a_harness_chat_on_its_provider() {
+        let mut conversation = test_conversation();
+        conversation.ai_provider = "codex_cli".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        let error = db_service(db)
+            .update_runtime_selection(&conversation, Some("gateway_key:2"), None, None, None)
+            .await
+            .expect_err("a harness chat must not move to another provider");
+
+        assert!(matches!(error, ChatError::Ai(message) if
+            message.contains("codex_cli") && message.contains("gateway_key:2")));
+    }
+
+    #[tokio::test]
+    async fn update_runtime_selection_does_not_move_a_gateway_chat_onto_a_harness() {
+        let mut conversation = test_conversation();
+        conversation.ai_provider = "gateway_key:1".to_string();
+        conversation.ai_model = "gpt-4o-mini".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+
+        let error = db_service(db)
+            .update_runtime_selection(&conversation, Some("codex_cli"), None, None, None)
+            .await
+            .expect_err("a gateway chat must not move onto a host harness");
+
+        assert!(matches!(error, ChatError::Ai(message) if
+            message.contains("gateway_key:1") && message.contains("codex_cli")));
     }
 
     #[tokio::test]

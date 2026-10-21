@@ -167,12 +167,17 @@ impl ProviderModelService {
             let metadata = details
                 .as_ref()
                 .and_then(|details| serde_json::to_value(details).ok());
+            // The catalogue's own name when it gives one, else the id.
+            let display_name = details
+                .as_ref()
+                .and_then(|details| details.name.clone())
+                .unwrap_or_else(|| model.id.clone());
             if manual_ids.contains(model.id.as_str()) {
                 continue;
             }
             if let Some(existing) = existing_by_id.get(model.id.as_str()) {
                 let mut active: ai_provider_models::ActiveModel = (*existing).clone().into();
-                active.display_name = Set(model.id.clone());
+                active.display_name = Set(display_name);
                 active.source = Set(MODEL_SOURCE_DISCOVERED.to_string());
                 active.is_available = Set(true);
                 active.owned_by = Set(Some(model.owned_by));
@@ -182,8 +187,8 @@ impl ProviderModelService {
             } else {
                 ai_provider_models::ActiveModel {
                     provider_key_id: Set(provider_key_id),
-                    model_id: Set(model.id.clone()),
-                    display_name: Set(model.id),
+                    model_id: Set(model.id),
+                    display_name: Set(display_name),
                     source: Set(MODEL_SOURCE_DISCOVERED.to_string()),
                     is_available: Set(true),
                     is_enabled: Set(true),

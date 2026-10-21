@@ -22,8 +22,10 @@ import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { Check, ChevronsUpDown, Loader2, TriangleAlert } from 'lucide-react'
 import { useMemo, useState } from 'react'
+import { AiProviderIcon } from '@/lib/ai-providers'
+import { assistantKeyLabel, type AssistantKey } from './assistant-keys'
 import {
-  useAssistantProviderKey,
+  useAssistantProviderKeys,
   useEffectiveDefaultModel,
   useProviderModels,
   useSetDefaultModel,
@@ -398,38 +400,108 @@ export function AssistantModelSetup({
 }
 
 /**
+ * Which provider key the model list shows, for a new chat when more than one
+ * key is active. Hidden with a single key: there is nothing to choose.
+ */
+export function AssistantKeySelect({
+  keys,
+  value,
+  onChange,
+  disabled,
+}: {
+  keys: readonly AssistantKey[]
+  value: number | null
+  onChange: (keyId: number) => void
+  disabled?: boolean
+}) {
+  if (keys.length < 2) return null
+  return (
+    <div className="grid gap-1.5">
+      <span className="text-xs font-medium text-muted-foreground">
+        Provider
+      </span>
+      <Select
+        value={value === null ? undefined : String(value)}
+        onValueChange={(next) => onChange(Number(next))}
+        disabled={disabled}
+      >
+        <SelectTrigger aria-label="Provider for this chat" className="w-full">
+          <SelectValue placeholder="Choose a provider" />
+        </SelectTrigger>
+        <SelectContent>
+          {keys.map((key) => (
+            <SelectItem key={key.id} value={String(key.id)}>
+              <span className="flex min-w-0 items-center gap-2">
+                <AiProviderIcon provider={key.provider} size={16} />
+                <span className="truncate">{assistantKeyLabel(key)}</span>
+              </span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  )
+}
+
+/**
  * The model of one chat, as a button that opens the list. It is controlled by
  * the chat that owns it: choosing here never changes the key's default, so two
  * chats can run on different models.
+ *
+ * The chat may also choose its provider key (`chooseKey`) when more than one
+ * is active; without it the list is the models of the chat's key
+ * (`providerKeyId`).
  */
 export function AssistantModelChip({
   value,
   onChange,
+  providerKeyId,
+  chooseKey,
   disabled,
   roomy,
 }: {
   value: string | null
-  onChange: (modelId: string) => void
+  onChange: (modelId: string, providerKeyId: number) => void
+  /** The key the chat runs on; the default key when not given. */
+  providerKeyId?: number | null
+  /** Whether the provider key can be changed from this chip. */
+  chooseKey?: boolean
   disabled?: boolean
   roomy?: boolean
 }) {
-  const { key } = useAssistantProviderKey()
-  const providerKeyId = key?.id ?? null
-  const models = useProviderModels(providerKeyId)
-  const defaultModel = useEffectiveDefaultModel(key)
+  const { keys, defaultKey } = useAssistantProviderKeys()
+  const currentKeyId = providerKeyId ?? defaultKey?.id ?? null
+  const currentKey = keys.find((key) => key.id === currentKeyId) ?? null
+  // The key whose models the open list shows; reset to the chat's own key
+  // every time the list opens.
+  const [browsingKeyId, setBrowsingKeyId] = useState<number | null>(null)
+  const listKeyId = browsingKeyId ?? currentKeyId
+  const models = useProviderModels(currentKeyId)
+  const listKey = keys.find((key) => key.id === listKeyId) ?? null
+  const listDefaultModel = useEffectiveDefaultModel(listKey)
   const [open, setOpen] = useState(false)
   const isMobile = useIsMobile()
+  const showKeys = keys.length > 1
 
   const fullName = modelDisplayName(models.options, value)
   const label = fullName && value ? shortModelName(fullName, value) : 'Loading…'
+  const keyLabel = showKeys && currentKey ? assistantKeyLabel(currentKey) : null
+
+  const openChange = (next: boolean) => {
+    setOpen(next)
+    if (next) setBrowsingKeyId(null)
+  }
 
   const choose = (modelId: string) => {
     setOpen(false)
-    if (modelId !== value) onChange(modelId)
+    if (listKeyId === null) return
+    if (modelId !== value || listKeyId !== currentKeyId) {
+      onChange(modelId, listKeyId)
+    }
   }
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={openChange}>
       <PopoverTrigger asChild>
         <Button
           type="button"
@@ -440,8 +512,12 @@ export function AssistantModelChip({
             'h-8 min-w-0 max-w-44 justify-between gap-2 px-2 font-normal md:max-w-full text-muted-foreground hover:text-foreground',
             roomy && 'h-9 text-sm'
           )}
-          aria-label={`Model: ${label}. Change model for this chat`}
-          title="The model for this chat"
+          aria-label={`Model: ${label}${keyLabel ? ` on ${keyLabel}` : ''}. Change model for this chat`}
+          title={
+            keyLabel
+              ? `The model for this chat, on ${keyLabel}`
+              : 'The model for this chat'
+          }
         >
           <span className="flex min-w-0 items-center gap-2">
             {value ? (
@@ -450,6 +526,9 @@ export function AssistantModelChip({
             <span className="truncate font-medium text-foreground">
               {label}
             </span>
+            {keyLabel ? (
+              <span className="hidden truncate md:inline">· {keyLabel}</span>
+            ) : null}
           </span>
           <ChevronsUpDown
             className="size-4 shrink-0 opacity-50"
@@ -459,16 +538,24 @@ export function AssistantModelChip({
       </PopoverTrigger>
       <PopoverContent
         align="start"
-        className="w-[min(32rem,calc(100vw-1rem))] p-3"
+        className="grid w-[min(32rem,calc(100vw-1rem))] gap-3 p-3"
         onOpenAutoFocus={(event) => {
           // The keyboard would cover the list; search is one tap away.
           if (isMobile) event.preventDefault()
         }}
       >
+        {chooseKey ? (
+          <AssistantKeySelect
+            keys={keys}
+            value={listKeyId}
+            onChange={setBrowsingKeyId}
+          />
+        ) : null}
         <AssistantModelList
-          providerKeyId={providerKeyId}
-          value={value}
-          defaultModelId={defaultModel}
+          key={listKeyId ?? 'none'}
+          providerKeyId={listKeyId}
+          value={listKeyId === currentKeyId ? value : null}
+          defaultModelId={listDefaultModel}
           onChange={choose}
           roomy={false}
         />
