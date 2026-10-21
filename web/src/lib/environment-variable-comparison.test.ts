@@ -8,6 +8,8 @@ import type {
 } from '@/api/client/types.gen'
 import {
   compareEnvironmentVariableKeys,
+  groupVariableEnvironments,
+  liveEnvironmentSelection,
   variableAppliesToEnvironment,
   orderEnvironments,
   orderVariableEnvironments,
@@ -79,4 +81,41 @@ test('environment filtering includes explicit bindings and preview inheritance o
   expect(variableAppliesToEnvironment(variable('UNBOUND', []), undefined)).toBe(
     true
   )
+})
+
+describe('variable environment grouping', () => {
+  const binding = (id: number, name: string) => ({ id, name, main_url: '' })
+
+  test('separates stable, preview and deleted bindings', () => {
+    const groups = groupVariableEnvironments(
+      [
+        binding(4, 'removed-branch'),
+        binding(3, 'branch-c'),
+        binding(2, 'staging'),
+        binding(1, 'production'),
+      ],
+      new Set([3]),
+      new Set([1, 2, 3])
+    )
+    expect(groups.stable.map((env) => env.id)).toEqual([1, 2])
+    expect(groups.previews.map((env) => env.id)).toEqual([3])
+    expect(groups.deleted.map((env) => env.id)).toEqual([4])
+  })
+
+  test('classifies nothing as deleted while the environment list is unknown', () => {
+    const groups = groupVariableEnvironments(
+      [binding(4, 'removed-branch'), binding(1, 'production')],
+      new Set(),
+      undefined
+    )
+    expect(groups.stable.map((env) => env.id)).toEqual([1, 4])
+    expect(groups.deleted).toEqual([])
+  })
+
+  test('drops deleted environments from the submitted selection', () => {
+    expect(liveEnvironmentSelection([1, 9, 3], new Set([1, 2, 3]))).toEqual([
+      1, 3,
+    ])
+    expect(liveEnvironmentSelection([9], new Set([1]))).toEqual([])
+  })
 })

@@ -103,6 +103,13 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
 
   const secrets = secretsQuery.data ?? []
   const environments = environmentsQuery.data ?? []
+  const liveEnvironmentIds = useMemo(
+    () =>
+      environmentsQuery.data
+        ? new Set(environmentsQuery.data.map((environment) => environment.id))
+        : undefined,
+    [environmentsQuery.data]
+  )
   const composeServiceNames = composeServiceNamesFor(project)
   const isComposeProject = project.preset === 'docker-compose'
 
@@ -161,6 +168,7 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
               secret={s}
               projectId={project.id}
               detailPath={secretPath(s.id)}
+              liveEnvironmentIds={liveEnvironmentIds}
               checks={checksBySecret.get(s.id) ?? []}
               onManageChecks={() =>
                 navigate(secretPath(s.id), {
@@ -196,6 +204,31 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
       />
     </div>
   )
+}
+
+/**
+ * Where a secret is mounted, for its list row. Bindings to deleted
+ * environments are kept by the server (a restored environment gets its secrets
+ * back) but mount nowhere. They still count as a scope: a secret bound only to
+ * deleted environments is not "All environments", which is what an empty
+ * binding list means.
+ */
+function secretScopeLabel(
+  environments: Array<{ id: number; name: string }>,
+  liveIds: ReadonlySet<number> | undefined
+): string {
+  if (environments.length === 0) return 'All environments'
+  const active = liveIds
+    ? environments.filter((environment) => liveIds.has(environment.id))
+    : environments
+  const deletedCount = environments.length - active.length
+  const deleted =
+    deletedCount === 0
+      ? ''
+      : `${deletedCount} deleted ${deletedCount === 1 ? 'environment' : 'environments'}`
+  if (active.length === 0) return `Only ${deleted} (not mounted anywhere)`
+  const names = active.map((environment) => environment.name).join(', ')
+  return deleted ? `${names} • ${deleted}` : names
 }
 
 /** A secret with no environments is mounted in every environment. */
@@ -238,6 +271,8 @@ interface SecretRowProps {
   }
   projectId: number
   detailPath: string
+  /** Ids of the project's current environments; undefined while not loaded. */
+  liveEnvironmentIds: ReadonlySet<number> | undefined
   checks: EnvironmentVariableCheck[]
   onManageChecks: () => void
   onDeleted: () => void
@@ -247,6 +282,7 @@ function SecretRow({
   secret,
   projectId,
   detailPath,
+  liveEnvironmentIds,
   checks,
   onManageChecks,
   onDeleted,
@@ -276,9 +312,7 @@ function SecretRow({
           {secret.key}
         </Link>
         <div className="text-xs text-muted-foreground">
-          {secret.environments.length === 0
-            ? 'All environments'
-            : secret.environments.map((e) => e.name).join(', ')}
+          {secretScopeLabel(secret.environments, liveEnvironmentIds)}
           {secret.include_in_preview ? ' • preview enabled' : ''}
           {secret.compose_services && secret.compose_services.length > 0
             ? ` • only ${secret.compose_services.join(', ')}`

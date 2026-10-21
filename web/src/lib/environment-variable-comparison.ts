@@ -30,6 +30,60 @@ export function orderVariableEnvironments(
   })
 }
 
+export interface VariableEnvironmentGroups {
+  /** Existing non-preview environments, production first. */
+  stable: EnvironmentInfo[]
+  /** Existing preview environments. */
+  previews: EnvironmentInfo[]
+  /**
+   * Bindings to deleted environments. The server keeps them so a restored
+   * environment gets its variables back, but they apply to no deployment.
+   */
+  deleted: EnvironmentInfo[]
+}
+
+/**
+ * Split a variable's bindings for display. `liveIds` holds the project's
+ * current environments; while that list is loading or failed it is
+ * `undefined` and nothing is classified as deleted.
+ */
+export function groupVariableEnvironments(
+  environments: EnvironmentInfo[],
+  previewIds: ReadonlySet<number>,
+  liveIds: ReadonlySet<number> | undefined
+): VariableEnvironmentGroups {
+  const groups: VariableEnvironmentGroups = {
+    stable: [],
+    previews: [],
+    deleted: [],
+  }
+  for (const environment of orderVariableEnvironments(
+    environments,
+    previewIds
+  )) {
+    if (liveIds && !liveIds.has(environment.id)) {
+      groups.deleted.push(environment)
+    } else if (previewIds.has(environment.id)) {
+      groups.previews.push(environment)
+    } else {
+      groups.stable.push(environment)
+    }
+  }
+  return groups
+}
+
+/**
+ * The selection to submit: only environments that still exist. A deleted
+ * environment cannot be chosen in the form, and the server keeps those
+ * bindings on its own, so sending them back would only be stale input.
+ */
+export function liveEnvironmentSelection(
+  selectedIds: readonly number[],
+  liveIds: ReadonlySet<number>
+): number[] {
+  return selectedIds.filter((id) => liveIds.has(id))
+}
+
 /** Explicit bindings plus inherited preview variables determine applicability. */
 export function variableAppliesToEnvironment(
   variable: Pick<
