@@ -439,8 +439,14 @@ mod image_pull_tests {
         assert!(reason.contains("temps-sandbox-abc"), "{reason}");
         assert!(reason.contains("pools fully subnetted"), "{reason}");
         assert!(reason.contains("default-address-pools"), "{reason}");
-        assert!(reason.contains("Stopped sandboxes have already released"), "{reason}");
-        assert!(reason.contains("Stop sandboxes you are not using"), "{reason}");
+        assert!(
+            reason.contains("Stopped sandboxes have already released"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Stop sandboxes you are not using"),
+            "{reason}"
+        );
         let error = AgentError::SandboxProviderUnavailable {
             provider: "docker".into(),
             reason,
