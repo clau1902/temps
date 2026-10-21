@@ -616,12 +616,13 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn the_per_user_share_leaves_room_for_other_users() {
+    // The per-user share leaves room for other users: checked when the crate
+    // compiles, since both sides are constants. At least two other users can
+    // upload while one holds a full share.
+    const _: () = {
         assert!(MAX_RESERVED_BYTES_PER_USER < MAX_RESERVED_BYTES);
-        // At least two other users can upload while one holds a full share.
         assert!(MAX_RESERVED_BYTES - MAX_RESERVED_BYTES_PER_USER >= 2 * (20 * 1024 * 1024));
-    }
+    };
 
     #[test]
     fn an_empty_chunk_is_refused_and_does_not_keep_the_upload_alive() {

@@ -1869,12 +1869,12 @@ impl SandboxLinkService {
                         )
                         .await
                     }
-                    Err(_) => format!(
-                        "Nothing was read: the credentials of the services this sandbox is \
-                         linked to could not be prepared, so a file holding them could not be \
-                         redacted. Tell the user; they can disconnect the sandbox from the \
-                         project's services in the chat's Made here tab."
-                    ),
+                    Err(_) => "Nothing was read: the credentials of the services this \
+                               sandbox is linked to could not be prepared, so a file holding \
+                               them could not be redacted. Tell the user; they can disconnect \
+                               the sandbox from the project's services in the chat's Made here \
+                               tab."
+                        .to_string(),
                 }
             }
             SANDBOX_WRITE_TOOL => {
