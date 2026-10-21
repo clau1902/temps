@@ -203,6 +203,21 @@ pub enum DeploymentError {
     #[error("Invalid deployment state: {0}")]
     InvalidDeploymentState(String),
 
+    /// A lifecycle action (pause, resume) was asked of a deployment whose
+    /// current state does not allow it, e.g. resuming a stopped or failed
+    /// deployment. Mapped to 409: the request is well formed, the
+    /// deployment is just not in a state it applies to.
+    #[error(
+        "Cannot {operation} deployment {deployment_id}: it is '{state}', and only a deployment \
+         that is {expected} can be {operation}d"
+    )]
+    DeploymentStateConflict {
+        deployment_id: i32,
+        operation: &'static str,
+        state: String,
+        expected: &'static str,
+    },
+
     #[error("Pipeline error: {0}")]
     PipelineError(String),
 
@@ -296,6 +311,31 @@ impl From<sea_orm::DbErr> for DeploymentError {
             },
         }
     }
+}
+
+/// Deployment states a pause applies to: the deployment is live and serving.
+const PAUSABLE_DEPLOYMENT_STATES: &[&str] = &["deployed", "completed"];
+/// Deployment states a resume applies to: only one paused by `pause_deployment`.
+const RESUMABLE_DEPLOYMENT_STATES: &[&str] = &["paused"];
+
+/// Refuse a pause/resume whose current state is not one it applies to.
+/// Without this, resume restarted the containers of a stopped, failed or
+/// cancelled deployment and marked it "deployed" again.
+fn check_lifecycle_transition(
+    deployment: &deployments::Model,
+    operation: &'static str,
+    allowed: &[&str],
+    expected: &'static str,
+) -> Result<(), DeploymentError> {
+    if allowed.contains(&deployment.state.as_str()) {
+        return Ok(());
+    }
+    Err(DeploymentError::DeploymentStateConflict {
+        deployment_id: deployment.id,
+        operation,
+        state: deployment.state.clone(),
+        expected,
+    })
 }
 
 /// Whether a project's hosting allows Temps to deploy it.
@@ -4772,6 +4812,7 @@ impl DeploymentService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+        check_lifecycle_transition(&deployment, "pause", PAUSABLE_DEPLOYMENT_STATES, "deployed")?;
 
         let environment_id = deployment.environment_id;
 
@@ -4955,6 +4996,7 @@ impl DeploymentService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+        check_lifecycle_transition(&deployment, "resume", RESUMABLE_DEPLOYMENT_STATES, "paused")?;
 
         // Resume all containers for this deployment
         let containers = deployment_containers::Entity::find()
@@ -6522,6 +6564,122 @@ impl temps_core::DeploymentContainerCleaner for DeploymentService {
     ) -> Result<u64, temps_core::ContainerCleanupError> {
         self.cleanup_containers(project_id, Some(environment_id))
             .await
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_transition_tests {
+    use super::*;
+
+    fn deployment_in(state: &str) -> deployments::Model {
+        deployments::Model {
+            id: 17,
+            project_id: 1,
+            environment_id: 1,
+            slug: "deploy-17".to_string(),
+            state: state.to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: None,
+            branch_ref: Some("main".to_string()),
+            tag_ref: None,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+            upload_request_id: None,
+            docker_socket_mounted: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn only_a_paused_deployment_can_be_resumed() {
+        let resume = |state| {
+            check_lifecycle_transition(
+                &deployment_in(state),
+                "resume",
+                RESUMABLE_DEPLOYMENT_STATES,
+                "paused",
+            )
+        };
+        assert!(resume("paused").is_ok());
+        for state in [
+            "stopped",
+            "failed",
+            "cancelled",
+            "pending",
+            "running",
+            "deployed",
+        ] {
+            match resume(state) {
+                Err(DeploymentError::DeploymentStateConflict {
+                    deployment_id: 17,
+                    operation: "resume",
+                    state: rejected,
+                    ..
+                }) => assert_eq!(rejected, state),
+                other => panic!("resuming a '{state}' deployment must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_live_deployment_can_be_paused() {
+        let pause = |state| {
+            check_lifecycle_transition(
+                &deployment_in(state),
+                "pause",
+                PAUSABLE_DEPLOYMENT_STATES,
+                "deployed",
+            )
+        };
+        assert!(pause("deployed").is_ok());
+        assert!(pause("completed").is_ok());
+        for state in [
+            "paused",
+            "stopped",
+            "failed",
+            "cancelled",
+            "pending",
+            "running",
+        ] {
+            assert!(
+                matches!(
+                    pause(state),
+                    Err(DeploymentError::DeploymentStateConflict {
+                        operation: "pause",
+                        ..
+                    })
+                ),
+                "pausing a '{state}' deployment must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_message_names_the_deployment_and_its_state() {
+        let message = check_lifecycle_transition(
+            &deployment_in("stopped"),
+            "resume",
+            RESUMABLE_DEPLOYMENT_STATES,
+            "paused",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("deployment 17"), "{message}");
+        assert!(message.contains("'stopped'"), "{message}");
+        assert!(message.contains("paused"), "{message}");
     }
 }
 
