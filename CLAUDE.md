@@ -266,7 +266,12 @@ All error responses follow this JSON structure:
 
 ## Scalability & Efficiency
 
-Temps is a single binary that operators run on small machines (the reference deployment is a Hetzner cpx22: 3 vCPU / 4 GB RAM) while the proxy path may serve very high request rates. **Every new feature must be designed to scale on a small number of resources and be as efficient as possible.** This is a requirement for new functionality, not an optimization to defer.
+Temps is a single binary that operators run on small machines while the proxy path may serve very high request rates. Two hardware targets are requirements, not aspirations:
+
+- **2 vCPU / 4 GB RAM, everything on one host** (Temps and its PostgreSQL/TimescaleDB together): Temps **must run well** -- this is the default experience, with room left for the user's workloads.
+- **1 vCPU / 2 GB RAM with an external database** (`TEMPS_DATABASE_URL` pointing at PostgreSQL on another host or a managed service): Temps **must run** -- every feature works, nothing is OOM-killed or crashes; only throughput and the room left for workloads shrink.
+
+Design against the smaller target: everything resident (caches, connection pools, buffers, background tasks, per-workload sidecars) counts against 2 GB shared with the OS and the user's workloads, on one core. **Every new feature must be designed to scale on a small number of resources and be as efficient as possible.** This is a requirement for new functionality, not an optimization to defer.
 
 ### Hot path vs. control plane
 
@@ -280,7 +285,7 @@ Classify every piece of new code. The bar differs by an order of magnitude:
 - **No synchronous I/O and no per-operation network/DB/disk calls.** Never write a row, send an HTTP request, or log to an external store per request. Aggregate in memory (atomics, sharded counters) and flush on an interval, or push into a bounded channel consumed by a background batcher.
 - **No `Mutex`/`RwLock` on the request path.** Prefer atomics (`AtomicU64`, prometheus-style counters/histograms which are atomic internally), `arc-swap`/`ArcSwap` for rarely-updated shared config (already the pattern for route tables), thread-locals, or sharded state. A single contended lock at 100k req/s serializes all cores.
 - **Bounded channels with explicit overflow policy.** Any `mpsc` fed by the hot path must be bounded, and the send must be `try_send` with a documented drop/degrade policy (count drops in a metric). An unbounded channel is a memory leak with a delay; a blocking send is a proxy stall.
-- **Bounded label/key cardinality.** Metrics, caches, and maps keyed by request attributes must use bounded dimensions (status class, not full URL; project ID only if project count is bounded). Unbounded cardinality is an OOM on a 4 GB box.
+- **Bounded label/key cardinality.** Metrics, caches, and maps keyed by request attributes must use bounded dimensions (status class, not full URL; project ID only if project count is bounded). Unbounded cardinality is an OOM on a 2 GB box.
 - **Avoid per-request allocation and serialization** where practical: reuse buffers, prefer `&str`/`Bytes` over `String` clones, don't `serde_json::to_string` on the request path.
 
 ### Everywhere rules
