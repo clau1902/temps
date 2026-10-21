@@ -271,11 +271,40 @@ impl IngressConnectorService {
             .await?
         {
             Some((_, managed)) => Ok(managed.domain.trim_end_matches('.').to_ascii_lowercase()),
-            None => Err(IngressError::Validation(format!(
-                "{} is no longer a managed domain, or under one. Add it again under DNS providers.",
-                connector.domain
-            ))),
+            None => Err(not_managed(&connector.domain)),
         }
+    }
+
+    /// [`Self::zone_of`] for many connectors in one query. A connector whose
+    /// domain is no longer managed, or ambiguously so, has no zone.
+    async fn zones_of(
+        &self,
+        connectors: &[ingress_connectors::Model],
+    ) -> Result<HashMap<i32, Option<String>>, IngressError> {
+        let domains: Vec<String> = connectors.iter().map(|c| c.domain.clone()).collect();
+        let found = self
+            .dns_providers
+            .find_providers_for_domains(&domains)
+            .await?;
+        Ok(connectors
+            .iter()
+            .map(|connector| {
+                let zone = match found.get(&connector.domain) {
+                    Some(Ok(Some((_, managed)))) => {
+                        Some(managed.domain.trim_end_matches('.').to_ascii_lowercase())
+                    }
+                    Some(Err(error)) => {
+                        debug!(connector_id = connector.id, %error, "no zone for ingress connector");
+                        None
+                    }
+                    _ => {
+                        debug!(connector_id = connector.id, domain = %connector.domain, "no managed zone covers ingress connector");
+                        None
+                    }
+                };
+                (connector.id, zone)
+            })
+            .collect())
     }
 
     /// The providers this control plane offers, for the console.
@@ -800,9 +829,10 @@ impl IngressConnectorService {
             .filter(ingress_publications::Column::ConnectorId.eq(id))
             .all(self.db.as_ref())
             .await?;
+        let zone = self.zone_of(&connector).await.ok();
         for publication in publications {
             if has_record(&publication.state) {
-                self.remove_record(&connector, &publication.hostname)
+                self.remove_record(&connector, zone.as_deref(), &publication.hostname)
                     .await?;
             }
         }
@@ -1193,21 +1223,15 @@ impl IngressConnectorService {
             .into_iter()
             .map(|row| row.connector_id)
             .collect();
-        let mut connectors = Vec::with_capacity(models.len());
-        for model in models {
-            let zone = match self.zone_of(&model).await {
-                Ok(zone) => Some(zone),
-                Err(error) => {
-                    debug!(connector_id = model.id, %error, "no zone for ingress connector");
-                    None
-                }
-            };
-            connectors.push(PlannedConnector {
+        let mut zones = self.zones_of(&models).await?;
+        let connectors: Vec<PlannedConnector> = models
+            .into_iter()
+            .map(|model| PlannedConnector {
                 has_nodes: with_nodes.contains(&model.id),
-                zone,
+                zone: zones.remove(&model.id).flatten(),
                 model,
-            });
-        }
+            })
+            .collect();
         let choices = ingress_hostname_choices::Entity::find()
             .all(self.db.as_ref())
             .await?
@@ -1296,8 +1320,13 @@ impl IngressConnectorService {
                                 }
                             }
                         }
-                        if let Err(error) =
-                            self.remove_record(&connector.model, &row.hostname).await
+                        if let Err(error) = self
+                            .remove_record(
+                                &connector.model,
+                                connector.zone.as_deref(),
+                                &row.hostname,
+                            )
+                            .await
                         {
                             warn!(host = %row.hostname, %error, "could not remove tunnel record");
                             continue;
@@ -1332,8 +1361,14 @@ impl IngressConnectorService {
             }
             let outcome = match &providers[&id] {
                 Ok(provider) => {
-                    self.publish(&connector.model, provider.as_ref(), &handle, host)
-                        .await
+                    self.publish(
+                        &connector.model,
+                        connector.zone.as_deref(),
+                        provider.as_ref(),
+                        &handle,
+                        host,
+                    )
+                    .await
                 }
                 Err(error) => Err(IngressError::Provider(error.clone())),
             };
@@ -1342,15 +1377,17 @@ impl IngressConnectorService {
         Ok(())
     }
 
+    /// `zone` is the connector's managed zone, looked up once per pass.
     async fn publish(
         &self,
         connector: &ingress_connectors::Model,
+        zone: Option<&str>,
         provider: &dyn TunnelProvider,
         handle: &TunnelHandle,
         host: &str,
     ) -> Result<(), IngressError> {
-        let zone = self.zone_of(connector).await?;
-        let label = record_label(host, &connector.domain, &zone)?;
+        let zone = zone.ok_or_else(|| not_managed(&connector.domain))?;
+        let label = record_label(host, &connector.domain, zone)?;
         match provider.publish(handle, host).await? {
             DnsIntent::Cname { target, proxied } => {
                 self.records
@@ -1384,12 +1421,13 @@ impl IngressConnectorService {
     async fn remove_record(
         &self,
         connector: &ingress_connectors::Model,
+        zone: Option<&str>,
         host: &str,
     ) -> Result<(), IngressError> {
-        let Ok(zone) = self.zone_of(connector).await else {
+        let Some(zone) = zone else {
             return Ok(());
         };
-        let Ok(label) = record_label(host, &connector.domain, &zone) else {
+        let Ok(label) = record_label(host, &connector.domain, zone) else {
             return Ok(());
         };
         match self
@@ -1499,13 +1537,16 @@ impl IngressConnectorService {
         report: NodeConnectorStatusReport,
     ) -> Result<(), IngressError> {
         let now = Utc::now();
-        for status in report.reports {
-            let Some(row) = ingress_connector_nodes::Entity::find()
+        let mut assigned: HashMap<i32, ingress_connector_nodes::Model> =
+            ingress_connector_nodes::Entity::find()
                 .filter(ingress_connector_nodes::Column::NodeId.eq(node_id))
-                .filter(ingress_connector_nodes::Column::ConnectorId.eq(status.connector_id))
-                .one(self.db.as_ref())
+                .all(self.db.as_ref())
                 .await?
-            else {
+                .into_iter()
+                .map(|row| (row.connector_id, row))
+                .collect();
+        for status in report.reports {
+            let Some(row) = assigned.remove(&status.connector_id) else {
                 continue;
             };
             let mut row: ingress_connector_nodes::ActiveModel = row.into();
@@ -1906,6 +1947,12 @@ fn connections_to_keep(rows: &[&ingress_connector_nodes::Model]) -> HashSet<Stri
 }
 
 /// Whether `ensure` replaced the tunnel publications point at.
+fn not_managed(domain: &str) -> IngressError {
+    IngressError::Validation(format!(
+        "{domain} is no longer a managed domain, or under one. Add it again under DNS providers."
+    ))
+}
+
 fn tunnel_replaced(before: Option<&str>, after: &str) -> bool {
     before.is_some_and(|before| before != after)
 }

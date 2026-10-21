@@ -204,7 +204,9 @@ fn status(path: &Path) -> anyhow::Result<()> {
 /// legacy listen fields so the two cannot disagree.
 fn write_ingress(path: &Path, ingress: &LocalIngress) -> anyhow::Result<()> {
     let mut value = read_config(path)?;
-    let object = value.as_object_mut().expect("checked in read_config");
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not an agent config object", path.display()))?;
     object.insert("ingress".to_string(), serde_json::to_value(ingress)?);
     object.insert(
         "public_ingress_address".to_string(),
