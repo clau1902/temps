@@ -609,6 +609,7 @@ fn linked() -> CloudLinkSnapshot {
 fn span(project_id: i32, n: usize) -> SpanRecord {
     let start = chrono::Utc::now();
     SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: ResourceInfo {

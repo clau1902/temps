@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     RequestMetadata,
@@ -41,6 +41,7 @@ use crate::services::source_map_service::{
     ),
     components(schemas(
         SourceMapResponse,
+        SourceMapUploadForm,
         SourceMapListResponse,
         ReleaseListResponse,
         DeleteResponse,
@@ -102,8 +103,17 @@ pub struct SourceMapResponse {
     pub dist: Option<String>,
     pub size_bytes: i64,
     pub checksum: Option<String>,
+    pub debug_id: Option<String>,
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub created_at: String,
+}
+
+#[derive(ToSchema)]
+pub struct SourceMapUploadForm {
+    #[schema(value_type=String,format=Binary)]
+    pub file: Vec<u8>,
+    pub file_path: String,
+    pub dist: Option<String>,
 }
 
 impl From<SourceMapInfo> for SourceMapResponse {
@@ -116,7 +126,10 @@ impl From<SourceMapInfo> for SourceMapResponse {
             dist: info.dist,
             size_bytes: info.size_bytes,
             checksum: info.checksum,
-            created_at: info.created_at.to_rfc3339(),
+            debug_id: info.debug_id,
+            created_at: info
+                .created_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         }
     }
 }
@@ -183,6 +196,7 @@ impl From<SourceMapError> for Problem {
     tag = "source-maps",
     post,
     path = "/projects/{project_id}/releases/{release}/source-maps",
+    request_body(content=SourceMapUploadForm,content_type="multipart/form-data"),
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("release" = String, Path, description = "Release version"),
@@ -204,6 +218,7 @@ async fn upload_source_map(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingCreate);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let mut file_data: Option<Vec<u8>> = None;
@@ -337,6 +352,7 @@ async fn list_source_maps(
     Path((project_id, release)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let maps = state
@@ -371,6 +387,7 @@ async fn list_releases(
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let releases = state.source_map_service.list_releases(project_id).await?;
@@ -401,6 +418,7 @@ async fn delete_release_source_maps(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let deleted = state
@@ -454,6 +472,7 @@ async fn delete_source_map(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
@@ -566,6 +585,7 @@ async fn upload_source_file(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingCreate);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Opt-in gate: never store application source unless the project enabled it.
@@ -688,6 +708,7 @@ async fn list_source_files(
     Path((project_id, release)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let files = state
@@ -727,6 +748,7 @@ async fn delete_release_source_files(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let deleted = state

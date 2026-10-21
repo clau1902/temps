@@ -393,8 +393,52 @@ async fn validate_webhook_url(url: &str) -> Result<()> {
 }
 
 async fn webhook_http_client(url: &str, timeout_secs: u64) -> Result<reqwest::Client> {
-    let parsed = validate_external_url(url)
-        .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+    Ok(pinned_webhook_http_client(url, url, timeout_secs).await?)
+}
+
+/// Why an outbound webhook client could not be built or a webhook delivery
+/// failed. `url` is always the display form chosen by the caller, so a
+/// credential-bearing URL (a Slack incoming webhook) is never echoed.
+#[derive(Debug, thiserror::Error)]
+pub enum WebhookDeliveryError {
+    #[error("Invalid Slack webhook URL '{url}': it must start with {prefix}")]
+    NotSlackWebhook {
+        url: &'static str,
+        prefix: &'static str,
+    },
+
+    #[error("Invalid webhook URL '{url}': {reason}")]
+    InvalidUrl { url: String, reason: String },
+
+    #[error("Invalid webhook URL '{url}': URL has no resolvable port")]
+    NoResolvablePort { url: String },
+
+    #[error("Failed to build the HTTP client for webhook '{url}': {reason}")]
+    ClientBuild { url: String, reason: String },
+
+    #[error("{stage} for webhook '{url}': {reason}")]
+    Request {
+        stage: &'static str,
+        url: String,
+        reason: String,
+    },
+}
+
+/// Build the hardened outbound client for `url`: SSRF-validated, DNS-pinned
+/// to the addresses that passed validation, and with redirects disabled.
+///
+/// `display` is what error messages show in place of the URL, for callers
+/// whose URL is itself a secret (a Slack incoming-webhook URL is the
+/// credential).
+async fn pinned_webhook_http_client(
+    url: &str,
+    display: &str,
+    timeout_secs: u64,
+) -> std::result::Result<reqwest::Client, WebhookDeliveryError> {
+    let parsed = validate_external_url(url).map_err(|error| WebhookDeliveryError::InvalidUrl {
+        url: display.to_string(),
+        reason: error.to_string(),
+    })?;
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::none());
@@ -404,15 +448,25 @@ async fn webhook_http_client(url: &str, timeout_secs: u64) -> Result<reqwest::Cl
         .filter(|host| host.parse::<std::net::IpAddr>().is_err())
     {
         let port = parsed.port_or_known_default().ok_or_else(|| {
-            anyhow::anyhow!("Invalid webhook URL '{}': URL has no resolvable port", url)
+            WebhookDeliveryError::NoResolvablePort {
+                url: display.to_string(),
+            }
         })?;
         let addrs = resolve_and_validate_domain(domain, port)
             .await
-            .map_err(|error| anyhow::anyhow!("Invalid webhook URL '{}': {}", url, error))?;
+            .map_err(|error| WebhookDeliveryError::InvalidUrl {
+                url: display.to_string(),
+                reason: error.to_string(),
+            })?;
         builder = builder.resolve_to_addrs(domain, &addrs);
     }
 
-    Ok(builder.build()?)
+    builder
+        .build()
+        .map_err(|error| WebhookDeliveryError::ClientBuild {
+            url: display.to_string(),
+            reason: error.without_url().to_string(),
+        })
 }
 
 /// Cloudflare Email Sending provider.
@@ -1702,19 +1756,50 @@ impl EmailProvider {
     }
 }
 
-#[async_trait]
-impl NotificationProvider for SlackProvider {
-    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
-        // Validate webhook URL format
-        if !self.webhook_url.starts_with("https://hooks.slack.com/") {
-            return Err(anyhow::anyhow!("Invalid Slack webhook URL"));
+/// Only Slack's own incoming-webhook host is accepted for the Slack provider.
+const SLACK_WEBHOOK_PREFIX: &str = "https://hooks.slack.com/";
+
+/// Shown in errors instead of the Slack webhook URL, which is the credential.
+const SLACK_WEBHOOK_DISPLAY: &str = "https://hooks.slack.com/services/***";
+
+/// Typed counterpart of [`webhook_request_error`] for Slack: the URL is
+/// stripped from the reqwest error and replaced by the redacted display form.
+fn slack_request_error(stage: &'static str, error: reqwest::Error) -> WebhookDeliveryError {
+    WebhookDeliveryError::Request {
+        stage,
+        url: SLACK_WEBHOOK_DISPLAY.to_string(),
+        reason: error.without_url().to_string(),
+    }
+}
+
+impl SlackProvider {
+    /// The hardened client every Slack request goes through: host allowlist,
+    /// SSRF validation of the resolved addresses, DNS pinning to them, and no
+    /// redirect following -- the same guarantees as the generic webhook
+    /// provider rather than a bare `reqwest::Client::new()`.
+    async fn http_client(&self) -> std::result::Result<reqwest::Client, WebhookDeliveryError> {
+        if !self.webhook_url.starts_with(SLACK_WEBHOOK_PREFIX) {
+            return Err(WebhookDeliveryError::NotSlackWebhook {
+                url: SLACK_WEBHOOK_DISPLAY,
+                prefix: SLACK_WEBHOOK_PREFIX,
+            });
         }
-        Ok(())
+        pinned_webhook_http_client(
+            &self.webhook_url,
+            SLACK_WEBHOOK_DISPLAY,
+            default_timeout_secs(),
+        )
+        .await
     }
 
-    async fn send(&self, notification: &Notification) -> Result<()> {
-        let client = reqwest::Client::new();
-
+    /// Build and post the Slack payload with an already-constructed client.
+    /// Production goes through [`Self::http_client`] via `send`; tests pass a
+    /// plain client so they can target a local mock server.
+    async fn send_with_client(
+        &self,
+        client: &reqwest::Client,
+        notification: &Notification,
+    ) -> std::result::Result<(), WebhookDeliveryError> {
         let color = match notification.notification_type {
             NotificationType::Info => "#0088cc",
             NotificationType::Warning => "#ffa500",
@@ -1751,15 +1836,37 @@ impl NotificationProvider for SlackProvider {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| webhook_request_error("Slack webhook request failed", e))?
+            .map_err(|e| slack_request_error("Slack webhook request failed", e))?
             .error_for_status()
-            .map_err(|e| webhook_request_error("Slack webhook rejected the request", e))?;
+            .map_err(|e| slack_request_error("Slack webhook rejected the request", e))?;
 
         Ok(())
     }
+}
+
+#[async_trait]
+impl NotificationProvider for SlackProvider {
+    async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
+        // Validate webhook URL format
+        if !self.webhook_url.starts_with(SLACK_WEBHOOK_PREFIX) {
+            return Err(anyhow::anyhow!("Invalid Slack webhook URL"));
+        }
+        Ok(())
+    }
+
+    async fn send(&self, notification: &Notification) -> Result<()> {
+        let client = self.http_client().await?;
+        Ok(self.send_with_client(&client, notification).await?)
+    }
 
     async fn health_check(&self) -> Result<bool> {
-        let client = reqwest::Client::new();
+        let client = match self.http_client().await {
+            Ok(client) => client,
+            Err(e) => {
+                error!("Slack provider health check failed: {}", e);
+                return Ok(false);
+            }
+        };
 
         let test_payload = serde_json::json!({ "text": "Health check" });
 
@@ -4788,6 +4895,77 @@ mod tests {
         );
     }
 
+    /// `send`/`health_check` must go through the hardened client: a URL
+    /// outside hooks.slack.com (here a loopback mock) is refused before any
+    /// request is made, instead of being POSTed by a bare client.
+    #[tokio::test]
+    async fn test_slack_send_refuses_non_slack_and_loopback_urls() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: None,
+        };
+        let error = provider
+            .send(&Notification::new("t", "m"))
+            .await
+            .expect_err("a non-Slack webhook URL must be refused");
+        assert!(error.to_string().contains("hooks.slack.com"), "{error}");
+        assert!(!provider.health_check().await.unwrap_or(true));
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests.is_empty(), "no request may reach the target");
+    }
+
+    #[tokio::test]
+    async fn test_slack_http_client_does_not_echo_secret_url() {
+        // The Slack webhook URL is the credential: validation errors must
+        // show the redacted form, never the path. A loopback literal fails
+        // validation without any DNS lookup.
+        let error = pinned_webhook_http_client(
+            "https://127.0.0.1/services/T000/B000/SECRETTOKEN",
+            SLACK_WEBHOOK_DISPLAY,
+            5,
+        )
+        .await
+        .expect_err("loopback must be refused");
+        assert!(!error.to_string().contains("SECRETTOKEN"), "{error}");
+        assert!(
+            matches!(&error, WebhookDeliveryError::InvalidUrl { url, .. } if url == SLACK_WEBHOOK_DISPLAY),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slack_http_client_rejects_non_slack_host_with_typed_error() {
+        let provider = SlackProvider {
+            webhook_url: "https://hooks.example.test/services/T000/B000/SECRETTOKEN".to_string(),
+            channel: None,
+        };
+        let error = provider
+            .http_client()
+            .await
+            .expect_err("a host outside hooks.slack.com must be refused");
+        assert!(
+            matches!(
+                error,
+                WebhookDeliveryError::NotSlackWebhook {
+                    prefix: SLACK_WEBHOOK_PREFIX,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("SECRETTOKEN"), "{error}");
+    }
+
     #[tokio::test]
     async fn test_slack_send_uses_webhook_default_when_channel_is_absent() {
         use wiremock::matchers::{method, path};
@@ -4805,7 +4983,10 @@ mod tests {
             channel: None,
         };
         provider
-            .send(&Notification::new("Default route", "Use webhook channel"))
+            .send_with_client(
+                &reqwest::Client::new(),
+                &Notification::new("Default route", "Use webhook channel"),
+            )
             .await
             .expect("Slack delivery should succeed");
 
@@ -4853,7 +5034,10 @@ mod tests {
         )
         .with_metadata("_action_label", "View error details");
 
-        provider.send(&notification).await.unwrap();
+        provider
+            .send_with_client(&reqwest::Client::new(), &notification)
+            .await
+            .unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
@@ -4903,7 +5087,10 @@ mod tests {
             channel: Some("#incidents".to_string()),
         };
         let error = provider
-            .send(&Notification::new("Critical", "Webhook rejected"))
+            .send_with_client(
+                &reqwest::Client::new(),
+                &Notification::new("Critical", "Webhook rejected"),
+            )
             .await
             .expect_err("Slack HTTP failures must not be reported as successful deliveries");
 
@@ -5703,7 +5890,10 @@ FOR EACH ROW EXECUTE FUNCTION reject_notification_route_assignment()
         .with_metadata("project_slug", "checkout-api")
         .with_metadata("http_check_id", "72");
 
-        provider.send(&notification).await.unwrap();
+        provider
+            .send_with_client(&reqwest::Client::new(), &notification)
+            .await
+            .unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);

@@ -47,6 +47,11 @@ import { ProjectPageNotFound } from '@/components/project/ProjectPageNotFound'
 import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
+import CronMonitors from './CronMonitors'
+import ProjectFeedback from './ProjectFeedback'
+import TelemetryReleases from './TelemetryReleases'
+import ClientOutcomes from './ClientOutcomes'
+import { SourceMapArtifacts, SourceMapCredentials } from './SourceMapArtifacts'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
 import { ProjectStatusPages } from '@/components/project/status-pages/ProjectStatusPages'
 import { StatusPageDetail } from '@/components/project/status-pages/StatusPageDetail'
@@ -562,6 +567,14 @@ export function ProjectDetail() {
                 }
               />
               <Route
+                path="errors/source-maps"
+                element={<SourceMapArtifacts project={project} />}
+              />
+              <Route
+                path="errors/source-maps/credentials"
+                element={<SourceMapCredentials project={project} />}
+              />
+              <Route
                 path="errors/:errorGroupId"
                 element={<ErrorGroupDetail project={project} />}
               />
@@ -570,6 +583,14 @@ export function ProjectDetail() {
                 element={<ErrorEventDetail project={project} />}
               />
               <Route path="traces/*" element={<Traces project={project} />} />
+              <Route
+                path="client-outcomes"
+                element={<ClientOutcomes project={project} />}
+              />
+              <Route
+                path="releases"
+                element={<TelemetryReleases project={project} />}
+              />
               <Route
                 path="ai-gateway"
                 element={
@@ -584,6 +605,14 @@ export function ProjectDetail() {
                 element={<LogsList project={project} />}
               />
               <Route path="metrics/*" element={<Metrics project={project} />} />
+              <Route
+                path="errors/feedback/*"
+                element={<ProjectFeedback project={project} />}
+              />
+              <Route
+                path="cron-jobs/*"
+                element={<CronMonitors project={project} />}
+              />
               <Route
                 path="monitors"
                 element={<ProjectMonitors project={project} />}
@@ -854,6 +883,14 @@ export function ProjectDetail() {
                 element={<ProjectAiCrawlers project={project} />}
               />
               <Route
+                path="errors/feedback/*"
+                element={<ProjectFeedback project={project} />}
+              />
+              <Route
+                path="cron-jobs/*"
+                element={<CronMonitors project={project} />}
+              />
+              <Route
                 path="monitors"
                 element={<ProjectMonitors project={project} />}
               />
@@ -870,6 +907,14 @@ export function ProjectDetail() {
                 element={<StatusPageDetail project={project} />}
               />
               <Route path="traces/*" element={<Traces project={project} />} />
+              <Route
+                path="client-outcomes"
+                element={<ClientOutcomes project={project} />}
+              />
+              <Route
+                path="releases"
+                element={<TelemetryReleases project={project} />}
+              />
               <Route
                 path="telemetry-logs"
                 element={<LogsList project={project} />}
@@ -953,6 +998,14 @@ export function ProjectDetail() {
                     projectName={project.name}
                   />
                 }
+              />
+              <Route
+                path="errors/source-maps"
+                element={<SourceMapArtifacts project={project} />}
+              />
+              <Route
+                path="errors/source-maps/credentials"
+                element={<SourceMapCredentials project={project} />}
               />
               <Route
                 path="errors/:errorGroupId"

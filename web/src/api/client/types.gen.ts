@@ -2381,6 +2381,20 @@ export type ArchiveFlagResponse = {
 
 export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
 
+export type ArtifactAssembleRequest = {
+    checksum: string;
+    chunks: Array<string>;
+    dist?: string | null;
+    projects: Array<string>;
+    version?: string | null;
+};
+
+export type ArtifactAssembly = {
+    detail?: string | null;
+    missingChunks: Array<string>;
+    state: string;
+};
+
 /**
  * The formats local checks read. Adding one needs no migration or new check kind.
  */
@@ -3959,6 +3973,30 @@ export type ClickHouseSettingsResponse = {
      * `false` or the probe is failing.
      */
     setup_path?: string | null;
+};
+
+export type ClientOutcome = {
+    bucket: string;
+    category: string;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    first_reported_at: string;
+    id: number;
+    last_received_at: string;
+    last_reported_at: string;
+    /**
+     * Decimal string avoids rounding large integer totals in JavaScript.
+     */
+    quantity: string;
+    reason: string;
+    unit: string;
+};
+
+export type ClientOutcomePage = {
+    approximate: boolean;
+    items: Array<ClientOutcome>;
+    retention_days: number;
+    total: number;
 };
 
 export type CloudAiCapability = {
@@ -5990,6 +6028,12 @@ export type CreateConversationRequest = {
     context_type: string;
 };
 
+export type CreateCronMonitor = {
+    config: MonitorConfig;
+    environment_id?: number | null;
+    slug: string;
+};
+
 export type CreateDsnRequest = {
     base_url?: string | null;
     deployment_id?: number | null;
@@ -7154,6 +7198,55 @@ export type CronInfo = {
     project_id: number;
     schedule: string;
     updated_at: string;
+};
+
+export type CronMonitorList = {
+    items: Array<CronMonitorView>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type CronMonitorRun = {
+    check_in_id: string;
+    deadline_at?: string | null;
+    deployment_id?: number | null;
+    duration?: number | null;
+    environment?: string | null;
+    finished_at?: string | null;
+    id: number;
+    monitor_id: number;
+    release?: string | null;
+    span_id?: string | null;
+    started_at: string;
+    status: string;
+    trace_id?: string | null;
+};
+
+export type CronMonitorRunList = {
+    items: Array<CronMonitorRun>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type CronMonitorView = {
+    alarm_id?: number | null;
+    config?: MonitorConfig | null;
+    /**
+     * Editing the configuration in Temps makes it authoritative over SDK config.
+     */
+    configuration_source: string;
+    consecutive_failures: number;
+    consecutive_successes: number;
+    enabled: boolean;
+    environment_id?: number | null;
+    id: number;
+    last_check_in_at?: string | null;
+    next_expected_at?: string | null;
+    project_id: number;
+    slug: string;
+    status: string;
 };
 
 /**
@@ -11584,6 +11677,45 @@ export type FeatureMaturity = {
     reason: string;
 };
 
+export type FeedbackPage = {
+    items: Array<FeedbackView>;
+    total: number;
+};
+
+export type FeedbackQuery = {
+    page?: number | null;
+    page_size?: number | null;
+    status?: string | null;
+};
+
+export type FeedbackStatusRequest = {
+    status: string;
+};
+
+export type FeedbackView = {
+    associated_event_id?: string | null;
+    context: unknown;
+    deployment_id?: number | null;
+    email?: string | null;
+    environment?: string | null;
+    environment_id?: number | null;
+    error_group_id?: number | null;
+    id: number;
+    message: string;
+    name?: string | null;
+    project_id: number;
+    received_at: string;
+    release?: string | null;
+    replay_id?: string | null;
+    replay_session_id?: number | null;
+    replay_visitor_id?: number | null;
+    source: string;
+    source_id: string;
+    status: string;
+    timestamp: string;
+    url?: string | null;
+};
+
 export type FieldResponse = {
     /**
      * Field type (Int32, String, Timestamp, etc.)
@@ -15253,6 +15385,15 @@ export type ListEntitiesQuery = {
 export type ListErrorEventsQuery = {
     page?: number;
     page_size?: number;
+    /**
+     * Exact tag match; supply tag_value together with this field.
+     */
+    tag_key?: string | null;
+    tag_value?: string | null;
+    /**
+     * Exact native user ID match.
+     */
+    user_id?: string | null;
 };
 
 export type ListErrorGroupsQuery = {
@@ -15515,6 +15656,10 @@ export type LocationInfo = {
     region?: string | null;
 };
 
+export type LogAttributeOperator = 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte';
+
+export type LogAttributeType = 'string' | 'boolean' | 'integer' | 'double' | 'array' | 'object' | 'bytes';
+
 /**
  * Whether new container log lines are being collected right now. Separate
  * from `analytics` because the two fail independently: after a restart the
@@ -15582,6 +15727,12 @@ export type LogLevel = 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
  * A single log record ready for storage.
  */
 export type LogRecord = {
+    /**
+     * Declared native types for keys in `attributes`; absent on older records.
+     */
+    attribute_types?: {
+        [key: string]: LogAttributeType;
+    };
     attributes: {
         [key: string]: string;
     };
@@ -16471,6 +16622,15 @@ export type ModelUsage = {
     total_tokens: number;
 };
 
+export type MonitorConfig = {
+    checkin_margin?: number;
+    failure_issue_threshold?: number;
+    max_runtime?: number;
+    recovery_threshold?: number;
+    schedule: MonitorSchedule;
+    timezone?: string;
+};
+
 export type MonitorResponse = {
     check_interval_seconds: number;
     check_path?: string | null;
@@ -16494,6 +16654,15 @@ export type MonitorResponse = {
     next_check_at?: string | null;
     project_id: number;
     updated_at: string;
+};
+
+export type MonitorSchedule = {
+    type: 'crontab';
+    value: string;
+} | {
+    type: 'interval';
+    unit: string;
+    value: number;
 };
 
 export type MonitorStatus = {
@@ -25571,12 +25740,19 @@ export type SourceMapListResponse = {
 export type SourceMapResponse = {
     checksum?: string | null;
     created_at: string;
+    debug_id?: string | null;
     dist?: string | null;
     file_path: string;
     id: number;
     project_id: number;
     release: string;
     size_bytes: number;
+};
+
+export type SourceMapUploadForm = {
+    dist?: string | null;
+    file: Blob | File;
+    file_path: string;
 };
 
 /**
@@ -26580,6 +26756,31 @@ export type TelemetryGapWindowResponse = {
     project_id: number;
     reason: TelemetryWriteIntervalReason;
     started_at: string;
+};
+
+export type TelemetryRelease = {
+    check_ins: number;
+    errors: number;
+    example_error_group_id?: number | null;
+    example_feedback_id?: number | null;
+    example_log_trace_id?: string | null;
+    example_metric_name?: string | null;
+    example_monitor_id?: number | null;
+    example_trace_id?: string | null;
+    feedback: number;
+    first_seen: string;
+    last_seen: string;
+    logs: number;
+    metric_points: number;
+    release: string;
+    spans: number;
+};
+
+export type TelemetryReleasePage = {
+    end_time: string;
+    items: Array<TelemetryRelease>;
+    start_time: string;
+    total: number;
 };
 
 /**
@@ -28294,6 +28495,11 @@ export type UpdateComposeSecurityRequest = {
 
 export type UpdateConfigBody = {
     config?: ProviderConfig | null;
+};
+
+export type UpdateCronMonitor = {
+    config?: MonitorConfig | null;
+    enabled?: boolean | null;
 };
 
 export type UpdateCustomDomainRequest = {
@@ -30688,28 +30894,95 @@ export type ZoneListResponse = {
 };
 
 /**
- * Who can reach an address.
+ * Who makes the published hostnames resolve.
  */
-export type AddressScope = 'public' | 'private' | 'cgnat' | 'local';
+export type DnsHandling = 'automatic' | 'manual' | 'provider_hostname';
 
 /**
- * `PUT /settings/cluster-network` answer.
+ * Body of `POST /internal/nodes/mesh-enroll` (ADR 055).
  */
-export type ClusterNetworkChangeResponse = {
-    reassigned: Array<ClusterNetworkReassignment>;
-    status: ClusterNetworkStatus;
+export type MeshEnrollApiRequest = {
+    /**
+     * Enrollment token, as for `/internal/nodes/register`.
+     */
+    join_token?: string | null;
+    /**
+     * Scheduling labels the worker will register with; checked against the
+     * token's bound labels and carried over to the pairing's token.
+     */
+    labels?: unknown;
+    /**
+     * The name the worker will register under.
+     */
+    name: string;
+    /**
+     * The worker's base64 WireGuard public key. The private key never
+     * leaves the worker.
+     */
+    wg_public_key: string;
+};
+
+export type SetHostnameChoiceRequest = {
+    /**
+     * Required with mode `tunnel`.
+     */
+    connector_id?: number | null;
+    mode: HostnameMode;
+};
+
+export type LinkView = {
+    client_version?: string | null;
+    /**
+     * The provider's data centre, such as `mad01`.
+     */
+    location?: string | null;
+    /**
+     * The worker holding it, when its connector could be matched.
+     */
+    node_id?: number | null;
+    node_name?: string | null;
+    opened_at?: string | null;
+    reconnecting: boolean;
 };
 
 /**
- * The control plane's overlay.
+ * Cross-node overlay state reported by the agent (ADR 056).
  */
-export type ClusterNetworkControlPlane = {
-    compute_cidr?: string | null;
-    overlay_ready: boolean;
+export type OverlayHeartbeat = {
     /**
-     * Why its last overlay setup failed, with the fix, when it did.
+     * The allocation the agent applied (when `ready`) or tried to.
      */
-    setup_failure?: string | null;
+    compute_cidr?: string | null;
+    /**
+     * Why the overlay is unavailable, with the fix.
+     */
+    last_error?: string | null;
+    /**
+     * `ready` or `unavailable`.
+     */
+    status: string;
+};
+
+/**
+ * How one hostname reaches visitors, as the operator chose it (ADR 058 D9).
+ */
+export type HostnameMode = 'automatic' | 'tunnel' | 'off';
+
+export type ConnectorNodeView = {
+    driver?: string | null;
+    last_error?: string | null;
+    node_id: number;
+    node_name: string;
+    ready_connections?: number | null;
+    reported_at?: string | null;
+    state: string;
+};
+
+export type HostnameCandidate = {
+    auto_publish: boolean;
+    connector_id: number;
+    domain: string;
+    name: string;
 };
 
 /**
@@ -30746,14 +31019,75 @@ export type ClusterNetworkNode = {
     overlay_status?: string | null;
 };
 
+export type UpdateConnectorRequest = {
+    /**
+     * Publish every worker-served hostname under the domain (true), or only
+     * hostnames chosen for this tunnel (false).
+     */
+    auto_publish?: boolean | null;
+};
+
 /**
- * A node whose allocation a change moved.
+ * The control plane's overlay.
  */
-export type ClusterNetworkReassignment = {
-    from: string;
-    node_id: number;
-    node_name: string;
-    to: string;
+export type ClusterNetworkControlPlane = {
+    compute_cidr?: string | null;
+    overlay_ready: boolean;
+    /**
+     * Why its last overlay setup failed, with the fix, when it did.
+     */
+    setup_failure?: string | null;
+};
+
+export type PublicIngressCheck = {
+    ok: boolean;
+    steps: Array<PublicIngressCheckStep>;
+    summary: string;
+    /**
+     * The address that was dialled.
+     */
+    target?: string | null;
+};
+
+export type SetConnectorNodesRequest = {
+    node_ids: Array<number>;
+};
+
+/**
+ * `PUT /settings/cluster-network` answer.
+ */
+export type ClusterNetworkChangeResponse = {
+    reassigned: Array<ClusterNetworkReassignment>;
+    status: ClusterNetworkStatus;
+};
+
+export type PublicIngressCheckStep = {
+    message: string;
+    ok: boolean;
+    /**
+     * `address`, `http` or `https`.
+     */
+    step: string;
+};
+
+export type FieldKind = {
+    type: 'text';
+} | {
+    type: 'secret';
+} | {
+    provider_type?: string | null;
+    type: 'dns_provider';
+} | {
+    allow_subdomain?: boolean;
+    provider_field: string;
+    type: 'managed_domain';
+};
+
+export type PublicIngressInterface = {
+    address: string;
+    default_route: boolean;
+    name: string;
+    scope: AddressScope;
 };
 
 /**
@@ -30790,45 +31124,50 @@ export type ClusterNetworkStatus = {
 };
 
 /**
- * A tunnel's live connections, read from the provider on request.
+ * One IPv4 range a node already uses outside Temps (ADR 056).
  */
-export type ConnectorLinksView = {
-    links: Array<LinkView>;
+export type OccupiedRangeReport = {
     /**
-     * The provider's own word for the tunnel (Cloudflare: `healthy`,
-     * `degraded`, `down`, `inactive`).
+     * IPv4 network, e.g. `172.20.0.0/16`.
      */
-    status: string;
-};
-
-export type ConnectorNodeView = {
-    driver?: string | null;
-    last_error?: string | null;
-    node_id: number;
-    node_name: string;
-    ready_connections?: number | null;
-    reported_at?: string | null;
-    state: string;
-};
-
-export type ConnectorView = {
-    auto_publish: boolean;
-    created_at: string;
-    dns_provider_id?: number | null;
+    cidr: string;
     /**
-     * Where published hostnames point.
+     * Device name for a route, network name for a Docker network.
      */
-    dns_target?: string | null;
-    domain: string;
-    edge_port: number;
-    external_id?: string | null;
-    id: number;
-    last_error?: string | null;
     name: string;
-    nodes: Array<ConnectorNodeView>;
-    provider: string;
-    publications: Array<PublicationView>;
-    status: string;
+    /**
+     * `route` (a host route) or `docker` (a Docker network's subnet).
+     */
+    source: string;
+};
+
+/**
+ * One question in a provider's setup form.
+ */
+export type SetupField = {
+    help?: string | null;
+    /**
+     * The key in `values` of the create request.
+     */
+    key: string;
+    kind: FieldKind;
+    label: string;
+    placeholder?: string | null;
+    required: boolean;
+};
+
+export type UpdatePublicIngressSettingsRequest = {
+    enabled: boolean;
+    http_port?: number | null;
+    https_port?: number | null;
+    /**
+     * Local address to bind, or `None` for automatic.
+     */
+    listen_address?: string | null;
+    /**
+     * What DNS points at, or `None` for the listen address.
+     */
+    public_address?: string | null;
 };
 
 export type CreateConnectorRequest = {
@@ -30851,142 +31190,6 @@ export type CreateConnectorRequest = {
     values?: {
         [key: string]: unknown;
     };
-};
-
-/**
- * Who makes the published hostnames resolve.
- */
-export type DnsHandling = 'automatic' | 'manual' | 'provider_hostname';
-
-export type FieldKind = {
-    type: 'text';
-} | {
-    type: 'secret';
-} | {
-    provider_type?: string | null;
-    type: 'dns_provider';
-} | {
-    allow_subdomain?: boolean;
-    provider_field: string;
-    type: 'managed_domain';
-};
-
-export type HostnameCandidate = {
-    auto_publish: boolean;
-    connector_id: number;
-    domain: string;
-    name: string;
-};
-
-/**
- * How one hostname reaches visitors, as the operator chose it (ADR 058 D9).
- */
-export type HostnameMode = 'automatic' | 'tunnel' | 'off';
-
-/**
- * Where a hostname stands with the tunnels, and why.
- */
-export type HostnameView = {
-    /**
-     * The tunnels whose domain covers it.
-     */
-    candidates: Array<HostnameCandidate>;
-    /**
-     * The tunnel chosen for it, with mode `tunnel`.
-     */
-    chosen_connector_id?: number | null;
-    /**
-     * The tunnel that publishes it, or would once `detail` is dealt with.
-     */
-    connector_id?: number | null;
-    connector_name?: string | null;
-    /**
-     * What is happening; when it is not published, why and what to do.
-     */
-    detail: string;
-    hostname: string;
-    mode: HostnameMode;
-    published_at?: string | null;
-    /**
-     * Whether workers serve it. A tunnel only publishes those.
-     */
-    served_by_workers: boolean;
-    /**
-     * `published`, `pending`, `error` or `not_published`.
-     */
-    state: string;
-};
-
-/**
- * What a worker lets its control plane do with public ingress. Set on the
- * worker only (`temps join --ingress`, `temps agent ingress`): opening ports
- * on a machine is its owner's decision, whoever runs the control plane.
- */
-export type IngressMode = 'off' | 'fixed' | 'delegated';
-
-export type InstallRepositoryRequest = {
-    grants?: PluginGrantConfig | null;
-    name?: string | null;
-    path?: string | null;
-    progressId?: string | null;
-    ref_name?: string | null;
-    repository_url: string;
-};
-
-export type InstallRepositoryResponse = {
-    message: string;
-    name: string;
-    platform: string;
-    sha256: string;
-    source_commit: string;
-    version: string;
-};
-
-export type InstallationReportingSettings = {
-    /**
-     * Opt in to sharing a plugin name and plugin-specific anonymous identifier
-     * with the official Temps registry after a verified install succeeds.
-     */
-    enabled: boolean;
-};
-
-export type LinkView = {
-    client_version?: string | null;
-    /**
-     * The provider's data centre, such as `mad01`.
-     */
-    location?: string | null;
-    /**
-     * The worker holding it, when its connector could be matched.
-     */
-    node_id?: number | null;
-    node_name?: string | null;
-    opened_at?: string | null;
-    reconnecting: boolean;
-};
-
-/**
- * Body of `POST /internal/nodes/mesh-enroll` (ADR 055).
- */
-export type MeshEnrollApiRequest = {
-    /**
-     * Enrollment token, as for `/internal/nodes/register`.
-     */
-    join_token?: string | null;
-    /**
-     * Scheduling labels the worker will register with; checked against the
-     * token's bound labels and carried over to the pairing's token.
-     */
-    labels?: unknown;
-    /**
-     * The name the worker will register under.
-     */
-    name: string;
-    /**
-     * The worker's base64 WireGuard public key. The private key never
-     * leaves the worker.
-     */
-    wg_public_key: string;
 };
 
 /**
@@ -31039,6 +31242,207 @@ export type MeshEnrollResponse = {
     prefix_len: number;
 };
 
+export type PublicationView = {
+    hostname: string;
+    last_error?: string | null;
+    published_at?: string | null;
+    state: string;
+};
+
+export type ConnectorView = {
+    auto_publish: boolean;
+    created_at: string;
+    dns_provider_id?: number | null;
+    /**
+     * Where published hostnames point.
+     */
+    dns_target?: string | null;
+    domain: string;
+    edge_port: number;
+    external_id?: string | null;
+    id: number;
+    last_error?: string | null;
+    name: string;
+    nodes: Array<ConnectorNodeView>;
+    provider: string;
+    publications: Array<PublicationView>;
+    status: string;
+};
+
+/**
+ * What a provider is, for the console.
+ */
+export type ProviderInfo = {
+    dns: DnsHandling;
+    docs_url?: string | null;
+    fields: Array<SetupField>;
+    /**
+     * Stored on the connector, e.g. `cloudflare_tunnel`.
+     */
+    kind: string;
+    name: string;
+    /**
+     * Whether the worker needs a public address. Tunnels do not.
+     */
+    needs_public_ip: boolean;
+    /**
+     * What the operator needs before starting, one line each.
+     */
+    requirements: Array<string>;
+    summary: string;
+    /**
+     * Whether it works when the ISP puts the worker behind carrier-grade NAT.
+     */
+    works_behind_cgnat: boolean;
+};
+
+/**
+ * Body of `PUT /settings/cluster-network`.
+ */
+export type UpdateClusterNetworkRequest = {
+    /**
+     * New compute pool, an RFC 1918 IPv4 network such as `10.202.0.0/16`.
+     */
+    compute_pool_cidr: string;
+    /**
+     * Prefix of each node's subnet; keeps the current one when omitted.
+     */
+    subnet_prefix_len?: number | null;
+};
+
+export type PublicIngressSettings = {
+    /**
+     * Whether the agent reported its addresses: an agent that predates
+     * console-managed ingress never does, and keeps its flag.
+     */
+    agent_reports: boolean;
+    /**
+     * The listen address is not public but the public address is: traffic
+     * crosses a NAT, so the router must forward the ports.
+     */
+    behind_nat: boolean;
+    checked_at?: string | null;
+    /**
+     * The address DNS should point at, as far as Temps can tell.
+     */
+    effective_public_address?: string | null;
+    effective_public_scope?: AddressScope | null;
+    enabled: boolean;
+    http_port: number;
+    https_port: number;
+    interfaces: Array<PublicIngressInterface>;
+    last_check?: PublicIngressCheck | null;
+    last_error?: string | null;
+    /**
+     * Configured listen address; `None` means automatic.
+     */
+    listen_address?: string | null;
+    listener_error?: string | null;
+    listening_http?: string | null;
+    listening_https?: string | null;
+    mode?: IngressMode | null;
+    node_id: number;
+    /**
+     * Configured public address; `None` means the listen address.
+     */
+    public_address?: string | null;
+    running?: boolean | null;
+};
+
+/**
+ * Who can reach an address.
+ */
+export type AddressScope = 'public' | 'private' | 'cgnat' | 'local';
+
+/**
+ * A tunnel's live connections, read from the provider on request.
+ */
+export type ConnectorLinksView = {
+    links: Array<LinkView>;
+    /**
+     * The provider's own word for the tunnel (Cloudflare: `healthy`,
+     * `degraded`, `down`, `inactive`).
+     */
+    status: string;
+};
+
+/**
+ * A node whose allocation a change moved.
+ */
+export type ClusterNetworkReassignment = {
+    from: string;
+    node_id: number;
+    node_name: string;
+    to: string;
+};
+
+/**
+ * What a worker lets its control plane do with public ingress. Set on the
+ * worker only (`temps join --ingress`, `temps agent ingress`): opening ports
+ * on a machine is its owner's decision, whoever runs the control plane.
+ */
+export type IngressMode = 'off' | 'fixed' | 'delegated';
+
+/**
+ * Where a hostname stands with the tunnels, and why.
+ */
+export type HostnameView = {
+    /**
+     * The tunnels whose domain covers it.
+     */
+    candidates: Array<HostnameCandidate>;
+    /**
+     * The tunnel chosen for it, with mode `tunnel`.
+     */
+    chosen_connector_id?: number | null;
+    /**
+     * The tunnel that publishes it, or would once `detail` is dealt with.
+     */
+    connector_id?: number | null;
+    connector_name?: string | null;
+    /**
+     * What is happening; when it is not published, why and what to do.
+     */
+    detail: string;
+    hostname: string;
+    mode: HostnameMode;
+    published_at?: string | null;
+    /**
+     * Whether workers serve it. A tunnel only publishes those.
+     */
+    served_by_workers: boolean;
+    /**
+     * `published`, `pending`, `error` or `not_published`.
+     */
+    state: string;
+};
+
+export type InstallRepositoryRequest = {
+    grants?: PluginGrantConfig | null;
+    name?: string | null;
+    path?: string | null;
+    progressId?: string | null;
+    ref_name?: string | null;
+    repository_url: string;
+};
+
+export type InstallRepositoryResponse = {
+    message: string;
+    name: string;
+    platform: string;
+    sha256: string;
+    source_commit: string;
+    version: string;
+};
+
+export type InstallationReportingSettings = {
+    /**
+     * Opt in to sharing a plugin name and plugin-specific anonymous identifier
+     * with the official Temps registry after a verified install succeeds.
+     */
+    enabled: boolean;
+};
+
 /**
  * A navigation entry that the plugin contributes to the Temps UI.
  */
@@ -31075,42 +31479,6 @@ export type NpmRelease = {
     integrity: string;
     name: string;
     version: string;
-};
-
-/**
- * One IPv4 range a node already uses outside Temps (ADR 056).
- */
-export type OccupiedRangeReport = {
-    /**
-     * IPv4 network, e.g. `172.20.0.0/16`.
-     */
-    cidr: string;
-    /**
-     * Device name for a route, network name for a Docker network.
-     */
-    name: string;
-    /**
-     * `route` (a host route) or `docker` (a Docker network's subnet).
-     */
-    source: string;
-};
-
-/**
- * Cross-node overlay state reported by the agent (ADR 056).
- */
-export type OverlayHeartbeat = {
-    /**
-     * The allocation the agent applied (when `ready`) or tried to.
-     */
-    compute_cidr?: string | null;
-    /**
-     * Why the overlay is unavailable, with the fix.
-     */
-    last_error?: string | null;
-    /**
-     * `ready` or `unavailable`.
-     */
-    status: string;
 };
 
 export type PlatformRelease = {
@@ -31297,105 +31665,6 @@ export type ProgressStage = {
 
 export type ProgressStatus = 'running' | 'completed' | 'failed';
 
-/**
- * What a provider is, for the console.
- */
-export type ProviderInfo = {
-    dns: DnsHandling;
-    docs_url?: string | null;
-    fields: Array<SetupField>;
-    /**
-     * Stored on the connector, e.g. `cloudflare_tunnel`.
-     */
-    kind: string;
-    name: string;
-    /**
-     * Whether the worker needs a public address. Tunnels do not.
-     */
-    needs_public_ip: boolean;
-    /**
-     * What the operator needs before starting, one line each.
-     */
-    requirements: Array<string>;
-    summary: string;
-    /**
-     * Whether it works when the ISP puts the worker behind carrier-grade NAT.
-     */
-    works_behind_cgnat: boolean;
-};
-
-export type PublicIngressCheck = {
-    ok: boolean;
-    steps: Array<PublicIngressCheckStep>;
-    summary: string;
-    /**
-     * The address that was dialled.
-     */
-    target?: string | null;
-};
-
-export type PublicIngressCheckStep = {
-    message: string;
-    ok: boolean;
-    /**
-     * `address`, `http` or `https`.
-     */
-    step: string;
-};
-
-export type PublicIngressInterface = {
-    address: string;
-    default_route: boolean;
-    name: string;
-    scope: AddressScope;
-};
-
-export type PublicIngressSettings = {
-    /**
-     * Whether the agent reported its addresses: an agent that predates
-     * console-managed ingress never does, and keeps its flag.
-     */
-    agent_reports: boolean;
-    /**
-     * The listen address is not public but the public address is: traffic
-     * crosses a NAT, so the router must forward the ports.
-     */
-    behind_nat: boolean;
-    checked_at?: string | null;
-    /**
-     * The address DNS should point at, as far as Temps can tell.
-     */
-    effective_public_address?: string | null;
-    effective_public_scope?: AddressScope | null;
-    enabled: boolean;
-    http_port: number;
-    https_port: number;
-    interfaces: Array<PublicIngressInterface>;
-    last_check?: PublicIngressCheck | null;
-    last_error?: string | null;
-    /**
-     * Configured listen address; `None` means automatic.
-     */
-    listen_address?: string | null;
-    listener_error?: string | null;
-    listening_http?: string | null;
-    listening_https?: string | null;
-    mode?: IngressMode | null;
-    node_id: number;
-    /**
-     * Configured public address; `None` means the listen address.
-     */
-    public_address?: string | null;
-    running?: boolean | null;
-};
-
-export type PublicationView = {
-    hostname: string;
-    last_error?: string | null;
-    published_at?: string | null;
-    state: string;
-};
-
 export type RegistryPlugin = {
     author: string;
     category: string;
@@ -31490,33 +31759,6 @@ export type RepositoryValidation = {
     metadata: string;
 };
 
-export type SetConnectorNodesRequest = {
-    node_ids: Array<number>;
-};
-
-export type SetHostnameChoiceRequest = {
-    /**
-     * Required with mode `tunnel`.
-     */
-    connector_id?: number | null;
-    mode: HostnameMode;
-};
-
-/**
- * One question in a provider's setup form.
- */
-export type SetupField = {
-    help?: string | null;
-    /**
-     * The key in `values` of the create request.
-     */
-    key: string;
-    kind: FieldKind;
-    label: string;
-    placeholder?: string | null;
-    required: boolean;
-};
-
 /**
  * Describes the plugin's embedded UI bundle.
  */
@@ -31553,42 +31795,6 @@ export type UninstallPluginResponse = {
     data_preserved: boolean;
     message: string;
     name: string;
-};
-
-/**
- * Body of `PUT /settings/cluster-network`.
- */
-export type UpdateClusterNetworkRequest = {
-    /**
-     * New compute pool, an RFC 1918 IPv4 network such as `10.202.0.0/16`.
-     */
-    compute_pool_cidr: string;
-    /**
-     * Prefix of each node's subnet; keeps the current one when omitted.
-     */
-    subnet_prefix_len?: number | null;
-};
-
-export type UpdateConnectorRequest = {
-    /**
-     * Publish every worker-served hostname under the domain (true), or only
-     * hostnames chosen for this tunnel (false).
-     */
-    auto_publish?: boolean | null;
-};
-
-export type UpdatePublicIngressSettingsRequest = {
-    enabled: boolean;
-    http_port?: number | null;
-    https_port?: number | null;
-    /**
-     * Local address to bind, or `None` for automatic.
-     */
-    listen_address?: string | null;
-    /**
-     * What DNS points at, or `None` for the listen address.
-     */
-    public_address?: string | null;
 };
 
 export type UpdateRepositoryRequest = {
@@ -31682,26 +31888,67 @@ export type GetPlatformInfoResponses = {
 
 export type GetPlatformInfoResponse = GetPlatformInfoResponses[keyof GetPlatformInfoResponses];
 
+export type AssembleArtifactBundleData = {
+    body: ArtifactAssembleRequest;
+    path: {
+        org_slug: string;
+    };
+    query?: never;
+    url: '/0/organizations/{org_slug}/artifactbundle/assemble/';
+};
+
+export type AssembleArtifactBundleErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    429: unknown;
+};
+
+export type AssembleArtifactBundleResponses = {
+    200: ArtifactAssembly;
+};
+
+export type AssembleArtifactBundleResponse = AssembleArtifactBundleResponses[keyof AssembleArtifactBundleResponses];
+
 export type ChunkUploadOptionsData = {
     body?: never;
     path: {
-        /**
-         * Organization slug (ignored)
-         */
         org_slug: string;
     };
     query?: never;
     url: '/0/organizations/{org_slug}/chunk-upload/';
 };
 
+export type ChunkUploadOptionsErrors = {
+    401: unknown;
+    403: unknown;
+};
+
 export type ChunkUploadOptionsResponses = {
-    /**
-     * Chunk upload options
-     */
     200: SentryChunkUploadResponse;
 };
 
 export type ChunkUploadOptionsResponse = ChunkUploadOptionsResponses[keyof ChunkUploadOptionsResponses];
+
+export type UploadArtifactChunkData = {
+    body?: never;
+    path: {
+        org_slug: string;
+    };
+    query?: never;
+    url: '/0/organizations/{org_slug}/chunk-upload/';
+};
+
+export type UploadArtifactChunkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    429: unknown;
+};
+
+export type UploadArtifactChunkResponses = {
+    200: unknown;
+};
 
 export type CreateReleaseData = {
     body: SentryCreateReleaseRequest;
@@ -34927,6 +35174,10 @@ export type DeleteFileErrors = {
      * Unauthorized
      */
     401: OpenAiErrorResponse;
+    /**
+     * Insufficient permissions (requires ai_gateway:write)
+     */
+    403: unknown;
     /**
      * No such file created by the caller
      */
@@ -42779,6 +43030,10 @@ export type GetGlobalEventsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
 };
 
 export type GetGlobalEventsResponses = {
@@ -42802,6 +43057,10 @@ export type GetGlobalEventStatsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
 };
 
 export type GetGlobalEventStatsResponses = {
@@ -44121,6 +44380,10 @@ export type AddClusterMemberErrors = {
      */
     400: unknown;
     /**
+     * Insufficient permissions or deployment-token caller
+     */
+    403: unknown;
+    /**
      * Service not found
      */
     404: unknown;
@@ -44160,6 +44423,10 @@ export type RemoveClusterMemberErrors = {
      * Validation failed (monitor, primary, or quorum violation)
      */
     400: unknown;
+    /**
+     * Insufficient permissions or deployment-token caller
+     */
+    403: unknown;
     /**
      * Service or member not found
      */
@@ -44236,6 +44503,10 @@ export type PromoteClusterMemberErrors = {
      * Validation failed (monitor, already primary, not running, etc.)
      */
     400: unknown;
+    /**
+     * Insufficient permissions or deployment-token caller
+     */
+    403: unknown;
     /**
      * Service or member not found
      */
@@ -45195,7 +45466,7 @@ export type PlanRestoreErrors = {
      */
     401: ProblemDetails;
     /**
-     * Insufficient permissions
+     * Insufficient permissions (requires backups:write)
      */
     403: ProblemDetails;
     /**
@@ -45267,6 +45538,10 @@ export type RetryClusterErrors = {
      * Service is not a failed cluster
      */
     400: unknown;
+    /**
+     * Insufficient permissions or deployment-token caller
+     */
+    403: unknown;
     /**
      * Service not found
      */
@@ -54156,6 +54431,22 @@ export type QueryLogsData = {
          */
         search?: string;
         /**
+         * Exact attribute key; pair with attribute_value
+         */
+        attribute_key?: string;
+        /**
+         * Exact string or numeric text, preserving int64 precision
+         */
+        attribute_value?: string;
+        /**
+         * Optional native declared type; older records without type metadata do not match
+         */
+        attribute_type?: LogAttributeType;
+        /**
+         * Default eq; numeric types also support lt/lte/gt/gte
+         */
+        attribute_op?: LogAttributeOperator;
+        /**
          * Filter by correlated trace ID
          */
         trace_id?: string;
@@ -54180,6 +54471,10 @@ export type QueryLogsData = {
 };
 
 export type QueryLogsErrors = {
+    /**
+     * Invalid log attribute filter
+     */
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
@@ -59996,6 +60291,43 @@ export type UpdateAutomaticDeployResponses = {
 
 export type UpdateAutomaticDeployResponse = UpdateAutomaticDeployResponses[keyof UpdateAutomaticDeployResponses];
 
+export type ListClientOutcomesData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Retained observation window, 1–31 days; default 7.
+         */
+        days?: number | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/client-outcomes';
+};
+
+export type ListClientOutcomesErrors = {
+    /**
+     * Invalid outcome query
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Project and telemetry permissions required
+     */
+    403: unknown;
+};
+
+export type ListClientOutcomesResponses = {
+    200: ClientOutcomePage;
+};
+
+export type ListClientOutcomesResponse = ListClientOutcomesResponses[keyof ListClientOutcomesResponses];
+
 export type GetProjectComposeValidationData = {
     body?: never;
     path: {
@@ -60033,6 +60365,340 @@ export type GetProjectComposeValidationResponses = {
 };
 
 export type GetProjectComposeValidationResponse = GetProjectComposeValidationResponses[keyof GetProjectComposeValidationResponses];
+
+export type ListCronMonitorsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/cron-monitors';
+};
+
+export type ListCronMonitorsErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type ListCronMonitorsResponses = {
+    /**
+     * Success
+     */
+    200: CronMonitorList;
+};
+
+export type ListCronMonitorsResponse = ListCronMonitorsResponses[keyof ListCronMonitorsResponses];
+
+export type CreateCronMonitorData = {
+    body: CreateCronMonitor;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/cron-monitors';
+};
+
+export type CreateCronMonitorErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type CreateCronMonitorResponses = {
+    /**
+     * Success
+     */
+    201: CronMonitorView;
+};
+
+export type CreateCronMonitorResponse = CreateCronMonitorResponses[keyof CreateCronMonitorResponses];
+
+export type DeleteCronMonitorData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/cron-monitors/{monitor_id}';
+};
+
+export type DeleteCronMonitorErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type DeleteCronMonitorResponses = {
+    /**
+     * Success
+     */
+    204: void;
+};
+
+export type DeleteCronMonitorResponse = DeleteCronMonitorResponses[keyof DeleteCronMonitorResponses];
+
+export type GetCronMonitorData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/cron-monitors/{monitor_id}';
+};
+
+export type GetCronMonitorErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type GetCronMonitorResponses = {
+    /**
+     * Success
+     */
+    200: CronMonitorView;
+};
+
+export type GetCronMonitorResponse = GetCronMonitorResponses[keyof GetCronMonitorResponses];
+
+export type UpdateCronMonitorData = {
+    body: UpdateCronMonitor;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/cron-monitors/{monitor_id}';
+};
+
+export type UpdateCronMonitorErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type UpdateCronMonitorResponses = {
+    /**
+     * Success
+     */
+    200: CronMonitorView;
+};
+
+export type UpdateCronMonitorResponse = UpdateCronMonitorResponses[keyof UpdateCronMonitorResponses];
+
+export type ListCronMonitorRunsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Monitor ID
+         */
+        monitor_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/cron-monitors/{monitor_id}/runs';
+};
+
+export type ListCronMonitorRunsErrors = {
+    /**
+     * Invalid configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Already exists
+     */
+    409: unknown;
+    /**
+     * Monitor limit reached
+     */
+    429: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type ListCronMonitorRunsResponses = {
+    /**
+     * Success
+     */
+    200: CronMonitorRunList;
+};
+
+export type ListCronMonitorRunsResponse = ListCronMonitorRunsResponses[keyof ListCronMonitorRunsResponses];
 
 export type ListCustomDomainsForProjectData = {
     body?: never;
@@ -60982,6 +61648,10 @@ export type SendFailureReportData = {
 };
 
 export type SendFailureReportErrors = {
+    /**
+     * Insufficient permissions, cross-project credential, or reporting disabled
+     */
+    403: unknown;
     /**
      * Job not found
      */
@@ -63271,6 +63941,10 @@ export type RestartContainerData = {
 
 export type RestartContainerErrors = {
     /**
+     * Insufficient permissions or cross-project credential
+     */
+    403: unknown;
+    /**
      * Container not found
      */
     404: unknown;
@@ -63315,6 +63989,10 @@ export type StartContainerData = {
 
 export type StartContainerErrors = {
     /**
+     * Insufficient permissions or cross-project credential
+     */
+    403: unknown;
+    /**
      * Container not found
      */
     404: unknown;
@@ -63358,6 +64036,10 @@ export type StopContainerData = {
 };
 
 export type StopContainerErrors = {
+    /**
+     * Insufficient permissions or cross-project credential
+     */
+    403: unknown;
     /**
      * Container not found
      */
@@ -64249,11 +64931,24 @@ export type ListErrorEventsData = {
     query?: {
         page?: number;
         page_size?: number;
+        /**
+         * Exact native user ID match.
+         */
+        user_id?: string | null;
+        /**
+         * Exact tag match; supply tag_value together with this field.
+         */
+        tag_key?: string | null;
+        tag_value?: string | null;
     };
     url: '/projects/{project_id}/error-groups/{group_id}/events';
 };
 
 export type ListErrorEventsErrors = {
+    /**
+     * Invalid metadata filters
+     */
+    400: unknown;
     /**
      * Error group not found
      */
@@ -64968,6 +65663,119 @@ export type GetRemoteExternalImageResponses = {
 
 export type GetRemoteExternalImageResponse = GetRemoteExternalImageResponses[keyof GetRemoteExternalImageResponses];
 
+export type ListProjectFeedbackData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        status?: string | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/feedback';
+};
+
+export type ListProjectFeedbackErrors = {
+    /**
+     * Invalid filter
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Project access required
+     */
+    403: unknown;
+};
+
+export type ListProjectFeedbackResponses = {
+    200: FeedbackPage;
+};
+
+export type ListProjectFeedbackResponse = ListProjectFeedbackResponses[keyof ListProjectFeedbackResponses];
+
+export type DeleteProjectFeedbackData = {
+    body?: never;
+    path: {
+        project_id: number;
+        feedback_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/feedback/{feedback_id}';
+};
+
+export type DeleteProjectFeedbackErrors = {
+    /**
+     * Feedback not found
+     */
+    404: unknown;
+};
+
+export type DeleteProjectFeedbackResponses = {
+    /**
+     * Feedback permanently deleted
+     */
+    204: void;
+};
+
+export type DeleteProjectFeedbackResponse = DeleteProjectFeedbackResponses[keyof DeleteProjectFeedbackResponses];
+
+export type GetProjectFeedbackData = {
+    body?: never;
+    path: {
+        project_id: number;
+        feedback_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/feedback/{feedback_id}';
+};
+
+export type GetProjectFeedbackErrors = {
+    /**
+     * Feedback not found
+     */
+    404: unknown;
+};
+
+export type GetProjectFeedbackResponses = {
+    200: FeedbackView;
+};
+
+export type GetProjectFeedbackResponse = GetProjectFeedbackResponses[keyof GetProjectFeedbackResponses];
+
+export type UpdateProjectFeedbackData = {
+    body: FeedbackStatusRequest;
+    path: {
+        project_id: number;
+        feedback_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/feedback/{feedback_id}';
+};
+
+export type UpdateProjectFeedbackErrors = {
+    /**
+     * Invalid status
+     */
+    400: unknown;
+    /**
+     * Feedback not found
+     */
+    404: unknown;
+};
+
+export type UpdateProjectFeedbackResponses = {
+    /**
+     * Feedback status updated
+     */
+    204: void;
+};
+
+export type UpdateProjectFeedbackResponse = UpdateProjectFeedbackResponses[keyof UpdateProjectFeedbackResponses];
+
 export type ListFlagsData = {
     body?: never;
     path: {
@@ -65382,6 +66190,10 @@ export type PreviewFunnelMetricsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Insufficient permissions (requires funnel:write)
+     */
+    403: unknown;
     /**
      * Internal server error
      */
@@ -67250,7 +68062,7 @@ export type ListSourceMapsResponses = {
 export type ListSourceMapsResponse = ListSourceMapsResponses[keyof ListSourceMapsResponses];
 
 export type UploadSourceMapData = {
-    body?: never;
+    body: SourceMapUploadForm;
     path: {
         /**
          * Project ID
@@ -68521,6 +69333,47 @@ export type CreateStatusPageResponses = {
 };
 
 export type CreateStatusPageResponse = CreateStatusPageResponses[keyof CreateStatusPageResponses];
+
+export type ListTelemetryReleasesData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Exact SDK release identity; absent lists observed releases.
+         */
+        release?: string | null;
+        /**
+         * Retained observation window, 1–31 days; default 7.
+         */
+        days?: number | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/telemetry-releases';
+};
+
+export type ListTelemetryReleasesErrors = {
+    /**
+     * Invalid release query
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Project and telemetry permissions required
+     */
+    403: unknown;
+};
+
+export type ListTelemetryReleasesResponses = {
+    200: TelemetryReleasePage;
+};
+
+export type ListTelemetryReleasesResponse = ListTelemetryReleasesResponses[keyof ListTelemetryReleasesResponses];
 
 export type GetUniqueCountsData = {
     body?: never;
@@ -70991,6 +71844,13 @@ export type RevenueGlobalEventsData = {
     url: '/revenue/events';
 };
 
+export type RevenueGlobalEventsErrors = {
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
+};
+
 export type RevenueGlobalEventsResponses = {
     200: Array<GlobalRecentEventResponse>;
 };
@@ -71002,6 +71862,13 @@ export type RevenueMetricsGlobalMrrData = {
     path?: never;
     query?: never;
     url: '/revenue/metrics/global-mrr';
+};
+
+export type RevenueMetricsGlobalMrrErrors = {
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
 };
 
 export type RevenueMetricsGlobalMrrResponses = {
@@ -71020,6 +71887,13 @@ export type RevenueMetricsGlobalSummaryData = {
         currency?: string;
     };
     url: '/revenue/metrics/global-summary';
+};
+
+export type RevenueMetricsGlobalSummaryErrors = {
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
 };
 
 export type RevenueMetricsGlobalSummaryResponses = {
@@ -76890,6 +77764,50 @@ export type IngestSentryEnvelopeResponses = {
     200: unknown;
 };
 
+export type IngestNelReportsData = {
+    body: string;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/{project_id}/nel/';
+};
+
+export type IngestNelReportsErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    415: unknown;
+    429: unknown;
+};
+
+export type IngestNelReportsResponses = {
+    200: unknown;
+};
+
+export type IngestSecurityReportsData = {
+    body: string;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/{project_id}/security/';
+};
+
+export type IngestSecurityReportsErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    415: unknown;
+    429: unknown;
+};
+
+export type IngestSecurityReportsResponses = {
+    200: unknown;
+};
+
 export type IngestSentryEventData = {
     body: SentryEventRequest;
     path: {
@@ -77019,46 +77937,79 @@ export type GetAuditLogResponses = {
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
 
-export type ListIngressConnectorsData = {
+export type SyncIngressConnectorData = {
     body?: never;
-    path?: never;
+    path: {
+        id: number;
+    };
     query?: never;
-    url: '/ingress/connectors';
+    url: '/ingress/connectors/{id}/sync';
 };
 
-export type ListIngressConnectorsResponses = {
-    200: Array<ConnectorView>;
-};
-
-export type ListIngressConnectorsResponse = ListIngressConnectorsResponses[keyof ListIngressConnectorsResponses];
-
-export type CreateIngressConnectorData = {
-    body: CreateConnectorRequest;
-    path?: never;
-    query?: never;
-    url: '/ingress/connectors';
-};
-
-export type CreateIngressConnectorErrors = {
-    /**
-     * Invalid name, setup answers or nodes
-     */
-    400: unknown;
-    /**
-     * A worker has not delegated public ingress
-     */
-    409: unknown;
-    /**
-     * The provider refused; the detail says what to fix
-     */
+export type SyncIngressConnectorErrors = {
+    404: unknown;
     502: unknown;
 };
 
-export type CreateIngressConnectorResponses = {
-    201: ConnectorView;
+export type SyncIngressConnectorResponses = {
+    200: ConnectorView;
 };
 
-export type CreateIngressConnectorResponse = CreateIngressConnectorResponses[keyof CreateIngressConnectorResponses];
+export type SyncIngressConnectorResponse = SyncIngressConnectorResponses[keyof SyncIngressConnectorResponses];
+
+export type AdminGetNodePublicIngressSettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/settings';
+};
+
+export type AdminGetNodePublicIngressSettingsErrors = {
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminGetNodePublicIngressSettingsResponses = {
+    200: PublicIngressSettings;
+};
+
+export type AdminGetNodePublicIngressSettingsResponse = AdminGetNodePublicIngressSettingsResponses[keyof AdminGetNodePublicIngressSettingsResponses];
+
+export type AdminUpdateNodePublicIngressSettingsData = {
+    body: UpdatePublicIngressSettingsRequest;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/settings';
+};
+
+export type AdminUpdateNodePublicIngressSettingsErrors = {
+    /**
+     * Invalid address or ports, or not a worker
+     */
+    400: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminUpdateNodePublicIngressSettingsResponses = {
+    200: PublicIngressSettings;
+};
+
+export type AdminUpdateNodePublicIngressSettingsResponse = AdminUpdateNodePublicIngressSettingsResponses[keyof AdminUpdateNodePublicIngressSettingsResponses];
 
 export type DeleteIngressConnectorData = {
     body?: never;
@@ -77117,261 +78068,6 @@ export type UpdateIngressConnectorResponses = {
 };
 
 export type UpdateIngressConnectorResponse = UpdateIngressConnectorResponses[keyof UpdateIngressConnectorResponses];
-
-export type GetIngressConnectorLinksData = {
-    body?: never;
-    path: {
-        id: number;
-    };
-    query?: never;
-    url: '/ingress/connectors/{id}/links';
-};
-
-export type GetIngressConnectorLinksErrors = {
-    /**
-     * The tunnel is not created yet
-     */
-    400: unknown;
-    404: unknown;
-    /**
-     * The provider could not be asked
-     */
-    502: unknown;
-};
-
-export type GetIngressConnectorLinksResponses = {
-    200: ConnectorLinksView;
-};
-
-export type GetIngressConnectorLinksResponse = GetIngressConnectorLinksResponses[keyof GetIngressConnectorLinksResponses];
-
-export type SetIngressConnectorNodesData = {
-    body: SetConnectorNodesRequest;
-    path: {
-        id: number;
-    };
-    query?: never;
-    url: '/ingress/connectors/{id}/nodes';
-};
-
-export type SetIngressConnectorNodesErrors = {
-    404: unknown;
-};
-
-export type SetIngressConnectorNodesResponses = {
-    200: ConnectorView;
-};
-
-export type SetIngressConnectorNodesResponse = SetIngressConnectorNodesResponses[keyof SetIngressConnectorNodesResponses];
-
-export type SyncIngressConnectorData = {
-    body?: never;
-    path: {
-        id: number;
-    };
-    query?: never;
-    url: '/ingress/connectors/{id}/sync';
-};
-
-export type SyncIngressConnectorErrors = {
-    404: unknown;
-    502: unknown;
-};
-
-export type SyncIngressConnectorResponses = {
-    200: ConnectorView;
-};
-
-export type SyncIngressConnectorResponse = SyncIngressConnectorResponses[keyof SyncIngressConnectorResponses];
-
-export type ListIngressHostnamesData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/ingress/hostnames';
-};
-
-export type ListIngressHostnamesResponses = {
-    200: Array<HostnameView>;
-};
-
-export type ListIngressHostnamesResponse = ListIngressHostnamesResponses[keyof ListIngressHostnamesResponses];
-
-export type GetIngressHostnameData = {
-    body?: never;
-    path: {
-        hostname: string;
-    };
-    query?: never;
-    url: '/ingress/hostnames/{hostname}';
-};
-
-export type GetIngressHostnameErrors = {
-    400: unknown;
-};
-
-export type GetIngressHostnameResponses = {
-    200: HostnameView;
-};
-
-export type GetIngressHostnameResponse = GetIngressHostnameResponses[keyof GetIngressHostnameResponses];
-
-export type SetIngressHostnameChoiceData = {
-    body: SetHostnameChoiceRequest;
-    path: {
-        hostname: string;
-    };
-    query?: never;
-    url: '/ingress/hostnames/{hostname}';
-};
-
-export type SetIngressHostnameChoiceErrors = {
-    /**
-     * Invalid hostname, or the tunnel cannot publish it
-     */
-    400: unknown;
-    /**
-     * No such tunnel
-     */
-    404: unknown;
-};
-
-export type SetIngressHostnameChoiceResponses = {
-    200: HostnameView;
-};
-
-export type SetIngressHostnameChoiceResponse = SetIngressHostnameChoiceResponses[keyof SetIngressHostnameChoiceResponses];
-
-export type ListIngressProvidersData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/ingress/providers';
-};
-
-export type ListIngressProvidersResponses = {
-    200: Array<ProviderInfo>;
-};
-
-export type ListIngressProvidersResponse = ListIngressProvidersResponses[keyof ListIngressProvidersResponses];
-
-export type MeshEnrollData = {
-    body: MeshEnrollApiRequest;
-    path?: never;
-    query?: never;
-    url: '/internal/nodes/mesh-enroll';
-};
-
-export type MeshEnrollErrors = {
-    /**
-     * Invalid name or WireGuard key
-     */
-    400: unknown;
-    /**
-     * Missing, unknown or unusable join token
-     */
-    403: unknown;
-    /**
-     * Mesh off or not ready, control plane not dialable, key in use, or too many pairings
-     */
-    409: unknown;
-    /**
-     * Rate limited
-     */
-    429: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type MeshEnrollResponses = {
-    /**
-     * Pairing created; register over the mesh next
-     */
-    201: MeshEnrollResponse;
-};
-
-export type MeshEnrollResponse2 = MeshEnrollResponses[keyof MeshEnrollResponses];
-
-export type AdminCheckNodePublicIngressData = {
-    body?: never;
-    path: {
-        /**
-         * Worker node ID
-         */
-        node_id: number;
-    };
-    query?: never;
-    url: '/internal/nodes/{node_id}/public-ingress/check';
-};
-
-export type AdminCheckNodePublicIngressErrors = {
-    /**
-     * Node not found
-     */
-    404: unknown;
-};
-
-export type AdminCheckNodePublicIngressResponses = {
-    200: PublicIngressCheck;
-};
-
-export type AdminCheckNodePublicIngressResponse = AdminCheckNodePublicIngressResponses[keyof AdminCheckNodePublicIngressResponses];
-
-export type AdminGetNodePublicIngressSettingsData = {
-    body?: never;
-    path: {
-        /**
-         * Worker node ID
-         */
-        node_id: number;
-    };
-    query?: never;
-    url: '/internal/nodes/{node_id}/public-ingress/settings';
-};
-
-export type AdminGetNodePublicIngressSettingsErrors = {
-    /**
-     * Node not found
-     */
-    404: unknown;
-};
-
-export type AdminGetNodePublicIngressSettingsResponses = {
-    200: PublicIngressSettings;
-};
-
-export type AdminGetNodePublicIngressSettingsResponse = AdminGetNodePublicIngressSettingsResponses[keyof AdminGetNodePublicIngressSettingsResponses];
-
-export type AdminUpdateNodePublicIngressSettingsData = {
-    body: UpdatePublicIngressSettingsRequest;
-    path: {
-        /**
-         * Worker node ID
-         */
-        node_id: number;
-    };
-    query?: never;
-    url: '/internal/nodes/{node_id}/public-ingress/settings';
-};
-
-export type AdminUpdateNodePublicIngressSettingsErrors = {
-    /**
-     * Invalid address or ports, or not a worker
-     */
-    400: unknown;
-    /**
-     * Node not found
-     */
-    404: unknown;
-};
-
-export type AdminUpdateNodePublicIngressSettingsResponses = {
-    200: PublicIngressSettings;
-};
-
-export type AdminUpdateNodePublicIngressSettingsResponse = AdminUpdateNodePublicIngressSettingsResponses[keyof AdminUpdateNodePublicIngressSettingsResponses];
 
 export type ClusterNetworkGetData = {
     body?: never;
@@ -77446,6 +78142,228 @@ export type ClusterNetworkUpdateResponses = {
 };
 
 export type ClusterNetworkUpdateResponse = ClusterNetworkUpdateResponses[keyof ClusterNetworkUpdateResponses];
+
+export type MeshEnrollData = {
+    body: MeshEnrollApiRequest;
+    path?: never;
+    query?: never;
+    url: '/internal/nodes/mesh-enroll';
+};
+
+export type MeshEnrollErrors = {
+    /**
+     * Invalid name or WireGuard key
+     */
+    400: unknown;
+    /**
+     * Missing, unknown or unusable join token
+     */
+    403: unknown;
+    /**
+     * Mesh off or not ready, control plane not dialable, key in use, or too many pairings
+     */
+    409: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MeshEnrollResponses = {
+    /**
+     * Pairing created; register over the mesh next
+     */
+    201: MeshEnrollResponse;
+};
+
+export type MeshEnrollResponse2 = MeshEnrollResponses[keyof MeshEnrollResponses];
+
+export type ListIngressProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/providers';
+};
+
+export type ListIngressProvidersResponses = {
+    200: Array<ProviderInfo>;
+};
+
+export type ListIngressProvidersResponse = ListIngressProvidersResponses[keyof ListIngressProvidersResponses];
+
+export type AdminCheckNodePublicIngressData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/check';
+};
+
+export type AdminCheckNodePublicIngressErrors = {
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminCheckNodePublicIngressResponses = {
+    200: PublicIngressCheck;
+};
+
+export type AdminCheckNodePublicIngressResponse = AdminCheckNodePublicIngressResponses[keyof AdminCheckNodePublicIngressResponses];
+
+export type ListIngressConnectorsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/connectors';
+};
+
+export type ListIngressConnectorsResponses = {
+    200: Array<ConnectorView>;
+};
+
+export type ListIngressConnectorsResponse = ListIngressConnectorsResponses[keyof ListIngressConnectorsResponses];
+
+export type CreateIngressConnectorData = {
+    body: CreateConnectorRequest;
+    path?: never;
+    query?: never;
+    url: '/ingress/connectors';
+};
+
+export type CreateIngressConnectorErrors = {
+    /**
+     * Invalid name, setup answers or nodes
+     */
+    400: unknown;
+    /**
+     * A worker has not delegated public ingress
+     */
+    409: unknown;
+    /**
+     * The provider refused; the detail says what to fix
+     */
+    502: unknown;
+};
+
+export type CreateIngressConnectorResponses = {
+    201: ConnectorView;
+};
+
+export type CreateIngressConnectorResponse = CreateIngressConnectorResponses[keyof CreateIngressConnectorResponses];
+
+export type GetIngressConnectorLinksData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/links';
+};
+
+export type GetIngressConnectorLinksErrors = {
+    /**
+     * The tunnel is not created yet
+     */
+    400: unknown;
+    404: unknown;
+    /**
+     * The provider could not be asked
+     */
+    502: unknown;
+};
+
+export type GetIngressConnectorLinksResponses = {
+    200: ConnectorLinksView;
+};
+
+export type GetIngressConnectorLinksResponse = GetIngressConnectorLinksResponses[keyof GetIngressConnectorLinksResponses];
+
+export type SetIngressConnectorNodesData = {
+    body: SetConnectorNodesRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/nodes';
+};
+
+export type SetIngressConnectorNodesErrors = {
+    404: unknown;
+};
+
+export type SetIngressConnectorNodesResponses = {
+    200: ConnectorView;
+};
+
+export type SetIngressConnectorNodesResponse = SetIngressConnectorNodesResponses[keyof SetIngressConnectorNodesResponses];
+
+export type ListIngressHostnamesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/hostnames';
+};
+
+export type ListIngressHostnamesResponses = {
+    200: Array<HostnameView>;
+};
+
+export type ListIngressHostnamesResponse = ListIngressHostnamesResponses[keyof ListIngressHostnamesResponses];
+
+export type GetIngressHostnameData = {
+    body?: never;
+    path: {
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/hostnames/{hostname}';
+};
+
+export type GetIngressHostnameErrors = {
+    400: unknown;
+};
+
+export type GetIngressHostnameResponses = {
+    200: HostnameView;
+};
+
+export type GetIngressHostnameResponse = GetIngressHostnameResponses[keyof GetIngressHostnameResponses];
+
+export type SetIngressHostnameChoiceData = {
+    body: SetHostnameChoiceRequest;
+    path: {
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/hostnames/{hostname}';
+};
+
+export type SetIngressHostnameChoiceErrors = {
+    /**
+     * Invalid hostname, or the tunnel cannot publish it
+     */
+    400: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+};
+
+export type SetIngressHostnameChoiceResponses = {
+    200: HostnameView;
+};
+
+export type SetIngressHostnameChoiceResponse = SetIngressHostnameChoiceResponses[keyof SetIngressHostnameChoiceResponses];
 
 export type ListExternalPluginsData = {
     body?: never;

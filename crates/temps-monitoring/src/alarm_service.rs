@@ -1447,6 +1447,25 @@ impl AlarmService {
                     ),
             );
 
+        // External monitors have no deployment/container. Give each monitor its
+        // own cooldown bucket instead of suppressing every cron in a project.
+        if request.alarm_type == AlarmType::CronJobFailed {
+            let monitor_id = request
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cron_monitor_id"));
+            if let Some(id) = monitor_id.and_then(|id| id.as_i64()) {
+                query = query.filter(sea_orm::sea_query::Expr::cust_with_values(
+                    "metadata->>'cron_monitor_id' = $1",
+                    [id.to_string()],
+                ));
+            } else {
+                query = query.filter(sea_orm::sea_query::Expr::cust(
+                    "metadata->>'cron_monitor_id' IS NULL",
+                ));
+            }
+        }
+
         match request.deployment_id {
             Some(deployment_id) => {
                 query = query.filter(alarms::Column::DeploymentId.eq(deployment_id));

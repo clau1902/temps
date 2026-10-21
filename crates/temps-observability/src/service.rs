@@ -724,6 +724,7 @@ mod tests {
         let mut attributes = BTreeMap::new();
         attributes.insert("http.method".to_string(), "GET".to_string());
         let record = SpanRecord {
+            ingest_identity: None,
             project_id: 1,
             deployment_id: Some(3),
             resource: temps_otel::types::ResourceInfo {

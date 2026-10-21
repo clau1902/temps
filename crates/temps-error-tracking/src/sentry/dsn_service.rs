@@ -4,11 +4,12 @@
 use chrono::Utc;
 use moka::future::Cache;
 use rand::RngExt;
+use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use temps_entities::{project_dsns, projects};
+use temps_entities::{deployments, environments, project_dsns, projects};
 
 use super::types::{ParsedDSN, ProjectDSN, SentryIngesterError};
 
@@ -624,6 +625,45 @@ fn active_dsn_query() -> sea_orm::Select<project_dsns::Entity> {
         .filter(project_dsns::Column::IsActive.eq(true))
         .inner_join(projects::Entity)
         .filter(projects::Column::IsDeleted.eq(false))
+        .left_join(environments::Entity)
+        .left_join(deployments::Entity)
+        .filter(
+            sea_orm::Condition::any()
+                .add(project_dsns::Column::EnvironmentId.is_null())
+                .add(
+                    sea_orm::Condition::all()
+                        .add(
+                            Expr::col((environments::Entity, environments::Column::ProjectId))
+                                .equals((project_dsns::Entity, project_dsns::Column::ProjectId)),
+                        )
+                        .add(environments::Column::DeletedAt.is_null()),
+                ),
+        )
+        .filter(
+            sea_orm::Condition::any()
+                .add(project_dsns::Column::DeploymentId.is_null())
+                .add(
+                    sea_orm::Condition::all()
+                        .add(
+                            Expr::col((deployments::Entity, deployments::Column::ProjectId))
+                                .equals((project_dsns::Entity, project_dsns::Column::ProjectId)),
+                        )
+                        .add(
+                            sea_orm::Condition::any()
+                                .add(project_dsns::Column::EnvironmentId.is_null())
+                                .add(
+                                    Expr::col((
+                                        deployments::Entity,
+                                        deployments::Column::EnvironmentId,
+                                    ))
+                                    .equals((
+                                        project_dsns::Entity,
+                                        project_dsns::Column::EnvironmentId,
+                                    )),
+                                ),
+                        ),
+                ),
+        )
 }
 
 #[cfg(test)]

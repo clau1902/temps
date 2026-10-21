@@ -440,6 +440,8 @@ fn pipeline_stat_deltas(
             crate::types::SpanStatusCode,
             crate::types::LogRecord,
             crate::types::LogSeverity,
+            crate::types::LogAttributeType,
+            crate::types::LogAttributeOperator,
             crate::types::ResourceInfo,
             crate::types::MetricType,
             crate::types::Insight,

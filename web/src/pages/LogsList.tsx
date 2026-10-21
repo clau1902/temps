@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  LogAttributeFilter,
+  type LogAttributePredicate,
+} from '@/components/logs/LogAttributeFilter'
+import type { LogAttributeOperator, LogAttributeType } from '@/api/client'
+import { Callout } from '@temps-sdk/ds'
+import { readFailureServerDetail } from '@/lib/read-failure'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 
@@ -79,7 +86,15 @@ function severityBadge(severity: LogSeverity, text?: string) {
 export default function LogsList({ project }: LogsListProps) {
   const navigate = useNavigate()
   const urlState = useUrlState<
-    'range' | 'severity' | 'service' | 'q' | 'trace'
+    | 'range'
+    | 'severity'
+    | 'service'
+    | 'q'
+    | 'trace'
+    | 'attribute_key'
+    | 'attribute_value'
+    | 'attribute_type'
+    | 'attribute_op'
   >()
   const { state, patch } = urlState
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -98,7 +113,30 @@ export default function LogsList({ project }: LogsListProps) {
   const [search, setSearch] = useUrlSearchText('q', { urlState })
   // Trace correlation: when arriving from a trace, `?trace=<id>` pins the filter.
   const traceId = state.trace || ''
+  const attributeFilter = useMemo<LogAttributePredicate | undefined>(() => {
+    return state.attribute_key
+      ? {
+          key: state.attribute_key,
+          value: state.attribute_value ?? '',
+          type: state.attribute_type as LogAttributeType | undefined,
+          operator: (state.attribute_op ?? 'eq') as LogAttributeOperator,
+        }
+      : undefined
+  }, [
+    state.attribute_key,
+    state.attribute_value,
+    state.attribute_type,
+    state.attribute_op,
+  ])
+  const setAttributeFilter = (value: LogAttributePredicate | undefined) =>
+    patch({
+      attribute_key: value?.key,
+      attribute_value: value?.value,
+      attribute_type: value?.type,
+      attribute_op: value?.operator,
+    })
   const [page, setPage] = useState(1)
+  const [queryClock, setQueryClock] = useState(Date.now)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
   const debouncedService = useDebounce(service, 300)
@@ -119,17 +157,28 @@ export default function LogsList({ project }: LogsListProps) {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setPage(1)
     setExpanded(new Set())
-  }, [timeRange, severity, debouncedService, debouncedSearch, traceId])
+  }, [
+    timeRange,
+    severity,
+    debouncedService,
+    debouncedSearch,
+    traceId,
+    attributeFilter,
+  ])
 
   const { startTime, endTime } = useMemo(() => {
-    const range = resolveTimeRange(timeRange)
+    const range = resolveTimeRange(timeRange, queryClock)
     return { startTime: range.from, endTime: range.to }
-  }, [timeRange])
+  }, [timeRange, queryClock])
 
-  const { data, isLoading, isFetching, refetch } = useQuery({
+  const { data, isLoading, isFetching, refetch, isError, error } = useQuery({
     ...queryLogsOptions({
       query: {
         project_id: project.id,
+        attribute_key: attributeFilter?.key,
+        attribute_value: attributeFilter?.value,
+        attribute_type: attributeFilter?.type,
+        attribute_op: attributeFilter?.operator,
         severity: severity !== ALL ? severity : undefined,
         service_name: debouncedService || undefined,
         search: debouncedSearch || undefined,
@@ -146,7 +195,8 @@ export default function LogsList({ project }: LogsListProps) {
 
   const logs: LogRecord[] = data?.data ?? []
   const hasMore = logs.length === PAGE_SIZE
-  const hasFilters = severity !== ALL || !!service || !!search
+  const hasFilters =
+    severity !== ALL || !!service || !!search || !!attributeFilter
 
   // Tell the assistant the user is exploring logs (+ active filters).
   const assistantContext = useMemo(() => {
@@ -185,14 +235,19 @@ export default function LogsList({ project }: LogsListProps) {
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Logs</h2>
           <p className="text-sm text-muted-foreground">
-            Structured logs from your application via OpenTelemetry
+            Structured application logs from OpenTelemetry and Sentry SDKs
           </p>
         </div>
         <Button
           aria-label="Refresh"
           variant="ghost"
           size="icon"
-          onClick={() => refetch()}
+          onClick={() => {
+            setQueryClock(Date.now())
+            setPage(1)
+            // Absolute windows and trace filters keep the same query key.
+            if (traceId || timeRange.startsWith('custom:')) void refetch()
+          }}
           disabled={isFetching}
         >
           <RefreshCw
@@ -235,7 +290,10 @@ export default function LogsList({ project }: LogsListProps) {
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
             <TimeRangeFilter
               value={timeRange}
-              onChange={setTimeRange}
+              onChange={(value) => {
+                setQueryClock(Date.now())
+                setTimeRange(value)
+              }}
               disabled={!!traceId}
             />
 
@@ -273,11 +331,25 @@ export default function LogsList({ project }: LogsListProps) {
               />
             </div>
           </div>
+          <LogAttributeFilter
+            key={JSON.stringify(attributeFilter)}
+            value={attributeFilter}
+            onApply={setAttributeFilter}
+            pending={isFetching}
+          />
         </CardContent>
       </Card>
 
       {/* List */}
-      {isLoading ? (
+      {isError ? (
+        <Callout tone="error" title="Could not load logs">
+          {readFailureServerDetail(error) ??
+            'Retry the request or adjust the attribute filter.'}
+          <Button variant="outline" onClick={() => void refetch()}>
+            Retry
+          </Button>
+        </Callout>
+      ) : isLoading ? (
         <div className="space-y-2">
           {Array.from({ length: 10 }).map((_, i) => (
             <Skeleton key={i} className="h-10 w-full" />
@@ -358,10 +430,21 @@ export default function LogsList({ project }: LogsListProps) {
                         <div className="space-y-0.5">
                           {Object.entries(log.attributes).map(([k, v]) => (
                             <div key={k} className="flex gap-2">
-                              <span className="shrink-0 text-muted-foreground">
+                              <span className="min-w-0 basis-1/3 break-all text-muted-foreground">
                                 {k}
+                                <span className="ml-1 text-xs">
+                                  (
+                                  {log.attribute_types &&
+                                  Object.prototype.hasOwnProperty.call(
+                                    log.attribute_types,
+                                    k
+                                  )
+                                    ? log.attribute_types[k]
+                                    : 'untyped'}
+                                  )
+                                </span>
                               </span>
-                              <span className="break-all text-foreground">
+                              <span className="min-w-0 flex-1 break-all text-foreground">
                                 {String(v)}
                               </span>
                             </div>

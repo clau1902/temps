@@ -5,15 +5,19 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::{header::SET_COOKIE, HeaderMap, StatusCode},
+    http::{
+        header::{COOKIE, SET_COOKIE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
 use cookie::Cookie;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use temps_core::problemdetails::Problem;
-use temps_core::{AuditContext, RequestMetadata, SensitiveAction};
+use temps_core::{AuditContext, CookieCrypto, RequestMetadata, SensitiveAction};
 use tracing::{error, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -22,7 +26,7 @@ use crate::audit::{
     OidcRoleMappingCreatedAudit, OidcRoleMappingDeletedAudit,
 };
 use crate::oidc_errors::OidcError;
-use crate::oidc_service::OidcService;
+use crate::oidc_service::{OidcLoginStart, OidcService, LOGIN_STATE_TTL_MINUTES};
 use crate::oidc_types::{
     provider_to_response, provider_user_to_response, CreateOidcProviderRequest,
     CreateOidcRoleMappingRequest, OidcProviderResponse, OidcProviderSummary,
@@ -44,6 +48,109 @@ pub struct OidcCallbackQuery {
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct OidcLoginQuery {
     pub return_to: Option<String>,
+}
+
+/// `/`, like every other auth cookie: a console served behind a reverse proxy
+/// under a URL prefix would never be sent a cookie scoped to `/api/auth/oidc`.
+/// Each login attempt has its own cookie name, so a wide path costs nothing.
+const LOGIN_BINDING_COOKIE_PATH: &str = "/";
+
+/// Name of the cookie that ties one login attempt to the browser that started
+/// it. Derived from the attempt's `state`, so logins started in several tabs
+/// at once each keep their own cookie. It is a hash, so the name carries no
+/// part of the `state` itself.
+///
+/// Over https the name carries the `__Host-` prefix, which browsers only
+/// accept from the exact host that is serving the console: with `Secure`,
+/// `Path=/` and no `Domain`, an app deployed on a sibling subdomain cannot
+/// plant a cookie of this name (encryption stops a cookie being altered, not
+/// being copied from another login). Over plain http browsers refuse that
+/// prefix, so the unprefixed name is used there.
+fn login_binding_cookie_name(state: &str, secure: bool) -> String {
+    let digest = Sha256::digest(state.as_bytes());
+    let prefix = if secure {
+        "__Host-oidc_login_"
+    } else {
+        "oidc_login_"
+    };
+    format!("{prefix}{}", hex::encode(&digest[..8]))
+}
+
+fn login_binding_cookie_builder(
+    name: String,
+    value: String,
+    secure: bool,
+) -> cookie::CookieBuilder<'static> {
+    // `Lax`, not `Strict`: the issuer sends the browser back to the callback
+    // with a cross-site top-level navigation, and a `Strict` cookie is not sent
+    // on that request.
+    Cookie::build((name, value))
+        .http_only(true)
+        .path(LOGIN_BINDING_COOKIE_PATH)
+        .same_site(cookie::SameSite::Lax)
+        .secure(secure)
+}
+
+fn cookie_header_value(cookie: &Cookie<'_>) -> Result<HeaderValue, String> {
+    cookie
+        .to_string()
+        .parse()
+        .map_err(|error| format!("failed to build login binding cookie: {error}"))
+}
+
+/// `Set-Cookie` that ties the login attempt `state` to the browser receiving it.
+fn login_binding_cookie(
+    crypto: &CookieCrypto,
+    state: &str,
+    secure: bool,
+) -> Result<HeaderValue, String> {
+    let sealed = crypto
+        .encrypt(state)
+        .map_err(|error| format!("failed to seal login binding cookie: {error}"))?;
+    let cookie =
+        login_binding_cookie_builder(login_binding_cookie_name(state, secure), sealed, secure)
+            .max_age(cookie::time::Duration::minutes(LOGIN_STATE_TTL_MINUTES))
+            .build();
+    cookie_header_value(&cookie)
+}
+
+/// `Set-Cookie` that removes the binding cookie of the login attempt `state`.
+fn clear_login_binding_cookie(state: &str, secure: bool) -> Result<HeaderValue, String> {
+    let cookie = login_binding_cookie_builder(
+        login_binding_cookie_name(state, secure),
+        String::new(),
+        secure,
+    )
+    .max_age(cookie::time::Duration::ZERO)
+    .build();
+    cookie_header_value(&cookie)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// True when the request carries the cookie that was set when the login
+/// attempt `state` started, and that cookie was sealed for exactly this `state`.
+fn login_is_bound_to_browser(
+    crypto: &CookieCrypto,
+    headers: &HeaderMap,
+    state: &str,
+    secure: bool,
+) -> bool {
+    let name = login_binding_cookie_name(state, secure);
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .flat_map(|header| Cookie::split_parse(header.to_owned()).flatten())
+        .filter(|cookie| cookie.name() == name)
+        .any(|cookie| {
+            crypto
+                .decrypt(cookie.value())
+                .map(|bound| constant_time_eq(bound.as_bytes(), state.as_bytes()))
+                .unwrap_or(false)
+        })
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -123,7 +230,7 @@ pub async fn start_oidc_login_by_slug(
     Path(slug): Path<String>,
     Query(query): Query<OidcLoginQuery>,
     Extension(metadata): Extension<RequestMetadata>,
-) -> Result<Redirect, Problem> {
+) -> Result<Response, Problem> {
     let provider = state.oidc_service.get_provider_by_slug(&slug).await?;
     let redirect_uri = format!(
         "{}/api/auth/oidc/callback",
@@ -133,7 +240,7 @@ pub async fn start_oidc_login_by_slug(
         .oidc_service
         .start_login(provider.id, &redirect_uri, query.return_to)
         .await?;
-    Ok(Redirect::temporary(&login.authorize_url))
+    redirect_to_issuer(&state, &metadata, &login)
 }
 
 /// Start a login against the Cloud-managed console-access provider without
@@ -163,7 +270,7 @@ pub async fn start_managed_cloud_login(
     State(state): State<Arc<AuthState>>,
     Query(query): Query<OidcLoginQuery>,
     Extension(metadata): Extension<RequestMetadata>,
-) -> Result<Redirect, Problem> {
+) -> Result<Response, Problem> {
     let provider = state
         .oidc_service
         .managed_cloud_provider()
@@ -177,7 +284,26 @@ pub async fn start_managed_cloud_login(
         .oidc_service
         .start_login(provider.id, &redirect_uri, query.return_to)
         .await?;
-    Ok(Redirect::temporary(&login.authorize_url))
+    redirect_to_issuer(&state, &metadata, &login)
+}
+
+/// Redirect the browser to the issuer, tying this login attempt to it.
+fn redirect_to_issuer(
+    state: &AuthState,
+    metadata: &RequestMetadata,
+    login: &OidcLoginStart,
+) -> Result<Response, Problem> {
+    // A local failure, not the provider's: don't report it as an unreachable issuer.
+    let cookie = login_binding_cookie(&state.cookie_crypto, &login.state, metadata.is_secure)
+        .map_err(|reason| {
+            error!(%reason, "could not start OIDC login");
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Sign-in Failed")
+                .with_detail("Could not start sign-in. Try again.")
+        })?;
+    let mut headers = HeaderMap::new();
+    headers.insert(SET_COOKIE, cookie);
+    Ok((headers, Redirect::temporary(&login.authorize_url)).into_response())
 }
 
 #[utoipa::path(
@@ -193,6 +319,51 @@ pub async fn oidc_callback(
     State(state): State<Arc<AuthState>>,
     Query(query): Query<OidcCallbackQuery>,
     Extension(metadata): Extension<RequestMetadata>,
+    headers: HeaderMap,
+) -> Response {
+    let state_param = query.state.clone();
+
+    // A callback that carries a code and a state must come from the browser
+    // that started that login. This is checked before the state is consumed,
+    // so a refused request leaves the real login untouched. The link itself
+    // is not enough: whoever starts a login at the issuer also holds a valid
+    // callback link, and without this check another browser that follows it
+    // would be signed in as them (login CSRF, OAuth 2.0 Security BCP).
+    let unbound = match (&query.code, &query.state) {
+        (Some(_), Some(candidate)) => !login_is_bound_to_browser(
+            &state.cookie_crypto,
+            &headers,
+            candidate,
+            metadata.is_secure,
+        ),
+        _ => false,
+    };
+
+    let mut response = if unbound {
+        warn!(
+            target: "temps_auth::oidc::abuse",
+            ip = %metadata.ip_address,
+            user_agent = %metadata.user_agent,
+            "OIDC callback without this browser's login binding cookie (login started in another browser, or cookies dropped)"
+        );
+        redirect_login_error("state_invalid")
+    } else {
+        complete_callback(&state, &metadata, query).await
+    };
+
+    // The cookie has done its job whatever the outcome.
+    if let Some(state_param) = state_param {
+        if let Ok(clear) = clear_login_binding_cookie(&state_param, metadata.is_secure) {
+            response.headers_mut().append(SET_COOKIE, clear);
+        }
+    }
+    response
+}
+
+async fn complete_callback(
+    state: &Arc<AuthState>,
+    metadata: &RequestMetadata,
+    query: OidcCallbackQuery,
 ) -> Response {
     if let Some(err) = query.error {
         // The IdP's `error` + `error_description` can carry detailed
@@ -233,7 +404,7 @@ pub async fn oidc_callback(
         }
     };
 
-    match complete_oidc_login(&state, &metadata, &code, &state_param).await {
+    match complete_oidc_login(state, metadata, &code, &state_param).await {
         Ok(response) => response,
         Err(err) => {
             // Distinguish potentially-abusive probes from ordinary failures.
@@ -837,10 +1008,20 @@ pub async fn test_oidc_provider(
             success: true,
             message,
         })),
-        Err(err) => Ok(Json(OidcTestConnectionResponse {
-            success: false,
-            message: err.to_string(),
-        })),
+        Err(err) => {
+            // Full error (incl. upstream status / transport text) goes to the
+            // server log only; the response carries `client_message`, which
+            // does not reflect what the target host answered.
+            warn!(
+                provider_id,
+                error = %err,
+                "OIDC provider connection test failed"
+            );
+            Ok(Json(OidcTestConnectionResponse {
+                success: false,
+                message: err.client_message(),
+            }))
+        }
     }
 }
 
@@ -1015,3 +1196,659 @@ pub async fn delete_oidc_role_mapping(
     )
 )]
 pub struct OidcApiDoc;
+
+#[cfg(test)]
+mod login_binding_tests {
+    use super::*;
+    use axum::http::header::COOKIE;
+
+    fn crypto() -> CookieCrypto {
+        CookieCrypto::new("0123456789abcdef0123456789abcdef").unwrap()
+    }
+
+    /// The `name=value` pair a browser would send back for a `Set-Cookie`.
+    fn sent_back(set_cookie: &HeaderValue) -> String {
+        set_cookie
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn request_with(cookies: &[String]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for cookie in cookies {
+            headers.append(COOKIE, HeaderValue::from_str(cookie).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn the_browser_that_started_a_login_is_bound_to_it() {
+        let crypto = crypto();
+        let set = login_binding_cookie(&crypto, "state-one", false).unwrap();
+        let headers = request_with(&[sent_back(&set)]);
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
+    }
+
+    #[test]
+    fn a_browser_without_the_cookie_is_not_bound() {
+        let crypto = crypto();
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &HeaderMap::new(),
+            "state-one",
+            false
+        ));
+        let unrelated = request_with(&["session=abc".to_string(), "theme=dark".to_string()]);
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &unrelated,
+            "state-one",
+            false
+        ));
+    }
+
+    #[test]
+    fn another_logins_cookie_does_not_bind_this_state() {
+        // Someone else's login (state-two) must not satisfy state-one, even
+        // when this browser holds a perfectly valid cookie for that other login.
+        let crypto = crypto();
+        let other = login_binding_cookie(&crypto, "state-two", false).unwrap();
+        let headers = request_with(&[sent_back(&other)]);
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-two",
+            false
+        ));
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
+    }
+
+    #[test]
+    fn a_cookie_sealed_for_a_different_state_is_refused() {
+        // The cookie is found by the name derived from the callback's state, but
+        // its sealed value must also be that state.
+        let crypto = crypto();
+        let sealed_for_two = crypto.encrypt("state-two").unwrap();
+        let forged = format!(
+            "{}={}",
+            login_binding_cookie_name("state-one", false),
+            sealed_for_two
+        );
+        let headers = request_with(&[forged]);
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
+    }
+
+    #[test]
+    fn a_tampered_or_foreign_value_is_refused() {
+        let crypto = crypto();
+        let name = login_binding_cookie_name("state-one", false);
+        for value in ["", "not-sealed", "state-one", "AAAA"] {
+            let headers = request_with(&[format!("{name}={value}")]);
+            assert!(!login_is_bound_to_browser(
+                &crypto,
+                &headers,
+                "state-one",
+                false
+            ));
+        }
+        // Sealed under a different key (another instance, or an attacker).
+        let other = CookieCrypto::new("fedcba9876543210fedcba9876543210").unwrap();
+        let foreign = other.encrypt("state-one").unwrap();
+        let headers = request_with(&[format!("{name}={foreign}")]);
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
+    }
+
+    #[test]
+    fn logins_in_several_tabs_do_not_overwrite_each_other() {
+        let crypto = crypto();
+        let first = sent_back(&login_binding_cookie(&crypto, "state-one", false).unwrap());
+        let second = sent_back(&login_binding_cookie(&crypto, "state-two", false).unwrap());
+        assert_ne!(first.split('=').next(), second.split('=').next());
+        let headers = request_with(&[format!("{first}; {second}")]);
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            false
+        ));
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-two",
+            false
+        ));
+        // HTTP/2 clients may send each cookie in its own header.
+        let split = request_with(&[first, second]);
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &split,
+            "state-one",
+            false
+        ));
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &split,
+            "state-two",
+            false
+        ));
+    }
+
+    #[test]
+    fn the_cookie_name_does_not_reveal_the_state() {
+        let name = login_binding_cookie_name("a-very-recognisable-state-value", false);
+        assert!(name.starts_with("oidc_login_"));
+        assert!(!name.contains("recognisable"));
+        assert_eq!(name.len(), "oidc_login_".len() + 16);
+        assert_ne!(name, login_binding_cookie_name("another-state", false));
+    }
+
+    #[test]
+    fn the_binding_cookie_has_the_intended_attributes() {
+        let crypto = crypto();
+        let plain = login_binding_cookie(&crypto, "state-one", false).unwrap();
+        let text = plain.to_str().unwrap();
+        assert!(text.contains("HttpOnly"), "{text}");
+        assert!(
+            text.contains("Path=/") && !text.contains("Path=/api"),
+            "{text}"
+        );
+        assert!(text.contains("Max-Age=600"), "{text}");
+        // Lax so it is sent when the issuer redirects back; never Strict, which
+        // browsers withhold on that cross-site navigation.
+        assert!(text.contains("SameSite=Lax"), "{text}");
+        assert!(!text.contains("Strict"), "{text}");
+        assert!(!text.contains("Secure"), "{text}");
+        assert!(!text.contains("state-one"), "{text}");
+
+        let secure = login_binding_cookie(&crypto, "state-one", true).unwrap();
+        assert!(secure.to_str().unwrap().contains("Secure"));
+    }
+
+    #[test]
+    fn clearing_removes_exactly_this_logins_cookie() {
+        let clear = clear_login_binding_cookie("state-one", true).unwrap();
+        let text = clear.to_str().unwrap();
+        assert!(
+            text.starts_with(&format!(
+                "{}=;",
+                login_binding_cookie_name("state-one", true)
+            )),
+            "{text}"
+        );
+        assert!(text.contains("Max-Age=0"), "{text}");
+        assert!(
+            text.contains("Path=/") && !text.contains("Path=/api"),
+            "{text}"
+        );
+        assert!(
+            text.contains("SameSite=Lax") && text.contains("Secure"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn over_https_the_cookie_is_host_only_and_a_planted_one_is_ignored() {
+        let crypto = crypto();
+        let set = login_binding_cookie(&crypto, "state-one", true).unwrap();
+        let text = set.to_str().unwrap();
+        // Browsers enforce these together for a `__Host-` cookie, which is what
+        // keeps an app on a sibling subdomain from setting one.
+        assert!(text.starts_with("__Host-oidc_login_"), "{text}");
+        assert!(text.contains("Secure") && text.contains("Path=/"), "{text}");
+        assert!(!text.contains("Domain"), "{text}");
+        let headers = request_with(&[sent_back(&set)]);
+        assert!(login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            true
+        ));
+
+        // A sibling app can set an unprefixed cookie holding a sealed value it
+        // copied from its own login. It must not count over https.
+        let planted = format!(
+            "{}={}",
+            login_binding_cookie_name("state-one", false),
+            crypto.encrypt("state-one").unwrap()
+        );
+        let headers = request_with(&[planted]);
+        assert!(!login_is_bound_to_browser(
+            &crypto,
+            &headers,
+            "state-one",
+            true
+        ));
+    }
+
+    #[test]
+    fn over_http_the_name_has_no_host_prefix() {
+        // Browsers refuse the `__Host-` prefix without `Secure`.
+        let plain = login_binding_cookie_name("state-one", false);
+        assert!(plain.starts_with("oidc_login_"), "{plain}");
+        assert_ne!(plain, login_binding_cookie_name("state-one", true));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
+}
+
+/// The binding wired into the real handlers: the start redirect, and the
+/// callback route over a migrated test database.
+#[cfg(test)]
+mod login_binding_http_tests {
+    use super::*;
+    use crate::http_test_support::{auth_state, insert_request_metadata};
+    use crate::oidc_types::CreateOidcProviderRequest;
+    use axum::{body::Body, http::Request, routing::get};
+    use chrono::Utc;
+    use openidconnect::core::{
+        CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreResponseType, CoreSubjectIdentifierType,
+    };
+    use openidconnect::{
+        AuthUrl, EmptyAdditionalProviderMetadata, IssuerUrl, JsonWebKeySetUrl, ResponseTypes,
+    };
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::{oidc_login_states, oidc_providers};
+    use tower::ServiceExt;
+
+    struct Fixture {
+        _db: TestDatabase,
+        state: Arc<AuthState>,
+        app: Router,
+    }
+
+    async fn test_db() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(db) => Some(db),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                None
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        }
+    }
+
+    fn discovery_metadata(issuer: &str) -> CoreProviderMetadata {
+        CoreProviderMetadata::new(
+            IssuerUrl::new(issuer.to_string()).unwrap(),
+            AuthUrl::new(format!("{issuer}/authorize")).unwrap(),
+            JsonWebKeySetUrl::new(format!("{issuer}/jwks")).unwrap(),
+            vec![ResponseTypes::new(vec![CoreResponseType::Code])],
+            vec![CoreSubjectIdentifierType::Public],
+            vec![CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256],
+            EmptyAdditionalProviderMetadata {},
+        )
+    }
+
+    fn provider_request(name: &str, issuer: &str, enabled: bool) -> CreateOidcProviderRequest {
+        CreateOidcProviderRequest {
+            name: name.to_string(),
+            issuer_url: issuer.to_string(),
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            scopes: "openid email profile".to_string(),
+            jit_provisioning: true,
+            enabled,
+            template: "generic".to_string(),
+            group_claim: "groups".to_string(),
+            role_claim: "roles".to_string(),
+            default_role: "user".to_string(),
+            trust_idp_email: false,
+        }
+    }
+
+    fn router(state: &Arc<AuthState>) -> Router {
+        Router::new()
+            .route("/auth/oidc/login/{slug}", get(start_oidc_login_by_slug))
+            .route("/auth/oidc/cloud/login", get(start_managed_cloud_login))
+            .route("/auth/oidc/callback", get(oidc_callback))
+            .layer(axum::middleware::from_fn(insert_request_metadata))
+            .with_state(state.clone())
+    }
+
+    async fn fixture(pending_states: &[&str]) -> Option<Fixture> {
+        let db = test_db().await?;
+        let state = auth_state(db.db.clone());
+        // Disabled, so a callback that passes the binding check stops right
+        // after consuming its state instead of reaching out to an issuer.
+        let provider = state
+            .oidc_service
+            .create_provider(provider_request(
+                "Binding Test",
+                "https://issuer.example.com",
+                false,
+            ))
+            .await
+            .expect("create provider");
+        for pending in pending_states {
+            oidc_login_states::ActiveModel {
+                state: Set(pending.to_string()),
+                nonce: Set("nonce".to_string()),
+                pkce_verifier: Set("verifier".to_string()),
+                provider_id: Set(provider.id),
+                return_to: Set(None),
+                expires_at: Set(Utc::now() + chrono::Duration::minutes(10)),
+                ..Default::default()
+            }
+            .insert(db.db.as_ref())
+            .await
+            .expect("insert login state");
+        }
+        let app = router(&state);
+        Some(Fixture {
+            _db: db,
+            state,
+            app,
+        })
+    }
+
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "temps-auth-test".to_string(),
+            headers: HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://temps.test".to_string(),
+            scheme: "http".to_string(),
+            host: "temps.test".to_string(),
+            is_secure: false,
+        }
+    }
+
+    async fn callback(
+        app: &Router,
+        query: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String, Vec<String>) {
+        get_path(app, &format!("/auth/oidc/callback?{query}"), cookie).await
+    }
+
+    /// `(status, Location, Set-Cookie values)` of a GET request.
+    async fn get_path(
+        app: &Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String, Vec<String>) {
+        let mut request = Request::builder().uri(uri);
+        if let Some(cookie) = cookie {
+            request = request.header(COOKIE, cookie);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let location = response
+            .headers()
+            .get("location")
+            .map(|value| value.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let set_cookies = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        (response.status(), location, set_cookies)
+    }
+
+    async fn is_pending(fixture: &Fixture, state: &str) -> bool {
+        oidc_login_states::Entity::find()
+            .filter(oidc_login_states::Column::State.eq(state))
+            .one(fixture._db.db.as_ref())
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    fn clears_binding_cookie(set_cookies: &[String], state: &str) -> bool {
+        let name = login_binding_cookie_name(state, false);
+        set_cookies
+            .iter()
+            .any(|cookie| cookie.starts_with(&format!("{name}=;")) && cookie.contains("Max-Age=0"))
+    }
+
+    #[tokio::test]
+    async fn a_callback_from_another_browser_is_refused_and_leaves_the_login_pending() {
+        let Some(fixture) = fixture(&["state-one", "state-two"]).await else {
+            return;
+        };
+        let crypto = &fixture.state.cookie_crypto;
+        let other_browser_cookie = {
+            let set = login_binding_cookie(crypto, "state-two", false).unwrap();
+            set.to_str().unwrap().split(';').next().unwrap().to_string()
+        };
+        let tampered = format!("{}=AAAA", login_binding_cookie_name("state-one", false));
+
+        let attempts = [
+            ("no cookie", None),
+            (
+                "a cookie for a different login",
+                Some(other_browser_cookie.as_str()),
+            ),
+            ("a tampered cookie", Some(tampered.as_str())),
+        ];
+        for (label, cookie) in attempts {
+            let (status, location, set_cookies) =
+                callback(&fixture.app, "code=abc&state=state-one", cookie).await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{label}");
+            assert!(
+                location.contains("reason=state_invalid"),
+                "{label}: {location}"
+            );
+            assert!(clears_binding_cookie(&set_cookies, "state-one"), "{label}");
+            assert!(
+                is_pending(&fixture, "state-one").await,
+                "{label}: a refused callback must not consume the login"
+            );
+            assert!(is_pending(&fixture, "state-two").await, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_start_redirect_sets_the_cookie_the_callback_accepts() {
+        let Some(fixture) = fixture(&["state-one"]).await else {
+            return;
+        };
+        let response = redirect_to_issuer(
+            &fixture.state,
+            &metadata(),
+            &OidcLoginStart {
+                authorize_url: "https://issuer.example.com/authorize?state=state-one".to_string(),
+                state: "state-one".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            "https://issuer.example.com/authorize?state=state-one"
+        );
+        let set_cookies: Vec<_> = response.headers().get_all(SET_COOKIE).iter().collect();
+        assert_eq!(set_cookies.len(), 1);
+        let cookie = set_cookies[0]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let (status, location, set_cookies) =
+            callback(&fixture.app, "code=abc&state=state-one", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        // The binding passed: the login was consumed and failed later (the
+        // provider is disabled), not at the binding check.
+        assert!(!location.contains("reason=state_invalid"), "{location}");
+        assert!(!is_pending(&fixture, "state-one").await);
+        assert!(clears_binding_cookie(&set_cookies, "state-one"));
+
+        // The same link and cookie cannot be used twice.
+        let (_, location, _) =
+            callback(&fixture.app, "code=abc&state=state-one", Some(&cookie)).await;
+        assert!(location.contains("reason=state_invalid"), "{location}");
+    }
+
+    fn query_param(url: &str, key: &str) -> String {
+        let query = url.split_once('?').expect("a query string").1;
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key} in {url}"))
+            .to_string()
+    }
+
+    /// Both real start routes, with the `state` they actually issue.
+    #[tokio::test]
+    async fn both_start_routes_bind_the_login_to_the_browser_that_started_it() {
+        let Some(db) = test_db().await else {
+            return;
+        };
+        let state = auth_state(db.db.clone());
+        let service = &state.oidc_service;
+        let ordinary = service
+            .create_provider(provider_request(
+                "Start Test",
+                "https://issuer.example.com",
+                true,
+            ))
+            .await
+            .unwrap();
+        let managed = service
+            .upsert_managed_cloud_provider(crate::oidc_service::ManagedCloudOidcConfig {
+                issuer: "https://cloud.example.com".to_string(),
+                client_id: "cloud-client".to_string(),
+                client_secret: "cloud-secret".to_string(),
+            })
+            .await
+            .unwrap();
+        service
+            .seed_discovery_for_test(
+                &ordinary,
+                discovery_metadata("https://issuer.example.com"),
+                "secret",
+            )
+            .await;
+        service
+            .seed_discovery_for_test(
+                &managed,
+                discovery_metadata("https://cloud.example.com"),
+                "cloud-secret",
+            )
+            .await;
+        let fixture = Fixture {
+            _db: db,
+            app: router(&state),
+            state: state.clone(),
+        };
+
+        let slug = crate::oidc_types::derive_provider_slug(ordinary.id, &ordinary.name);
+        let routes = [
+            (
+                format!("/auth/oidc/login/{slug}"),
+                "https://issuer.example.com/authorize",
+                ordinary.id,
+            ),
+            (
+                "/auth/oidc/cloud/login".to_string(),
+                "https://cloud.example.com/authorize",
+                managed.id,
+            ),
+        ];
+        for (path, authorize, provider_id) in routes {
+            let (status, location, set_cookies) = get_path(&fixture.app, &path, None).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "{path}");
+            assert!(location.starts_with(authorize), "{path}: {location}");
+            let login_state = query_param(&location, "state");
+            assert!(is_pending(&fixture, &login_state).await, "{path}");
+
+            assert_eq!(set_cookies.len(), 1, "{path}: {set_cookies:?}");
+            let cookie = set_cookies[0].split(';').next().unwrap().to_string();
+            assert!(
+                cookie.starts_with(&login_binding_cookie_name(&login_state, false)),
+                "{path}: {cookie}"
+            );
+
+            // Another browser (no cookie) follows this login's callback.
+            let query = format!("code=abc&state={login_state}");
+            let (_, location, _) = callback(&fixture.app, &query, None).await;
+            assert!(
+                location.contains("reason=state_invalid"),
+                "{path}: {location}"
+            );
+            assert!(is_pending(&fixture, &login_state).await, "{path}");
+
+            // The browser that started it. The provider is switched off first
+            // so that, once the binding passes, the login stops without
+            // reaching an issuer.
+            let mut row: oidc_providers::ActiveModel =
+                oidc_providers::Entity::find_by_id(provider_id)
+                    .one(fixture._db.db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into();
+            row.enabled = Set(false);
+            row.update(fixture._db.db.as_ref()).await.unwrap();
+            let (status, location, _) = callback(&fixture.app, &query, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{path}");
+            assert!(
+                !location.contains("reason=state_invalid"),
+                "{path}: {location}"
+            );
+            assert!(!is_pending(&fixture, &login_state).await, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_is_still_reported_as_one() {
+        let Some(fixture) = fixture(&[]).await else {
+            return;
+        };
+        let (status, location, _) = callback(
+            &fixture.app,
+            "error=access_denied&error_description=no",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(location.contains("reason=idp_error"), "{location}");
+        let (_, location, _) = callback(&fixture.app, "code=abc", None).await;
+        assert!(location.contains("reason=callback_invalid"), "{location}");
+    }
+}

@@ -73,7 +73,7 @@ pub(crate) fn auth_state(db: Arc<DatabaseConnection>) -> Arc<AuthState> {
     ))
 }
 
-async fn insert_request_metadata(mut request: Request<Body>, next: Next) -> Response {
+pub(crate) async fn insert_request_metadata(mut request: Request<Body>, next: Next) -> Response {
     let headers = request.headers().clone();
     request.extensions_mut().insert(RequestMetadata {
         ip_address: "127.0.0.1".to_string(),

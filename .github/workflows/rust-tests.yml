@@ -1395,3 +1395,96 @@ jobs:
           name: mariadb-pitr-e2e-log
           path: /tmp/mariadb-pitr-e2e.log
           if-no-files-found: ignore
+
+  sentry-sdk-acceptance:
+    name: Sentry SDK Acceptance
+    needs: [changes, build-test-binaries]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.build-test-binaries.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Make room for the shared test archive
+        # This job runs on a fresh hosted runner; keep existing Docker images.
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Install Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: true
+
+      - name: Install Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Install Chromium system dependencies
+        run: bunx playwright@1.64.1 install-deps chromium
+
+      - name: Download existing Rust test binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: test-binaries-default
+
+      - name: Start isolated TimescaleDB
+        shell: bash
+        run: |
+          set -euo pipefail
+          db_container="sentry-acceptance-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "TEMPS_SENTRY_CI_DB_CONTAINER=$db_container" >> "$GITHUB_ENV"
+          docker run --detach --name "$db_container" \
+            --label "temps.sentry-test=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -e POSTGRES_DB=test_db -e POSTGRES_USER=test_user \
+            -e POSTGRES_PASSWORD=test_password \
+            -p 127.0.0.1::5432 timescale/timescaledb-ha:pg18 \
+            postgres -c timescaledb.max_background_workers=0
+          ready=false
+          for attempt in {1..60}; do
+            if docker exec "$db_container" pg_isready -U test_user -d test_db; then
+              ready=true
+              break
+            fi
+            echo "Waiting for the SDK acceptance database ($attempt/60)"
+            sleep 1
+          done
+          [[ "$ready" == true ]]
+          db_address=$(docker port "$db_container" 5432/tcp | head -1)
+          echo "TEMPS_TEST_DATABASE_URL=postgresql://test_user:test_password@${db_address}/test_db" >> "$GITHUB_ENV"
+
+      - name: Run official SDK traffic and Rust native assertions
+        env:
+          # Execute the already-built Rust tests, including explicitly ignored
+          # SDK cases. Only the tiny official Rust SDK fixture is compiled here.
+          TEMPS_SENTRY_TEST_ARCHIVE: ${{ github.workspace }}/test-binaries-default.tar.zst
+          TEMPS_SENTRY_FIXTURES_ROOT: ${{ runner.temp }}/temps-sentry-sdk-fixtures
+        run: scripts/sentry-acceptance.sh sdk
+
+      - name: Clean up this job's database
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${TEMPS_SENTRY_CI_DB_CONTAINER:-}" ]]; then
+            docker rm --force "$TEMPS_SENTRY_CI_DB_CONTAINER"
+          fi

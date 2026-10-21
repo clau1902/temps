@@ -197,7 +197,7 @@ pub use app_settings::{
 pub use async_trait;
 pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};
-pub use encryption::EncryptionService;
+pub use encryption::{EncryptionService, PasswordEncryptionError};
 pub use preview_grant::{
     encode_preview_session_grant, sanitize_preview_next, sanitize_preview_next_ref,
     validate_preview_session_grant_envelope, verify_preview_session_grant, PreviewGrantError,
@@ -205,8 +205,9 @@ pub use preview_grant::{
 };
 pub use repo_config::*;
 pub use request_metadata::{
-    build_from_request as build_request_metadata, host_without_port, request_metadata_middleware,
-    RequestMetadata, RequestMetadataMiddleware,
+    build_from_request as build_request_metadata, declared_console_scheme, host_without_port,
+    request_metadata_middleware, secure_cookie_for_request, set_declared_console_scheme,
+    DeclaredConsoleScheme, RequestMetadata, RequestMetadataMiddleware,
 };
 pub use serde;
 pub use serde_json;
