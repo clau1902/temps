@@ -22589,6 +22589,27 @@ export type ResetPgStatStatementsResponse = {
 };
 
 /**
+ * Returned when an administrator removes another user's second factor.
+ */
+export type ResetUserMfaResponse = {
+    /**
+     * Always false: the user's TOTP secret and recovery codes are gone.
+     */
+    mfa_enabled: boolean;
+    /**
+     * True when this instance requires MFA for admins
+     * (`require_mfa_for_admins`) and the user is an admin: until they enroll
+     * again they cannot sign in with a password, so they must sign in
+     * through SSO, or the setting must be turned off while they re-enroll.
+     */
+    password_sign_in_blocked: boolean;
+    /**
+     * How many of the user's sessions were signed out by the reset.
+     */
+    sessions_revoked: number;
+};
+
+/**
  * Returned once when an administrator resets another user's password. The
  * temporary password is not stored in retrievable form, so this response is
  * the only place it ever appears. The user must replace it at next sign-in.
@@ -75055,6 +75076,54 @@ export type UpdateUserResponses = {
 };
 
 export type UpdateUserResponse = UpdateUserResponses[keyof UpdateUserResponses];
+
+export type ResetUserMfaData = {
+    body?: never;
+    path: {
+        /**
+         * User ID
+         */
+        user_id: number;
+    };
+    query?: never;
+    url: '/users/{user_id}/mfa';
+};
+
+export type ResetUserMfaErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * users:manage required, or attempted to reset your own MFA (use DELETE /users/me/mfa)
+     */
+    403: unknown;
+    /**
+     * User not found
+     */
+    404: unknown;
+    /**
+     * User is deleted, or has no MFA enrolled
+     */
+    409: unknown;
+    /**
+     * Recent identity verification (step-up) required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ResetUserMfaResponses = {
+    /**
+     * MFA removed and the user's sessions revoked
+     */
+    200: ResetUserMfaResponse;
+};
+
+export type ResetUserMfaResponse2 = ResetUserMfaResponses[keyof ResetUserMfaResponses];
 
 export type ResetUserPasswordData = {
     body?: never;
