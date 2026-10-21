@@ -702,6 +702,7 @@ mod tests {
             + Duration::milliseconds(start_offset_ms);
         let end_time = start_time + Duration::milliseconds(duration_ms as i64);
         SpanRecord {
+            ingest_identity: None,
             project_id,
             deployment_id: None,
             resource: ResourceInfo {

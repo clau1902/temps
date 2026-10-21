@@ -1,19 +1,25 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { expect, test } from '@playwright/test'
+import type { ProjectResponse } from '../../src/api/client'
 
 test('direct project links and direct flat settings navigation', async ({
   page,
 }) => {
   const { projects } = await (await page.request.get('/api/projects')).json()
   expect(projects.length).toBeGreaterThan(0)
-  const root = `/projects/${projects[0].slug}`
+  const project = projects.find(
+    (project: ProjectResponse) =>
+      project.hosting === 'hosted' && project.source_type !== 'external'
+  )
+  expect(project, 'Hosted navigation needs a hosted project').toBeDefined()
+  const root = `/projects/${project.slug}`
   const errors: string[] = []
   page.on('pageerror', (error) => errors.push(error.message))
   await page.setViewportSize({ width: 1440, height: 1000 })
   await page.goto(`${root}/settings`)
   await expect(page).toHaveURL(/settings\/general$/)
-  const primary = page.getByRole('list', { name: 'Project navigation' })
+  const primary = page.getByRole('list', { name: 'Service navigation' })
   await expect(primary.getByRole('link')).toHaveCount(12)
   await expect(primary.getByRole('link')).toHaveText([
     'Overview',
@@ -45,7 +51,15 @@ test('direct project links and direct flat settings navigation', async ({
   })
   await primary.getByRole('link', { name: 'Settings', exact: true }).click()
   const settings = page.getByRole('navigation', { name: 'Settings pages' })
-  await expect(settings.getByRole('link')).toHaveCount(7)
+  await expect(settings.getByRole('link')).toHaveText([
+    'General',
+    'Build & deploy',
+    'Domains',
+    'Variables',
+    'Automation',
+    'Integrations',
+    'Telemetry',
+  ])
   await expect(settings.locator('a > svg')).toHaveCount(7)
   await settings
     .getByRole('link', { name: 'Build & deploy', exact: true })
@@ -105,16 +119,40 @@ test('direct project links and direct flat settings navigation', async ({
     path: '/tmp/temps-project-security-flat.png',
     fullPage: true,
   })
-  for (const [section, count] of [
-    ['Logs', 3],
-    ['Traces', 2],
-    ['Monitoring', 3],
-    ['Analytics', 14],
+  // Each contextual navigation lists exactly these pages, in this order.
+  // Naming them (rather than only counting) is what catches a page being
+  // added, dropped or renamed; `toHaveText` with an array also pins the count.
+  for (const [section, pages] of [
+    ['Logs', ['Application logs', 'Request logs', 'Telemetry logs']],
+    ['Traces', ['Traces', 'AI traces']],
+    [
+      'Monitoring',
+      ['Metrics', 'Uptime', 'Cron jobs', 'Status pages', 'Alert rules'],
+    ],
+    [
+      'Analytics',
+      [
+        'Overview',
+        'Visitors',
+        'Live visitors',
+        'Live globe',
+        'Journey',
+        'Activity report',
+        'Pages',
+        'Sessions',
+        'Funnels',
+        'Web performance',
+        'AI visitors',
+        'API traffic',
+        'AI crawlers',
+        'Revenue',
+      ],
+    ],
   ] as const) {
     await primary.getByRole('link', { name: section, exact: true }).click()
     const nav = page.getByRole('navigation', { name: `${section} pages` })
-    await expect(nav.getByRole('link')).toHaveCount(count)
-    await expect(nav.locator('a > svg')).toHaveCount(count)
+    await expect(nav.getByRole('link')).toHaveText([...pages])
+    await expect(nav.locator('a > svg')).toHaveCount(pages.length)
     await expect(
       primary.getByRole('link', { name: section, exact: true })
     ).toHaveAttribute('aria-current', 'page')
@@ -143,7 +181,12 @@ test('legacy build links and mobile contextual navigation stay usable', async ({
 }) => {
   const { projects } = await (await page.request.get('/api/projects')).json()
   expect(projects.length).toBeGreaterThan(0)
-  const root = `/projects/${projects[0].slug}`
+  const project = projects.find(
+    (project: ProjectResponse) =>
+      project.hosting === 'hosted' && project.source_type !== 'external'
+  )
+  expect(project, 'Hosted navigation needs a hosted project').toBeDefined()
+  const root = `/projects/${project.slug}`
   await page.setViewportSize({ width: 390, height: 844 })
   // The old standalone build page redirects to its section of Build & deploy,
   // opened and scrolled into view.

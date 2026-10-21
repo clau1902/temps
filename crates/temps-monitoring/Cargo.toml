@@ -25,6 +25,8 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = "0.10"
+croner = "=4.0.1"
 sea-orm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

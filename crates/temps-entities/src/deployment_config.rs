@@ -289,6 +289,8 @@ pub enum BuildLocation {
     ControlPlane,
     /// Build on a worker node, falling back to the control plane.
     Node,
+    /// Dispatch source builds to the installation CI executor. Fail closed.
+    Ci,
 }
 
 /// Deployment configuration shared between projects and environments
@@ -489,6 +491,9 @@ pub struct DeploymentConfig {
     /// value and may override it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_timeout_seconds: Option<i32>,
+    /// Deploy-time probe; environment overrides project, repository config overrides both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<temps_core::repo_config::HealthCheckConfig>,
 }
 
 /// Default readiness budget for a new deployment's containers, in seconds.
@@ -616,6 +621,7 @@ impl Default for DeploymentConfig {
             websocket_idle_timeout_seconds: None,
             max_concurrent_connections: None,
             health_check_timeout_seconds: None,
+            health: None,
         }
     }
 }
@@ -753,6 +759,7 @@ impl DeploymentConfig {
             max_concurrent_connections: other
                 .max_concurrent_connections
                 .or(self.max_concurrent_connections),
+            health: other.health.clone().or_else(|| self.health.clone()),
             health_check_timeout_seconds: other
                 .health_check_timeout_seconds
                 .or(self.health_check_timeout_seconds),
@@ -871,6 +878,10 @@ impl DeploymentConfig {
                     max_conn
                 ));
             }
+        }
+
+        if let Some(health) = &self.health {
+            health.validate()?;
         }
 
         if let Some(seconds) = self.health_check_timeout_seconds {
@@ -1708,5 +1719,44 @@ mod tests {
         );
         assert!(snapshot.automatic_deploy);
         assert_eq!(snapshot.replicas, 2);
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use temps_core::repo_config::HealthCheckConfig;
+
+    #[test]
+    fn health_probe_settings_inherit_and_validate() {
+        let project = DeploymentConfig {
+            health: Some(HealthCheckConfig {
+                probe_type: Some("process".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            project.merge(&DeploymentConfig::default()).health,
+            project.health
+        );
+        let environment = DeploymentConfig {
+            health: Some(HealthCheckConfig {
+                probe_type: Some("exec".into()),
+                command: vec!["redis-cli".into(), "ping".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(project.merge(&environment).health, environment.health);
+        assert!(environment.validate().is_ok());
+        let bad = DeploymentConfig {
+            health: Some(HealthCheckConfig {
+                probe_type: Some("unsupported".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
     }
 }

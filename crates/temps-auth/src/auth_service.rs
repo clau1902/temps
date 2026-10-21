@@ -69,6 +69,13 @@ pub enum AuthError {
     MfaCodeRequired,
     #[error("MFA code is invalid")]
     InvalidMfaCode,
+    #[error(
+        "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
+    )]
+    MfaLockedOut {
+        user_id: i32,
+        retry_after_seconds: i64,
+    },
     #[error("New password must differ from the current password")]
     SamePassword,
     #[error("Password complexity check failed: {0}")]
@@ -77,6 +84,21 @@ pub enum AuthError {
     NoPasswordSet,
     #[error("User {user_id} must change their password before a session can be created")]
     PasswordChangeRequired { user_id: i32 },
+    #[error(
+        "User {user_id} enabled MFA after the first factor was checked; a session needs the second factor"
+    )]
+    MfaRequired { user_id: i32 },
+}
+
+/// Whether the caller of [`AuthService::create_session_in_transaction`] has
+/// already verified the user's second factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondFactor {
+    /// Only the first factor (password or IdP) was checked. Refused if the
+    /// user has MFA enabled by the time the session row is written.
+    NotPresented,
+    /// An MFA challenge was completed for this sign-in.
+    Verified,
 }
 
 #[derive(Error, Debug)]
@@ -87,16 +109,72 @@ pub enum MfaChallengeError {
     UserNotFound { user_id: i32 },
     #[error("MFA code is invalid for user {user_id}")]
     InvalidCode { user_id: i32 },
+    #[error(
+        "MFA challenge for user {user_id} was discarded after too many wrong codes; the user must sign in again"
+    )]
+    ChallengeExhausted { user_id: i32 },
+    #[error(
+        "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
+    )]
+    LockedOut {
+        user_id: i32,
+        retry_after_seconds: i64,
+    },
     #[error("MFA verifier configuration is invalid for user {user_id}: {reason}")]
     VerifierConfiguration { user_id: i32, reason: String },
     #[error("MFA verification clock failed for user {user_id}: {reason}")]
     VerificationClock { user_id: i32, reason: String },
+    #[error("MFA verifier could not run for user {user_id}: {reason}")]
+    VerifierUnavailable { user_id: i32, reason: String },
     #[error("Failed to {operation} for MFA challenge (user {user_id:?}): {source}")]
     Database {
         operation: &'static str,
         user_id: Option<i32>,
         #[source]
         source: sea_orm::DbErr,
+    },
+}
+
+impl MfaChallengeError {
+    fn from_guard(error: crate::mfa_guard::MfaGuardError) -> Self {
+        match error {
+            crate::mfa_guard::MfaGuardError::InvalidSecret { user_id, reason }
+            | crate::mfa_guard::MfaGuardError::InvalidRecoveryCodes { user_id, reason } => {
+                MfaChallengeError::VerifierConfiguration { user_id, reason }
+            }
+            crate::mfa_guard::MfaGuardError::VerifierUnavailable { user_id, reason }
+            | crate::mfa_guard::MfaGuardError::SecretEncryption { user_id, reason } => {
+                MfaChallengeError::VerifierUnavailable { user_id, reason }
+            }
+            crate::mfa_guard::MfaGuardError::Database {
+                operation,
+                user_id,
+                source,
+            } => MfaChallengeError::Database {
+                operation,
+                user_id: Some(user_id),
+                source,
+            },
+        }
+    }
+}
+
+/// Result of one sign-in challenge transaction. Rejections are `Ok` values so
+/// the transaction commits the failure counters before the caller reports
+/// the rejection as an error.
+enum ChallengeOutcome {
+    Verified(Box<temps_entities::users::Model>, Option<String>),
+    Rejected {
+        user_id: i32,
+    },
+    /// The wrong code used up the challenge's attempts and the challenge was
+    /// discarded; only a fresh sign-in can continue.
+    Exhausted {
+        user_id: i32,
+    },
+    Locked {
+        user_id: i32,
+        retry_after_seconds: i64,
     },
 }
 
@@ -113,21 +191,73 @@ impl From<sea_orm::DbErr> for AuthError {
     }
 }
 
+/// Which flow minted a credential stored in `users.password_reset_token`.
+///
+/// Both the out-of-band email reset and the first-login (temporary password)
+/// change keep their single-use credential in that one column. The stored
+/// value is tagged with the purpose, and each flow only looks up its own tag,
+/// so a credential minted for one flow can never be redeemed by the other.
+/// The raw token handed to the user is unchanged (a UUID, which never contains
+/// `:`), so links and cookies keep their existing shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasswordTokenPurpose {
+    /// `POST /auth/password-reset/verify`, token sent by email.
+    EmailReset,
+    /// Forced password change after signing in with a temporary password.
+    FirstLogin,
+}
+
+impl PasswordTokenPurpose {
+    fn prefix(self) -> &'static str {
+        match self {
+            PasswordTokenPurpose::EmailReset => "email-reset:",
+            PasswordTokenPurpose::FirstLogin => "first-login:",
+        }
+    }
+
+    /// The value persisted in `users.password_reset_token` for `token`.
+    pub(crate) fn stored_value(self, token: &str) -> String {
+        format!("{}{}", self.prefix(), token)
+    }
+}
+
+/// Whether `token` has the shape of an untagged credential written before
+/// purpose tags existed. Generated tokens are UUIDs and never contain `:`; a
+/// presented value with `:` is refused here so it can never be matched against
+/// a tagged row through the legacy lookup.
+fn is_legacy_password_token_shape(token: &str) -> bool {
+    !token.is_empty() && !token.contains(':')
+}
+
 pub struct AuthService {
     db: Arc<DatabaseConnection>,
     email_service: AuthEmailService,
+    /// Opens (and lazily re-seals) the encrypted `users.mfa_secret`.
+    encryption_service: Arc<temps_core::EncryptionService>,
 }
 
 impl AuthService {
-    pub fn new(db: Arc<DatabaseConnection>, notification_service: DynNotificationService) -> Self {
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        notification_service: DynNotificationService,
+        encryption_service: Arc<temps_core::EncryptionService>,
+    ) -> Self {
         let email_service = AuthEmailService::new(notification_service);
-        Self { db, email_service }
+        Self {
+            db,
+            email_service,
+            encryption_service,
+        }
+    }
+
+    fn user_service(&self) -> crate::user_service::UserService {
+        crate::user_service::UserService::new(self.db.clone(), self.encryption_service.clone())
     }
 
     pub async fn create_session(&self, user_id: i32) -> Result<String, AuthError> {
         let transaction = self.db.begin().await?;
         let token = self
-            .create_session_in_transaction(user_id, None, &transaction)
+            .create_session_in_transaction(user_id, None, SecondFactor::NotPresented, &transaction)
             .await?;
         transaction.commit().await?;
         Ok(token)
@@ -137,8 +267,13 @@ impl AuthService {
         &self,
         user_id: i32,
         issuer: Option<&str>,
+        second_factor: SecondFactor,
         transaction: &sea_orm::DatabaseTransaction,
     ) -> Result<String, AuthError> {
+        // The shared lock waits for any in-flight writer holding the row
+        // exclusively (password reset, MFA enrolment) and then reads its
+        // committed result, so the checks below see the user as it is now,
+        // not as the caller saw it before verifying the first factor.
         let user = temps_entities::users::Entity::find_by_id(user_id)
             .filter(temps_entities::users::Column::DeletedAt.is_null())
             .lock_shared()
@@ -147,6 +282,12 @@ impl AuthService {
             .ok_or_else(|| AuthError::NotFound(format!("User {user_id} not found or deleted")))?;
         if user.must_change_password {
             return Err(AuthError::PasswordChangeRequired { user_id });
+        }
+        // MFA enrolment revokes every other session under the exclusive lock.
+        // A first-factor sign-in that decided "no MFA" before that enrolment
+        // committed must not write a full session after it.
+        if second_factor == SecondFactor::NotPresented && user.mfa_enabled {
+            return Err(AuthError::MfaRequired { user_id });
         }
 
         let session_token = self.generate_session_token();
@@ -377,22 +518,29 @@ impl AuthService {
         user: &temps_entities::users::Model,
         origin: Option<&str>,
     ) -> Result<String, AuthError> {
-        self.create_authenticated_session(user.id, origin).await
+        self.create_authenticated_session(user.id, origin, SecondFactor::Verified)
+            .await
     }
 
+    /// Session for an SSO sign-in that did not need an MFA challenge.
     pub(crate) async fn create_oidc_session(
         &self,
         user_id: i32,
         provider_id: i32,
     ) -> Result<String, AuthError> {
-        self.create_authenticated_session(user_id, Some(&format!("oidc:{provider_id}")))
-            .await
+        self.create_authenticated_session(
+            user_id,
+            Some(&format!("oidc:{provider_id}")),
+            SecondFactor::NotPresented,
+        )
+        .await
     }
 
     async fn create_authenticated_session(
         &self,
         user_id: i32,
         origin: Option<&str>,
+        second_factor: SecondFactor,
     ) -> Result<String, AuthError> {
         let transaction = self.db.begin().await?;
         if let Some(origin) = origin.filter(|origin| origin.starts_with("oidc")) {
@@ -425,6 +573,7 @@ impl AuthService {
             .create_session_in_transaction(
                 user_id,
                 origin.filter(|origin| origin.starts_with("oidc:")),
+                second_factor,
                 &transaction,
             )
             .await?;
@@ -432,6 +581,20 @@ impl AuthService {
         Ok(token)
     }
 
+    /// Spend a pending sign-in challenge with a TOTP code or, once MFA is
+    /// enrolled, a recovery code.
+    ///
+    /// Everything happens under the user's exclusive row lock:
+    /// - a TOTP code is accepted only if its step is newer than the last
+    ///   accepted one, so a code cannot sign in twice;
+    /// - a recovery code is burned in the same transaction that accepts it;
+    /// - a wrong code is counted against the challenge (discarded after
+    ///   [`crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE`] misses) and
+    ///   against the user (locked out past
+    ///   [`crate::mfa_guard::USER_LOCKOUT_THRESHOLD`]), and those counters are
+    ///   committed before the rejection is returned;
+    /// - completing a first-time enrolment here revokes every other session,
+    ///   matching self-service enrolment.
     pub(crate) async fn verify_mfa_challenge_with_origin(
         &self,
         session_token: &str,
@@ -439,83 +602,192 @@ impl AuthService {
     ) -> Result<(temps_entities::users::Model, Option<String>), MfaChallengeError> {
         let session_token = session_token.to_owned();
         let code = code.to_owned();
-        self.db
-            .transaction::<_, (temps_entities::users::Model, Option<String>), MfaChallengeError>(
-                |transaction| {
-                    Box::pin(async move {
-                        // Get the user from the temporary session. Require mfa_pending so a
-                        // real (fully authenticated) session token can never be spent as an
-                        // MFA challenge -- the discriminator cuts both ways.
-                        let session = temps_entities::sessions::Entity::find()
-                            .filter(
-                                temps_entities::sessions::Column::SessionToken.eq(&session_token),
-                            )
-                            .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
-                            .filter(temps_entities::sessions::Column::MfaPending.eq(true))
-                            .one(transaction)
+        let encryption = self.encryption_service.clone();
+        let outcome = self
+            .db
+            .transaction::<_, ChallengeOutcome, MfaChallengeError>(|transaction| {
+                Box::pin(async move {
+                    // Get the user from the temporary session. Require mfa_pending so a
+                    // real (fully authenticated) session token can never be spent as an
+                    // MFA challenge -- the discriminator cuts both ways.
+                    let pending = temps_entities::sessions::Entity::find()
+                        .filter(temps_entities::sessions::Column::SessionToken.eq(&session_token))
+                        .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "load the pending session",
+                            user_id: None,
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
+
+                    let user = temps_entities::users::Entity::find_by_id(pending.user_id)
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "load the challenge user",
+                            user_id: Some(pending.user_id),
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::UserNotFound {
+                            user_id: pending.user_id,
+                        })?;
+                    let user_id = user.id;
+
+                    // Re-read the challenge now that the user lock serializes every
+                    // writer: its failure count is current, and a challenge a
+                    // concurrent request already spent or discarded is gone.
+                    let session = temps_entities::sessions::Entity::find_by_id(pending.id)
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "lock the pending session",
+                            user_id: Some(user_id),
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
+                    if session.mfa_failed_attempts
+                        >= crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE
+                    {
+                        return Err(MfaChallengeError::InvalidOrExpiredSession);
+                    }
+
+                    let now = Utc::now();
+                    let guard = crate::mfa_guard::load_guard(transaction, user_id)
+                        .await
+                        .map_err(MfaChallengeError::from_guard)?;
+                    if let Some(retry_after_seconds) = guard.lockout_remaining_seconds(now) {
+                        return Ok(ChallengeOutcome::Locked {
+                            user_id,
+                            retry_after_seconds,
+                        });
+                    }
+
+                    // Recovery codes stand in for an enrolled authenticator; they can
+                    // never confirm a first-time enrolment.
+                    let allow_recovery_codes = user.mfa_enabled;
+                    let factor = crate::mfa_guard::check_factor(
+                        &encryption,
+                        &user,
+                        guard.last_totp_step,
+                        &code,
+                        allow_recovery_codes,
+                        now,
+                    )
+                    .await
+                    .map_err(MfaChallengeError::from_guard)?;
+
+                    let Some(factor) = factor else {
+                        crate::mfa_guard::record_failure(transaction, user_id, &guard, now)
                             .await
-                            .map_err(|source| MfaChallengeError::Database {
-                                operation: "load the pending session",
-                                user_id: None,
-                                source,
-                            })?
-                            .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
-
-                        let user = temps_entities::users::Entity::find_by_id(session.user_id)
-                            .lock_exclusive()
-                            .one(transaction)
-                            .await
-                            .map_err(|source| MfaChallengeError::Database {
-                                operation: "load the challenge user",
-                                user_id: Some(session.user_id),
-                                source,
-                            })?
-                            .ok_or(MfaChallengeError::UserNotFound {
-                                user_id: session.user_id,
-                            })?;
-
-                        // Verify the MFA code
-                        if !Self::verify_totp_code(&user, &code)? {
-                            return Err(MfaChallengeError::InvalidCode { user_id: user.id });
-                        }
-
-                        let mut verified_user = user;
-                        if !verified_user.mfa_enabled {
-                            let mut user_update: temps_entities::users::ActiveModel =
-                                verified_user.into();
-                            user_update.mfa_enabled = Set(true);
-                            verified_user =
-                                user_update.update(transaction).await.map_err(|source| {
-                                    MfaChallengeError::Database {
-                                        operation: "enable MFA for the challenge user",
-                                        user_id: Some(session.user_id),
-                                        source,
-                                    }
+                            .map_err(MfaChallengeError::from_guard)?;
+                        let attempts = session.mfa_failed_attempts.saturating_add(1);
+                        if attempts >= crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+                            temps_entities::sessions::Entity::delete_by_id(session.id)
+                                .exec(transaction)
+                                .await
+                                .map_err(|source| MfaChallengeError::Database {
+                                    operation: "discard the exhausted pending session",
+                                    user_id: Some(user_id),
+                                    source,
                                 })?;
-                        }
-
-                        // Consume the challenge in the same transaction as enrollment so a
-                        // failed update never strands the user without a retryable challenge.
-                        let deletion = temps_entities::sessions::Entity::delete_many()
-                            .filter(
-                                temps_entities::sessions::Column::SessionToken.eq(&session_token),
-                            )
-                            .filter(temps_entities::sessions::Column::MfaPending.eq(true))
-                            .exec(transaction)
-                            .await
-                            .map_err(|source| MfaChallengeError::Database {
-                                operation: "consume the verified pending session",
-                                user_id: Some(verified_user.id),
-                                source,
+                            warn!(
+                                user_id,
+                                attempts, "MFA challenge discarded after repeated wrong codes"
+                            );
+                            return Ok(ChallengeOutcome::Exhausted { user_id });
+                        } else {
+                            let mut challenge: temps_entities::sessions::ActiveModel =
+                                session.into();
+                            challenge.mfa_failed_attempts = Set(attempts);
+                            challenge.update(transaction).await.map_err(|source| {
+                                MfaChallengeError::Database {
+                                    operation: "count a wrong code on the pending session",
+                                    user_id: Some(user_id),
+                                    source,
+                                }
                             })?;
-                        if deletion.rows_affected != 1 {
-                            return Err(MfaChallengeError::InvalidOrExpiredSession);
                         }
+                        return Ok(ChallengeOutcome::Rejected { user_id });
+                    };
 
-                        Ok((verified_user, session.mfa_pending_origin))
-                    })
-                },
-            )
+                    let mut verified_user = crate::mfa_guard::record_success(
+                        transaction,
+                        &encryption,
+                        user,
+                        &guard,
+                        &factor,
+                        now,
+                    )
+                    .await
+                    .map_err(MfaChallengeError::from_guard)?;
+                    if matches!(
+                        factor,
+                        crate::mfa_guard::AcceptedFactor::RecoveryCode { .. }
+                    ) {
+                        info!(user_id, "MFA challenge satisfied with a recovery code");
+                    }
+
+                    if !verified_user.mfa_enabled {
+                        let mut user_update: temps_entities::users::ActiveModel =
+                            verified_user.into();
+                        user_update.mfa_enabled = Set(true);
+                        verified_user =
+                            user_update.update(transaction).await.map_err(|source| {
+                                MfaChallengeError::Database {
+                                    operation: "enable MFA for the challenge user",
+                                    user_id: Some(user_id),
+                                    source,
+                                }
+                            })?;
+                        // Sessions created before the second factor existed must not
+                        // outlive its enrolment. The challenge itself is consumed below.
+                        let revoked = crate::user_service::revoke_sessions_except(
+                            transaction,
+                            user_id,
+                            Some(session.id),
+                        )
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "revoke sessions that predate MFA enrolment",
+                            user_id: Some(user_id),
+                            source,
+                        })?;
+                        info!(
+                            user_id,
+                            revoked_sessions = revoked,
+                            "MFA enabled at sign-in; other sessions revoked"
+                        );
+                    }
+
+                    // Consume the challenge in the same transaction as enrollment so a
+                    // failed update never strands the user without a retryable challenge.
+                    let deletion = temps_entities::sessions::Entity::delete_many()
+                        .filter(temps_entities::sessions::Column::Id.eq(session.id))
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .exec(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "consume the verified pending session",
+                            user_id: Some(user_id),
+                            source,
+                        })?;
+                    if deletion.rows_affected != 1 {
+                        return Err(MfaChallengeError::InvalidOrExpiredSession);
+                    }
+
+                    Ok(ChallengeOutcome::Verified(
+                        Box::new(verified_user),
+                        session.mfa_pending_origin,
+                    ))
+                })
+            })
             .await
             .map_err(|error| match error {
                 sea_orm::TransactionError::Transaction(error) => error,
@@ -524,51 +796,26 @@ impl AuthService {
                     user_id: None,
                     source,
                 },
-            })
-    }
+            })?;
 
-    fn verify_totp_code(
-        user: &temps_entities::users::Model,
-        code: &str,
-    ) -> Result<bool, MfaChallengeError> {
-        match &user.mfa_secret {
-            Some(secret) => {
-                use totp_rs::{Algorithm, Builder};
-
-                let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret)
-                    .ok_or(MfaChallengeError::VerifierConfiguration {
-                    user_id: user.id,
-                    reason: "stored secret is not valid base32".to_string(),
-                })?;
-
-                // Algorithm::SHA1, 6 digits, skew 1, step 30 — these are the
-                // parameters that were used when the secret was enrolled (see
-                // `generate_mfa_setup_candidate`). They must not silently change.
-                // `build()` (not `build_noncompliant()`) so a malformed stored
-                // secret still fails loudly instead of constructing a Totp that
-                // silently never validates.
-                let totp = Builder::new()
-                    .with_algorithm(Algorithm::SHA1)
-                    .with_digits(6)
-                    .with_skew(1)
-                    .with_step_duration(30)
-                    .with_secret(decoded)
-                    .build()
-                    .map_err(|error| MfaChallengeError::VerifierConfiguration {
-                        user_id: user.id,
-                        reason: format!("TOTP verifier cannot be initialized: {error}"),
-                    })?;
-
-                // check_current now returns Option<u64>: Some(step) = valid,
-                // None = invalid. There is no longer a fallible clock path.
-                Ok(totp.check_current(code).is_some())
+        match outcome {
+            ChallengeOutcome::Verified(user, origin) => Ok((*user, origin)),
+            ChallengeOutcome::Rejected { user_id } => {
+                Err(MfaChallengeError::InvalidCode { user_id })
             }
-            None => Err(MfaChallengeError::VerifierConfiguration {
-                user_id: user.id,
-                reason: "stored MFA secret is missing".to_string(),
+            ChallengeOutcome::Exhausted { user_id } => {
+                Err(MfaChallengeError::ChallengeExhausted { user_id })
+            }
+            ChallengeOutcome::Locked {
+                user_id,
+                retry_after_seconds,
+            } => Err(MfaChallengeError::LockedOut {
+                user_id,
+                retry_after_seconds,
             }),
         }
     }
+
     // Register a new user with email/password
     pub async fn register_user(
         &self,
@@ -641,47 +888,59 @@ impl AuthService {
         &self,
         request: LoginRequest,
     ) -> Result<temps_entities::users::Model, UserAuthError> {
-        // Find user by email, excluding soft-deleted users
-        let user = temps_entities::users::Entity::find()
+        // Every rejection below costs one Argon2 verification, the same as a
+        // wrong password for a real account, so response time does not
+        // reveal whether the email exists or has a password.
+        let user = match temps_entities::users::Entity::find()
             .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
             .filter(temps_entities::users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
+        {
+            Some(user) => user,
+            None => {
+                verify_against_dummy_hash(&request.password);
                 warn!(
                     "Login attempt for non-existent or deleted email: {}",
                     request.email
                 );
-                UserAuthError::InvalidCredentials
-            })?;
+                return Err(UserAuthError::InvalidCredentials);
+            }
+        };
 
         // Check if user has a password (might be GitHub-only user)
-        let password_hash = user.password_hash.as_ref().ok_or_else(|| {
+        let Some(password_hash) = user.password_hash.as_ref() else {
+            verify_against_dummy_hash(&request.password);
             warn!("Login attempt for user {} with no password hash", user.id);
-            UserAuthError::InvalidCredentials
-        })?;
+            return Err(UserAuthError::InvalidCredentials);
+        };
 
         // Verify password - only Argon2 is supported
-        let password_valid = if password_hash.starts_with("$argon2") {
-            // Argon2 hash (only supported format)
-            debug!("Verifying Argon2 password for user {}", user.id);
-            let parsed_hash = argon2::PasswordHash::new(password_hash).map_err(|e| {
+        let password_valid = match password_hash
+            .starts_with("$argon2")
+            .then(|| argon2::PasswordHash::new(password_hash))
+        {
+            Some(Ok(parsed_hash)) => {
+                debug!("Verifying Argon2 password for user {}", user.id);
+                argon2::Argon2::default()
+                    .verify_password(request.password.as_bytes(), &parsed_hash)
+                    .is_ok()
+            }
+            Some(Err(e)) => {
                 error!("Failed to parse Argon2 hash for user {}: {}", user.id, e);
-                UserAuthError::InvalidCredentials
-            })?;
-
-            let argon2 = argon2::Argon2::default();
-            argon2
-                .verify_password(request.password.as_bytes(), &parsed_hash)
-                .is_ok()
-        } else {
-            // Only Argon2 is supported - all other hash formats are rejected
-            error!(
-                "User {} has unsupported password hash format (only Argon2 is supported): {}",
-                user.id,
-                &password_hash[..std::cmp::min(20, password_hash.len())]
-            );
-            false
+                verify_against_dummy_hash(&request.password);
+                false
+            }
+            None => {
+                // Only Argon2 is supported - all other hash formats are rejected
+                error!(
+                    "User {} has unsupported password hash format (only Argon2 is supported): {}",
+                    user.id,
+                    &password_hash[..std::cmp::min(20, password_hash.len())]
+                );
+                verify_against_dummy_hash(&request.password);
+                false
+            }
         };
 
         if !password_valid {
@@ -712,7 +971,7 @@ impl AuthService {
         // `count_active_sessions` below.
         let settings = self.get_settings().await.unwrap_or_default();
         if settings.require_mfa_for_admins && !user.mfa_enabled {
-            let user_service = crate::user_service::UserService::new(self.db.clone());
+            let user_service = self.user_service();
             let is_admin = match user_service.is_admin(user.id).await {
                 Ok(is_admin) => is_admin,
                 Err(e) => {
@@ -770,7 +1029,8 @@ impl AuthService {
 
         let token = self.generate_token();
         let mut user_update: temps_entities::users::ActiveModel = user.into();
-        user_update.password_reset_token = Set(Some(token.clone()));
+        user_update.password_reset_token =
+            Set(Some(PasswordTokenPurpose::FirstLogin.stored_value(&token)));
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
         user_update.update(&transaction).await?;
         transaction.commit().await?;
@@ -785,8 +1045,12 @@ impl AuthService {
         &self,
         token: &str,
     ) -> Result<temps_entities::users::Model, UserAuthError> {
+        // Only first-login credentials: an email-reset token is never valid here.
         let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::PasswordResetToken.eq(token))
+            .filter(
+                temps_entities::users::Column::PasswordResetToken
+                    .eq(PasswordTokenPurpose::FirstLogin.stored_value(token)),
+            )
             .one(self.db.as_ref())
             .await?
             .ok_or(UserAuthError::InvalidToken)?;
@@ -818,7 +1082,9 @@ impl AuthService {
 
             // Update user with reset token
             let mut user_update: temps_entities::users::ActiveModel = user.clone().into();
-            user_update.password_reset_token = Set(Some(reset_token.clone()));
+            user_update.password_reset_token = Set(Some(
+                PasswordTokenPurpose::EmailReset.stored_value(&reset_token),
+            ));
             user_update.password_reset_expires = Set(Some(expires_at));
             user_update.update(self.db.as_ref()).await?;
             let settings = self.get_settings().await?;
@@ -848,10 +1114,27 @@ impl AuthService {
                 Box::pin(async move {
                     // Find user by reset token. The transaction callback guarantees that
                     // every rejection path is rolled back before this method returns.
+                    //
+                    // Only email-reset credentials are accepted: a first-login token
+                    // (minted after a temporary-password sign-in) is never valid here.
+                    // An untagged value predates purpose tags and is accepted only on
+                    // an account that is not awaiting a forced change: first-login
+                    // tokens exist only while `must_change_password` is set, so such
+                    // a value can only be an in-flight email reset from before the
+                    // upgrade.
+                    let column = temps_entities::users::Column::PasswordResetToken;
+                    let mut matches = sea_orm::Condition::any().add(
+                        column.eq(PasswordTokenPurpose::EmailReset.stored_value(&request.token)),
+                    );
+                    if is_legacy_password_token_shape(&request.token) {
+                        matches = matches.add(
+                            sea_orm::Condition::all()
+                                .add(column.eq(request.token.as_str()))
+                                .add(temps_entities::users::Column::MustChangePassword.eq(false)),
+                        );
+                    }
                     let user = temps_entities::users::Entity::find()
-                        .filter(
-                            temps_entities::users::Column::PasswordResetToken.eq(&request.token),
-                        )
+                        .filter(matches)
                         .lock_exclusive()
                         .one(transaction)
                         .await?
@@ -912,9 +1195,12 @@ impl AuthService {
         self.db
             .transaction::<_, temps_entities::users::Model, UserAuthError>(|transaction| {
                 Box::pin(async move {
+                    // Only first-login credentials: an email-reset token must go
+                    // through `reset_password`.
                     let user = temps_entities::users::Entity::find()
                         .filter(
-                            temps_entities::users::Column::PasswordResetToken.eq(&request.token),
+                            temps_entities::users::Column::PasswordResetToken
+                                .eq(PasswordTokenPurpose::FirstLogin.stored_value(&request.token)),
                         )
                         .lock_exclusive()
                         .one(transaction)
@@ -972,7 +1258,7 @@ impl AuthService {
             return Ok(false);
         }
 
-        crate::user_service::UserService::new(self.db.clone())
+        self.user_service()
             .is_admin(user_id)
             .await
             .map_err(|error| UserAuthError::RoleLookup {
@@ -1043,14 +1329,24 @@ impl AuthService {
                 .ok_or(AuthError::MfaCodeRequired)?;
             // Reuse the user_service verifier so behavior matches login
             // exactly (TOTP skew window, recovery code burn-on-use).
-            let user_service = crate::user_service::UserService::new(self.db.clone());
-            let mfa_ok = user_service
-                .verify_mfa_code(user_id, code)
-                .await
-                .map_err(|e| {
-                    error!("MFA verification error during password change: {}", e);
-                    AuthError::InvalidMfaCode
-                })?;
+            let user_service = self.user_service();
+            let mfa_ok =
+                user_service
+                    .verify_mfa_code(user_id, code)
+                    .await
+                    .map_err(|e| match e {
+                        crate::user_service::UserServiceError::MfaLocked {
+                            user_id,
+                            retry_after_seconds,
+                        } => AuthError::MfaLockedOut {
+                            user_id,
+                            retry_after_seconds,
+                        },
+                        other => {
+                            error!("MFA verification error during password change: {}", other);
+                            AuthError::InvalidMfaCode
+                        }
+                    })?;
             if !mfa_ok {
                 return Err(AuthError::InvalidMfaCode);
             }
@@ -1165,6 +1461,47 @@ impl AuthService {
             .map(|r| temps_core::AppSettings::from_json(r.data))
             .unwrap_or_default())
     }
+}
+
+/// An Argon2 hash of a random secret nobody knows, produced with the same
+/// parameters as real password hashes (`Argon2::default()`). Computed once.
+fn dummy_password_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| {
+        let secret: [u8; 32] = rand::rng().random();
+        argon2::Argon2::default()
+            .hash_password(&secret)
+            .map(|hash| hash.to_string())
+            // Hashing fixed-size input with default params cannot fail in
+            // practice; an empty string makes the verification below a no-op
+            // rather than a panic, and is logged.
+            .unwrap_or_else(|error| {
+                error!("Failed to compute the login timing-equalization hash: {error}");
+                String::new()
+            })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static DUMMY_VERIFICATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Spend the same Argon2 work a real wrong-password check costs, so the
+/// "no such account" / "no password" paths are not measurably faster.
+/// Always rejects.
+fn verify_against_dummy_hash(password: &str) -> bool {
+    #[cfg(test)]
+    DUMMY_VERIFICATIONS.with(|count| count.set(count.get() + 1));
+    match argon2::PasswordHash::new(dummy_password_hash()) {
+        Ok(parsed) => {
+            let _ = argon2::Argon2::default().verify_password(password.as_bytes(), &parsed);
+        }
+        Err(error) => {
+            error!("Login timing-equalization hash is unusable: {error}");
+        }
+    }
+    false
 }
 
 /// Validate password meets minimum complexity requirements.
@@ -1425,7 +1762,11 @@ mod tests {
         settings.insert(db.db.as_ref()).await.unwrap();
 
         let notification_service = Arc::new(MockEmailService::new());
-        let auth_service = AuthService::new(db.db.clone(), notification_service.clone());
+        let auth_service = AuthService::new(
+            db.db.clone(),
+            notification_service.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        );
         (db, auth_service, notification_service)
     }
 
@@ -1493,10 +1834,13 @@ mod tests {
     ) -> Option<(TestDatabase, AuthService)> {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
-            Err(e) => {
-                println!("Docker not available, skipping test: {}", e);
+            Err(e)
+                if temps_database::test_utils::is_container_runtime_unavailable(&e.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {e}");
                 return None;
             }
+            Err(e) => panic!("test database setup failed: {e}"),
         };
 
         let settings_row = settings::ActiveModel {
@@ -1510,7 +1854,11 @@ mod tests {
         settings_row.insert(db.db.as_ref()).await.unwrap();
 
         let notification_service = Arc::new(MockEmailService::new());
-        let auth_service = AuthService::new(db.db.clone(), notification_service);
+        let auth_service = AuthService::new(
+            db.db.clone(),
+            notification_service,
+            crate::mfa_guard::test_support::encryption(),
+        );
         Some((db, auth_service))
     }
 
@@ -1523,13 +1871,18 @@ mod tests {
                 .append_query_errors([sea_orm::DbErr::Custom("provider lookup unavailable".into())])
                 .into_connection(),
         );
-        let auth = AuthService::new(db.clone(), Arc::new(MockEmailService::new()));
+        let auth = AuthService::new(
+            db.clone(),
+            Arc::new(MockEmailService::new()),
+            crate::mfa_guard::test_support::encryption(),
+        );
         assert!(auth
-            .create_authenticated_session(7, Some("oidc:5"))
+            .create_authenticated_session(7, Some("oidc:5"), SecondFactor::Verified)
             .await
             .is_err());
         assert!(matches!(
-            auth.create_authenticated_session(7, Some("oidc")).await,
+            auth.create_authenticated_session(7, Some("oidc"), SecondFactor::Verified)
+                .await,
             Err(AuthError::Unauthorized(_))
         ));
         drop(auth);
@@ -1548,7 +1901,10 @@ mod tests {
             Arc::new(temps_core::EncryptionService::new_from_password(
                 "mfa-oidc-test",
             )),
-            Arc::new(crate::UserService::new(db.db.clone())),
+            Arc::new(crate::UserService::new(
+                db.db.clone(),
+                crate::mfa_guard::test_support::encryption(),
+            )),
         );
         let provider = oidc
             .upsert_managed_cloud_provider(crate::oidc_service::ManagedCloudOidcConfig {
@@ -1581,17 +1937,28 @@ mod tests {
 
         // Consume another valid challenge before revocation, then finish the
         // delayed MFA request after teardown has deleted every visible session.
+        // The first code's step is spent, so this one comes from the next step.
+        let next_code = crate::mfa_guard::test_support::code_at(
+            user.mfa_secret.as_deref().unwrap(),
+            Utc::now() + Duration::seconds(30),
+        );
         let pending = auth
             .create_mfa_session(user.id, &format!("oidc:{}", provider.id))
             .await
             .unwrap();
         let (verified, origin) = auth
-            .verify_mfa_challenge_with_origin(&pending, &code)
+            .verify_mfa_challenge_with_origin(&pending, &next_code)
             .await
             .unwrap();
-        auth.create_oidc_session(user.id, provider.id)
-            .await
-            .unwrap();
+        // Another live session from this provider, as a completed SSO + MFA
+        // sign-in leaves it (an MFA user never gets a first-factor-only one).
+        auth.create_authenticated_session(
+            user.id,
+            Some(&format!("oidc:{}", provider.id)),
+            SecondFactor::Verified,
+        )
+        .await
+        .unwrap();
         auth.create_mfa_session(user.id, &format!("oidc:{}", provider.id))
             .await
             .unwrap();
@@ -2103,7 +2470,9 @@ mod tests {
         // Set reset token
         let reset_token = Uuid::new_v4().to_string();
         let mut user_update: users::ActiveModel = user.clone().into();
-        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_token = Set(Some(
+            PasswordTokenPurpose::EmailReset.stored_value(&reset_token),
+        ));
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
         user_update.must_change_password = Set(true);
         user_update.update(db.db.as_ref()).await.unwrap();
@@ -2151,7 +2520,10 @@ mod tests {
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
         user_update.update(db.db.as_ref()).await.unwrap();
 
-        let user_service = crate::user_service::UserService::new(db.db.clone());
+        let user_service = crate::user_service::UserService::new(
+            db.db.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        );
         let (updated, temporary_password) =
             user_service.admin_reset_password(user.id).await.unwrap();
 
@@ -2249,10 +2621,13 @@ mod tests {
             .unwrap();
 
         // ...when an admin reset replaces the password.
-        crate::user_service::UserService::new(db.db.clone())
-            .admin_reset_password(user.id)
-            .await
-            .unwrap();
+        crate::user_service::UserService::new(
+            db.db.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        )
+        .admin_reset_password(user.id)
+        .await
+        .unwrap();
 
         let result = auth_service
             .create_required_password_change_token(&verified)
@@ -2320,14 +2695,77 @@ mod tests {
         assert_eq!(surviving, 0);
     }
 
+    /// MFA enrolment holds the user row exclusively while it enables MFA and
+    /// revokes other sessions. A password sign-in that checked the password
+    /// before the enrolment committed waits on that lock, then must refuse to
+    /// write a first-factor-only session.
+    #[tokio::test]
+    async fn create_session_refuses_a_first_factor_session_once_mfa_is_enabled() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "raced-enrolment@example.com", "Original123!").await;
+        let auth_service = Arc::new(auth_service);
+
+        let enrolment = db.db.begin().await.unwrap();
+        let locked = users::Entity::find_by_id(user.id)
+            .lock_exclusive()
+            .one(&enrolment)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let racing_login = {
+            let auth_service = auth_service.clone();
+            tokio::spawn(async move { auth_service.create_session(user.id).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !racing_login.is_finished(),
+            "create_session must block on the enrolment's row lock"
+        );
+
+        let mut enrolled: users::ActiveModel = locked.into();
+        enrolled.mfa_enabled = Set(true);
+        enrolled.mfa_secret = Set(Some(HARDENING_SECRET.to_string()));
+        enrolled.update(&enrolment).await.unwrap();
+        sessions::Entity::delete_many()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .exec(&enrolment)
+            .await
+            .unwrap();
+        enrolment.commit().await.unwrap();
+
+        let result = racing_login.await.unwrap();
+        assert!(
+            matches!(result, Err(AuthError::MfaRequired { user_id }) if user_id == user.id),
+            "a password-only session must not outlive the enrolment: {result:?}"
+        );
+        let surviving = sessions::Entity::find()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .count(db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(surviving, 0);
+
+        let enrolled = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        auth_service
+            .create_session_after_mfa(&enrolled, Some("password"))
+            .await
+            .expect("a session after a completed MFA challenge is still issued");
+    }
+
     #[tokio::test]
     async fn email_reset_rejects_temporary_password_reuse() {
         let (db, auth_service, _) = setup_test_env().await;
         let user =
             create_test_user(&db.db, "forced-email-reset@example.com", "Temporary123!").await;
         let reset_token = Uuid::new_v4().to_string();
+        let stored_token = PasswordTokenPurpose::EmailReset.stored_value(&reset_token);
         let mut user_update: users::ActiveModel = user.clone().into();
-        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_token = Set(Some(stored_token.clone()));
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
         user_update.must_change_password = Set(true);
         user_update.update(db.db.as_ref()).await.unwrap();
@@ -2348,7 +2786,7 @@ mod tests {
         assert!(unchanged.must_change_password);
         assert_eq!(
             unchanged.password_reset_token.as_deref(),
-            Some(reset_token.as_str())
+            Some(stored_token.as_str())
         );
     }
 
@@ -2357,8 +2795,9 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "forced-change@example.com", "Temporary123!").await;
         let reset_token = Uuid::new_v4().to_string();
+        let stored_token = PasswordTokenPurpose::FirstLogin.stored_value(&reset_token);
         let mut user_update: users::ActiveModel = user.clone().into();
-        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_token = Set(Some(stored_token.clone()));
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
         user_update.must_change_password = Set(true);
         user_update.update(db.db.as_ref()).await.unwrap();
@@ -2379,7 +2818,7 @@ mod tests {
         assert!(unchanged.must_change_password);
         assert_eq!(
             unchanged.password_reset_token.as_deref(),
-            Some(reset_token.as_str())
+            Some(stored_token.as_str())
         );
     }
 
@@ -2390,7 +2829,9 @@ mod tests {
             create_test_user(&db.db, "forced-change-success@example.com", "Temporary123!").await;
         let reset_token = Uuid::new_v4().to_string();
         let mut user_update: users::ActiveModel = user.clone().into();
-        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_token = Set(Some(
+            PasswordTokenPurpose::FirstLogin.stored_value(&reset_token),
+        ));
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
         user_update.must_change_password = Set(true);
         user_update.update(db.db.as_ref()).await.unwrap();
@@ -2424,7 +2865,9 @@ mod tests {
             create_test_user(&db.db, "forced-change-race@example.com", "Temporary123!").await;
         let reset_token = Uuid::new_v4().to_string();
         let mut user_update: users::ActiveModel = user.into();
-        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_token = Set(Some(
+            PasswordTokenPurpose::FirstLogin.stored_value(&reset_token),
+        ));
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
         user_update.must_change_password = Set(true);
         user_update.update(db.db.as_ref()).await.unwrap();
@@ -2502,7 +2945,11 @@ mod tests {
 
         assert_eq!(
             updated_user.password_reset_token.as_deref(),
-            Some(token.as_str())
+            Some(
+                PasswordTokenPurpose::FirstLogin
+                    .stored_value(&token)
+                    .as_str()
+            )
         );
         let expires_at = updated_user
             .password_reset_expires
@@ -2510,6 +2957,157 @@ mod tests {
         assert!(expires_at > issued_at + Duration::minutes(14));
         assert!(expires_at <= issued_at + Duration::minutes(16));
         assert!(updated_user.must_change_password);
+    }
+
+    fn emailed_reset_token(email_service: &MockEmailService) -> String {
+        let emails = email_service.get_password_reset_emails();
+        let (_, _, url) = emails.last().expect("a reset email was sent");
+        url.split("token=")
+            .nth(1)
+            .expect("reset url carries the token")
+            .to_string()
+    }
+
+    /// F-015: a first-login credential must not be redeemable through the
+    /// email password-reset endpoint.
+    #[tokio::test]
+    async fn first_login_token_is_rejected_by_email_reset() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "first-login-only@example.com", "Temporary123!").await;
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.must_change_password = Set(true);
+        let user = user_update.update(db.db.as_ref()).await.unwrap();
+
+        let first_login_token = auth_service
+            .create_required_password_change_token(&user)
+            .await
+            .unwrap();
+
+        let crossed = auth_service
+            .reset_password(ResetPasswordRequest {
+                token: first_login_token.clone(),
+                new_password: "Crossed-Flow-123!".to_string(),
+            })
+            .await;
+        assert!(matches!(crossed, Err(UserAuthError::InvalidToken)));
+        // Presenting the stored (tagged) form verbatim does not help either.
+        let tagged = auth_service
+            .reset_password(ResetPasswordRequest {
+                token: PasswordTokenPurpose::FirstLogin.stored_value(&first_login_token),
+                new_password: "Crossed-Flow-123!".to_string(),
+            })
+            .await;
+        assert!(matches!(tagged, Err(UserAuthError::InvalidToken)));
+
+        // The credential still works for its own flow.
+        let changed = auth_service
+            .reset_required_password(ResetPasswordRequest {
+                token: first_login_token,
+                new_password: "Own-Flow-Password-456!".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(!changed.must_change_password);
+    }
+
+    /// F-015: an emailed reset token must not satisfy the first-login flow.
+    #[tokio::test]
+    async fn email_reset_token_is_rejected_by_first_login_flow() {
+        let (db, auth_service, email_service) = setup_test_env().await;
+        let user = create_test_user(&db.db, "email-only@example.com", "Temporary123!").await;
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.must_change_password = Set(true);
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        auth_service
+            .request_password_reset("email-only@example.com")
+            .await
+            .unwrap();
+        let email_token = emailed_reset_token(&email_service);
+        let stored = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.password_reset_token.as_deref(),
+            Some(
+                PasswordTokenPurpose::EmailReset
+                    .stored_value(&email_token)
+                    .as_str()
+            )
+        );
+
+        assert!(matches!(
+            auth_service
+                .required_password_change_user(&email_token)
+                .await,
+            Err(UserAuthError::InvalidToken)
+        ));
+        assert!(matches!(
+            auth_service
+                .reset_required_password(ResetPasswordRequest {
+                    token: email_token.clone(),
+                    new_password: "Crossed-Flow-123!".to_string(),
+                })
+                .await,
+            Err(UserAuthError::InvalidToken)
+        ));
+
+        auth_service
+            .reset_password(ResetPasswordRequest {
+                token: email_token,
+                new_password: "Own-Flow-Password-456!".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Reset emails sent before the upgrade stored the token untagged. They
+    /// keep working for accounts not awaiting a forced change (the only state
+    /// in which an untagged value can be an email reset), and nowhere else.
+    #[tokio::test]
+    async fn legacy_untagged_email_reset_token_remains_valid_only_without_forced_change() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "legacy-reset@example.com", "OldPassword123!").await;
+        let legacy_token = Uuid::new_v4().to_string();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token = Set(Some(legacy_token.clone()));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+        user_update.must_change_password = Set(true);
+        let flagged = user_update.update(db.db.as_ref()).await.unwrap();
+
+        // Ambiguous while the account awaits a forced change: refused by both flows.
+        assert!(matches!(
+            auth_service
+                .reset_password(ResetPasswordRequest {
+                    token: legacy_token.clone(),
+                    new_password: "Legacy-Reset-123!".to_string(),
+                })
+                .await,
+            Err(UserAuthError::InvalidToken)
+        ));
+        assert!(matches!(
+            auth_service
+                .reset_required_password(ResetPasswordRequest {
+                    token: legacy_token.clone(),
+                    new_password: "Legacy-Reset-123!".to_string(),
+                })
+                .await,
+            Err(UserAuthError::InvalidToken)
+        ));
+
+        let mut user_update: users::ActiveModel = flagged.into();
+        user_update.must_change_password = Set(false);
+        user_update.update(db.db.as_ref()).await.unwrap();
+        let reset = auth_service
+            .reset_password(ResetPasswordRequest {
+                token: legacy_token,
+                new_password: "Legacy-Reset-123!".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(reset.password_reset_token.is_none());
     }
 
     #[tokio::test]
@@ -2798,7 +3396,11 @@ mod tests {
                 "challenge database unavailable".to_string(),
             )])
             .into_connection();
-        let auth_service = AuthService::new(Arc::new(db), Arc::new(MockEmailService::new()));
+        let auth_service = AuthService::new(
+            Arc::new(db),
+            Arc::new(MockEmailService::new()),
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let result = auth_service
             .verify_mfa_challenge("pending-session", "123456")
@@ -2829,7 +3431,11 @@ mod tests {
             password_reset_expires: None,
             must_change_password: false,
             deleted_at: None,
-            mfa_secret: Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
+            // Already encrypted, so the accepted code does not also trigger
+            // the legacy-seed re-encryption write.
+            mfa_secret: Some(crate::mfa_guard::test_support::sealed(
+                "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            )),
             mfa_enabled: true,
             mfa_recovery_codes: None,
             oidc_subject: None,
@@ -2845,13 +3451,27 @@ mod tests {
             mfa_pending: true,
             step_up_expires_at: None,
             mfa_pending_origin: Some("password".to_string()),
+            mfa_failed_attempts: 0,
         };
+        // Query order: pending challenge, user (locked), challenge re-read
+        // under the user lock, guard row (absent). Exec order: guard upsert
+        // recording the accepted step, then the failing challenge delete.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![session]])
+            .append_query_results([vec![session.clone()]])
             .append_query_results([vec![user]])
+            .append_query_results([vec![session]])
+            .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 7,
+                rows_affected: 1,
+            }])
             .append_exec_errors([sea_orm::DbErr::Custom("session delete failed".to_string())])
             .into_connection();
-        let auth_service = AuthService::new(Arc::new(db), Arc::new(MockEmailService::new()));
+        let auth_service = AuthService::new(
+            Arc::new(db),
+            Arc::new(MockEmailService::new()),
+            crate::mfa_guard::test_support::encryption(),
+        );
         let code = current_totp_code("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
 
         let result = auth_service
@@ -3121,7 +3741,11 @@ mod tests {
             .into_connection();
 
         let notification_service = Arc::new(MockEmailService::new());
-        let auth_service = AuthService::new(Arc::new(db), notification_service);
+        let auth_service = AuthService::new(
+            Arc::new(db),
+            notification_service,
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let result = auth_service
             .register_user(RegisterRequest {
@@ -3149,7 +3773,11 @@ mod tests {
             .into_connection();
 
         let notification_service = Arc::new(MockEmailService::new());
-        let auth_service = AuthService::new(Arc::new(db), notification_service);
+        let auth_service = AuthService::new(
+            Arc::new(db),
+            notification_service,
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let count = auth_service.count_active_sessions(42).await.unwrap();
         assert_eq!(count, 2);
@@ -3166,7 +3794,11 @@ mod tests {
             .into_connection();
 
         let notification_service = Arc::new(MockEmailService::new());
-        let auth_service = AuthService::new(Arc::new(db), notification_service);
+        let auth_service = AuthService::new(
+            Arc::new(db),
+            notification_service,
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let result = auth_service.count_active_sessions(42).await;
         assert!(matches!(result, Err(AuthError::DatabaseError { .. })));
@@ -3231,7 +3863,10 @@ mod tests {
         let user =
             create_test_user_with_mfa(&db.db, "admin-mfa@example.com", "Password123!", true).await;
 
-        let user_service = crate::user_service::UserService::new(db.db.clone());
+        let user_service = crate::user_service::UserService::new(
+            db.db.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        );
         user_service.initialize_roles().await.unwrap();
         let admin_role = temps_entities::roles::Entity::find()
             .filter(temps_entities::roles::Column::Name.eq(RoleType::Admin.as_str()))
@@ -3263,7 +3898,10 @@ mod tests {
             create_test_user_with_mfa(&db.db, "admin-nomfa@example.com", "Password123!", false)
                 .await;
 
-        let user_service = crate::user_service::UserService::new(db.db.clone());
+        let user_service = crate::user_service::UserService::new(
+            db.db.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        );
         user_service.initialize_roles().await.unwrap();
         let admin_role = temps_entities::roles::Entity::find()
             .filter(temps_entities::roles::Column::Name.eq(RoleType::Admin.as_str()))
@@ -3298,7 +3936,10 @@ mod tests {
             create_test_user_with_mfa(&db.db, "admin-nomfa2@example.com", "Password123!", false)
                 .await;
 
-        let user_service = crate::user_service::UserService::new(db.db.clone());
+        let user_service = crate::user_service::UserService::new(
+            db.db.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        );
         user_service.initialize_roles().await.unwrap();
         let admin_role = temps_entities::roles::Entity::find()
             .filter(temps_entities::roles::Column::Name.eq(RoleType::Admin.as_str()))
@@ -3391,7 +4032,11 @@ mod tests {
             .into_connection();
 
         let notification_service = Arc::new(MockEmailService::new());
-        let auth_service = AuthService::new(Arc::new(db), notification_service);
+        let auth_service = AuthService::new(
+            Arc::new(db),
+            notification_service,
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let result = auth_service
             .login(LoginRequest {
@@ -3403,6 +4048,414 @@ mod tests {
         assert!(
             result.is_ok(),
             "a settings-lookup failure must not block a correct-password login"
+        );
+    }
+
+    // ---- Second-factor hardening: replay, throttling, recovery, enrolment ----
+
+    const HARDENING_SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+    /// A six-digit code that is not valid anywhere in the current skew window.
+    fn code_outside_window() -> String {
+        let totp = crate::mfa_guard::build_totp(0, HARDENING_SECRET).unwrap();
+        let now = Utc::now().timestamp() as u64;
+        (0..1_000_000)
+            .map(|n| format!("{:06}", n))
+            .find(|candidate| totp.check(candidate, now).is_none())
+            .unwrap()
+    }
+
+    async fn mfa_user_with_recovery(
+        db: &Arc<DatabaseConnection>,
+        email: &str,
+        mfa_enabled: bool,
+        recovery_codes: &[&str],
+    ) -> users::Model {
+        let hashes: Vec<String> = recovery_codes
+            .iter()
+            .map(|code| {
+                argon2::Argon2::default()
+                    .hash_password(code.as_bytes())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        users::ActiveModel {
+            email: Set(email.to_string()),
+            name: Set("Second Factor".to_string()),
+            password_hash: Set(None),
+            email_verified: Set(true),
+            mfa_enabled: Set(mfa_enabled),
+            mfa_secret: Set(Some(HARDENING_SECRET.to_string())),
+            mfa_recovery_codes: Set(Some(serde_json::to_string(&hashes).unwrap())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+    }
+
+    async fn guard_row(
+        db: &Arc<DatabaseConnection>,
+        user_id: i32,
+    ) -> Option<temps_entities::user_mfa_guards::Model> {
+        temps_entities::user_mfa_guards::Entity::find_by_id(user_id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn totp_code_is_rejected_for_a_second_challenge_in_the_same_step() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "replay@example.com", true, &[]).await;
+        let code = current_totp_code(HARDENING_SECRET);
+
+        let first = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        auth_service
+            .verify_mfa_challenge(&first, &code)
+            .await
+            .expect("a fresh code signs in");
+
+        let second = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let replay = auth_service.verify_mfa_challenge(&second, &code).await;
+        assert!(
+            matches!(replay, Err(MfaChallengeError::InvalidCode { user_id }) if user_id == user.id),
+            "the same TOTP code must not complete a second sign-in: {replay:?}"
+        );
+        assert!(guard_row(&db.db, user.id)
+            .await
+            .unwrap()
+            .last_totp_step
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn wrong_codes_discard_the_challenge_and_the_correct_code_is_then_rejected() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "exhaust@example.com", true, &[]).await;
+        let challenge = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let wrong = code_outside_window();
+
+        for attempt in 1..crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+            let result = auth_service.verify_mfa_challenge(&challenge, &wrong).await;
+            assert!(
+                matches!(result, Err(MfaChallengeError::InvalidCode { .. })),
+                "attempt {attempt} must be a plain rejection: {result:?}"
+            );
+        }
+        let last = auth_service.verify_mfa_challenge(&challenge, &wrong).await;
+        assert!(
+            matches!(last, Err(MfaChallengeError::ChallengeExhausted { user_id }) if user_id == user.id),
+            "the wrong code that uses up the challenge must say so: {last:?}"
+        );
+
+        let pending = sessions::Entity::find()
+            .filter(sessions::Column::SessionToken.eq(&challenge))
+            .one(db.db.as_ref())
+            .await
+            .unwrap();
+        assert!(pending.is_none(), "an exhausted challenge must be deleted");
+
+        let late = auth_service
+            .verify_mfa_challenge(&challenge, &current_totp_code(HARDENING_SECRET))
+            .await;
+        assert!(
+            matches!(late, Err(MfaChallengeError::InvalidOrExpiredSession)),
+            "the correct code must not revive a discarded challenge: {late:?}"
+        );
+        assert_eq!(
+            guard_row(&db.db, user.id).await.unwrap().failed_attempts,
+            crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE,
+            "failures must survive the rejected transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_user_lockout_applies_across_fresh_challenges() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "lockout@example.com", true, &[]).await;
+        let wrong = code_outside_window();
+
+        let mut failures = 0;
+        while failures < crate::mfa_guard::USER_LOCKOUT_THRESHOLD {
+            // Each new challenge is what an attacker gets by re-sending the
+            // password, possibly from a different address.
+            let challenge = auth_service
+                .create_mfa_session(user.id, "password")
+                .await
+                .unwrap();
+            for attempt in 1..=crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+                if failures == crate::mfa_guard::USER_LOCKOUT_THRESHOLD {
+                    break;
+                }
+                let result = auth_service.verify_mfa_challenge(&challenge, &wrong).await;
+                if attempt == crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+                    assert!(
+                        matches!(result, Err(MfaChallengeError::ChallengeExhausted { .. })),
+                        "the code that uses up a challenge ends it: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(MfaChallengeError::InvalidCode { .. })),
+                        "attempt {attempt} is a plain rejection: {result:?}"
+                    );
+                }
+                failures += 1;
+            }
+        }
+
+        let fresh = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let locked = auth_service
+            .verify_mfa_challenge(&fresh, &current_totp_code(HARDENING_SECRET))
+            .await;
+        assert!(
+            matches!(
+                locked,
+                Err(MfaChallengeError::LockedOut { user_id, retry_after_seconds })
+                    if user_id == user.id && retry_after_seconds > 0
+            ),
+            "a correct code must be refused while locked: {locked:?}"
+        );
+        let guard = guard_row(&db.db, user.id).await.unwrap();
+        assert!(guard.locked_until.is_some_and(|until| until > Utc::now()));
+        assert_eq!(
+            guard.last_totp_step, None,
+            "a locked attempt accepts nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_verification_resets_failure_counters() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "reset@example.com", true, &[]).await;
+        let challenge = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let wrong = code_outside_window();
+        for _ in 1..crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+            assert!(auth_service
+                .verify_mfa_challenge(&challenge, &wrong)
+                .await
+                .is_err());
+        }
+        assert_eq!(
+            guard_row(&db.db, user.id).await.unwrap().failed_attempts,
+            crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE - 1
+        );
+
+        auth_service
+            .verify_mfa_challenge(&challenge, &current_totp_code(HARDENING_SECRET))
+            .await
+            .expect("the correct code still works below the limit");
+
+        let guard = guard_row(&db.db, user.id).await.unwrap();
+        assert_eq!(guard.failed_attempts, 0);
+        assert_eq!(guard.locked_until, None);
+    }
+
+    #[tokio::test]
+    async fn recovery_code_signs_in_once() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user =
+            mfa_user_with_recovery(&db.db, "recovery@example.com", true, &["482915", "730264"])
+                .await;
+
+        let first = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let (signed_in, _) = auth_service
+            .verify_mfa_challenge_with_origin(&first, "482915")
+            .await
+            .expect("an unused recovery code completes sign-in");
+        let remaining: Vec<String> =
+            serde_json::from_str(signed_in.mfa_recovery_codes.as_deref().unwrap()).unwrap();
+        assert_eq!(remaining.len(), 1, "the used code is burned");
+
+        let second = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let reuse = auth_service.verify_mfa_challenge(&second, "482915").await;
+        assert!(
+            matches!(reuse, Err(MfaChallengeError::InvalidCode { .. })),
+            "a recovery code is single use: {reuse:?}"
+        );
+    }
+
+    /// Recovery codes are six digits like TOTP codes, so one value can be
+    /// both. It must complete exactly one sign-in, not one per factor.
+    #[tokio::test]
+    async fn a_value_that_is_both_factors_signs_in_once() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let both = current_totp_code(HARDENING_SECRET);
+        let user = mfa_user_with_recovery(&db.db, "both-factors@example.com", true, &[&both]).await;
+
+        let first = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let (signed_in, _) = auth_service
+            .verify_mfa_challenge_with_origin(&first, &both)
+            .await
+            .expect("the value signs in once");
+        let remaining: Vec<String> =
+            serde_json::from_str(signed_in.mfa_recovery_codes.as_deref().unwrap()).unwrap();
+        assert!(remaining.is_empty(), "the matching recovery code is burned");
+        assert!(guard_row(&db.db, user.id)
+            .await
+            .unwrap()
+            .last_totp_step
+            .is_some());
+
+        let second = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let again = auth_service.verify_mfa_challenge(&second, &both).await;
+        assert!(
+            matches!(again, Err(MfaChallengeError::InvalidCode { .. })),
+            "the same value must not sign in a second time: {again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_code_cannot_confirm_a_first_time_enrolment() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "enrol-rc@example.com", false, &["193746"]).await;
+        let challenge = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let result = auth_service
+            .verify_mfa_challenge(&challenge, "193746")
+            .await;
+        assert!(matches!(result, Err(MfaChallengeError::InvalidCode { .. })));
+    }
+
+    #[tokio::test]
+    async fn enrolment_at_sign_in_revokes_sessions_that_predate_it() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "enrol@example.com", false, &[]).await;
+        let pre_mfa_session = auth_service.create_session(user.id).await.unwrap();
+        assert!(auth_service.verify_session(&pre_mfa_session).await.is_ok());
+
+        let challenge = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let (enrolled, _) = auth_service
+            .verify_mfa_challenge_with_origin(&challenge, &current_totp_code(HARDENING_SECRET))
+            .await
+            .expect("the enrolment code is accepted");
+        assert!(enrolled.mfa_enabled);
+
+        assert!(
+            matches!(
+                auth_service.verify_session(&pre_mfa_session).await,
+                Err(AuthError::NotFound(_))
+            ),
+            "a session established before MFA existed must stop authenticating"
+        );
+    }
+
+    fn dummy_verifications() -> u32 {
+        DUMMY_VERIFICATIONS.with(|count| count.get())
+    }
+
+    #[test]
+    fn dummy_password_hash_uses_the_real_hash_parameters() {
+        let parsed = argon2::PasswordHash::new(dummy_password_hash()).unwrap();
+        assert_eq!(parsed.algorithm, argon2::Algorithm::default().ident());
+        // Compare the cost parameters only: a parsed hash records its output
+        // length, the default leaves it unset, and neither changes the cost.
+        let params = argon2::Params::try_from(&parsed).unwrap();
+        let default = argon2::Params::default();
+        assert_eq!(
+            (params.m_cost(), params.t_cost(), params.p_cost()),
+            (default.m_cost(), default.t_cost(), default.p_cost()),
+            "the dummy must cost exactly what a real verification costs"
+        );
+        assert!(!verify_against_dummy_hash("anything"));
+    }
+
+    #[tokio::test]
+    async fn login_runs_a_password_verification_on_every_rejection_path() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        create_test_user(&db.db, "has-password@example.com", "Correct-Horse-9!").await;
+        users::ActiveModel {
+            email: Set("sso-only@example.com".to_string()),
+            name: Set("SSO".to_string()),
+            password_hash: Set(None),
+            email_verified: Set(true),
+            mfa_enabled: Set(false),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let attempt = |email: &str| LoginRequest {
+            email: email.to_string(),
+            password: "Wrong-Password-1!".to_string(),
+        };
+
+        let before = dummy_verifications();
+        let unknown = auth_service.login(attempt("nobody@example.com")).await;
+        assert!(matches!(unknown, Err(UserAuthError::InvalidCredentials)));
+        assert_eq!(dummy_verifications(), before + 1, "unknown email must hash");
+
+        let no_password = auth_service.login(attempt("sso-only@example.com")).await;
+        assert!(matches!(
+            no_password,
+            Err(UserAuthError::InvalidCredentials)
+        ));
+        assert_eq!(
+            dummy_verifications(),
+            before + 2,
+            "no-password user must hash"
+        );
+
+        let wrong = auth_service
+            .login(attempt("has-password@example.com"))
+            .await;
+        assert!(matches!(wrong, Err(UserAuthError::InvalidCredentials)));
+        assert_eq!(
+            dummy_verifications(),
+            before + 2,
+            "a real account verifies against its own hash, not the dummy"
         );
     }
 }

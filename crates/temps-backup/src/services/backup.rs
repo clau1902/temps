@@ -6,7 +6,7 @@ use crate::handlers::backup_handler::{
 };
 use anyhow::Result;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::{Client as S3Client, Config};
+use aws_sdk_s3::Client as S3Client;
 use chrono::{DateTime, Duration, Timelike, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -15,7 +15,6 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use serde_yaml;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,6 +25,7 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 use urlencoding;
 use uuid::Uuid;
+use yaml_serde;
 
 use cron::Schedule;
 use temps_core::notifications::BackupFailureData;
@@ -1648,6 +1648,28 @@ pub struct BackupService {
 }
 
 impl BackupService {
+    /// Why running a backup of external service `service_id` with
+    /// `engine_key` would restart its database now, or `None`. Only the
+    /// WAL-G PostgreSQL engine can restart a service (to turn archiving on).
+    pub async fn backup_restart_reason(
+        &self,
+        service_id: i32,
+        engine_key: &str,
+    ) -> Result<Option<String>, BackupError> {
+        if engine_key != "postgres_walg" {
+            return Ok(None);
+        }
+        self.external_service_manager
+            .backup_restart_reason(service_id)
+            .await
+            .map_err(|e| {
+                BackupError::ExternalService(format!(
+                    "Failed to check whether backing up service {} restarts it: {}",
+                    service_id, e
+                ))
+            })
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         external_service_manager: Arc<ExternalServiceManager>,
@@ -1974,7 +1996,7 @@ impl BackupService {
         // credentials. Legacy manifests wrote it in plaintext. New recovery
         // sets encrypt it with a key derived from the S3 secret already needed
         // to download the backup, so bucket contents alone do not expose it.
-        let server_config = serde_yaml::to_string(&self.config_service.get_server_config())
+        let server_config = yaml_serde::to_string(&self.config_service.get_server_config())
             .map_err(|error| {
                 BackupError::Configuration(format!(
                     "Failed to serialize server config for recovery set {}: {}",
@@ -1990,10 +2012,10 @@ impl BackupService {
                     control_plane.backup_id, error
                 ))
             })?;
-        let manifest_encryption = temps_core::EncryptionService::new_from_password(&s3_secret);
+        // Argon2id with a fresh salt per ciphertext (F-009); the CLI still accepts
+        // legacy SHA-256-keyed manifests written by older servers.
         let encrypted_server_config =
-            manifest_encryption
-                .encrypt_string(&server_config)
+            temps_core::EncryptionService::encrypt_string_with_password(&s3_secret, &server_config)
                 .map_err(|error| BackupError::Internal {
                     message: format!(
                         "Failed to encrypt server config for recovery set {}: {}",
@@ -2024,19 +2046,21 @@ impl BackupService {
             "checksum": control_plane.checksum,
             "artifact_sha256": control_plane_sha256,
             "server_config_encrypted": encrypted_server_config,
-            "server_config_encryption": "aes-256-gcm+s3-secret-sha256",
+            "server_config_encryption": "aes-256-gcm+s3-secret-argon2id",
             "external_service_backups": external_service_backups,
             "metadata": control_plane_metadata,
         });
         let authenticated_payload = serde_json::to_string(&metadata)?;
-        let manifest_authentication = manifest_encryption
-            .encrypt_string(&authenticated_payload)
-            .map_err(|error| BackupError::Internal {
-                message: format!(
-                    "Failed to authenticate recovery manifest {}: {}",
-                    control_plane.backup_id, error
-                ),
-            })?;
+        let manifest_authentication = temps_core::EncryptionService::encrypt_string_with_password(
+            &s3_secret,
+            &authenticated_payload,
+        )
+        .map_err(|error| BackupError::Internal {
+            message: format!(
+                "Failed to authenticate recovery manifest {}: {}",
+                control_plane.backup_id, error
+            ),
+        })?;
         metadata["manifest_authentication"] = json!(manifest_authentication);
         let metadata_key =
             crate::engines::v2_common::derive_metadata_key(&control_plane.s3_location);
@@ -3322,32 +3346,14 @@ SELECT cp.id
             "backup-service",
         );
 
-        let mut config_builder = Config::builder()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(s3_source.region.clone()))
-            .force_path_style(s3_source.force_path_style.unwrap_or(true)) // Default to true for Minio
-            .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client())
-            // aws-sdk-s3 defaults to computing a flexible checksum and sending it via
-            // aws-chunked trailers on every PutObject/UploadPart. Most third-party
-            // S3-compatible providers (Cloudflare R2, OVH, MinIO, Backblaze) don't
-            // implement that trailer format and reject or corrupt the upload, so only
-            // compute checksums when a caller explicitly asks for one.
-            .request_checksum_calculation(
-                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-            );
-
-        // Only set endpoint URL if endpoint is specified (for Minio/custom S3)
-        if let Some(endpoint) = &s3_source.endpoint {
-            let endpoint_url = if endpoint.starts_with("http") {
-                endpoint.clone()
-            } else {
-                format!("http://{}", endpoint)
-            };
-            config_builder = config_builder.endpoint_url(endpoint_url);
-        }
-
-        let config = config_builder.build();
+        // Default to path style for MinIO and other S3-compatible stores.
+        let config = crate::engines::v2_common::s3_config_builder(
+            &s3_source.region,
+            s3_source.force_path_style.unwrap_or(true),
+            creds,
+            s3_source.endpoint.as_deref(),
+        )
+        .build();
 
         Ok(S3Client::from_conf(config))
     }
@@ -3365,32 +3371,21 @@ SELECT cp.id
             "backup-service",
         );
 
-        let mut config_builder = Config::builder()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new(request.region.clone()))
-            .force_path_style(request.force_path_style.unwrap_or(true))
-            .credentials_provider(creds)
-            .http_client(crate::engines::v2_common::bundled_roots_http_client())
-            // See create_s3_client() above for why this is forced to WhenRequired.
-            .request_checksum_calculation(
-                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-            )
-            // This client only verifies a destination while an operator
-            // waits; bound it so an endpoint that never answers cannot hold
-            // the request open.
-            .timeout_config(
-                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                    .operation_timeout(crate::services::s3_probe::S3_PROBE_OPERATION_TIMEOUT)
-                    .build(),
-            );
-
-        // Only set endpoint URL if endpoint is specified (for MinIO)
-        if let Some(endpoint) = &request.endpoint {
-            config_builder =
-                config_builder.endpoint_url(crate::services::s3_probe::endpoint_url(endpoint));
-        }
-
-        let config = config_builder.build();
+        let config = crate::engines::v2_common::s3_config_builder(
+            &request.region,
+            request.force_path_style.unwrap_or(true),
+            creds,
+            request.endpoint.as_deref(),
+        )
+        // This client only verifies a destination while an operator
+        // waits; bound it so an endpoint that never answers cannot hold
+        // the request open.
+        .timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .operation_timeout(crate::services::s3_probe::S3_PROBE_OPERATION_TIMEOUT)
+                .build(),
+        )
+        .build();
         Ok(S3Client::from_conf(config))
     }
 
@@ -8202,7 +8197,7 @@ RETURNING id
         )],
     ) -> Result<serde_json::Value, BackupError> {
         let config_yaml =
-            serde_yaml::to_string(&self.config_service.get_server_config()).map_err(|error| {
+            yaml_serde::to_string(&self.config_service.get_server_config()).map_err(|error| {
                 BackupError::Configuration(format!(
                     "Failed to serialize server config for backup {}: {}",
                     backup.backup_id, error
@@ -8217,9 +8212,9 @@ RETURNING id
                     backup.backup_id, error
                 ))
             })?;
-        let encrypted_server_config = temps_core::EncryptionService::new_from_password(&s3_secret)
-            .encrypt_string(&config_yaml)
-            .map_err(|error| BackupError::Internal {
+        let encrypted_server_config =
+            temps_core::EncryptionService::encrypt_string_with_password(&s3_secret, &config_yaml)
+                .map_err(|error| BackupError::Internal {
                 message: format!(
                     "Failed to encrypt server config for backup {}: {}",
                     backup.backup_id, error
@@ -8264,7 +8259,7 @@ RETURNING id
             "tags": serde_json::from_str::<Vec<String>>(&backup.tags).unwrap_or_default(),
             "checksum": backup.checksum,
             "server_config_encrypted": encrypted_server_config,
-            "server_config_encryption": "aes-256-gcm+s3-secret-sha256",
+            "server_config_encryption": "aes-256-gcm+s3-secret-argon2id",
             "external_service_backups": external_backups,
             "metadata": serde_json::from_str::<serde_json::Value>(&backup.metadata).unwrap_or_default()
         }))
@@ -9217,7 +9212,8 @@ ORDER BY a.opened_at DESC
         // used directly — the backup cannot proceed without the engine.
         let service_instance = self
             .external_service_manager
-            .get_service_instance(service.name.clone(), service_type)
+            .resolve_service_instance(&service.name, service_type)
+            .await
             .map_err(|e| {
                 error!(
                     "Could not resolve the backup engine for service '{}' (type={}, id={}): {}",

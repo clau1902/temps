@@ -42,9 +42,10 @@ use crate::handlers::types::{
     ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
     DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
     DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
-    EnvVarResponse, FailureReportPreviewResponse, LatestDeploymentMediaResponse,
-    LatestDeploymentMediaResponseItem, ManagedEnvironmentVariablesQuery, PromoteDeploymentRequest,
-    ResourceLimitsResponse, SendFailureReportRequest,
+    EnvVarResponse, FailureReportPreviewResponse, LastDeploymentResponse,
+    LatestDeploymentMediaResponse, LatestDeploymentMediaResponseItem,
+    ManagedEnvironmentVariablesQuery, PromoteDeploymentRequest, ResourceLimitsResponse,
+    SendFailureReportRequest,
 };
 use crate::services::{
     managed_environment_variables, ManagedEnvironmentVariable, ManagedEnvironmentVariableSource,
@@ -234,6 +235,7 @@ async fn deployment_response_with_service_urls(
         crate::services::DeploymentFailureStage,
         crate::services::DeploymentFailureCode,
         crate::services::FailureSettingsSection,
+        LastDeploymentResponse,
         LatestDeploymentMediaResponse,
         LatestDeploymentMediaResponseItem,
         DeploymentStateResponse,
@@ -567,6 +569,15 @@ impl From<crate::services::services::DeploymentError> for Problem {
                 .with_detail(format!(
                     "Container exec for {container_id} timed out after {timeout_seconds} seconds"
                 )),
+            // Same response the other external-hosting refusals give
+            // (`refuse_external_project`): the request is well-formed, but
+            // the project's state does not allow it.
+            DeploymentError::ProjectHostedExternally { reason, .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/project-hosted-externally")
+                    .with_title("Project Runs Outside Temps")
+                    .with_detail(reason)
+            }
             error @ (DeploymentError::AssetOriginNotFound { .. }
             | DeploymentError::AssetOriginCycle { .. }
             | DeploymentError::EnvironmentResolution(_)) => {
@@ -582,6 +593,9 @@ impl From<crate::services::services::DeploymentError> for Problem {
 }
 
 /// Get the last deployment for a specific project
+///
+/// A project that exists but has never been deployed answers 200 with
+/// `deployment: null`; only an unknown project is a 404.
 #[utoipa::path(
     tag = "Deployments",
     get,
@@ -589,8 +603,8 @@ impl From<crate::services::services::DeploymentError> for Problem {
         ("id" = i32, Path, description = "Project ID")
     ),
     responses(
-        (status = 200, description = "Last deployment details", body = DeploymentResponse),
-        (status = 404, description = "Project not found or no deployments"),
+        (status = 200, description = "Last deployment, or `deployment: null` when the project has no deployments yet", body = LastDeploymentResponse),
+        (status = 404, description = "Project not found"),
         (status = 500, description = "Internal server error")
     ),
     path = "/projects/{id}/last-deployment"
@@ -605,9 +619,13 @@ pub async fn get_last_deployment(
     project_access_guard!(auth, id, state.project_access_checker);
 
     debug!("Getting last deployment for project with id: {}", id);
-    let deployment = state.deployment_service.get_last_deployment(id).await?;
-    let response = deployment_response_with_service_urls(&state, id, deployment).await?;
-    Ok(Json(response).into_response())
+    let deployment = match state.deployment_service.get_last_deployment(id).await? {
+        Some(deployment) => {
+            Some(deployment_response_with_service_urls(&state, id, deployment).await?)
+        }
+        None => None,
+    };
+    Ok(Json(LastDeploymentResponse { deployment }).into_response())
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
@@ -801,6 +819,10 @@ pub async fn rollback_to_deployment(
         project_id,
         state.project_access_checker
     );
+    state
+        .deployment_service
+        .ensure_project_hosted_locally(project_id)
+        .await?;
 
     let deployment = state
         .deployment_service
@@ -866,6 +888,10 @@ pub async fn promote_deployment(
         project_id,
         state.project_access_checker
     );
+    state
+        .deployment_service
+        .ensure_project_hosted_locally(project_id)
+        .await?;
 
     info!(
         "Promoting deployment {} to environment {} (project {})",
@@ -1247,7 +1273,7 @@ pub async fn list_containers(
     // Collect unique node_ids to resolve names in a single batch
     let node_ids: Vec<i32> = containers
         .iter()
-        .filter_map(|(_, node_id, _)| *node_id)
+        .filter_map(|container| container.row.node_id)
         .collect::<std::collections::HashSet<i32>>()
         .into_iter()
         .collect();
@@ -1266,7 +1292,11 @@ pub async fn list_containers(
 
     let container_responses: Vec<ContainerInfoResponse> = containers
         .into_iter()
-        .map(|(info, node_id, service_name)| {
+        .map(|container| {
+            let info = container.info;
+            let row = container.row;
+            let node_id = row.node_id;
+            let service_name = row.service_name.clone();
             let node_name = node_id.and_then(|id| presentation.node_names.get(&id).cloned());
             // Build URLs only for services with a configured public port.
             // The first public route uses the canonical environment URL;
@@ -1284,7 +1314,19 @@ pub async fn list_containers(
                     )
                 })
                 .unwrap_or_default();
-            ContainerInfoResponse::from_info(info, node_name, service_name, service_urls)
+            let mut response =
+                ContainerInfoResponse::from_info(info, node_name, service_name, service_urls);
+            response.container_port = row.container_port;
+            response.health_state = row.health_state;
+            response.health_checked_at = row
+                .health_checked_at
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            response.health_detail = row.health_detail;
+            if row.container_port.is_none() {
+                response.service_url = None;
+                response.service_urls.clear();
+            }
+            response
         })
         .collect();
 
@@ -2158,6 +2200,11 @@ pub async fn get_container_detail(
         deployed_at: container.deployed_at.to_rfc3339(),
         ready_at: container.ready_at.map(|dt| dt.to_rfc3339()),
         container_port: container.container_port,
+        health_state: container.health_state,
+        health_checked_at: container
+            .health_checked_at
+            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        health_detail: container.health_detail,
         host_port: container.host_port,
         environment_variables: env_vars,
         restart_count,
@@ -2208,6 +2255,7 @@ pub async fn get_container_environment_variable(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     require_container_environment_reveal(&auth)?;
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let variables = state
@@ -2301,6 +2349,7 @@ fn mask_container_environment_variables(variables: Vec<(String, String)>) -> Vec
     ),
     responses(
         (status = 200, description = "Container stopped successfully", body = ContainerActionResponse),
+        (status = 403, description = "Insufficient permissions or cross-project credential"),
         (status = 404, description = "Container not found"),
         (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
@@ -2312,8 +2361,16 @@ pub async fn stop_container(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    // Container lifecycle is deployment runtime control, not env-var
+    // editing: gate it on the deployment write permission (with per-project
+    // narrowing) and confine deployment tokens to their own project.
+    project_permission_guard!(
+        auth,
+        DeploymentsWrite,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
 
     state
         .deployment_service
@@ -2358,6 +2415,7 @@ pub async fn stop_container(
     ),
     responses(
         (status = 200, description = "Container started successfully", body = ContainerActionResponse),
+        (status = 403, description = "Insufficient permissions or cross-project credential"),
         (status = 404, description = "Container not found"),
         (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
@@ -2369,8 +2427,16 @@ pub async fn start_container(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    // Container lifecycle is deployment runtime control, not env-var
+    // editing: gate it on the deployment write permission (with per-project
+    // narrowing) and confine deployment tokens to their own project.
+    project_permission_guard!(
+        auth,
+        DeploymentsWrite,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
 
     state
         .deployment_service
@@ -2415,6 +2481,7 @@ pub async fn start_container(
     ),
     responses(
         (status = 200, description = "Container restarted successfully", body = ContainerActionResponse),
+        (status = 403, description = "Insufficient permissions or cross-project credential"),
         (status = 404, description = "Container not found"),
         (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
@@ -2426,8 +2493,16 @@ pub async fn restart_container(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    // Container lifecycle is deployment runtime control, not env-var
+    // editing: gate it on the deployment write permission (with per-project
+    // narrowing) and confine deployment tokens to their own project.
+    project_permission_guard!(
+        auth,
+        DeploymentsWrite,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
 
     state
         .deployment_service
@@ -2483,6 +2558,7 @@ pub async fn get_container_metrics(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let stats = state
@@ -2540,6 +2616,7 @@ pub async fn get_container_metrics_history(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let store = state.metrics_store.as_ref().ok_or_else(|| {
@@ -2687,6 +2764,7 @@ pub async fn stream_container_metrics(
     Problem,
 > {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let interval_ms = params
@@ -2989,6 +3067,26 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
+    #[test]
+    fn external_hosting_refusal_is_a_conflict_that_names_the_project() {
+        let problem = Problem::from(
+            crate::services::services::DeploymentError::ProjectHostedExternally {
+                project_id: 7,
+                project_name: "edge-app".to_string(),
+                reason: "edge-app runs outside Temps".to_string(),
+            },
+        );
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title").and_then(|value| value.as_str()),
+            Some("Project Runs Outside Temps")
+        );
+        assert_eq!(
+            problem.body.get("detail").and_then(|value| value.as_str()),
+            Some("edge-app runs outside Temps")
+        );
+    }
+
     /// Test double for handlers unrelated to sensitive-action gating --
     /// always allows, so existing tests built before that gate was added
     /// don't need to know about it.
@@ -3097,6 +3195,70 @@ mod tests {
                 "{handler_name} must reject credentials scoped to another project"
             );
         }
+    }
+
+    /// Extract the body of `pub async fn {handler_name}` up to the next
+    /// `pub async fn` in `source`.
+    fn handler_source<'a>(source: &'a str, handler_name: &str) -> &'a str {
+        let fn_start = source
+            .find(&format!("pub async fn {handler_name}("))
+            .unwrap_or_else(|| panic!("{handler_name} handler not found in source"));
+        let after_start = &source[fn_start + 1..];
+        let next_fn_offset = after_start
+            .find("pub async fn")
+            .unwrap_or(after_start.len());
+        &source[fn_start..fn_start + 1 + next_fn_offset]
+    }
+
+    #[test]
+    fn container_env_and_metrics_handlers_enforce_credential_project_scope() {
+        let source = include_str!("deployments.rs");
+        for handler_name in [
+            "get_container_environment_variable",
+            "get_container_metrics",
+            "get_container_metrics_history",
+            "stream_container_metrics",
+            "stop_container",
+            "start_container",
+            "restart_container",
+        ] {
+            assert!(
+                handler_source(source, handler_name)
+                    .contains("project_scope_guard!(auth, project_id)"),
+                "{handler_name} must reject credentials scoped to another project"
+            );
+        }
+    }
+
+    #[test]
+    fn container_lifecycle_handlers_require_deployment_write_permission() {
+        let source = include_str!("deployments.rs");
+        for handler_name in ["stop_container", "start_container", "restart_container"] {
+            let body = handler_source(source, handler_name);
+            assert!(
+                body.contains("DeploymentsWrite"),
+                "{handler_name} must be gated on DeploymentsWrite"
+            );
+            assert!(
+                !body.contains("EnvironmentsWrite"),
+                "{handler_name} must not be gated on the env-var permission EnvironmentsWrite"
+            );
+        }
+    }
+
+    #[test]
+    fn send_failure_report_requires_deployment_write_permission() {
+        let source = include_str!("failure_report.rs");
+        let body = handler_source(source, "send_failure_report");
+        assert!(
+            body.contains("permission_guard!(auth, DeploymentsWrite)"),
+            "send_failure_report triggers an outbound report and must require DeploymentsWrite"
+        );
+        assert!(
+            !body.contains("DeploymentsRead"),
+            "send_failure_report must not be reachable with DeploymentsRead alone"
+        );
+        assert!(body.contains("project_scope_guard!(auth, project_id)"));
     }
 
     #[test]
@@ -3440,6 +3602,7 @@ mod tests {
                 tags: vec![],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
         async fn save_image(
@@ -4177,7 +4340,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set(real_container_id.clone()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("alpine:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -4392,7 +4555,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set(stale_container_id.clone()),
             container_name: Set("test-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("alpine:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -4585,7 +4748,7 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set(real_container1_id.clone()),
             container_name: Set("web-container".to_string()),
-            container_port: Set(8080),
+            container_port: Set(Some(8080)),
             image_name: Set(Some("alpine:latest".to_string())),
             status: Set(Some("running".to_string())),
             created_at: Set(now),
@@ -5045,10 +5208,106 @@ mod tests {
             "Response body: {}",
             serde_json::to_string_pretty(&body).unwrap()
         );
-        assert_eq!(body["id"], deployment.id);
-        assert_eq!(body["status"], "deployed");
+        assert_eq!(body["deployment"]["id"], deployment.id);
+        assert_eq!(body["deployment"]["status"], "deployed");
 
         println!("✅ GET /projects/{{id}}/last-deployment test passed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_get_last_deployment_endpoint_empty_state_and_missing_project() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::projects;
+
+        if !database_test_prerequisites_available().await {
+            println!("Docker/test database not available, skipping");
+            return;
+        }
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "test_last_deployment_empty_http_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temporary data directory");
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        // A project that exists but has never been deployed.
+        let project = projects::ActiveModel {
+            name: Set("Empty Project".to_string()),
+            slug: Set("empty-project".to_string()),
+            repo_name: Set("empty-repo".to_string()),
+            repo_owner: Set("example-owner".to_string()),
+            directory: Set("/tmp/empty-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(create_test_auth_context());
+                next.run(req).await
+            },
+        );
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+
+        // Exists but empty -> 200 with an explicit null.
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/last-deployment",
+                addr, project.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert_eq!(body, serde_json::json!({ "deployment": null }));
+
+        // Unknown project -> 404 that names the project.
+        let missing_id = project.id + 10_000;
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/last-deployment",
+                addr, missing_id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert_eq!(response.status(), 404);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert_eq!(
+            body["detail"],
+            format!("project {missing_id} not found").as_str()
+        );
+
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 

@@ -38,6 +38,23 @@ use std::pin::Pin;
 /// two seconds bounds the delay after an admin save without querying on traffic.
 const FORWARDED_IP_TRUST_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Apply setup's TLS ownership before accepting requests. External proxies
+/// reach the origin over HTTP even when the public origin is HTTPS. Reuse the
+/// global redirect gate so project overrides and cached certificates cannot
+/// send those requests back to the external proxy in a redirect loop.
+async fn load_https_redirect_policy(
+    config_service: &temps_config::ConfigService,
+    explicitly_disabled: bool,
+) -> Result<bool> {
+    let external_tls = config_service
+        .external_tls_enabled()
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("Cannot start proxy: failed to load external TLS policy: {error}")
+        })?;
+    Ok(explicitly_disabled || external_tls)
+}
+
 /// `None` means the settings read failed. Keep the last known value until a
 /// successful read, so a transient database outage cannot change IP policy.
 /// Returns the new value only when it changed.
@@ -109,9 +126,35 @@ pub struct TlsExtensionData {
     pub sni_hostname: String,
 }
 
+/// How the TLS callback treats an SNI hostname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SniCertPolicy {
+    /// Any other hostname: load its certificate; on a miss, ask on-demand TLS.
+    Default,
+    /// A status page's custom hostname (#1412) whose ownership is proven and
+    /// whose page is published: serve its own certificate, never ask
+    /// on-demand TLS to mint one.
+    StatusPageServing,
+    /// A status page's custom hostname that is not verified, or whose page is
+    /// unpublished: no certificate at all — no exact match, no wildcard
+    /// fallback, no on-demand issuance.
+    StatusPageRefused,
+}
+
+fn sni_cert_policy(route_table: &CachedPeerTable, sni: &str) -> SniCertPolicy {
+    match route_table.status_page_host(sni) {
+        None => SniCertPolicy::Default,
+        Some(route) if route.slug.is_some() => SniCertPolicy::StatusPageServing,
+        Some(_) => SniCertPolicy::StatusPageRefused,
+    }
+}
+
 /// Dynamic certificate callback for TLS
 struct DynamicCertLoader {
     cert_loader: Arc<CertificateLoader>,
+    /// Consulted for status-page custom hostnames (#1412) before any
+    /// certificate is chosen. Lock-free snapshot read.
+    route_table: Arc<CachedPeerTable>,
     /// On-demand HTTP-01 TLS manager (ADR-018). When present and the SNI has no
     /// active cert, the callback asks it to provision one in the background and
     /// still returns `Ok(None)` immediately (Option B: fail-fast, do not block
@@ -136,6 +179,15 @@ impl TlsAccept for DynamicCertLoader {
             .to_string();
 
         debug!("TLS callback for SNI: {}", sni);
+
+        let policy = sni_cert_policy(&self.route_table, &sni);
+        if policy == SniCertPolicy::StatusPageRefused {
+            debug!(
+                "No certificate for unverified or unpublished status-page hostname {}",
+                sni
+            );
+            return;
+        }
 
         match self.cert_loader.load_certificate(&sni).await {
             Ok(Some((certs, key))) => {
@@ -196,8 +248,10 @@ impl TlsAccept for DynamicCertLoader {
                 // Peer IP isn't readily available in the OpenSSL TLS callback, so
                 // the per-IP novelty limiter is passed `None`; the zone, route,
                 // dedup, backoff, and global hourly-cap checks remain in force.
-                if let Some(ref manager) = self.on_demand_cert_manager {
-                    let _ = manager.try_enqueue(&sni, None);
+                if policy == SniCertPolicy::Default {
+                    if let Some(ref manager) = self.on_demand_cert_manager {
+                        let _ = manager.try_enqueue(&sni, None);
+                    }
                 }
             }
             Err(e) => {
@@ -452,7 +506,13 @@ pub fn setup_proxy_server(
         db.clone(),
         ip_service.clone(),
         retention_resolver.clone(),
+        config_service.clickhouse_compression(),
     );
+
+    // One counter set shared by the batch writer (log write retries/drops) and
+    // the load balancer (request counters), so the metrics sampler persists
+    // both from a single snapshot.
+    let proxy_metrics = Arc::new(crate::metrics::ProxyMetrics::default());
 
     // Create batch writer for proxy logs and tracking events (bounded channels + background tasks)
     let (proxy_log_handle, tracking_handle, proxy_log_writer) =
@@ -461,6 +521,8 @@ pub fn setup_proxy_server(
             ip_service.clone(),
             proxy_log_storage,
         );
+    let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
+    let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
     // Spawn the batch writer background task
     std::thread::spawn(move || {
@@ -542,6 +604,9 @@ pub fn setup_proxy_server(
 
     // Create the main load balancer
     let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let disable_https_redirect = security_refresh_runtime()?.block_on(
+        load_https_redirect_policy(&config_service, proxy_config.disable_https_redirect),
+    )?;
     let mut lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
@@ -554,15 +619,20 @@ pub fn setup_proxy_server(
         project_ip_gate,
         challenge_service,
         cert_host_cache,
-        proxy_config.disable_https_redirect,
+        disable_https_redirect,
     )
     .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_proxy_metrics(proxy_metrics.clone())
     .with_request_policy_gate(request_policy_gate);
     if let Some(gate) = admin_gate {
         lb = lb.with_admin_gate(gate);
     }
     if let Some(state) = proxy_config.console_startup.clone() {
-        lb = lb.with_console_startup_state(state, &proxy_config.console_address);
+        lb = lb.with_console_startup_state(
+            state,
+            &proxy_config.console_address,
+            proxy_config.console_ingress_address.as_deref(),
+        );
     }
 
     // Wire up on-demand scale-to-zero if OnDemandManager was created.
@@ -688,6 +758,7 @@ pub fn setup_proxy_server(
         // only in DynamicCertLoader, never in the loader (ADR §7).
         let tls_callbacks: Box<dyn TlsAccept + Send + Sync> = Box::new(DynamicCertLoader {
             cert_loader,
+            route_table: route_table.clone(),
             on_demand_cert_manager: proxy_config.on_demand_cert_manager.clone(),
         });
 
@@ -844,7 +915,13 @@ pub fn create_proxy_service(
         db.clone(),
         ip_service.clone(),
         retention_resolver.clone(),
+        config_service.clickhouse_compression(),
     );
+
+    // One counter set shared by the batch writer (log write retries/drops) and
+    // the load balancer (request counters), so the metrics sampler persists
+    // both from a single snapshot.
+    let proxy_metrics = Arc::new(crate::metrics::ProxyMetrics::default());
 
     // Create batch writer for proxy logs and tracking events (bounded channels + background tasks)
     let (proxy_log_handle, tracking_handle, proxy_log_writer) =
@@ -853,6 +930,8 @@ pub fn create_proxy_service(
             ip_service.clone(),
             proxy_log_storage,
         );
+    let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
+    let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
     // Spawn the batch writer background task
     std::thread::spawn(move || {
@@ -887,6 +966,9 @@ pub fn create_proxy_service(
 
     // Create the main load balancer
     let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let disable_https_redirect = security_refresh_runtime()?.block_on(
+        load_https_redirect_policy(&config_service, proxy_config.disable_https_redirect),
+    )?;
     let lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
@@ -899,9 +981,10 @@ pub fn create_proxy_service(
         project_ip_gate,
         challenge_service,
         cert_host_cache,
-        proxy_config.disable_https_redirect,
+        disable_https_redirect,
     )
-    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip);
+    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_proxy_metrics(proxy_metrics);
 
     Ok(lb)
 }
@@ -924,6 +1007,50 @@ mod preflight_bind_tests {
             )
             .expect("create test server config"),
         )
+    }
+
+    #[tokio::test]
+    async fn external_tls_disables_origin_redirects_even_with_a_public_https_url() {
+        for (external_tls, explicit_disable, expected) in [
+            (true, false, true),
+            (true, true, true),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let row = settings::Model {
+                id: 1,
+                data: serde_json::json!({
+                    "external_url": "https://console.apps.example.com",
+                    "external_tls": external_tls,
+                }),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection();
+            let service = temps_config::ConfigService::new(test_config(), Arc::new(db));
+            assert_eq!(
+                load_https_redirect_policy(&service, explicit_disable)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_tls_policy_must_be_loaded_before_the_proxy_starts() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("settings unavailable".to_string())])
+            .into_connection();
+        let service = temps_config::ConfigService::new(test_config(), Arc::new(db));
+        let error = load_https_redirect_policy(&service, false)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Cannot start proxy: failed to load external TLS policy"));
     }
 
     #[test]
@@ -1140,6 +1267,34 @@ mod preflight_bind_tests {
         assert!(
             message.contains(&addr),
             "error should name the conflicting address: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sni_cert_policy_tests {
+    use super::*;
+
+    fn table() -> CachedPeerTable {
+        CachedPeerTable::new(Arc::new(sea_orm::DatabaseConnection::Disconnected))
+    }
+
+    #[test]
+    fn status_page_hosts_never_get_on_demand_or_unverified_certificates() {
+        let table = table();
+        table.insert_status_page_host_for_test("status.example.com", Some("abc"));
+        table.insert_status_page_host_for_test("pending.example.com", None);
+        assert_eq!(
+            sni_cert_policy(&table, "status.example.com"),
+            SniCertPolicy::StatusPageServing
+        );
+        assert_eq!(
+            sni_cert_policy(&table, "PENDING.example.com."),
+            SniCertPolicy::StatusPageRefused
+        );
+        assert_eq!(
+            sni_cert_policy(&table, "app.example.com"),
+            SniCertPolicy::Default
         );
     }
 }

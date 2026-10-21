@@ -79,7 +79,7 @@ Uptime monitors with status timelines, plus alerts for deploy failures, runtime 
 
 ### Error Tracking — Sentry-compatible
 
-Drop-in Sentry replacement: point the official Sentry SDK at your Temps DSN and get error groups, stack traces with source context, and alerts. No per-event pricing.
+Point supported official Sentry SDKs at your Temps DSN to ingest errors, structured logs, traces, metrics, web replay, and cron check-ins into native Temps services. Use Temps APIs and UI to query and manage them. See the [versioned compatibility contract](docs/features/error-tracking/page.mdx#sentry-compatibility) for verified SDK scenarios and unsupported features. No per-event pricing.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/errors-dark.png">
@@ -132,7 +132,7 @@ Point any OTLP exporter at Temps and get distributed traces, metrics, and struct
 
 **Real hardware-level isolation, not just containers.** Sandboxes run on **Firecracker microVMs** — the same tech behind AWS Lambda — with a **Docker** backend as the default. Run `temps firecracker setup` and Temps routes sandboxes to microVMs automatically; each one gets its own kernel, so untrusted agent-generated code never shares a kernel with your host.
 
-**Experimental: microsandbox (libkrun) microVMs.** A second microVM backend that boots in ~150 ms from a cached image, pulls OCI images natively and also runs on Apple Silicon Macs. Run `temps microsandbox setup`, restart `temps serve`, and pick it per sandbox (`backend: "microsandbox"`) or as the host default. It is meant for trusted and agent workloads; keep Firecracker for hostile multi-tenant code. Not included in the musl container image. See [ADR-050](docs/adr/050-microsandbox-sandbox-backend.md).
+**Experimental: microsandbox (libkrun) microVMs.** A second microVM backend that boots in ~150 ms from a cached image, pulls OCI images natively and also runs on Apple Silicon Macs. Run `temps microsandbox setup`, restart `temps serve`, and pick it per sandbox (`backend: "microsandbox"`) or as the host default. It is meant for trusted and agent workloads; keep Firecracker for hostile multi-tenant code. Interactive terminals (`temps sandbox shell`) work on it once the guest terminal agent is staged — `temps microsandbox setup --pty-agent-bin <path>`, or ship `temps-pty-agent` next to the `temps` binary. Not included in the musl container image. See [ADR-050](docs/adr/050-microsandbox-sandbox-backend.md).
 
 **A drop-in SDK.** `@temps-sdk/sandbox` is compatible with the `@vercel/sandbox` shape — switch providers by changing the import and base URL:
 

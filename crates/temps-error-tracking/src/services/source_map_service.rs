@@ -14,6 +14,12 @@ use tracing::{debug, warn};
 
 use super::types::CreateErrorEventData;
 
+mod artifacts;
+mod build_credentials;
+mod debug_ids;
+pub use artifacts::{ArtifactAssembly, ArtifactUploadError, ARTIFACT_WORKERS, CHUNK_BYTES};
+pub use build_credentials::{BuildCredentialError, ProjectBuildCredential};
+
 /// Maximum accepted size for one source map across HTTP uploads, deployment
 /// capture, parsing, and persistence.
 pub const MAX_SOURCE_MAP_BYTES: usize = 50 * 1024 * 1024;
@@ -72,6 +78,7 @@ pub struct SourceMapInfo {
     pub dist: Option<String>,
     pub size_bytes: i64,
     pub checksum: Option<String>,
+    pub debug_id: Option<String>,
     pub created_at: chrono::DateTime<Utc>,
 }
 
@@ -85,6 +92,7 @@ impl From<source_maps::Model> for SourceMapInfo {
             dist: model.dist,
             size_bytes: model.size_bytes,
             checksum: model.checksum,
+            debug_id: model.debug_id,
             created_at: model.created_at,
         }
     }
@@ -216,6 +224,7 @@ impl SourceMapService {
             dist: Option<String>,
             size_bytes: i64,
             checksum: Option<String>,
+            debug_id: Option<String>,
             created_at: chrono::DateTime<Utc>,
         }
 
@@ -231,6 +240,7 @@ impl SourceMapService {
             .column(source_maps::Column::Dist)
             .column(source_maps::Column::SizeBytes)
             .column(source_maps::Column::Checksum)
+            .column(source_maps::Column::DebugId)
             .column(source_maps::Column::CreatedAt)
             .into_model::<SourceMapMetadata>()
             .all(self.db.as_ref())
@@ -246,6 +256,7 @@ impl SourceMapService {
                 dist: m.dist,
                 size_bytes: m.size_bytes,
                 checksum: m.checksum,
+                debug_id: m.debug_id,
                 created_at: m.created_at,
             })
             .collect())
@@ -343,6 +354,7 @@ impl SourceMapService {
         let result = source_maps::Entity::delete_many()
             .filter(source_maps::Column::ProjectId.eq(project_id))
             .filter(source_maps::Column::Release.is_not_in(keep_releases.clone()))
+            .filter(source_maps::Column::DebugId.is_null())
             .exec(self.db.as_ref())
             .await?;
 
@@ -389,6 +401,28 @@ impl SourceMapService {
         &self,
         error_data: &mut CreateErrorEventData,
     ) -> Result<(), SourceMapError> {
+        if let Some(raw) = &mut error_data.raw_sentry_event {
+            self.symbolicate_debug_ids(error_data.project_id, raw).await;
+            if let Some(values) = raw
+                .pointer("/exception/values")
+                .and_then(serde_json::Value::as_array)
+            {
+                for (exception, value) in error_data.exceptions.iter_mut().zip(values) {
+                    if let Some(stack) = value.get("stacktrace") {
+                        exception.stack_trace = Some(stack.clone());
+                    }
+                }
+            }
+            if let Some(stack) = raw.get("stacktrace") {
+                error_data.stack_trace = Some(stack.clone());
+            } else if let Some(stack) = error_data
+                .exceptions
+                .last()
+                .and_then(|exception| exception.stack_trace.clone())
+            {
+                error_data.stack_trace = Some(stack);
+            }
+        }
         let release = match &error_data.release_version {
             Some(r) if !r.is_empty() => r.clone(),
             _ => {
@@ -453,6 +487,34 @@ impl SourceMapService {
     ///
     /// Frames already marked with `"symbolicated": true` are skipped.
     pub async fn symbolicate_stored_event(&self, project_id: i32, data: &mut serde_json::Value) {
+        if let Some(event) = data.get_mut("sentry") {
+            self.symbolicate_debug_ids(project_id, event).await;
+        }
+        let debug_frames = data
+            .get("sentry")
+            .and_then(|event| {
+                event
+                    .pointer("/exception/values")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|exceptions| exceptions.last())
+                    .and_then(|exception| exception.pointer("/stacktrace/frames"))
+                    .or_else(|| event.pointer("/stacktrace/frames"))
+            })
+            .filter(|frames| {
+                frames.as_array().is_some_and(|frames| {
+                    frames.iter().any(|frame| {
+                        frame.get("debug_id").is_some()
+                            && frame
+                                .get("symbolicated")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                    })
+                })
+            })
+            .cloned();
+        if let Some(frames) = debug_frames {
+            data["stack_trace"] = frames;
+        }
         // Extract the release from the sentry data
         let release = match data
             .get("sentry")
@@ -507,6 +569,10 @@ impl SourceMapService {
                     None => continue,
                 };
 
+                // An exact Debug ID cannot fall back to another release build.
+                if obj.contains_key("debug_id") {
+                    continue;
+                }
                 // Skip already-symbolicated frames
                 if obj
                     .get("symbolicated")
@@ -587,6 +653,12 @@ impl SourceMapService {
                 Some(o) => o,
                 None => continue,
             };
+
+            if obj.contains_key("debug_id")
+                || obj.get("symbolicated").and_then(serde_json::Value::as_bool) == Some(true)
+            {
+                continue;
+            }
 
             // Prefer abs_path (full URL/path) over filename (basename) for source map lookup.
             // Server-side Sentry sends filename="route.js" but abs_path="app:///path/to/.next/server/app/api/route.js"
@@ -1566,6 +1638,156 @@ mod tests {
                 } ] }
             }
         })
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn debug_id_artifacts_native_storage_isolation_retry_and_late_symbolication() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let project = create_test_project(&db).await;
+        let other = create_test_project(&db).await;
+        let service = SourceMapService::new(db.clone());
+        let id = "00112233-4455-4677-8899-aabbccddeeff";
+        let bytes = super::artifacts::tests::bundle(&[(id, "throw new Error('synthetic');")]);
+        let checksum = sha1_smol::Sha1::from(&bytes).digest().to_string();
+        let event = serde_json::json!({"sentry":{
+            "debug_meta":{"images":[{"type":"sourcemap","debug_id":id,"code_file":"https://synthetic.example/bundle.js"}]},
+            "exception":{"values":[{"stacktrace":{"frames":[{"filename":"bundle.js","abs_path":"https://synthetic.example/bundle.js","lineno":1,"colno":1}]}}]}
+        }});
+        let mut pending = event.clone();
+        service
+            .symbolicate_stored_event(project, &mut pending)
+            .await;
+        assert!(pending
+            .pointer("/sentry/exception/values/0/stacktrace/frames/0/symbolicated")
+            .is_none());
+        let missing = service
+            .assemble_artifact(
+                project,
+                checksum.clone(),
+                vec![checksum.clone()],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.missing_chunks, vec![checksum.clone()]);
+        assert!(service
+            .stage_artifact_chunks(project, vec![("a".repeat(40), bytes.clone())])
+            .await
+            .is_err());
+        for _ in 0..2 {
+            service
+                .stage_artifact_chunks(project, vec![(checksum.clone(), bytes.clone())])
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            service
+                .assemble_artifact(other, checksum.clone(), vec![checksum.clone()], None, None)
+                .await
+                .unwrap()
+                .state,
+            "not_found"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                service
+                    .assemble_artifact(
+                        project,
+                        checksum.clone(),
+                        vec![checksum.clone()],
+                        None,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .state,
+                "ok"
+            );
+        }
+        let maps = service
+            .list_for_release(project, &format!("debug-id:{id}"))
+            .await
+            .unwrap();
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].debug_id.as_deref(), Some(id));
+        service
+            .symbolicate_stored_event(project, &mut pending)
+            .await;
+        let frame = pending
+            .pointer("/sentry/exception/values/0/stacktrace/frames/0")
+            .unwrap();
+        assert_eq!(frame["filename"], "synthetic-original.js");
+        assert_eq!(frame["colno"], 1);
+        assert_eq!(frame["function"], "syntheticFailure");
+        assert_eq!(frame["context_line"], "throw new Error('synthetic');");
+        assert_eq!(
+            frame["original_filename"],
+            "https://synthetic.example/bundle.js"
+        );
+        let mut foreign = event.clone();
+        service.symbolicate_stored_event(other, &mut foreign).await;
+        assert!(foreign
+            .pointer("/sentry/exception/values/0/stacktrace/frames/0/symbolicated")
+            .is_none());
+        let conflict = super::artifacts::tests::bundle(&[
+            ("10112233-4455-4677-8899-aabbccddeeff", "new"),
+            (id, "conflict"),
+        ]);
+        let key = sha1_smol::Sha1::from(&conflict).digest().to_string();
+        service
+            .stage_artifact_chunks(project, vec![(key.clone(), conflict)])
+            .await
+            .unwrap();
+        assert!(service
+            .assemble_artifact(project, key.clone(), vec![key], None, None)
+            .await
+            .is_err());
+        assert!(service
+            .list_for_release(project, "debug-id:10112233-4455-4677-8899-aabbccddeeff")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            service
+                .list_for_release(project, &format!("debug-id:{id}"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut absent = event.clone();
+        absent["sentry"]["release"] = serde_json::json!("wrong-release");
+        absent["sentry"]["debug_meta"]["images"][0]["debug_id"] =
+            serde_json::json!("20112233-4455-4677-8899-aabbccddeeff");
+        service
+            .upload(
+                project,
+                "wrong-release",
+                "~/bundle.js",
+                test_source_map(),
+                None,
+            )
+            .await
+            .unwrap();
+        service.symbolicate_stored_event(project, &mut absent).await;
+        assert!(
+            absent
+                .pointer("/sentry/exception/values/0/stacktrace/frames/0/symbolicated")
+                .is_none(),
+            "an unavailable exact Debug ID must not fall back to a different release map"
+        );
+        service.delete_by_id(project, maps[0].id).await.unwrap();
+        assert_eq!(
+            service
+                .assemble_artifact(project, checksum.clone(), vec![checksum], None, None)
+                .await
+                .unwrap()
+                .state,
+            "ok"
+        );
     }
 
     #[tokio::test]

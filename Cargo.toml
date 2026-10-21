@@ -37,6 +37,7 @@ members = [
     "crates/temps-backup-core",
     "crates/temps-notifications",
     "crates/temps-monitoring",
+    "crates/temps-runtime-health",
     "crates/temps-credential-checks",
     "crates/temps-network",
     "crates/temps-analytics",
@@ -65,6 +66,7 @@ members = [
     "crates/temps-import-kamal",
     "crates/temps-captcha-wasm",
     "crates/temps-teams",
+    "crates/temps-project-groups",
     "crates/temps-webhooks",
     "crates/temps-email",
     "crates/temps-email-tracking",
@@ -107,7 +109,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-beta.56"
+version = "0.1.0-beta.57"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Temps Contributors"]
@@ -132,7 +134,12 @@ async-stream = "0.3"
 serde = { version = "=1.0.228", features = ["derive", "rc"] }
 serde_derive = "1.0"
 serde_json = "1.0.140"
-serde_yaml = "0.9"
+# The YAML organization's maintained continuation of `serde_yaml` (same API).
+# `serde_yaml` and its `unsafe-libyaml` parser are unmaintained
+# (RUSTSEC-2024-0449); `yaml_serde` parses with the maintained `libyaml-rs`.
+# Do not reintroduce `serde_yaml` -- the only remaining copy in Cargo.lock is
+# Pingora's, which Temps never feeds YAML (see dependency-scan.yml).
+yaml_serde = "0.10"
 serde_urlencoded = "0.7.1"
 serde_bytes = "0.11.17"
 serde_path_to_error = "0.1.20"
@@ -149,6 +156,15 @@ thiserror = "2.0.17"
 log = "0.4"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "std", "fmt", "registry"] }
+
+# OpenTelemetry export of the server's own spans (`temps serve --otel-export`).
+# opentelemetry_sdk must stay >= 0.32.1 (GHSA-w9wp-h8wv-79jx, see item 2b
+# below); the four crates move in lockstep, tracing-opentelemetry 0.34 pairs
+# with opentelemetry 0.33.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-blocking-client", "tls-ring", "tls-webpki-roots"] }
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
 
 # ============================================================================
 # Date/Time & UUID
@@ -249,7 +265,7 @@ openidconnect = { version = "4.0.1", default-features = false, features = ["reqw
 instant-acme = "0.8.5"
 rcgen = { version = "0.14.8", features = ["x509-parser"] }
 # RUSTSEC-2026-0285: reject TLS 1.3 handshake messages across key changes.
-rustls = { version = "0.23.45", default-features = false, features = [
+rustls = { version = "0.23.46", default-features = false, features = [
     "ring",
     "std",
     "tls12",
@@ -330,7 +346,7 @@ flate2 = "1.0"
 tar = "0.4.45"
 walkdir = "2"
 include_dir = "0.7"
-zip = "8.6"
+zip = "9.0"
 zstd = "0.14"
 
 # ============================================================================
@@ -484,6 +500,19 @@ debug = false
 #      Those prerequisites are absent in this reviewed consumer. This does not
 #      fix the dependency or establish safety for other consumers/features;
 #      re-review the key type and operations on every aws-sdk-s3 upgrade.
+#
+# 6. RUSTSEC-2026-0367 / -0368 / -0369: zip 8.6.0 (extract() SUID/SGID + symlink handling)
+#    - Fix: zip >= 9.0.0. The workspace `zip` dependency is already 9.x; the 8.6.0
+#      entry in Cargo.lock comes only from headless_chrome 1.0.22 (temps-screenshots,
+#      `fetch` feature) and utoipa-swagger-ui 10.0.1 (build-dependency), both of
+#      which require `zip ^8` in their latest releases (checked 2026-10-17). A
+#      [patch.crates-io] to 9.x is semver-incompatible and rejected.
+#    - Reachability: neither crate calls `ZipArchive::extract()` or
+#      `ZipStreamReader::extract()`. headless_chrome unpacks via `by_index()` +
+#      its own file writes (Chromium builds it downloads itself; `unzip` on macOS);
+#      utoipa-swagger-ui only reads the pinned Swagger UI archive in build.rs.
+#    - Ignored in .github/workflows/dependency-scan.yml; remove once both crates
+#      release against zip 9.
 #
 # Previously resolved:
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)

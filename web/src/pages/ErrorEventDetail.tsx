@@ -5,6 +5,7 @@ import { HighlightedCode } from '@/components/ui/code-block'
 import { ProjectResponse } from '@/api/client'
 import { getErrorEventOptions } from '@/api/client/@tanstack/react-query.gen'
 import { SentryEventDetail } from '@/components/error-tracking/SentryEventDetail'
+import { CspReportDetails } from '@/components/error-tracking/CspReportDetails'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -20,7 +21,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
-import { extractSentryEvent } from '@/lib/sentry-utils'
+import { extractSentryEvent, sentryExceptions } from '@/lib/sentry-utils'
+import { readCspReport } from '@/lib/csp-report'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
@@ -60,10 +62,14 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
   })
 
   const sentryEvent = event ? extractSentryEvent(event.data) : null
+  const isCsp = Boolean(readCspReport(event?.data))
+  const primaryException = sentryEvent
+    ? sentryExceptions(sentryEvent).slice(-1)[0]
+    : undefined
 
   usePageTitle(
     sentryEvent
-      ? `Event: ${sentryEvent.sentry.exception?.values?.[0]?.type || 'Event'}`
+      ? `Event: ${primaryException?.type || 'Event'}`
       : 'Event Details'
   )
 
@@ -86,9 +92,9 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
     switch (level?.toLowerCase()) {
       case 'error':
       case 'fatal':
-        return 'text-red-600 bg-red-100 dark:bg-red-900/20'
+        return 'text-red-700 dark:text-red-600 bg-red-100 dark:bg-red-900/20'
       case 'warning':
-        return 'text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
+        return 'text-yellow-700 dark:text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
       case 'info':
         return 'text-blue-600 bg-blue-100 dark:bg-blue-900/20'
       default:
@@ -179,8 +185,8 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div className="flex-1">
-            <div className="flex items-center gap-3 mb-2">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mb-2">
               <Badge
                 className={cn(
                   getSeverityColor(sentryEvent?.sentry?.level || 'error')
@@ -188,13 +194,15 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
               >
                 {sentryEvent?.sentry?.level || 'error'}
               </Badge>
-              <h1 className="text-2xl font-semibold">
-                {sentryEvent?.sentry?.exception?.values?.[0]?.value ||
+              <h1 className="min-w-0 break-words text-lg font-semibold sm:text-2xl">
+                {primaryException?.value ||
                   sentryEvent?.sentry?.logentry?.formatted ||
-                  'Event Details'}
+                  (isCsp
+                    ? 'Content Security Policy violation'
+                    : 'Event Details')}
               </h1>
             </div>
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
               <Clock className="h-3 w-3" />
               <span>{format(new Date(event.timestamp), 'PPpp')}</span>
               {sentryEvent && (
@@ -210,6 +218,7 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
+      <CspReportDetails data={event.data} />
       {/* Event Content */}
       {sentryEvent ? (
         <SentryEventDetail

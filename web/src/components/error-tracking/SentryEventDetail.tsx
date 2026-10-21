@@ -14,6 +14,7 @@ import {
 import { Label } from '@/components/ui/label'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Switch } from '@/components/ui/switch'
+import { sentryExceptions, sentryPairs } from '@/lib/sentry-utils'
 import { sentryTimestampToMillis } from '@/lib/sentry-timestamp'
 import { cn } from '@/lib/utils'
 import { SentryEvent, SentryException } from '@/types/sentry'
@@ -53,9 +54,9 @@ export function SentryEventDetail({
     switch (level?.toLowerCase()) {
       case 'error':
       case 'fatal':
-        return 'text-red-600 bg-red-100 dark:bg-red-900/20'
+        return 'text-red-700 dark:text-red-600 bg-red-100 dark:bg-red-900/20'
       case 'warning':
-        return 'text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
+        return 'text-yellow-700 dark:text-yellow-600 bg-yellow-100 dark:bg-yellow-900/20'
       case 'info':
         return 'text-blue-600 bg-blue-100 dark:bg-blue-900/20'
       default:
@@ -77,9 +78,13 @@ export function SentryEventDetail({
   }
 
   const sentryData = event.sentry
-  const exceptions = sentryData.exception?.values || []
-  const mainException = exceptions[0]
-  const breadcrumbs = sentryData.breadcrumbs?.values || []
+  const exceptions = sentryExceptions(event)
+  const mainException = exceptions[exceptions.length - 1]
+  const breadcrumbs = Array.isArray(sentryData.breadcrumbs)
+    ? sentryData.breadcrumbs
+    : sentryData.breadcrumbs?.values || []
+  const tags = sentryPairs(sentryData.tags)
+  const requestHeaders = sentryPairs(sentryData.request?.headers)
   const contexts = sentryData.contexts || {}
   const eventTimestampMs = sentryTimestampToMillis(sentryData.timestamp)
   const eventStartTimestampMs = sentryTimestampToMillis(
@@ -651,6 +656,7 @@ export function SentryEventDetail({
                   <Button
                     variant="ghost"
                     size="sm"
+                    aria-label="Copy raw event JSON"
                     onClick={() =>
                       copyToClipboard(JSON.stringify(event, null, 2), 'raw')
                     }
@@ -835,30 +841,27 @@ export function SentryEventDetail({
                     </div>
                   </div>
                 )}
-                {sentryData.request.headers &&
-                  sentryData.request.headers.length > 0 && (
-                    <div className="text-sm">
-                      <div className="text-muted-foreground text-xs mb-1">
-                        Headers
-                      </div>
-                      <ScrollArea className="h-[150px]">
-                        <div className="space-y-1 text-xs">
-                          {sentryData.request.headers.map(
-                            ([key, value], index) => (
-                              <div key={index} className="flex gap-2">
-                                <span className="font-mono font-medium">
-                                  {key}:
-                                </span>
-                                <span className="font-mono text-muted-foreground break-all">
-                                  {value}
-                                </span>
-                              </div>
-                            )
-                          )}
-                        </div>
-                      </ScrollArea>
+                {requestHeaders.length > 0 && (
+                  <div className="text-sm">
+                    <div className="text-muted-foreground text-xs mb-1">
+                      Headers
                     </div>
-                  )}
+                    <ScrollArea className="h-[150px]">
+                      <div className="space-y-1 text-xs">
+                        {requestHeaders.map(([key, value], index) => (
+                          <div key={index} className="flex gap-2">
+                            <span className="font-mono font-medium">
+                              {key}:
+                            </span>
+                            <span className="font-mono text-muted-foreground break-all">
+                              {value}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </ScrollArea>
+                  </div>
+                )}
               </CardContent>
             </Card>
           )}
@@ -1134,14 +1137,14 @@ export function SentryEventDetail({
           )}
 
           {/* Tags */}
-          {sentryData.tags && sentryData.tags.length > 0 && (
+          {tags.length > 0 && (
             <Card>
               <CardHeader className="pb-3">
                 <CardTitle className="text-sm font-medium">Tags</CardTitle>
               </CardHeader>
               <CardContent>
                 <div className="flex flex-wrap gap-2">
-                  {sentryData.tags.map(([key, value], index) => (
+                  {tags.map(([key, value], index) => (
                     <Badge key={index} variant="secondary">
                       {key}: {value}
                     </Badge>

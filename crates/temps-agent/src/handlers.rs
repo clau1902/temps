@@ -29,8 +29,9 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::exec_timeout::{
     completed_exec_exit_code, exec_start_was_rejected, monitor_exec_until_stopped,
-    resolve_container_id, resolve_exec_container_id, run_exec_with_deadline,
-    ContainerIdentityError, ExecCleanupGuard, ExecCompletionError, ExecDeadlineOutcome,
+    resolve_container_id, resolve_exec_container_id, run_exec_with_cleanup_mode,
+    ContainerIdentityError, ExecCleanupGuard, ExecCleanupMode, ExecCompletionError,
+    ExecDeadlineOutcome,
 };
 use crate::output_buffer::{
     json_response_with_capture_permit, BoundedTailBuffer, MAX_CAPTURED_STREAM_BYTES,
@@ -40,6 +41,9 @@ use crate::{NodeHealthReport, PullImageRequest, PullImageResponse, RegistryCrede
 pub(crate) const MAX_CONCURRENT_OUTPUT_CAPTURES: usize = 4;
 pub(crate) const MAX_CONCURRENT_EXEC_OPERATIONS: usize = 4;
 pub(crate) const MAX_CONCURRENT_IMAGE_IMPORTS: usize = 1;
+// Bound accepted requests (uploads, waiters and up to 32 executing builds).
+// Reserve before reading specs so queue pressure cannot allocate unbounded buffers.
+pub(crate) const MAX_BUILD_REQUESTS: usize = 96;
 const MAX_IMAGE_IMPORT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const IMAGE_IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const CONTAINER_LOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -96,6 +100,8 @@ pub struct AgentResourceLimits {
     exec_operation_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) image_import_slots: Arc<tokio::sync::Semaphore>,
     container_operations: ContainerOperationRegistry,
+    pub(crate) build_admission: Arc<crate::build_admission::BuildAdmission>,
+    pub(crate) build_request_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AgentResourceLimits {
@@ -109,6 +115,8 @@ impl AgentResourceLimits {
             )),
             image_import_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IMAGE_IMPORTS)),
             container_operations: ContainerOperationRegistry::default(),
+            build_admission: Arc::new(Default::default()),
+            build_request_slots: Arc::new(tokio::sync::Semaphore::new(MAX_BUILD_REQUESTS)),
         }
     }
 
@@ -119,6 +127,8 @@ impl AgentResourceLimits {
             exec_operation_slots: Arc::new(tokio::sync::Semaphore::new(operations)),
             image_import_slots: Arc::new(tokio::sync::Semaphore::new(imports)),
             container_operations: ContainerOperationRegistry::default(),
+            build_admission: Arc::new(Default::default()),
+            build_request_slots: Arc::new(tokio::sync::Semaphore::new(MAX_BUILD_REQUESTS)),
         }
     }
 }
@@ -375,7 +385,9 @@ pub(crate) fn container_identity_error_status(error: &ContainerIdentityError) ->
 fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
     match error {
         temps_deployer::DeployerError::ContainerNotFound(_) => StatusCode::NOT_FOUND,
-        temps_deployer::DeployerError::DeploymentFailed(_)
+        temps_deployer::DeployerError::ExecFailed { .. }
+        | temps_deployer::DeployerError::ExecTimeout { .. }
+        | temps_deployer::DeployerError::DeploymentFailed(_)
         | temps_deployer::DeployerError::ImageNotFound(_)
         | temps_deployer::DeployerError::NetworkError(_)
         | temps_deployer::DeployerError::ResourceAllocationFailed(_)
@@ -396,14 +408,17 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         remove_container,
         get_container_logs,
         exec_container,
+        exec_health_probe,
         get_container_info,
         list_containers,
         image_exists,
         import_image,
         pull_image,
         crate::build_handler::build_image,
+        crate::build_handler::fetch_registry_image,
         crate::build_handler::export_image,
         crate::build_handler::extract_image_path,
+        crate::build_handler::scan_image,
         crate::build_handler::inspect_image,
         health_check,
         crate::service_handlers::create_service,
@@ -413,6 +428,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::service_handlers::service_status,
         crate::service_handlers::service_exec,
         crate::service_handlers::runtime_env,
+        crate::service_handlers::revoke_s3_access,
         crate::service_handlers::health_probe,
         crate::service_handlers::list_services,
         crate::service_handlers::backup_service,
@@ -429,6 +445,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::sandbox_handlers::stop_sandbox,
         crate::sandbox_handlers::start_sandbox,
         crate::sandbox_handlers::recover_sandbox,
+        crate::sandbox_handlers::release_orphaned_sandbox_resources,
         crate::sandbox_handlers::sandbox_status,
     ),
     components(schemas(
@@ -452,6 +469,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         PullImageResponse,
         RegistryCredentials,
         NodeHealthReport,
+        crate::build_handler::FetchRegistryImage,
         temps_deployer::DeployRequest,
         temps_deployer::DeployResult,
         temps_deployer::ContainerInfo,
@@ -470,6 +488,10 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         temps_providers::remote_service_client::RemoteRuntimeEnvResponse,
         temps_providers::remote_service_client::RemoteHealthProbeRequest,
         temps_providers::remote_service_client::RemoteHealthProbeResponse,
+        temps_deployer::image_scan::ImageScanRequest,
+        temps_deployer::image_scan::ImageScanReport,
+        temps_deployer::image_scan::ImageScanFinding,
+        temps_deployer::ImageConfig,
         crate::ServiceBackupRequest,
         crate::ServiceBackupResponse,
         crate::ServiceRestoreRequest,
@@ -490,6 +512,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         temps_agents::sandbox::remote::RemoteWriteDirectoryRequest,
         temps_agents::sandbox::remote::RemoteKillRequest,
         temps_agents::sandbox::remote::RemoteRecoverRequest,
+        temps_agents::sandbox::remote::RemoteReleaseOrphanedRequest,
         temps_agents::sandbox::remote::RemoteStatusRequest,
         temps_agents::sandbox::remote::RemoteAliveResponse,
         temps_agents::sandbox::remote::RemoteStatusResponse,
@@ -893,6 +916,41 @@ pub async fn exec_container(
     Path(container_id): Path<String>,
     Json(request): Json<AgentExecRequest>,
 ) -> impl IntoResponse {
+    exec_container_with_cleanup(
+        state,
+        limits,
+        container_id,
+        request,
+        ExecCleanupMode::Restart,
+    )
+    .await
+}
+
+/// Deployment probes use stop-only cleanup, including cancellation and retries.
+/// A separate endpoint makes older agents fail closed rather than restart a candidate.
+#[utoipa::path(
+    tag = "Containers", post, path = "/agent/containers/{id}/health-exec",
+    params(("id" = String, Path, description = "Candidate container ID")),
+    request_body = AgentExecRequest,
+    responses((status = 200, body = AgentResponse<AgentExecResponse>), (status = 504, description = "Probe timed out; candidate stopped")),
+    security(("bearer_auth" = []))
+)]
+pub async fn exec_health_probe(
+    State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    Path(container_id): Path<String>,
+    Json(request): Json<AgentExecRequest>,
+) -> impl IntoResponse {
+    exec_container_with_cleanup(state, limits, container_id, request, ExecCleanupMode::Stop).await
+}
+
+async fn exec_container_with_cleanup(
+    state: Arc<AgentState>,
+    limits: Arc<AgentResourceLimits>,
+    container_id: String,
+    request: AgentExecRequest,
+    cleanup_mode: ExecCleanupMode,
+) -> Response {
     if request.command.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "Command cannot be empty".into())
             .into_response();
@@ -1013,18 +1071,20 @@ pub async fn exec_container(
         capture_permit,
         operation_permit,
         permits.container,
-    );
+    )
+    .with_cleanup_mode(cleanup_mode);
 
     let start_config = bollard::exec::StartExecOptions {
         detach: false,
         ..Default::default()
     };
 
-    let result = run_exec_with_deadline(
+    let result = run_exec_with_cleanup_mode(
         &docker,
         &exec.id,
         &cleanup_container_id,
         std::time::Duration::from_secs(timeout_secs),
+        cleanup_mode,
         async {
             let output = docker
                 .start_exec(&exec.id, Some(start_config))
@@ -1074,6 +1134,11 @@ pub async fn exec_container(
     )
     .await;
 
+    let cleanup_action = if cleanup_mode == ExecCleanupMode::Stop {
+        "stopped"
+    } else {
+        "restarted"
+    };
     match result {
         ExecDeadlineOutcome::Completed(Ok((exit_code, stdout, stderr))) => {
             let Some(capture_permit) = cleanup_guard.disarm_and_take_capture() else {
@@ -1110,7 +1175,7 @@ pub async fn exec_container(
             }
             let cleanup_note = if cleanup_scheduled {
                 format!(
-                    "container {container_id} restart was scheduled to stop any ambiguous command workload"
+                    "container {container_id} cleanup was scheduled to stop any ambiguous command workload"
                 )
             } else {
                 "Docker definitively rejected the command before it started; the container was not restarted".to_string()
@@ -1122,13 +1187,13 @@ pub async fn exec_container(
             )
             .into_response()
         }
-        ExecDeadlineOutcome::ContainerRestarted => {
+        ExecDeadlineOutcome::ContainerTerminated => {
             cleanup_guard.disarm();
-            tracing::warn!(container_id = %container_id, timeout_secs, "Exec timed out; containing container was restarted to stop the complete workload");
+            tracing::warn!(container_id = %container_id, timeout_secs, cleanup_action, "Exec timed out; containing container cleanup completed");
             error_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 format!(
-                    "Command timed out after {timeout_secs}s; container {container_id} was restarted to stop the complete command workload"
+                    "Command timed out after {timeout_secs}s; container {container_id} was {cleanup_action} to stop the complete command workload"
                 ),
             )
             .into_response()
@@ -1138,12 +1203,12 @@ pub async fn exec_container(
                 container_id = %container_id,
                 timeout_secs,
                 reason = %error,
-                "Exec timed out and its container could not be restarted"
+                "Exec timed out and its container could not be terminated"
             );
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
-                    "Command timed out after {timeout_secs}s, but the worker could not restart its container to stop the complete workload: {error}"
+                    "Command timed out after {timeout_secs}s, but the worker could not terminate its container to stop the complete workload: {error}"
                 ),
             )
             .into_response()
@@ -2225,13 +2290,19 @@ pub async fn pull_image(
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn health_check(State(state): State<Arc<AgentState>>) -> impl IntoResponse {
-    let report = collect_system_metrics(&state).await;
+pub async fn health_check(
+    State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
+) -> impl IntoResponse {
+    let report = collect_system_metrics(&state, &limits).await;
     AgentResponse::ok(report)
 }
 
 /// Collect real system metrics using sysinfo.
-async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
+async fn collect_system_metrics(
+    state: &AgentState,
+    limits: &AgentResourceLimits,
+) -> NodeHealthReport {
     use sysinfo::{Disks, System};
 
     let mut sys = System::new();
@@ -2267,6 +2338,16 @@ async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
         // Empty means "not discovered yet" — the control plane treats a blank
         // platform as unknown rather than as a claim about this node.
         platform: crate::server::read_platform(&state.platform).unwrap_or_default(),
+        build_slots_available: Some(
+            if limits.build_admission.serial() && limits.image_import_slots.available_permits() == 0
+            {
+                0
+            } else {
+                limits.build_admission.available()
+            },
+        ),
+        build_limits_supported: true,
+        build_concurrency_limit: Some(limits.build_admission.concurrency_limit()),
     }
 }
 

@@ -42,6 +42,8 @@ describe('flat project navigation', () => {
       'analytics/pages': 'analytics',
       'analytics/visitors/42': 'analytics',
       'errors/12': 'errors',
+      releases: 'errors',
+      'client-outcomes': 'errors',
       'errors/alert-rules/new': 'monitoring',
       'traces/abc': 'traces',
       'ai-gateway?tab=activity': 'traces',
@@ -49,6 +51,8 @@ describe('flat project navigation', () => {
       'request-logs/42': 'logs',
       'telemetry-logs': 'logs',
       'dashboards/custom': 'monitoring',
+      'cron-jobs/12': 'monitoring',
+      'cron-jobs/new': 'monitoring',
       observe: 'project',
     } as const))
       expect(resolveProjectPrimaryRoute(path)).toBe(section)
@@ -99,6 +103,21 @@ describe('flat project navigation', () => {
       'settings/deployment-tokens',
     ]) {
       expect(resolveProjectPrimaryRoute(route)).toBe('settings')
+    }
+  })
+  test('monitoring lists metrics, uptime, cron jobs, status pages and alert rules', () => {
+    expect(PROJECT_SECTION_LINKS.monitoring?.map((link) => link.url)).toEqual([
+      'metrics',
+      'monitors',
+      'cron-jobs',
+      'status-pages',
+      'errors/alert-rules',
+    ])
+    for (const route of ['status-pages', 'status-pages/7']) {
+      expect(resolveProjectPrimaryRoute(route)).toBe('monitoring')
+      expect(resolveProjectSectionLink('monitoring', route, '')).toBe(
+        'status-pages'
+      )
     }
   })
   test('settings has only seven destinations', () => {

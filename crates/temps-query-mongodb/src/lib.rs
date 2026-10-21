@@ -497,10 +497,7 @@ impl DataSource for MongoDBSource {
             }
 
             // Depth >= 1: Not supported (MongoDB has flat database -> collection structure)
-            _ => Err(DataError::InvalidQuery(format!(
-                "MongoDB hierarchy only supports 1 level (database). Path depth: {}. Use list_entities to list collections.",
-                path.depth()
-            ))),
+            _ => Err(DataError::container_path_too_deep("MongoDB", path, 1)),
         }
     }
 
@@ -569,10 +566,11 @@ impl DataSource for MongoDBSource {
         }
 
         if container_path.depth() > 1 {
-            return Err(DataError::InvalidQuery(format!(
-                "MongoDB only supports 1 level hierarchy (database). Path depth: {}",
-                container_path.depth()
-            )));
+            return Err(DataError::container_path_too_deep(
+                "MongoDB",
+                container_path,
+                1,
+            ));
         }
 
         let db_name = &container_path.segments[0];
@@ -593,10 +591,11 @@ impl DataSource for MongoDBSource {
         }
 
         if container_path.depth() > 1 {
-            return Err(DataError::InvalidQuery(format!(
-                "MongoDB only supports 1 level hierarchy (database). Path depth: {}",
-                container_path.depth()
-            )));
+            return Err(DataError::container_path_too_deep(
+                "MongoDB",
+                container_path,
+                1,
+            ));
         }
 
         let db_name = &container_path.segments[0];
@@ -978,6 +977,26 @@ mod tests {
         .any(|marker| message.contains(marker))
     }
 
+    /// MongoDB 8.x refuses to start on Linux kernels 6.19 and newer
+    /// (SERVER-121912) and logs this before exiting, so the container never
+    /// reaches "Waiting for connections". The host kernel is outside the
+    /// test's control, so that is treated like an unavailable runtime.
+    fn mongodb_incompatible_with_host_kernel(error: &str) -> bool {
+        error.contains("MongoDB cannot start: Linux kernel versions")
+    }
+
+    #[test]
+    fn host_kernel_incompatibility_is_recognised() {
+        let error = "container is not ready: failed to wait for container log: End of stream \
+                     reached before finding message: [\"{\\\"msg\\\":\\\"MongoDB cannot start: \
+                     Linux kernel versions 6.19 and newer has a known incompatibility with this \
+                     version of MongoDB.\\\"}\"]";
+        assert!(mongodb_incompatible_with_host_kernel(error));
+        assert!(!mongodb_incompatible_with_host_kernel(
+            "container is not ready: Waiting for connections timed out"
+        ));
+    }
+
     #[test]
     fn aggregation_sizes_before_conditionally_projecting_document() {
         let pipeline = bounded_document_pipeline(
@@ -1011,6 +1030,13 @@ mod tests {
             Ok(container) => container,
             Err(error) if container_runtime_unavailable(&error.to_string()) => {
                 eprintln!("Skipping Docker-dependent MongoDB budget test: {error}");
+                return Ok(());
+            }
+            Err(error) if mongodb_incompatible_with_host_kernel(&error.to_string()) => {
+                eprintln!(
+                    "Skipping MongoDB budget test: this MongoDB image does not run on the host \
+                     kernel (SERVER-121912): {error}"
+                );
                 return Ok(());
             }
             Err(error) => return Err(error.into()),

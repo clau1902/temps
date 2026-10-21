@@ -42,7 +42,13 @@ export const PROJECT_SECTION_LINKS: Partial<
     { title: 'Request logs', url: 'request-logs', aliases: ['logs'] },
     { title: 'Telemetry logs', url: 'telemetry-logs' },
   ],
-  errors: [{ title: 'Issues', url: 'errors' }],
+  errors: [
+    { title: 'Issues', url: 'errors' },
+    { title: 'Feedback', url: 'errors/feedback' },
+    { title: 'Releases', url: 'releases' },
+    { title: 'SDK ingestion health', url: 'client-outcomes' },
+    { title: 'Source maps', url: 'errors/source-maps' },
+  ],
   traces: [
     { title: 'Traces', url: 'traces' },
     { title: 'AI traces', url: 'ai-gateway?tab=activity' },
@@ -50,6 +56,12 @@ export const PROJECT_SECTION_LINKS: Partial<
   monitoring: [
     { title: 'Metrics', url: 'metrics', aliases: ['dashboards'] },
     { title: 'Uptime', url: 'monitors' },
+    {
+      title: 'Cron jobs',
+      url: 'cron-jobs',
+      keywords: ['schedule', 'check-ins', 'missed', 'timeout'],
+    },
+    { title: 'Status pages', url: 'status-pages' },
     { title: 'Alert rules', url: 'errors/alert-rules' },
   ],
   analytics: [
@@ -193,8 +205,12 @@ const EXTERNAL_PROJECT_PAGES = [
   'traces',
   'ai-gateway',
   'telemetry-logs',
+  'releases',
+  'client-outcomes',
   'metrics',
   'monitors',
+  'cron-jobs',
+  'status-pages',
   'settings/general',
   'settings/telemetry',
 ] as const

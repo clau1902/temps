@@ -10,7 +10,7 @@ use super::types::GitAppState as AppState;
 use super::types::GitAppState;
 use crate::services::connection_health::ConnectionHealthError;
 use crate::services::git_provider::GitProviderError;
-use crate::services::git_provider_manager::GitProviderManagerError;
+use crate::services::git_provider_manager::{GitProviderManager, GitProviderManagerError};
 use crate::services::repository::RepositoryServiceError;
 use crate::services::{
     git_provider::{AuthMethod, GitProviderType, RepositoryListParams},
@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_auth::{
-    permission_check, permission_guard, require_sensitive_action, Permission, RequireAuth,
+    permission_check, permission_guard, project_access_guard, project_scope_guard,
+    require_sensitive_action, Permission, RequireAuth,
 };
 use temps_core::telemetry::OperationFailureCode;
 use temps_core::SensitiveAction;
@@ -40,24 +41,43 @@ use utoipa::ToSchema;
 /// (loopback, RFC1918 private ranges, link-local, cloud metadata 169.254.169.254).
 ///
 /// `GitProvidersCreate` is granted to ordinary users, and the create handlers
-/// synchronously probe `{base_url}/api/v4/user` (GitLab) with the supplied
-/// token. Without this check a user could point `base_url`/`api_url` at an
-/// internal service and use the create call as an SSRF oracle (SEC-07). The
-/// validation is synchronous (it blocks literal private/loopback/link-local/
-/// metadata IPs and `localhost`); the provider HTTP clients additionally
-/// disable redirect following so a public host can't 302 to an internal one.
+/// synchronously probe `{base_url}/api/.../user` with the supplied token.
+/// Without this check a user could point `base_url`/`api_url` at an internal
+/// service and use the create call as an SSRF oracle (SEC-07).
 ///
-/// Residual gap: this synchronous validator does NOT resolve domains, so a
-/// public hostname that resolves to a private IP (DNS rebinding) is not caught
-/// here. Closing that needs a connect-time blocklisting DNS resolver on the
-/// provider clients (tracked separately).
-fn reject_ssrf_url(label: &str, url: Option<&String>) -> Result<(), Problem> {
-    if let Some(url) = url {
-        if let Err(e) = temps_core::url_validation::validate_external_url(url) {
-            return Err(problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid Provider URL")
-                .with_detail(format!("{} '{}' is not allowed: {}", label, url, e)));
-        }
+/// Two layers:
+/// - here, at create time: literal IPs are checked by `validate_external_url`
+///   and a hostname is resolved with `resolve_and_validate_domain`, so a name
+///   that resolves to an internal address is refused with a clear 400;
+/// - at connect time, every provider client uses
+///   `git_provider::guarded_client_builder`, whose DNS resolver re-validates
+///   and pins each lookup, so a name that *rebinds* after this check (or
+///   later, when a stored connection is used) still cannot reach an internal
+///   address. Redirects are never followed.
+///
+/// Both honour the operator's trusted private networks, which is how a Gitea
+/// or GitLab on the LAN is allowed.
+async fn reject_ssrf_url(label: &str, url: Option<&String>) -> Result<(), Problem> {
+    let Some(url) = url else {
+        return Ok(());
+    };
+    let refuse = |reason: String| {
+        problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Provider URL")
+            .with_detail(format!(
+                "{} '{}' is not allowed: {}",
+                label,
+                temps_core::url_validation::redact_url_password(url),
+                reason
+            ))
+    };
+    let parsed = temps_core::url_validation::validate_external_url(url)
+        .map_err(|e| refuse(e.to_string()))?;
+    if let Some(url::Host::Domain(domain)) = parsed.host() {
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        temps_core::url_validation::resolve_and_validate_domain(domain, port)
+            .await
+            .map_err(|e| refuse(e.to_string()))?;
     }
     Ok(())
 }
@@ -210,6 +230,10 @@ impl From<GitProviderError> for Problem {
                         name
                     ))
             }
+            GitProviderError::FileNotFound { .. } => problem_new(StatusCode::NOT_FOUND)
+                .with_type("https://docs.temps.sh/errors/file_not_found")
+                .with_title("File Not Found")
+                .with_detail(error.to_string()),
             GitProviderError::NotImplemented => problem_new(StatusCode::NOT_IMPLEMENTED)
                 .with_type("https://docs.temps.sh/errors/not_implemented")
                 .with_title("Not Implemented")
@@ -685,8 +709,8 @@ pub async fn create_git_provider(
     permission_check!(auth, Permission::GitProvidersCreate);
 
     // SSRF guard: a self-hosted base_url/api_url must not point at internal infra.
-    reject_ssrf_url("base_url", request.base_url.as_ref())?;
-    reject_ssrf_url("api_url", request.api_url.as_ref())?;
+    reject_ssrf_url("base_url", request.base_url.as_ref()).await?;
+    reject_ssrf_url("api_url", request.api_url.as_ref()).await?;
 
     // Parse provider type
     let provider_type = GitProviderType::try_from(request.provider_type.as_str()).map_err(|e| {
@@ -2242,7 +2266,7 @@ pub async fn create_gitlab_pat_provider(
 
     // SSRF guard: this handler synchronously probes {base_url}/api/v4/user with
     // the supplied token, so a malicious base_url is a live SSRF vector.
-    reject_ssrf_url("base_url", request.base_url.as_ref())?;
+    reject_ssrf_url("base_url", request.base_url.as_ref()).await?;
 
     let user_id = auth.user_id();
 
@@ -2296,6 +2320,9 @@ pub async fn create_gitlab_oauth_provider(
     Json(request): Json<CreateGitLabOAuthRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
+
+    // SSRF guard: the OAuth token exchange later POSTs to {base_url}/oauth/token.
+    reject_ssrf_url("base_url", request.base_url.as_ref()).await?;
 
     let provider = state
         .git_provider_manager
@@ -2362,7 +2389,7 @@ pub async fn create_gitea_pat_provider(
             )));
     }
     // SSRF guard: also reject RFC1918 / loopback / metadata addresses.
-    reject_ssrf_url("base_url", Some(&request.base_url))?;
+    reject_ssrf_url("base_url", Some(&request.base_url)).await?;
 
     let user_id = auth.user_id();
 
@@ -2503,7 +2530,7 @@ pub async fn create_generic_provider(
     }
     // SSRF guard: also reject RFC1918 / loopback / metadata addresses for
     // the optional base_url.
-    reject_ssrf_url("base_url", request.base_url.as_ref())?;
+    reject_ssrf_url("base_url", request.base_url.as_ref()).await?;
 
     let user_id = auth.user_id();
 
@@ -2807,8 +2834,17 @@ pub struct ComposePreviewRequest {
     #[serde(default)]
     pub excluded_services: Vec<String>,
     /// Advisory preview only. Deployment reloads the saved project policy.
+    /// Ignored when `project_id` is set: the saved policy is used instead.
     #[serde(default)]
     pub preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
+    /// The project this Compose file deploys. When set, the preview runs the
+    /// deploy job's check with that project's saved security policy and the
+    /// environment's variables (values are never returned), so it fails with
+    /// the same error class a deployment would.
+    pub project_id: Option<i32>,
+    /// Environment whose variables resolve `${VAR}`; defaults to the
+    /// project's production environment. Requires `project_id`.
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2821,6 +2857,13 @@ pub struct ComposePreviewResponse {
     pub enabled_services: Vec<String>,
     pub disabled_services: Vec<String>,
     pub redacted_values: usize,
+    /// The deploy-time Compose check this preview ran (resolution, policy,
+    /// referenced variable names). `None` when the check is unavailable.
+    pub check: Option<temps_presets::compose_check::ComposeCheckReport>,
+    /// Set when the override repeats the whole repository file.
+    pub override_redundancy: Option<temps_presets::compose_check::ComposeOverrideRedundancy>,
+    /// What to do about `override_redundancy`.
+    pub override_warning: Option<String>,
 }
 
 /// Parse a compose file's services for a connected repository, live
@@ -2902,25 +2945,128 @@ pub async fn get_repository_compose_preview(
     Json(request): Json<ComposePreviewRequest>,
 ) -> Result<axum::response::Response, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
+    if let Some(project_id) = request.project_id {
+        // The check resolves the project's environment variables (values are
+        // redacted from every message), so it is gated like the project.
+        permission_check!(auth, Permission::ProjectsRead);
+        project_scope_guard!(auth, project_id);
+        project_access_guard!(auth, project_id, state.project_access_checker);
+    } else if request.environment_id.is_some() {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Compose Preview Request")
+            .with_detail("environmentId requires projectId: environment variables are only loaded for a project"));
+    }
 
-    let result = match state
+    let source = state
         .git_provider_manager
-        .calculate_repository_compose_preview_live(
+        .fetch_repository_compose_source(
             repository_id,
-            request.branch,
-            request.path,
-            request.compose_override,
-            request.excluded_services,
-            request.preview_policy,
+            request.branch.clone(),
+            request.path.clone(),
         )
-        .await
-    {
+        .await?;
+
+    let check_request = match &state.compose_checker {
+        Some(checker) => {
+            let scope = compose_preview_check_scope(
+                checker.as_ref(),
+                &source.path,
+                request.project_id,
+                request.environment_id,
+                &request.preview_policy,
+            )
+            .await?;
+            let repository_env = match state
+                .git_provider_manager
+                .read_repository_text_file(
+                    source.connection_id,
+                    &source.owner,
+                    &source.name,
+                    &scope.env_path,
+                    &source.git_ref,
+                )
+                .await
+            {
+                Ok(content) => Some(content),
+                Err(error) => {
+                    tracing::debug!(
+                        repository_id = source.repository_id,
+                        "Repository .env '{}' not read for the Compose preview check: {error}",
+                        scope.env_path
+                    );
+                    None
+                }
+            };
+            Some(temps_presets::compose_check::ComposeCheckRequest {
+                project_name: scope.project_name,
+                compose_file: scope.compose_file,
+                content: source.content.clone(),
+                compose_override: request.compose_override.clone(),
+                excluded_services: request.excluded_services.clone(),
+                policy: scope.policy,
+                environment: scope.environment,
+                repository_env,
+                // The checker fetches the files `include`/`extends` reference
+                // at this same revision, so they resolve as in a checkout.
+                repository: Some(temps_presets::compose_check::ComposeRepositorySource {
+                    connection_id: source.connection_id,
+                    owner: source.owner.clone(),
+                    name: source.name.clone(),
+                    git_ref: source.git_ref.clone(),
+                    directory: scope.directory,
+                }),
+                reference_files: Default::default(),
+            })
+        }
+        None => None,
+    };
+
+    compose_preview_response(
+        state.compose_checker.as_deref(),
+        &source,
+        check_request,
+        &request,
+        &uri,
+    )
+    .await
+}
+
+/// Run the deploy-time check (when available) and render the preview. A
+/// failed check is returned exactly as the deployment would report it; the
+/// preview is rendered with the same policy the check used.
+async fn compose_preview_response(
+    checker: Option<&dyn temps_presets::compose_check::ComposeConfigurationChecker>,
+    source: &crate::services::git_provider_manager::RepositoryComposeSourceDomain,
+    check_request: Option<temps_presets::compose_check::ComposeCheckRequest>,
+    request: &ComposePreviewRequest,
+    uri: &axum::http::Uri,
+) -> Result<axum::response::Response, Problem> {
+    let mut policy = request.preview_policy.clone();
+    let mut check = None;
+    if let (Some(checker), Some(check_request)) = (checker, check_request) {
+        policy = check_request.policy.clone();
+        let report = checker.check(check_request).await;
+        if !report.passed {
+            return Ok(
+                ComposePreviewProblemResponse::from_check(&source.path, uri, report)
+                    .into_response(),
+            );
+        }
+        check = Some(report);
+    }
+
+    let result = match GitProviderManager::render_repository_compose_preview(
+        source,
+        request.compose_override.as_deref(),
+        &request.excluded_services,
+        &policy,
+    ) {
         Ok(result) => result,
         Err(GitProviderManagerError::ComposePreview { path, source }) => {
             return Ok(ComposePreviewProblemResponse::new(
                 "Compose Preview Failed",
                 &path,
-                &uri,
+                uri,
                 &source,
             )
             .into_response());
@@ -2928,6 +3074,9 @@ pub async fn get_repository_compose_preview(
         Err(error) => return Err(error.into()),
     };
 
+    let override_redundancy = request.compose_override.as_deref().and_then(|value| {
+        temps_presets::compose_check::override_redundancy(&source.content, value)
+    });
     Ok((
         StatusCode::OK,
         Json(ComposePreviewResponse {
@@ -2937,9 +3086,114 @@ pub async fn get_repository_compose_preview(
             enabled_services: result.preview.enabled_services,
             disabled_services: result.preview.disabled_services,
             redacted_values: result.preview.redacted_values,
+            check,
+            override_warning: override_redundancy.map(|value| value.warning().to_string()),
+            override_redundancy,
         }),
     )
         .into_response())
+}
+
+/// What a preview check runs against.
+#[derive(Debug)]
+struct ComposePreviewCheckScope {
+    project_name: String,
+    /// Compose file relative to the Compose project directory.
+    compose_file: String,
+    /// Repository path of the `.env` Compose would read.
+    env_path: String,
+    /// Compose project directory inside the repository; `.` for the root.
+    directory: String,
+    policy: temps_entities::compose_security::ComposeSecurityPolicy,
+    environment: HashMap<String, String>,
+}
+
+/// The project's saved policy, environment variables and Compose project
+/// name when `project_id` is set; otherwise the request's advisory policy,
+/// no variables, and the Compose file's own directory.
+async fn compose_preview_check_scope(
+    checker: &dyn temps_presets::compose_check::ComposeConfigurationChecker,
+    path: &str,
+    project_id: Option<i32>,
+    environment_id: Option<i32>,
+    preview_policy: &temps_entities::compose_security::ComposeSecurityPolicy,
+) -> Result<ComposePreviewCheckScope, Problem> {
+    let (project_name, directory, policy, environment) = match project_id {
+        Some(project_id) => {
+            let context = checker
+                .load_project_context(project_id, environment_id)
+                .await
+                .map_err(compose_context_problem)?;
+            (
+                context.project_name,
+                context.directory,
+                context.policy,
+                context.environment,
+            )
+        }
+        None => (
+            "temps-preview".to_string(),
+            compose_directory(path),
+            preview_policy.clone(),
+            HashMap::new(),
+        ),
+    };
+    let env_path = if directory == "." {
+        ".env".to_string()
+    } else {
+        format!("{directory}/.env")
+    };
+    Ok(ComposePreviewCheckScope {
+        project_name,
+        compose_file: compose_file_in_directory(path, &directory),
+        env_path,
+        directory,
+        policy,
+        environment,
+    })
+}
+
+fn compose_context_problem(error: temps_presets::compose_check::ComposeContextError) -> Problem {
+    use temps_presets::compose_check::ComposeContextError;
+    match error {
+        ComposeContextError::ProjectNotFound { .. } => problem_new(StatusCode::NOT_FOUND)
+            .with_title("Project Not Found")
+            .with_detail(error.to_string()),
+        ComposeContextError::EnvironmentNotFound { .. } => problem_new(StatusCode::NOT_FOUND)
+            .with_title("Environment Not Found")
+            .with_detail(error.to_string()),
+        ComposeContextError::NotComposeProject { .. } => problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Not a Docker Compose Project")
+            .with_detail(error.to_string()),
+        ComposeContextError::Load { .. } => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Compose Check Context Unavailable")
+            .with_detail(error.to_string()),
+    }
+}
+
+/// The repository directory holding `path`; `.` for the repository root.
+fn compose_directory(path: &str) -> String {
+    let path = path.trim_start_matches("./");
+    match path.rsplit_once('/') {
+        Some((directory, _)) if !directory.is_empty() => directory.to_string(),
+        _ => ".".to_string(),
+    }
+}
+
+/// `path` relative to the Compose project `directory`, as the deploy job
+/// passes it to `docker compose -f`.
+fn compose_file_in_directory(path: &str, directory: &str) -> String {
+    let path = path.trim_start_matches("./");
+    if directory == "." {
+        return path.to_string();
+    }
+    match path
+        .strip_prefix(directory)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        Some(relative) => relative.to_string(),
+        None => path.rsplit('/').next().unwrap_or(path).to_string(),
+    }
 }
 
 /// Get connections for a specific git provider
@@ -3443,6 +3697,26 @@ mod permission_error_tests {
             .and_then(|value| value.as_str())
             .is_some_and(|detail| detail.contains("Resource not accessible by integration")));
     }
+
+    #[test]
+    fn missing_files_become_not_found_problems_naming_the_file() {
+        let problem = Problem::from(GitProviderError::FileNotFound {
+            repository: "owner/repo".to_string(),
+            path: "stack/shared.yaml".to_string(),
+            git_ref: "main".to_string(),
+        });
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("stack/shared.yaml"), "{detail}");
+        assert!(
+            detail.contains("owner/repo") && detail.contains("main"),
+            "{detail}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3546,5 +3820,354 @@ mod convert_preset_json_tests {
             query.updated_after.unwrap().to_rfc3339(),
             "2026-01-01T00:00:00+00:00"
         );
+    }
+}
+
+#[cfg(test)]
+mod compose_preview_tests {
+    use super::*;
+    use crate::services::git_provider_manager::RepositoryComposeSourceDomain;
+    use async_trait::async_trait;
+    use axum::body::to_bytes;
+    use std::sync::Mutex;
+    use temps_entities::compose_security::{ComposeSecurityCheck, ComposeSecurityPolicy};
+    use temps_presets::compose_check::{
+        ComposeCheckErrorClass, ComposeCheckReport, ComposeCheckRequest,
+        ComposeConfigurationChecker, ComposeContextError, ComposeProjectContext,
+    };
+
+    /// Stands in for the deployments plugin's checker: records what it was
+    /// asked and answers with a canned report and project context.
+    struct FakeChecker {
+        report: ComposeCheckReport,
+        context: Result<ComposeProjectContext, ComposeContextError>,
+        seen: Mutex<Vec<ComposeCheckRequest>>,
+    }
+
+    impl FakeChecker {
+        fn new(report: ComposeCheckReport) -> Self {
+            Self {
+                report,
+                context: Err(ComposeContextError::ProjectNotFound { project_id: 0 }),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ComposeConfigurationChecker for FakeChecker {
+        async fn check(&self, request: ComposeCheckRequest) -> ComposeCheckReport {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(request);
+            }
+            self.report.clone()
+        }
+
+        async fn load_project_context(
+            &self,
+            _project_id: i32,
+            _environment_id: Option<i32>,
+        ) -> Result<ComposeProjectContext, ComposeContextError> {
+            self.context.clone()
+        }
+    }
+
+    fn passed() -> ComposeCheckReport {
+        ComposeCheckReport {
+            passed: true,
+            error_class: None,
+            error: None,
+            resolution_reasons: Vec::new(),
+            resolution_ran: false,
+            command: None,
+            unset_variables: Vec::new(),
+            referenced_variables: vec!["IMG".to_string()],
+            notes: Vec::new(),
+        }
+    }
+
+    fn source(content: &str) -> RepositoryComposeSourceDomain {
+        RepositoryComposeSourceDomain {
+            repository_id: 42,
+            connection_id: 11,
+            owner: "example-owner".to_string(),
+            name: "example-repository".to_string(),
+            git_ref: "main".to_string(),
+            path: "compose.yaml".to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    fn preview_request(compose_override: Option<&str>) -> ComposePreviewRequest {
+        ComposePreviewRequest {
+            branch: None,
+            path: "compose.yaml".to_string(),
+            compose_override: compose_override.map(str::to_string),
+            excluded_services: Vec::new(),
+            preview_policy: ComposeSecurityPolicy::default(),
+            project_id: None,
+            environment_id: None,
+        }
+    }
+
+    fn check_request(policy: ComposeSecurityPolicy) -> ComposeCheckRequest {
+        ComposeCheckRequest {
+            project_name: "temps-preview".to_string(),
+            compose_file: "compose.yaml".to_string(),
+            content: String::new(),
+            policy,
+            ..Default::default()
+        }
+    }
+
+    async fn body(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("preview body should be readable");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("preview body should be JSON"),
+        )
+    }
+
+    const IDIOMATIC: &str =
+        "services:\n  web:\n    image: ${IMG:-ghcr.io/example/app:1}\n    env_file: .env\n";
+
+    #[tokio::test]
+    async fn failed_check_returns_the_deploy_error_and_class() {
+        let checker = FakeChecker::new(ComposeCheckReport::failure(
+            ComposeCheckErrorClass::PolicyViolation,
+            "Compose security policy rejected privileged for service 'web': privileged containers are not allowed",
+        ));
+        let response = compose_preview_response(
+            Some(&checker),
+            &source("services:\n  web:\n    image: nginx:1\n    privileged: true\n"),
+            Some(check_request(ComposeSecurityPolicy::default())),
+            &preview_request(None),
+            &axum::http::Uri::from_static("/repositories/42/compose-file/preview"),
+        )
+        .await
+        .expect("a failed check is a problem response, not a handler error");
+        let (status, problem) = body(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem["error_class"], "policy_violation");
+        assert_eq!(problem["compose_check"]["passed"], false);
+        assert!(problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("privileged")));
+    }
+
+    #[tokio::test]
+    async fn passing_check_is_returned_with_the_rendered_preview() {
+        let checker = FakeChecker::new(passed());
+        let response = compose_preview_response(
+            Some(&checker),
+            &source(IDIOMATIC),
+            Some(check_request(ComposeSecurityPolicy::default())),
+            &preview_request(None),
+            &axum::http::Uri::from_static("/repositories/42/compose-file/preview"),
+        )
+        .await
+        .expect("preview should render");
+        let (status, preview) = body(response).await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["check"]["passed"], true);
+        assert_eq!(
+            preview["check"]["referencedVariables"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            preview["check"]["referenced_variables"],
+            serde_json::json!(["IMG"])
+        );
+        assert_eq!(preview["enabledServices"], serde_json::json!(["web"]));
+        assert!(preview["overrideRedundancy"].is_null());
+        let seen = checker.seen.lock().expect("fake checker lock");
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preview_renders_with_the_policy_the_check_used() {
+        // The saved project policy (carried by the check request) disables
+        // the Include check; the request's advisory policy does not. The
+        // preview must agree with the check, not with the advisory policy.
+        let mut saved = ComposeSecurityPolicy::default();
+        saved.disabled_checks.insert(ComposeSecurityCheck::Include);
+        let checker = FakeChecker::new(passed());
+        let response = compose_preview_response(
+            Some(&checker),
+            &source("include:\n  - other.yaml\nservices:\n  web:\n    image: nginx:1\n"),
+            Some(check_request(saved)),
+            &preview_request(None),
+            &axum::http::Uri::from_static("/repositories/42/compose-file/preview"),
+        )
+        .await
+        .expect("preview should render");
+        let (status, preview) = body(response).await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+
+        let response = compose_preview_response(
+            None,
+            &source("include:\n  - other.yaml\nservices:\n  web:\n    image: nginx:1\n"),
+            None,
+            &preview_request(None),
+            &axum::http::Uri::from_static("/repositories/42/compose-file/preview"),
+        )
+        .await
+        .expect("preview should answer");
+        let (status, problem) = body(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem["error_class"], "policy_violation");
+        assert_eq!(problem["policy_check"], "include");
+    }
+
+    #[tokio::test]
+    async fn override_copying_the_repository_file_is_reported() {
+        const REPOSITORY: &str = "services:\n  web:\n    image: ghcr.io/example/app:1\n";
+        let checker = FakeChecker::new(passed());
+        let response = compose_preview_response(
+            Some(&checker),
+            &source(REPOSITORY),
+            Some(check_request(ComposeSecurityPolicy::default())),
+            &preview_request(Some(REPOSITORY)),
+            &axum::http::Uri::from_static("/repositories/42/compose-file/preview"),
+        )
+        .await
+        .expect("preview should render");
+        let (status, preview) = body(response).await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["overrideRedundancy"], "identical");
+        assert!(preview["overrideWarning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("copy of the repository Compose file")));
+    }
+
+    #[tokio::test]
+    async fn project_scope_uses_the_saved_policy_environment_and_directory() {
+        let mut saved = ComposeSecurityPolicy::default();
+        saved.disabled_checks.insert(ComposeSecurityCheck::Include);
+        let mut checker = FakeChecker::new(passed());
+        checker.context = Ok(ComposeProjectContext {
+            project_id: 7,
+            environment_id: Some(3),
+            project_name: "temps-7-3".to_string(),
+            directory: "apps/web".to_string(),
+            policy: saved.clone(),
+            environment: HashMap::from([("APP_PORT".to_string(), "8080".to_string())]),
+            ..Default::default()
+        });
+        let scope = compose_preview_check_scope(
+            &checker,
+            "apps/web/deploy/compose.yaml",
+            Some(7),
+            Some(3),
+            &ComposeSecurityPolicy::default(),
+        )
+        .await
+        .expect("project scope should load");
+        assert_eq!(scope.project_name, "temps-7-3");
+        assert_eq!(scope.compose_file, "deploy/compose.yaml");
+        assert_eq!(scope.env_path, "apps/web/.env");
+        assert_eq!(scope.policy, saved);
+        assert_eq!(
+            scope.environment.get("APP_PORT").map(String::as_str),
+            Some("8080")
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_scope_uses_the_advisory_policy_and_the_file_directory() {
+        let checker = FakeChecker::new(passed());
+        let scope = compose_preview_check_scope(
+            &checker,
+            "deploy/compose.yaml",
+            None,
+            None,
+            &ComposeSecurityPolicy::default(),
+        )
+        .await
+        .expect("repository scope needs no project");
+        assert_eq!(scope.project_name, "temps-preview");
+        assert_eq!(scope.compose_file, "compose.yaml");
+        assert_eq!(scope.env_path, "deploy/.env");
+        assert!(scope.environment.is_empty());
+
+        let scope = compose_preview_check_scope(
+            &checker,
+            "compose.yaml",
+            None,
+            None,
+            &ComposeSecurityPolicy::default(),
+        )
+        .await
+        .expect("repository scope needs no project");
+        assert_eq!(scope.compose_file, "compose.yaml");
+        assert_eq!(scope.env_path, ".env");
+    }
+
+    #[tokio::test]
+    async fn project_context_errors_map_to_specific_statuses() {
+        let cases = [
+            (
+                ComposeContextError::ProjectNotFound { project_id: 7 },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ComposeContextError::EnvironmentNotFound {
+                    project_id: 7,
+                    environment_id: 3,
+                },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ComposeContextError::NotComposeProject { project_id: 7 },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ComposeContextError::Load {
+                    project_id: 7,
+                    reason: "database unavailable".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (error, status) in cases {
+            let mut checker = FakeChecker::new(passed());
+            checker.context = Err(error);
+            let problem = compose_preview_check_scope(
+                &checker,
+                "compose.yaml",
+                Some(7),
+                None,
+                &ComposeSecurityPolicy::default(),
+            )
+            .await
+            .expect_err("context errors must fail the preview");
+            assert_eq!(problem.status_code, status);
+            assert!(problem
+                .body
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .is_some_and(|detail| detail.contains("7")));
+        }
+    }
+
+    #[test]
+    fn compose_file_outside_the_project_directory_falls_back_to_its_name() {
+        assert_eq!(
+            compose_file_in_directory("./compose.yaml", "."),
+            "compose.yaml"
+        );
+        assert_eq!(
+            compose_file_in_directory("apps/web/compose.yaml", "apps/web"),
+            "compose.yaml"
+        );
+        assert_eq!(
+            compose_file_in_directory("apps/webapp/compose.yaml", "apps/web"),
+            "compose.yaml"
+        );
+        assert_eq!(compose_directory("compose.yaml"), ".");
+        assert_eq!(compose_directory("./ops/compose.yaml"), "ops");
     }
 }

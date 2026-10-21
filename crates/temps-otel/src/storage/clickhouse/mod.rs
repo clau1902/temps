@@ -92,6 +92,9 @@ pub struct ClickHouseOtelConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    /// Wire compression, resolved from the stored `clickhouse.compression`
+    /// setting. [`ClickHouseOtelConfig::new`] starts at the default (LZ4).
+    pub compression: temps_clickhouse::ClickHouseCompression,
 }
 
 // Manual Debug that masks the password so it can never leak into logs, panic
@@ -103,6 +106,7 @@ impl std::fmt::Debug for ClickHouseOtelConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"***")
+            .field("compression", &self.compression)
             .finish()
     }
 }
@@ -119,7 +123,29 @@ impl ClickHouseOtelConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
+            compression: temps_clickhouse::ClickHouseCompression::default(),
         }
+    }
+
+    /// Use `compression` for the clients built from this config.
+    pub fn with_compression(
+        mut self,
+        compression: temps_clickhouse::ClickHouseCompression,
+    ) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Build a plain client for this config (no per-query limits), through
+    /// the one shared constructor that applies the compression mode.
+    pub fn client(&self) -> ::clickhouse::Client {
+        temps_clickhouse::build_client(
+            &self.url,
+            &self.database,
+            &self.user,
+            &self.password,
+            self.compression,
+        )
     }
 }
 
@@ -157,11 +183,8 @@ impl ClickHouseOtelClient {
     /// Does not validate connectivity; call [`health_check`] or run migrations
     /// to confirm the connection is live.
     pub fn new(config: ClickHouseOtelConfig) -> Self {
-        let client = ::clickhouse::Client::default()
-            .with_url(config.url)
-            .with_database(config.database)
-            .with_user(config.user)
-            .with_password(config.password)
+        let client = config
+            .client()
             // NOTE: these limits belong to THIS client only, and it is built for
             // the backfill CLI. `ClickHouseOtelStorage::new` builds its own
             // client with no settings at all, so storage reads run under
@@ -503,6 +526,7 @@ impl From<ChSpanRow> for SpanRecord {
         };
 
         SpanRecord {
+            ingest_identity: None,
             project_id: row.project_id,
             deployment_id: row.deployment_id,
             resource,
@@ -1453,11 +1477,7 @@ impl ClickHouseOtelStorage {
         resolver: Arc<dyn temps_core::RetentionResolver>,
         facet_cache: Option<crate::services::FacetCache>,
     ) -> Self {
-        let ch = ::clickhouse::Client::default()
-            .with_url(&config.url)
-            .with_database(&config.database)
-            .with_user(&config.user)
-            .with_password(&config.password);
+        let ch = config.client();
         let read = read_limits::bounded_read_client(&ch);
         Self {
             ch,
@@ -1863,6 +1883,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                     attributes: std::collections::BTreeMap::new(),
                 };
                 SpanRecord {
+                    ingest_identity: None,
                     project_id: r.project_id,
                     deployment_id: r.deployment_id,
                     resource,
@@ -2418,6 +2439,7 @@ impl OtelStorage for ClickHouseOtelStorage {
                     attributes: std::collections::BTreeMap::new(),
                 };
                 SpanRecord {
+                    ingest_identity: None,
                     project_id: r.project_id,
                     deployment_id: r.deployment_id,
                     resource,
@@ -4041,6 +4063,7 @@ mod tests {
 
     fn make_span() -> SpanRecord {
         SpanRecord {
+            ingest_identity: None,
             project_id: 42,
             deployment_id: Some(7),
             resource: ResourceInfo {
@@ -4318,6 +4341,49 @@ mod tests {
         assert_ne!(EMPTY_STRING_ARRAY_SQL, "[]");
     }
 
+    // ── Wire compression ────────────────────────────────────────────────────
+
+    /// The configured mode must land on every client the OTel backend builds:
+    /// the storage's write client, and the standalone client used by the
+    /// backfill commands.
+    #[test]
+    fn configured_compression_reaches_every_otel_client() {
+        use temps_clickhouse::ClickHouseCompression;
+
+        let build = |mode| {
+            let config = ClickHouseOtelConfig::new("http://127.0.0.1:1", "otel", "default", "")
+                .with_compression(mode);
+            let storage = ClickHouseOtelStorage::new(
+                config.clone(),
+                Arc::new(TimescaleDbStorage::new(
+                    Arc::new(sea_orm::DatabaseConnection::Disconnected),
+                    None,
+                )),
+                Arc::new(temps_core::FixedRetentionResolver),
+                None,
+            );
+            (
+                format!("{:?}", storage.ch_client()),
+                format!("{:?}", ClickHouseOtelClient::new(config).client()),
+            )
+        };
+
+        let (storage_lz4, client_lz4) = build(ClickHouseCompression::Lz4);
+        for debug in [&storage_lz4, &client_lz4] {
+            assert!(debug.contains("compression: Lz4"), "{debug}");
+            assert!(
+                debug.contains("\"network_compression_method\": \"lz4\""),
+                "{debug}"
+            );
+        }
+
+        let (storage_none, client_none) = build(ClickHouseCompression::None);
+        for debug in [&storage_none, &client_none] {
+            assert!(debug.contains("compression: None"), "{debug}");
+            assert!(!debug.contains("network_compression_method"), "{debug}");
+        }
+    }
+
     // ── Migration write hold ────────────────────────────────────────────────
 
     /// A store pointed at a port nothing listens on: a write that gets past
@@ -4325,12 +4391,7 @@ mod tests {
     /// from "attempted" without a ClickHouse server.
     fn unreachable_store() -> ClickHouseOtelStorage {
         ClickHouseOtelStorage::new(
-            ClickHouseOtelConfig {
-                url: "http://127.0.0.1:1".into(),
-                database: "otel".into(),
-                user: "default".into(),
-                password: String::new(),
-            },
+            ClickHouseOtelConfig::new("http://127.0.0.1:1", "otel", "default", ""),
             Arc::new(TimescaleDbStorage::new(
                 Arc::new(sea_orm::DatabaseConnection::Disconnected),
                 None,

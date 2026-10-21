@@ -124,7 +124,7 @@ async fn setup() -> Option<ChTestEnv> {
     ));
     // Seed proxy logs through the REAL ClickHouse write path.
     ch_proxy_store
-        .write_batch(vec![
+        .write_batch(&[
             proxy_log_entry("req-ch-1", "/api/orders", 200, None),
             proxy_log_entry("req-ch-2", "/api/orders/17", 500, None),
             proxy_log_entry("req-ch-bot", "/robots.txt", 200, Some("GPTBot")),
@@ -238,6 +238,7 @@ fn proxy_log_entry(
 fn span(trace_id: &str, span_id: &str, parent: Option<&str>, name: &str) -> SpanRecord {
     let start = Utc::now() - Duration::minutes(1);
     SpanRecord {
+        ingest_identity: None,
         project_id: PROJECT_ID,
         deployment_id: Some(1),
         resource: ResourceInfo {
