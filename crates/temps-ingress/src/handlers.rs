@@ -23,7 +23,7 @@ use utoipa::OpenApi;
 use crate::registry::{DnsHandling, FieldKind, ProviderInfo, SetupField};
 use crate::service::{
     ConnectorLinksView, ConnectorList, ConnectorNodeView, ConnectorView, CreateConnectorRequest,
-    HostnameCandidate, HostnameMode, HostnameView, IngressConnectorService, LinkView,
+    CreateError, HostnameCandidate, HostnameMode, HostnameView, IngressConnectorService, LinkView,
     PublicationView, SetConnectorNodesRequest, SetHostnameChoiceRequest, UpdateConnectorRequest,
 };
 use crate::wire::NodeConnectorStatusReport;
@@ -259,7 +259,31 @@ async fn create_ingress_connector(
     Json(request): Json<CreateConnectorRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
-    let view = state.service.create(request).await?;
+    let provider = request.provider.clone();
+    let node_ids = request.node_ids.clone();
+    let view = match state.service.create(request).await {
+        Ok(view) => view,
+        Err(CreateError::NotSaved(error)) => return Err((*error).into()),
+        // Saved, then the provider or the worker assignment failed: still a
+        // write, so it is audited with the failure.
+        Err(CreateError::Saved {
+            connector_id,
+            connector_name,
+            error,
+        }) => {
+            let mut audit = IngressAudit::new("INGRESS_CONNECTOR_CREATED", &auth, &metadata)
+                .details(serde_json::json!({
+                    "provider": provider,
+                    "node_ids": node_ids,
+                    "outcome": "setup_failed",
+                    "error": error.to_string(),
+                }));
+            audit.connector_id = Some(connector_id);
+            audit.connector_name = Some(connector_name);
+            audit.record(&state).await;
+            return Err((*error).into());
+        }
+    };
     IngressAudit::new("INGRESS_CONNECTOR_CREATED", &auth, &metadata)
         .connector(&view)
         .details(serde_json::json!({
@@ -267,6 +291,7 @@ async fn create_ingress_connector(
             "domain": view.domain,
             "node_ids": view.nodes.iter().map(|n| n.node_id).collect::<Vec<_>>(),
             "auto_publish": view.auto_publish,
+            "outcome": "created",
         }))
         .record(&state)
         .await;

@@ -509,6 +509,9 @@ async fn run(
 
     // The allocation the overlay is up on, once it is.
     let mut bootstrapped: Option<Ipv4Net> = None;
+    // Containers taken off the overlay network when the control plane moved
+    // this node's allocation; they rejoin once the overlay is up again.
+    let mut detached: Vec<temps_network::docker::DetachedMember> = Vec::new();
     // ADR 056: backoff and log policy for an overlay that cannot come up,
     // the peers' subnets last seen (left out of the occupied report), and
     // the last occupied-range collection error (logged once per change).
@@ -734,6 +737,7 @@ async fn run(
                     manager,
                     payload,
                     &mut bootstrapped,
+                    &mut detached,
                     &mut _resolver_handle,
                     &config,
                     &slots,
@@ -1732,6 +1736,7 @@ async fn apply(
     manager: &NetworkManager,
     payload: WirePeerListResponse,
     bootstrapped: &mut Option<Ipv4Net>,
+    detached: &mut Vec<temps_network::docker::DetachedMember>,
     resolver: &mut Option<DnsResolverHandle>,
     config: &AgentConfig,
     slots: &SharedSlots<'_>,
@@ -1763,7 +1768,10 @@ async fn apply(
     // automatic move off a colliding range, ADR 056). It only moves one it
     // never saw applied, so this is the narrow race where the move crossed a
     // successful bootstrap: take the overlay down and bring it up on the new
-    // subnet rather than reconciling peers against the old one.
+    // subnet rather than reconciling peers against the old one. The Docker
+    // network goes too: Docker cannot change its subnet, and the preflight
+    // below refuses one on the old subnet. `bootstrapped` is cleared only
+    // once both are gone, so a failure here is retried on the next tick.
     if let Some(previous) = *bootstrapped {
         if previous != alloc.compute_cidr {
             warn!(
@@ -1775,6 +1783,16 @@ async fn apply(
                 .teardown()
                 .await
                 .map_err(|e| SyncError::Bootstrap(format!("tearing down the old overlay: {e}")))?;
+            let docker = Docker::connect_with_local_defaults()
+                .map_err(|error| SyncError::DockerConnect(error.to_string()))?;
+            let retired = temps_network::docker::retire_network_for_move(&docker, manager.config())
+                .await
+                .map_err(|e| {
+                    SyncError::Bootstrap(format!(
+                        "replacing the overlay Docker network on the old subnet: {e}"
+                    ))
+                })?;
+            detached.extend(retired);
             *bootstrapped = None;
         }
     }
@@ -1824,6 +1842,14 @@ async fn apply(
         if changed {
             info!("multi-host peer list updated");
         }
+    }
+
+    if !detached.is_empty() {
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|error| SyncError::DockerConnect(error.to_string()))?;
+        temps_network::docker::reattach_members(&docker, manager.config(), detached)
+            .await
+            .map_err(|e| SyncError::Bootstrap(e.to_string()))?;
     }
 
     // Publish only the peer view that the host data plane accepted. Container

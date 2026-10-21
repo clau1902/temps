@@ -257,6 +257,38 @@ impl CloudflareTunnelProvider {
         .ok_or_else(|| IngressError::Provider("Cloudflare returned no connector token".into()))
     }
 
+    /// Delete a tunnel [`TunnelProvider::ensure`] created moments ago when
+    /// setting it up then failed. It has never run a connector, so deleting
+    /// it cuts nothing. Returns the error to report: the setup failure, or
+    /// both failures with the tunnel to remove by hand.
+    async fn discard_new_tunnel(
+        &self,
+        account: &str,
+        id: &str,
+        name: &str,
+        cause: IngressError,
+    ) -> IngressError {
+        match self
+            .call::<Value>(
+                reqwest::Method::DELETE,
+                &format!("/accounts/{account}/cfd_tunnel/{id}"),
+                None,
+                "delete the tunnel whose setup failed",
+            )
+            .await
+        {
+            Ok(_) => {
+                warn!(tunnel = %id, "deleted the new Cloudflare tunnel after its setup failed; the next sync creates it again");
+                cause
+            }
+            Err(cleanup) => IngressError::Provider(format!(
+                "{cause} The new tunnel '{name}' ({id}) could not be removed afterwards ({cleanup}), \
+                 so the next sync will refuse it by name. Delete it in Cloudflare \
+                 (Zero Trust → Networks → Tunnels), then sync."
+            )),
+        }
+    }
+
     async fn configure(&self, account: &str, id: &str, edge_port: u16) -> Result<(), IngressError> {
         // One catch-all rule: the node's listener routes by Host.
         let body = json!({
@@ -304,8 +336,8 @@ impl TunnelProvider for CloudflareTunnelProvider {
                     "Cloudflare tunnel is gone; creating it again");
             }
         }
-        let tunnel = match tunnel {
-            Some(tunnel) => tunnel,
+        let (tunnel, created_now) = match tunnel {
+            Some(tunnel) => (tunnel, false),
             None => {
                 if self.find_by_name(&account, &tunnel_name).await?.is_some() {
                     return Err(IngressError::Provider(format!(
@@ -323,11 +355,25 @@ impl TunnelProvider for CloudflareTunnelProvider {
                     .await?
                     .ok_or_else(|| IngressError::Provider("Cloudflare created no tunnel".into()))?;
                 info!(connector_id = ctx.connector_id, tunnel = %created.id, "created Cloudflare tunnel");
-                created
+                (created, true)
             }
         };
-        self.configure(&account, &tunnel.id, ctx.edge_port).await?;
-        let secret = self.token(&account, &tunnel.id).await?;
+        let finished = match self.configure(&account, &tunnel.id, ctx.edge_port).await {
+            Ok(()) => self.token(&account, &tunnel.id).await,
+            Err(error) => Err(error),
+        };
+        let secret = match finished {
+            Ok(secret) => secret,
+            // The caller saves the tunnel id only from a returned handle, so
+            // a tunnel created here and left behind would be refused by name
+            // on every later sync. Remove it so the next sync starts clean.
+            Err(error) if created_now => {
+                return Err(self
+                    .discard_new_tunnel(&account, &tunnel.id, &tunnel_name, error)
+                    .await)
+            }
+            Err(error) => return Err(error),
+        };
         Ok(TunnelHandle {
             external_id: tunnel.id.clone(),
             settings: json!({

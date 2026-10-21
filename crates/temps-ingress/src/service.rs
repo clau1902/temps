@@ -203,6 +203,26 @@ pub struct LinkView {
     pub client_version: Option<String>,
 }
 
+/// Why creating a connector failed, and whether it was saved first.
+#[derive(Debug)]
+pub enum CreateError {
+    /// Refused before anything was written.
+    NotSaved(Box<IngressError>),
+    /// The connector was saved, then assigning its workers or setting it up
+    /// with the provider failed. It stays, so a sync can finish it.
+    Saved {
+        connector_id: i32,
+        connector_name: String,
+        error: Box<IngressError>,
+    },
+}
+
+impl From<IngressError> for CreateError {
+    fn from(error: IngressError) -> Self {
+        Self::NotSaved(Box::new(error))
+    }
+}
+
 pub struct IngressConnectorService {
     db: Arc<DatabaseConnection>,
     encryption: Arc<EncryptionService>,
@@ -626,7 +646,7 @@ impl IngressConnectorService {
     pub async fn create(
         self: &Arc<Self>,
         request: CreateConnectorRequest,
-    ) -> Result<ConnectorView, IngressError> {
+    ) -> Result<ConnectorView, CreateError> {
         let name = request.name.trim().to_ascii_lowercase();
         if name.is_empty()
             || name.len() > 50
@@ -636,7 +656,8 @@ impl IngressConnectorService {
         {
             return Err(IngressError::Validation(
                 "The name must be 1-50 lowercase letters, digits or hyphens.".into(),
-            ));
+            )
+            .into());
         }
         let factory = self.registry.get(&request.provider)?;
         let info = factory.info();
@@ -683,13 +704,27 @@ impl IngressConnectorService {
             }
             other => IngressError::Database(other),
         })?;
-        self.replace_nodes(connector.id, &request.node_ids).await?;
-
+        // From here the connector is saved, so a failure is reported with it:
+        // the write happened and must be audited as one.
         let id = connector.id;
-        self.ensure(connector).await?;
-        let service = Arc::clone(self);
-        tokio::spawn(async move { service.reconcile_all().await });
-        self.get(id).await
+        let name = connector.name.clone();
+        let setup = match self.replace_nodes(id, &request.node_ids).await {
+            Ok(()) => self.ensure(connector).await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        if setup.is_ok() {
+            let service = Arc::clone(self);
+            tokio::spawn(async move { service.reconcile_all().await });
+        }
+        let view = self.get(id).await;
+        match (setup, view) {
+            (Ok(()), Ok(view)) => Ok(view),
+            (Ok(()), Err(error)) | (Err(error), _) => Err(CreateError::Saved {
+                connector_id: id,
+                connector_name: name,
+                error: Box::new(error),
+            }),
+        }
     }
 
     pub async fn set_nodes(
