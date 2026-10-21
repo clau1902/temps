@@ -260,6 +260,19 @@ export function runningTool(steps: readonly WorkStep[]): ToolCall | null {
   return null
 }
 
+/**
+ * The one line a working group shows while it is closed: the step running
+ * now ("Running npm test"), or between steps how far it has got ("3 steps so
+ * far"). Null before the first step, when "Working" says it all.
+ */
+export function liveWorkStatus(steps: readonly WorkStep[]): string | null {
+  const running = runningTool(steps)
+  if (running)
+    return toolActivity(running) ?? `Using ${humanName(running.name)}`
+  if (steps.length === 0) return null
+  return steps.length === 1 ? '1 step so far' : `${steps.length} steps so far`
+}
+
 export function stepTools(steps: readonly WorkStep[]): ToolCall[] {
   return steps.map((step) => step.tool)
 }

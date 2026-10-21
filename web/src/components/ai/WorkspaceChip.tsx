@@ -144,19 +144,20 @@ export function WorkspaceChip({
       <PopoverTrigger asChild>
         <Button
           type="button"
-          variant="outline"
-          size="sm"
-          className="h-8 max-w-44 gap-1.5"
+          variant="ghost"
+          size="icon"
+          className={cn(
+            'size-8',
+            current ? 'text-foreground' : 'text-muted-foreground'
+          )}
           title={
             current
               ? `Part of the application ${current.name}`
               : 'Group this chat with others about the same application'
           }
+          aria-label={current ? `Application: ${current.name}` : 'Application'}
         >
-          <Boxes className="size-4 shrink-0" />
-          <span className="hidden truncate sm:inline">
-            {current?.name ?? 'Application'}
-          </span>
+          <Boxes className="size-4" />
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-80 space-y-4 p-3">

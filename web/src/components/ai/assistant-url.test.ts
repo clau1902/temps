@@ -3,7 +3,6 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
-  readViewParam,
   syncedPageParams,
   withoutChat,
   withoutChatScopedParams,
@@ -11,18 +10,6 @@ import {
 } from './assistant-url'
 
 const q = (s: string) => new URLSearchParams(s)
-
-describe('readViewParam', () => {
-  test('reads a known layout', () => {
-    expect(readViewParam(q('view=work'))).toBe('work')
-    expect(readViewParam(q('view=chats'))).toBe('chats')
-  })
-
-  test('ignores a missing or unknown layout', () => {
-    expect(readViewParam(q(''))).toBeNull()
-    expect(readViewParam(q('view=sideways'))).toBeNull()
-  })
-})
 
 describe('withParam', () => {
   test('sets and removes without touching the original', () => {
@@ -54,50 +41,36 @@ describe('withoutChat', () => {
 
 describe('syncedPageParams', () => {
   test('is null when the address already says it', () => {
-    expect(
-      syncedPageParams(q('chat=a&view=work&tab=made'), {
-        chat: 'a',
-        view: 'work',
-      })
-    ).toBeNull()
+    expect(syncedPageParams(q('chat=a&tab=made'), { chat: 'a' })).toBeNull()
   })
 
   test('keeps the tab when a reload resolves the chat the address names', () => {
     expect(
-      syncedPageParams(q('chat=a&view=work&tab=terminal'), {
-        chat: 'a',
-        view: 'work',
-      })
+      syncedPageParams(q('chat=a&tab=terminal&panel=open'), { chat: 'a' })
     ).toBeNull()
   })
 
-  test('writes chat and layout together in one address', () => {
-    expect(
-      syncedPageParams(q(''), { chat: 'a', view: 'chats' })?.toString()
-    ).toBe('chat=a&view=chats')
-  })
-
-  test('adds the layout to an address that has none', () => {
-    expect(
-      syncedPageParams(q('chat=a'), { chat: 'a', view: 'chats' })?.toString()
-    ).toBe('chat=a&view=chats')
+  test('writes the chat into a bare address', () => {
+    expect(syncedPageParams(q(''), { chat: 'a' })?.toString()).toBe('chat=a')
   })
 
   test('switching chats drops the previous chat tab state', () => {
     expect(
-      syncedPageParams(q('chat=a&view=work&tab=terminal&panel=open&x=1'), {
+      syncedPageParams(q('chat=a&tab=terminal&panel=open&x=1'), {
         chat: 'b',
-        view: 'work',
       })?.toString()
-    ).toBe('chat=b&view=work&x=1')
+    ).toBe('chat=b&x=1')
+  })
+
+  test('drops the retired layout from links copied before it went away', () => {
+    expect(
+      syncedPageParams(q('chat=a&view=work&tab=made'), {
+        chat: 'a',
+      })?.toString()
+    ).toBe('chat=a&tab=made')
   })
 
   test('does not invent a chat while none is open', () => {
-    expect(
-      syncedPageParams(q('view=work'), { chat: null, view: 'work' })
-    ).toBeNull()
-    expect(
-      syncedPageParams(q(''), { chat: null, view: 'work' })?.toString()
-    ).toBe('view=work')
+    expect(syncedPageParams(q(''), { chat: null })).toBeNull()
   })
 })

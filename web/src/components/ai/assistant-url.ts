@@ -1,20 +1,21 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { AssistantView } from './assistant-view'
-
 /**
  * What the full-screen assistant keeps in its address, so a link or a reload
  * shows the same screen:
  * - `chat`: the open conversation.
- * - `view`: `chats` (list beside the chat) or `work` (chat beside its tabs).
  * - `tab`: the selected working tab (`made`, `preview`, `files`, `changes`,
  *   `terminal`, `project:<id>`, or a deployment as
  *   `<project id>:<deployment id>`).
- * - `panel=open`: the working tabs are open in the `chats` view.
+ * - `panel=open`: the working tabs are open beside the chat.
  */
 export const CHAT_PARAM = 'chat'
-export const VIEW_PARAM = 'view'
+/**
+ * The retired Chats / Work layout. Links copied before it went away still
+ * carry it; it is dropped from the address rather than kept as noise.
+ */
+const LEGACY_VIEW_PARAM = 'view'
 export const TAB_PARAM = 'tab'
 export const PANEL_PARAM = 'panel'
 
@@ -29,12 +30,6 @@ export const PANEL_PARAM = 'panel'
  */
 export function liveSearchParams(): URLSearchParams {
   return new URLSearchParams(window.location.search)
-}
-
-/** The layout an address asks for, or null when it names none (or garbage). */
-export function readViewParam(params: URLSearchParams): AssistantView | null {
-  const raw = params.get(VIEW_PARAM)
-  return raw === 'chats' || raw === 'work' ? raw : null
 }
 
 /** A copy of `params` with `name` set, or removed when `value` is null/empty. */
@@ -67,13 +62,13 @@ export function withoutChat(params: URLSearchParams): URLSearchParams {
 }
 
 /**
- * The address after the open conversation or layout changed, or null when it
+ * The address after the open conversation changed, or null when it
  * already says so. One pass, because two writes in the same commit would each
  * start from the same stale address and the second would undo the first.
  */
 export function syncedPageParams(
   params: URLSearchParams,
-  state: { chat: string | null; view: AssistantView }
+  state: { chat: string | null }
 ): URLSearchParams | null {
   let next = new URLSearchParams(params)
   let changed = false
@@ -84,8 +79,8 @@ export function syncedPageParams(
     next.set(CHAT_PARAM, state.chat)
     changed = true
   }
-  if (params.get(VIEW_PARAM) !== state.view) {
-    next.set(VIEW_PARAM, state.view)
+  if (next.has(LEGACY_VIEW_PARAM)) {
+    next.delete(LEGACY_VIEW_PARAM)
     changed = true
   }
   return changed ? next : null

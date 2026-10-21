@@ -214,9 +214,8 @@ import {
   standaloneResultId,
   groupAssistantParts,
   liveWorkSegmentKey,
-  runningTool,
+  liveWorkStatus,
   stepTools,
-  toolActivity,
   traceStep,
   workSummary,
   type WorkStep,
@@ -1757,9 +1756,6 @@ function ElapsedTime({ startedAt }: { startedAt?: string | null }) {
   )
 }
 
-/** While a turn works its trace shows only its latest steps. */
-const LIVE_TRACE_STEPS = 4
-
 function TraceSparkle({ working }: { working: boolean }) {
   return (
     <svg
@@ -1884,11 +1880,11 @@ function traceRowDelay(order: number): CSSProperties {
 
 /**
  * The work behind an answer, as a trace the way the answer reads best. While
- * the turn works on it, the trace is open on its latest steps under a ticking
- * "Working"; once it moves on, it folds to what it did ("Ran 4 commands, read
- * 2 files"). Opening it lists every step in order, narration included, and
- * each step opens to its input and result. Opening or closing it by hand wins
- * over all of that.
+ * the turn works on it, the trace stays closed under a ticking "Working" and
+ * one line of state: the step running now ("Running npm test"), or how many
+ * steps it has taken. Once it moves on, it reads as what it did ("Ran 4
+ * commands, read 2 files"). Opening it lists every step in order, and each
+ * step opens to its input and result.
  */
 function AssistantWorkGroup({
   steps,
@@ -1909,7 +1905,7 @@ function AssistantWorkGroup({
     expandToolCalls ? true : null
   )
   const [selectedTool, setSelectedTool] = useState<string | null>(null)
-  const open = chosenOpen ?? live
+  const open = chosenOpen ?? false
   // A trace never opened has nothing to lay out; once opened it stays
   // mounted so closing it animates.
   const [opened, setOpened] = useState(open)
@@ -1917,15 +1913,7 @@ function AssistantWorkGroup({
 
   const tools = stepTools(steps)
   const failed = failedToolCount(tools)
-  const tail =
-    live && chosenOpen === null && steps.length > LIVE_TRACE_STEPS
-      ? steps.slice(-LIVE_TRACE_STEPS)
-      : steps
-  const earlier = steps.length - tail.length
-  const current = runningTool(steps) ?? tools[tools.length - 1] ?? null
-  const currentActivity = current
-    ? (toolActivity(current) ?? toolLabel(current))
-    : null
+  const status = live ? liveWorkStatus(steps) : null
   const sandboxTools = conversationPublicId
     ? tools.filter(
         (tool) =>
@@ -1998,12 +1986,13 @@ function AssistantWorkGroup({
           aria-hidden="true"
         />
       </button>
-      {live && !open && currentActivity && (
+      {status && !open && (
         <p
-          className="ml-6 truncate text-xs text-muted-foreground"
-          title={currentActivity}
+          key={status}
+          className="ai-trace-fade ml-6 truncate text-xs text-muted-foreground"
+          title={status}
         >
-          {currentActivity}
+          {status}
         </p>
       )}
       <div
@@ -2017,16 +2006,7 @@ function AssistantWorkGroup({
         <div className="min-h-0 overflow-hidden">
           {opened && (
             <div className="ml-[7.5px] mt-0.5 flex min-w-0 flex-col gap-0.5 border-l py-1 pl-3">
-              {earlier > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setChosenOpen(true)}
-                  className="w-fit rounded-md px-1.5 py-0.5 text-[12px] text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-                >
-                  {earlier} earlier {earlier === 1 ? 'step' : 'steps'}
-                </button>
-              )}
-              {tail.map((step, order) => (
+              {steps.map((step, order) => (
                 <TraceToolRow
                   key={step.tool.id}
                   tool={step.tool}

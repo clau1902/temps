@@ -87,7 +87,7 @@ test('text between tools stays in the conversation, outside the trace', () => {
   )
 })
 
-test('while the turn works, the trace is open on the step it is taking', () => {
+test('while the turn works, the trace stays closed on the step it is taking', () => {
   const markup = body(
     {
       role: 'assistant',
@@ -100,26 +100,30 @@ test('while the turn works, the trace is open on the step it is taking', () => {
     true
   )
   expect(markup).toContain('Thinking')
-  expect(markup).toContain('aria-expanded="true"')
-  expect(markup).toMatch(/aria-label="Running"[^]*npm install/)
+  expect(markup).toContain('aria-expanded="false"')
+  // One line of state, not a row per tool.
+  expect(markup).toContain('>Running npm install</p>')
+  expect(markup).not.toContain('aria-label="Running"')
   expect(markup).not.toContain('Ran 2 commands')
   // The group's header is the activity: no second indicator after it.
   expect(markup.match(/role="status"/g)?.length).toBe(1)
 })
 
-test('a long trace shows only its latest steps while it works', () => {
+test('between steps the working state counts them instead of repeating the last', () => {
   const parts = Array.from({ length: 7 }, (_, at) => ({
     type: 'tool' as const,
-    tool: command(
-      `t${at}`,
-      `step-${at}`,
-      at < 6 ? '{"exit_code":0}' : undefined
-    ),
+    tool: command(`t${at}`, `step-${at}`, '{"exit_code":0}'),
   }))
-  const markup = body({ role: 'assistant', content: '', parts }, true)
-  expect(markup).toContain('3 earlier steps')
-  expect(markup).not.toContain('step-2<')
-  expect(markup).toContain('step-6')
+  const markup = body(
+    {
+      role: 'assistant',
+      content: '',
+      parts: [...parts, { type: 'text', text: '' }],
+    },
+    true
+  )
+  expect(markup).toContain('7 steps so far')
+  expect(markup).not.toContain('step-6')
 })
 
 test('a settled goal step folds to what it did, not its raw arguments', () => {

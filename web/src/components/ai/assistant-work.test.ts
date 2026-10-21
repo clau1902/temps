@@ -7,6 +7,7 @@ import {
   standaloneResultId,
   groupAssistantParts,
   liveWorkSegmentKey,
+  liveWorkStatus,
   runningTool,
   toolActivity,
   traceStep,
@@ -277,6 +278,35 @@ describe('runningTool', () => {
       ])
     ).toBe(sleeping)
     expect(runningTool([{ tool: tool('a', 'Bash'), index: 0 }])).toBeNull()
+  })
+})
+
+describe('liveWorkStatus', () => {
+  it('names the step running now', () => {
+    expect(
+      liveWorkStatus([
+        { tool: tool('a', 'Read', { file_path: 'a.ts' }), index: 0 },
+        { tool: running('b', 'Bash', { command: 'npm test' }), index: 1 },
+      ])
+    ).toBe('Running npm test')
+  })
+
+  it('names an unrecognised running tool in plain words', () => {
+    expect(
+      liveWorkStatus([{ tool: running('a', 'temps_deploy_preview'), index: 0 }])
+    ).toBe('Using Deploy preview')
+  })
+
+  it('counts the steps taken between steps, not the last one finished', () => {
+    const done = { tool: tool('a', 'Bash', { command: 'npm test' }), index: 0 }
+    expect(liveWorkStatus([done])).toBe('1 step so far')
+    expect(liveWorkStatus([done, { tool: tool('b', 'Bash'), index: 1 }])).toBe(
+      '2 steps so far'
+    )
+  })
+
+  it('says nothing before the first step', () => {
+    expect(liveWorkStatus([])).toBeNull()
   })
 })
 

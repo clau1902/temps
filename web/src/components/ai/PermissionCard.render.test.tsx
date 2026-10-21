@@ -99,3 +99,70 @@ describe('PermissionCard generic platform writes', () => {
     expect(markup).toContain('Approve &amp; run')
   })
 })
+
+function renderQuestion(input: Record<string, unknown>) {
+  return renderToStaticMarkup(
+    <MemoryRouter>
+      <PermissionCard
+        conversationPublicId="conversation-1"
+        permission={{
+          id: 'permission-2',
+          kind: 'question',
+          tool_name: 'temps_ask_user',
+          input,
+        }}
+        userScoped
+      />
+    </MemoryRouter>
+  )
+}
+
+describe('PermissionCard questions', () => {
+  test('lists the choices vertically with descriptions and an Other choice', () => {
+    const markup = renderQuestion({
+      questions: [
+        {
+          header: 'Sign-in',
+          question: 'Which provider should people sign in with?',
+          options: [
+            { label: 'Google', description: 'Any Google account' },
+            { label: 'Generic OIDC' },
+          ],
+        },
+      ],
+    })
+
+    expect(markup).toContain('role="radiogroup"')
+    expect(markup.match(/role="radio"/g)?.length).toBe(3)
+    expect(markup).toContain('Any Google account')
+    expect(markup).toContain('Other')
+    // The text box opens only once Other is chosen.
+    expect(markup).not.toContain('<textarea')
+    expect(markup).toContain('Send answer')
+    expect(markup).toContain('disabled=""')
+  })
+
+  test('numbers several questions and uses checkboxes for multi-select', () => {
+    const markup = renderQuestion({
+      questions: [
+        {
+          question: 'Who can read the board?',
+          options: [{ label: 'Signed-in users' }, { label: 'Anyone' }],
+        },
+        {
+          question: 'Where should alerts go?',
+          multiSelect: true,
+          options: [{ label: 'Email' }, { label: 'Slack' }],
+        },
+      ],
+    })
+
+    expect(markup).toContain('2 questions')
+    expect(markup).toContain('1/2')
+    expect(markup).toContain('2/2')
+    expect(markup).toContain('Choose any')
+    expect(markup.match(/role="checkbox"/g)?.length).toBe(3)
+    expect(markup).toContain('0 of 2 answered')
+    expect(markup).toContain('Send answers')
+  })
+})

@@ -2,18 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Which layout the full-screen assistant uses.
- * - `chats`: the chat list beside the conversation.
- * - `work`: the conversation beside its working tabs (deployments), with the
- *   chat list tucked into a switcher in the page header.
+ * Whether the full-screen assistant shows its chat list beside the
+ * conversation. Hiding it gives the conversation (and its working tabs) the
+ * whole width; the list stays one click, or ⌘K, away.
  */
-export type AssistantView = 'chats' | 'work'
+export const CHAT_LIST_STORAGE_KEY = 'temps.assistant.chatList'
 
-export const ASSISTANT_VIEW_STORAGE_KEY = 'temps.assistant.view'
-
-export function parseAssistantView(raw: string | null): AssistantView {
-  return raw === 'work' ? 'work' : 'chats'
-}
+/**
+ * Where the retired Chats / Work layout choice was kept. `work` hid the chat
+ * list, so a stored `work` still means hidden until the user picks again.
+ */
+const LEGACY_VIEW_STORAGE_KEY = 'temps.assistant.view'
 
 type ViewStorage = Pick<Storage, 'getItem' | 'setItem'>
 
@@ -21,32 +20,50 @@ function defaultStorage(): ViewStorage | null {
   try {
     return typeof window === 'undefined' ? null : window.localStorage
   } catch {
-    // Storage can be blocked (private mode); the view just isn't remembered.
+    // Storage can be blocked (private mode); the choice just isn't remembered.
     return null
   }
 }
 
-export function readAssistantView(
+export function readChatListHidden(
   storage: ViewStorage | null = defaultStorage()
-): AssistantView {
+): boolean {
   try {
-    return parseAssistantView(
-      storage?.getItem(ASSISTANT_VIEW_STORAGE_KEY) ?? null
-    )
+    const stored = storage?.getItem(CHAT_LIST_STORAGE_KEY) ?? null
+    if (stored !== null) return stored === 'hidden'
+    return storage?.getItem(LEGACY_VIEW_STORAGE_KEY) === 'work'
   } catch {
-    return 'chats'
+    return false
   }
 }
 
-export function writeAssistantView(
-  view: AssistantView,
+export function writeChatListHidden(
+  hidden: boolean,
   storage: ViewStorage | null = defaultStorage()
 ): void {
   try {
-    storage?.setItem(ASSISTANT_VIEW_STORAGE_KEY, view)
+    storage?.setItem(CHAT_LIST_STORAGE_KEY, hidden ? 'hidden' : 'shown')
   } catch {
-    // Not remembered; the view still applies for this visit.
+    // Not remembered; the choice still applies for this visit.
   }
+}
+
+/**
+ * Whether a keydown is ⌘B / Ctrl+B, which shows or hides the chat list. It is
+ * the key that toggles the console sidebar, which the assistant page replaces.
+ */
+export function isChatListShortcut(
+  event: Pick<
+    KeyboardEvent,
+    'key' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'
+  >
+): boolean {
+  return (
+    event.key.toLowerCase() === 'b' &&
+    (event.metaKey || event.ctrlKey) &&
+    !event.altKey &&
+    !event.shiftKey
+  )
 }
 
 /** Whether a keydown is the ⌘K / Ctrl+K shortcut. */

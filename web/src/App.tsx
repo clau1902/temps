@@ -52,7 +52,6 @@ import {
 import { announceMutationFailure } from './lib/mutation-error-toast'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
-import { AssistantTopBar } from './components/ai/AssistantTopBar'
 import { useVisualViewportFit } from './hooks/useVisualViewportFit'
 import AppSidebar from './components/dashboard/Sidebar'
 import { ComposeVersionAlert } from './components/alerts/ComposeVersionAlert'
@@ -545,7 +544,7 @@ const GlobalMcpServerDetailPage = lazy(() =>
 const FullAppRoutes = () => {
   const { routes: extraRoutes } = useConsoleExtensions()
   // The assistant is a focus mode: no console sidebar, header or banners, just
-  // the conversation and a way back (see `AssistantTopBar`).
+  // the conversation. Its own header carries the way back to the console.
   const focusMode = useLocation().pathname === '/chat'
   // On a phone the keyboard must not push the header off screen.
   useVisualViewportFit(focusMode)
@@ -624,9 +623,7 @@ const FullAppRoutes = () => {
               for it inline while on-demand TLS is on and nothing else blocks. */}
               {!focusMode && <AcmeContactEmailBanner />}
               {/* Wrap header with independent error boundary */}
-              {focusMode ? (
-                <AssistantTopBar />
-              ) : (
+              {!focusMode && (
                 <ErrorBoundary
                   fallback={(error, _errorInfo, resetError) => (
                     <CompactErrorFallback

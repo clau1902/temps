@@ -332,13 +332,13 @@ export function ChatOperationsIndicator({
       <PopoverTrigger asChild>
         <Button
           type="button"
-          variant="outline"
-          size="sm"
-          className={cn('h-8 gap-1.5', INDICATOR_CLASSES[summary.state])}
-          title="Deployments, backups and restores this chat started"
+          variant="ghost"
+          size="icon"
+          className={cn('size-8', INDICATOR_CLASSES[summary.state])}
+          title={`${summary.label}: deployments, backups and restores this chat started`}
+          aria-label={`Activity: ${summary.label}`}
         >
           <OperationsIcon state={summary.state} />
-          {summary.label}
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-96 p-0">

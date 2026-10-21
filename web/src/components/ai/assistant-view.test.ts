@@ -3,12 +3,12 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
-  ASSISTANT_VIEW_STORAGE_KEY,
+  CHAT_LIST_STORAGE_KEY,
+  isChatListShortcut,
   isFocusComposerShortcut,
   isSwitcherShortcut,
-  parseAssistantView,
-  readAssistantView,
-  writeAssistantView,
+  readChatListHidden,
+  writeChatListHidden,
 } from './assistant-view'
 
 function memory(initial: Record<string, string> = {}) {
@@ -19,23 +19,36 @@ function memory(initial: Record<string, string> = {}) {
   }
 }
 
-describe('assistant view', () => {
-  test('anything but "work" is the chats view', () => {
-    expect(parseAssistantView('work')).toBe('work')
-    expect(parseAssistantView('chats')).toBe('chats')
-    expect(parseAssistantView('sidebar')).toBe('chats')
-    expect(parseAssistantView(null)).toBe('chats')
-  })
-
-  test('the choice survives a reload', () => {
+describe('chat list visibility', () => {
+  test('is shown until the user hides it, and the choice survives a reload', () => {
     const storage = memory()
-    expect(readAssistantView(storage)).toBe('chats')
-    writeAssistantView('work', storage)
-    expect(storage.getItem(ASSISTANT_VIEW_STORAGE_KEY)).toBe('work')
-    expect(readAssistantView(storage)).toBe('work')
+    expect(readChatListHidden(storage)).toBe(false)
+    writeChatListHidden(true, storage)
+    expect(storage.getItem(CHAT_LIST_STORAGE_KEY)).toBe('hidden')
+    expect(readChatListHidden(storage)).toBe(true)
+    writeChatListHidden(false, storage)
+    expect(readChatListHidden(storage)).toBe(false)
   })
 
-  test('blocked storage falls back to chats without throwing', () => {
+  test('the retired work layout carries over as a hidden list', () => {
+    expect(readChatListHidden(memory({ 'temps.assistant.view': 'work' }))).toBe(
+      true
+    )
+    expect(
+      readChatListHidden(memory({ 'temps.assistant.view': 'chats' }))
+    ).toBe(false)
+    // A choice made since wins over the old layout.
+    expect(
+      readChatListHidden(
+        memory({
+          'temps.assistant.view': 'work',
+          [CHAT_LIST_STORAGE_KEY]: 'shown',
+        })
+      )
+    ).toBe(false)
+  })
+
+  test('blocked storage shows the list without throwing', () => {
     const blocked = {
       getItem: () => {
         throw new Error('denied')
@@ -44,9 +57,36 @@ describe('assistant view', () => {
         throw new Error('denied')
       },
     }
-    expect(readAssistantView(blocked)).toBe('chats')
-    expect(() => writeAssistantView('work', blocked)).not.toThrow()
-    expect(readAssistantView(null)).toBe('chats')
+    expect(readChatListHidden(blocked)).toBe(false)
+    expect(() => writeChatListHidden(true, blocked)).not.toThrow()
+    expect(readChatListHidden(null)).toBe(false)
+  })
+})
+
+describe('isChatListShortcut', () => {
+  const press = (over: Partial<KeyboardEvent>) => ({
+    key: 'b',
+    metaKey: false,
+    ctrlKey: false,
+    altKey: false,
+    shiftKey: false,
+    ...over,
+  })
+
+  test('is ⌘B or Ctrl+B, in either case', () => {
+    expect(isChatListShortcut(press({ metaKey: true }))).toBe(true)
+    expect(isChatListShortcut(press({ ctrlKey: true, key: 'B' }))).toBe(true)
+  })
+
+  test('is not a bare B or a modified chord', () => {
+    expect(isChatListShortcut(press({}))).toBe(false)
+    expect(isChatListShortcut(press({ metaKey: true, shiftKey: true }))).toBe(
+      false
+    )
+    expect(isChatListShortcut(press({ metaKey: true, altKey: true }))).toBe(
+      false
+    )
+    expect(isChatListShortcut(press({ metaKey: true, key: 'k' }))).toBe(false)
   })
 })
 

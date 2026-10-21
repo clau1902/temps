@@ -113,3 +113,12 @@ export function announceChatTurn(publicId: string, active: boolean) {
     })
   )
 }
+
+/**
+ * Whether the collapsed chat rail marks a chat in this state. It marks what
+ * needs a look (still working, failed, cut short) and leaves finished and
+ * stopped chats plain, so a rail of done chats stays quiet.
+ */
+export function railMarksState(state: ChatRunState | null): boolean {
+  return state === 'working' || state === 'error' || state === 'interrupted'
+}

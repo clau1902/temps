@@ -419,11 +419,14 @@ export function ChatSandbox({
   conversationPublicId,
   fromProject = false,
   compact = false,
+  iconOnly = false,
 }: {
   conversationPublicId: string
   fromProject?: boolean
   /** Icon only on narrow screens, for crowded toolbars. */
   compact?: boolean
+  /** Icon only at every width, for the conversation header. */
+  iconOnly?: boolean
 }) {
   const status = useQuery(
     getChatSandboxOptions({ path: { public_id: conversationPublicId } })
@@ -437,9 +440,10 @@ export function ChatSandbox({
       <PopoverTrigger asChild>
         <Button
           type="button"
-          variant="outline"
-          size="sm"
-          className="h-8 max-w-44 gap-1.5"
+          variant={iconOnly ? 'ghost' : 'outline'}
+          size={iconOnly ? 'icon' : 'sm'}
+          className={iconOnly ? 'size-8' : 'h-8 max-w-44 gap-1.5'}
+          aria-label={iconOnly ? `Sandbox: ${label}` : undefined}
           title={
             wake.phase === 'waking'
               ? 'Waking the sandbox linked to this chat'
@@ -455,9 +459,11 @@ export function ChatSandbox({
           ) : (
             <SquareTerminal className="size-4 shrink-0" />
           )}
-          <span className={cn('truncate', compact && 'hidden sm:inline')}>
-            {label}
-          </span>
+          {!iconOnly && (
+            <span className={cn('truncate', compact && 'hidden sm:inline')}>
+              {label}
+            </span>
+          )}
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-80">

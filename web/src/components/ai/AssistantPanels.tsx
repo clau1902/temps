@@ -35,14 +35,7 @@ import {
   Sparkles,
   X,
 } from 'lucide-react'
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
 import { useForm } from 'react-hook-form'
 import { Link, useSearchParams } from 'react-router'
@@ -50,6 +43,7 @@ import { toast } from 'sonner'
 import { z } from 'zod'
 import { FOCUS_COMPOSER_HINT } from './assistant-view'
 import { WorkspaceChip } from './WorkspaceChip'
+import { InAssistantHeader } from './InAssistantHeader'
 import { ChatProjectsLink } from './ChatProjectsLink'
 import { useChatBlueprint } from './chat-blueprint'
 import { projectRequest, type ProjectChoice } from './chat-project'
@@ -81,7 +75,6 @@ import {
   DeploymentSidebar,
   PREVIEW_TAB,
 } from './DeploymentSidebar'
-import { WorkTabsOnboarding } from './WorkTabsOnboarding'
 import {
   liveSearchParams,
   PANEL_PARAM,
@@ -782,11 +775,6 @@ function AssistantStartSkeleton({ roomy }: { roomy?: boolean }) {
   )
 }
 
-/**
- * The work view before the first message: the start screen beside what the
- * working tabs will hold. It shares the conversation's split (and its
- * remembered size), so sending the first message does not move the columns.
- */
 export type NewChatWorkspaceChoice = { public_id: string; name: string }
 
 /** Says which workspace a chat being started will join, with a way out. */
@@ -827,39 +815,6 @@ function NewChatWorkspaceChip({
   )
 }
 
-export function AssistantStartWorkView({ children }: { children: ReactNode }) {
-  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
-    id: 'assistant-deployment-split',
-    onlySaveAfterUserInteractions: true,
-  })
-  return (
-    <ResizablePanelGroup
-      orientation="horizontal"
-      className="h-full"
-      defaultLayout={defaultLayout}
-      onLayoutChanged={onLayoutChanged}
-    >
-      <ResizablePanel id="thread" minSize={360}>
-        <div className="mx-auto h-full w-full max-w-3xl">{children}</div>
-      </ResizablePanel>
-      <ResizableHandle
-        withHandle
-        aria-label="Resize deployment panel"
-        className="mx-2"
-      />
-      <ResizablePanel
-        id="deployment"
-        defaultSize="40"
-        minSize={300}
-        maxSize="50"
-        className="min-w-0"
-      >
-        <WorkTabsOnboarding />
-      </ResizablePanel>
-    </ResizablePanelGroup>
-  )
-}
-
 /**
  * An assistant conversation: the shared chat panel on the chat's model, named
  * above it. Whether changes ask first is a switch inside the composer.
@@ -869,7 +824,6 @@ export function AssistantThread({
   firstMessage,
   firstAttachments,
   readOnly,
-  workView = false,
   syncUrl = false,
 }: {
   conversation: Pick<ConversationResponse, 'public_id' | 'context_id'>
@@ -877,8 +831,6 @@ export function AssistantThread({
   /** Files already uploaded to this chat, sent with `firstMessage`. */
   firstAttachments?: OpeningAttachment[]
   readOnly?: boolean
-  /** The work view: working tabs are always docked beside the chat. */
-  workView?: boolean
   /**
    * Keep the working tabs (open or not, and which one) in the address, so a
    * link or reload shows the same screen. Only the full-screen page does:
@@ -1028,7 +980,7 @@ export function AssistantThread({
 
   // Wide screens dock the panel beside the chat (resizable); narrower ones
   // show the same content in a drawer, so the chat is never squeezed.
-  const docked = isDesktop && (workView || panelOpen)
+  const docked = isDesktop && panelOpen
   const wasShown = useRef(false)
   useEffect(() => {
     const panel = panelRef.current
@@ -1047,7 +999,7 @@ export function AssistantThread({
       initialSelected={urlTab ?? undefined}
       onSelectedChange={setUrlTab}
       onOpenProject={openProject}
-      onClose={workView ? undefined : () => setPanelOpen(false)}
+      onClose={() => setPanelOpen(false)}
     />
   )
 
@@ -1057,43 +1009,43 @@ export function AssistantThread({
         orientation="horizontal"
         className="h-full"
         defaultLayout={defaultLayout}
-        onLayoutChanged={(layout, meta) => {
-          onLayoutChanged(layout, meta)
-          // The work view always rests with its tabs open.
-          const panel = panelRef.current
-          if (workView && isDesktop && panel?.isCollapsed()) panel.expand()
-        }}
+        onLayoutChanged={onLayoutChanged}
       >
         <ResizablePanel id="thread" minSize={isDesktop ? 360 : 0}>
           <div
             className={cn(
-              'flex h-full min-h-0 min-w-0 flex-col gap-2',
+              'flex h-full min-h-0 min-w-0 flex-col',
               // Alone, the chat reads best as a centred column; beside its tabs it fills its half.
               !docked && 'mx-auto w-full max-w-3xl'
             )}
           >
-            <div className="flex shrink-0 items-center justify-end gap-2">
+            <InAssistantHeader>
               <ChatOperationsIndicator
                 conversationPublicId={conversation.public_id}
               />
               <ChatProjectsLink conversationPublicId={conversation.public_id} />
               <WorkspaceChip conversationPublicId={conversation.public_id} />
-              <ChatSandbox conversationPublicId={conversation.public_id} />
-              {!workView && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-8 gap-1.5"
-                  aria-pressed={panelOpen}
-                  onClick={() => setPanelOpen(!panelOpen)}
-                  title="Show what this chat made and the deployments it is working on"
-                >
-                  <Rocket className="size-4" />
-                  Working tabs
-                </Button>
-              )}
-            </div>
+              <ChatSandbox
+                conversationPublicId={conversation.public_id}
+                iconOnly
+              />
+              <Button
+                type="button"
+                variant={panelOpen ? 'secondary' : 'ghost'}
+                size="icon"
+                className="size-8"
+                aria-pressed={panelOpen}
+                aria-label="Working tabs"
+                onClick={() => setPanelOpen(!panelOpen)}
+                title={
+                  panelOpen
+                    ? 'Hide the working tabs'
+                    : 'Show what this chat made and the deployments it is working on'
+                }
+              >
+                <Rocket className="size-4" />
+              </Button>
+            </InAssistantHeader>
             <div className="min-h-0 flex-1">
               <DebugChatPanel
                 key={conversation.public_id}
@@ -1131,9 +1083,8 @@ export function AssistantThread({
             // dragging it shut.
             if (size.asPercentage > 0) wasShown.current = true
             if (size.asPercentage !== 0 || !docked || !wasShown.current) return
-            // The work view keeps its tabs; elsewhere closing is the user's call.
-            if (workView) panelRef.current?.expand()
-            else setPanelOpen(false)
+            // Dragging the tabs shut closes them, like the button does.
+            setPanelOpen(false)
           }}
           className="min-w-0"
         >

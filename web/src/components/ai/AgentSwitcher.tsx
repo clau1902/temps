@@ -24,7 +24,7 @@ export interface SwitcherChat {
 
 /**
  * Jump to another chat, or start one, without the chat list on screen. Opened
- * from the page header or with ⌘K in the work view.
+ * from the page header or with ⌘K while the chat list is hidden.
  *
  * `chats` are the ones already loaded and are filtered as you type. The list
  * only holds the most recent pages, so the typed text also goes out through

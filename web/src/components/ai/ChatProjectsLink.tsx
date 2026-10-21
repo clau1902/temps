@@ -15,7 +15,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronDown, ExternalLink, FolderGit2 } from 'lucide-react'
+import { ExternalLink, FolderGit2 } from 'lucide-react'
 import { Link } from 'react-router'
 import { useChatBlueprint } from './chat-blueprint'
 import { chatProjects, projectHref } from './chat-projects'
@@ -63,33 +63,26 @@ function SingleProjectLink({ project }: { project: ProjectRef }) {
     latest.data?.status === 'completed' ? (latest.data.url ?? null) : null
   return (
     <div className="flex items-center">
-      <Button
-        asChild
-        variant="outline"
-        size="sm"
-        className="h-8 max-w-56 gap-1.5 rounded-r-none"
-      >
+      <Button asChild variant="ghost" size="icon" className="size-8">
         <Link
           to={projectHref(project)}
           title={`Open the project ${project.name}`}
+          aria-label={`Open the project ${project.name}`}
         >
           <ProjectAvatar
             name={project.name}
             className="size-4 shrink-0 rounded-sm"
             fallbackClassName="rounded-sm bg-primary/10 text-[10px] text-primary"
           />
-          <span className="hidden min-w-0 truncate sm:inline">
-            <span className="text-muted-foreground">Project </span>
-            {project.name}
-          </span>
         </Link>
       </Button>
-      {liveUrl ? (
+      {/* The live app is offered only once there is one to open. */}
+      {liveUrl && (
         <Button
           asChild
-          variant="outline"
-          size="sm"
-          className="h-8 rounded-l-none border-l-0 px-2"
+          variant="ghost"
+          size="icon"
+          className="size-8 text-muted-foreground"
         >
           <a
             href={liveUrl}
@@ -98,20 +91,9 @@ function SingleProjectLink({ project }: { project: ProjectRef }) {
             title={`Open the live app: ${liveUrl}`}
             aria-label={`Open the live ${project.name} app`}
           >
-            <ExternalLink className="size-3.5" />
+            <ExternalLink className="size-4" />
           </a>
         </Button>
-      ) : (
-        <span
-          className="flex h-8 items-center rounded-r-md border border-l-0 px-2 text-xs text-muted-foreground"
-          title={
-            latest.isPending
-              ? 'Checking the latest deployment'
-              : 'No finished deployment yet, so there is no live app to open'
-          }
-        >
-          <ExternalLink className="size-3.5 opacity-40" aria-hidden="true" />
-        </span>
       )}
     </div>
   )
@@ -123,14 +105,13 @@ function ProjectsMenu({ projects }: { projects: readonly ProjectRef[] }) {
       <DropdownMenuTrigger asChild>
         <Button
           type="button"
-          variant="outline"
-          size="sm"
-          className="h-8 gap-1.5"
-          title="Open one of the projects this chat works on"
+          variant="ghost"
+          size="icon"
+          className="size-8"
+          title={`Open one of the ${projects.length} projects this chat works on`}
+          aria-label={`${projects.length} projects`}
         >
-          <FolderGit2 className="size-4 shrink-0" />
-          <span className="hidden sm:inline">{projects.length} projects</span>
-          <ChevronDown className="size-3.5 opacity-60" />
+          <FolderGit2 className="size-4" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-60">

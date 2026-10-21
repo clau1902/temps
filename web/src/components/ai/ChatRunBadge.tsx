@@ -12,6 +12,7 @@ import {
 import {
   chatRunPresentation,
   chatRunState,
+  railMarksState,
   type ChatRunState,
 } from './chat-run-state'
 
@@ -58,6 +59,34 @@ export function ChatRunBadge({
     >
       <Icon className={cn('size-3', iconClassName)} aria-hidden />
       <span className={compact ? 'sr-only' : undefined}>{label}</span>
+    </span>
+  )
+}
+
+/**
+ * The run state as a small mark over a chat's avatar, for the collapsed chat
+ * rail. Nothing is drawn for states the rail leaves plain.
+ */
+export function ChatRunMark({
+  turnStatus,
+  className,
+}: {
+  turnStatus: string
+  className?: string
+}) {
+  const state = chatRunState(turnStatus)
+  if (!state || !railMarksState(state)) return null
+  const { Icon, className: tone, iconClassName } = RUN_STATE_STYLES[state]
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        'flex size-4 items-center justify-center rounded-full bg-background shadow-sm ring-1 ring-border',
+        tone,
+        className
+      )}
+    >
+      <Icon className={cn('size-3', iconClassName)} />
     </span>
   )
 }

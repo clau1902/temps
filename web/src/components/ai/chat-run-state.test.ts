@@ -9,6 +9,7 @@ import {
   WORKING_CHAT_POLL_MS,
   chatRunPresentation,
   chatRunState,
+  railMarksState,
   withTurnStatus,
 } from './chat-run-state'
 
@@ -87,5 +88,16 @@ describe('withTurnStatus', () => {
   it('returns the same list when nothing changes', () => {
     expect(withTurnStatus(chats, 'a', 'completed')).toBe(chats)
     expect(withTurnStatus(chats, 'missing', 'running')).toBe(chats)
+  })
+})
+
+describe('railMarksState', () => {
+  it('marks the chats that need a look and leaves done ones plain', () => {
+    expect(railMarksState(chatRunState('running'))).toBe(true)
+    expect(railMarksState(chatRunState('failed'))).toBe(true)
+    expect(railMarksState(chatRunState('interrupted'))).toBe(true)
+    expect(railMarksState(chatRunState('completed'))).toBe(false)
+    expect(railMarksState(chatRunState('cancelled'))).toBe(false)
+    expect(railMarksState(chatRunState('idle'))).toBe(false)
   })
 })
