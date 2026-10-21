@@ -4905,6 +4905,67 @@
         ],
         "type": "string"
       },
+      "ArtifactAssembleRequest": {
+        "properties": {
+          "checksum": {
+            "type": "string"
+          },
+          "chunks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "dist": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "projects": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "checksum",
+          "chunks",
+          "projects"
+        ],
+        "type": "object"
+      },
+      "ArtifactAssembly": {
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "missingChunks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "missingChunks"
+        ],
+        "type": "object"
+      },
       "ArtifactKind": {
         "description": "The formats local checks read. Adding one needs no migration or new check kind.",
         "enum": [
@@ -9384,6 +9445,94 @@
           "restart_required",
           "available_compressions",
           "connection"
+        ],
+        "type": "object"
+      },
+      "ClientOutcome": {
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "first_reported_at": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_received_at": {
+            "type": "string"
+          },
+          "last_reported_at": {
+            "type": "string"
+          },
+          "quantity": {
+            "description": "Decimal string avoids rounding large integer totals in JavaScript.",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "bucket",
+          "reason",
+          "category",
+          "unit",
+          "quantity",
+          "first_reported_at",
+          "last_reported_at",
+          "last_received_at"
+        ],
+        "type": "object"
+      },
+      "ClientOutcomePage": {
+        "properties": {
+          "approximate": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ClientOutcome"
+            },
+            "type": "array"
+          },
+          "retention_days": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "retention_days",
+          "approximate"
         ],
         "type": "object"
       },
@@ -14117,6 +14266,29 @@
         ],
         "type": "object"
       },
+      "CreateCronMonitor": {
+        "additionalProperties": false,
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/MonitorConfig"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "config"
+        ],
+        "type": "object"
+      },
       "CreateDSNRequest": {
         "properties": {
           "base_url": {
@@ -16563,6 +16735,234 @@
           "schedule",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "CronMonitorList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CronMonitorView"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "CronMonitorRun": {
+        "properties": {
+          "check_in_id": {
+            "type": "string"
+          },
+          "deadline_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "duration": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "monitor_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "release": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "span_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "trace_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "monitor_id",
+          "check_in_id",
+          "status",
+          "started_at"
+        ],
+        "type": "object"
+      },
+      "CronMonitorRunList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CronMonitorRun"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "CronMonitorView": {
+        "properties": {
+          "alarm_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "config": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MonitorConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "configuration_source": {
+            "description": "Editing the configuration in Temps makes it authoritative over SDK config.",
+            "type": "string"
+          },
+          "consecutive_failures": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "consecutive_successes": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_check_in_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_expected_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "slug",
+          "enabled",
+          "configuration_source",
+          "status",
+          "consecutive_failures",
+          "consecutive_successes"
         ],
         "type": "object"
       },
@@ -26183,6 +26583,183 @@
         ],
         "type": "object"
       },
+      "FeedbackPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/FeedbackView"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total"
+        ],
+        "type": "object"
+      },
+      "FeedbackQuery": {
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "FeedbackStatusRequest": {
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "FeedbackView": {
+        "properties": {
+          "associated_event_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "context": {},
+          "deployment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error_group_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "received_at": {
+            "type": "string"
+          },
+          "release": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replay_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replay_session_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "replay_visitor_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "source",
+          "source_id",
+          "timestamp",
+          "received_at",
+          "status",
+          "message",
+          "context"
+        ],
+        "type": "object"
+      },
       "FieldResponse": {
         "properties": {
           "field_type": {
@@ -34444,6 +35021,26 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "tag_key": {
+            "description": "Exact tag match; supply tag_value together with this field.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tag_value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "description": "Exact native user ID match.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -35231,6 +35828,29 @@
         },
         "type": "object"
       },
+      "LogAttributeOperator": {
+        "enum": [
+          "eq",
+          "ne",
+          "lt",
+          "lte",
+          "gt",
+          "gte"
+        ],
+        "type": "string"
+      },
+      "LogAttributeType": {
+        "enum": [
+          "string",
+          "boolean",
+          "integer",
+          "double",
+          "array",
+          "object",
+          "bytes"
+        ],
+        "type": "string"
+      },
       "LogCollectionCapability": {
         "description": "Whether new container log lines are being collected right now. Separate\nfrom `analytics` because the two fail independently: after a restart the\nindex can be healthy while collection waits on WAL recovery, and without\nthis the explorer shows a histogram that simply stops.",
         "properties": {
@@ -35334,6 +35954,16 @@
       "LogRecord": {
         "description": "A single log record ready for storage.",
         "properties": {
+          "attribute_types": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/LogAttributeType"
+            },
+            "description": "Declared native types for keys in `attributes`; absent on older records.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "attributes": {
             "additionalProperties": {
               "type": "string"
@@ -37556,6 +38186,41 @@
         ],
         "type": "object"
       },
+      "MonitorConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "checkin_margin": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failure_issue_threshold": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_runtime": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "recovery_threshold": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/MonitorSchedule"
+          },
+          "timezone": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schedule"
+        ],
+        "type": "object"
+      },
       "MonitorResponse": {
         "properties": {
           "check_interval_seconds": {
@@ -37629,6 +38294,52 @@
           "updated_at"
         ],
         "type": "object"
+      },
+      "MonitorSchedule": {
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "crontab"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "interval"
+                ],
+                "type": "string"
+              },
+              "unit": {
+                "type": "string"
+              },
+              "value": {
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "value",
+              "unit",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "MonitorStatus": {
         "properties": {
@@ -57387,6 +58098,12 @@
             "example": "2025-10-12T12:15:47.609192Z",
             "type": "string"
           },
+          "debug_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "dist": {
             "type": [
               "string",
@@ -57419,6 +58136,28 @@
           "file_path",
           "size_bytes",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "SourceMapUploadForm": {
+        "properties": {
+          "dist": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file": {
+            "format": "binary",
+            "type": "string"
+          },
+          "file_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "file_path"
         ],
         "type": "object"
       },
@@ -59695,6 +60434,125 @@
           "dropped_bytes",
           "reason",
           "message"
+        ],
+        "type": "object"
+      },
+      "TelemetryRelease": {
+        "properties": {
+          "check_ins": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "errors": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "example_error_group_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "example_feedback_id": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "example_log_trace_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "example_metric_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "example_monitor_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "example_trace_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "feedback": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "first_seen": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "last_seen": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "logs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "metric_points": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "release": {
+            "type": "string"
+          },
+          "spans": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "release",
+          "first_seen",
+          "last_seen",
+          "errors",
+          "logs",
+          "spans",
+          "metric_points",
+          "feedback",
+          "check_ins"
+        ],
+        "type": "object"
+      },
+      "TelemetryReleasePage": {
+        "properties": {
+          "end_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TelemetryRelease"
+            },
+            "type": "array"
+          },
+          "start_time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "start_time",
+          "end_time"
         ],
         "type": "object"
       },
@@ -63237,6 +64095,28 @@
               {
                 "type": "null"
               }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateCronMonitor": {
+        "additionalProperties": false,
+        "properties": {
+          "config": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MonitorConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
             ]
           }
         },
@@ -69083,13 +69963,54 @@
         ]
       }
     },
+    "/0/organizations/{org_slug}/artifactbundle/assemble/": {
+      "post": {
+        "operationId": "assemble_artifact_bundle",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArtifactAssembleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactAssembly"
+                }
+              }
+            }
+          },
+          "400": {},
+          "401": {},
+          "403": {},
+          "429": {}
+        },
+        "tags": [
+          "sentry-compat"
+        ]
+      }
+    },
     "/0/organizations/{org_slug}/chunk-upload/": {
       "get": {
-        "description": "sentry-cli checks this endpoint to determine if chunk-based upload is supported.\nWe return a response indicating that chunk upload is NOT supported, which forces\nsentry-cli to fall back to the standard file-by-file upload.",
         "operationId": "chunk_upload_options",
         "parameters": [
           {
-            "description": "Organization slug (ignored)",
             "in": "path",
             "name": "org_slug",
             "required": true,
@@ -69106,11 +70027,35 @@
                   "$ref": "#/components/schemas/SentryChunkUploadResponse"
                 }
               }
-            },
-            "description": "Chunk upload options"
-          }
+            }
+          },
+          "401": {},
+          "403": {}
         },
-        "summary": "Chunk upload options (stub for sentry-cli compatibility).",
+        "summary": "Negotiates only the artifact capability implemented here. Build credentials\nare required; browser DSN public keys cannot upload or read source artifacts.",
+        "tags": [
+          "sentry-compat"
+        ]
+      },
+      "post": {
+        "operationId": "upload_artifact_chunk",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {},
+          "400": {},
+          "401": {},
+          "403": {},
+          "429": {}
+        },
         "tags": [
           "sentry-compat"
         ]
@@ -110483,6 +111428,42 @@
             }
           },
           {
+            "description": "Exact attribute key; pair with attribute_value",
+            "in": "query",
+            "name": "attribute_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact string or numeric text, preserving int64 precision",
+            "in": "query",
+            "name": "attribute_value",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional native declared type; older records without type metadata do not match",
+            "in": "query",
+            "name": "attribute_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/LogAttributeType"
+            }
+          },
+          {
+            "description": "Default eq; numeric types also support lt/lte/gt/gte",
+            "in": "query",
+            "name": "attribute_op",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/LogAttributeOperator"
+            }
+          },
+          {
             "description": "Filter by correlated trace ID",
             "in": "query",
             "name": "trace_id",
@@ -110542,6 +111523,16 @@
               }
             },
             "description": "Log records"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid log attribute filter"
           },
           "401": {
             "content": {
@@ -121002,6 +121993,85 @@
         ]
       }
     },
+    "/projects/{project_id}/client-outcomes": {
+      "get": {
+        "operationId": "list_client_outcomes",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Retained observation window, 1–31 days; default 7.",
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientOutcomePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid outcome query"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Project and telemetry permissions required"
+          }
+        },
+        "tags": [
+          "ingestion-health"
+        ]
+      }
+    },
     "/projects/{project_id}/compose-validation": {
       "get": {
         "operationId": "get_project_compose_validation",
@@ -121074,6 +122144,453 @@
         "summary": "The project's most recent stored Compose check (from its last deployment\nor the revalidation after an upgrade); `null` when it was never checked.",
         "tags": [
           "Compose"
+        ]
+      }
+    },
+    "/projects/{project_id}/cron-monitors": {
+      "get": {
+        "operationId": "listCronMonitors",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CronMonitorList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Already exists"
+          },
+          "429": {
+            "description": "Monitor limit reached"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cron Monitors"
+        ]
+      },
+      "post": {
+        "operationId": "createCronMonitor",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCronMonitor"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CronMonitorView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Already exists"
+          },
+          "429": {
+            "description": "Monitor limit reached"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cron Monitors"
+        ]
+      }
+    },
+    "/projects/{project_id}/cron-monitors/{monitor_id}": {
+      "delete": {
+        "operationId": "deleteCronMonitor",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Monitor ID",
+            "in": "path",
+            "name": "monitor_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Already exists"
+          },
+          "429": {
+            "description": "Monitor limit reached"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cron Monitors"
+        ]
+      },
+      "get": {
+        "operationId": "getCronMonitor",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Monitor ID",
+            "in": "path",
+            "name": "monitor_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CronMonitorView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Already exists"
+          },
+          "429": {
+            "description": "Monitor limit reached"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cron Monitors"
+        ]
+      },
+      "patch": {
+        "operationId": "updateCronMonitor",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Monitor ID",
+            "in": "path",
+            "name": "monitor_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCronMonitor"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CronMonitorView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Already exists"
+          },
+          "429": {
+            "description": "Monitor limit reached"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cron Monitors"
+        ]
+      }
+    },
+    "/projects/{project_id}/cron-monitors/{monitor_id}/runs": {
+      "get": {
+        "operationId": "listCronMonitorRuns",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Monitor ID",
+            "in": "path",
+            "name": "monitor_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CronMonitorRunList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid configuration"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Already exists"
+          },
+          "429": {
+            "description": "Monitor limit reached"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cron Monitors"
         ]
       }
     },
@@ -127786,6 +129303,41 @@
               "minimum": 0,
               "type": "integer"
             }
+          },
+          {
+            "description": "Exact native user ID match.",
+            "in": "query",
+            "name": "user_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Exact tag match; supply tag_value together with this field.",
+            "in": "query",
+            "name": "tag_key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag_value",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -127798,6 +129350,9 @@
               }
             },
             "description": "Paginated list of error events"
+          },
+          "400": {
+            "description": "Invalid metadata filters"
           },
           "404": {
             "description": "Error group not found"
@@ -128957,6 +130512,205 @@
         "summary": "Get details of a specific external image",
         "tags": [
           "External Images"
+        ]
+      }
+    },
+    "/projects/{project_id}/feedback": {
+      "get": {
+        "operationId": "list_project_feedback",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedbackPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Project access required"
+          }
+        },
+        "tags": [
+          "feedback"
+        ]
+      }
+    },
+    "/projects/{project_id}/feedback/{feedback_id}": {
+      "delete": {
+        "operationId": "delete_project_feedback",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "feedback_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Feedback permanently deleted"
+          },
+          "404": {
+            "description": "Feedback not found"
+          }
+        },
+        "tags": [
+          "feedback"
+        ]
+      },
+      "get": {
+        "operationId": "get_project_feedback",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "feedback_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedbackView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Feedback not found"
+          }
+        },
+        "tags": [
+          "feedback"
+        ]
+      },
+      "patch": {
+        "operationId": "update_project_feedback",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "feedback_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackStatusRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Feedback status updated"
+          },
+          "400": {
+            "description": "Invalid status"
+          },
+          "404": {
+            "description": "Feedback not found"
+          }
+        },
+        "tags": [
+          "feedback"
         ]
       }
     },
@@ -132494,6 +134248,16 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceMapUploadForm"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {
@@ -134562,6 +136326,97 @@
           "Status Page"
         ],
         "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/telemetry-releases": {
+      "get": {
+        "operationId": "list_telemetry_releases",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exact SDK release identity; absent lists observed releases.",
+            "in": "query",
+            "name": "release",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Retained observation window, 1–31 days; default 7.",
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryReleasePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid release query"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Project and telemetry permissions required"
+          }
+        },
+        "tags": [
+          "releases"
+        ]
       }
     },
     "/projects/{project_id}/unique-counts": {
@@ -147860,6 +149715,82 @@
         ]
       }
     },
+    "/{project_id}/nel/": {
+      "post": {
+        "operationId": "ingest_nel_reports",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/reports+json": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {},
+          "400": {},
+          "401": {},
+          "403": {},
+          "413": {},
+          "415": {},
+          "429": {}
+        },
+        "tags": [
+          "sentry-ingestor"
+        ]
+      }
+    },
+    "/{project_id}/security/": {
+      "post": {
+        "operationId": "ingest_security_reports",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/csp-report": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {},
+          "400": {},
+          "401": {},
+          "403": {},
+          "413": {},
+          "415": {},
+          "429": {}
+        },
+        "tags": [
+          "sentry-ingestor"
+        ]
+      }
+    },
     "/{project_id}/store/": {
       "post": {
         "operationId": "ingest_sentry_event",
@@ -148393,6 +150324,18 @@
     {
       "description": "External plugin management and discovery",
       "name": "External Plugins"
+    },
+    {
+      "description": "Native project feedback inbox",
+      "name": "feedback"
+    },
+    {
+      "description": "Release correlation across native telemetry",
+      "name": "releases"
+    },
+    {
+      "description": "Approximate SDK-reported telemetry discards",
+      "name": "ingestion-health"
     }
   ]
 }

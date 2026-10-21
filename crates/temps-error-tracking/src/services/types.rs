@@ -69,6 +69,22 @@ pub enum ErrorTrackingError {
     },
 }
 
+/// Native durable ingestion result; duplicate SDK events do not increment counts
+/// or re-run alert/regression transitions.
+#[derive(Debug, Clone, Copy)]
+pub struct ErrorIngestReceipt {
+    pub group_id: i32,
+    pub stored: bool,
+}
+
+/// Native error metadata filters; both tags fields must be provided together.
+#[derive(Debug, Default, Clone)]
+pub struct ErrorEventFilter {
+    pub user_id: Option<String>,
+    pub tag_key: Option<String>,
+    pub tag_value: Option<String>,
+}
+
 /// Input data for creating a new error event
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateErrorEventData {

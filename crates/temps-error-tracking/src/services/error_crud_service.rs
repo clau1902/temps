@@ -80,7 +80,9 @@ impl ErrorCRUDService {
             request_data: data
                 .as_ref()
                 .and_then(|d| d.request.as_ref()?.post_data.clone()),
-            request_context: None,
+            request_context: data
+                .as_ref()
+                .and_then(|d| d.sentry.as_ref()?.get("request").cloned()),
 
             // User context
             user_id: data.as_ref().and_then(|d| d.user.as_ref()?.user_id.clone()),
@@ -246,8 +248,8 @@ impl ErrorCRUDService {
         start_date: Option<DateTime<Utc>>,
         end_date: Option<DateTime<Utc>>,
     ) -> Result<(Vec<ErrorGroupDomain>, u64), ErrorTrackingError> {
-        let page = page.unwrap_or(1);
-        let page_size = std::cmp::min(page_size.unwrap_or(20), 100);
+        let page = page.unwrap_or(1).max(1);
+        let page_size = page_size.unwrap_or(20).clamp(1, 100);
 
         let mut query =
             error_groups::Entity::find().filter(error_groups::Column::ProjectId.eq(project_id));
@@ -697,14 +699,60 @@ impl ErrorCRUDService {
         page: Option<u64>,
         page_size: Option<u64>,
     ) -> Result<(Vec<ErrorEventDomain>, u64), ErrorTrackingError> {
-        let page = page.unwrap_or(1);
-        let page_size = std::cmp::min(page_size.unwrap_or(20), 100);
+        self.list_error_events_filtered(
+            group_id,
+            project_id,
+            page,
+            page_size,
+            &super::types::ErrorEventFilter::default(),
+        )
+        .await
+    }
 
-        let query = error_events::Entity::find()
+    pub async fn list_error_events_filtered(
+        &self,
+        group_id: i32,
+        project_id: i32,
+        page: Option<u64>,
+        page_size: Option<u64>,
+        filter: &super::types::ErrorEventFilter,
+    ) -> Result<(Vec<ErrorEventDomain>, u64), ErrorTrackingError> {
+        if filter
+            .user_id
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > 1024)
+            || filter
+                .tag_key
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 1024)
+            || filter.tag_value.as_ref().is_some_and(|s| s.len() > 4096)
+            || filter.tag_key.is_some() != filter.tag_value.is_some()
+        {
+            return Err(ErrorTrackingError::Validation(
+                "Metadata filters exceed limits, or tag_key/tag_value are not paired".into(),
+            ));
+        }
+        let page = page.unwrap_or(1).max(1);
+        let page_size = page_size.unwrap_or(20).clamp(1, 100);
+
+        let mut query = error_events::Entity::find()
             .filter(error_events::Column::ErrorGroupId.eq(group_id))
             .filter(error_events::Column::ProjectId.eq(project_id))
             .order_by_desc(error_events::Column::Timestamp);
 
+        if let Some(user_id) = &filter.user_id {
+            query = query.filter(sea_orm::sea_query::Expr::cust_with_values(
+                "data #>> '{user,user_id}' = $1",
+                [user_id.clone()],
+            ));
+        }
+        if let (Some(key), Some(value)) = (&filter.tag_key, &filter.tag_value) {
+            let object = serde_json::json!({(key):value}).to_string();
+            query = query.filter(sea_orm::sea_query::Expr::cust_with_values(
+                "(data #> '{trace,extra,tags}' @> CAST($1 AS jsonb) OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(data #> '{trace,extra,tags}')='array' THEN data #> '{trace,extra,tags}' ELSE '[]'::jsonb END) AS tag WHERE tag->>0=$2 AND tag->>1=$3))",
+                [object, key.clone(), value.clone()],
+            ));
+        }
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
         let events = paginator.fetch_page(page - 1).await?;

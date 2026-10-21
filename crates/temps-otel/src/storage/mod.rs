@@ -18,6 +18,7 @@ pub mod cloud_routed;
 /// Reads mirrored spans back out of Temps Cloud through its read proxy.
 pub mod cloud_spans;
 pub mod global_traces;
+pub mod receipts;
 pub mod timescaledb;
 
 pub use cloud_metrics::{

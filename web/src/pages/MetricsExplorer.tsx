@@ -13,6 +13,7 @@ import {
   getEnvironmentsOptions,
   listMetricNamesOptions,
   queryMetricsOptions,
+  queryMetricsQueryKey,
   listAlertsOptions,
   // Backtests an anomaly rule's band over the visible range to shade it.
   previewAlertMutation,
@@ -63,7 +64,7 @@ import {
 } from '@/components/metrics/alert-status'
 import { SuggestAlertsButton } from '@/components/metrics/SuggestAlertsButton'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   ArrowLeft,
@@ -114,8 +115,7 @@ const RANGE_BUCKET: Record<TimeRange, string> = {
   '30d': '6 hours',
 }
 
-function timeRangeToFrom(range: TimeRange): Date {
-  const now = Date.now()
+function timeRangeToFrom(range: TimeRange, now = Date.now()): Date {
   const map: Record<TimeRange, number> = {
     '1h': 60 * 60 * 1000,
     '6h': 6 * 60 * 60 * 1000,
@@ -288,6 +288,8 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   // The filter controls collapse by default so the metric grid / chart sits high
   // on the page; the collapsed header still summarizes the active selection.
   const [filtersOpen, setFiltersOpen] = useState(false)
+  const [queryClock, setQueryClock] = useState(Date.now)
+  const queryClient = useQueryClient()
 
   const patchParams = (mutate: (p: URLSearchParams) => void) => {
     const params = new URLSearchParams(searchParams)
@@ -299,7 +301,8 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
     patchParams((p) => (v ? p.set('metric', v) : p.delete('metric')))
   const setServiceName = (v: string) =>
     patchParams((p) => (v ? p.set('service', v) : p.delete('service')))
-  const setTimeRange = (v: TimeRange) =>
+  const setTimeRange = (v: TimeRange) => {
+    setQueryClock(Date.now())
     patchParams((p) => {
       // Selecting a preset always exits custom mode.
       p.delete('start')
@@ -307,6 +310,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
       if (v === '24h') p.delete('range')
       else p.set('range', v)
     })
+  }
   // Apply an absolute range (from the date picker, or freezing the current
   // window). Clears the relative preset.
   const setCustomRange = (from: Date, to: Date) =>
@@ -365,18 +369,20 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   }, [allNames, nameSearch])
 
   // ── Time-bucketed series ──
-  // Both bounds are memoized on `timeRange` so they stay STABLE across renders.
+  // Keep both bounds stable across renders, advancing relative windows on Refresh.
   // Using `new Date()` inline would change the query key every render and spin
   // React Query into an infinite refetch loop.
   const fromDate = useMemo(
-    () => (isCustom ? new Date(customStartStr!) : timeRangeToFrom(timeRange)),
+    () =>
+      isCustom
+        ? new Date(customStartStr!)
+        : timeRangeToFrom(timeRange, queryClock),
 
-    [isCustom, customStartStr, timeRange]
+    [isCustom, customStartStr, timeRange, queryClock]
   )
   const toDate = useMemo(
-    () => (isCustom ? new Date(customEndStr!) : new Date()),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isCustom, customEndStr, timeRange]
+    () => (isCustom ? new Date(customEndStr!) : new Date(queryClock)),
+    [isCustom, customEndStr, queryClock]
   )
   const fromIso = fromDate.toISOString()
   const toIso = toDate.toISOString()
@@ -652,7 +658,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
             <h1 className="text-lg font-semibold tracking-tight">Metrics</h1>
           </div>
           <p className="text-sm text-muted-foreground">
-            Explore OpenTelemetry metrics for {project.name}.
+            Explore application metrics from OpenTelemetry and Sentry SDKs.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 self-start">
@@ -668,7 +674,14 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
             size="sm"
             onClick={() => {
               namesQuery.refetch()
-              if (metricName) metricsQuery.refetch()
+              setQueryClock(Date.now())
+              // Custom bounds stay fixed; refresh every visible metric tile too.
+              if (isCustom)
+                void queryClient.invalidateQueries({
+                  queryKey: queryMetricsQueryKey({
+                    query: { project_id: project.id },
+                  }),
+                })
             }}
             className="gap-1.5"
           >

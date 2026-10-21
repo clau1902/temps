@@ -35,3 +35,5 @@ pub use migration::m20261016_000002_ci_build_dispatch::Migration as CiBuildDispa
 pub use migration::m20261017_000001_retain_ci_cancellation::Migration as RetainCiCancellationMigration;
 
 pub use migration::m20261017_000002_runtime_health::Migration as RuntimeHealthMigration;
+
+pub use migration::m20261019_000002_reconcile_error_group_counts::Migration as ReconcileErrorGroupCountsMigration;

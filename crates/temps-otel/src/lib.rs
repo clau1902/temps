@@ -169,3 +169,5 @@ pub struct OtelAppState {
     /// forced to re-estimate by an unrelated restart.
     pub plan_signing_key: std::sync::Arc<[u8; 32]>,
 }
+
+pub mod log_attributes;
