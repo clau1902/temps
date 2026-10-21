@@ -799,6 +799,22 @@ impl ImportOrchestrator {
     }
 
     /// Get import status
+    /// The source a session was planned from, for authorizing its execution
+    /// before anything is created. Ownership is checked exactly as for
+    /// `execute_import`, so a non-owner learns nothing about the session.
+    pub fn session_source(
+        &self,
+        user_id: i32,
+        session_id: &str,
+    ) -> ImportServiceResult<ImportSource> {
+        let sessions = self.sessions_read()?;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| ImportServiceError::SessionNotFound(session_id.to_string()))?;
+        check_session_ownership(session, user_id, session_id)?;
+        Ok(ImportSource::from_str(&session.plan.source)?)
+    }
+
     pub async fn get_status(
         &self,
         user_id: i32,

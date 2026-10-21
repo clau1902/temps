@@ -14,12 +14,14 @@ use axum::{
     Json, Router,
 };
 use std::sync::Arc;
-use temps_auth::{permission_check, RequireAuth};
-use temps_core::problemdetails::Problem;
+use temps_auth::{permission_check, AuthContext, RequireAuth};
+use temps_core::error_builder::ErrorBuilder;
+use temps_core::problemdetails::{PermissionDenialKind, Problem};
 use temps_core::{AuditContext, RequestMetadata};
 use tracing::error;
 use utoipa::OpenApi;
 
+use temps_import_types::ImportSource;
 use types::{
     CreatePlanRequest, CreatePlanResponse, DiscoverRequest, DiscoverResponse, ExecuteImportRequest,
     ExecuteImportResponse, ImportSourceInfo, ImportStatusResponse,
@@ -33,6 +35,37 @@ pub fn configure_routes() -> Router<Arc<types::AppState>> {
         .route("/imports/plan", post(create_plan))
         .route("/imports/execute", post(execute_import))
         .route("/imports/{session_id}", get(get_import_status))
+}
+
+/// Whether `source` reads this server's own host rather than a remote
+/// platform reached with the caller's credentials. The Docker importer talks
+/// to the local Docker daemon and ignores credentials entirely, so it sees
+/// every container on the host -- every project's, and Temps' own -- with
+/// their env vars, labels and bind-mount paths.
+fn source_reads_local_host(source: ImportSource) -> bool {
+    matches!(source, ImportSource::Docker)
+}
+
+/// A host-local source is an operator tool: only an instance administrator
+/// may enumerate, inspect or import from it. Remote sources reach only what
+/// the caller's own credentials can, so they keep the plain import
+/// permissions.
+fn require_source_access(auth: &AuthContext, source: ImportSource) -> Result<(), Problem> {
+    if source_reads_local_host(source) && !auth.is_instance_admin() {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .type_("https://temps.sh/probs/insufficient-permissions")
+            .title("Instance Administrator Required")
+            .detail(format!(
+                "Importing from the '{}' source reads this server's Docker daemon, which \
+                 holds every project's containers; only an instance administrator can use it",
+                source.as_str()
+            ))
+            .value("source", source.as_str())
+            .value("user_role", auth.effective_role.to_string())
+            .permission_denial(PermissionDenialKind::InsufficientPermission, None)
+            .build());
+    }
+    Ok(())
 }
 
 /// List available import sources
@@ -77,6 +110,7 @@ async fn discover_workloads(
     Json(request): Json<types::DiscoverRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, temps_auth::Permission::ImportsRead);
+    require_source_access(&auth, request.source)?;
 
     let workloads = state
         .import_orchestrator
@@ -106,6 +140,7 @@ async fn create_plan(
     Json(request): Json<types::CreatePlanRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, temps_auth::Permission::ImportsCreate);
+    require_source_access(&auth, request.source)?;
 
     let result = state
         .import_orchestrator
@@ -142,6 +177,12 @@ async fn execute_import(
     Json(request): Json<types::ExecuteImportRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, temps_auth::Permission::ImportsCreate);
+    // Re-checked here, not only at plan time: the caller may have lost
+    // instance-admin standing since the session was planned.
+    let source = state
+        .import_orchestrator
+        .session_source(auth.user_id(), &request.session_id)?;
+    require_source_access(&auth, source)?;
 
     let session_id = request.session_id.clone();
     let project_name = request.project_name.clone();
@@ -241,3 +282,70 @@ async fn get_import_status(
     )
 )]
 pub struct ImportApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temps_auth::permissions::Role;
+    use temps_entities::users;
+
+    fn auth(role: Role) -> AuthContext {
+        let now = chrono::Utc::now();
+        AuthContext::new_session(
+            users::Model {
+                id: 11,
+                name: "Import Tester".to_string(),
+                email: "import-tester@example.com".to_string(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            },
+            role,
+        )
+    }
+
+    /// F2: users and readers hold `imports:read`/`imports:create`, but the
+    /// Docker source would hand them every container on the host.
+    #[test]
+    fn non_admins_cannot_use_the_host_docker_source() {
+        for role in [Role::User, Role::Reader] {
+            let err = require_source_access(&auth(role), ImportSource::Docker)
+                .expect_err("host Docker daemon is admin-only");
+            assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[test]
+    fn instance_admins_can_use_the_host_docker_source() {
+        for role in [Role::Admin, Role::PlatformAdmin] {
+            assert!(require_source_access(&auth(role), ImportSource::Docker).is_ok());
+        }
+    }
+
+    #[test]
+    fn remote_sources_keep_the_plain_import_permissions() {
+        for source in [
+            ImportSource::Coolify,
+            ImportSource::Dokploy,
+            ImportSource::Kubernetes,
+            ImportSource::Caprover,
+            ImportSource::Portainer,
+            ImportSource::Kamal,
+        ] {
+            assert!(!source_reads_local_host(source), "{source:?}");
+            assert!(require_source_access(&auth(Role::User), source).is_ok());
+        }
+    }
+}
