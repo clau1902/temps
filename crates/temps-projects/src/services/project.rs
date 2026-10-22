@@ -1930,6 +1930,56 @@ impl ProjectService {
             project_found_db
         };
 
+        // Auto-install a GitHub repository webhook for non-App GitHub
+        // connections (best-effort, non-fatal). Without it a PAT/OAuth
+        // project never hears about a push (#1596).
+        let project_found_db = if let Some(conn_id) = project_found_db.git_provider_connection_id {
+            let repo_owner = project_found_db.repo_owner.clone();
+            let repo_name = project_found_db.repo_name.clone();
+            if !repo_owner.is_empty() && !repo_name.is_empty() {
+                match self
+                    .install_github_webhook_for_connection(
+                        project_found_db.id,
+                        conn_id,
+                        &repo_owner,
+                        &repo_name,
+                    )
+                    .await
+                {
+                    Ok(Some((hook_id, encrypted_secret))) => {
+                        let mut active = projects::ActiveModel::from(project_found_db.clone());
+                        active.github_webhook_id = Set(Some(hook_id));
+                        active.github_webhook_signing_token = Set(Some(encrypted_secret));
+                        active.updated_at = Set(chrono::Utc::now());
+                        match active.update(self.db.as_ref()).await {
+                            Ok(updated) => updated,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to persist GitHub webhook fields on new project {}: {}",
+                                    project_found_db.id,
+                                    e
+                                );
+                                project_found_db
+                            }
+                        }
+                    }
+                    Ok(None) => project_found_db,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to install GitHub webhook for new project {}: {}",
+                            project_found_db.id,
+                            e
+                        );
+                        project_found_db
+                    }
+                }
+            } else {
+                project_found_db
+            }
+        } else {
+            project_found_db
+        };
+
         // Auto-install Gitea webhook if applicable (best-effort, non-fatal).
         // BLOCKER 1 fix: gitea_webhook_signing_token was never written.
         let project_found_db = if let Some(conn_id) = project_found_db.git_provider_connection_id {
@@ -4007,6 +4057,7 @@ impl ProjectService {
         let old_repo_name = project.repo_name.clone();
         let old_gitlab_webhook_id = project.gitlab_webhook_id;
         let old_bitbucket_hook_id = project.bitbucket_webhook_hook_id.clone();
+        let old_github_webhook_id = project.github_webhook_id;
         // Gitea: no separate hook_id column — we clear gitea_webhook_signing_token
         // on repo change / disconnect. The orphaned remote hook on Gitea is
         // acceptable for v1 (no stored ID to call DELETE with).
@@ -4295,6 +4346,67 @@ impl ProjectService {
             // Explicit disconnect: clear Bitbucket webhook state.
             active_project.bitbucket_webhook_hook_id = Set(None);
             active_project.bitbucket_webhook_token = Set(None);
+        }
+
+        // ── GitHub repository webhook lifecycle ─────────────────────────────
+        //
+        // Mirrors the GitLab block above for non-App GitHub connections:
+        // delete the old repository hook when the repo changes and register
+        // one on the new repo (best-effort, non-fatal).
+
+        if repo_changed {
+            if let (Some(old_hook_id), Some(old_conn_id)) =
+                (old_github_webhook_id, old_connection_id)
+            {
+                if let Err(e) = self
+                    .delete_github_webhook_for_connection(
+                        old_conn_id,
+                        &old_repo_owner,
+                        &old_repo_name,
+                        old_hook_id,
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to remove old GitHub webhook {} for project {}: {}",
+                        old_hook_id, project_id, e
+                    );
+                }
+            }
+            // Clear stale hook fields unconditionally — even if delete failed
+            // (it may already be gone on GitHub's side).
+            active_project.github_webhook_id = Set(None);
+            active_project.github_webhook_signing_token = Set(None);
+
+            if let Some(conn_id) = new_connection_id {
+                match self
+                    .install_github_webhook_for_connection(
+                        project_id,
+                        conn_id,
+                        &repo_owner,
+                        &repo_name,
+                    )
+                    .await
+                {
+                    Ok(Some((hook_id, encrypted_secret))) => {
+                        active_project.github_webhook_id = Set(Some(hook_id));
+                        active_project.github_webhook_signing_token = Set(Some(encrypted_secret));
+                    }
+                    Ok(None) => {
+                        // Not a non-App GitHub connection — nothing to do.
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to install GitHub webhook for project {}: {}",
+                            project_id, e
+                        );
+                    }
+                }
+            }
+        } else if git_provider_connection_id == Some(0) {
+            // Explicit disconnect: clear GitHub webhook state.
+            active_project.github_webhook_id = Set(None);
+            active_project.github_webhook_signing_token = Set(None);
         }
 
         // ── Gitea webhook lifecycle ──────────────────────────────────────────
@@ -5091,6 +5203,162 @@ impl ProjectService {
         );
 
         Ok(encrypted_token)
+    }
+
+    // ── GitHub repository webhook install / delete ──────────────────────────────
+    //
+    // A GitHub App delivers every push through the App's own webhook. A GitHub
+    // connection authenticated any other way (personal access token, OAuth)
+    // has no App, so without a repository webhook nothing ever told Temps
+    // about a push and auto-deploy silently did nothing (#1596). For those
+    // connections we register a repository webhook signed with a fresh
+    // per-project secret, stored encrypted together with the hook ID so the
+    // hook can be deleted when the project's repository changes.
+    //
+    // Failures are non-fatal — same policy as GitLab/Gitea/Bitbucket.
+
+    /// Resolve `connection_id` to `(provider_id, access_token)` when it is a
+    /// GitHub connection that needs its own repository webhook, i.e. any
+    /// GitHub connection that is not a GitHub App. `Ok(None)` for App
+    /// connections and other providers (caller skips).
+    async fn resolve_github_repo_webhook_connection(
+        &self,
+        connection_id: i32,
+    ) -> Result<Option<(i32, String)>, String> {
+        use temps_entities::{git_provider_connections, git_providers};
+
+        let connection = git_provider_connections::Entity::find_by_id(connection_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching connection {connection_id}: {e}"))?
+            .ok_or_else(|| format!("Connection {connection_id} not found"))?;
+
+        let provider = git_providers::Entity::find_by_id(connection.provider_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching provider {}: {e}", connection.provider_id))?
+            .ok_or_else(|| format!("Provider {} not found", connection.provider_id))?;
+
+        if !github_connection_needs_repo_webhook(&provider.provider_type, &provider.auth_method) {
+            return Ok(None);
+        }
+
+        let access_token = self
+            .git_provider_manager
+            .get_connection_token(connection_id)
+            .await
+            .map_err(|e| {
+                format!("Failed to get access token for GitHub connection {connection_id}: {e}")
+            })?;
+
+        Ok(Some((provider.id, access_token)))
+    }
+
+    /// Register a GitHub repository webhook for `project_id` when
+    /// `connection_id` is a non-App GitHub connection.
+    ///
+    /// Returns `Ok(Some((hook_id, encrypted_secret)))` on success, `Ok(None)`
+    /// when the connection does not need one, `Err` on failure (non-fatal —
+    /// the caller logs and continues).
+    async fn install_github_webhook_for_connection(
+        &self,
+        project_id: i32,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Option<(i64, String)>, String> {
+        use temps_git::handlers::github::GITHUB_REPO_WEBHOOK_PATH;
+        use temps_git::services::git_provider::WebhookConfig;
+        use temps_git::services::github_provider::generate_github_webhook_secret;
+
+        let Some((provider_id, access_token)) = self
+            .resolve_github_repo_webhook_connection(connection_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let secret = generate_github_webhook_secret()
+            .map_err(|error| format!("Failed to generate GitHub webhook secret: {error}"))?;
+
+        let webhook_url = format!(
+            "{}/api{}",
+            self.git_webhook_base_url().await,
+            GITHUB_REPO_WEBHOOK_PATH
+        );
+
+        let provider_service = self
+            .git_provider_manager
+            .get_provider_service(provider_id)
+            .await
+            .map_err(|e| {
+                format!("Failed to get provider service for GitHub connection {connection_id}: {e}")
+            })?;
+
+        let hook_id = provider_service
+            .create_webhook(
+                &access_token,
+                owner,
+                repo,
+                WebhookConfig {
+                    url: webhook_url,
+                    secret: Some(secret.clone()),
+                    events: vec!["push".to_string()],
+                },
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to register GitHub webhook for project {project_id} ({owner}/{repo}): {e}"
+                )
+            })?;
+        let hook_id: i64 = hook_id.parse().map_err(|e| {
+            format!(
+                "GitHub returned a non-numeric webhook ID '{hook_id}' for project {project_id} ({owner}/{repo}): {e}"
+            )
+        })?;
+
+        let encrypted_secret = self
+            .encryption_service
+            .encrypt_string(&secret)
+            .map_err(|e| format!("Failed to encrypt GitHub webhook secret: {e}"))?;
+
+        info!(
+            "Registered GitHub repository webhook {} for project {} ({}/{})",
+            hook_id, project_id, owner, repo
+        );
+
+        Ok(Some((hook_id, encrypted_secret)))
+    }
+
+    /// Delete a previously registered GitHub repository webhook. Best-effort.
+    async fn delete_github_webhook_for_connection(
+        &self,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+        hook_id: i64,
+    ) -> Result<(), String> {
+        let Some((provider_id, access_token)) = self
+            .resolve_github_repo_webhook_connection(connection_id)
+            .await?
+        else {
+            // No longer a non-App GitHub connection — nothing we can delete with.
+            return Ok(());
+        };
+
+        let provider_service = self
+            .git_provider_manager
+            .get_provider_service(provider_id)
+            .await
+            .map_err(|e| {
+                format!("Failed to get provider service for GitHub connection {connection_id}: {e}")
+            })?;
+
+        provider_service
+            .delete_webhook(&access_token, owner, repo, &hook_id.to_string())
+            .await
+            .map_err(|e| format!("GitHub delete webhook {hook_id} error for {owner}/{repo}: {e}"))
     }
 
     // ── Generic webhook token install ────────────────────────────────────────────
@@ -7056,6 +7324,14 @@ fn git_webhook_base_url(settings: Option<&temps_core::AppSettings>) -> String {
         .unwrap_or_else(|| "http://localhost:8080".to_string())
 }
 
+/// Whether a provider needs Temps to register a GitHub repository webhook for
+/// its projects: a GitHub provider authenticated any way other than as a
+/// GitHub App. An App delivers pushes through its own webhook, and a second
+/// repository webhook would deploy every push twice.
+fn github_connection_needs_repo_webhook(provider_type: &str, auth_method: &str) -> bool {
+    provider_type == "github" && auth_method != "github_app"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7305,6 +7581,22 @@ mod tests {
         );
         // An unreadable settings row behaves like an unconfigured one.
         assert_eq!(git_webhook_base_url(None), "http://localhost:8080");
+    }
+
+    // #1596: a GitHub PAT/OAuth connection has no App webhook, so its
+    // projects need a repository webhook; an App connection must not get one
+    // (the push would arrive twice), and other providers have their own flow.
+    #[test]
+    fn only_non_app_github_connections_get_a_repository_webhook() {
+        assert!(github_connection_needs_repo_webhook("github", "pat"));
+        assert!(github_connection_needs_repo_webhook("github", "oauth"));
+        assert!(!github_connection_needs_repo_webhook(
+            "github",
+            "github_app"
+        ));
+        assert!(!github_connection_needs_repo_webhook("gitlab", "pat"));
+        assert!(!github_connection_needs_repo_webhook("gitea", "pat"));
+        assert!(!github_connection_needs_repo_webhook("bitbucket", "pat"));
     }
     use sea_orm::{ActiveModelTrait, Set};
 

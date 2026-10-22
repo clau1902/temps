@@ -5628,6 +5628,107 @@ impl GitProviderManager {
             .await
     }
 
+    /// Handle a push delivered by a GitHub App webhook.
+    ///
+    /// Same as [`Self::handle_push_event`], except projects that receive
+    /// pushes through their own repository webhook (a non-App GitHub
+    /// connection, see [`Self::github_repo_webhook_projects`]) are left out:
+    /// when an App also happens to be installed on that repository, both
+    /// webhooks fire for the same push and the project would deploy twice.
+    pub async fn handle_github_app_push_event(
+        &self,
+        owner: String,
+        repo: String,
+        branch: Option<String>,
+        tag: Option<String>,
+        commit: String,
+    ) -> Result<usize, GitProviderManagerError> {
+        if commit.is_empty() || commit.chars().all(|c| c == '0') {
+            tracing::info!(
+                "Ignoring GitHub App push event for {}/{} with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
+                owner,
+                repo,
+                branch,
+                tag
+            );
+            return Ok(0);
+        }
+
+        let matching_projects = projects::Entity::find()
+            .filter(projects::Column::RepoOwner.eq(&owner))
+            .filter(projects::Column::RepoName.eq(&repo))
+            .filter(projects::Column::GithubWebhookSigningToken.is_null())
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "Failed to find GitHub App projects for {}/{}: {}",
+                    owner,
+                    repo,
+                    e
+                );
+                GitProviderManagerError::DatabaseError(e)
+            })?;
+
+        self.queue_push_event_for_projects(branch, tag, commit, matching_projects)
+            .await
+    }
+
+    /// Projects whose own GitHub repository webhook signed this delivery.
+    ///
+    /// A GitHub connection that is not a GitHub App (personal access token or
+    /// OAuth) has no App webhook to deliver pushes, so Temps registers a
+    /// repository webhook per project, each signed with a secret of its own.
+    /// Only projects whose stored secret verifies `signature`
+    /// (`X-Hub-Signature-256`) over the raw `body` are returned. Several
+    /// projects may point at the same repository, each with its own hook, and
+    /// a delivery signed with one project's secret must not deploy the others.
+    pub async fn github_repo_webhook_projects(
+        &self,
+        owner: &str,
+        repo: &str,
+        body: &[u8],
+        signature: &str,
+    ) -> Result<Vec<projects::Model>, GitProviderManagerError> {
+        let candidates = projects::Entity::find()
+            .filter(projects::Column::RepoOwner.eq(owner))
+            .filter(projects::Column::RepoName.eq(repo))
+            .filter(projects::Column::GithubWebhookSigningToken.is_not_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut authorized = Vec::with_capacity(candidates.len());
+        for project in candidates {
+            let Some(encrypted) = project.github_webhook_signing_token.as_deref() else {
+                continue;
+            };
+            let secret = match self.decrypt_string(encrypted).await {
+                Ok(secret) => secret,
+                Err(e) => {
+                    warn!(
+                        "Failed to decrypt GitHub webhook secret for project {} ({}/{}): {}",
+                        project.id, owner, repo, e
+                    );
+                    continue;
+                }
+            };
+            match super::github_provider::github_webhook_signature_matches(body, signature, &secret)
+            {
+                Ok(true) => authorized.push(project),
+                Ok(false) => debug!(
+                    "GitHub repository webhook signature does not match project {} ({}/{})",
+                    project.id, owner, repo
+                ),
+                Err(e) => warn!(
+                    "Cannot verify GitHub repository webhook for project {} ({}/{}): {}",
+                    project.id, owner, repo, e
+                ),
+            }
+        }
+
+        Ok(authorized)
+    }
+
     /// Whether a project with this source type should still act on a Git push.
     ///
     /// `Git` obviously does. `Manual` does too — it is documented as "accepts
@@ -7602,6 +7703,260 @@ mod tests {
         assert!(
             result.is_ok(),
             "empty-SHA push event should be ignored: {result:?}"
+        );
+    }
+
+    /// Records every job it is sent.
+    #[derive(Default)]
+    struct RecordingJobQueue {
+        jobs: std::sync::Mutex<Vec<Job>>,
+    }
+
+    #[async_trait]
+    impl JobQueue for RecordingJobQueue {
+        async fn send(&self, job: Job) -> Result<(), QueueError> {
+            self.jobs.lock().unwrap().push(job);
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn JobReceiver> {
+            panic!("subscribe not needed for tests")
+        }
+    }
+
+    fn github_repo_project(id: i32, encrypted_secret: Option<String>) -> projects::Model {
+        let now = chrono::Utc::now();
+        projects::Model {
+            id,
+            name: format!("project-{id}"),
+            repo_name: "example-repository".to_string(),
+            repo_owner: "example-owner".to_string(),
+            directory: "/".to_string(),
+            pull_only_root_directory: false,
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::Vite,
+            preset_config: None,
+            deployment_config: None,
+            created_at: now,
+            updated_at: now,
+            slug: format!("project-{id}"),
+            template_slug: None,
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: false,
+            git_url: None,
+            git_provider_connection_id: Some(7),
+            attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_api_traffic_summary_enabled: None,
+            allow_alternate_sources: None,
+            hosting: Default::default(),
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            cross_project_trace_sharing: true,
+            error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
+            error_source_root: None,
+            image_retention_hours: None,
+            cloud_telemetry_fidelity:
+                temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
+            cloud_telemetry_write_mode:
+                temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
+            cloud_analytics_write_mode:
+                temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            instantiation_token: None,
+            cloud_telemetry_attribute_allowlist: Vec::new(),
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
+            source_type: temps_entities::source_type::SourceType::Git,
+            project_type: temps_entities::types::ProjectType::Server,
+            service_template: None,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            github_webhook_id: encrypted_secret.as_ref().map(|_| 1000 + i64::from(id)),
+            github_webhook_signing_token: encrypted_secret,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+        }
+    }
+
+    fn github_signature(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, KeyInit, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    /// #1596: a push to a repository connected through a GitHub personal
+    /// access token never deployed, because only the GitHub App webhook was
+    /// accepted. A repository webhook delivery signed with the project's own
+    /// secret must now queue a deployment for that project -- and only that
+    /// one, when another project on the same repository has its own secret.
+    #[tokio::test]
+    async fn github_repo_webhook_push_deploys_only_projects_whose_secret_signed_it() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        );
+        let signing_project = github_repo_project(
+            1,
+            Some(encryption_service.encrypt_string("secret-one").unwrap()),
+        );
+        let other_project = github_repo_project(
+            2,
+            Some(encryption_service.encrypt_string("secret-two").unwrap()),
+        );
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![signing_project, other_project]])
+                .into_connection(),
+        );
+        let queue = Arc::new(RecordingJobQueue::default());
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            queue.clone() as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+
+        let body =
+            br#"{"ref":"refs/heads/main","after":"0123456789abcdef0123456789abcdef01234567"}"#;
+        let authorized = manager
+            .github_repo_webhook_projects(
+                "example-owner",
+                "example-repository",
+                body,
+                &github_signature("secret-one", body),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            authorized.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![1],
+            "only the project whose secret signed the delivery is authorized"
+        );
+
+        let queued = manager
+            .handle_push_event_for_projects(
+                Some("main".to_string()),
+                None,
+                "0123456789abcdef0123456789abcdef01234567".to_string(),
+                authorized,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued, 1);
+
+        let jobs = queue.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        match &jobs[0] {
+            Job::GitPushEvent(job) => {
+                assert_eq!(job.project_id, 1);
+                assert_eq!(job.branch.as_deref(), Some("main"));
+                assert!(
+                    !job.manual_trigger,
+                    "a webhook push honours automatic_deploy"
+                );
+            }
+            other => panic!("expected a GitPushEvent job, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn github_repo_webhook_rejects_signatures_from_unknown_secrets() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        );
+        let project = github_repo_project(
+            1,
+            Some(encryption_service.encrypt_string("project-secret").unwrap()),
+        );
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![project]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(PanicOnSendJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+
+        let body = br#"{"ref":"refs/heads/main"}"#;
+        let authorized = manager
+            .github_repo_webhook_projects(
+                "example-owner",
+                "example-repository",
+                body,
+                &github_signature("attacker-secret", body),
+            )
+            .await
+            .unwrap();
+        assert!(authorized.is_empty());
+    }
+
+    /// When a GitHub App is also installed on a repository whose project has
+    /// its own repository webhook, the App's delivery must not deploy that
+    /// project a second time.
+    #[tokio::test]
+    async fn github_app_push_skips_projects_with_their_own_repo_webhook() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<projects::Model>::new()])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(PanicOnSendJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db.clone()),
+        );
+
+        let queued = manager
+            .handle_github_app_push_event(
+                "example-owner".to_string(),
+                "example-repository".to_string(),
+                Some("main".to_string()),
+                None,
+                "0123456789abcdef0123456789abcdef01234567".to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued, 0);
+
+        drop(manager);
+        let log = match Arc::try_unwrap(db) {
+            Ok(db) => db.into_transaction_log(),
+            Err(_) => panic!("the manager was dropped, so the test holds the only database handle"),
+        };
+        let sql = format!("{log:?}");
+        assert!(
+            // `Debug` escapes the identifier quotes.
+            sql.contains(r#"\"github_webhook_signing_token\" IS NULL"#),
+            "the App push lookup must exclude projects with a repository webhook: {sql}"
         );
     }
 

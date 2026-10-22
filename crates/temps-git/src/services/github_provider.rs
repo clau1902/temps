@@ -3441,7 +3441,7 @@ mod list_directory_tests {
 /// timing side-channel that could leak the expected signature byte-by-byte
 /// (security review finding #14). Factored out as a free function so the
 /// verification logic can be unit-tested with a known vector.
-fn github_webhook_signature_matches(
+pub(crate) fn github_webhook_signature_matches(
     payload: &[u8],
     signature: &str,
     secret: &str,
@@ -3457,9 +3457,27 @@ fn github_webhook_signature_matches(
     Ok(signature.as_bytes().ct_eq(expected.as_bytes()).into())
 }
 
+/// Generate a fresh 32-byte (64 hex chars) secret for a GitHub repository
+/// webhook. Temps registers one per project on non-App GitHub connections and
+/// verifies `X-Hub-Signature-256` against it.
+pub fn generate_github_webhook_secret() -> Result<String, rand::rngs::SysError> {
+    let mut bytes = [0u8; 32];
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)?;
+    Ok(hex::encode(bytes))
+}
+
 #[cfg(test)]
 mod signature_tests {
-    use super::github_webhook_signature_matches;
+    use super::{generate_github_webhook_secret, github_webhook_signature_matches};
+
+    #[test]
+    fn generated_webhook_secrets_are_unique_64_char_hex() {
+        let first = generate_github_webhook_secret().unwrap();
+        let second = generate_github_webhook_secret().unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
 
     // Known HMAC-SHA256 vector (GitHub's documented example):
     // secret "It's a Secret to Everybody", payload "Hello, World!".

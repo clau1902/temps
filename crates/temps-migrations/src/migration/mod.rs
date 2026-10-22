@@ -29,6 +29,7 @@ mod m20261020_000003_debug_id_artifacts;
 mod m20261020_000004_client_outcomes;
 mod m20261020_000005_client_outcome_receipts;
 mod m20261020_000006_otel_ingest_receipts;
+mod m20261022_000001_add_github_repo_webhook;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -800,6 +801,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000004_client_outcomes::Migration),
             Box::new(m20261020_000005_client_outcome_receipts::Migration),
             Box::new(m20261020_000006_otel_ingest_receipts::Migration),
+            Box::new(m20261022_000001_add_github_repo_webhook::Migration),
             Box::new(m20261010_000001_create_ai_goals::Migration),
             Box::new(m20261017_000001_create_ai_chat_attachments::Migration),
             Box::new(m20261017_000002_add_text_to_ai_chat_attachments::Migration),

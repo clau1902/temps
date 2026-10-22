@@ -78,6 +78,17 @@ It maps directly to the sidebar IA.
 "Manual (Generic)" intentionally offers only clone and deploy over HTTPS. It is
 the universal escape hatch for providers not natively supported.
 
+GitHub delivers pushes two ways. A GitHub App connection receives them through
+the App's own webhook (`POST /webhook/git/github/events`, signed with the App's
+secret), so no repository webhook is registered. Any other GitHub connection
+(personal access token, OAuth) has no App webhook, so on project connect Temps
+registers a repository webhook delivering to
+`POST /webhook/git/github/repo-events`, signed with a per-project secret stored
+encrypted in `projects.github_webhook_signing_token` alongside the hook ID in
+`projects.github_webhook_id` (#1596). A delivery deploys only the projects whose
+own secret verifies its `X-Hub-Signature-256`, and the App path skips those
+projects so a repository with both never deploys a push twice.
+
 ## Decision
 
 ### 1. Three new provider structs
