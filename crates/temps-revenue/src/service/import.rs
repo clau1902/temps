@@ -404,7 +404,14 @@ async fn upsert_subscription_from_csv(
                 );
                 return Ok(UpsertOutcome::SkippedStale);
             }
+            // Keep the webhook ordering fence monotonic: a snapshot is as
+            // new as its newest timestamp, so webhook events older than it
+            // must not roll this row back afterwards.
+            let fence = existing_row
+                .last_event_at
+                .map_or(snapshot_at, |fence| fence.max(snapshot_at));
             let mut active: revenue_subscriptions_state::ActiveModel = existing_row.into();
+            active.last_event_at = Set(Some(fence));
             active.status = Set(status);
             active.mrr_minor = Set(mrr_minor);
             active.currency = Set(currency);
@@ -430,6 +437,7 @@ async fn upsert_subscription_from_csv(
                 started_at: Set(started_at.or(Some(snapshot_at))),
                 canceled_at: Set(canceled_at),
                 updated_at: Set(snapshot_at),
+                last_event_at: Set(Some(snapshot_at)),
                 ..Default::default()
             };
             new.insert(txn).await?;

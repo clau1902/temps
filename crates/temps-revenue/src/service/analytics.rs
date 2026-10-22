@@ -611,6 +611,7 @@ mod tests {
             started_at: None,
             canceled_at: None,
             updated_at: Utc::now(),
+            last_event_at: None,
         }
     }
 

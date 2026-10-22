@@ -113,6 +113,113 @@ fn stripe_subscription_created_payload(sub_id: &str, customer: &str, amount: i64
     )
 }
 
+/// A subscription webhook with an explicit event type, status and
+/// `created` time, for ordering tests.
+fn stripe_subscription_event_payload(
+    event_id: &str,
+    event_type: &str,
+    sub_id: &str,
+    status: &str,
+    created: i64,
+) -> String {
+    format!(
+        r#"{{
+            "id": "{event_id}",
+            "type": "{event_type}",
+            "created": {created},
+            "data": {{
+                "object": {{
+                    "id": "{sub_id}",
+                    "customer": "cus_order",
+                    "status": "{status}",
+                    "currency": "usd",
+                    "items": {{
+                        "data": [
+                            {{"price": {{"unit_amount": 2000, "recurring": {{"interval": "month", "interval_count": 1}}}}, "quantity": 1}}
+                        ]
+                    }}
+                }}
+            }}
+        }}"#
+    )
+}
+
+/// Providers do not guarantee delivery order. An "active" update that
+/// happened before the cancellation but arrives after it must not revive the
+/// subscription.
+#[tokio::test]
+async fn out_of_order_event_does_not_revive_a_canceled_subscription() {
+    let Some(test_db) = try_test_db().await else {
+        return;
+    };
+    let conn = test_db.connection_arc();
+    insert_project(conn.as_ref(), 1004, "ordering").await;
+
+    let enc = encryption();
+    let integrations = Arc::new(RevenueIntegrationService::new(
+        conn.clone(),
+        enc.clone(),
+        ProviderRegistry::default_registry(),
+    ));
+    let ingestion = Arc::new(RevenueIngestionService::new(
+        conn.clone(),
+        integrations.clone(),
+        ProviderRegistry::default_registry(),
+    ));
+    let analytics = RevenueAnalyticsService::new(conn.clone());
+
+    let signing_secret = "whsec_test_secret_ordering_0123456789";
+    let integration = integrations
+        .create(CreateIntegrationInput {
+            project_id: 1004,
+            provider: "stripe".into(),
+            signing_secret: signing_secret.into(),
+        })
+        .await
+        .expect("create integration");
+
+    let now = Utc::now().timestamp();
+    let deliveries = [
+        stripe_subscription_event_payload(
+            "evt_order_created",
+            "customer.subscription.created",
+            "sub_order",
+            "active",
+            now - 120,
+        ),
+        stripe_subscription_event_payload(
+            "evt_order_deleted",
+            "customer.subscription.deleted",
+            "sub_order",
+            "canceled",
+            now,
+        ),
+        // Older than the cancellation, delivered last.
+        stripe_subscription_event_payload(
+            "evt_order_updated",
+            "customer.subscription.updated",
+            "sub_order",
+            "active",
+            now - 60,
+        ),
+    ];
+    for payload in deliveries {
+        let (headers, body) = make_stripe_webhook(signing_secret, &payload);
+        let outcome = ingestion
+            .ingest("stripe", &integration.webhook_path_token, headers, body)
+            .await
+            .expect("ingest");
+        assert!(
+            matches!(outcome, IngestOutcome::Ingested(1)),
+            "every event is still logged, got {outcome:?}"
+        );
+    }
+
+    let summary = analytics.summary(1004, "usd").await.expect("summary");
+    assert_eq!(summary.active_subscriptions, 0);
+    assert_eq!(summary.current_mrr_minor, 0);
+}
+
 #[tokio::test]
 async fn ingest_then_summary_projects_correctly() {
     let Some(test_db) = try_test_db().await else {
