@@ -380,6 +380,84 @@ mod tests {
         Ok(())
     }
 
+    /// Two nodes starting at once against a database a newer release migrated
+    /// (e.g. one rolled back, one restarted) must not corrupt the ledger: in
+    /// the divergent case this binary's missing migration is recorded exactly
+    /// once and a losing start fails cleanly and succeeds on retry; in the
+    /// plain-rollback case both starts succeed and write nothing.
+    #[tokio::test]
+    async fn concurrent_starts_on_a_newer_schema_keep_the_ledger_consistent() -> anyhow::Result<()>
+    {
+        let Some((container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        let port = container.get_host_port_ipv4(5432).await?;
+        let database_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
+        let db = db.as_ref();
+        const FUTURE: &str = "m29991231_000001_from_a_newer_release";
+
+        async fn ledger(db: &DbConnection) -> anyhow::Result<Vec<String>> {
+            let mut versions = db
+                .query_all(sea_orm::Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT version FROM seaql_migrations".to_owned(),
+                ))
+                .await?
+                .iter()
+                .map(|row| row.try_get::<String>("", "version"))
+                .collect::<Result<Vec<String>, _>>()?;
+            versions.sort();
+            Ok(versions)
+        }
+
+        // Divergent build: our newest migration is missing, a future one is present.
+        run_migrations(db).await?;
+        Migrator::down(db, Some(1)).await?;
+        let newest = schema_guard::known_migration_names()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("binary defines no migrations"))?;
+        db.execute_unprepared(&format!(
+            "INSERT INTO seaql_migrations (version, applied_at) VALUES ('{FUTURE}', 0)"
+        ))
+        .await?;
+
+        let node_a = connect_without_migrations(&database_url).await?;
+        let node_b = connect_without_migrations(&database_url).await?;
+        let (a, b) = tokio::join!(
+            run_migrations(node_a.as_ref()),
+            run_migrations(node_b.as_ref())
+        );
+        println!("divergent concurrent starts: a={a:?} b={b:?}");
+        assert!(
+            a.is_ok() || b.is_ok(),
+            "one start must win: a={a:?} b={b:?}"
+        );
+        // A losing start is retried by the service manager; the retry is clean.
+        run_migrations(db).await?;
+        assert!(get_pending_migration_names(db).await?.is_empty());
+        let versions = ledger(db).await?;
+        assert_eq!(
+            versions.iter().filter(|v| **v == newest).count(),
+            1,
+            "own migration recorded exactly once"
+        );
+        assert!(versions.contains(&FUTURE.to_string()), "unknown entry kept");
+
+        // Plain rollback: nothing of ours is pending, so concurrent starts both
+        // succeed and leave the ledger untouched.
+        let before = ledger(db).await?;
+        let (a, b) = tokio::join!(
+            run_migrations(node_a.as_ref()),
+            run_migrations(node_b.as_ref())
+        );
+        a?;
+        b?;
+        let after = ledger(db).await?;
+        assert_eq!(before, after, "concurrent no-op starts changed the ledger");
+        Ok(())
+    }
+
     /// Start a throwaway TimescaleDB container and connect (no auto-migrate).
     /// Returns `None` when Docker is unavailable so callers skip gracefully.
     async fn start_fresh_db() -> anyhow::Result<
