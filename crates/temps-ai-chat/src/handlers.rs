@@ -7776,6 +7776,24 @@ async fn ensure_user_conversation_mutation_access(
     Ok(())
 }
 
+/// Renaming, archiving, restoring or stopping a user-owned conversation
+/// changes its state, so read access to it is not enough. Each context takes
+/// the permission its project-scoped routes have always asked for,
+/// `projects:write`. Assistant chats are the exception: any role holding
+/// `projects:read` may start one and send it messages (it has no sandbox, and
+/// every tool call it makes is re-checked against the caller's own
+/// permissions), so the same role may manage it.
+fn ensure_user_conversation_write_permission(
+    auth: &AuthContext,
+    conversation: &ai_conversations::Model,
+) -> Result<(), Problem> {
+    if conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
+        return Ok(());
+    }
+    permission_guard!(auth, ProjectsWrite);
+    Ok(())
+}
+
 async fn ensure_legacy_conversation_mutation_access(
     auth: &AuthContext,
     project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
@@ -9136,6 +9154,7 @@ pub async fn stop_user_turn(
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    ensure_user_conversation_write_permission(&auth, &conversation)?;
     state.service.cancel_turn(&conversation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -9196,6 +9215,7 @@ pub async fn archive_user_conversation(
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    ensure_user_conversation_write_permission(&auth, &conversation)?;
     state.service.archive(&conversation).await?;
     state
         .audit(&ConversationArchivedAudit {
@@ -9230,6 +9250,7 @@ pub async fn restore_user_conversation(
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    ensure_user_conversation_write_permission(&auth, &conversation)?;
     state.service.restore(&conversation).await?;
     state
         .audit(&ConversationRestoredAudit {
@@ -9989,6 +10010,7 @@ pub async fn rename_user_conversation(
         .get_owned_by_public_id(auth.user_id(), &public_id)
         .await?;
     ensure_user_conversation_access(&state, &auth, &conversation).await?;
+    ensure_user_conversation_write_permission(&auth, &conversation)?;
     let updated = state.service.rename(&conversation, title).await?;
     state
         .audit(&ConversationRenamedAudit {
@@ -10347,6 +10369,9 @@ pub async fn reject_user_pending_action(
         ai_call.as_ref().map(|e| &e.0),
         "reject_user_pending_action",
     )?;
+    // Like confirm, the pending-action service checks the operation's own
+    // permission before rejecting: deciding a proposal either way takes the
+    // authority to approve it, which a read-only key never holds.
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
     let action = state
@@ -11983,6 +12008,66 @@ mod tests {
         }
     }
 
+    fn api_key_with_role(role: Role) -> AuthContext {
+        AuthContext::new_api_key(test_user(), Some(role), None, "test-key".to_string(), 1)
+    }
+
+    // Rename, archive, restore and stop on `/ai/conversations/{id}` change a
+    // conversation's state, so a read-only key is refused on every context
+    // its project-scoped twin would refuse it on.
+    #[test]
+    fn read_only_api_keys_cannot_change_user_conversations() {
+        for context_type in ["project", "deployment", "application", "global"] {
+            let mut conversation = conversation_with_runtime("claude_code", "ask");
+            conversation.context_type = context_type.to_string();
+            for role in [Role::Reader, Role::ApiReader] {
+                let auth = api_key_with_role(role.clone());
+                let problem = ensure_user_conversation_write_permission(&auth, &conversation)
+                    .expect_err("a read-only key must not change a conversation");
+                assert_eq!(
+                    problem.status_code,
+                    StatusCode::FORBIDDEN,
+                    "{role:?} on a {context_type} conversation"
+                );
+            }
+            for role in [Role::User, Role::Admin] {
+                assert!(
+                    ensure_user_conversation_write_permission(
+                        &api_key_with_role(role.clone()),
+                        &conversation
+                    )
+                    .is_ok(),
+                    "{role:?} may change its own {context_type} conversation"
+                );
+            }
+        }
+    }
+
+    // Any role that may start an assistant chat and send it messages may also
+    // rename, archive, restore and stop it, including roles without
+    // `projects:write` such as a platform administrator.
+    #[test]
+    fn assistant_chats_are_managed_by_whoever_may_drive_them() {
+        let mut conversation = conversation_with_runtime("openrouter", "ask");
+        conversation.context_type = crate::providers::assistant::ASSISTANT_CONTEXT_TYPE.to_string();
+        conversation.project_id = None;
+        for role in [
+            Role::Reader,
+            Role::ApiReader,
+            Role::PlatformAdmin,
+            Role::User,
+        ] {
+            assert!(
+                ensure_user_conversation_write_permission(
+                    &api_key_with_role(role.clone()),
+                    &conversation
+                )
+                .is_ok(),
+                "{role:?} may manage an assistant chat it can message"
+            );
+        }
+    }
+
     #[test]
     fn archived_conversation_is_read_only_until_restored() {
         let active = conversation_with_runtime("claude_code", "ask");
@@ -12814,7 +12899,9 @@ mod tests {
     #[test]
     fn test_pending_action_permission_denied_maps_to_403() {
         let p: Problem = PendingActionError::PermissionDenied {
+            public_id: "abc".to_string(),
             permission: "deployments:write".to_string(),
+            decision: "confirm",
         }
         .into();
         assert_eq!(p.status_code, StatusCode::FORBIDDEN);
