@@ -122,10 +122,8 @@ impl ProcessDriver {
         ensure_trusted(artifact)?;
         let expected = artifact.sha256.to_ascii_lowercase();
         let path = bin_dir.join(&expected);
-        if let Ok(bytes) = tokio::fs::read(&path).await {
-            if hex::encode(Sha256::digest(&bytes)) == expected {
-                return Ok(path);
-            }
+        if sha256_of_file(&path).await.ok().as_deref() == Some(expected.as_str()) {
+            return Ok(path);
         }
         tokio::fs::create_dir_all(bin_dir)
             .await
@@ -143,21 +141,28 @@ impl ProcessDriver {
                     artifact.url
                 )
             })?;
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| format!("download of {} failed: {e}", artifact.url))?;
-        let actual = hex::encode(Sha256::digest(&bytes));
+        if let Some(length) = response.content_length() {
+            if length > MAX_CONNECTOR_BYTES {
+                return Err(too_large(&artifact.url));
+            }
+        }
+        // Streamed to disk and hashed as it arrives: a large body (an error
+        // page served with 200, say) must not be buffered in memory first.
+        let tmp = bin_dir.join(format!("{expected}.part"));
+        let actual = match download_to(response, &tmp, &artifact.url).await {
+            Ok(actual) => actual,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(error);
+            }
+        };
         if actual != expected {
+            let _ = tokio::fs::remove_file(&tmp).await;
             return Err(format!(
                 "{} has sha256 {actual}, expected {expected}; refusing to run it",
                 artifact.url
             ));
         }
-        let tmp = bin_dir.join(format!("{expected}.part"));
-        tokio::fs::write(&tmp, &bytes)
-            .await
-            .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
         tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
             .await
             .map_err(|e| format!("could not make {} executable: {e}", tmp.display()))?;
@@ -165,6 +170,66 @@ impl ProcessDriver {
             .await
             .map_err(|e| format!("could not install {}: {e}", path.display()))?;
         Ok(path)
+    }
+}
+
+/// Larger than any connector binary we pin (cloudflared is about 40 MiB);
+/// a download past it is refused before its checksum can be checked.
+const MAX_CONNECTOR_BYTES: u64 = 256 * 1024 * 1024;
+
+fn too_large(url: &str) -> String {
+    format!(
+        "{url} is larger than {} MiB, which no connector binary is; refusing to download it. \
+         Check that the node reaches the release host directly and not through a proxy that \
+         rewrites the response.",
+        MAX_CONNECTOR_BYTES / (1024 * 1024)
+    )
+}
+
+/// Write `response` to `tmp` in chunks, returning the body's hex SHA-256.
+async fn download_to(
+    mut response: reqwest::Response,
+    tmp: &Path,
+    url: &str,
+) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(tmp)
+        .await
+        .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("download of {url} failed: {e}"))?
+    {
+        written += chunk.len() as u64;
+        if written > MAX_CONNECTOR_BYTES {
+            return Err(too_large(url));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Hex SHA-256 of a file, read in chunks.
+async fn sha256_of_file(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(hex::encode(hasher.finalize()));
+        }
+        hasher.update(&buffer[..read]);
     }
 }
 
