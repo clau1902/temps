@@ -313,6 +313,33 @@ impl From<sea_orm::DbErr> for DeploymentError {
     }
 }
 
+/// Run a failed mark-complete job's cleanup and describe both outcomes.
+///
+/// Promotion and rollback drive their jobs by hand instead of through the
+/// workflow executor, so they must also do what the executor does when a
+/// job fails: call its `cleanup`. For `MarkDeploymentCompleteJob` that tears
+/// down the containers the deploy step started, unless the deployment
+/// already reached completed/deployed.
+async fn clean_up_failed_completion(
+    job: &dyn WorkflowTask,
+    context: &temps_core::WorkflowContext,
+    error: &temps_core::WorkflowError,
+    operation: &str,
+) -> String {
+    match job.cleanup(context).await {
+        Ok(()) => format!("Mark complete failed: {error}"),
+        Err(cleanup_error) => {
+            error!(
+                "{operation}: cleanup after failed mark-complete for deployment {} also failed: {}",
+                context.deployment_id, cleanup_error
+            );
+            format!(
+                "Mark complete failed: {error}; {operation} container cleanup also failed: {cleanup_error}"
+            )
+        }
+    }
+}
+
 /// Deployment states a pause applies to: the deployment is live and serving.
 const PAUSABLE_DEPLOYMENT_STATES: &[&str] = &["deployed", "completed"];
 /// Deployment states a resume applies to: only one paused by `pause_deployment`.
@@ -4020,6 +4047,9 @@ impl DeploymentService {
                     DeploymentError::Other(format!("Failed to create mark complete job: {}", e))
                 })?;
 
+            // `execute` consumes the context; keep a copy for the failure
+            // path's cleanup below.
+            let cleanup_context = rollback_context.clone();
             match mark_complete_job.execute(rollback_context).await {
                 Ok(_) => {
                     info!("Rollback: Mark complete job executed successfully");
@@ -4033,16 +4063,31 @@ impl DeploymentService {
                 Err(e) => {
                     error!("Rollback: Mark complete job failed: {}", e);
 
-                    // Update complete job record to Failure
+                    // The deploy step already started this deployment's
+                    // containers. The workflow executor runs the job's
+                    // cleanup on failure; this hand-rolled path must do the
+                    // same, or a readiness or route failure leaves them
+                    // running with no owner: failed deployments are excluded
+                    // from the previous-deployment sweep. `cleanup` leaves a
+                    // deployment that already reached completed/deployed
+                    // alone, so a late failure never tears down a serving
+                    // deployment.
+                    let failure_message = clean_up_failed_completion(
+                        &mark_complete_job,
+                        &cleanup_context,
+                        &e,
+                        "rollback",
+                    )
+                    .await;
+
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
                     active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
-                    active_job.error_message = Set(Some(format!("Mark complete failed: {}", e)));
+                    active_job.error_message = Set(Some(failure_message.clone()));
                     let _ = active_job.update(self.db.as_ref()).await;
 
                     return Err(DeploymentError::Other(format!(
-                        "Failed to mark deployment complete during rollback: {}",
-                        e
+                        "Failed to mark deployment complete during rollback: {failure_message}"
                     )));
                 }
             }
@@ -4641,6 +4686,9 @@ impl DeploymentService {
                     DeploymentError::Other(format!("Failed to create mark complete job: {}", e))
                 })?;
 
+            // `execute` consumes the context; keep a copy for the failure
+            // path's cleanup below.
+            let cleanup_context = promote_context.clone();
             match mark_complete_job.execute(promote_context).await {
                 Ok(_) => {
                     info!("Promotion: Mark complete job executed successfully");
@@ -4653,15 +4701,31 @@ impl DeploymentService {
                 Err(e) => {
                     error!("Promotion: Mark complete job failed: {}", e);
 
+                    // The deploy step already started this deployment's
+                    // containers. The workflow executor runs the job's
+                    // cleanup on failure; this hand-rolled path must do the
+                    // same, or a readiness or route failure leaves them
+                    // running with no owner: failed deployments are excluded
+                    // from the previous-deployment sweep. `cleanup` leaves a
+                    // deployment that already reached completed/deployed
+                    // alone, so a late failure never tears down a serving
+                    // deployment.
+                    let failure_message = clean_up_failed_completion(
+                        &mark_complete_job,
+                        &cleanup_context,
+                        &e,
+                        "promotion",
+                    )
+                    .await;
+
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
                     active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
-                    active_job.error_message = Set(Some(format!("Mark complete failed: {}", e)));
+                    active_job.error_message = Set(Some(failure_message.clone()));
                     let _ = active_job.update(self.db.as_ref()).await;
 
                     return Err(DeploymentError::Other(format!(
-                        "Failed to mark deployment complete during promotion: {}",
-                        e
+                        "Failed to mark deployment complete during promotion: {failure_message}"
                     )));
                 }
             }
@@ -6564,6 +6628,98 @@ impl temps_core::DeploymentContainerCleaner for DeploymentService {
     ) -> Result<u64, temps_core::ContainerCleanupError> {
         self.cleanup_containers(project_id, Some(environment_id))
             .await
+    }
+}
+
+#[cfg(test)]
+mod failed_completion_cleanup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temps_core::{JobResult, WorkflowContext, WorkflowError};
+
+    struct NoopLogWriter;
+
+    #[async_trait::async_trait]
+    impl temps_core::LogWriter for NoopLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
+    /// A job whose cleanup counts its calls and optionally fails.
+    #[derive(Debug)]
+    struct CleanupProbe {
+        cleanups: AtomicUsize,
+        cleanup_error: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for CleanupProbe {
+        fn job_id(&self) -> &str {
+            "mark_deployment_complete"
+        }
+
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn description(&self) -> &str {
+            "records cleanup calls"
+        }
+
+        async fn execute(&self, _context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            Err(WorkflowError::JobExecutionFailed("not used".to_string()))
+        }
+
+        async fn cleanup(&self, _context: &WorkflowContext) -> Result<(), WorkflowError> {
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            match self.cleanup_error {
+                Some(reason) => Err(WorkflowError::JobExecutionFailed(reason.to_string())),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn context() -> WorkflowContext {
+        WorkflowContext::new("run-1".to_string(), 31, 1, 2, Arc::new(NoopLogWriter))
+    }
+
+    #[tokio::test]
+    async fn failed_completion_runs_the_jobs_cleanup() {
+        let probe = CleanupProbe {
+            cleanups: AtomicUsize::new(0),
+            cleanup_error: None,
+        };
+        let error = WorkflowError::JobExecutionFailed("route never became ready".to_string());
+
+        let message = clean_up_failed_completion(&probe, &context(), &error, "promotion").await;
+
+        assert_eq!(probe.cleanups.load(Ordering::SeqCst), 1);
+        assert!(message.contains("route never became ready"), "{message}");
+        assert!(!message.contains("cleanup also failed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_is_reported_alongside_the_original_error() {
+        let probe = CleanupProbe {
+            cleanups: AtomicUsize::new(0),
+            cleanup_error: Some("worker node 4 unreachable"),
+        };
+        let error = WorkflowError::JobExecutionFailed("HTTP 503".to_string());
+
+        let message = clean_up_failed_completion(&probe, &context(), &error, "rollback").await;
+
+        assert_eq!(probe.cleanups.load(Ordering::SeqCst), 1);
+        assert!(message.contains("HTTP 503"), "{message}");
+        assert!(
+            message.contains("rollback container cleanup also failed"),
+            "{message}"
+        );
+        assert!(message.contains("worker node 4 unreachable"), "{message}");
     }
 }
 
