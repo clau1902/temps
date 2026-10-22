@@ -328,7 +328,7 @@ impl OpenAiCompatProvider {
         Self::new(
             ProviderInfo {
                 id: crate::self_hosted::OPENAI_COMPATIBLE,
-                display_name: "Self-hosted (OpenAI-compatible)",
+                display_name: "OpenAI-compatible",
                 default_base_url: "",
                 capabilities: &[
                     ProviderCapability::ChatCompletion,
@@ -394,6 +394,9 @@ impl AiProvider for OpenAiCompatProvider {
         if self.info.id == "openai" {
             sanitize_openai_request(&mut req);
         }
+        if super::prompt_cache::uses_explicit_prompt_cache(self.info.id, &req.model) {
+            super::prompt_cache::mark_cache_breakpoints(&mut req.messages);
+        }
 
         let response = with_bearer(self.client.post(&url), api_key)
             .json(&req)
@@ -444,6 +447,9 @@ impl AiProvider for OpenAiCompatProvider {
 
         if self.info.id == "openai" {
             sanitize_openai_request(&mut req);
+        }
+        if super::prompt_cache::uses_explicit_prompt_cache(self.info.id, &req.model) {
+            super::prompt_cache::mark_cache_breakpoints(&mut req.messages);
         }
 
         // Inject stream_options.include_usage so the final chunk includes token counts

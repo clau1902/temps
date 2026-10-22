@@ -400,6 +400,11 @@ export type AddStatusPageDomainRequest = {
     verification_method?: VerificationMethod;
 };
 
+/**
+ * Who can reach an address.
+ */
+export type AddressScope = 'public' | 'private' | 'cgnat' | 'local';
+
 export type AdminGateResponse = {
     /**
      * `Host` header values allowed. Empty = any host.
@@ -932,17 +937,6 @@ export type AiConfigSettings = {
      * Branch of the config repo to use.
      */
     config_repo_branch?: string;
-};
-
-export type AiDataAccessResponse = {
-    /**
-     * Whether the AI assistant may read row data from this service
-     */
-    enabled: boolean;
-    /**
-     * Service id
-     */
-    service_id: number;
 };
 
 export type AiModelOptionDto = {
@@ -1699,6 +1693,13 @@ export type ApiTrafficSummaryResponse = {
     unavailable_reason?: string | null;
 };
 
+export type AppRole = 'web' | 'api' | 'worker' | 'cron' | 'static';
+
+/**
+ * How Temps runs an app.
+ */
+export type AppRuntime = 'preset' | 'dockerfile' | 'image';
+
 /**
  * Application settings stored in the database
  * All fields have sensible defaults for easy onboarding
@@ -1833,6 +1834,13 @@ export type AppSettings = {
      * disables DNS record sync regardless of per-domain opt-in.
      */
     edge_target?: string | null;
+    /**
+     * Label of a new environment's generated hostname under `preview_domain`,
+     * from `{project}` and `{env}` (ADR 058 D9). `None` means
+     * [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+     * environments created after it is set; existing ones keep their names.
+     */
+    environment_hostname_template?: string | null;
     external_url?: string | null;
     /**
      * Geolocation database refresh policy, MaxMind credential (encrypted at
@@ -1905,6 +1913,12 @@ export type AppSettings = {
      * to match; the generic settings update preserves the stored value.
      */
     preview_gateway?: PreviewGatewaySettings;
+    /**
+     * Label for an environment named `production`, when it should differ
+     * (e.g. `{project}` for `app.example.com`). `None` uses
+     * `environment_hostname_template`.
+     */
+    production_hostname_template?: string | null;
     /**
      * Base URL handed to third parties that call back into Temps: email
      * open/click tracking, git provider webhooks, SES/SNS events, revenue
@@ -2387,6 +2401,25 @@ export type ArtifactAssembly = {
  */
 export type ArtifactKind = 'x509_certificate' | 'ssh_certificate' | 'openpgp_key' | 'jwt';
 
+/**
+ * The score and how it was reached.
+ */
+export type Assessment = {
+    /**
+     * What the next level needs and why it was not reached, below the top.
+     */
+    next_level?: string | null;
+    /**
+     * Paths that block a policy merge.
+     */
+    protected_paths: Array<string>;
+    /**
+     * Highest level of the confidence ladder the fix reached, 0-5.
+     */
+    score: number;
+    signals: Array<Signal>;
+};
+
 export type AssignRoleRequest = {
     role_type: string;
     user_id: number;
@@ -2416,6 +2449,31 @@ export type AttachScheduleServicesResponse = {
      * Total number of services now attached to the schedule.
      */
     total_attached: number;
+};
+
+export type AttachmentChunkReceived = {
+    /**
+     * Bytes of the file the server now holds.
+     */
+    received_bytes: number;
+};
+
+/**
+ * Request body type for the chunk endpoint's OpenAPI entry.
+ */
+export type AttachmentChunkUpload = {
+    chunk: Blob | File;
+};
+
+export type AttachmentUploadStarted = {
+    /**
+     * The most bytes one chunk may carry.
+     */
+    chunk_bytes: number;
+    /**
+     * Opaque id to send every chunk and the completion to.
+     */
+    upload_id: string;
 };
 
 export type AttrOp = 'eq' | 'neq' | 'exists' | 'prefix' | 'gt' | 'lt';
@@ -2582,6 +2640,127 @@ export type AutoWatchParams = {
 };
 
 /**
+ * Whether autofix can run for a project, and what a fix would become.
+ */
+export type AutofixCapabilityResponse = {
+    /**
+     * An AI provider and sandboxes are available.
+     */
+    configured: boolean;
+    /**
+     * What a fix becomes: `pull_request`, `patch` or `report`.
+     */
+    delivery: string;
+    /**
+     * Why the delivery is what it is, e.g. the Git connection is missing.
+     */
+    delivery_reason?: string | null;
+    /**
+     * Why autofix cannot run, when `configured` is false.
+     */
+    reason?: string | null;
+    settings: AutofixSettingsResponse;
+    /**
+     * Console path that fixes the missing configuration.
+     */
+    setup_path?: string | null;
+    /**
+     * How the latest production deployment was built: `git`,
+     * `uploaded_source`, `report_only` or `none`.
+     */
+    source_kind: string;
+};
+
+export type AutofixEventListResponse = {
+    /**
+     * The incident's status when the page was read, so a poller knows when
+     * to stop.
+     */
+    incident_status: string;
+    items: Array<AutofixEventResponse>;
+};
+
+export type AutofixEventResponse = {
+    /**
+     * `server`, `agent`, `policy` or `user:<id>`.
+     */
+    actor: string;
+    created_at: string;
+    details?: EventDetails | null;
+    id: number;
+    kind: string;
+    summary: string;
+};
+
+export type AutofixIncidentListResponse = {
+    items: Array<AutofixIncidentResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type AutofixIncidentResponse = {
+    assessment?: Assessment | null;
+    attempts: number;
+    base_revision?: string | null;
+    branch?: string | null;
+    closed_at?: string | null;
+    /**
+     * Confidence level reached, 0-5: see `assessment` for what it proves.
+     */
+    confidence?: number | null;
+    /**
+     * Public id of the incident chat.
+     */
+    conversation_id?: string | null;
+    created_at: string;
+    decided_at?: string | null;
+    decided_by_user_id?: number | null;
+    decision?: string | null;
+    delivery?: string | null;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    error_group_id: number;
+    failure_reason?: string | null;
+    has_patch: boolean;
+    head_revision?: string | null;
+    /**
+     * Public id (`afx_…`).
+     */
+    id: string;
+    is_open: boolean;
+    owner_user_id: number;
+    /**
+     * `queued`, `prepare`, `reproduce`, `verify`, `deliver` or `done`.
+     */
+    phase: string;
+    pr_number?: number | null;
+    pr_url?: string | null;
+    project_id: number;
+    /**
+     * Public id of the sandbox while it exists.
+     */
+    sandbox_id?: string | null;
+    source_kind?: string | null;
+    /**
+     * `open`, `working`, `awaiting_review`, `merged`, `applied`, `rejected`,
+     * `failed` or `stopped`.
+     */
+    status: string;
+    summary?: string | null;
+    title: string;
+    /**
+     * `manual` or `automatic`.
+     */
+    trigger: string;
+    updated_at: string;
+    /**
+     * Public id of the workspace the chat is in.
+     */
+    workspace_id?: string | null;
+};
+
+/**
  * User-chosen per-run options, persisted as JSON in `agent_runs.run_config`.
  * Every field is optional — unset fields fall back to the provider defaults
  * in settings, then to built-in defaults.
@@ -2607,6 +2786,32 @@ export type AutofixRunConfig = {
      * the platform default provider from agent sandbox settings.
      */
     provider?: string | null;
+};
+
+export type AutofixSettingsResponse = {
+    ai_model?: string | null;
+    ai_provider?: string | null;
+    /**
+     * Confidence level, 0-5, an `auto_merge` fix must reach.
+     */
+    min_confidence: number;
+    /**
+     * `off`, `propose` or `auto_merge`.
+     */
+    mode: string;
+    /**
+     * User automatic incidents act as.
+     */
+    owner_user_id?: number | null;
+    paused: boolean;
+    project_id: number;
+    protected_paths: Array<string>;
+    /**
+     * Command the server runs to verify a fix, in addition to the agent's
+     * reproduction.
+     */
+    test_command?: string | null;
+    updated_at?: string | null;
 };
 
 export type AutofixerRunResponse = {
@@ -2920,6 +3125,14 @@ export type BindApplicationGitConnectionRequest = {
 };
 
 /**
+ * The project (for an app part) or service (for a data part) to bind.
+ */
+export type BindBlueprintComponentRequest = {
+    project_id?: number | null;
+    service_id?: number | null;
+};
+
+/**
  * Authentication input for a Bitbucket Cloud provider. Use `access_token` for
  * a Repository or Workspace Access Token (PAT), or `username` + `app_password`
  * for App Password (HTTP Basic) authentication.
@@ -2928,13 +3141,13 @@ export type BitbucketAuthInput = {
     /**
      * The Bitbucket access token value.
      */
-    token: string;
+    token: SecretString;
     type: 'access_token';
 } | {
     /**
      * App password generated in Bitbucket security settings.
      */
-    password: string;
+    password: SecretString;
     type: 'app_password';
     /**
      * Bitbucket account username.
@@ -3002,6 +3215,70 @@ export type BlobStatusResponse = {
      * Current version (if running)
      */
     version?: string | null;
+};
+
+/**
+ * The design of an application: what it is for, its parts and its flows.
+ */
+export type BlueprintDocument = {
+    components: Array<Component>;
+    flows?: Array<Flow>;
+    /**
+     * One paragraph: what the application does and for whom.
+     */
+    summary: string;
+};
+
+/**
+ * A workspace's architecture: what was accepted, what waits for a
+ * decision, and how each bound part is doing.
+ */
+export type BlueprintResponse = {
+    accepted?: BlueprintVersionResponse | null;
+    application_id: string;
+    /**
+     * Which project or service realises each part, by part id.
+     */
+    bindings: {
+        [key: string]: ComponentBinding;
+    };
+    /**
+     * The live state of each bound part, by part id.
+     */
+    live: {
+        [key: string]: ComponentLive;
+    };
+    proposal?: BlueprintVersionResponse | null;
+    workspace_name: string;
+};
+
+/**
+ * What the console needs to draw one version.
+ */
+export type BlueprintVersionResponse = {
+    change_summary: string;
+    /**
+     * ISO 8601.
+     */
+    created_at: string;
+    /**
+     * ISO 8601, once accepted or rejected.
+     */
+    decided_at?: string | null;
+    document: BlueprintDocument;
+    /**
+     * Whether the model proposed it (in a chat) rather than the user writing it.
+     */
+    proposed_by_assistant: boolean;
+    status: VersionStatus;
+    version: number;
+};
+
+export type BlueprintVersionsResponse = {
+    page: number;
+    page_size: number;
+    total: number;
+    versions: Array<BlueprintVersionResponse>;
 };
 
 export type BranchInfo = {
@@ -3646,6 +3923,91 @@ export type ChatMessage = {
 };
 
 /**
+ * One operation the chat started, with its current state.
+ */
+export type ChatOperation = {
+    deployment_id?: number | null;
+    /**
+     * Where: the project and environment, or the S3 source.
+     */
+    detail?: string | null;
+    environment_id?: number | null;
+    /**
+     * Why it failed, when the record says.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    /**
+     * Console path that shows the operation.
+     */
+    href?: string | null;
+    id: number;
+    kind: ChatOperationKind;
+    /**
+     * What started it: the API operation id, or `temps_deploy_sandbox_source`.
+     */
+    operation_id: string;
+    project_id?: number | null;
+    service_id?: number | null;
+    /**
+     * ISO 8601 time the chat started it.
+     */
+    started_at: string;
+    state: ChatOperationState;
+    /**
+     * The record's own status, e.g. `running` or `completed`.
+     */
+    status?: string | null;
+    /**
+     * e.g. "Deployment #41", "Backup of orders-db".
+     */
+    title: string;
+};
+
+/**
+ * What a chat started.
+ */
+export type ChatOperationKind = 'deployment' | 'backup' | 'service_backup' | 'restore';
+
+/**
+ * Where an operation is, in the same words for every kind.
+ */
+export type ChatOperationState = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'not_started';
+
+/**
+ * The operations a chat started, newest first.
+ */
+export type ChatOperationsResponse = {
+    operations: Array<ChatOperation>;
+    /**
+     * How many of them are still running.
+     */
+    running: number;
+    /**
+     * True when the chat started more operations than this response covers.
+     */
+    truncated: boolean;
+};
+
+/**
+ * How to reach a page served from the chat's sandbox.
+ */
+export type ChatPreview = {
+    /**
+     * The port the assistant last confirmed serving a page, if it has.
+     */
+    port?: number | null;
+    /**
+     * Address of that page, served by Temps.
+     */
+    url?: string | null;
+    /**
+     * Address for any port: `{port}` stands for the port number.
+     */
+    url_template: string;
+};
+
+/**
  * What still has to be true before an AI chat can run a turn in this project.
  */
 export type ChatReadinessResponse = {
@@ -3654,6 +4016,152 @@ export type ChatReadinessResponse = {
      * Settings → AI Providers; instance-wide, not per project.
      */
     ai_configured: boolean;
+};
+
+/**
+ * One piece the chat made, with its current state.
+ */
+export type ChatResource = {
+    /**
+     * ISO 8601 time the piece was made (or, for a sandbox, linked).
+     */
+    created_at: string;
+    /**
+     * What it is: the framework preset, the service type, the repository's
+     * visibility, the sandbox backend.
+     */
+    detail?: string | null;
+    /**
+     * Numeric id for projects and services, `owner/name` for repositories,
+     * public id (`sbx_…`) for sandboxes.
+     */
+    id: string;
+    kind: ChatResourceKind;
+    name: string;
+    /**
+     * Project slug, for opening the project.
+     */
+    slug?: string | null;
+    /**
+     * Current status, for services and sandboxes.
+     */
+    status?: string | null;
+    /**
+     * Where to see it outside Temps: a repository's web page.
+     */
+    url?: string | null;
+};
+
+/**
+ * What kind of piece a chat made.
+ */
+export type ChatResourceKind = 'project' | 'service' | 'repository' | 'sandbox';
+
+/**
+ * Everything the chat made, newest first.
+ */
+export type ChatResourcesResponse = {
+    resources: Array<ChatResource>;
+    /**
+     * True when the chat made more pieces than this response covers.
+     */
+    truncated: boolean;
+};
+
+/**
+ * Whether a linked sandbox's compute is running.
+ */
+export type ChatSandboxRuntime = 'running' | 'asleep';
+
+/**
+ * What a chat can do with a sandbox, and the one it is linked to.
+ */
+export type ChatSandboxStatus = {
+    /**
+     * Whether this chat can use a sandbox at all.
+     */
+    configured: boolean;
+    /**
+     * Projects whose services the linked sandbox is connected to: its
+     * commands run with credentials for a database of its own on each.
+     */
+    connected_projects: Array<number>;
+    /**
+     * Every service the linked sandbox is connected to, whether or not it was
+     * connected through a project.
+     */
+    connected_services: Array<ConnectedService>;
+    linked?: SandboxLink | null;
+    /**
+     * True once the assistant has asked the user to link a sandbox.
+     */
+    offered: boolean;
+    preview?: ChatPreview | null;
+    /**
+     * Why it cannot, when `configured` is false.
+     */
+    reason?: string | null;
+    runtime?: ChatSandboxRuntime | null;
+    /**
+     * Console path where the user can fix it, when there is one.
+     */
+    setup_path?: string | null;
+};
+
+/**
+ * A chat's next-step suggestion setting.
+ */
+export type ChatSuggestionSettings = {
+    /**
+     * Whether this chat can have suggestions at all. Only the assistant chat
+     * can; the other fields still describe the setting for other chats.
+     */
+    available: boolean;
+    chat_mode?: SuggestionMode | null;
+    /**
+     * The user's default, which applies when `chat_mode` is unset.
+     */
+    default_mode: SuggestionMode;
+    /**
+     * What happens after each answer in this chat.
+     */
+    mode: SuggestionMode;
+    /**
+     * Whether `mode` is the chat's own setting or the user's default.
+     */
+    source: SuggestionModeSource;
+};
+
+/**
+ * The workspace a chat is in.
+ */
+export type ChatWorkspace = {
+    description?: string | null;
+    name: string;
+    /**
+     * Public id of the workspace (`app_…`).
+     */
+    public_id: string;
+};
+
+/**
+ * A chat's workspace, and the chats in it.
+ */
+export type ChatWorkspaceResponse = {
+    /**
+     * The workspace's chats, most recently active first, at most 20.
+     */
+    chats: Array<WorkspaceChatSummary>;
+    /**
+     * Whether this chat can be put in a workspace. Chats about one project
+     * cannot: the project is their scope.
+     */
+    joinable: boolean;
+    /**
+     * Why the chat cannot be in a workspace, when `joinable` is false.
+     */
+    reason?: string | null;
+    workspace?: ChatWorkspace | null;
 };
 
 /**
@@ -3986,6 +4494,16 @@ export type ClientOutcomePage = {
     total: number;
 };
 
+export type ClientSurface = 'browser' | 'mobile' | 'cli' | 'third_party';
+
+export type CloseIncidentRequest = {
+    /**
+     * `merged` (you merged the pull request), `applied` (you applied the
+     * patch) or `rejected`.
+     */
+    decision: string;
+};
+
 export type CloudAiCapability = {
     configured: boolean;
     model?: string | null;
@@ -4300,6 +4818,8 @@ export type CloudTelemetryWriteStatusResponse = {
  * Notifications are delivered through Cloudflare's transactional Email Sending
  * API. Only the account, token, sender and recipients are configured here —
  * subject and body are derived from each notification.
+ * Request-side config. Not `Serialize`: `api_token` is a `SecretString`; use
+ * [`CloudflareConfig::into_stored_value`].
  */
 export type CloudflareConfig = {
     /**
@@ -4310,7 +4830,7 @@ export type CloudflareConfig = {
      * Cloudflare API token with the Email Sending permission. Encrypted at
      * rest and masked in normal API responses.
      */
-    api_token: string;
+    api_token: SecretString;
     /**
      * Verified sender address (must belong to a domain enabled for Cloudflare
      * Email Sending).
@@ -4489,14 +5009,114 @@ export type ClusterMemberRequest = {
 };
 
 /**
- * Read-only cluster network state. Pool changes are performed on the control
- * plane through `temps network setup-multi-node`, which enforces that no
- * existing node allocation can be stranded by an in-place edit.
+ * `PUT /settings/cluster-network` answer.
+ */
+export type ClusterNetworkChangeResponse = {
+    reassigned: Array<ClusterNetworkReassignment>;
+    status: ClusterNetworkStatus;
+};
+
+/**
+ * The control plane's overlay.
+ */
+export type ClusterNetworkControlPlane = {
+    compute_cidr?: string | null;
+    overlay_ready: boolean;
+    /**
+     * Why its last overlay setup failed, with the fix, when it did.
+     */
+    setup_failure?: string | null;
+};
+
+/**
+ * One worker's view of the overlay.
+ */
+export type ClusterNetworkNode = {
+    /**
+     * Its subnet of the pool, if allocated.
+     */
+    compute_cidr?: string | null;
+    id: number;
+    /**
+     * Whether its allocation locks the pool, and why when it does.
+     */
+    in_use: boolean;
+    in_use_reason?: string | null;
+    name: string;
+    /**
+     * What the node reported it already uses outside Temps.
+     */
+    occupied_ranges: Array<OccupiedRangeReport>;
+    /**
+     * Why the overlay is unavailable: the colliding range, its owner and
+     * the fixes.
+     */
+    overlay_last_error?: string | null;
+    /**
+     * The last automatic move of its allocation, and why.
+     */
+    overlay_remediation?: string | null;
+    /**
+     * `ready`, `unavailable`, or `None` when its agent never reported it.
+     */
+    overlay_status?: string | null;
+};
+
+/**
+ * A node whose allocation a change moved.
+ */
+export type ClusterNetworkReassignment = {
+    from: string;
+    node_id: number;
+    node_name: string;
+    to: string;
+};
+
+/**
+ * Read-only cluster network state. The pool is changed through
+ * `PUT /settings/cluster-network` or `temps network setup-multi-node`, which
+ * refuse while any allocation is in use (ADR 056). `locked` means only that
+ * allocations exist: allocations never applied are re-assigned by a change,
+ * so whether it is allowed now is `GET /settings/cluster-network`'s
+ * `can_change`.
  */
 export type ClusterNetworkSettings = {
     allocation_count: number;
     compute_pool_cidr: string;
     locked: boolean;
+    subnet_prefix_len: number;
+};
+
+/**
+ * `GET /settings/cluster-network`.
+ */
+export type ClusterNetworkStatus = {
+    /**
+     * Whether `PUT` can change the pool now.
+     */
+    can_change: boolean;
+    /**
+     * Why it cannot: the members using the pool, or a control-plane setup
+     * in progress.
+     */
+    change_blocked_by: Array<string>;
+    compute_pool_cidr: string;
+    control_plane: ClusterNetworkControlPlane;
+    /**
+     * What a new cluster starts with.
+     */
+    default_compute_pool_cidr: string;
+    mesh_enabled: boolean;
+    /**
+     * The WireGuard mesh pool; a compute pool may not overlap it.
+     */
+    mesh_pool_cidr: string;
+    nodes: Array<ClusterNetworkNode>;
+    /**
+     * Whether an operator has confirmed the pool, or a member already uses
+     * it. The console asks for it once before adding the first node.
+     */
+    pool_confirmed: boolean;
     subnet_prefix_len: number;
 };
 
@@ -4589,10 +5209,69 @@ export type CmdResponse = {
     command: CmdInner;
 };
 
+/**
+ * Result of a command the server ran in the sandbox.
+ */
+export type CommandOutcome = {
+    command: string;
+    duration_ms: number;
+    exit_code: number;
+    /**
+     * Last bytes of stdout and stderr, at most 4 KB.
+     */
+    output_excerpt: string;
+};
+
 export type CommitExistsResponse = {
     commit?: CommitInfo | null;
     commit_sha?: string | null;
     exists: boolean;
+};
+
+/**
+ * How the `content` of a committed file is encoded.
+ */
+export type CommitFileEncoding = 'utf8' | 'base64';
+
+/**
+ * One file in a commit.
+ */
+export type CommitFileRequest = {
+    content: string;
+    encoding?: CommitFileEncoding;
+    /**
+     * Path inside the repository, relative and without `..` or `.git`
+     * segments, e.g. `cmd/server/main.go`.
+     */
+    path: string;
+};
+
+/**
+ * Request body for committing files to a repository.
+ */
+export type CommitFilesRequest = {
+    /**
+     * Branch to commit to. Defaults to the repository's default branch; a
+     * branch that does not exist is created from the default branch.
+     */
+    branch?: string | null;
+    /**
+     * Files to add or overwrite (1-100, at most 5 MiB in total). Files not
+     * listed are left as they are.
+     */
+    files: Array<CommitFileRequest>;
+    /**
+     * Commit message (at most 500 bytes).
+     */
+    message: string;
+};
+
+export type CommitFilesResponse = {
+    branch: string;
+    commit_sha: string;
+    connection_id: number;
+    file_count: number;
+    repository: string;
 };
 
 export type CommitInfo = {
@@ -4623,6 +5302,32 @@ export type CommitListResponse = {
 };
 
 /**
+ * What "Compact now" did.
+ */
+export type CompactConversationResponse = {
+    /**
+     * Whether older messages were folded into the summary by this request.
+     */
+    compacted: boolean;
+    /**
+     * Messages folded into the summary by this request.
+     */
+    folded_messages: number;
+    /**
+     * Messages the model still sees word for word after the summary.
+     */
+    kept_messages: number;
+    /**
+     * The model that wrote the summary, when one did.
+     */
+    model?: string | null;
+    /**
+     * Why nothing was compacted, when `compacted` is false.
+     */
+    reason?: string | null;
+};
+
+/**
  * Comparator for static/forecast threshold detectors. Serializes to the
  * keyword forms `gt|gte|lt|lte` (NOT the SQL operators used by
  * `temps-monitoring::compare`).
@@ -4630,6 +5335,81 @@ export type CommitListResponse = {
 export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 
 export type Comparison = 'below' | 'above';
+
+/**
+ * One part of the application. Which fields apply depends on `kind`:
+ * a client has `surface`; an app has `role`, `stack` and `runtime` (and
+ * `image` when it runs an image); data has `engine` and `holds`; an external
+ * service has `provider`.
+ */
+export type Component = {
+    engine?: DataEngine | null;
+    /**
+     * What lives in a data part: tables, key prefixes, buckets, streams.
+     */
+    holds?: Array<string>;
+    /**
+     * Stable slug, unique in the document: `web`, `api`, `orders-worker`.
+     */
+    id: string;
+    /**
+     * The image an app runs, when `runtime` is `image`: `nats:2.10`.
+     */
+    image?: string | null;
+    kind: ComponentKind;
+    name: string;
+    /**
+     * The outside service: "Stripe", "an LLM API", "GitHub OAuth".
+     */
+    provider?: string | null;
+    /**
+     * Why it exists, in one sentence.
+     */
+    purpose: string;
+    role?: AppRole | null;
+    runtime?: AppRuntime | null;
+    /**
+     * Free text, as the user wants it: "Next.js", "Bun + Hono", "FastAPI".
+     */
+    stack?: string | null;
+    surface?: ClientSurface | null;
+};
+
+/**
+ * The project or service that realises one part.
+ */
+export type ComponentBinding = {
+    project_id?: number | null;
+    service_id?: number | null;
+};
+
+/**
+ * What a part of the application is.
+ */
+export type ComponentKind = 'client' | 'app' | 'data' | 'external';
+
+/**
+ * The live state of one bound part.
+ */
+export type ComponentLive = {
+    /**
+     * The project's latest deployment.
+     */
+    deployment_id?: number | null;
+    /**
+     * The project's or the service's name.
+     */
+    name?: string | null;
+    /**
+     * The project's slug, for links into the console.
+     */
+    project_slug?: string | null;
+    /**
+     * The service's engine as Temps names it (`postgres`, `redis`…).
+     */
+    service_type?: string | null;
+    status: LiveStatus;
+};
 
 /**
  * The `docker compose` invocation a check ran, sanitized for display.
@@ -4701,6 +5481,12 @@ export type ComposeCheckReport = {
  * The host's Docker Compose CLI as probed at startup.
  */
 export type ComposeHostStatusResponse = {
+    /**
+     * False when this process never runs Compose workloads (a hosted control
+     * plane): the CLI is neither probed nor expected, so a missing or old
+     * Compose is not a problem to report there.
+     */
+    applicable: boolean;
     /**
      * Whether the Compose CLI ran.
      */
@@ -4895,6 +5681,42 @@ export type ComposeValidationReportResponse = {
 };
 
 /**
+ * Connect the chat's sandbox to the services of a project.
+ */
+export type ConnectProjectRequest = {
+    /**
+     * The project whose services the sandbox may use.
+     */
+    project_id: number;
+};
+
+/**
+ * Connect the chat's sandbox to one service.
+ */
+export type ConnectServiceRequest = {
+    /**
+     * A project the service is linked to. Names the sandbox's database or
+     * bucket after the project; without it the name comes from the sandbox.
+     */
+    project_id?: number | null;
+    /**
+     * The service the sandbox may use.
+     */
+    service_id: number;
+};
+
+/**
+ * A service a sandbox is linked to.
+ */
+export type ConnectedService = {
+    /**
+     * The project the link was made through, if it was made through one.
+     */
+    project_id?: number | null;
+    service_id: number;
+};
+
+/**
  * Per-upstream concurrent-connection limiting. Protects the proxy's own
  * connection/file-descriptor budget from a single slow or malicious
  * customer upstream — independent of the request/idle timeouts in
@@ -4975,6 +5797,58 @@ export type ConnectionResponse = {
 export type ConnectionTestResult = {
     message: string;
     success: boolean;
+};
+
+/**
+ * A tunnel's live connections, read from the provider on request.
+ */
+export type ConnectorLinksView = {
+    links: Array<LinkView>;
+    /**
+     * The provider's own word for the tunnel (Cloudflare: `healthy`,
+     * `degraded`, `down`, `inactive`).
+     */
+    status: string;
+};
+
+/**
+ * One page of tunnels, newest first.
+ */
+export type ConnectorList = {
+    connectors: Array<ConnectorView>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type ConnectorNodeView = {
+    driver?: string | null;
+    last_error?: string | null;
+    node_id: number;
+    node_name: string;
+    ready_connections?: number | null;
+    reported_at?: string | null;
+    state: string;
+};
+
+export type ConnectorView = {
+    auto_publish: boolean;
+    created_at: string;
+    dns_provider_id?: number | null;
+    /**
+     * Where published hostnames point.
+     */
+    dns_target?: string | null;
+    domain: string;
+    edge_port: number;
+    external_id?: string | null;
+    id: number;
+    last_error?: string | null;
+    name: string;
+    nodes: Array<ConnectorNodeView>;
+    provider: string;
+    publications: Array<PublicationView>;
+    status: string;
 };
 
 /**
@@ -5489,6 +6363,12 @@ export type ContainerStatsSample = {
 };
 
 export type ContentPart = {
+    /**
+     * Prompt-cache breakpoint for providers that cache explicitly, e.g.
+     * `{"type": "ephemeral"}`. Everything up to and including this part is
+     * cacheable.
+     */
+    cache_control?: unknown;
     image_url?: unknown;
     text?: string | null;
     type: string;
@@ -5560,6 +6440,26 @@ export type ControlApplicationWorkspaceRequest = {
      */
     runtime?: string | null;
     snapshot_id?: string | null;
+};
+
+/**
+ * How much of the model's context the chat fills right now: the prompt size
+ * of its latest request, which is the whole conversation, the system framing
+ * and the tool definitions as the model last saw them.
+ */
+export type ConversationContext = {
+    /**
+     * Model of that request.
+     */
+    model: string;
+    /**
+     * Prompt tokens of the latest request, as the provider counted them.
+     */
+    tokens: number;
+    /**
+     * The model's context window in tokens, when its catalogue lists one.
+     */
+    window?: number | null;
 };
 
 export type ConversationDetailResponse = ConversationResponse & {
@@ -5646,6 +6546,10 @@ export type ConversationResponse = {
     created_at: string;
     failure?: ChatFailureResponse | null;
     /**
+     * The project an assistant chat was started about, if any.
+     */
+    focus_project_id?: number | null;
+    /**
      * `ai` (a conversation with an AI harness) or `terminal` (an interactive
      * shell in the workspace sandbox). Fixed at creation.
      */
@@ -5663,6 +6567,22 @@ export type ConversationResponse = {
 };
 
 /**
+ * The sandbox a chat is linked to, as the conversation list shows it.
+ */
+export type ConversationSandboxResponse = {
+    /**
+     * Isolation backend: `docker`, `firecracker` or `microsandbox`. Absent
+     * for sandboxes created before the backend was recorded.
+     */
+    backend?: string | null;
+    name: string;
+    /**
+     * Public id of the sandbox (`sbx_…`).
+     */
+    sandbox_id: string;
+};
+
+/**
  * A conversation summary grouping related AI invocations.
  */
 export type ConversationSummary = {
@@ -5676,6 +6596,49 @@ export type ConversationSummary = {
     total_input_tokens: number;
     total_output_tokens: number;
     total_tokens: number;
+};
+
+/**
+ * What one conversation has cost so far.
+ */
+export type ConversationUsage = {
+    /**
+     * Requests made with the user's own provider key rather than the
+     * platform's, which Temps does not bill.
+     */
+    byok_requests: number;
+    context?: ConversationContext | null;
+    /**
+     * Estimated cost in microcents (1/10000 of a cent), summed over the
+     * requests that have a known price.
+     */
+    cost_microcents: number;
+    input_tokens: number;
+    models: Array<ModelSpend>;
+    output_tokens: number;
+    requests: number;
+    /**
+     * Earlier messages folded into the chat's running summary, so the model
+     * no longer sees them word for word. `0` when the chat was never compacted
+     * or the count could not be read.
+     */
+    summarized_messages: number;
+    /**
+     * Requests that used tokens but were logged at zero cost because the
+     * model has no known price. When this is not zero, the cost is a floor.
+     */
+    unpriced_requests: number;
+};
+
+/**
+ * The workspace a chat is in, as the conversation list shows it.
+ */
+export type ConversationWorkspaceResponse = {
+    name: string;
+    /**
+     * Public id of the workspace (`app_…`).
+     */
+    public_id: string;
 };
 
 export type ConversationsQueryParams = {
@@ -5891,6 +6854,25 @@ export type CreateApplicationRequest = {
     starter_project?: CreateApplicationProjectRequest | null;
 };
 
+export type CreateAssistantConversationRequest = {
+    /**
+     * Model id to start with; defaults to the provider's default model.
+     */
+    ai_model?: string | null;
+    /**
+     * An AI-gateway provider id (`gateway_key:<id>`). Defaults to the active
+     * OpenRouter key, then to the instance default. Host harnesses are
+     * rejected: the assistant has no sandbox.
+     */
+    ai_provider?: string | null;
+    /**
+     * A project the chat is about. The assistant is told which it is, so it
+     * needs no searching to resolve "my app". It is a default, not a limit,
+     * and grants nothing: the chat still acts with the user's own permissions.
+     */
+    project_id?: number | null;
+};
+
 export type CreateBackupScheduleRequest = {
     backup_type: string;
     description?: string | null;
@@ -5915,6 +6897,11 @@ export type CreateBackupScheduleRequest = {
      * Optional S3 source. If omitted, the current default S3 source is used.
      */
     s3_source_id?: number | null;
+    /**
+     * Cron expression with a leading seconds field: `sec min hour day-of-month
+     * month day-of-week`, for example `0 0 3 * * *` for every day at 03:00
+     * UTC. A five-field expression such as `0 3 * * *` is rejected.
+     */
     schedule_expression: string;
     /**
      * External services to target when `target_all_services` is `false`.
@@ -5985,6 +6972,28 @@ export type CreateCloudflareProviderRequest = {
     config: CloudflareConfig;
     enabled?: boolean | null;
     name: string;
+};
+
+export type CreateConnectorRequest = {
+    /**
+     * Lowercase letters, digits and hyphens; names the tunnel `temps-<name>`.
+     */
+    name: string;
+    /**
+     * Nodes that run a connector replica.
+     */
+    node_ids: Array<number>;
+    /**
+     * The provider's `kind`, from `GET /ingress/providers`.
+     */
+    provider: string;
+    /**
+     * Answers to the provider's setup fields, by field key. DNS provider
+     * fields take the provider's id; every other field takes a string.
+     */
+    values?: {
+        [key: string]: unknown;
+    };
 };
 
 export type CreateConversationRequest = {
@@ -6157,7 +7166,12 @@ export type CreateEnvironmentVariableRequest = {
 
 export type CreateExternalServiceRequest = {
     /**
-     * Cluster member specifications. Required when topology is "cluster".
+     * Cluster member specifications for topology "cluster". Optional: when
+     * omitted the cluster gets a monitor, a primary and a replica, all on the
+     * control plane (one host, so it survives a member failing, not the host
+     * failing). When given it must hold exactly one `monitor` and at least
+     * one `primary` or `replica`; set `node_id` to spread members across
+     * worker nodes.
      */
     members?: Array<ClusterMemberRequest>;
     name: string;
@@ -6256,10 +7270,7 @@ export type CreateGenericRequest = {
      * Display name for this provider.
      */
     name: string;
-    /**
-     * Access token or password. Omit (or set to `null`) for public repositories.
-     */
-    token?: string | null;
+    token?: SecretString | null;
     /**
      * HTTP Basic username used with the token. Defaults to `x-access-token` when
      * absent or empty. Ignored for public (unauthenticated) repositories.
@@ -6269,13 +7280,13 @@ export type CreateGenericRequest = {
 
 export type CreateGitHubPatRequest = {
     name: string;
-    token: string;
+    token: SecretString;
 };
 
 export type CreateGitLabOAuthRequest = {
     base_url?: string | null;
     client_id: string;
-    client_secret: string;
+    client_secret: SecretString;
     name: string;
     redirect_uri: string;
 };
@@ -6283,7 +7294,7 @@ export type CreateGitLabOAuthRequest = {
 export type CreateGitLabPatRequest = {
     base_url?: string | null;
     name: string;
-    token: string;
+    token: SecretString;
 };
 
 export type CreateGiteaPatRequest = {
@@ -6298,7 +7309,7 @@ export type CreateGiteaPatRequest = {
     /**
      * Personal access token issued by the Gitea instance.
      */
-    token: string;
+    token: SecretString;
 };
 
 export type CreateGlobalConversationRequest = {
@@ -6375,7 +7386,7 @@ export type CreateIntegrationBody = {
     /**
      * Signing secret from the provider's dashboard.
      */
-    signing_secret: string;
+    signing_secret: SecretString;
 };
 
 /**
@@ -6517,7 +7528,7 @@ export type CreateNotificationRouteRequest = {
 
 export type CreateOidcProviderRequest = {
     client_id: string;
-    client_secret: string;
+    client_secret: SecretString;
     default_role?: string;
     enabled?: boolean;
     group_claim?: string;
@@ -6868,7 +7879,7 @@ export type CreateProviderKeyRequest = {
      * Provider API key. Optional only for self-hosted providers that run
      * without authentication.
      */
-    api_key?: string;
+    api_key?: SecretString;
     /**
      * Required for "openai_compatible", e.g. "http://10.0.0.5:8000/v1".
      */
@@ -6902,6 +7913,29 @@ export type CreateProviderRequest = {
     provider_type: string;
 };
 
+/**
+ * Request body for creating an empty repository through a git connection.
+ */
+export type CreateRepositoryRequest = {
+    /**
+     * Short description, up to 350 characters.
+     */
+    description?: string | null;
+    /**
+     * Repository name: letters, digits, `-`, `_` and `.`, up to 100 characters.
+     */
+    name: string;
+    /**
+     * Account or organization to create it under. Defaults to the
+     * connection's own account.
+     */
+    owner?: string | null;
+    /**
+     * Whether the repository is private. Defaults to `true`.
+     */
+    private?: boolean;
+};
+
 export type CreateRouteRequest = {
     domain: string;
     host: string;
@@ -6914,7 +7948,10 @@ export type CreateRouteRequest = {
 };
 
 export type CreateS3SourceRequest = {
-    access_key_id: string;
+    /**
+     * Access key ID of the bucket's credentials, for example `AKIA...` on AWS.
+     */
+    access_key_id: SecretString;
     /**
      * Managed RustFS/S3 service that supplies this destination. When set,
      * schedules using this source can never target that service itself.
@@ -6937,7 +7974,11 @@ export type CreateS3SourceRequest = {
     is_default?: boolean | null;
     name: string;
     region: string;
-    secret_key: string;
+    /**
+     * Secret access key that goes with the access key ID. Shown once by the
+     * provider; stored encrypted and never returned.
+     */
+    secret_key: SecretString;
 };
 
 export type CreateSandboxBody = {
@@ -7015,14 +8056,7 @@ export type CreateSandboxBody = {
      * extra round-trip.
      */
     ports?: Array<number>;
-    /**
-     * Optional preview-URL password. When set, every preview URL served
-     * for this sandbox is gated behind a login form. 8–256 characters.
-     * Omit to leave preview URLs open (the sandbox ID remains the only
-     * gate). The plaintext is never returned; only the last-4 hint is
-     * surfaced in `SandboxResponse.preview_password_hint`.
-     */
-    preview_password?: string | null;
+    preview_password?: SecretString | null;
     projectId?: string | null;
     /**
      * Create the sandbox against a temps project (temps-native). The
@@ -7127,14 +8161,25 @@ export type CreateWebhookRequestBody = {
      * Event types to subscribe to
      */
     events: Array<string>;
-    /**
-     * Secret for HMAC signature verification (optional)
-     */
-    secret?: string | null;
+    secret?: SecretString | null;
     /**
      * Target URL for webhook delivery
      */
     url: string;
+};
+
+/**
+ * The repository that was created. Carries no credentials.
+ */
+export type CreatedRepositoryResponse = {
+    clone_url: string;
+    connection_id: number;
+    default_branch: string;
+    full_name: string;
+    name: string;
+    owner: string;
+    private: boolean;
+    web_url: string;
 };
 
 /**
@@ -7420,6 +8465,11 @@ export type DashboardTile = {
      */
     title?: string | null;
 };
+
+/**
+ * The engines Temps operates as managed services.
+ */
+export type DataEngine = 'postgres' | 'redis' | 'mongodb' | 'mariadb' | 's3';
 
 /**
  * A specific data implication the user needs to understand
@@ -8630,7 +9680,7 @@ export type DiscoverProviderModelsRequest = {
     /**
      * API key, if the server requires one
      */
-    api_key?: string;
+    api_key?: SecretString;
     /**
      * Base URL of the server (required for "openai_compatible")
      */
@@ -8684,6 +9734,10 @@ export type DiscoverResponse = {
 
 export type DiscoveredModelResponse = {
     id: string;
+    /**
+     * The model's human-readable name, when the server's listing gives one.
+     */
+    name?: string | null;
     owned_by: string;
 };
 
@@ -8854,6 +9908,11 @@ export type DnsCompletionResponse = {
 };
 
 /**
+ * Who makes the published hostnames resolve.
+ */
+export type DnsHandling = 'automatic' | 'manual' | 'provider_hostname';
+
+/**
  * Error response for DNS lookup failures
  */
 export type DnsLookupError = {
@@ -8903,14 +9962,14 @@ export type DnsLookupResponse = {
  * DNS provider credentials (API-facing)
  */
 export type DnsProviderCredentials = {
-    api_key: string;
+    api_key: SecretString;
     type: 'bunny';
 } | {
     account_id?: string | null;
-    api_token: string;
+    api_token: SecretString;
     type: 'cloudflare';
 } | {
-    api_key: string;
+    api_key: SecretString;
     api_user: string;
     client_ip?: string | null;
     sandbox?: boolean;
@@ -8918,20 +9977,20 @@ export type DnsProviderCredentials = {
 } | {
     access_key_id: string;
     region?: string | null;
-    secret_access_key: string;
-    session_token?: string | null;
+    secret_access_key: SecretString;
+    session_token?: SecretString | null;
     type: 'route53';
 } | {
-    api_token: string;
+    api_token: SecretString;
     type: 'digitalocean';
 } | {
-    private_key: string;
+    private_key: SecretString;
     project_id: string;
     service_account_email: string;
     type: 'gcp';
 } | {
     client_id: string;
-    client_secret: string;
+    client_secret: SecretString;
     resource_group: string;
     subscription_id: string;
     tenant_id: string;
@@ -9774,11 +10833,15 @@ export type EligibleGitRepositoryResponse = {
     repositoryUrl: string;
 };
 
+/**
+ * Request-side SMTP config. Not `Serialize` for the same reason as
+ * [`SlackConfig`]; use [`EmailConfig::into_stored_value`].
+ */
 export type EmailConfig = {
     accept_invalid_certs?: boolean;
     from_address: string;
     from_name?: string | null;
-    password: string;
+    password: SecretString;
     smtp_host: string;
     smtp_port: number;
     starttls_required?: boolean;
@@ -10001,10 +11064,7 @@ export type EnableBlobRequest = {
      * Docker image to use (optional, defaults to RustFS)
      */
     docker_image?: string | null;
-    /**
-     * Root password for S3 access
-     */
-    root_password?: string | null;
+    root_password?: SecretString | null;
     /**
      * Root user for S3 access
      */
@@ -10803,6 +11863,27 @@ export type EventDetailResponse = {
      * Number of unique visitors who triggered this event
      */
     unique_visitors: number;
+};
+
+/**
+ * Structured details of a timeline event. Stored as JSON; every field is
+ * optional because each kind uses a few of them.
+ */
+export type EventDetails = {
+    attempt?: number | null;
+    branch?: string | null;
+    command?: string | null;
+    conversation_id?: string | null;
+    duration_ms?: number | null;
+    exit_code?: number | null;
+    files?: Array<FileChange> | null;
+    output_excerpt?: string | null;
+    sandbox_id?: string | null;
+    score?: number | null;
+    sha?: string | null;
+    status?: string | null;
+    tool?: string | null;
+    url?: string | null;
 };
 
 /**
@@ -11694,6 +12775,19 @@ export type FeedbackView = {
     url?: string | null;
 };
 
+export type FieldKind = {
+    type: 'text';
+} | {
+    type: 'secret';
+} | {
+    provider_type?: string | null;
+    type: 'dns_provider';
+} | {
+    allow_subdomain?: boolean;
+    provider_field: string;
+    type: 'managed_domain';
+};
+
 export type FieldResponse = {
     /**
      * Field type (Int32, String, Timestamp, etc.)
@@ -11707,6 +12801,18 @@ export type FieldResponse = {
      * Whether the field is nullable
      */
     nullable: boolean;
+};
+
+/**
+ * One changed path, from `git diff --numstat`.
+ */
+export type FileChange = {
+    /**
+     * `None` for binary files.
+     */
+    added?: number | null;
+    path: string;
+    removed?: number | null;
 };
 
 /**
@@ -11739,6 +12845,14 @@ export type FileObject = {
      * `batch` for uploads, `batch_output` for batch results
      */
     purpose?: string;
+};
+
+export type FillSecretRequest = {
+    /**
+     * The credential. Stored encrypted; never returned and never shown to the
+     * assistant, which only receives an opaque handle.
+     */
+    value: SecretString;
 };
 
 export type Finding = {
@@ -11847,6 +12961,24 @@ export type FlagSnapshotResponse = {
  * The declared type of a flag's value. Fixed at create time.
  */
 export type FlagValueType = 'bool' | 'string' | 'number' | 'json';
+
+/**
+ * Data moving from one part to another. `from` is the part that starts it.
+ */
+export type Flow = {
+    from: string;
+    kind: FlowKind;
+    /**
+     * What travels: "POST /api/tasks", "topic task.created", "tables tasks, users".
+     */
+    label: string;
+    to: string;
+};
+
+/**
+ * What travels along a flow.
+ */
+export type FlowKind = 'http' | 'websocket' | 'query' | 'publish' | 'subscribe' | 'cache' | 'blob' | 'webhook';
 
 /**
  * Forecast model family.
@@ -12762,6 +13894,30 @@ export type GitBindingResponse = {
 };
 
 /**
+ * How a file differs from the last commit.
+ */
+export type GitChangeKind = 'modified' | 'added' | 'deleted' | 'renamed' | 'copied' | 'type_changed' | 'untracked' | 'conflicted';
+
+/**
+ * A file that differs from the repository's last commit.
+ */
+export type GitChangedFile = {
+    change: GitChangeKind;
+    /**
+     * The path before a rename or copy.
+     */
+    old_path?: string | null;
+    /**
+     * Path relative to the repository root.
+     */
+    path: string;
+    /**
+     * True when the change is staged (in the index).
+     */
+    staged: boolean;
+};
+
+/**
  * Git push event information that triggered the deployment
  */
 export type GitPushEvent = {
@@ -12818,6 +13974,33 @@ export type GitRefResponse = {
      * Git repository URL
      */
     url: string;
+};
+
+/**
+ * The uncommitted changes of one repository in the sandbox.
+ */
+export type GitRepoChanges = {
+    /**
+     * The checked-out branch, or the short commit when detached.
+     */
+    branch?: string | null;
+    files: Array<GitChangedFile>;
+    /**
+     * False for a repository with no commit yet: every file is new.
+     */
+    has_commits: boolean;
+    /**
+     * The root relative to the work directory (`.` for the work directory).
+     */
+    name: string;
+    /**
+     * Absolute path of the repository root.
+     */
+    root: string;
+    /**
+     * True when more files changed than are listed.
+     */
+    truncated: boolean;
 };
 
 /**
@@ -12886,6 +14069,10 @@ export type GlobalConversationResponse = {
     created_at: string;
     failure?: ChatFailureResponse | null;
     /**
+     * The project an assistant chat was started about, if any.
+     */
+    focus_project_id?: number | null;
+    /**
      * `"ai"` for an agent conversation, `"terminal"` for a shell thread.
      */
     kind: string;
@@ -12894,12 +14081,14 @@ export type GlobalConversationResponse = {
     project_name?: string | null;
     project_slug?: string | null;
     public_id: string;
+    sandbox?: ConversationSandboxResponse | null;
     status: string;
     title?: string | null;
     /**
      * Server-authoritative lifecycle for the current/most recent turn.
      */
     turn_status: string;
+    workspace?: ConversationWorkspaceResponse | null;
 };
 
 export type GlobalErrorGroupResponse = {
@@ -13178,6 +14367,56 @@ export type GlobalTracesResponse = {
      * Effective per-project windows; totals and rows describe these windows.
      */
     windows: Array<GlobalTraceWindow>;
+};
+
+/**
+ * A deployment a goal is watching.
+ */
+export type GoalDeployment = {
+    /**
+     * Absent when the goal watches whichever deployment is the project's
+     * latest, so the console follows that deployment as it changes.
+     */
+    deployment_id?: number | null;
+    project_id: number;
+};
+
+/**
+ * Goal as returned to the console.
+ */
+export type GoalResponse = {
+    /**
+     * Fix turns started so far.
+     */
+    attempts: number;
+    /**
+     * The read operation that observes the goal.
+     */
+    check_operation: string;
+    created_at: string;
+    /**
+     * The goal is given up, as failed, after this instant (ISO 8601).
+     */
+    deadline_at: string;
+    deployment?: GoalDeployment | null;
+    /**
+     * Opaque goal id.
+     */
+    id: string;
+    /**
+     * ISO 8601, `Z` suffix.
+     */
+    last_checked_at?: string | null;
+    /**
+     * What the last check saw, in one sentence.
+     */
+    last_observation?: string | null;
+    max_attempts: number;
+    /**
+     * `active`, `healing`, `needs_you`, `achieved`, `failed` or `cancelled`.
+     */
+    status: string;
+    title: string;
 };
 
 /**
@@ -13659,6 +14898,11 @@ export type HeartbeatApiRequest = {
      * Updated node labels for scheduling (allows runtime label changes).
      */
     labels?: unknown;
+    /**
+     * The node's occupied IPv4 ranges (ADR 056), sent when they change.
+     */
+    occupied_ranges?: Array<OccupiedRangeReport> | null;
+    overlay?: OverlayHeartbeat | null;
     public_ingress?: PublicIngressHeartbeat | null;
 };
 
@@ -13751,6 +14995,13 @@ export type HistogramSummary = {
  */
 export type Hosting = 'hosted' | 'external';
 
+export type HostnameCandidate = {
+    auto_publish: boolean;
+    connector_id: number;
+    domain: string;
+    name: string;
+};
+
 /**
  * A single generated-hostname change in a flatten preview/apply.
  */
@@ -13766,6 +15017,11 @@ export type HostnameChange = {
     new: string;
     old: string;
 };
+
+/**
+ * How one hostname reaches visitors, as the operator chose it (ADR 058 D9).
+ */
+export type HostnameMode = 'automatic' | 'tunnel' | 'off';
 
 /**
  * Combined preview of a hostname-mode change.
@@ -13784,6 +15040,40 @@ export type HostnamePreviewResponse = {
      * Whether the provider token can manage this zone (None if not checked).
      */
     zone_access_ok?: boolean | null;
+};
+
+/**
+ * Where a hostname stands with the tunnels, and why.
+ */
+export type HostnameView = {
+    /**
+     * The tunnels whose domain covers it.
+     */
+    candidates: Array<HostnameCandidate>;
+    /**
+     * The tunnel chosen for it, with mode `tunnel`.
+     */
+    chosen_connector_id?: number | null;
+    /**
+     * The tunnel that publishes it, or would once `detail` is dealt with.
+     */
+    connector_id?: number | null;
+    connector_name?: string | null;
+    /**
+     * What is happening; when it is not published, why and what to do.
+     */
+    detail: string;
+    hostname: string;
+    mode: HostnameMode;
+    published_at?: string | null;
+    /**
+     * Whether workers serve it. A tunnel only publishes those.
+     */
+    served_by_workers: boolean;
+    /**
+     * `published`, `pending`, `error` or `not_published`.
+     */
+    state: string;
 };
 
 export type HourlyPageSessions = {
@@ -14582,6 +15872,13 @@ export type IngestErrorsResponse = {
     errors: Array<IngestErrorSummary>;
 };
 
+/**
+ * What a worker lets its control plane do with public ingress. Set on the
+ * worker only (`temps join --ingress`, `temps agent ingress`): opening ports
+ * on a machine is its owner's decision, whoever runs the control plane.
+ */
+export type IngressMode = 'off' | 'fixed' | 'delegated';
+
 export type InheritedEnvVarResponse = {
     /**
      * The project also defines this key itself (in some environment), and
@@ -15041,6 +16338,12 @@ export type JourneySession = {
 };
 
 /**
+ * Which sandbox the chats keep when a chat with a sandbox of its own joins a
+ * workspace that already has one.
+ */
+export type KeepSandbox = 'workspace' | 'chat';
+
+/**
  * Request to get keys matching a pattern
  */
 export type KeysRequest = {
@@ -15223,6 +16526,20 @@ export type LinkApplicationProjectRequest = {
     project_id: number;
 };
 
+/**
+ * Link an existing sandbox (`sandbox_id`) or create a new one (`create`).
+ */
+export type LinkSandboxRequest = {
+    /**
+     * Create a fresh sandbox for this chat instead.
+     */
+    create?: boolean;
+    /**
+     * Public id of one of the caller's own sandboxes.
+     */
+    sandbox_id?: string | null;
+};
+
 export type LinkServiceRequest = {
     /**
      * Exact database name used when `database_provisioning_mode` is `custom`.
@@ -15233,6 +16550,21 @@ export type LinkServiceRequest = {
      */
     database_provisioning_mode?: DatabaseProvisioningMode;
     project_id: number;
+};
+
+export type LinkView = {
+    client_version?: string | null;
+    /**
+     * The provider's data centre, such as `mad01`.
+     */
+    location?: string | null;
+    /**
+     * The worker holding it, when its connector could be matched.
+     */
+    node_id?: number | null;
+    node_name?: string | null;
+    opened_at?: string | null;
+    reconnecting: boolean;
 };
 
 export type ListAgentsResponse = {
@@ -15549,6 +16881,11 @@ export type ListVulnerabilitiesQuery = {
     page_size?: number | null;
     severity?: string | null;
 };
+
+/**
+ * How a bound part is doing right now.
+ */
+export type LiveStatus = 'created' | 'building' | 'live' | 'failed' | 'stopped' | 'missing';
 
 export type LiveVisitorInfo = {
     city?: string | null;
@@ -16041,6 +17378,77 @@ export type MemberSyncResult = {
     slug: string;
 };
 
+/**
+ * Body of `POST /internal/nodes/mesh-enroll` (ADR 055).
+ */
+export type MeshEnrollApiRequest = {
+    join_token?: SecretString | null;
+    /**
+     * Scheduling labels the worker will register with; checked against the
+     * token's bound labels and carried over to the pairing's token.
+     */
+    labels?: unknown;
+    /**
+     * The name the worker will register under.
+     */
+    name: string;
+    /**
+     * The worker's base64 WireGuard public key. The private key never
+     * leaves the worker.
+     */
+    wg_public_key: string;
+};
+
+/**
+ * What a worker that joins outbound only needs to bring its end of the mesh
+ * up and register over it (ADR 055): a pairing code without its secret.
+ */
+export type MeshEnrollResponse = {
+    /**
+     * SHA-256 fingerprint of the cluster CA the node API presents.
+     */
+    ca_fingerprint: string;
+    /**
+     * The control plane's mesh address; the node API listens there.
+     */
+    control_plane_address: string;
+    /**
+     * `ip:port` the worker dials.
+     */
+    control_plane_endpoint: string;
+    control_plane_public_key: string;
+    /**
+     * When the pairing and its token expire (RFC 3339).
+     */
+    expires_at: string;
+    /**
+     * Single-use join token bound to `name`, accepted only over the mesh
+     * node API from `node_address`.
+     */
+    join_token: string;
+    /**
+     * The mesh UDP port.
+     */
+    listen_port: number;
+    /**
+     * The name the pairing's join token is bound to.
+     */
+    name: string;
+    /**
+     * The worker's mesh address, reserved for it. It registers under it.
+     */
+    node_address: string;
+    /**
+     * TCP port of the node API on the control plane's mesh address.
+     */
+    node_api_port: number;
+    /**
+     * The pairing created for the worker.
+     */
+    pairing_id: number;
+    prefix_len: number;
+};
+
 export type MessageContent = string | Array<ContentPart>;
 
 /**
@@ -16067,6 +17475,11 @@ export type MessageResponse = {
      * an uninterpreted token and send it back through the `before` query.
      */
     cursor: string;
+    /**
+     * Next steps already suggested after this answer, shown again on reload
+     * without asking the model a second time.
+     */
+    next_steps?: Array<string> | null;
     /**
      * Ordered render segments (text / tool, in the order they occurred) so a
      * reloaded chat shows the same interleaving as the live stream. Absent for
@@ -16523,6 +17936,50 @@ export type ModelCapability = {
  */
 export type ModelCatalogSource = 'live' | 'cache' | 'stale_cache' | 'bootstrap';
 
+/**
+ * What a provider's model catalogue says about one model, kept so a user can
+ * choose between models without leaving the console. Every field is optional
+ * because catalogues differ: OpenRouter publishes all of them, others few.
+ */
+export type ModelDetails = {
+    /**
+     * USD per one million input tokens read from the provider's prompt cache.
+     */
+    cache_read_price_per_million?: number | null;
+    /**
+     * USD per one million input tokens written to the provider's prompt cache.
+     */
+    cache_write_price_per_million?: number | null;
+    /**
+     * Maximum context window in tokens.
+     */
+    context_length?: number | null;
+    /**
+     * What the model accepts: `text`, `image`, `file`, `audio`, ...
+     */
+    input_modalities?: Array<string>;
+    /**
+     * USD per one million input (prompt) tokens.
+     */
+    input_price_per_million?: number | null;
+    /**
+     * Human-readable name, when it differs from the model id.
+     */
+    name?: string | null;
+    /**
+     * What the model produces: `text`, `image`, ...
+     */
+    output_modalities?: Array<string>;
+    /**
+     * USD per one million output (completion) tokens.
+     */
+    output_price_per_million?: number | null;
+    /**
+     * Whether the catalogue lists tool calling. The Temps assistant needs it.
+     */
+    supports_tools?: boolean | null;
+};
+
 export type ModelInfo = {
     id: string;
     object: string;
@@ -16583,6 +18040,20 @@ export type ModelPricing = {
      * Provider ID (e.g. "openai", "anthropic")
      */
     provider: string;
+};
+
+/**
+ * Spend for one model within a chat.
+ */
+export type ModelSpend = {
+    /**
+     * Estimated cost in microcents (1/10000 of a cent), as logged.
+     */
+    cost_microcents: number;
+    input_tokens: number;
+    model: string;
+    output_tokens: number;
+    requests: number;
 };
 
 export type ModelUsage = {
@@ -16785,6 +18256,18 @@ export type MultiNodeSettings = {
      * workers have re-enrolled with certs.
      */
     require_mtls?: boolean;
+    /**
+     * `ip:port` workers dial for the control plane's end of the WireGuard
+     * mesh, published instead of `private_address` on the mesh port. For a
+     * control plane reachable only through NAT or a forwarded port.
+     *
+     * Owned by `temps serve --wg-endpoint` / `TEMPS_WG_ENDPOINT`: every start
+     * records the flag's value (clearing it when the flag is absent), and a
+     * settings write never changes it. Stored here only so the processes
+     * that set the mesh up (the deployer plugin, `temps network
+     * setup-multi-node`) read the same value.
+     */
+    wg_endpoint?: string | null;
 };
 
 /**
@@ -16897,6 +18380,33 @@ export type NetworkMode = 'bridge' | 'host' | 'none' | {
 export type NetworkPoolEntry = {
     compute_pool_cidr: string;
     subnet_prefix_len: number;
+};
+
+/**
+ * A new workspace to create for the chat.
+ */
+export type NewChatWorkspace = {
+    description?: string | null;
+    name: string;
+};
+
+/**
+ * Suggestions for one answer.
+ */
+export type NextSteps = {
+    /**
+     * Cursor of the answer they follow on from, as in the message list.
+     */
+    answer: string;
+    /**
+     * The model that wrote them.
+     */
+    model: string;
+    /**
+     * True when they were saved earlier and returned without a new request.
+     */
+    saved: boolean;
+    suggestions: Array<string>;
 };
 
 /**
@@ -17108,11 +18618,29 @@ export type NodeInfoResponse = {
      * Resource capacity/usage metrics from the latest heartbeat
      */
     capacity: unknown;
+    /**
+     * This node's subnet of the cluster compute pool, if allocated.
+     */
+    compute_cidr?: string | null;
     created_at: string;
     id: number;
     labels: unknown;
     last_heartbeat?: string | null;
     name: string;
+    /**
+     * Why the overlay is unavailable: the colliding range, its owner and the
+     * fixes.
+     */
+    overlay_last_error?: string | null;
+    /**
+     * The last automatic move of this node's allocation, and why.
+     */
+    overlay_remediation?: string | null;
+    /**
+     * Cross-node overlay (ADR 056): `ready`, `unavailable`, or `None` when
+     * the agent never reported it (older agent, or no heartbeat yet).
+     */
+    overlay_status?: string | null;
     private_address: string;
     public_ingress_certificate_count?: number | null;
     public_ingress_enabled: boolean;
@@ -17158,9 +18686,10 @@ export type NodePairingResponse = {
     mesh_address: string;
     name: string;
     /**
-     * `ip:port` the control plane dials.
+     * `ip:port` the control plane dials; `null` for a worker that joined
+     * outbound only (ADR 055): it dials the control plane instead.
      */
-    node_endpoint: string;
+    node_endpoint?: string | null;
     /**
      * The node that registered with this pairing.
      */
@@ -17583,6 +19112,24 @@ export type ObservabilityRetentionSettings = {
     proxy_logs_days?: number;
 };
 
+/**
+ * One IPv4 range a node already uses outside Temps (ADR 056).
+ */
+export type OccupiedRangeReport = {
+    /**
+     * IPv4 network, e.g. `172.20.0.0/16`.
+     */
+    cidr: string;
+    /**
+     * Device name for a route, network name for a Docker network.
+     */
+    name: string;
+    /**
+     * `route` (a host route) or `docker` (a Docker network's subnet).
+     */
+    source: string;
+};
+
 export type OidcProviderResponse = {
     client_id: string;
     /**
@@ -17811,6 +19358,37 @@ export type OpenAiError = {
 
 export type OpenAiErrorResponse = {
     error: OpenAiError;
+};
+
+export type OpenIncidentRequest = {
+    /**
+     * The error group to fix.
+     */
+    error_group_id: number;
+};
+
+export type OpenIncidentResponse = {
+    /**
+     * False when an open incident for the group already existed.
+     */
+    created: boolean;
+    incident: AutofixIncidentResponse;
+};
+
+/**
+ * Request body for opening a pull request.
+ */
+export type OpenPullRequestRequest = {
+    /**
+     * Branch to merge into. Defaults to the repository's default branch.
+     */
+    base_branch?: string | null;
+    body?: string | null;
+    /**
+     * Branch holding the changes.
+     */
+    head_branch: string;
+    title: string;
 };
 
 export type OperatingSystemCount = {
@@ -18065,6 +19643,24 @@ export type OutlierParams = {
      * Sensitivity; higher tolerates larger spread before flagging.
      */
     tolerance?: number;
+};
+
+/**
+ * Cross-node overlay state reported by the agent (ADR 056).
+ */
+export type OverlayHeartbeat = {
+    /**
+     * The allocation the agent applied (when `ready`) or tried to.
+     */
+    compute_cidr?: string | null;
+    /**
+     * Why the overlay is unavailable, with the fix.
+     */
+    last_error?: string | null;
+    /**
+     * `ready` or `unavailable`.
+     */
+    status: string;
 };
 
 /**
@@ -18734,6 +20330,10 @@ export type PathVisitorsAnalyticsQuery = {
 
 export type PathVisitorsResponse = {
     results: Array<PathVisitors>;
+};
+
+export type PauseAutofixRequest = {
+    paused: boolean;
 };
 
 /**
@@ -20486,6 +22086,20 @@ export type PromoteDeploymentRequest = {
     target_environment_id: number;
 };
 
+/**
+ * The cached share of a prompt. Both counts are parts of `prompt_tokens`.
+ */
+export type PromptTokensDetails = {
+    /**
+     * Tokens written to the provider's prompt cache by this request.
+     */
+    cache_write_tokens?: number;
+    /**
+     * Tokens read from the provider's prompt cache.
+     */
+    cached_tokens?: number;
+};
+
 export type PropertyBreakdownItem = {
     count: number;
     percentage: number;
@@ -20825,6 +22439,33 @@ export type ProviderDomainIdentityResponse = {
     status: string;
 };
 
+/**
+ * What a provider is, for the console.
+ */
+export type ProviderInfo = {
+    dns: DnsHandling;
+    docs_url?: string | null;
+    fields: Array<SetupField>;
+    /**
+     * Stored on the connector, e.g. `cloudflare_tunnel`.
+     */
+    kind: string;
+    name: string;
+    /**
+     * Whether the worker needs a public address. Tunnels do not.
+     */
+    needs_public_ip: boolean;
+    /**
+     * What the operator needs before starting, one line each.
+     */
+    requirements: Array<string>;
+    summary: string;
+    /**
+     * Whether it works when the ISP puts the worker behind carrier-grade NAT.
+     */
+    works_behind_cgnat: boolean;
+};
+
 export type ProviderKeyResponse = {
     /**
      * Masked API key (only last 4 chars visible)
@@ -20866,6 +22507,7 @@ export type ProviderMetadata = {
 };
 
 export type ProviderModelResponse = {
+    details?: ModelDetails | null;
     display_name: string;
     id: number;
     is_available: boolean;
@@ -21133,6 +22775,25 @@ export type PublicIncidentUpdate = {
     status: PublicIncidentStatus;
 };
 
+export type PublicIngressCheck = {
+    ok: boolean;
+    steps: Array<PublicIngressCheckStep>;
+    summary: string;
+    /**
+     * The address that was dialled.
+     */
+    target?: string | null;
+};
+
+export type PublicIngressCheckStep = {
+    message: string;
+    ok: boolean;
+    /**
+     * `address`, `http` or `https`.
+     */
+    step: string;
+};
+
 export type PublicIngressHeartbeat = {
     certificate_count: number;
     last_error?: string | null;
@@ -21140,6 +22801,52 @@ export type PublicIngressHeartbeat = {
     running: boolean;
     unsupported_reasons?: Array<string>;
     unsupported_route_count: number;
+};
+
+export type PublicIngressInterface = {
+    address: string;
+    default_route: boolean;
+    name: string;
+    scope: AddressScope;
+};
+
+export type PublicIngressSettings = {
+    /**
+     * Whether the agent reported its addresses: an agent that predates
+     * console-managed ingress never does, and keeps its flag.
+     */
+    agent_reports: boolean;
+    /**
+     * The listen address is not public but the public address is: traffic
+     * crosses a NAT, so the router must forward the ports.
+     */
+    behind_nat: boolean;
+    checked_at?: string | null;
+    /**
+     * The address DNS should point at, as far as Temps can tell.
+     */
+    effective_public_address?: string | null;
+    effective_public_scope?: AddressScope | null;
+    enabled: boolean;
+    http_port: number;
+    https_port: number;
+    interfaces: Array<PublicIngressInterface>;
+    last_check?: PublicIngressCheck | null;
+    last_error?: string | null;
+    /**
+     * Configured listen address; `None` means automatic.
+     */
+    listen_address?: string | null;
+    listener_error?: string | null;
+    listening_http?: string | null;
+    listening_https?: string | null;
+    mode?: IngressMode | null;
+    node_id: number;
+    /**
+     * Configured public address; `None` means the listen address.
+     */
+    public_address?: string | null;
+    running?: boolean | null;
 };
 
 /**
@@ -21325,6 +23032,27 @@ export type PublicUrlStatus = {
      * Console path where the operator sets it. Present whenever `reason` is.
      */
     setup_path?: string | null;
+};
+
+export type PublicationView = {
+    hostname: string;
+    last_error?: string | null;
+    published_at?: string | null;
+    /**
+     * `published`, `error`, or `stale` (its record points at a tunnel that
+     * was replaced; it is being published again).
+     */
+    state: string;
+};
+
+export type PullRequestResponse = {
+    base_branch: string;
+    connection_id: number;
+    head_branch: string;
+    number: number;
+    repository: string;
+    title: string;
+    url: string;
 };
 
 export type PurgeLogsRequest = {
@@ -21783,6 +23511,11 @@ export type RegisterNodeApiRequest = {
      */
     name: string;
     /**
+     * IPv4 ranges this machine already uses (ADR 056), so its overlay
+     * allocation avoids them. Absent from older CLIs.
+     */
+    occupied_ranges?: Array<OccupiedRangeReport> | null;
+    /**
      * The node's *current* token, supplied to prove possession when
      * re-registering (changing the identity of) a node that already exists.
      * Optional; only needed to rebind a still-live node. (ADR-020 WS-1.2.)
@@ -21843,8 +23576,10 @@ export type RegisterRequest = {
 export type RegisterWireguardMeshRequest = {
     /**
      * `ip:port` other nodes dial to reach this node's WireGuard socket.
+     * Absent or `null` for a node nobody can dial (ADR 055): it dials the
+     * control plane, which learns its address from the handshake.
      */
-    endpoint: string;
+    endpoint?: string | null;
     /**
      * Base64 WireGuard public key. The private key never leaves the node.
      */
@@ -21945,20 +23680,21 @@ export type RemoteDeploymentResponse = {
  * agent handler already deserializes.
  */
 export type RemotePullCredentials = {
-    /**
-     * **Never logged or included in error messages.**
-     */
-    identity_token?: string | null;
-    /**
-     * **Never logged or included in error messages.**
-     */
-    password?: string | null;
+    identity_token?: SecretString | null;
+    password?: SecretString | null;
     server_address?: string | null;
     username?: string | null;
 };
 
 export type RemoveNodeResponse = {
     id: number;
+    /**
+     * Environments that were still serving from the node when it was
+     * removed as gone (`force=true` on an unreachable node, ADR 057). Their
+     * containers there are recorded as orphaned; one with no replicas on
+     * another node serves nothing until it is redeployed.
+     */
+    lost_environments?: Array<string>;
     message: string;
     /**
      * Containers Temps could not confirm were removed from the node before
@@ -21972,6 +23708,13 @@ export type RemoveNodeResponse = {
      * nodes they still target.
      */
     placements_updated?: Array<NodePlacementReference>;
+};
+
+export type RenameApplicationRequest = {
+    /**
+     * New name shown for the application. Trimmed; 1 to 200 characters.
+     */
+    name: string;
 };
 
 export type RenameConversationRequest = {
@@ -22771,7 +24514,8 @@ export type RetryClusterRequest = {
     /**
      * Cluster member specifications (same format as create).
      * If omitted, the original member configuration is reconstructed from
-     * the preserved service_members records.
+     * the preserved service_members records, or, when none were recorded,
+     * the default monitor + primary + replica layout is used.
      */
     members?: Array<ClusterMemberRequest>;
 };
@@ -22973,7 +24717,7 @@ export type RunExternalServiceBackupRequest = {
 };
 
 export type RunnerClaim = {
-    identity_token: string;
+    identity_token: SecretString;
 };
 
 export type RunnerFailure = {
@@ -23144,9 +24888,92 @@ export type S3SourceResponse = {
     updated_at: number;
 };
 
+/**
+ * The Git changes of every repository found under the work directory.
+ */
+export type SandboxChanges = {
+    /**
+     * False when the sandbox has no `git`: nothing can be tracked.
+     */
+    git_available: boolean;
+    /**
+     * Repositories at most three levels below the work directory, outside
+     * `node_modules`.
+     */
+    repos: Array<GitRepoChanges>;
+    work_dir: string;
+};
+
+/**
+ * What linking the sandbox to services gave it.
+ */
+export type SandboxConnections = {
+    /**
+     * Services the sandbox can now reach.
+     */
+    connected_service_ids: Array<number>;
+    /**
+     * Projects the sandbox is now linked to services through.
+     */
+    project_ids: Array<number>;
+    /**
+     * Every service the sandbox is now linked to.
+     */
+    services: Array<ConnectedService>;
+    /**
+     * Linked services left out because their type cannot give a sandbox
+     * credentials of its own yet.
+     */
+    skipped_service_ids: Array<number>;
+    /**
+     * Names (never values) of the variables commands now run with.
+     */
+    variable_names: Array<string>;
+};
+
+/**
+ * One directory of the chat's sandbox: folders first, then files, by name.
+ */
+export type SandboxDirectory = {
+    entries: Array<SandboxEntry>;
+    /**
+     * Absolute path of the directory listed.
+     */
+    path: string;
+    /**
+     * True when the directory has more than the entries returned.
+     */
+    truncated: boolean;
+    /**
+     * The sandbox work directory, where the assistant's relative paths start.
+     */
+    work_dir: string;
+};
+
 export type SandboxDomainResponse = {
     url: string;
 };
+
+/**
+ * One entry of a sandbox directory.
+ */
+export type SandboxEntry = {
+    kind: SandboxEntryKind;
+    name: string;
+    /**
+     * Absolute path inside the sandbox.
+     */
+    path: string;
+    /**
+     * Size in bytes as the filesystem reports it.
+     */
+    size: number;
+};
+
+/**
+ * What a directory entry is.
+ */
+export type SandboxEntryKind = 'file' | 'directory' | 'symlink' | 'other';
 
 /**
  * One entry in a sandbox's operations timeline.
@@ -23171,6 +24998,57 @@ export type SandboxEvent = {
 
 export type SandboxEventsResponse = {
     events: Array<SandboxEvent>;
+};
+
+/**
+ * Both sides of one file's diff against the last commit.
+ */
+export type SandboxFileDiff = {
+    /**
+     * True when either side is binary; both sides are then `None`.
+     */
+    binary: boolean;
+    /**
+     * The file as it is now. `None` when it was deleted.
+     */
+    modified?: string | null;
+    /**
+     * The file as last committed. `None` when it is new.
+     */
+    original?: string | null;
+    /**
+     * Path relative to the repository root.
+     */
+    path: string;
+    /**
+     * Absolute path of the repository root.
+     */
+    repo: string;
+    /**
+     * True when either side was cut at [`MAX_VIEW_BYTES`].
+     */
+    truncated: boolean;
+};
+
+/**
+ * One file of the chat's sandbox, for the viewer.
+ */
+export type SandboxFileView = {
+    binary: boolean;
+    /**
+     * The text, or its first [`MAX_VIEW_BYTES`] when `truncated`. `None`
+     * for a binary file.
+     */
+    content?: string | null;
+    /**
+     * Absolute path inside the sandbox.
+     */
+    path: string;
+    /**
+     * Size in bytes of the whole file.
+     */
+    size: number;
+    truncated: boolean;
 };
 
 /**
@@ -23241,6 +25119,24 @@ export type SandboxInner = {
     timeout: number;
     updatedAt: number;
     vcpus: number;
+};
+
+/**
+ * The sandbox a chat is linked to, as stored.
+ */
+export type SandboxLink = {
+    /**
+     * ISO 8601 time the link was made.
+     */
+    linked_at: string;
+    /**
+     * Display name of the sandbox when it was linked.
+     */
+    name: string;
+    /**
+     * Public id of the sandbox (`sbx_…`).
+     */
+    sandbox_id: string;
 };
 
 /**
@@ -23319,6 +25215,14 @@ export type SaveAgentTokenResponse = {
     saved: boolean;
 };
 
+/**
+ * A version the user wrote; it is accepted as it is saved.
+ */
+export type SaveBlueprintVersionRequest = {
+    change_summary: string;
+    document: BlueprintDocument;
+};
+
 export type SaveCredentialRequest = {
     /**
      * Auth flavor id (must match one of the provider's catalog entries).
@@ -23329,7 +25233,7 @@ export type SaveCredentialRequest = {
      * contents). Encrypted with `EncryptionService` before being persisted
      * inside the `agent_sandbox.providers` JSON map.
      */
-    credential: string;
+    credential: SecretString;
     /**
      * OpenCode model to test, in `provider/model` form. Omit to use the
      * built-in minimal probe model. A successfully verified explicit model
@@ -23372,7 +25276,7 @@ export type SaveHttpCheck = {
 };
 
 export type ScalewayCredentialsRequest = {
-    api_key: string;
+    api_key: SecretString;
     project_id: string;
 };
 
@@ -23752,6 +25656,39 @@ export type SecretResponse = {
 };
 
 /**
+ * What a slot looks like to the console and to the model: everything except
+ * the value.
+ */
+export type SecretSlotView = {
+    conversation_id: number;
+    created_at: string;
+    expires_at: string;
+    /**
+     * JSON pointer of the request field the value is for.
+     */
+    field: string;
+    filled_at?: string | null;
+    /**
+     * The id inside the handle (`secret_ref:v1:<id>`).
+     */
+    id: string;
+    /**
+     * What the form asks for.
+     */
+    label: string;
+    operation_id: string;
+    /**
+     * `awaiting`, `filled`, `cancelled` or `expired`.
+     */
+    status: string;
+};
+
+/**
+ * A credential. Write-only: it is never returned, and the AI assistant supplies it through a secret slot instead of typing it into the conversation.
+ */
+export type SecretString = string;
+
+/**
  * Security configuration for projects and environments
  *
  * This configuration can be set at three levels:
@@ -24035,14 +25972,20 @@ export type SendMessageAcceptedResponse = {
 
 export type SendMessageRequest = {
     /**
-     * Optional next-turn model. The provider harness remains pinned, but its
-     * advertised models may be changed between turns.
+     * Optional next-turn model, one advertised by the conversation's
+     * provider (or by `ai_provider` when that is set).
      */
     ai_model?: string | null;
     /**
      * Optional next-turn permission mode for the pinned provider harness.
      */
     ai_permission_mode?: string | null;
+    /**
+     * Optional AI gateway provider (`gateway_key:<id>`) for this and later
+     * turns. A chat on an AI gateway provider may move to another one; a
+     * provider harness chat stays on the provider it was created with.
+     */
+    ai_provider?: string | null;
     /**
      * Optional next-turn thinking level.
      */
@@ -24449,6 +26392,12 @@ export type ServiceMemberInfo = {
      * the UI falls back to the `status` column for those.
      */
     provisioning_step?: string | null;
+    /**
+     * Configured member kind. For a PostgreSQL cluster this is `monitor` or
+     * `replica`, and every data node is `replica`, including the current
+     * primary: which node is primary is runtime state, read it from
+     * `live_state`.
+     */
     role: string;
     status: string;
 };
@@ -24714,7 +26663,7 @@ export type ServiceUpdateAlertRuleRequest = {
 
 export type SesCredentialsRequest = {
     access_key_id: string;
-    secret_access_key: string;
+    secret_access_key: SecretString;
 };
 
 export type SessionDetails = {
@@ -24924,6 +26873,24 @@ export type SetAlternateSourcesRequest = {
     allow_alternate_sources: boolean;
 };
 
+/**
+ * Put a chat in a workspace: an existing one (`application_id`) or a new
+ * one (`create`). Exactly one of the two.
+ */
+export type SetChatWorkspaceRequest = {
+    application_id?: string | null;
+    create?: NewChatWorkspace | null;
+    /**
+     * Which sandbox the chats keep when both the chat and the workspace
+     * have one. Default `workspace`.
+     */
+    keep_sandbox?: KeepSandbox;
+};
+
+export type SetConnectorNodesRequest = {
+    node_ids: Array<number>;
+};
+
 export type SetFlagEnvironmentRequest = {
     /**
      * The kill switch. `false` makes the flag serve its default regardless of
@@ -24960,6 +26927,14 @@ export type SetGroupRepositoryResponse = {
      * `error` still points at its previous repository or branch.
      */
     services: Array<MemberSyncResult>;
+};
+
+export type SetHostnameChoiceRequest = {
+    /**
+     * Required with mode `tunnel`.
+     */
+    connector_id?: number | null;
+    mode: HostnameMode;
 };
 
 export type SetHttpCheckEnabled = {
@@ -25016,7 +26991,7 @@ export type SetPreviewPasswordBody = {
      * server-side with argon2id — we never persist or echo this back.
      * Must be between 8 and 256 characters.
      */
-    password: string;
+    password: SecretString;
 };
 
 export type SetPreviewPasswordResponse = {
@@ -25199,6 +27174,21 @@ export type SetupDnsResponse = {
     total_records: number;
 };
 
+/**
+ * One question in a provider's setup form.
+ */
+export type SetupField = {
+    help?: string | null;
+    /**
+     * The key in `values` of the create request.
+     */
+    key: string;
+    kind: FieldKind;
+    label: string;
+    placeholder?: string | null;
+    required: boolean;
+};
+
 export type SetupMfaRequest = {
     /**
      * Required to enroll MFA on an account that has a password set.
@@ -25222,6 +27212,26 @@ export type SiblingRef = {
      * URL slug used to link into the sibling project's single-project trace view.
      */
     project_slug: string;
+};
+
+/**
+ * One check behind the score, as stored on the incident and shown to the
+ * reviewer.
+ */
+export type Signal = {
+    detail: string;
+    key: string;
+    label: string;
+    /**
+     * Level of the confidence ladder this check belongs to, 1-5; `None` for
+     * context that is shown but never scored (the agent's own confidence).
+     */
+    level?: number | null;
+    /**
+     * `Some(true)` met, `Some(false)` not met, `None` not collected.
+     */
+    met?: boolean | null;
+    outcome?: CommandOutcome | null;
 };
 
 /**
@@ -25267,9 +27277,14 @@ export type SkipHostnameRecord = {
     revision: string;
 };
 
+/**
+ * Request-side Slack config. Deliberately not `Serialize`: the webhook URL is
+ * a `SecretString`, which would serialize as `"***"`. Use
+ * [`SlackConfig::into_stored_value`] to build the value that gets encrypted.
+ */
 export type SlackConfig = {
     channel?: string | null;
-    webhook_url: string;
+    webhook_url: SecretString;
 };
 
 /**
@@ -25470,10 +27485,7 @@ export type SmtpCredentialsRequest = {
      * SMTP host, e.g. `email-smtp.eu-west-1.amazonaws.com`.
      */
     host: string;
-    /**
-     * SMTP password / API token. Required when `username` is set.
-     */
-    password?: string | null;
+    password?: SecretString | null;
     /**
      * SMTP port (587 for STARTTLS, 465 for implicit TLS, 25/1025 for plain).
      */
@@ -25997,6 +28009,21 @@ export type StartAnalysisRequest = {
     user_context?: string | null;
 };
 
+export type StartAttachmentUploadRequest = {
+    /**
+     * Content type the browser reported, if any.
+     */
+    mime_type?: string | null;
+    /**
+     * File name as the user knows it; unsafe characters are replaced.
+     */
+    name: string;
+    /**
+     * Size of the whole file in bytes.
+     */
+    size_bytes: number;
+};
+
 /**
  * Start importing an external database into a database of this service.
  */
@@ -26500,6 +28527,35 @@ export type SubmitLoginCodeRequest = {
      */
     code: string;
 };
+
+/**
+ * Which answer to suggest next steps for.
+ */
+export type SuggestNextStepsRequest = {
+    /**
+     * Cursor of the answer the user is looking at, from the message list. When
+     * given, it must still be the chat's latest answer. Without it the latest
+     * answer is used.
+     */
+    answer?: string | null;
+};
+
+/**
+ * The user's default for chats that do not set their own mode.
+ */
+export type SuggestionDefault = {
+    mode: SuggestionMode;
+};
+
+/**
+ * What happens after each answer.
+ */
+export type SuggestionMode = 'off' | 'ask' | 'always';
+
+/**
+ * Where a chat's effective mode comes from.
+ */
+export type SuggestionModeSource = 'chat' | 'default';
 
 /**
  * What (if anything) will restart the process after it exits.
@@ -27272,7 +29328,7 @@ export type TestProviderKeyRequest = {
     /**
      * The raw API key to test (may be empty for a self-hosted provider)
      */
-    api_key?: string;
+    api_key?: SecretString;
     /**
      * Optional custom base URL (required for "openai_compatible")
      */
@@ -27445,13 +29501,6 @@ export type TodayStatsResponse = {
     total_requests: number;
 };
 
-export type ToggleAiDataAccessRequest = {
-    /**
-     * Whether the AI assistant may read row data from this service.
-     */
-    enabled: boolean;
-};
-
 /**
  * Request body to toggle OTLP metric ingestion for a deployment.
  */
@@ -27603,6 +29652,17 @@ export type TraceSummary = {
 export type TracesResponse = {
     count: number;
     data: Array<SpanRecord>;
+};
+
+/**
+ * A folder to put under Git.
+ */
+export type TrackSandboxChangesRequest = {
+    /**
+     * Absolute, or relative to the work directory; the work directory when
+     * omitted.
+     */
+    path?: string | null;
 };
 
 /**
@@ -28252,6 +30312,30 @@ export type UpdateApplicationWorkspaceRequest = {
     runtime?: string | null;
 };
 
+export type UpdateAutofixSettingsRequest = {
+    /**
+     * Empty string clears it.
+     */
+    ai_model?: string | null;
+    /**
+     * Empty string clears it (back to the assistant's default).
+     */
+    ai_provider?: string | null;
+    /**
+     * Confidence level, 0-5, an `auto_merge` fix must reach.
+     */
+    min_confidence?: number | null;
+    /**
+     * `off`, `propose` or `auto_merge`.
+     */
+    mode?: string | null;
+    protected_paths?: Array<string> | null;
+    /**
+     * Empty string clears it.
+     */
+    test_command?: string | null;
+};
+
 export type UpdateAutomaticDeployRequest = {
     automatic_deploy: boolean;
 };
@@ -28292,7 +30376,9 @@ export type UpdateBackupScheduleRequest = {
      */
     retention_period?: number | null;
     /**
-     * New cron expression. When changed, `next_run` is recomputed.
+     * New cron expression with a leading seconds field (`sec min hour
+     * day-of-month month day-of-week`, e.g. `0 0 3 * * *`). When changed,
+     * `next_run` is recomputed.
      */
     schedule_expression?: string | null;
     /**
@@ -28426,10 +30512,31 @@ export type UpdateCapabilityResponse = {
     supervisor: SupervisorKind;
 };
 
+/**
+ * Set a chat's own mode, or `null` to follow the user's default.
+ */
+export type UpdateChatSuggestionModeRequest = {
+    mode?: SuggestionMode | null;
+};
+
 export type UpdateCloudflareProviderRequest = {
     config: CloudflareConfig;
     enabled?: boolean | null;
     name?: string | null;
+};
+
+/**
+ * Body of `PUT /settings/cluster-network`.
+ */
+export type UpdateClusterNetworkRequest = {
+    /**
+     * New compute pool, an RFC 1918 IPv4 network such as `10.202.0.0/16`.
+     */
+    compute_pool_cidr: string;
+    /**
+     * Prefix of each node's subnet; keeps the current one when omitted.
+     */
+    subnet_prefix_len?: number | null;
 };
 
 export type UpdateComposeSecurityRequest = {
@@ -28444,6 +30551,14 @@ export type UpdateComposeSecurityRequest = {
 
 export type UpdateConfigBody = {
     config?: ProviderConfig | null;
+};
+
+export type UpdateConnectorRequest = {
+    /**
+     * Publish every worker-served hostname under the domain (true), or only
+     * hostnames chosen for this tunnel (false).
+     */
+    auto_publish?: boolean | null;
 };
 
 export type UpdateCronMonitor = {
@@ -28667,13 +30782,7 @@ export type UpdateEnvironmentSettingsRequest = {
      * idle_timeout_seconds of no traffic and started on the next request.
      */
     on_demand?: boolean | null;
-    /**
-     * Set a password to protect this environment. The proxy will show an HTML
-     * password form before allowing access. The password is bcrypt-hashed
-     * server-side and never stored in plaintext.
-     * Send an empty string to remove password protection.
-     */
-    password?: string | null;
+    password?: SecretString | null;
     /**
      * Enable/disable performance metrics collection
      */
@@ -28994,7 +31103,7 @@ export type UpdateNotificationRouteRequest = {
 
 export type UpdateOidcProviderRequest = {
     client_id?: string | null;
-    client_secret?: string | null;
+    client_secret?: SecretString | null;
     default_role?: string | null;
     enabled?: boolean | null;
     group_claim?: string | null;
@@ -29159,41 +31268,23 @@ export type UpdateProviderCredentialsRequest = {
      * Application ID (GitHub App integer as string; GitLab App string).
      */
     app_id?: string | null;
-    /**
-     * GitLab App secret (not used by GitHub App — use `client_secret`).
-     */
-    app_secret?: string | null;
+    app_secret?: SecretString | null;
     /**
      * OAuth client ID (GitLab OAuth, GitHub App).
      */
     client_id?: string | null;
-    /**
-     * OAuth client secret (GitLab OAuth, GitHub App).
-     */
-    client_secret?: string | null;
-    /**
-     * GitHub App private key (PEM).
-     */
-    private_key?: string | null;
+    client_secret?: SecretString | null;
+    private_key?: SecretString | null;
     /**
      * OAuth redirect URI (GitLab OAuth / GitLab App).
      */
     redirect_uri?: string | null;
-    /**
-     * PAT for PAT-type providers.
-     */
-    token?: string | null;
-    /**
-     * GitHub App webhook secret.
-     */
-    webhook_secret?: string | null;
+    token?: SecretString | null;
+    webhook_secret?: SecretString | null;
 };
 
 export type UpdateProviderKeyRequest = {
-    /**
-     * New API key. An empty string removes it, for self-hosted keys only.
-     */
-    api_key?: string | null;
+    api_key?: SecretString | null;
     /**
      * Double-Option: absent = leave unchanged, present-null = clear (revert to
      * the provider's default endpoint), present-value = set. Moving the base
@@ -29225,6 +31316,20 @@ export type UpdateProviderRequest = {
     name?: string | null;
 };
 
+export type UpdatePublicIngressSettingsRequest = {
+    enabled: boolean;
+    http_port?: number | null;
+    https_port?: number | null;
+    /**
+     * Local address to bind, or `None` for automatic.
+     */
+    listen_address?: string | null;
+    /**
+     * What DNS points at, or `None` for the listen address.
+     */
+    public_address?: string | null;
+};
+
 export type UpdateRouteRequest = {
     enabled: boolean;
     host: string;
@@ -29237,10 +31342,7 @@ export type UpdateRouteRequest = {
 };
 
 export type UpdateS3SourceRequest = {
-    /**
-     * Optional new access key ID
-     */
-    access_key_id?: string | null;
+    access_key_id?: SecretString | null;
     /**
      * Optional new bucket name
      */
@@ -29265,10 +31367,7 @@ export type UpdateS3SourceRequest = {
      * Optional new region
      */
     region?: string | null;
-    /**
-     * Optional new secret key
-     */
-    secret_key?: string | null;
+    secret_key?: SecretString | null;
 };
 
 /**
@@ -29290,7 +31389,7 @@ export type UpdateSecretBody = {
      * New signing secret from the provider's dashboard. Encrypted at
      * rest; never returned in any API response.
      */
-    signing_secret: string;
+    signing_secret: SecretString;
 };
 
 export type UpdateSelfRequest = {
@@ -29424,8 +31523,8 @@ export type UpdateTelemetrySettingsRequest = {
 };
 
 export type UpdateTokenRequest = {
-    access_token: string;
-    refresh_token?: string | null;
+    access_token: SecretString;
+    refresh_token?: SecretString | null;
 };
 
 export type UpdateTokenResponse = {
@@ -29465,10 +31564,7 @@ export type UpdateWebhookRequestBody = {
      * Event types to subscribe to
      */
     events?: Array<string> | null;
-    /**
-     * Secret for HMAC signature verification
-     */
-    secret?: string | null;
+    secret?: SecretString | null;
     /**
      * Target URL for webhook delivery
      */
@@ -29659,11 +31755,23 @@ export type UsageFilter = {
 
 export type UsageInfo = {
     completion_tokens: number;
+    /**
+     * The whole prompt, including any part served from the provider's cache.
+     */
     prompt_tokens: number;
+    prompt_tokens_details?: PromptTokensDetails | null;
     total_tokens: number;
 };
 
 export type UsageLogEntry = {
+    /**
+     * Part of `input_tokens` read from the provider's prompt cache.
+     */
+    cache_read_tokens: number;
+    /**
+     * Part of `input_tokens` written to the provider's prompt cache.
+     */
+    cache_write_tokens: number;
     conversation_id?: string | null;
     estimated_cost_microcents: number;
     id: number;
@@ -29968,6 +32076,11 @@ export type VerifyStepUpRequest = {
      */
     code: string;
 };
+
+/**
+ * Where a version stands.
+ */
+export type VersionStatus = 'proposed' | 'accepted' | 'rejected' | 'superseded';
 
 export type ViewItem = {
     label: string;
@@ -30626,7 +32739,11 @@ export type WireguardMeshPeerEntry = {
  */
 export type WireguardMeshSelfEntry = {
     address: string;
-    endpoint: string;
+    /**
+     * `null` for a node nobody dials (ADR 055): it dials its peers, which
+     * learn its address from its handshakes.
+     */
+    endpoint?: string | null;
     public_key: string;
 };
 
@@ -30780,6 +32897,19 @@ export type WorkspaceActivitySummary = {
     total: number;
 };
 
+/**
+ * One chat of a workspace, for the switcher.
+ */
+export type WorkspaceChatSummary = {
+    /**
+     * ISO 8601.
+     */
+    last_activity_at: string;
+    public_id: string;
+    title?: string | null;
+    turn_status: string;
+};
+
 export type WorkspaceHarnessActivity = {
     ai_provider: string;
     cancelled: number;
@@ -30840,10 +32970,7 @@ export type ZoneListResponse = {
 
 export type CiExecutorSettingsWritable = {
     control_plane_url: string;
-    /**
-     * Write-only. Stored encrypted; omitted by the status endpoint.
-     */
-    dispatch_token?: string | null;
+    dispatch_token?: SecretString | null;
     git_ref: string;
     identity: TrustedIdentityIssuer;
     image_repository: string;
@@ -31815,6 +33942,31 @@ export type GetApplicationResponses = {
 
 export type GetApplicationResponse = GetApplicationResponses[keyof GetApplicationResponses];
 
+export type RenameApplicationData = {
+    body: RenameApplicationRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}';
+};
+
+export type RenameApplicationErrors = {
+    /**
+     * The name is empty or longer than 200 characters
+     */
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type RenameApplicationResponses = {
+    200: ApplicationResponse;
+};
+
+export type RenameApplicationResponse = RenameApplicationResponses[keyof RenameApplicationResponses];
+
 export type ListApplicationConversationsData = {
     body?: never;
     path: {
@@ -32464,6 +34616,376 @@ export type AttachApplicationWorkspaceTerminalErrors = {
     503: unknown;
 };
 
+export type GetBlueprintData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint';
+};
+
+export type GetBlueprintErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetBlueprintError = GetBlueprintErrors[keyof GetBlueprintErrors];
+
+export type GetBlueprintResponses = {
+    /**
+     * The workspace's blueprint
+     */
+    200: BlueprintResponse;
+};
+
+export type GetBlueprintResponse = GetBlueprintResponses[keyof GetBlueprintResponses];
+
+export type UnbindBlueprintComponentData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+        /**
+         * The part's id in the accepted blueprint
+         */
+        component_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/bindings/{component_id}';
+};
+
+export type UnbindBlueprintComponentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace or part not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UnbindBlueprintComponentError = UnbindBlueprintComponentErrors[keyof UnbindBlueprintComponentErrors];
+
+export type UnbindBlueprintComponentResponses = {
+    /**
+     * The blueprint without the binding
+     */
+    200: BlueprintResponse;
+};
+
+export type UnbindBlueprintComponentResponse = UnbindBlueprintComponentResponses[keyof UnbindBlueprintComponentResponses];
+
+export type BindBlueprintComponentData = {
+    body: BindBlueprintComponentRequest;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+        /**
+         * The part's id in the accepted blueprint
+         */
+        component_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/bindings/{component_id}';
+};
+
+export type BindBlueprintComponentErrors = {
+    /**
+     * The binding does not fit the part
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace or part not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BindBlueprintComponentError = BindBlueprintComponentErrors[keyof BindBlueprintComponentErrors];
+
+export type BindBlueprintComponentResponses = {
+    /**
+     * The blueprint with the new binding
+     */
+    200: BlueprintResponse;
+};
+
+export type BindBlueprintComponentResponse = BindBlueprintComponentResponses[keyof BindBlueprintComponentResponses];
+
+export type ListBlueprintVersionsData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+    };
+    query?: {
+        /**
+         * 1-based page. Default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/ai/applications/{public_id}/blueprint/versions';
+};
+
+export type ListBlueprintVersionsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListBlueprintVersionsError = ListBlueprintVersionsErrors[keyof ListBlueprintVersionsErrors];
+
+export type ListBlueprintVersionsResponses = {
+    /**
+     * Blueprint versions
+     */
+    200: BlueprintVersionsResponse;
+};
+
+export type ListBlueprintVersionsResponse = ListBlueprintVersionsResponses[keyof ListBlueprintVersionsResponses];
+
+export type SaveBlueprintVersionData = {
+    body: SaveBlueprintVersionRequest;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/versions';
+};
+
+export type SaveBlueprintVersionErrors = {
+    /**
+     * The document is not valid
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type SaveBlueprintVersionError = SaveBlueprintVersionErrors[keyof SaveBlueprintVersionErrors];
+
+export type SaveBlueprintVersionResponses = {
+    /**
+     * The saved, accepted version
+     */
+    201: BlueprintResponse;
+};
+
+export type SaveBlueprintVersionResponse = SaveBlueprintVersionResponses[keyof SaveBlueprintVersionResponses];
+
+export type AcceptBlueprintVersionData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+        /**
+         * The proposed version
+         */
+        version: number;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/versions/{version}/accept';
+};
+
+export type AcceptBlueprintVersionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace or version not found
+     */
+    404: ProblemDetails;
+    /**
+     * The version was already decided or replaced
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type AcceptBlueprintVersionError = AcceptBlueprintVersionErrors[keyof AcceptBlueprintVersionErrors];
+
+export type AcceptBlueprintVersionResponses = {
+    /**
+     * The blueprint after the decision
+     */
+    200: BlueprintResponse;
+};
+
+export type AcceptBlueprintVersionResponse = AcceptBlueprintVersionResponses[keyof AcceptBlueprintVersionResponses];
+
+export type RejectBlueprintVersionData = {
+    body?: never;
+    path: {
+        /**
+         * Workspace (application) public id
+         */
+        public_id: string;
+        /**
+         * The proposed version
+         */
+        version: number;
+    };
+    query?: never;
+    url: '/ai/applications/{public_id}/blueprint/versions/{version}/reject';
+};
+
+export type RejectBlueprintVersionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Workspace or version not found
+     */
+    404: ProblemDetails;
+    /**
+     * The version was already decided or replaced
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RejectBlueprintVersionError = RejectBlueprintVersionErrors[keyof RejectBlueprintVersionErrors];
+
+export type RejectBlueprintVersionResponses = {
+    /**
+     * The blueprint after the decision
+     */
+    200: BlueprintResponse;
+};
+
+export type RejectBlueprintVersionResponse = RejectBlueprintVersionResponses[keyof RejectBlueprintVersionResponses];
+
+export type CreateAssistantConversationData = {
+    body: CreateAssistantConversationRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/assistant/conversations';
+};
+
+export type CreateAssistantConversationErrors = {
+    /**
+     * Provider is not an AI-gateway provider
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No AI provider is configured; the problem carries `setup_path`
+     */
+    409: unknown;
+};
+
+export type CreateAssistantConversationResponses = {
+    /**
+     * Conversation created
+     */
+    201: ConversationResponse;
+};
+
+export type CreateAssistantConversationResponse = CreateAssistantConversationResponses[keyof CreateAssistantConversationResponses];
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
@@ -32484,6 +35006,12 @@ export type ListAllConversationsData = {
          * Number of conversations per page (clamped to 1..=100).
          */
         page_size?: number;
+        /**
+         * Keep only chats whose title, or whose project's name or slug, contains
+         * this text (case-insensitive, matched literally). At most 200
+         * characters; blank means no filter.
+         */
+        search?: string;
     };
     url: '/ai/conversations';
 };
@@ -32594,6 +35122,203 @@ export type ArchiveUserConversationResponses = {
 
 export type ArchiveUserConversationResponse = ArchiveUserConversationResponses[keyof ArchiveUserConversationResponses];
 
+export type StartAttachmentUploadData = {
+    body: StartAttachmentUploadRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/attachment-uploads';
+};
+
+export type StartAttachmentUploadErrors = {
+    /**
+     * Empty file
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * File too large
+     */
+    413: ProblemDetails;
+    /**
+     * Too many uploads in progress
+     */
+    429: ProblemDetails;
+    /**
+     * Upload capacity reached
+     */
+    503: ProblemDetails;
+};
+
+export type StartAttachmentUploadError = StartAttachmentUploadErrors[keyof StartAttachmentUploadErrors];
+
+export type StartAttachmentUploadResponses = {
+    /**
+     * Upload opened
+     */
+    201: AttachmentUploadStarted;
+};
+
+export type StartAttachmentUploadResponse = StartAttachmentUploadResponses[keyof StartAttachmentUploadResponses];
+
+export type CancelAttachmentUploadData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Upload id from the start request
+         */
+        upload_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/attachment-uploads/{upload_id}';
+};
+
+export type CancelAttachmentUploadErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type CancelAttachmentUploadError = CancelAttachmentUploadErrors[keyof CancelAttachmentUploadErrors];
+
+export type CancelAttachmentUploadResponses = {
+    /**
+     * Upload cancelled (or already gone)
+     */
+    204: void;
+};
+
+export type CancelAttachmentUploadResponse = CancelAttachmentUploadResponses[keyof CancelAttachmentUploadResponses];
+
+export type AppendAttachmentChunkData = {
+    body: AttachmentChunkUpload;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Upload id from the start request
+         */
+        upload_id: string;
+    };
+    query: {
+        /**
+         * Where this chunk starts in the file: the bytes received so far.
+         */
+        offset: number;
+    };
+    url: '/ai/conversations/{public_id}/attachment-uploads/{upload_id}/chunk';
+};
+
+export type AppendAttachmentChunkErrors = {
+    /**
+     * Invalid chunk
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Upload not found or expired
+     */
+    404: ProblemDetails;
+    /**
+     * Chunk is not the next one expected
+     */
+    409: ProblemDetails;
+};
+
+export type AppendAttachmentChunkError = AppendAttachmentChunkErrors[keyof AppendAttachmentChunkErrors];
+
+export type AppendAttachmentChunkResponses = {
+    /**
+     * Chunk stored
+     */
+    200: AttachmentChunkReceived;
+};
+
+export type AppendAttachmentChunkResponse = AppendAttachmentChunkResponses[keyof AppendAttachmentChunkResponses];
+
+export type CompleteAttachmentUploadData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Upload id from the start request
+         */
+        upload_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/attachment-uploads/{upload_id}/complete';
+};
+
+export type CompleteAttachmentUploadErrors = {
+    /**
+     * Not every byte has arrived
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Upload or conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no workspace for attachments
+     */
+    409: ProblemDetails;
+};
+
+export type CompleteAttachmentUploadError = CompleteAttachmentUploadErrors[keyof CompleteAttachmentUploadErrors];
+
+export type CompleteAttachmentUploadResponses = {
+    /**
+     * Attachment stored
+     */
+    201: ChatAttachmentResponse;
+};
+
+export type CompleteAttachmentUploadResponse = CompleteAttachmentUploadResponses[keyof CompleteAttachmentUploadResponses];
+
 export type UploadUserConversationAttachmentData = {
     body: ChatAttachmentUpload;
     path: {
@@ -32608,6 +35333,7 @@ export type UploadUserConversationAttachmentErrors = {
     401: unknown;
     403: unknown;
     404: unknown;
+    409: unknown;
     413: unknown;
 };
 
@@ -32642,6 +35368,56 @@ export type GetUserConversationAttachmentResponses = {
 
 export type GetUserConversationAttachmentResponse = GetUserConversationAttachmentResponses[keyof GetUserConversationAttachmentResponses];
 
+export type CompactConversationData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/compact';
+};
+
+export type CompactConversationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat is already being compacted
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * The summary model failed
+     */
+    502: ProblemDetails;
+};
+
+export type CompactConversationError = CompactConversationErrors[keyof CompactConversationErrors];
+
+export type CompactConversationResponses = {
+    /**
+     * Compaction finished, or there was nothing to compact
+     */
+    200: CompactConversationResponse;
+};
+
+export type CompactConversationResponse2 = CompactConversationResponses[keyof CompactConversationResponses];
+
 export type GetUserConversationDiagnosticsData = {
     body?: never;
     path: {
@@ -32668,6 +35444,148 @@ export type GetUserConversationDiagnosticsResponses = {
 
 export type GetUserConversationDiagnosticsResponse = GetUserConversationDiagnosticsResponses[keyof GetUserConversationDiagnosticsResponses];
 
+export type ListGoalsData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/goals';
+};
+
+export type ListGoalsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListGoalsError = ListGoalsErrors[keyof ListGoalsErrors];
+
+export type ListGoalsResponses = {
+    /**
+     * Goals of the conversation
+     */
+    200: Array<GoalResponse>;
+};
+
+export type ListGoalsResponse = ListGoalsResponses[keyof ListGoalsResponses];
+
+export type CancelGoalData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Goal id
+         */
+        goal_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/goals/{goal_id}/cancel';
+};
+
+export type CancelGoalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or goal not found
+     */
+    404: ProblemDetails;
+    /**
+     * Goal is already finished
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CancelGoalError = CancelGoalErrors[keyof CancelGoalErrors];
+
+export type CancelGoalResponses = {
+    /**
+     * Goal cancelled
+     */
+    200: GoalResponse;
+};
+
+export type CancelGoalResponse = CancelGoalResponses[keyof CancelGoalResponses];
+
+export type RetryGoalData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Goal id
+         */
+        goal_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/goals/{goal_id}/retry';
+};
+
+export type RetryGoalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or goal not found
+     */
+    404: ProblemDetails;
+    /**
+     * Goal is not failed or waiting
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RetryGoalError = RetryGoalErrors[keyof RetryGoalErrors];
+
+export type RetryGoalResponses = {
+    /**
+     * Goal reopened
+     */
+    200: GoalResponse;
+};
+
+export type RetryGoalResponse = RetryGoalResponses[keyof RetryGoalResponses];
+
 export type SendUserMessageData = {
     body: SendMessageRequest;
     path: {
@@ -32689,6 +35607,48 @@ export type SendUserMessageResponses = {
 };
 
 export type SendUserMessageResponse = SendUserMessageResponses[keyof SendUserMessageResponses];
+
+export type ListChatOperationsData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/operations';
+};
+
+export type ListChatOperationsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListChatOperationsError = ListChatOperationsErrors[keyof ListChatOperationsErrors];
+
+export type ListChatOperationsResponses = {
+    /**
+     * Operations the conversation started
+     */
+    200: ChatOperationsResponse;
+};
+
+export type ListChatOperationsResponse = ListChatOperationsResponses[keyof ListChatOperationsResponses];
 
 export type ListUserPendingActionsData = {
     body?: never;
@@ -32759,6 +35719,48 @@ export type ResolveUserPermissionResponses = {
 
 export type ResolveUserPermissionResponse = ResolveUserPermissionResponses[keyof ResolveUserPermissionResponses];
 
+export type ListChatResourcesData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/resources';
+};
+
+export type ListChatResourcesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListChatResourcesError = ListChatResourcesErrors[keyof ListChatResourcesErrors];
+
+export type ListChatResourcesResponses = {
+    /**
+     * Pieces the conversation made
+     */
+    200: ChatResourcesResponse;
+};
+
+export type ListChatResourcesResponse = ListChatResourcesResponses[keyof ListChatResourcesResponses];
+
 export type RestoreUserConversationData = {
     body?: never;
     path: {
@@ -32780,6 +35782,869 @@ export type RestoreUserConversationResponses = {
 
 export type RestoreUserConversationResponse = RestoreUserConversationResponses[keyof RestoreUserConversationResponses];
 
+export type UnlinkChatSandboxData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox';
+};
+
+export type UnlinkChatSandboxErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type UnlinkChatSandboxError = UnlinkChatSandboxErrors[keyof UnlinkChatSandboxErrors];
+
+export type UnlinkChatSandboxResponses = {
+    /**
+     * Sandbox unlinked
+     */
+    200: ChatSandboxStatus;
+};
+
+export type UnlinkChatSandboxResponse = UnlinkChatSandboxResponses[keyof UnlinkChatSandboxResponses];
+
+export type GetChatSandboxData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox';
+};
+
+export type GetChatSandboxErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetChatSandboxError = GetChatSandboxErrors[keyof GetChatSandboxErrors];
+
+export type GetChatSandboxResponses = {
+    /**
+     * Sandbox status of the conversation
+     */
+    200: ChatSandboxStatus;
+};
+
+export type GetChatSandboxResponse = GetChatSandboxResponses[keyof GetChatSandboxResponses];
+
+export type LinkChatSandboxData = {
+    body: LinkSandboxRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox';
+};
+
+export type LinkChatSandboxErrors = {
+    /**
+     * Neither or both of sandbox_id and create were sent
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The sandbox cannot be linked
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type LinkChatSandboxError = LinkChatSandboxErrors[keyof LinkChatSandboxErrors];
+
+export type LinkChatSandboxResponses = {
+    /**
+     * Sandbox linked
+     */
+    200: ChatSandboxStatus;
+};
+
+export type LinkChatSandboxResponse = LinkChatSandboxResponses[keyof LinkChatSandboxResponses];
+
+export type GetChatSandboxChangesData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/changes';
+};
+
+export type GetChatSandboxChangesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * No sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The Git command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type GetChatSandboxChangesError = GetChatSandboxChangesErrors[keyof GetChatSandboxChangesErrors];
+
+export type GetChatSandboxChangesResponses = {
+    /**
+     * Changes per repository
+     */
+    200: SandboxChanges;
+};
+
+export type GetChatSandboxChangesResponse = GetChatSandboxChangesResponses[keyof GetChatSandboxChangesResponses];
+
+export type GetChatSandboxDiffData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query: {
+        /**
+         * The repository root, absolute or relative to the work directory.
+         */
+        repo: string;
+        /**
+         * The file, relative to the repository root.
+         */
+        path: string;
+        /**
+         * The path before a rename, relative to the repository root.
+         */
+        old_path?: string | null;
+    };
+    url: '/ai/conversations/{public_id}/sandbox/changes/diff';
+};
+
+export type GetChatSandboxDiffErrors = {
+    /**
+     * Invalid repository or path
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * No sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The Git command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type GetChatSandboxDiffError = GetChatSandboxDiffErrors[keyof GetChatSandboxDiffErrors];
+
+export type GetChatSandboxDiffResponses = {
+    /**
+     * Both sides of the diff
+     */
+    200: SandboxFileDiff;
+};
+
+export type GetChatSandboxDiffResponse = GetChatSandboxDiffResponses[keyof GetChatSandboxDiffResponses];
+
+export type TrackChatSandboxChangesData = {
+    body: TrackSandboxChangesRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/changes/track';
+};
+
+export type TrackChatSandboxChangesErrors = {
+    /**
+     * Invalid path
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation, sandbox or folder not found
+     */
+    404: ProblemDetails;
+    /**
+     * The folder is already tracked, no sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The Git command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type TrackChatSandboxChangesError = TrackChatSandboxChangesErrors[keyof TrackChatSandboxChangesErrors];
+
+export type TrackChatSandboxChangesResponses = {
+    /**
+     * Tracking started; the changes as they are now
+     */
+    200: SandboxChanges;
+};
+
+export type TrackChatSandboxChangesResponse = TrackChatSandboxChangesResponses[keyof TrackChatSandboxChangesResponses];
+
+export type ReadChatSandboxFileData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query: {
+        /**
+         * Absolute, or relative to the sandbox work directory.
+         */
+        path: string;
+    };
+    url: '/ai/conversations/{public_id}/sandbox/file';
+};
+
+export type ReadChatSandboxFileErrors = {
+    /**
+     * Invalid path
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation, sandbox or file not found
+     */
+    404: ProblemDetails;
+    /**
+     * No sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The read command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type ReadChatSandboxFileError = ReadChatSandboxFileErrors[keyof ReadChatSandboxFileErrors];
+
+export type ReadChatSandboxFileResponses = {
+    /**
+     * File content
+     */
+    200: SandboxFileView;
+};
+
+export type ReadChatSandboxFileResponse = ReadChatSandboxFileResponses[keyof ReadChatSandboxFileResponses];
+
+export type ListChatSandboxFilesData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: {
+        /**
+         * Absolute, or relative to the sandbox work directory.
+         */
+        path?: string | null;
+    };
+    url: '/ai/conversations/{public_id}/sandbox/files';
+};
+
+export type ListChatSandboxFilesErrors = {
+    /**
+     * Invalid path
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation, sandbox or directory not found
+     */
+    404: ProblemDetails;
+    /**
+     * No sandbox is linked, or it could not be started
+     */
+    409: ProblemDetails;
+    /**
+     * The listing command failed
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+    /**
+     * The sandbox did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type ListChatSandboxFilesError = ListChatSandboxFilesErrors[keyof ListChatSandboxFilesErrors];
+
+export type ListChatSandboxFilesResponses = {
+    /**
+     * Directory listing
+     */
+    200: SandboxDirectory;
+};
+
+export type ListChatSandboxFilesResponse = ListChatSandboxFilesResponses[keyof ListChatSandboxFilesResponses];
+
+export type ConnectChatSandboxProjectData = {
+    body: ConnectProjectRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/projects';
+};
+
+export type ConnectChatSandboxProjectErrors = {
+    /**
+     * The project has no service that can be connected
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type ConnectChatSandboxProjectError = ConnectChatSandboxProjectErrors[keyof ConnectChatSandboxProjectErrors];
+
+export type ConnectChatSandboxProjectResponses = {
+    /**
+     * Sandbox connected
+     */
+    200: SandboxConnections;
+};
+
+export type ConnectChatSandboxProjectResponse = ConnectChatSandboxProjectResponses[keyof ConnectChatSandboxProjectResponses];
+
+export type DisconnectChatSandboxProjectData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Project to disconnect
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/projects/{project_id}';
+};
+
+export type DisconnectChatSandboxProjectErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type DisconnectChatSandboxProjectError = DisconnectChatSandboxProjectErrors[keyof DisconnectChatSandboxProjectErrors];
+
+export type DisconnectChatSandboxProjectResponses = {
+    /**
+     * Sandbox disconnected
+     */
+    200: SandboxConnections;
+};
+
+export type DisconnectChatSandboxProjectResponse = DisconnectChatSandboxProjectResponses[keyof DisconnectChatSandboxProjectResponses];
+
+export type ConnectChatSandboxServiceData = {
+    body: ConnectServiceRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/services';
+};
+
+export type ConnectChatSandboxServiceErrors = {
+    /**
+     * The service cannot give a sandbox credentials
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type ConnectChatSandboxServiceError = ConnectChatSandboxServiceErrors[keyof ConnectChatSandboxServiceErrors];
+
+export type ConnectChatSandboxServiceResponses = {
+    /**
+     * Sandbox connected
+     */
+    200: SandboxConnections;
+};
+
+export type ConnectChatSandboxServiceResponse = ConnectChatSandboxServiceResponses[keyof ConnectChatSandboxServiceResponses];
+
+export type DisconnectChatSandboxServiceData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Service to disconnect
+         */
+        service_id: number;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/services/{service_id}';
+};
+
+export type DisconnectChatSandboxServiceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type DisconnectChatSandboxServiceError = DisconnectChatSandboxServiceErrors[keyof DisconnectChatSandboxServiceErrors];
+
+export type DisconnectChatSandboxServiceResponses = {
+    /**
+     * Sandbox disconnected
+     */
+    200: SandboxConnections;
+};
+
+export type DisconnectChatSandboxServiceResponse = DisconnectChatSandboxServiceResponses[keyof DisconnectChatSandboxServiceResponses];
+
+export type WakeChatSandboxData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/sandbox/wake';
+};
+
+export type WakeChatSandboxErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The chat has no linked sandbox
+     */
+    409: ProblemDetails;
+    /**
+     * The sandbox could not be started
+     */
+    500: ProblemDetails;
+    /**
+     * This server has no sandbox backend
+     */
+    503: ProblemDetails;
+};
+
+export type WakeChatSandboxError = WakeChatSandboxErrors[keyof WakeChatSandboxErrors];
+
+export type WakeChatSandboxResponses = {
+    /**
+     * Sandbox running
+     */
+    200: ChatSandboxStatus;
+};
+
+export type WakeChatSandboxResponse = WakeChatSandboxResponses[keyof WakeChatSandboxResponses];
+
+export type ListSecretRequestsData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/secrets';
+};
+
+export type ListSecretRequestsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListSecretRequestsError = ListSecretRequestsErrors[keyof ListSecretRequestsErrors];
+
+export type ListSecretRequestsResponses = {
+    /**
+     * Open secret requests, never including values
+     */
+    200: Array<SecretSlotView>;
+};
+
+export type ListSecretRequestsResponse = ListSecretRequestsResponses[keyof ListSecretRequestsResponses];
+
+export type ProvideSecretData = {
+    body: FillSecretRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Secret request id
+         */
+        secret_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/secrets/{secret_id}';
+};
+
+export type ProvideSecretErrors = {
+    /**
+     * Empty or oversized value
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or secret request not found
+     */
+    404: ProblemDetails;
+    /**
+     * The request was cancelled or already closed
+     */
+    409: ProblemDetails;
+    /**
+     * The request expired
+     */
+    410: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ProvideSecretError = ProvideSecretErrors[keyof ProvideSecretErrors];
+
+export type ProvideSecretResponses = {
+    /**
+     * Credential stored; the response never includes it
+     */
+    200: SecretSlotView;
+};
+
+export type ProvideSecretResponse = ProvideSecretResponses[keyof ProvideSecretResponses];
+
+export type DiscardSecretData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+        /**
+         * Secret request id
+         */
+        secret_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/secrets/{secret_id}/discard';
+};
+
+export type DiscardSecretErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or secret request not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DiscardSecretError = DiscardSecretErrors[keyof DiscardSecretErrors];
+
+export type DiscardSecretResponses = {
+    /**
+     * Request discarded
+     */
+    200: SecretSlotView;
+};
+
+export type DiscardSecretResponse = DiscardSecretResponses[keyof DiscardSecretResponses];
+
 export type StopUserTurnData = {
     body?: never;
     path: {
@@ -32800,6 +36665,307 @@ export type StopUserTurnResponses = {
 };
 
 export type StopUserTurnResponse = StopUserTurnResponses[keyof StopUserTurnResponses];
+
+export type GetChatSuggestionModeData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/suggestion-mode';
+};
+
+export type GetChatSuggestionModeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetChatSuggestionModeError = GetChatSuggestionModeErrors[keyof GetChatSuggestionModeErrors];
+
+export type GetChatSuggestionModeResponses = {
+    /**
+     * The chat's setting
+     */
+    200: ChatSuggestionSettings;
+};
+
+export type GetChatSuggestionModeResponse = GetChatSuggestionModeResponses[keyof GetChatSuggestionModeResponses];
+
+export type UpdateChatSuggestionModeData = {
+    body: UpdateChatSuggestionModeRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/suggestion-mode';
+};
+
+export type UpdateChatSuggestionModeErrors = {
+    /**
+     * Invalid mode
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * This chat cannot have suggestions
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateChatSuggestionModeError = UpdateChatSuggestionModeErrors[keyof UpdateChatSuggestionModeErrors];
+
+export type UpdateChatSuggestionModeResponses = {
+    /**
+     * The chat's new setting
+     */
+    200: ChatSuggestionSettings;
+};
+
+export type UpdateChatSuggestionModeResponse = UpdateChatSuggestionModeResponses[keyof UpdateChatSuggestionModeResponses];
+
+export type SuggestNextStepsData = {
+    body: SuggestNextStepsRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/suggestions';
+};
+
+export type SuggestNextStepsErrors = {
+    /**
+     * The answer cursor is malformed
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Suggestions are off or unavailable in this chat, a turn is running, the answer is no longer the latest, there is no answer yet, or a suggestion is already being made
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * The model failed to suggest anything
+     */
+    502: ProblemDetails;
+};
+
+export type SuggestNextStepsError = SuggestNextStepsErrors[keyof SuggestNextStepsErrors];
+
+export type SuggestNextStepsResponses = {
+    /**
+     * Suggested next steps
+     */
+    200: NextSteps;
+};
+
+export type SuggestNextStepsResponse = SuggestNextStepsResponses[keyof SuggestNextStepsResponses];
+
+export type GetUserConversationUsageData = {
+    body?: never;
+    path: {
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/usage';
+};
+
+export type GetUserConversationUsageErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetUserConversationUsageResponses = {
+    200: ConversationUsage;
+};
+
+export type GetUserConversationUsageResponse = GetUserConversationUsageResponses[keyof GetUserConversationUsageResponses];
+
+export type LeaveChatWorkspaceData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/workspace';
+};
+
+export type LeaveChatWorkspaceErrors = {
+    /**
+     * Not an assistant chat
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found or not in a workspace
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type LeaveChatWorkspaceError = LeaveChatWorkspaceErrors[keyof LeaveChatWorkspaceErrors];
+
+export type LeaveChatWorkspaceResponses = {
+    /**
+     * The chat is no longer in a workspace
+     */
+    200: ChatWorkspaceResponse;
+};
+
+export type LeaveChatWorkspaceResponse = LeaveChatWorkspaceResponses[keyof LeaveChatWorkspaceResponses];
+
+export type GetChatWorkspaceData = {
+    body?: never;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/workspace';
+};
+
+export type GetChatWorkspaceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetChatWorkspaceError = GetChatWorkspaceErrors[keyof GetChatWorkspaceErrors];
+
+export type GetChatWorkspaceResponses = {
+    /**
+     * The chat's workspace
+     */
+    200: ChatWorkspaceResponse;
+};
+
+export type GetChatWorkspaceResponse = GetChatWorkspaceResponses[keyof GetChatWorkspaceResponses];
+
+export type SetChatWorkspaceData = {
+    body: SetChatWorkspaceRequest;
+    path: {
+        /**
+         * Conversation public id
+         */
+        public_id: string;
+    };
+    query?: never;
+    url: '/ai/conversations/{public_id}/workspace';
+};
+
+export type SetChatWorkspaceErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Conversation or workspace not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type SetChatWorkspaceError = SetChatWorkspaceErrors[keyof SetChatWorkspaceErrors];
+
+export type SetChatWorkspaceResponses = {
+    /**
+     * The chat's workspace
+     */
+    200: ChatWorkspaceResponse;
+};
+
+export type SetChatWorkspaceResponse = SetChatWorkspaceResponses[keyof SetChatWorkspaceResponses];
 
 export type GetLimitsOverviewData = {
     body?: never;
@@ -33050,6 +37216,76 @@ export type RejectUserPendingActionResponses = {
 };
 
 export type RejectUserPendingActionResponse = RejectUserPendingActionResponses[keyof RejectUserPendingActionResponses];
+
+export type GetSuggestionDefaultData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/preferences/suggestions';
+};
+
+export type GetSuggestionDefaultErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetSuggestionDefaultError = GetSuggestionDefaultErrors[keyof GetSuggestionDefaultErrors];
+
+export type GetSuggestionDefaultResponses = {
+    /**
+     * The user's default
+     */
+    200: SuggestionDefault;
+};
+
+export type GetSuggestionDefaultResponse = GetSuggestionDefaultResponses[keyof GetSuggestionDefaultResponses];
+
+export type UpdateSuggestionDefaultData = {
+    body: SuggestionDefault;
+    path?: never;
+    query?: never;
+    url: '/ai/preferences/suggestions';
+};
+
+export type UpdateSuggestionDefaultErrors = {
+    /**
+     * Invalid mode
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateSuggestionDefaultError = UpdateSuggestionDefaultErrors[keyof UpdateSuggestionDefaultErrors];
+
+export type UpdateSuggestionDefaultResponses = {
+    /**
+     * The saved default
+     */
+    200: SuggestionDefault;
+};
+
+export type UpdateSuggestionDefaultResponse = UpdateSuggestionDefaultResponses[keyof UpdateSuggestionDefaultResponses];
 
 export type AuthorizeWorkspacePreviewData = {
     body: AuthorizeWorkspacePreviewRequest;
@@ -33365,7 +37601,7 @@ export type UpdateProviderKeyData = {
 
 export type UpdateProviderKeyErrors = {
     /**
-     * Validation error
+     * Validation error, or a new API key that failed verification (the current key is kept)
      */
     400: ProblemDetails;
     /**
@@ -44969,82 +49205,6 @@ export type GetSlowQueriesResponses = {
 
 export type GetSlowQueriesResponse = GetSlowQueriesResponses[keyof GetSlowQueriesResponses];
 
-export type GetAiDataAccessData = {
-    body?: never;
-    path: {
-        /**
-         * External service id
-         */
-        service_id: number;
-    };
-    query?: never;
-    url: '/external-services/{service_id}/query/ai-data-access';
-};
-
-export type GetAiDataAccessErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Service not found
-     */
-    404: unknown;
-};
-
-export type GetAiDataAccessResponses = {
-    /**
-     * Current AI data access setting
-     */
-    200: AiDataAccessResponse;
-};
-
-export type GetAiDataAccessResponse = GetAiDataAccessResponses[keyof GetAiDataAccessResponses];
-
-export type SetAiDataAccessData = {
-    body: ToggleAiDataAccessRequest;
-    path: {
-        /**
-         * External service id
-         */
-        service_id: number;
-    };
-    query?: never;
-    url: '/external-services/{service_id}/query/ai-data-access';
-};
-
-export type SetAiDataAccessErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Service not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type SetAiDataAccessResponses = {
-    /**
-     * Setting applied
-     */
-    200: AiDataAccessResponse;
-};
-
-export type SetAiDataAccessResponse = SetAiDataAccessResponses[keyof SetAiDataAccessResponses];
-
 export type ListRootContainersData = {
     body?: never;
     path: {
@@ -45269,7 +49429,7 @@ export type ReadEntityRowsErrors = {
      */
     401: unknown;
     /**
-     * Insufficient permissions, or AI data access not enabled for this service
+     * Insufficient permissions
      */
     403: unknown;
     /**
@@ -46285,6 +50445,166 @@ export type ListRepositoriesByConnectionResponses = {
 };
 
 export type ListRepositoriesByConnectionResponse = ListRepositoriesByConnectionResponses[keyof ListRepositoriesByConnectionResponses];
+
+export type CreateRepositoryData = {
+    body: CreateRepositoryRequest;
+    path: {
+        /**
+         * Connection ID
+         */
+        connection_id: number;
+    };
+    query?: never;
+    url: '/git-connections/{connection_id}/repositories';
+};
+
+export type CreateRepositoryErrors = {
+    /**
+     * Invalid name, owner or description, or the connection is inactive
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Connection not found, or not owned by the caller
+     */
+    404: unknown;
+    /**
+     * A repository with that name already exists
+     */
+    409: unknown;
+    /**
+     * The git provider rejected or failed the request
+     */
+    502: unknown;
+};
+
+export type CreateRepositoryResponses = {
+    /**
+     * Repository created
+     */
+    201: CreatedRepositoryResponse;
+};
+
+export type CreateRepositoryResponse = CreateRepositoryResponses[keyof CreateRepositoryResponses];
+
+export type CommitRepositoryFilesData = {
+    body: CommitFilesRequest;
+    path: {
+        /**
+         * Connection ID
+         */
+        connection_id: number;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: never;
+    url: '/git-connections/{connection_id}/repositories/{owner}/{repo}/commits';
+};
+
+export type CommitRepositoryFilesErrors = {
+    /**
+     * Invalid path (including one through a symlink tracked in the repository), branch, message or file content, or the connection is inactive
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Connection not found, or not owned by the caller
+     */
+    404: unknown;
+    /**
+     * Nothing to commit (the files already match the branch), or the remote rejected the push (protected branch, hook, non-fast-forward)
+     */
+    409: unknown;
+    /**
+     * The git provider failed the request
+     */
+    502: unknown;
+    /**
+     * The commit timed out; `push_may_have_completed` says whether the branch must be checked before retrying
+     */
+    504: unknown;
+};
+
+export type CommitRepositoryFilesResponses = {
+    /**
+     * Files committed
+     */
+    201: CommitFilesResponse;
+};
+
+export type CommitRepositoryFilesResponse = CommitRepositoryFilesResponses[keyof CommitRepositoryFilesResponses];
+
+export type OpenRepositoryPullRequestData = {
+    body: OpenPullRequestRequest;
+    path: {
+        /**
+         * Connection ID
+         */
+        connection_id: number;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: never;
+    url: '/git-connections/{connection_id}/repositories/{owner}/{repo}/pull-requests';
+};
+
+export type OpenRepositoryPullRequestErrors = {
+    /**
+     * Invalid title, branch or body, or the connection is inactive
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Connection not found, or not owned by the caller
+     */
+    404: unknown;
+    /**
+     * The git provider rejected or failed the request
+     */
+    502: unknown;
+};
+
+export type OpenRepositoryPullRequestResponses = {
+    /**
+     * Pull request opened
+     */
+    201: PullRequestResponse;
+};
+
+export type OpenRepositoryPullRequestResponse = OpenRepositoryPullRequestResponses[keyof OpenRepositoryPullRequestResponses];
 
 export type SyncRepositoriesData = {
     body?: never;
@@ -47815,6 +52135,251 @@ export type SetIncidentUpdateVisibilityResponses = {
 
 export type SetIncidentUpdateVisibilityResponse = SetIncidentUpdateVisibilityResponses[keyof SetIncidentUpdateVisibilityResponses];
 
+export type ListIngressConnectorsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Number of items per page (default 20, max 100)
+         */
+        page_size?: number;
+    };
+    url: '/ingress/connectors';
+};
+
+export type ListIngressConnectorsResponses = {
+    200: ConnectorList;
+};
+
+export type ListIngressConnectorsResponse = ListIngressConnectorsResponses[keyof ListIngressConnectorsResponses];
+
+export type CreateIngressConnectorData = {
+    body: CreateConnectorRequest;
+    path?: never;
+    query?: never;
+    url: '/ingress/connectors';
+};
+
+export type CreateIngressConnectorErrors = {
+    /**
+     * Invalid name, setup answers or nodes
+     */
+    400: unknown;
+    /**
+     * A worker has not delegated public ingress
+     */
+    409: unknown;
+    /**
+     * The provider refused; the detail says what to fix
+     */
+    502: unknown;
+};
+
+export type CreateIngressConnectorResponses = {
+    201: ConnectorView;
+};
+
+export type CreateIngressConnectorResponse = CreateIngressConnectorResponses[keyof CreateIngressConnectorResponses];
+
+export type DeleteIngressConnectorData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}';
+};
+
+export type DeleteIngressConnectorErrors = {
+    404: unknown;
+    502: unknown;
+};
+
+export type DeleteIngressConnectorResponses = {
+    204: void;
+};
+
+export type DeleteIngressConnectorResponse = DeleteIngressConnectorResponses[keyof DeleteIngressConnectorResponses];
+
+export type GetIngressConnectorData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}';
+};
+
+export type GetIngressConnectorErrors = {
+    404: unknown;
+};
+
+export type GetIngressConnectorResponses = {
+    200: ConnectorView;
+};
+
+export type GetIngressConnectorResponse = GetIngressConnectorResponses[keyof GetIngressConnectorResponses];
+
+export type UpdateIngressConnectorData = {
+    body: UpdateConnectorRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}';
+};
+
+export type UpdateIngressConnectorErrors = {
+    404: unknown;
+};
+
+export type UpdateIngressConnectorResponses = {
+    200: ConnectorView;
+};
+
+export type UpdateIngressConnectorResponse = UpdateIngressConnectorResponses[keyof UpdateIngressConnectorResponses];
+
+export type GetIngressConnectorLinksData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/links';
+};
+
+export type GetIngressConnectorLinksErrors = {
+    /**
+     * The tunnel is not created yet
+     */
+    400: unknown;
+    404: unknown;
+    /**
+     * The provider could not be asked
+     */
+    502: unknown;
+};
+
+export type GetIngressConnectorLinksResponses = {
+    200: ConnectorLinksView;
+};
+
+export type GetIngressConnectorLinksResponse = GetIngressConnectorLinksResponses[keyof GetIngressConnectorLinksResponses];
+
+export type SetIngressConnectorNodesData = {
+    body: SetConnectorNodesRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/nodes';
+};
+
+export type SetIngressConnectorNodesErrors = {
+    404: unknown;
+};
+
+export type SetIngressConnectorNodesResponses = {
+    200: ConnectorView;
+};
+
+export type SetIngressConnectorNodesResponse = SetIngressConnectorNodesResponses[keyof SetIngressConnectorNodesResponses];
+
+export type SyncIngressConnectorData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/sync';
+};
+
+export type SyncIngressConnectorErrors = {
+    404: unknown;
+    502: unknown;
+};
+
+export type SyncIngressConnectorResponses = {
+    200: ConnectorView;
+};
+
+export type SyncIngressConnectorResponse = SyncIngressConnectorResponses[keyof SyncIngressConnectorResponses];
+
+export type ListIngressHostnamesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/hostnames';
+};
+
+export type ListIngressHostnamesResponses = {
+    200: Array<HostnameView>;
+};
+
+export type ListIngressHostnamesResponse = ListIngressHostnamesResponses[keyof ListIngressHostnamesResponses];
+
+export type GetIngressHostnameData = {
+    body?: never;
+    path: {
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/hostnames/{hostname}';
+};
+
+export type GetIngressHostnameErrors = {
+    400: unknown;
+};
+
+export type GetIngressHostnameResponses = {
+    200: HostnameView;
+};
+
+export type GetIngressHostnameResponse = GetIngressHostnameResponses[keyof GetIngressHostnameResponses];
+
+export type SetIngressHostnameChoiceData = {
+    body: SetHostnameChoiceRequest;
+    path: {
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/hostnames/{hostname}';
+};
+
+export type SetIngressHostnameChoiceErrors = {
+    /**
+     * Invalid hostname, or the tunnel cannot publish it
+     */
+    400: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+};
+
+export type SetIngressHostnameChoiceResponses = {
+    200: HostnameView;
+};
+
+export type SetIngressHostnameChoiceResponse = SetIngressHostnameChoiceResponses[keyof SetIngressHostnameChoiceResponses];
+
+export type ListIngressProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/providers';
+};
+
+export type ListIngressProvidersResponses = {
+    200: Array<ProviderInfo>;
+};
+
+export type ListIngressProvidersResponse = ListIngressProvidersResponses[keyof ListIngressProvidersResponses];
+
 export type ListInstantiationsData = {
     body?: never;
     path?: never;
@@ -48168,6 +52733,45 @@ export type AdminListNodesResponses = {
 
 export type AdminListNodesResponse = AdminListNodesResponses[keyof AdminListNodesResponses];
 
+export type MeshEnrollData = {
+    body: MeshEnrollApiRequest;
+    path?: never;
+    query?: never;
+    url: '/internal/nodes/mesh-enroll';
+};
+
+export type MeshEnrollErrors = {
+    /**
+     * Invalid name or WireGuard key
+     */
+    400: unknown;
+    /**
+     * Missing, unknown or unusable join token
+     */
+    403: unknown;
+    /**
+     * Mesh off or not ready, control plane not dialable, key in use, or too many pairings
+     */
+    409: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MeshEnrollResponses = {
+    /**
+     * Pairing created; register over the mesh next
+     */
+    201: MeshEnrollResponse;
+};
+
+export type MeshEnrollResponse2 = MeshEnrollResponses[keyof MeshEnrollResponses];
+
 export type RegisterNodeData = {
     body: RegisterNodeApiRequest;
     path?: never;
@@ -48211,7 +52815,11 @@ export type AdminRemoveNodeData = {
         /**
          * Remove the node even if containers Temps placed on it could not be
          * confirmed removed (e.g. the host is gone for good). Those containers
-         * are recorded as orphaned instead of being re-homed.
+         * are recorded as orphaned instead of being re-homed. On a node the
+         * control plane can no longer reach (no heartbeat for 90 seconds) this
+         * also covers containers deployments still serve from it:
+         * they are recorded as orphaned too and their environments listed in
+         * `lost_environments` (ADR 057).
          */
         force?: boolean;
     };
@@ -48228,7 +52836,7 @@ export type AdminRemoveNodeErrors = {
      */
     404: unknown;
     /**
-     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)
+     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first). For a node the control plane cannot reach that live deployments still serve from, `force_removes_serving` is set and `serving_environments` names them: force=true removes it anyway (ADR 057)
      */
     409: unknown;
     /**
@@ -48734,6 +53342,85 @@ export type AdminSetNodePublicIngressResponses = {
 };
 
 export type AdminSetNodePublicIngressResponse = AdminSetNodePublicIngressResponses[keyof AdminSetNodePublicIngressResponses];
+
+export type AdminCheckNodePublicIngressData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/check';
+};
+
+export type AdminCheckNodePublicIngressErrors = {
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminCheckNodePublicIngressResponses = {
+    200: PublicIngressCheck;
+};
+
+export type AdminCheckNodePublicIngressResponse = AdminCheckNodePublicIngressResponses[keyof AdminCheckNodePublicIngressResponses];
+
+export type AdminGetNodePublicIngressSettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/settings';
+};
+
+export type AdminGetNodePublicIngressSettingsErrors = {
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminGetNodePublicIngressSettingsResponses = {
+    200: PublicIngressSettings;
+};
+
+export type AdminGetNodePublicIngressSettingsResponse = AdminGetNodePublicIngressSettingsResponses[keyof AdminGetNodePublicIngressSettingsResponses];
+
+export type AdminUpdateNodePublicIngressSettingsData = {
+    body: UpdatePublicIngressSettingsRequest;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/settings';
+};
+
+export type AdminUpdateNodePublicIngressSettingsErrors = {
+    /**
+     * Invalid address or ports, or not a worker
+     */
+    400: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminUpdateNodePublicIngressSettingsResponses = {
+    200: PublicIngressSettings;
+};
+
+export type AdminUpdateNodePublicIngressSettingsResponse = AdminUpdateNodePublicIngressSettingsResponses[keyof AdminUpdateNodePublicIngressSettingsResponses];
 
 export type GetS3CredentialsData = {
     body?: never;
@@ -58971,6 +63658,338 @@ export type GetApiTimeseriesResponses = {
 };
 
 export type GetApiTimeseriesResponse = GetApiTimeseriesResponses[keyof GetApiTimeseriesResponses];
+
+export type GetAutofixCapabilityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix';
+};
+
+export type GetAutofixCapabilityErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type GetAutofixCapabilityError = GetAutofixCapabilityErrors[keyof GetAutofixCapabilityErrors];
+
+export type GetAutofixCapabilityResponses = {
+    200: AutofixCapabilityResponse;
+};
+
+export type GetAutofixCapabilityResponse = GetAutofixCapabilityResponses[keyof GetAutofixCapabilityResponses];
+
+export type ListAutofixIncidentsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Page number, from 1. Default 1.
+         */
+        page?: number;
+        /**
+         * Items per page. Default 20, max 100.
+         */
+        page_size?: number;
+        /**
+         * `open`, `closed`, or one exact status.
+         */
+        status?: string;
+        /**
+         * Only incidents of this error group.
+         */
+        error_group_id?: number;
+    };
+    url: '/projects/{project_id}/autofix/incidents';
+};
+
+export type ListAutofixIncidentsErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type ListAutofixIncidentsError = ListAutofixIncidentsErrors[keyof ListAutofixIncidentsErrors];
+
+export type ListAutofixIncidentsResponses = {
+    200: AutofixIncidentListResponse;
+};
+
+export type ListAutofixIncidentsResponse = ListAutofixIncidentsResponses[keyof ListAutofixIncidentsResponses];
+
+export type OpenAutofixIncidentData = {
+    body: OpenIncidentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents';
+};
+
+export type OpenAutofixIncidentErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    409: ProblemDetails;
+    429: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type OpenAutofixIncidentError = OpenAutofixIncidentErrors[keyof OpenAutofixIncidentErrors];
+
+export type OpenAutofixIncidentResponses = {
+    /**
+     * The group already had an open incident
+     */
+    200: OpenIncidentResponse;
+    /**
+     * Incident queued
+     */
+    201: OpenIncidentResponse;
+};
+
+export type OpenAutofixIncidentResponse = OpenAutofixIncidentResponses[keyof OpenAutofixIncidentResponses];
+
+export type GetAutofixIncidentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}';
+};
+
+export type GetAutofixIncidentErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type GetAutofixIncidentError = GetAutofixIncidentErrors[keyof GetAutofixIncidentErrors];
+
+export type GetAutofixIncidentResponses = {
+    200: AutofixIncidentResponse;
+};
+
+export type GetAutofixIncidentResponse = GetAutofixIncidentResponses[keyof GetAutofixIncidentResponses];
+
+export type CloseAutofixIncidentData = {
+    body: CloseIncidentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}/close';
+};
+
+export type CloseAutofixIncidentErrors = {
+    400: ProblemDetails;
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    409: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type CloseAutofixIncidentError = CloseAutofixIncidentErrors[keyof CloseAutofixIncidentErrors];
+
+export type CloseAutofixIncidentResponses = {
+    200: AutofixIncidentResponse;
+};
+
+export type CloseAutofixIncidentResponse = CloseAutofixIncidentResponses[keyof CloseAutofixIncidentResponses];
+
+export type ListAutofixIncidentEventsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: {
+        /**
+         * Only events after this id; pass the last id seen to poll.
+         */
+        after_id?: number;
+        /**
+         * Default 100, max 500.
+         */
+        limit?: number;
+    };
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}/events';
+};
+
+export type ListAutofixIncidentEventsErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type ListAutofixIncidentEventsError = ListAutofixIncidentEventsErrors[keyof ListAutofixIncidentEventsErrors];
+
+export type ListAutofixIncidentEventsResponses = {
+    200: AutofixEventListResponse;
+};
+
+export type ListAutofixIncidentEventsResponse = ListAutofixIncidentEventsResponses[keyof ListAutofixIncidentEventsResponses];
+
+export type DownloadAutofixPatchData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}/patch';
+};
+
+export type DownloadAutofixPatchErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    409: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type DownloadAutofixPatchError = DownloadAutofixPatchErrors[keyof DownloadAutofixPatchErrors];
+
+export type DownloadAutofixPatchResponses = {
+    /**
+     * Unified diff
+     */
+    200: string;
+};
+
+export type DownloadAutofixPatchResponse = DownloadAutofixPatchResponses[keyof DownloadAutofixPatchResponses];
+
+export type StopAutofixIncidentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Incident public id
+         */
+        incident_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/incidents/{incident_id}/stop';
+};
+
+export type StopAutofixIncidentErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    409: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type StopAutofixIncidentError = StopAutofixIncidentErrors[keyof StopAutofixIncidentErrors];
+
+export type StopAutofixIncidentResponses = {
+    200: AutofixIncidentResponse;
+};
+
+export type StopAutofixIncidentResponse = StopAutofixIncidentResponses[keyof StopAutofixIncidentResponses];
+
+export type SetAutofixPausedData = {
+    body: PauseAutofixRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/pause';
+};
+
+export type SetAutofixPausedErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type SetAutofixPausedError = SetAutofixPausedErrors[keyof SetAutofixPausedErrors];
+
+export type SetAutofixPausedResponses = {
+    200: AutofixSettingsResponse;
+};
+
+export type SetAutofixPausedResponse = SetAutofixPausedResponses[keyof SetAutofixPausedResponses];
+
+export type UpdateAutofixSettingsData = {
+    body: UpdateAutofixSettingsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/autofix/settings';
+};
+
+export type UpdateAutofixSettingsErrors = {
+    400: ProblemDetails;
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+    500: ProblemDetails;
+};
+
+export type UpdateAutofixSettingsError = UpdateAutofixSettingsErrors[keyof UpdateAutofixSettingsErrors];
+
+export type UpdateAutofixSettingsResponses = {
+    200: AutofixSettingsResponse;
+};
+
+export type UpdateAutofixSettingsResponse = UpdateAutofixSettingsResponses[keyof UpdateAutofixSettingsResponses];
 
 export type StartAnalysisData = {
     body: StartAnalysisRequest;
@@ -71852,6 +76871,80 @@ export type RotateClusterCaResponses = {
 };
 
 export type RotateClusterCaResponse2 = RotateClusterCaResponses[keyof RotateClusterCaResponses];
+
+export type ClusterNetworkGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-network';
+};
+
+export type ClusterNetworkGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ClusterNetworkGetResponses = {
+    /**
+     * Cluster network
+     */
+    200: ClusterNetworkStatus;
+};
+
+export type ClusterNetworkGetResponse = ClusterNetworkGetResponses[keyof ClusterNetworkGetResponses];
+
+export type ClusterNetworkUpdateData = {
+    body: UpdateClusterNetworkRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-network';
+};
+
+export type ClusterNetworkUpdateErrors = {
+    /**
+     * Invalid pool, or it collides with the mesh pool, a node's address or a node's occupied range
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The pool is in use
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ClusterNetworkUpdateResponses = {
+    /**
+     * Pool changed
+     */
+    200: ClusterNetworkChangeResponse;
+};
+
+export type ClusterNetworkUpdateResponse = ClusterNetworkUpdateResponses[keyof ClusterNetworkUpdateResponses];
 
 export type GetDiskStatusData = {
     body?: never;

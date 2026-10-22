@@ -21,6 +21,7 @@ use sea_orm::{
 use temps_ai_api_tools::{ApiCallScope, ProjectSelectorScope, WriteApiToolsHandle};
 use temps_auth::context::AuthContext;
 use temps_auth::permissions::Permission;
+use temps_core::ai_tool_call::AiToolOrigin;
 use temps_entities::ai_pending_actions;
 
 use crate::sensitive::{decrypt_value, encrypt_value, redact_text, redact_value};
@@ -116,6 +117,10 @@ pub struct PendingActionService {
     db: Arc<DatabaseConnection>,
     write_handle: Arc<WriteApiToolsHandle>,
     encryption: Arc<temps_core::EncryptionService>,
+    /// Where `secret_ref:` handles in an approved action's params are resolved
+    /// from. `None` means the action runs without secrets, and a handle in its
+    /// params is refused rather than sent as text.
+    secret_slots: Option<crate::secret_slots::SecretSlotService>,
 }
 
 impl PendingActionService {
@@ -128,7 +133,14 @@ impl PendingActionService {
             db,
             write_handle,
             encryption,
+            secret_slots: None,
         }
+    }
+
+    /// Let approved actions use the secrets the user provided in this chat.
+    pub fn with_secret_slots(mut self, slots: crate::secret_slots::SecretSlotService) -> Self {
+        self.secret_slots = Some(slots);
+        self
     }
 
     /// Insert a new `proposed` pending action row.
@@ -427,9 +439,17 @@ impl PendingActionService {
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
+        origin: Option<AiToolOrigin>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
-        self.confirm_with_status(project_id, public_id, auth, confirmed_by, "proposed")
-            .await
+        self.confirm_with_status(
+            project_id,
+            public_id,
+            auth,
+            confirmed_by,
+            origin,
+            "proposed",
+        )
+        .await
     }
 
     /// Resolve an action that belongs to the currently active inline waiter.
@@ -439,12 +459,14 @@ impl PendingActionService {
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
+        origin: Option<AiToolOrigin>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         self.confirm_with_status(
             project_id,
             public_id,
             auth,
             confirmed_by,
+            origin,
             "awaiting_inline_approval",
         )
         .await
@@ -456,6 +478,7 @@ impl PendingActionService {
         public_id: &str,
         auth: &AuthContext,
         confirmed_by: Option<i32>,
+        origin: Option<AiToolOrigin>,
         expected_status: &str,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         // 1. Load + project-scope check.
@@ -539,6 +562,13 @@ impl PendingActionService {
             project_scope: project_id.map_or(ProjectSelectorScope::Unrestricted, |project_id| {
                 ProjectSelectorScope::Allowed(vec![project_id])
             }),
+            origin,
+            // Bound to the action's owner and conversation, so an action can
+            // only spend secrets its own user gave in its own chat.
+            secrets: self.secret_slots.as_ref().map(|slots| {
+                Arc::new(slots.resolver(user_id, action.conversation_id))
+                    as Arc<dyn temps_ai_api_tools::SecretResolver>
+            }),
         };
         let exec_result = caller
             .execute_write(&action.operation_id, executable_params, &scope)
@@ -547,7 +577,7 @@ impl PendingActionService {
         // 8. Persist outcome regardless of success/failure.
         let updated = match exec_result {
             Ok(resp) => {
-                ai_pending_actions::ActiveModel {
+                let executed = ai_pending_actions::ActiveModel {
                     id: Set(action.id),
                     status: Set("executed".to_string()),
                     result: Set(Some(redact_value(&resp.body))),
@@ -557,7 +587,11 @@ impl PendingActionService {
                     ..Default::default()
                 }
                 .update(self.db.as_ref())
-                .await?
+                .await?;
+                // A deployment, backup or restore it started joins the chat's
+                // operations list.
+                crate::chat_operations::record_executed_action(self.db.as_ref(), &executed).await;
+                executed
             }
             Err(e) => {
                 let failed = ai_pending_actions::ActiveModel {
@@ -966,7 +1000,7 @@ mod tests {
         let auth = make_auth();
 
         let error = svc
-            .confirm(Some(7), "inline", &auth, Some(auth.user_id()))
+            .confirm(Some(7), "inline", &auth, Some(auth.user_id()), None)
             .await
             .expect_err("legacy confirmation must reject inline lifecycle rows");
         assert!(matches!(
@@ -1140,8 +1174,14 @@ mod tests {
             Err(PendingActionError::NotFound { .. })
         ));
         assert!(matches!(
-            svc.confirm(Some(7), "other-user-or-legacy", &auth, Some(auth.user_id()))
-                .await,
+            svc.confirm(
+                Some(7),
+                "other-user-or-legacy",
+                &auth,
+                Some(auth.user_id()),
+                None
+            )
+            .await,
             Err(PendingActionError::NotFound { .. })
         ));
         assert!(matches!(
@@ -1179,7 +1219,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1), None)
             .await
             .expect_err("empty write handle remains unavailable");
         assert!(matches!(err, PendingActionError::Unavailable));
@@ -1220,7 +1260,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1), None)
             .await
             .expect_err("should fail");
         assert!(
@@ -1250,7 +1290,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "step2", &auth, Some(1))
+            .confirm(Some(7), "step2", &auth, Some(1), None)
             .await
             .expect_err("step 2 must be blocked until step 1 executes");
         assert!(
@@ -1399,7 +1439,7 @@ mod tests {
         let svc = make_svc(db);
         let auth = make_auth();
         let err = svc
-            .confirm(Some(7), "abc", &auth, Some(1))
+            .confirm(Some(7), "abc", &auth, Some(1), None)
             .await
             .expect_err("should fail with Unavailable");
         assert!(

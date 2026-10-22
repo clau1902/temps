@@ -24,7 +24,13 @@ import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
-import { Fragment, useMemo, useState } from 'react'
+import {
+  Fragment,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  type ChangeEvent,
+} from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -137,6 +143,7 @@ import {
   Cpu,
   Hash,
   Info,
+  KeyRound,
   RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -162,6 +169,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from '@/hooks/useSettings'
 import { ReadFailure } from '@/components/ui/read-failure'
+import { ReplaceProviderKeyDialog } from '@/components/ai/ReplaceProviderKeyDialog'
 import {
   aiProviderRowStatus,
   providerKeysUnknown,
@@ -174,7 +182,10 @@ import {
   aiProviderName,
   aiProviderModels,
   getAiProvider,
+  providerFromAddParam,
   isSelfHostedProvider,
+  providerKeyEndpoint,
+  SELF_HOSTED_PROVIDER_ID,
 } from '@/lib/ai-providers'
 import { SelfHostedProviderFields } from '@/components/ai/SelfHostedProviderFields'
 import { SelfHostedKeySettings } from '@/components/ai/SelfHostedKeySettings'
@@ -189,8 +200,11 @@ import {
   providerKeyFormSchema,
   providerKeyFormToRequest,
   selectProviderKeyFormProvider,
+  switchToOpenAiCompatible,
+  vendorHasCustomBaseUrl,
   type ProviderKeyFormValues,
 } from '@/components/ai/provider-key-form'
+import { VendorBaseUrlHint } from '@/components/ai/VendorBaseUrlHint'
 import { ProviderKeyProviderPicker } from '@/components/ai/ProviderKeyProviderPicker'
 import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -882,6 +896,40 @@ function AiTimeRange({
 // pages, and the sandbox UI.
 const SUPPORTED_PROVIDERS = AI_PROVIDERS
 const providerName = aiProviderName
+
+/** A key's custom endpoint host, shown so keys of one provider differ. */
+function KeyEndpoint({ baseUrl }: { baseUrl?: string | null }) {
+  const endpoint = providerKeyEndpoint(baseUrl)
+  if (!endpoint) return null
+  return (
+    <Badge
+      variant="outline"
+      className="h-5 shrink-0 px-1.5 font-mono text-[10px]"
+      title={baseUrl ?? undefined}
+    >
+      {endpoint}
+    </Badge>
+  )
+}
+
+/**
+ * The models column of a provider row. An OpenAI-compatible provider lists
+ * the endpoints its keys point at, since that is what tells them apart.
+ */
+function providerRowModels(
+  provider: { id: string; models: string },
+  providerKeys: { base_url?: string | null }[]
+): string {
+  if (!isSelfHostedProvider(provider.id)) return provider.models
+  const endpoints = [
+    ...new Set(
+      providerKeys
+        .map((key) => providerKeyEndpoint(key.base_url))
+        .filter((endpoint): endpoint is string => endpoint !== null)
+    ),
+  ]
+  return endpoints.length > 0 ? endpoints.join(', ') : provider.models
+}
 const providerModels = aiProviderModels
 
 // ============================================================================
@@ -3968,6 +4016,9 @@ export function AiGatewayPage() {
   // provider is fixed. Opened from the header or the onboarding prompt, the
   // dialog shows a provider choice instead.
   const [providerPreselected, setProviderPreselected] = useState(false)
+  // The base URL as last left or pasted, so an OpenAI-compatible key's
+  // models load on their own without sending the key to a half-typed host.
+  const [committedBaseUrl, setCommittedBaseUrl] = useState('')
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [selectedKey, setSelectedKey] = useState<ProviderKeyResponse | null>(
     null
@@ -3999,6 +4050,11 @@ export function AiGatewayPage() {
       shouldValidate: providerKeyForm.formState.isSubmitted,
     })
 
+  // `/ai-gateway?add=openrouter` is where the assistant's onboarding sends
+  // operators. Handled in an effect below, once the existing keys are known.
+  const [addSearchParams, setAddSearchParams] = useSearchParams()
+  const addProvider = addSearchParams.get('add')
+
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
   const gatewayEndpoint = `${externalUrl}/api/ai/v1`
@@ -4016,6 +4072,42 @@ export function AiGatewayPage() {
   const { data: keysData, isLoading } = keysQuery
 
   const keys = keysData ?? []
+
+  // Open the add-key dialog for the `?add=` provider exactly as its "Add key"
+  // button would (numbering the name after the keys it already has), then
+  // drop the parameter so a reload or a back-navigation does not reopen it.
+  // Waits for the key list so the pre-filled name is the right one. The
+  // dialog state is adjusted during render (the page can already be mounted
+  // when the link is followed); the form store is filled before paint.
+  const keysSettled = keysData !== undefined || keysQuery.isError
+  const [handledAddProvider, setHandledAddProvider] = useState<string | null>(
+    null
+  )
+  if (keysSettled && addProvider !== handledAddProvider) {
+    setHandledAddProvider(addProvider)
+    if (providerFromAddParam(addProvider)) {
+      setProviderPreselected(true)
+      setDialogOpen(true)
+    }
+  }
+  useLayoutEffect(() => {
+    if (addProvider === null || !keysSettled) return
+    const provider = providerFromAddParam(addProvider)
+    if (provider) {
+      const existing = (keysData ?? []).filter(
+        (key) => key.provider === provider.id
+      ).length
+      providerKeyForm.reset(providerKeyFormForProvider(provider, existing))
+    }
+    setAddSearchParams(
+      (params) => {
+        params.delete('add')
+        return params
+      },
+      { replace: true }
+    )
+  }, [addProvider, keysSettled, keysData, providerKeyForm, setAddSearchParams])
+
   const keysRead = { keys: keysData, isError: keysQuery.isError }
   const keysUnknown = providerKeysUnknown(keysRead)
 
@@ -4086,6 +4178,36 @@ export function AiGatewayPage() {
     },
   })
 
+  // Replace a key's secret. The dialog keeps the key it was opened for while
+  // it animates closed, so `replaceOpen` is separate from `replacingKey`.
+  const [replacingKey, setReplacingKey] = useState<ProviderKeyResponse | null>(
+    null
+  )
+  const [replaceOpen, setReplaceOpen] = useState(false)
+  const replaceMutation = useMutation({
+    mutationFn: ({ id, apiKey }: { id: number; apiKey: string }) =>
+      updateProviderKey({
+        path: { id },
+        body: { api_key: apiKey },
+        throwOnError: true,
+      }),
+    onSuccess: (_, { id }) => {
+      queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
+      queryClient.invalidateQueries({
+        queryKey: getAiProviderStatusQueryKey(),
+      })
+      setReplaceOpen(false)
+      toast.success('API key replaced', {
+        description: 'The new key was verified with the provider.',
+        action: {
+          label: 'Test key',
+          onClick: () => testKeyMutation.mutate(id),
+        },
+      })
+    },
+    // A refusal is shown in the dialog, which stays open for another try.
+  })
+
   // Test existing key by ID
   const [testingKeyId, setTestingKeyId] = useState<number | null>(null)
   // Which provider row is expanded in the keys table
@@ -4148,6 +4270,17 @@ export function AiGatewayPage() {
         providerKeyForm.getValues(),
         provider,
         existingKeyCount,
+        SUPPORTED_PROVIDERS.map((p) => p.name)
+      )
+    )
+  }
+
+  const handleSwitchToOpenAiCompatible = () => {
+    providerKeyForm.reset(
+      switchToOpenAiCompatible(
+        providerKeyForm.getValues(),
+        providerName(SELF_HOSTED_PROVIDER_ID),
+        keys.filter((k) => k.provider === SELF_HOSTED_PROVIDER_ID).length,
         SUPPORTED_PROVIDERS.map((p) => p.name)
       )
     )
@@ -4502,7 +4635,7 @@ console.log(response.choices[0].message.content);`,
                         </TableCell>
                         <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
                           <span className="line-clamp-1">
-                            {provider.models}
+                            {providerRowModels(provider, providerKeys)}
                           </span>
                         </TableCell>
                         <TableCell className="hidden sm:table-cell py-2">
@@ -4582,6 +4715,7 @@ console.log(response.choices[0].message.content);`,
                                       Disabled
                                     </Badge>
                                   )}
+                                  <KeyEndpoint baseUrl={key.base_url} />
                                   <code className="text-xs text-muted-foreground truncate">
                                     {key.api_key_masked}
                                   </code>
@@ -4604,6 +4738,20 @@ console.log(response.choices[0].message.content);`,
                                     ) : (
                                       <Play className="h-4 w-4" />
                                     )}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8"
+                                    onClick={() => {
+                                      replaceMutation.reset()
+                                      setReplacingKey(key)
+                                      setReplaceOpen(true)
+                                    }}
+                                    title="Replace API key"
+                                    aria-label={`Replace API key for ${key.display_name}`}
+                                  >
+                                    <KeyRound className="h-4 w-4" />
                                   </Button>
                                   <Button
                                     variant="ghost"
@@ -4807,12 +4955,25 @@ console.log(response.choices[0].message.content);`,
                     id="baseUrl"
                     placeholder={
                       newProviderIsSelfHosted
-                        ? 'http://10.0.0.5:8000/v1'
+                        ? 'https://api.deepseek.com/v1 or http://10.0.0.5:8000/v1'
                         : 'https://api.openai.com/v1'
                     }
                     disabled={createMutation.isPending}
                     aria-invalid={!!formErrors.base_url}
-                    {...providerKeyForm.register('base_url')}
+                    {...providerKeyForm.register('base_url', {
+                      onBlur: (event: ChangeEvent<HTMLInputElement>) =>
+                        setCommittedBaseUrl(event.target.value),
+                      onChange: (event: ChangeEvent<HTMLInputElement>) => {
+                        const { inputType } = event.nativeEvent as InputEvent
+                        // A paste or browser autofill arrives whole.
+                        if (
+                          inputType === 'insertFromPaste' ||
+                          inputType === 'insertReplacementText'
+                        ) {
+                          setCommittedBaseUrl(event.target.value)
+                        }
+                      },
+                    })}
                   />
                   {formErrors.base_url && (
                     <p className="text-xs text-destructive">
@@ -4821,13 +4982,20 @@ console.log(response.choices[0].message.content);`,
                   )}
                   <p className="text-xs text-muted-foreground">
                     {newProviderIsSelfHosted
-                      ? 'The OpenAI-compatible API root of your server, including /v1. Private addresses must be trusted first.'
-                      : 'Override the default API endpoint for this provider.'}
+                      ? 'The OpenAI-compatible API root, including /v1: a hosted API or a server on your network. Private addresses must be trusted first.'
+                      : `Only for a proxy or gateway that serves ${providerName(newProvider)}'s own models.`}
                   </p>
+                  <VendorBaseUrlHint
+                    open={vendorHasCustomBaseUrl(formValues)}
+                    providerName={providerName(newProvider)}
+                    onSwitch={handleSwitchToOpenAiCompatible}
+                    disabled={createMutation.isPending}
+                  />
                 </div>
                 <SelfHostedProviderFields
                   open={newProviderIsSelfHosted}
                   baseUrl={formValues.base_url}
+                  committedBaseUrl={committedBaseUrl}
                   apiKey={formValues.api_key}
                   trustPrivateAddress={formValues.trust_private_address}
                   onTrustPrivateAddressChange={(trusted) =>
@@ -4887,6 +5055,25 @@ console.log(response.choices[0].message.content);`,
         </DialogContent>
       </Dialog>
 
+      <ReplaceProviderKeyDialog
+        open={replaceOpen}
+        onOpenChange={setReplaceOpen}
+        keyName={replacingKey?.display_name ?? ''}
+        providerName={replacingKey ? providerName(replacingKey.provider) : ''}
+        pending={replaceMutation.isPending}
+        error={
+          replaceMutation.isError
+            ? apiErrorMessage(replaceMutation.error)
+            : null
+        }
+        onReplace={(apiKey) =>
+          replacingKey
+            ? replaceMutation.mutateAsync({ id: replacingKey.id, apiKey })
+            : Promise.reject(new Error('No provider key selected'))
+        }
+      />
+
+      {/* Delete Confirmation Dialog */}
       <ConfirmDeleteDialog
         open={deleteDialogOpen}
         onOpenChange={(open) => {

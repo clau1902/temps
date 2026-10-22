@@ -1363,7 +1363,6 @@ mod tests {
             metrics_enabled: Set(false),
             default_backup_provisioned: Set(false),
             container_name: Set(None),
-            ai_data_access: Set(false),
             ..Default::default()
         }
         .insert(db)

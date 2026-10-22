@@ -689,7 +689,10 @@ pub async fn blob_enable(
             parameters.insert("access_key".to_string(), serde_json::json!(root_user));
         }
         if let Some(root_password) = &request.root_password {
-            parameters.insert("secret_key".to_string(), serde_json::json!(root_password));
+            parameters.insert(
+                "secret_key".to_string(),
+                serde_json::json!(root_password.expose()),
+            );
         }
 
         // Extract version from docker_image (e.g., "rustfs/rustfs:1.0.0" -> "1.0.0")

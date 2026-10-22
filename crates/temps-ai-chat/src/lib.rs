@@ -10,18 +10,47 @@
 //! deployment provider seeds from a failure diagnosis). Built on the `temps-ai`
 //! foundation; the AI is injected as `Arc<dyn AiService>`.
 
+pub mod application_link;
 pub mod applications;
+pub mod ask_user;
+pub mod attachment_upload_handlers;
+pub mod attachment_uploads;
+pub mod attachments;
 pub mod audit;
+pub mod autofix;
+pub mod autofix_handlers;
+pub mod blueprint;
+pub mod blueprint_handlers;
+pub mod chat_operations;
+pub mod chat_operations_handlers;
+pub mod chat_resources;
+pub mod chat_resources_handlers;
+pub mod compaction;
+pub mod compaction_handlers;
 pub mod git_bindings;
 pub mod git_bindings_handlers;
+pub mod goals;
+pub mod goals_handlers;
 pub mod handlers;
+pub mod harness;
 pub mod pending_actions;
 pub mod plugin;
 pub mod provider;
 pub mod providers;
+pub mod sandbox_deploy;
+pub mod sandbox_files;
+pub mod sandbox_files_handlers;
+pub mod sandbox_link;
+pub mod sandbox_link_handlers;
+pub mod secret_slot_handlers;
+pub mod secret_slots;
 mod sensitive;
 pub mod service;
+pub mod suggestion_handlers;
+pub mod suggestions;
 pub mod thread_kind;
+pub mod usage;
+pub mod workspace_chats;
 
 pub use applications::{ApplicationError, ApplicationService, ApplicationWorkspaceService};
 pub use git_bindings::{GitBindingError, GitBindingService};
@@ -31,6 +60,7 @@ pub use provider::{ConversationContextProvider, ConversationSeed};
 pub use providers::alert::AlertChatProvider;
 pub use providers::api_tools::ApiToolsProvider;
 pub use providers::application::ApplicationChatProvider;
+pub use providers::assistant::{AssistantChatProvider, ASSISTANT_CONTEXT_ID_PREFIX};
 pub use providers::deployment::DeploymentChatProvider;
 pub use providers::global::GlobalChatProvider;
 pub use providers::project::ProjectChatProvider;

@@ -31,6 +31,7 @@ pub mod notifications;
 pub mod on_demand;
 pub mod openapi;
 pub mod plugin;
+pub mod plugin_builder;
 pub mod problemdetails;
 pub mod project_access;
 pub mod project_deletion;
@@ -57,6 +58,7 @@ pub mod retention;
 pub mod retry;
 pub mod runtime;
 pub mod sandbox_runtime;
+pub mod secret_string;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
@@ -68,6 +70,7 @@ pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;
+pub mod worker_ingress;
 pub use docker_handle::{
     worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
     WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,
@@ -153,7 +156,9 @@ pub use runtime::{
     RuntimeConfigurationError, RuntimeContext, ServiceEndpoint, ServiceEndpointResolver,
     ServiceEndpointScheme, EXECUTION_ENVIRONMENT_VARIABLE, LEGACY_DEPLOYMENT_MODE_VARIABLE,
 };
-pub use sandbox_runtime::{SandboxRuntimeCredentialsError, SandboxRuntimeCredentialsProvider};
+pub use sandbox_runtime::{
+    SandboxRuntimeCredentialsError, SandboxRuntimeCredentialsProvider, SandboxScope,
+};
 pub use secrets_manager::SecretsManagerResolver;
 pub use sensitive_action::{
     SensitiveAction, SensitiveActionAuthorizationError, SensitiveActionAuthorizer,

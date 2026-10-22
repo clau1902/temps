@@ -147,7 +147,7 @@ async fn add_key(
         .expect("create provider key");
     harness
         .models
-        .apply_discovered(key.id, discovered)
+        .apply_discovered(key.id, discovered.into_iter().map(Into::into).collect())
         .await
         .expect("store discovered catalog");
     key

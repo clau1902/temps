@@ -363,6 +363,138 @@ fn unreachable_container_reason(
     }
 }
 
+/// Label keys that have named a container's project over time.
+const PROJECT_LABEL_KEYS: &[&str] = &["sh.temps.project_id"];
+/// Label keys that have named a container's environment over time:
+/// Compose stacks used `sh.temps.environment_id` until they adopted the image
+/// deployer's `sh.temps.environment`.
+const ENVIRONMENT_LABEL_KEYS: &[&str] = &["sh.temps.environment", "sh.temps.environment_id"];
+
+/// Why owner cleanup may remove a recorded container it found running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordedContainerOwnership {
+    /// The current label scheme names exactly this project and environment.
+    Labelled,
+    /// The container predates the current label scheme (no labels, no
+    /// `sh.temps.managed`, or a project ID written as a UUID), no label
+    /// contradicts ownership, and Docker resolved the recorded reference to
+    /// that very container -- so the database row is the ownership record.
+    Recorded { missing_labels: Vec<&'static str> },
+}
+
+/// How the values under `keys` compare with `expected`.
+enum LabelVerdict {
+    /// At least one key carries `expected`, and none carries another ID.
+    Matches,
+    /// No key carries a comparable numeric ID (absent, or a legacy format).
+    Unknown,
+}
+
+/// Compare every label in `keys` against `expected`, failing on the first one
+/// that names a *different* numeric ID. A non-numeric value is a legacy
+/// format (the first label scheme wrote project IDs as UUIDs) that can
+/// neither prove nor disprove ownership, so it is reported as `Unknown`.
+fn compare_id_labels(
+    labels: &HashMap<String, String>,
+    keys: &[&'static str],
+    expected: i32,
+) -> Result<LabelVerdict, String> {
+    let mut verdict = LabelVerdict::Unknown;
+    for key in keys {
+        let Some(value) = labels.get(*key) else {
+            continue;
+        };
+        match value.trim().parse::<i32>() {
+            Ok(id) if id == expected => verdict = LabelVerdict::Matches,
+            Ok(_) => return Err(format!("label {key}={value} (expected {expected})")),
+            Err(_) => {}
+        }
+    }
+    Ok(verdict)
+}
+
+/// Decide whether owner cleanup may remove `info`, the runtime container that
+/// Docker returned for the recorded reference `recorded_container_id`, when
+/// deleting `project_id`/`environment_id`.
+///
+/// The database row is the authority -- labels carry numeric IDs that are
+/// local to one database, so they can never prove ownership on their own.
+/// What labels *can* do is contradict it: a container labelled with another
+/// project or environment, or explicitly marked unmanaged, is refused. A
+/// container whose labels are absent or in a legacy format is accepted only
+/// when Docker resolved the recorded reference to that exact container ID, so
+/// a reference that now names someone else's container is still refused.
+///
+/// The error is the reason the container was refused, for the cleanup error.
+fn recorded_container_ownership(
+    recorded_container_id: &str,
+    info: &temps_deployer::ContainerInfo,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<RecordedContainerOwnership, String> {
+    let labels = &info.labels;
+    let mut conflicts = Vec::new();
+    let managed = labels.get("sh.temps.managed").map(String::as_str);
+    if let Some(value) = managed.filter(|value| *value != "true") {
+        conflicts.push(format!("label sh.temps.managed={value}"));
+    }
+    let mut compare = |keys, expected| match compare_id_labels(labels, keys, expected) {
+        Ok(verdict) => Some(verdict),
+        Err(conflict) => {
+            conflicts.push(conflict);
+            None
+        }
+    };
+    let project = compare(PROJECT_LABEL_KEYS, project_id);
+    let environment = compare(ENVIRONMENT_LABEL_KEYS, environment_id);
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "runtime container labels name a different owner than project {project_id}, \
+             environment {environment_id}: {}",
+            conflicts.join(", ")
+        ));
+    }
+
+    let mut missing_labels = Vec::new();
+    if managed.is_none() {
+        missing_labels.push("sh.temps.managed");
+    }
+    if !matches!(project, Some(LabelVerdict::Matches)) {
+        missing_labels.push("sh.temps.project_id");
+    }
+    if !matches!(environment, Some(LabelVerdict::Matches)) {
+        missing_labels.push("sh.temps.environment");
+    }
+    if missing_labels.is_empty() {
+        return Ok(RecordedContainerOwnership::Labelled);
+    }
+
+    // Docker resolves names and ID prefixes too, and some rows (importers)
+    // record a source app name rather than an ID, so a short reference can
+    // land on an unrelated container. Without labels to vouch for it, only a
+    // row that recorded the container's full, exact ID proves ownership.
+    if is_full_container_id(recorded_container_id) && info.container_id == recorded_container_id {
+        return Ok(RecordedContainerOwnership::Recorded { missing_labels });
+    }
+    Err(format!(
+        "runtime container '{}' is missing ownership labels ({}) and the recorded reference \
+         '{recorded_container_id}' is not its full container ID, so it cannot be confirmed as \
+         belonging to project {project_id}, environment {environment_id}",
+        info.container_id,
+        missing_labels.join(", "),
+    ))
+}
+
+/// Whether `value` is a full Docker container ID: 64 lowercase hex digits,
+/// the form Docker returns from create and inspect. Prefixes and names are
+/// ambiguous references, never identities.
+fn is_full_container_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn confined_archive_path(
     data_dir: &std::path::Path,
     stored_path: &str,
@@ -1117,29 +1249,49 @@ impl DeploymentService {
                 })?
             };
 
-            let runtime_container_absent = match deployer.get_container_info(&container_id).await {
+            // The exact container that was inspected and judged ours. Removal
+            // targets this ID, never the recorded reference: Docker resolves
+            // names and ID prefixes again on every call, so the reference
+            // could name a different container by the time it is removed.
+            let verified_runtime_id = match deployer.get_container_info(&container_id).await {
                 Ok(info) => {
-                    let expected_project = project_id.to_string();
-                    let expected_environment = container_environment_id.to_string();
-                    if info.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
-                        || info.labels.get("sh.temps.project_id") != Some(&expected_project)
-                        || info.labels.get("sh.temps.environment") != Some(&expected_environment)
-                    {
-                        let reason = "runtime container labels do not match the project and environment being deleted".to_string();
-                        let _ = self
-                            .restore_cleanup_marker(&original, already_prepared)
-                            .await;
-                        return Err(temps_core::ContainerCleanupError::Removal {
-                            project_id,
-                            environment_id: container_environment_id,
-                            container_id,
-                            node_id,
-                            reason,
-                        });
+                    match recorded_container_ownership(
+                        &container_id,
+                        &info,
+                        project_id,
+                        container_environment_id,
+                    ) {
+                        Ok(RecordedContainerOwnership::Labelled) => {}
+                        Ok(RecordedContainerOwnership::Recorded { missing_labels }) => {
+                            warn!(
+                                project_id,
+                                environment_id = container_environment_id,
+                                container_id,
+                                ?node_id,
+                                ?missing_labels,
+                                "Removing recorded container that predates Temps ownership labels; the database record is its ownership proof"
+                            );
+                        }
+                        Err(reason) => {
+                            let _ = self
+                                .restore_cleanup_marker(&original, already_prepared)
+                                .await;
+                            return Err(temps_core::ContainerCleanupError::Removal {
+                                project_id,
+                                environment_id: container_environment_id,
+                                container_id,
+                                node_id,
+                                reason,
+                            });
+                        }
                     }
-                    false
+                    Some(if info.container_id.is_empty() {
+                        container_id.clone()
+                    } else {
+                        info.container_id
+                    })
                 }
-                Err(temps_deployer::DeployerError::ContainerNotFound(_)) => true,
+                Err(temps_deployer::DeployerError::ContainerNotFound(_)) => None,
                 Err(error) => {
                     let _ = self
                         .restore_cleanup_marker(&original, already_prepared)
@@ -1167,12 +1319,10 @@ impl DeploymentService {
                 }
             };
 
-            let removal_error = if runtime_container_absent {
-                None
-            } else {
+            let removal_error = if let Some(runtime_id) = verified_runtime_id {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(30),
-                    deployer.remove_container(&container_id),
+                    deployer.remove_container(&runtime_id),
                 )
                 .await
                 {
@@ -1182,6 +1332,8 @@ impl DeploymentService {
                     Ok(Err(error)) => Some(error.to_string()),
                     Err(_) => Some("container removal timed out after 30 seconds".to_string()),
                 }
+            } else {
+                None
             };
             if let Some(reason) = removal_error {
                 // Once a request may have reached Docker/the agent, its result is
@@ -1562,10 +1714,10 @@ impl DeploymentService {
             ))
         })?;
 
+        let endpoint = crate::cluster_ca::node_agent_endpoint(&node);
         let remote = crate::cluster_ca::build_node_deployer(
-            &node.address,
+            &node,
             token,
-            node.name.clone(),
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
         )
@@ -1577,7 +1729,7 @@ impl DeploymentService {
             ))
         })?;
         let client = crate::cluster_ca::build_node_http_client(
-            &node.address,
+            &endpoint,
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
             None,
@@ -1591,6 +1743,7 @@ impl DeploymentService {
         })?;
         let terminal_connector = if node.address.starts_with("https://") {
             let config = crate::cluster_ca::cp_ws_client_config(
+                &endpoint,
                 self.config_service.as_ref(),
                 self.encryption_service.as_ref(),
             )
@@ -8015,6 +8168,348 @@ mod tests {
             "a container we refused to touch must not be marked deleted"
         );
 
+        Ok(())
+    }
+
+    fn runtime_container(id: &str, labels: &[(&str, &str)]) -> temps_deployer::ContainerInfo {
+        temps_deployer::ContainerInfo {
+            container_id: id.to_string(),
+            labels: labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Docker returns the full 64-character ID; rows may record it in full or
+    /// as a prefix.
+    const RUNTIME_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn ownership_accepts_a_container_with_matching_labels() {
+        let info = runtime_container(
+            RUNTIME_ID,
+            &[
+                ("sh.temps.managed", "true"),
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "22"),
+            ],
+        );
+        assert_eq!(
+            recorded_container_ownership(RUNTIME_ID, &info, 11, 22),
+            Ok(RecordedContainerOwnership::Labelled)
+        );
+        // Labels are authoritative enough when they fully match, even if the
+        // row recorded a reference Docker resolved by name.
+        assert_eq!(
+            recorded_container_ownership("app-production", &info, 11, 22),
+            Ok(RecordedContainerOwnership::Labelled)
+        );
+    }
+
+    #[test]
+    fn ownership_falls_back_to_the_recorded_id_for_unlabelled_containers() {
+        let unlabelled = runtime_container(RUNTIME_ID, &[]);
+        assert_eq!(
+            recorded_container_ownership(RUNTIME_ID, &unlabelled, 11, 22),
+            Ok(RecordedContainerOwnership::Recorded {
+                missing_labels: vec![
+                    "sh.temps.managed",
+                    "sh.temps.project_id",
+                    "sh.temps.environment"
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_accepts_legacy_label_schemes_on_the_recorded_container() {
+        // Before `sh.temps.managed` existed.
+        let pre_managed = runtime_container(
+            RUNTIME_ID,
+            &[
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "22"),
+            ],
+        );
+        assert_eq!(
+            recorded_container_ownership(RUNTIME_ID, &pre_managed, 11, 22),
+            Ok(RecordedContainerOwnership::Recorded {
+                missing_labels: vec!["sh.temps.managed"],
+            })
+        );
+        // The first label scheme wrote the project as a UUID.
+        let uuid_project = runtime_container(
+            RUNTIME_ID,
+            &[
+                (
+                    "sh.temps.project_id",
+                    "00000000-0000-5000-8000-000000000000",
+                ),
+                ("sh.temps.environment", "22"),
+            ],
+        );
+        assert!(recorded_container_ownership(RUNTIME_ID, &uuid_project, 11, 22).is_ok());
+        // Early Compose stacks used `sh.temps.environment_id`.
+        let compose_environment_id = runtime_container(
+            RUNTIME_ID,
+            &[
+                ("sh.temps.managed", "true"),
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment_id", "22"),
+            ],
+        );
+        assert_eq!(
+            recorded_container_ownership(RUNTIME_ID, &compose_environment_id, 11, 22),
+            Ok(RecordedContainerOwnership::Labelled)
+        );
+    }
+
+    #[test]
+    fn ownership_refuses_containers_labelled_for_another_owner() {
+        let cases: &[&[(&str, &str)]] = &[
+            &[
+                ("sh.temps.managed", "true"),
+                ("sh.temps.project_id", "12"),
+                ("sh.temps.environment", "22"),
+            ],
+            &[
+                ("sh.temps.managed", "true"),
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "23"),
+            ],
+            // Legacy key, different environment.
+            &[
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment_id", "23"),
+            ],
+            // The current key matches but the legacy one contradicts it.
+            &[
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "22"),
+                ("sh.temps.environment_id", "23"),
+            ],
+            // Explicitly not managed by Temps.
+            &[
+                ("sh.temps.managed", "false"),
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "22"),
+            ],
+        ];
+        for labels in cases {
+            // Refused even though Docker resolved the recorded ID exactly: a
+            // label naming someone else outweighs our own record.
+            let info = runtime_container(RUNTIME_ID, labels);
+            let reason = recorded_container_ownership(RUNTIME_ID, &info, 11, 22)
+                .expect_err(&format!("labels {labels:?} must be refused"));
+            assert!(
+                reason.contains("different owner") && reason.contains("project 11"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_refuses_an_unlabelled_container_docker_resolved_elsewhere() {
+        // The recorded reference is a name that now resolves to a container
+        // carrying no labels: nothing ties it to this project.
+        let info = runtime_container(RUNTIME_ID, &[]);
+        let reason = recorded_container_ownership("app-production", &info, 11, 22)
+            .expect_err("a renamed-onto container must be refused");
+        assert!(reason.contains(RUNTIME_ID), "{reason}");
+        assert!(recorded_container_ownership("", &info, 11, 22).is_err());
+        // Docker resolves unique ID prefixes, so a short value -- a short ID,
+        // or an importer's source app name that happens to be hex -- can
+        // land on any container. Only the full, exact ID is an identity.
+        for reference in [&RUNTIME_ID[..2], &RUNTIME_ID[..12], &RUNTIME_ID[..63]] {
+            assert!(
+                recorded_container_ownership(reference, &info, 11, 22).is_err(),
+                "prefix {reference} must not prove ownership"
+            );
+        }
+        let uppercase = RUNTIME_ID.to_uppercase();
+        let uppercase_info = runtime_container(&uppercase, &[]);
+        assert!(recorded_container_ownership(&uppercase, &uppercase_info, 11, 22).is_err());
+    }
+
+    /// The bug this guards: a project whose container predates Temps'
+    /// ownership labels (and was stopped by scaling to zero) could never be
+    /// deleted, because cleanup refused its own recorded container.
+    #[tokio::test]
+    async fn cleanup_removes_a_recorded_container_that_predates_ownership_labels(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping legacy-label cleanup integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let mut stopped: deployment_containers::ActiveModel = container.clone().into();
+        stopped.status = Set(Some("stopped".to_string()));
+        stopped.container_id = Set(RUNTIME_ID.to_string());
+        stopped.update(db.as_ref()).await?;
+
+        let expected_container_id = RUNTIME_ID.to_string();
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        deployer.expect_get_container_info().returning(|id| {
+            Ok(temps_deployer::ContainerInfo {
+                container_id: id.to_string(),
+                status: temps_deployer::ContainerStatus::Stopped,
+                ..Default::default()
+            })
+        });
+        deployer
+            .expect_remove_container()
+            .withf(move |container_id| container_id == expected_container_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+
+        let cleaned = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container cleanup record remains until project cascade");
+        assert_eq!(cleaned.status.as_deref(), Some("removed"));
+        Ok(())
+    }
+
+    /// A row may record a reference Docker resolves (a name). Once that
+    /// resolved container is verified as ours, removal must target its exact
+    /// ID -- re-resolving the reference could reach a different container.
+    #[tokio::test]
+    async fn cleanup_removes_the_inspected_container_id_not_the_recorded_reference(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping resolved-id cleanup integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let (project_id, environment_id) = (project.id, environment.id);
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        deployer.expect_get_container_info().returning(move |_| {
+            Ok(runtime_container(
+                RUNTIME_ID,
+                &[
+                    ("sh.temps.managed", "true"),
+                    ("sh.temps.project_id", &project_id.to_string()),
+                    ("sh.temps.environment", &environment_id.to_string()),
+                ],
+            ))
+        });
+        deployer
+            .expect_remove_container()
+            .withf(|container_id| container_id == RUNTIME_ID)
+            .times(1)
+            .returning(|_| Ok(()));
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+        assert_ne!(container.container_id, RUNTIME_ID);
+        Ok(())
+    }
+
+    /// A stopped container's environment label still has to match: a
+    /// recorded ID that carries another environment of the same project is
+    /// refused, and its row is left untouched.
+    #[tokio::test]
+    async fn cleanup_refuses_a_container_labelled_for_another_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping cleanup environment integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id + 1);
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+        assert!(
+            matches!(
+                &result,
+                Err(temps_core::ContainerCleanupError::Removal { reason, .. })
+                    if reason.contains("sh.temps.environment")
+            ),
+            "cleanup must refuse a container labelled for another environment, got {result:?}"
+        );
+        let preserved = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("a refused cleanup must preserve the container record");
+        assert!(preserved.deleted_at.is_none());
+        assert_eq!(preserved.status, container.status);
+        Ok(())
+    }
+
+    /// A scaled-to-zero environment's container may already be gone from
+    /// Docker. That is the state cleanup wants, not an error.
+    #[tokio::test]
+    async fn cleanup_treats_an_already_gone_container_as_removed(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping gone-container cleanup integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let mut stopped: deployment_containers::ActiveModel = container.clone().into();
+        stopped.status = Set(Some("stopped".to_string()));
+        stopped.update(db.as_ref()).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        deployer
+            .expect_get_container_info()
+            .times(1)
+            .returning(|id| {
+                Err(temps_deployer::DeployerError::ContainerNotFound(format!(
+                    "Container {id} not found"
+                )))
+            });
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+        let finalized = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("cleanup record remains until project cascade");
+        assert_eq!(finalized.status.as_deref(), Some("removed"));
+        assert!(finalized.deleted_at.is_some());
         Ok(())
     }
 

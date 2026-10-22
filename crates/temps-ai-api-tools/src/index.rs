@@ -38,7 +38,9 @@
 //! | Object required      | `obj.required: Vec<String>`                               |
 //! | $ref location        | `Ref::ref_location: String`                               |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+use crate::secrets::{secret_paths_for_request_body, SecretPath};
 
 use serde::{Deserialize, Serialize};
 use utoipa::openapi::{
@@ -316,6 +318,24 @@ pub struct ReadOnlyApiIndex {
     /// `tags`. Used to describe CLI sections in `--help`. Empty when the
     /// document declares no tag descriptions.
     tag_descriptions: BTreeMap<String, String>,
+    /// `operation_id` → where in its request body a credential goes (fields the
+    /// API flagged `x-temps-secret`). Only operations that have such fields are
+    /// present. Computed once, at construction, from the OpenAPI document.
+    secret_paths: HashMap<String, Vec<SecretPath>>,
+}
+
+/// The document's `components`, serialized once so request-body schemas can be
+/// walked as JSON. `Null` when the document has none.
+fn components_json(openapi: &utoipa::openapi::OpenApi) -> serde_json::Value {
+    serde_json::to_value(&openapi.components).unwrap_or(serde_json::Value::Null)
+}
+
+/// The credential paths for `op`'s request body, keyed for [`ReadOnlyApiIndex`].
+fn secret_paths_of(op: &Operation, components: &serde_json::Value) -> Vec<SecretPath> {
+    match op.request_body.as_ref().map(serde_json::to_value) {
+        Some(Ok(body)) => secret_paths_for_request_body(&body, components),
+        _ => Vec::new(),
+    }
 }
 
 /// Extract `tag name → description` from the OpenAPI document's top-level tags.
@@ -359,6 +379,7 @@ impl ReadOnlyApiIndex {
         Self {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
+            secret_paths: HashMap::new(),
         }
     }
 
@@ -389,6 +410,7 @@ impl ReadOnlyApiIndex {
         Self {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
+            secret_paths: HashMap::new(),
         }
     }
 
@@ -430,6 +452,7 @@ impl ReadOnlyApiIndex {
         safe_posts: &[&str],
     ) -> Self {
         let mut index = Self::from_openapi_allowlist(openapi, allowlist);
+        let components = components_json(openapi);
 
         for (path, path_item) in &openapi.paths.paths {
             let Some(op) = path_item.post.as_ref() else {
@@ -442,6 +465,10 @@ impl ReadOnlyApiIndex {
                 continue;
             }
             let body_params = resolve_body_params(op, openapi);
+            let credential_paths = secret_paths_of(op, &components);
+            if !credential_paths.is_empty() {
+                index.secret_paths.insert(op_id.clone(), credential_paths);
+            }
             index.operations.push(build_api_operation(
                 op_id.clone(),
                 path.clone(),
@@ -475,6 +502,8 @@ impl ReadOnlyApiIndex {
         allowlist: &[&str],
     ) -> Self {
         let mut operations = Vec::new();
+        let mut secret_paths = HashMap::new();
+        let components = components_json(openapi);
 
         // Pre-build a slice of (method-string, Option<Operation>) pairs from
         // each path_item so we can iterate uniformly.
@@ -506,6 +535,10 @@ impl ReadOnlyApiIndex {
                     &body_params,
                     openapi,
                 );
+                let credential_paths = secret_paths_of(op, &components);
+                if !credential_paths.is_empty() {
+                    secret_paths.insert(op_id.clone(), credential_paths);
+                }
                 operations.push(api_op);
             }
         }
@@ -513,12 +546,22 @@ impl ReadOnlyApiIndex {
         Self {
             operations,
             tag_descriptions: extract_tag_descriptions(openapi),
+            secret_paths,
         }
     }
 
     /// All indexed operations, in document order.
     pub fn operations(&self) -> &[ApiOperation] {
         &self.operations
+    }
+
+    /// Where in `operation_id`'s request body a credential goes, i.e. the fields
+    /// the API declared `x-temps-secret`. Empty for operations that take none.
+    pub fn secret_fields(&self, operation_id: &str) -> &[SecretPath] {
+        self.secret_paths
+            .get(operation_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Human description for a tag/section, from the OpenAPI top-level tags.
@@ -1037,8 +1080,14 @@ pub(crate) fn extract_type_and_enum(schema: Option<&RefOr<Schema>>) -> (String, 
 }
 
 fn extract_schema_type_and_enum(schema: &Schema) -> (String, Vec<String>) {
-    let Schema::Object(obj) = schema else {
-        return ("string".to_string(), vec![]);
+    let obj = match schema {
+        Schema::Object(obj) => obj,
+        // A list field (`Vec<T>`) is its own schema kind, not an object.
+        // Reporting it as a string made the CLI keep `--files '[...]'` as
+        // opaque text, which the validator accepted and the API then refused
+        // ("invalid type: string ..., expected a sequence").
+        Schema::Array(_) => return ("array".to_string(), vec![]),
+        _ => return ("string".to_string(), vec![]),
     };
 
     let ty = schema_type_to_string(&obj.schema_type);
@@ -1700,6 +1749,87 @@ mod tests {
         assert!(service_type.required);
         assert_eq!(service_type.ty, "string");
         assert_eq!(service_type.enum_values, vec!["postgres", "redis"]);
+    }
+
+    /// A list-of-objects body field (`files` of `commit_repository_files`) must
+    /// be typed `array`. Typed `string`, the CLI kept the model's JSON as text
+    /// and the API rejected it as "expected a sequence".
+    #[test]
+    fn write_allowlist_types_a_list_body_field_as_an_array() {
+        use utoipa::openapi::{
+            path::{HttpMethod, OperationBuilder, PathItem, PathsBuilder},
+            request_body::RequestBodyBuilder,
+            schema::{ArrayBuilder, ComponentsBuilder},
+            ContentBuilder, OpenApiBuilder,
+        };
+
+        let file = ObjectBuilder::new()
+            .property(
+                "path",
+                ObjectBuilder::new().schema_type(SchemaType::Type(Type::String)),
+            )
+            .required("path")
+            .build();
+        let request = ObjectBuilder::new()
+            .property(
+                "files",
+                ArrayBuilder::new().items(RefOr::Ref(utoipa::openapi::Ref::from_schema_name(
+                    "CommitFile",
+                ))),
+            )
+            .required("files")
+            .property(
+                "message",
+                ObjectBuilder::new().schema_type(SchemaType::Type(Type::String)),
+            )
+            .build();
+        let api = OpenApiBuilder::new()
+            .paths(
+                PathsBuilder::new()
+                    .path(
+                        "/commits",
+                        PathItem::new(
+                            HttpMethod::Post,
+                            OperationBuilder::new()
+                                .operation_id(Some("commit_files"))
+                                .request_body(Some(
+                                    RequestBodyBuilder::new()
+                                        .content(
+                                            "application/json",
+                                            ContentBuilder::new()
+                                                .schema(Some(RefOr::Ref(
+                                                    utoipa::openapi::Ref::from_schema_name(
+                                                        "CommitRequest",
+                                                    ),
+                                                )))
+                                                .build(),
+                                        )
+                                        .build(),
+                                ))
+                                .build(),
+                        ),
+                    )
+                    .build(),
+            )
+            .components(Some(
+                ComponentsBuilder::new()
+                    .schema("CommitFile", file)
+                    .schema("CommitRequest", request)
+                    .build(),
+            ))
+            .build();
+
+        let index = ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["commit_files"]);
+        let op = index.get("commit_files").expect("commit_files");
+        let files = op.params.iter().find(|p| p.name == "files").expect("files");
+        assert_eq!(files.ty, "array");
+        assert!(files.required);
+        let message = op
+            .params
+            .iter()
+            .find(|p| p.name == "message")
+            .expect("message");
+        assert_eq!(message.ty, "string");
     }
 
     #[test]

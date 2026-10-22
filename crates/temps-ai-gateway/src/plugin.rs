@@ -482,10 +482,17 @@ impl TempsPlugin for AiGatewayPlugin {
             // host harnesses receive the same scoped tools through the
             // turn-local MCP bridge. Chat and feature code never branches on
             // provider transport.
-            let gateway_ai_service = Arc::new(crate::services::GatewayAiService::new(
-                gateway_service.clone(),
-                db.clone(),
-            ));
+            //
+            // Chat turns stream through this service rather than the HTTP
+            // gateway handler, so it needs the usage service to record tokens
+            // for them; otherwise assistant traffic would be invisible in
+            // AI Gateway usage and spend views.
+            let usage_service = Arc::new(UsageService::new(db.clone()));
+            context.register_service(usage_service.clone());
+            let gateway_ai_service = Arc::new(
+                crate::services::GatewayAiService::new(gateway_service.clone(), db.clone())
+                    .with_usage_service(usage_service.clone()),
+            );
 
             // One AgentCliAiService per catalog entry (Claude Code, Codex,
             // OpenCode), built once here rather than per-request — each is
@@ -661,9 +668,6 @@ impl TempsPlugin for AiGatewayPlugin {
             // Browser-supplied generic prompts are intentionally restricted to
             // tool-less gateway APIs. Host subscription CLIs can inspect the
             // host and are reserved for server-authored, purpose-specific jobs.
-            let usage_service = Arc::new(UsageService::new(db.clone()));
-            context.register_service(usage_service.clone());
-
             let structured_output_service = Arc::new(StructuredOutputService::new(
                 gateway_ai_service as Arc<dyn temps_ai::AiService>,
                 usage_service.clone(),

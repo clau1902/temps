@@ -34,6 +34,7 @@ use std::sync::Arc;
 use temps_auth::{permission_guard, require_sensitive_action, Permission, RequireAuth};
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
+use temps_core::secret_string::SecretString;
 use temps_core::RequestMetadata;
 use temps_core::SensitiveAction;
 use tracing::error;
@@ -262,8 +263,13 @@ pub struct CreateS3SourceRequest {
     pub name: String,
     pub bucket_name: String,
     pub bucket_path: String,
-    pub access_key_id: String,
-    pub secret_key: String,
+    /// Access key ID of the bucket's credentials, for example `AKIA...` on AWS.
+    // A credential type, so the assistant collects it in the same private form
+    // as the secret key and never sees either.
+    pub access_key_id: SecretString,
+    /// Secret access key that goes with the access key ID. Shown once by the
+    /// provider; stored encrypted and never returned.
+    pub secret_key: SecretString,
     pub region: String,
     /// Optional endpoint URL for S3-compatible services like MinIO
     #[schema(example = "http://minio.example.com:9000")]
@@ -289,10 +295,9 @@ pub struct UpdateS3SourceRequest {
     /// Optional new bucket path
     pub bucket_path: Option<String>,
     /// Optional new access key ID
-    #[schema(example = "AKIAXXXXXXXXXXXXXXXX")]
-    pub access_key_id: Option<String>,
+    pub access_key_id: Option<SecretString>,
     /// Optional new secret key
-    pub secret_key: Option<String>,
+    pub secret_key: Option<SecretString>,
     /// Optional new region
     pub region: Option<String>,
     /// Optional new endpoint URL for S3-compatible services
@@ -310,6 +315,10 @@ pub struct CreateBackupScheduleRequest {
     pub retention_period: i32,
     /// Optional S3 source. If omitted, the current default S3 source is used.
     pub s3_source_id: Option<i32>,
+    /// Cron expression with a leading seconds field: `sec min hour day-of-month
+    /// month day-of-week`, for example `0 0 3 * * *` for every day at 03:00
+    /// UTC. A five-field expression such as `0 3 * * *` is rejected.
+    #[schema(example = "0 0 3 * * *")]
     pub schedule_expression: String,
     pub enabled: bool,
     pub description: Option<String>,
@@ -374,7 +383,10 @@ pub struct UpdateBackupScheduleRequest {
     pub name: Option<String>,
     /// New human-readable description. Pass an empty string `""` to clear.
     pub description: Option<String>,
-    /// New cron expression. When changed, `next_run` is recomputed.
+    /// New cron expression with a leading seconds field (`sec min hour
+    /// day-of-month month day-of-week`, e.g. `0 0 3 * * *`). When changed,
+    /// `next_run` is recomputed.
+    #[schema(example = "0 0 3 * * *")]
     pub schedule_expression: Option<String>,
     /// Days to retain backups produced by this schedule. Must be >= 1.
     pub retention_period: Option<i32>,
@@ -636,7 +648,7 @@ pub struct BackupScheduleResponse {
     pub backup_type: String,
     pub retention_period: i32,
     pub s3_source_id: i32,
-    #[schema(example = "0 0 * * *")]
+    #[schema(example = "0 0 3 * * *")]
     pub schedule_expression: String,
     pub enabled: bool,
     pub created_at: i64,
@@ -1709,15 +1721,12 @@ async fn update_s3_source(
     }
     // A masked (`***`) or empty credential is sent back unchanged by edit
     // forms and is not stored; see `BackupService::update_s3_source`.
-    let credential_changed = |value: &Option<String>| {
-        value
-            .as_deref()
-            .is_some_and(|v| !v.is_empty() && v != "***")
-    };
-    if credential_changed(&request.access_key_id) {
+    let credential_changed =
+        |value: Option<&str>| value.is_some_and(|v| !v.is_empty() && v != "***");
+    if credential_changed(request.access_key_id.as_ref().map(SecretString::expose)) {
         updated_fields.insert("access_key_id".to_string(), "updated".to_string());
     }
-    if credential_changed(&request.secret_key) {
+    if credential_changed(request.secret_key.as_ref().map(SecretString::expose)) {
         updated_fields.insert("secret_key".to_string(), "updated".to_string());
     }
     if request.region.is_some() {
@@ -3467,6 +3476,83 @@ async fn list_backup_alerts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The secret key an operator (or the assistant, through a secret slot)
+    /// supplies is published as a flagged credential, so tooling in front of
+    /// the API can tell it from an ordinary string without a hand-kept list.
+    #[test]
+    fn s3_source_request_publishes_both_keys_as_credentials() {
+        use utoipa::PartialSchema;
+
+        for (name, schema) in [
+            (
+                "create",
+                serde_json::to_value(CreateS3SourceRequest::schema()),
+            ),
+            (
+                "update",
+                serde_json::to_value(UpdateS3SourceRequest::schema()),
+            ),
+        ] {
+            let schema = schema.expect("schema serializes");
+            let rendered = schema["properties"]["secret_key"].to_string();
+            assert!(
+                rendered.contains("SecretString"),
+                "the {name} request must type secret_key as SecretString, got {rendered}"
+            );
+            let access_key = schema["properties"]["access_key_id"].to_string();
+            assert!(
+                access_key.contains("SecretString"),
+                "the {name} request must type access_key_id as SecretString so the assistant \
+                 collects it in the private form with the secret key, got {access_key}"
+            );
+        }
+    }
+
+    /// The assistant's read tool exposes `list_s3_sources` and `get_s3_source`
+    /// on the strength of this: a stored source never leaves the API with a
+    /// usable credential, and no session token field exists to leak.
+    #[test]
+    fn s3_source_response_masks_both_keys() {
+        let now = chrono::Utc::now();
+        let source = temps_entities::s3_sources::Model {
+            id: 7,
+            name: "offsite".to_string(),
+            bucket_name: "backups".to_string(),
+            region: "eu-west-1".to_string(),
+            endpoint: None,
+            bucket_path: "/pg".to_string(),
+            access_key_id: "AKIAEXAMPLEEXAMPLE00".to_string(),
+            secret_key: "encrypted-secret-material".to_string(),
+            session_token: Some("encrypted-session-token".to_string()),
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: now,
+            updated_at: now,
+            backing_service_id: None,
+        };
+
+        let response = S3SourceResponse::from(source);
+        assert_eq!(response.access_key_id, "***");
+        assert_eq!(response.secret_key, "***");
+        let wire = serde_json::to_string(&response).expect("response serializes");
+        for leaked in [
+            "AKIAEXAMPLEEXAMPLE00",
+            "encrypted-secret-material",
+            "encrypted-session-token",
+            "session_token",
+        ] {
+            assert!(!wire.contains(leaked), "`{leaked}` leaked into {wire}");
+        }
+        assert_eq!(
+            response.bucket_name, "backups",
+            "non-secret fields stay readable"
+        );
+    }
 
     #[test]
     fn capability_dto_preserves_service_result() {

@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_core::secret_string::SecretString;
 use temps_core::{
     AuditLogger, DeploymentCanceller, DeploymentContainerCleaner, ProjectEnvVarsProvider,
 };
@@ -531,7 +532,7 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// server-side and never stored in plaintext.
     /// Send an empty string to remove password protection.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
 }
 
 /// Request to rename an environment's auto-managed subdomain.

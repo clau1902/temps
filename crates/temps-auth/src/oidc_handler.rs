@@ -1519,7 +1519,7 @@ mod login_binding_http_tests {
             name: name.to_string(),
             issuer_url: issuer.to_string(),
             client_id: "client".to_string(),
-            client_secret: "secret".to_string(),
+            client_secret: "secret".to_string().into(),
             scopes: "openid email profile".to_string(),
             jit_provisioning: true,
             enabled,

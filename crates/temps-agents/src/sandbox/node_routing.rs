@@ -527,8 +527,9 @@ impl NodeProviderFactory for MtlsProviderFactory {
         token: String,
         defaults: RemoteSandboxDefaults,
     ) -> Result<Arc<dyn SandboxProvider>, String> {
+        let endpoint = temps_deployments::cluster_ca::node_agent_endpoint(node);
         let client = temps_deployments::cluster_ca::build_node_http_client(
-            &node.address,
+            &endpoint,
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
             None,
@@ -539,7 +540,7 @@ impl NodeProviderFactory for MtlsProviderFactory {
             RemoteSandboxProvider::new(
                 node.id,
                 node.name.clone(),
-                node.address.clone(),
+                endpoint.dial_url,
                 token,
                 client,
             )
@@ -1100,6 +1101,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: now,
             updated_at: now,
         }

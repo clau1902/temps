@@ -210,6 +210,15 @@ jobs:
       #   Neither path calls an advisory-affected function nor handles
       #   attacker-controlled archives. Re-check and drop these three once
       #   headless_chrome and utoipa-swagger-ui release with zip 9.
+      # - RUSTSEC-2026-0381 (webpki-roots: bundled `emSign ECC Root CA - G3`
+      #   lets paths through distrusted emSign intermediates; fixed in
+      #   webpki-roots >= 1.0.10). Cargo.lock has webpki-roots 1.0.10. The
+      #   advisory still matches the 0.26.11 copy that sqlx-core 0.8.6 requires,
+      #   but that release is a semver-compatibility shim whose whole API is
+      #   `pub use parent::TLS_SERVER_ROOTS` over webpki-roots ^1, so the roots
+      #   it serves are 1.0.10's, without the distrusted root. Drop this entry
+      #   once sqlx moves to webpki-roots 1, and re-check it if the shim is
+      #   ever locked against a 1.x older than 1.0.10.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
@@ -225,7 +234,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0381
 
   web-audit:
     name: Web Dependency Audit (bun audit)

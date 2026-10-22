@@ -179,6 +179,8 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
         };
 
         let response = caller
@@ -209,6 +211,8 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Allowed(vec![7]),
+            origin: None,
+            secrets: None,
         };
 
         // Admin has ProjectsRead → the handler returns 200.
@@ -246,6 +250,8 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Allowed(vec![7]),
+            origin: None,
+            secrets: None,
         };
 
         let err = caller
@@ -272,6 +278,8 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
         };
 
         let err = caller
@@ -298,6 +306,8 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
         };
 
         let err = caller
@@ -329,6 +339,8 @@ mod tests {
         let scope = ApiCallScope {
             auth,
             project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
         };
 
         let results = caller.search("guarded", &scope);
@@ -410,6 +422,222 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Secret references
+    // -----------------------------------------------------------------------
+
+    const SECRET_VALUE: &str = "wJalr-example-not-a-real-secret";
+    const SECRET_HANDLE: &str = "secret_ref:v1:0123456789abcdef0123456789abcdef";
+
+    #[derive(Debug)]
+    struct OneSecret;
+
+    #[async_trait::async_trait]
+    impl crate::SecretResolver for OneSecret {
+        async fn resolve(
+            &self,
+            handle: &str,
+            usage: &crate::SecretUse<'_>,
+        ) -> Result<temps_core::secret_string::SecretString, crate::SecretResolveError> {
+            if handle == SECRET_HANDLE && usage.field == "/secret_key" {
+                Ok(temps_core::secret_string::SecretString::new(SECRET_VALUE))
+            } else {
+                Err(crate::SecretResolveError::Unknown {
+                    handle: handle.to_string(),
+                })
+            }
+        }
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Option<Value>>>;
+
+    /// A `POST /sources` that records the body it received and echoes the secret
+    /// back, either in a 200 body or inside a 400 error message, depending on
+    /// `name`. A well-behaved API never does either; this one does both so the
+    /// test can prove the scrub holds regardless.
+    fn sources_router(seen: Seen) -> Router {
+        Router::new().route(
+            "/sources",
+            axum::routing::post(move |Json(body): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().expect("lock") = Some(body.clone());
+                    let key = body["secret_key"].as_str().unwrap_or_default().to_string();
+                    if body["name"] == "reject" {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"detail": format!("credentials {key} were rejected")})),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({"name": body["name"], "echo": key})),
+                        )
+                    }
+                }
+            }),
+        )
+    }
+
+    fn sources_openapi() -> utoipa::openapi::OpenApi {
+        serde_json::from_value(json!({
+            "openapi": "3.1.0",
+            "info": {"title": "t", "version": "1"},
+            "paths": {
+                "/sources": {
+                    "post": {
+                        "operationId": "create_source",
+                        "summary": "create a source",
+                        "requestBody": {
+                            "required": true,
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateSource"}}}
+                        },
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            },
+            "components": {"schemas": {
+                "SecretString": {"type": "string", "format": "password", "x-temps-secret": true},
+                "CreateSource": {
+                    "type": "object",
+                    "required": ["name", "secret_key"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "secret_key": {"$ref": "#/components/schemas/SecretString"}
+                    }
+                }
+            }}
+        }))
+        .expect("test spec parses")
+    }
+
+    fn secrets_scope(resolver: Option<std::sync::Arc<dyn crate::SecretResolver>>) -> ApiCallScope {
+        ApiCallScope {
+            auth: auth_with_role(1, Role::Admin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: resolver,
+        }
+    }
+
+    fn sources_caller(seen: Seen) -> InternalApiCaller {
+        InternalApiCaller::new_write_allowlisted(
+            sources_router(seen),
+            &sources_openapi(),
+            vec!["create_source".to_string()],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_handle_reaches_the_handler_as_the_real_value_and_never_comes_back() {
+        let seen = Seen::default();
+        let caller = sources_caller(seen.clone());
+        let scope = secrets_scope(Some(std::sync::Arc::new(OneSecret)));
+
+        let response = caller
+            .call(
+                "create_source",
+                json!({"name": "primary", "secret_key": SECRET_HANDLE}),
+                &scope,
+            )
+            .await
+            .expect("a resolvable handle succeeds");
+
+        assert_eq!(
+            seen.lock().expect("lock").as_ref().expect("handler ran")["secret_key"],
+            SECRET_VALUE,
+            "the handler must receive the user's value, not the handle"
+        );
+        assert!(
+            !response.body.to_string().contains(SECRET_VALUE),
+            "the echoed value must be masked: {}",
+            response.body
+        );
+        assert_eq!(response.body["echo"], "***");
+    }
+
+    #[tokio::test]
+    async fn an_error_that_repeats_the_value_is_scrubbed_too() {
+        let seen = Seen::default();
+        let caller = sources_caller(seen);
+        let scope = secrets_scope(Some(std::sync::Arc::new(OneSecret)));
+
+        let err = caller
+            .call(
+                "create_source",
+                json!({"name": "reject", "secret_key": SECRET_HANDLE}),
+                &scope,
+            )
+            .await
+            .expect_err("the handler answers 400");
+
+        let rendered = format!("{err} / {err:?}");
+        assert!(!rendered.contains(SECRET_VALUE), "{rendered}");
+        assert!(rendered.contains("***"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn a_handle_in_a_non_credential_field_is_refused_before_anything_is_sent() {
+        let seen = Seen::default();
+        let caller = sources_caller(seen.clone());
+        let scope = secrets_scope(Some(std::sync::Arc::new(OneSecret)));
+
+        let err = caller
+            .call(
+                "create_source",
+                json!({"name": SECRET_HANDLE, "secret_key": "x"}),
+                &scope,
+            )
+            .await
+            .expect_err("a handle in `name` is refused");
+
+        assert!(
+            matches!(err, crate::ApiToolError::SecretReferenceMisplaced { .. }),
+            "{err:?}"
+        );
+        assert!(
+            seen.lock().expect("lock").is_none(),
+            "the handler must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handle_with_no_resolver_is_refused_instead_of_stored_as_text() {
+        let seen = Seen::default();
+        let caller = sources_caller(seen.clone());
+
+        let err = caller
+            .call(
+                "create_source",
+                json!({"name": "n", "secret_key": SECRET_HANDLE}),
+                &secrets_scope(None),
+            )
+            .await
+            .expect_err("no resolver");
+
+        assert!(
+            matches!(err, crate::ApiToolError::SecretsUnavailable { .. }),
+            "{err:?}"
+        );
+        assert!(
+            seen.lock().expect("lock").is_none(),
+            "the handler must not run"
+        );
+    }
+
+    #[test]
+    fn the_index_learns_which_fields_are_credentials_from_the_spec() {
+        let index = crate::ReadOnlyApiIndex::from_openapi_write_allowlist(
+            &sources_openapi(),
+            &["create_source"],
+        );
+        assert_eq!(
+            index.secret_fields("create_source"),
+            &[vec![crate::SecretPathSegment::Key("secret_key".into())]]
+        );
+        assert!(index.secret_fields("unknown").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
     // List parameters over a real serde body and a derived OpenAPI schema
     // -----------------------------------------------------------------------
 
@@ -471,6 +699,8 @@ mod tests {
         ApiCallScope {
             auth: auth_with_role(1, Role::Admin),
             project_scope: ProjectSelectorScope::Allowed(vec![7]),
+            origin: None,
+            secrets: None,
         }
     }
 

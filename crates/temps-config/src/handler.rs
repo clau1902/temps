@@ -982,9 +982,12 @@ pub struct MultiNodeSettingsMasked {
     pub node_failover_after_secs: Option<u64>,
 }
 
-/// Read-only cluster network state. Pool changes are performed on the control
-/// plane through `temps network setup-multi-node`, which enforces that no
-/// existing node allocation can be stranded by an in-place edit.
+/// Read-only cluster network state. The pool is changed through
+/// `PUT /settings/cluster-network` or `temps network setup-multi-node`, which
+/// refuse while any allocation is in use (ADR 056). `locked` means only that
+/// allocations exist: allocations never applied are re-assigned by a change,
+/// so whether it is allowed now is `GET /settings/cluster-network`'s
+/// `can_change`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ClusterNetworkSettings {
     pub compute_pool_cidr: String,
@@ -2407,6 +2410,8 @@ fn preserve_masked_secrets(
     incoming.multi_node.cluster_ca_cert_pem = current.multi_node.cluster_ca_cert_pem.clone();
     incoming.multi_node.cluster_ca_key_encrypted =
         current.multi_node.cluster_ca_key_encrypted.clone();
+    // Owned by `temps serve --wg-endpoint`, not by the settings API.
+    incoming.multi_node.wg_endpoint = current.multi_node.wg_endpoint.clone();
     if incoming.multi_node.join_token_hash.is_none() {
         incoming.multi_node.join_token_hash = current.multi_node.join_token_hash.clone();
     }
@@ -4739,6 +4744,7 @@ mod tests {
         s.multi_node.join_token_hash = Some("stored-join-token-hash".into());
         s.multi_node.cluster_ca_cert_pem = Some("stored-ca-cert".into());
         s.multi_node.cluster_ca_key_encrypted = Some("stored-ca-key".into());
+        s.multi_node.wg_endpoint = Some("203.0.113.1:20517".into());
         s.multi_node.node_failover_after_secs = None;
         s.monitoring.clickhouse_url = Some("http://user:pass@clickhouse:8123".into());
         s.geo.maxmind_license_key_encrypted = Some("stored-maxmind-ciphertext".into());
@@ -4824,6 +4830,7 @@ mod tests {
         incoming.docker_registry.password = Some("******".into());
         incoming.monitoring.clickhouse_url = Some("   ".into());
         incoming.multi_node.cluster_ca_key_encrypted = Some("forged-ca-key".into());
+        incoming.multi_node.wg_endpoint = Some("198.51.100.66:51820".into());
         preserve_masked_secrets(&mut incoming, &stored, false);
         assert_eq!(
             incoming.dns_provider.cloudflare_api_key.as_deref(),
@@ -4840,6 +4847,11 @@ mod tests {
         assert_eq!(
             incoming.multi_node.cluster_ca_key_encrypted,
             stored.multi_node.cluster_ca_key_encrypted
+        );
+        // `--wg-endpoint` is the flag's, never the settings API's.
+        assert_eq!(
+            incoming.multi_node.wg_endpoint,
+            stored.multi_node.wg_endpoint
         );
     }
 

@@ -28,7 +28,7 @@ export const SETTINGS_SECTION_IDS = {
     'host-access',
   ],
   variables: ['environment-variables', 'secrets', 'deployment-tokens'],
-  automation: ['agents', 'cron-jobs', 'autofixer'],
+  automation: ['agents', 'cron-jobs', 'crash-autofix', 'autofixer'],
   integrations: ['webhooks', 'skills', 'mcp-servers', 'extensions'],
 } as const satisfies Record<CombinedSettingsPage, readonly string[]>
 

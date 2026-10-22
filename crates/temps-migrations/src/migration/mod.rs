@@ -18,6 +18,12 @@ mod m20261017_000001_deployment_health_probes;
 pub mod m20261017_000001_retain_ci_cancellation;
 pub mod m20261017_000002_runtime_health;
 mod m20261019_000001_mfa_verification_guards;
+mod m20261020_000001_node_pairings_outbound;
+mod m20261020_000002_compute_pool_collisions;
+mod m20261020_000003_compute_pool_confirmed;
+mod m20261020_000004_ingress_connectors;
+mod m20261020_000005_node_public_ingress;
+mod m20261021_000001_ingress_hostname_choices;
 
 mod m20261019_000001_cron_monitors;
 pub mod m20261019_000002_reconcile_error_group_counts;
@@ -341,6 +347,7 @@ mod m20261007_000001_cron_executions_cron_index;
 mod m20261007_000002_restore_runs_cancellation;
 mod m20261008_000001_create_service_data_imports;
 mod m20261009_000001_unconfirm_legacy_worker_container_removals;
+mod m20261010_000001_create_ai_goals;
 mod m20261011_000001_create_public_status_pages;
 mod m20261012_000001_ai_provider_keys_self_hosted;
 mod m20261012_000002_create_status_page_domains;
@@ -355,6 +362,16 @@ mod m20261014_000003_ip_geolocation_last_used_at;
 mod m20261014_000004_managed_daemon_unpublished_tags;
 mod m20261015_000001_compose_validation_reports;
 mod m20261016_000001_ai_usage_logs_project_attribution;
+mod m20261017_000001_create_ai_chat_attachments;
+mod m20261017_000002_add_text_to_ai_chat_attachments;
+mod m20261017_000003_create_sandbox_services;
+mod m20261018_000001_add_cache_tokens_to_ai_usage_logs;
+mod m20261018_000002_create_ai_secret_slots;
+mod m20261019_000001_add_ai_next_step_suggestions;
+mod m20261019_000002_create_ai_chat_operations;
+mod m20261019_000003_drop_ai_data_access_from_external_services;
+mod m20261020_000001_create_ai_blueprints;
+mod m20261020_000002_create_autofix_incidents;
 
 pub struct Migrator;
 
@@ -789,6 +806,29 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000004_client_outcomes::Migration),
             Box::new(m20261020_000005_client_outcome_receipts::Migration),
             Box::new(m20261020_000006_otel_ingest_receipts::Migration),
+            Box::new(m20261010_000001_create_ai_goals::Migration),
+            Box::new(m20261017_000001_create_ai_chat_attachments::Migration),
+            Box::new(m20261017_000002_add_text_to_ai_chat_attachments::Migration),
+            Box::new(m20261017_000003_create_sandbox_services::Migration),
+            Box::new(m20261018_000001_add_cache_tokens_to_ai_usage_logs::Migration),
+            Box::new(m20261018_000002_create_ai_secret_slots::Migration),
+            Box::new(m20261019_000001_add_ai_next_step_suggestions::Migration),
+            Box::new(m20261019_000002_create_ai_chat_operations::Migration),
+            Box::new(m20261019_000003_drop_ai_data_access_from_external_services::Migration),
+            Box::new(m20261020_000001_create_ai_blueprints::Migration),
+            Box::new(m20261020_000002_create_autofix_incidents::Migration),
+            // ADR 055: outbound-only worker joins have no pairing endpoint.
+            Box::new(m20261020_000001_node_pairings_outbound::Migration),
+            // ADR 056: new default compute pool, per-node overlay status.
+            Box::new(m20261020_000002_compute_pool_collisions::Migration),
+            // ADR 056: the console asks for the pool once before the first node.
+            Box::new(m20261020_000003_compute_pool_confirmed::Migration),
+            // ADR 058: ingress connectors (tunnels) and what they publish.
+            Box::new(m20261020_000004_ingress_connectors::Migration),
+            // ADR 058 D7: direct worker ingress configured from the console.
+            Box::new(m20261020_000005_node_public_ingress::Migration),
+            // ADR 058 D9: the operator decides what each tunnel publishes.
+            Box::new(m20261021_000001_ingress_hostname_choices::Migration),
         ]
     }
 }

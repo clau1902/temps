@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::audit::{
+    AuditContext, GitFilesCommittedAudit, GitPullRequestOpenedAudit, GitRepositoryCreatedAudit,
+};
 use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{
     check_commit_exists, get_branches_by_repository_id, get_repository_branches,
@@ -17,9 +20,10 @@ use crate::services::{
     repository::RepositoryFilter,
 };
 use axum::{
-    extract::{OriginalUri, Path, Query, State},
+    extract::{DefaultBodyLimit, OriginalUri, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
+    Extension,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -28,7 +32,9 @@ use temps_auth::{
     permission_check, permission_guard, project_access_guard, project_scope_guard,
     require_sensitive_action, Permission, RequireAuth,
 };
+use temps_core::secret_string::SecretString;
 use temps_core::telemetry::OperationFailureCode;
+use temps_core::RequestMetadata;
 use temps_core::SensitiveAction;
 use tracing::info;
 
@@ -158,19 +164,132 @@ impl From<GitProviderManagerError> for Problem {
             GitProviderManagerError::RepositoryCreation {
                 connection_id,
                 repository_name,
-                source: _,
+                source,
+            } => match source {
+                // A taken name is the caller's to fix, not an upstream outage.
+                GitProviderError::RepositoryAlreadyExists { .. } => {
+                    problem_new(StatusCode::CONFLICT)
+                        .with_type("https://docs.temps.sh/errors/repository_already_exists")
+                        .with_title("Repository Already Exists")
+                        .with_detail(format!(
+                            "A repository named '{}' already exists in the target account of connection {}. Choose a different name.",
+                            repository_name, connection_id
+                        ))
+                        .with_value("connection_id", connection_id)
+                        .with_value("repository_name", repository_name)
+                }
+                _ => problem_new(StatusCode::BAD_GATEWAY)
+                    .with_title("Repository Creation Failed")
+                    .with_detail(format!(
+                        "The git provider could not create repository '{}' through connection {}.",
+                        repository_name, connection_id
+                    )),
+            },
+            GitProviderManagerError::RepositoryOperation {
+                connection_id,
+                repository,
+                operation,
+                reason,
             } => problem_new(StatusCode::BAD_GATEWAY)
-                .with_title("Repository Creation Failed")
+                .with_title("Git Provider Operation Failed")
                 .with_detail(format!(
-                    "The git provider could not create repository '{}' through connection {}.",
-                    repository_name, connection_id
-                )),
+                    "Failed to {} in '{}' through connection {}: {}",
+                    operation, repository, connection_id, reason
+                ))
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository),
             GitProviderManagerError::QueueError(msg) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Queue Error")
                 .with_detail(msg),
             GitProviderManagerError::OAuthStateInvalid(msg) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("OAuth State Invalid")
                 .with_detail(msg),
+            GitProviderManagerError::CommitPathRejected {
+                connection_id,
+                ref repository,
+                ref branch,
+                ref path,
+                ..
+            } => problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Commit Path")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_value("path", path.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::BaseBranchNotFound {
+                connection_id,
+                ref repository,
+                ref branch,
+                ref base_branch,
+            } => problem_new(StatusCode::CONFLICT)
+                .with_title("Base Branch Not Found")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_value("base_branch", base_branch.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::FilesChangedSince {
+                connection_id,
+                ref repository,
+                ref branch,
+                ref since_revision,
+                ref paths,
+            } => problem_new(StatusCode::CONFLICT)
+                .with_title("Files Changed Since Revision")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_value("since_revision", since_revision.clone())
+                .with_value("paths", paths.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::RevisionNotFound {
+                connection_id,
+                ref repository,
+                ref branch,
+                ref revision,
+            } => problem_new(StatusCode::CONFLICT)
+                .with_title("Revision Not Found")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_value("revision", revision.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::NothingToCommit {
+                connection_id,
+                ref repository,
+                ref branch,
+                ..
+            } => problem_new(StatusCode::CONFLICT)
+                .with_title("Nothing To Commit")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::PushRejected {
+                connection_id,
+                ref repository,
+                ref branch,
+                ..
+            } => problem_new(StatusCode::CONFLICT)
+                .with_title("Push Rejected")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_detail(error.to_string()),
+            GitProviderManagerError::CommitTimedOut {
+                connection_id,
+                ref repository,
+                ref branch,
+                push_may_have_completed,
+                ..
+            } => problem_new(StatusCode::GATEWAY_TIMEOUT)
+                .with_title("Commit Timed Out")
+                .with_value("connection_id", connection_id)
+                .with_value("repository", repository.clone())
+                .with_value("branch", branch.clone())
+                .with_value("push_may_have_completed", push_may_have_completed)
+                .with_detail(error.to_string()),
         }
     }
 }
@@ -283,13 +402,13 @@ pub struct CreateProviderRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateGitHubPATRequest {
     pub name: String,
-    pub token: String,
+    pub token: SecretString,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateGitLabPATRequest {
     pub name: String,
-    pub token: String,
+    pub token: SecretString,
     pub base_url: Option<String>,
 }
 
@@ -297,7 +416,7 @@ pub struct CreateGitLabPATRequest {
 pub struct CreateGitLabOAuthRequest {
     pub name: String,
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: SecretString,
     pub redirect_uri: String,
     pub base_url: Option<String>,
 }
@@ -307,7 +426,7 @@ pub struct CreateGiteaPATRequest {
     /// Display name for this provider.
     pub name: String,
     /// Personal access token issued by the Gitea instance.
-    pub token: String,
+    pub token: SecretString,
     /// HTTPS base URL of the Gitea instance, e.g. `https://git.example.com`.
     pub base_url: String,
 }
@@ -321,14 +440,14 @@ pub enum BitbucketAuthInput {
     /// Personal / Workspace / Repository Access Token.
     AccessToken {
         /// The Bitbucket access token value.
-        token: String,
+        token: SecretString,
     },
     /// HTTP Basic / App Password authentication.
     AppPassword {
         /// Bitbucket account username.
         username: String,
         /// App password generated in Bitbucket security settings.
-        password: String,
+        password: SecretString,
     },
 }
 
@@ -350,7 +469,7 @@ pub struct CreateGenericRequest {
     /// absent or empty. Ignored for public (unauthenticated) repositories.
     pub token_username: Option<String>,
     /// Access token or password. Omit (or set to `null`) for public repositories.
-    pub token: Option<String>,
+    pub token: Option<SecretString>,
     /// Optional base URL of the git host for display purposes (no API is called).
     pub base_url: Option<String>,
 }
@@ -364,19 +483,19 @@ pub struct UpdateProviderCredentialsRequest {
     /// OAuth client ID (GitLab OAuth, GitHub App).
     pub client_id: Option<String>,
     /// OAuth client secret (GitLab OAuth, GitHub App).
-    pub client_secret: Option<String>,
+    pub client_secret: Option<SecretString>,
     /// Application ID (GitHub App integer as string; GitLab App string).
     pub app_id: Option<String>,
     /// GitLab App secret (not used by GitHub App — use `client_secret`).
-    pub app_secret: Option<String>,
+    pub app_secret: Option<SecretString>,
     /// GitHub App private key (PEM).
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretString>,
     /// GitHub App webhook secret.
-    pub webhook_secret: Option<String>,
+    pub webhook_secret: Option<SecretString>,
     /// OAuth redirect URI (GitLab OAuth / GitLab App).
     pub redirect_uri: Option<String>,
     /// PAT for PAT-type providers.
-    pub token: Option<String>,
+    pub token: Option<SecretString>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -980,6 +1099,393 @@ pub async fn sync_repositories(
             connection_id,
             syncing: true,
             started_at: chrono::Utc::now(),
+        }),
+    ))
+}
+
+/// Request body for creating an empty repository through a git connection.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateRepositoryRequest {
+    /// Repository name: letters, digits, `-`, `_` and `.`, up to 100 characters.
+    #[schema(example = "my-app")]
+    pub name: String,
+    /// Account or organization to create it under. Defaults to the
+    /// connection's own account.
+    pub owner: Option<String>,
+    /// Short description, up to 350 characters.
+    pub description: Option<String>,
+    /// Whether the repository is private. Defaults to `true`.
+    #[serde(default = "default_repository_private")]
+    pub private: bool,
+}
+
+fn default_repository_private() -> bool {
+    true
+}
+
+/// The repository that was created. Carries no credentials.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CreatedRepositoryResponse {
+    pub connection_id: i32,
+    pub name: String,
+    pub full_name: String,
+    pub owner: String,
+    pub private: bool,
+    pub default_branch: String,
+    pub web_url: String,
+    pub clone_url: String,
+}
+
+/// Create an empty repository through one of your git connections
+///
+/// Uses the token of a connection you own, so the repository is created as
+/// you and with exactly the access that token has. Another user's connection
+/// answers 404. Pushing code into the new repository is a separate step.
+#[utoipa::path(
+    post,
+    path = "/git-connections/{connection_id}/repositories",
+    params(
+        ("connection_id" = i32, Path, description = "Connection ID")
+    ),
+    request_body = CreateRepositoryRequest,
+    responses(
+        (status = 201, description = "Repository created", body = CreatedRepositoryResponse),
+        (status = 400, description = "Invalid name, owner or description, or the connection is inactive"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Connection not found, or not owned by the caller"),
+        (status = 409, description = "A repository with that name already exists"),
+        (status = 502, description = "The git provider rejected or failed the request")
+    ),
+    tag = "Git Provider Connections",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn create_repository(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(connection_id): Path<i32>,
+    Json(request): Json<CreateRepositoryRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, GitRepositoriesCreate);
+
+    // The manager resolves the connection by (id, caller), so a connection
+    // that belongs to someone else is indistinguishable from a missing one.
+    let repository = state
+        .git_provider_manager
+        .create_repository_for_user(
+            connection_id,
+            auth.user_id(),
+            &request.name,
+            request.owner.as_deref(),
+            request.description.as_deref(),
+            request.private,
+        )
+        .await?;
+
+    let audit = GitRepositoryCreatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        connection_id,
+        repository_full_name: repository.full_name.clone(),
+        private: repository.private,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            "Failed to create audit log for repository {} created through connection {}: {}",
+            repository.full_name,
+            connection_id,
+            e
+        );
+    }
+
+    info!(
+        "Repository {} created through git connection {} by user {}",
+        repository.full_name,
+        connection_id,
+        auth.user_id()
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedRepositoryResponse {
+            connection_id,
+            name: repository.name,
+            full_name: repository.full_name,
+            owner: repository.owner,
+            private: repository.private,
+            default_branch: repository.default_branch,
+            web_url: repository.web_url,
+            clone_url: repository.clone_url,
+        }),
+    ))
+}
+
+/// How the `content` of a committed file is encoded.
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CommitFileEncoding {
+    /// `content` is the file's text, as is.
+    #[default]
+    Utf8,
+    /// `content` is the file's bytes, base64-encoded (for binary files).
+    Base64,
+}
+
+/// One file in a commit.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CommitFileRequest {
+    /// Path inside the repository, relative and without `..` or `.git`
+    /// segments, e.g. `cmd/server/main.go`.
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub encoding: CommitFileEncoding,
+}
+
+/// Request body for committing files to a repository.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CommitFilesRequest {
+    /// Files to add or overwrite (1-100, at most 5 MiB in total). Files not
+    /// listed are left as they are.
+    pub files: Vec<CommitFileRequest>,
+    /// Commit message (at most 500 bytes).
+    pub message: String,
+    /// Branch to commit to. Defaults to the repository's default branch; a
+    /// branch that does not exist is created from the default branch.
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CommitFilesResponse {
+    pub connection_id: i32,
+    pub repository: String,
+    pub branch: String,
+    pub commit_sha: String,
+    pub file_count: usize,
+}
+
+/// Commit files to a repository through one of your git connections
+///
+/// Adds a commit on top of the branch with the files given, using the token
+/// of a connection you own, so the push has exactly the access that token
+/// has. History is never rewritten. Another user's connection answers 404.
+#[utoipa::path(
+    post,
+    path = "/git-connections/{connection_id}/repositories/{owner}/{repo}/commits",
+    params(
+        ("connection_id" = i32, Path, description = "Connection ID"),
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    request_body = CommitFilesRequest,
+    responses(
+        (status = 201, description = "Files committed", body = CommitFilesResponse),
+        (status = 400, description = "Invalid path (including one through a symlink tracked in the repository), branch, message or file content, or the connection is inactive"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Connection not found, or not owned by the caller"),
+        (status = 409, description = "Nothing to commit (the files already match the branch), or the remote rejected the push (protected branch, hook, non-fast-forward)"),
+        (status = 502, description = "The git provider failed the request"),
+        (status = 504, description = "The commit timed out; `push_may_have_completed` says whether the branch must be checked before retrying")
+    ),
+    tag = "Git Provider Connections",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn commit_repository_files(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((connection_id, owner, repo)): Path<(i32, String, String)>,
+    Json(request): Json<CommitFilesRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, GitRepositoriesWrite);
+
+    use base64::Engine as _;
+    let mut files = Vec::with_capacity(request.files.len());
+    for file in request.files {
+        let content = match file.encoding {
+            CommitFileEncoding::Utf8 => file.content.into_bytes(),
+            CommitFileEncoding::Base64 => base64::engine::general_purpose::STANDARD
+                .decode(file.content.as_bytes())
+                .map_err(|e| {
+                    problem_new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid File Content")
+                        .with_detail(format!(
+                            "File '{}' in a commit to '{}/{}' is not valid base64: {}",
+                            file.path.escape_debug(),
+                            owner,
+                            repo,
+                            e
+                        ))
+                })?,
+        };
+        files.push((file.path, content));
+    }
+    let file_count = files.len();
+
+    let (commit_sha, branch) = state
+        .git_provider_manager
+        .commit_files_for_user(
+            connection_id,
+            auth.user_id(),
+            &owner,
+            &repo,
+            request.branch.as_deref(),
+            None,
+            None,
+            files,
+            &request.message,
+        )
+        .await?;
+
+    let repository = format!("{owner}/{repo}");
+    let audit = GitFilesCommittedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        connection_id,
+        repository_full_name: repository.clone(),
+        branch: branch.clone(),
+        commit_sha: commit_sha.clone(),
+        file_count,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            "Failed to create audit log for commit {} to {} through connection {}: {}",
+            commit_sha,
+            repository,
+            connection_id,
+            e
+        );
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CommitFilesResponse {
+            connection_id,
+            repository,
+            branch,
+            commit_sha,
+            file_count,
+        }),
+    ))
+}
+
+/// Request body for opening a pull request.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct OpenPullRequestRequest {
+    pub title: String,
+    pub body: Option<String>,
+    /// Branch holding the changes.
+    pub head_branch: String,
+    /// Branch to merge into. Defaults to the repository's default branch.
+    pub base_branch: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PullRequestResponse {
+    pub connection_id: i32,
+    pub repository: String,
+    pub number: i32,
+    pub url: String,
+    pub title: String,
+    pub head_branch: String,
+    pub base_branch: String,
+}
+
+/// Open a pull request through one of your git connections
+///
+/// Uses the token of a connection you own. The head branch must already
+/// exist, for example after committing to it. Another user's connection
+/// answers 404.
+#[utoipa::path(
+    post,
+    path = "/git-connections/{connection_id}/repositories/{owner}/{repo}/pull-requests",
+    params(
+        ("connection_id" = i32, Path, description = "Connection ID"),
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    request_body = OpenPullRequestRequest,
+    responses(
+        (status = 201, description = "Pull request opened", body = PullRequestResponse),
+        (status = 400, description = "Invalid title, branch or body, or the connection is inactive"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Connection not found, or not owned by the caller"),
+        (status = 502, description = "The git provider rejected or failed the request")
+    ),
+    tag = "Git Provider Connections",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn open_repository_pull_request(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((connection_id, owner, repo)): Path<(i32, String, String)>,
+    Json(request): Json<OpenPullRequestRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, GitRepositoriesWrite);
+
+    let pull_request = state
+        .git_provider_manager
+        .open_pull_request_for_user(
+            connection_id,
+            auth.user_id(),
+            &owner,
+            &repo,
+            &request.title,
+            request.body.as_deref().unwrap_or_default(),
+            &request.head_branch,
+            request.base_branch.as_deref(),
+        )
+        .await?;
+
+    let repository = format!("{owner}/{repo}");
+    let audit = GitPullRequestOpenedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        connection_id,
+        repository_full_name: repository.clone(),
+        head_branch: pull_request.head_branch.clone(),
+        base_branch: pull_request.base_branch.clone(),
+        pull_request_number: pull_request.number,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            "Failed to create audit log for pull request #{} on {} through connection {}: {}",
+            pull_request.number,
+            repository,
+            connection_id,
+            e
+        );
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(PullRequestResponse {
+            connection_id,
+            repository,
+            number: pull_request.number,
+            url: pull_request.url,
+            title: pull_request.title,
+            head_branch: pull_request.head_branch,
+            base_branch: pull_request.base_branch,
         }),
     ))
 }
@@ -1747,7 +2253,17 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
         )
         .route(
             "/git-connections/{connection_id}/repositories",
-            get(list_repositories_by_connection),
+            get(list_repositories_by_connection).post(create_repository),
+        )
+        .route(
+            "/git-connections/{connection_id}/repositories/{owner}/{repo}/commits",
+            // Files travel inside the JSON body, so allow a little more than
+            // axum's 2 MiB default: the 5 MiB commit limit plus base64 overhead.
+            post(commit_repository_files).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/git-connections/{connection_id}/repositories/{owner}/{repo}/pull-requests",
+            post(open_repository_pull_request),
         )
         .route(
             "/git-connections/{connection_id}/update-token",
@@ -2119,6 +2635,9 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         list_connections,
         get_provider_connections,
         sync_repositories,
+        create_repository,
+        commit_repository_files,
+        open_repository_pull_request,
         list_repositories_by_connection,
         get_connection,
         list_repositories_by_provider,
@@ -2172,6 +2691,14 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             SyncedRepositoryListQuery,
             RepositoryListResponse,
             RepositorySyncStartedResponse,
+            CreateRepositoryRequest,
+            CreatedRepositoryResponse,
+            CommitFileEncoding,
+            CommitFileRequest,
+            CommitFilesRequest,
+            CommitFilesResponse,
+            OpenPullRequestRequest,
+            PullRequestResponse,
             CreateGitHubPATRequest,
             CreateGitLabPATRequest,
             CreateGitLabOAuthRequest,
@@ -2220,7 +2747,7 @@ pub async fn create_github_pat_provider(
 
     let result = state
         .git_provider_manager
-        .create_github_pat_provider(request.name.clone(), request.token, user_id)
+        .create_github_pat_provider(request.name.clone(), request.token.into_exposed(), user_id)
         .await;
     report_git_provider_result(&state, Some("github"), "pat", &result);
     let provider = result?;
@@ -2274,7 +2801,7 @@ pub async fn create_gitlab_pat_provider(
         .git_provider_manager
         .create_gitlab_pat_provider(
             request.name.clone(),
-            request.token,
+            request.token.into_exposed(),
             user_id,
             request.base_url,
         )
@@ -2329,7 +2856,7 @@ pub async fn create_gitlab_oauth_provider(
         .create_gitlab_oauth_provider(
             request.name.clone(),
             request.client_id,
-            request.client_secret,
+            request.client_secret.into_exposed(),
             request.redirect_uri,
             request.base_url,
         )
@@ -2397,7 +2924,7 @@ pub async fn create_gitea_pat_provider(
         .git_provider_manager
         .create_gitea_pat_provider(
             request.name.clone(),
-            request.token,
+            request.token.into_exposed(),
             user_id,
             request.base_url,
         )
@@ -2455,10 +2982,13 @@ pub async fn create_bitbucket_provider(
     let user_id = auth.user_id();
 
     let auth_method = match request.auth {
-        BitbucketAuthInput::AccessToken { token } => AuthMethod::PersonalAccessToken { token },
-        BitbucketAuthInput::AppPassword { username, password } => {
-            AuthMethod::BasicAuth { username, password }
-        }
+        BitbucketAuthInput::AccessToken { token } => AuthMethod::PersonalAccessToken {
+            token: token.into_exposed(),
+        },
+        BitbucketAuthInput::AppPassword { username, password } => AuthMethod::BasicAuth {
+            username,
+            password: password.into_exposed(),
+        },
     };
 
     let result = state
@@ -2546,7 +3076,7 @@ pub async fn create_generic_provider(
             request.name.clone(),
             request.clone_url,
             token_username,
-            request.token,
+            request.token.map(SecretString::into_exposed),
             request.base_url,
             user_id,
         )
@@ -2613,13 +3143,13 @@ pub async fn update_git_provider_credentials(
         .update_provider_credentials(
             provider_id,
             request.client_id,
-            request.client_secret,
+            request.client_secret.map(SecretString::into_exposed),
             request.app_id,
-            request.app_secret,
-            request.private_key,
-            request.webhook_secret,
+            request.app_secret.map(SecretString::into_exposed),
+            request.private_key.map(SecretString::into_exposed),
+            request.webhook_secret.map(SecretString::into_exposed),
             request.redirect_uri,
-            request.token,
+            request.token.map(SecretString::into_exposed),
         )
         .await?;
 
@@ -3511,8 +4041,8 @@ pub async fn delete_connection(
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateTokenRequest {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -3561,7 +4091,11 @@ pub async fn update_connection_token(
 
     state
         .git_provider_manager
-        .update_connection_token(connection_id, request.access_token, request.refresh_token)
+        .update_connection_token(
+            connection_id,
+            request.access_token.into_exposed(),
+            request.refresh_token.map(SecretString::into_exposed),
+        )
         .await?;
     Ok(Json(UpdateTokenResponse {
         connection_id,
@@ -3716,6 +4250,140 @@ mod permission_error_tests {
             detail.contains("owner/repo") && detail.contains("main"),
             "{detail}"
         );
+    }
+}
+
+#[cfg(test)]
+mod repository_creation_problem_tests {
+    use super::*;
+
+    fn detail(problem: &Problem) -> String {
+        problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn a_taken_name_is_a_conflict_that_names_the_repository_and_connection() {
+        let problem = Problem::from(GitProviderManagerError::RepositoryCreation {
+            connection_id: 12,
+            repository_name: "my-app".to_string(),
+            source: GitProviderError::RepositoryAlreadyExists {
+                name: "my-app".to_string(),
+            },
+        });
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert!(detail(&problem).contains("'my-app'"));
+        assert!(detail(&problem).contains("connection 12"));
+    }
+
+    #[test]
+    fn commit_outcomes_the_caller_can_act_on_are_not_bad_gateways() {
+        let path = Problem::from(GitProviderManagerError::CommitPathRejected {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            branch: "main".to_string(),
+            path: "x/file".to_string(),
+            reason: "goes through 'x', which is a symbolic link on the branch".to_string(),
+        });
+        assert_eq!(path.status_code, StatusCode::BAD_REQUEST);
+        assert!(detail(&path).contains("'x/file'") && detail(&path).contains("connection 12"));
+
+        let unchanged = Problem::from(GitProviderManagerError::NothingToCommit {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            branch: "main".to_string(),
+            file_count: 1,
+            parent_sha: "abc123".to_string(),
+        });
+        assert_eq!(unchanged.status_code, StatusCode::CONFLICT);
+
+        let rejected = Problem::from(GitProviderManagerError::PushRejected {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            branch: "main".to_string(),
+            refname: "refs/heads/main".to_string(),
+            status: "protected branch hook declined".to_string(),
+        });
+        assert_eq!(rejected.status_code, StatusCode::CONFLICT);
+        let rejected_detail = detail(&rejected);
+        assert!(rejected_detail.contains("refs/heads/main"));
+        assert!(rejected_detail.contains("protected branch hook declined"));
+
+        let timed_out = Problem::from(GitProviderManagerError::CommitTimedOut {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            branch: "main".to_string(),
+            timeout_secs: 120,
+            push_may_have_completed: true,
+        });
+        assert_eq!(timed_out.status_code, StatusCode::GATEWAY_TIMEOUT);
+        assert!(detail(&timed_out).contains("may still have completed"));
+        assert_eq!(
+            timed_out.body.get("push_may_have_completed"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn a_failed_commit_is_a_bad_gateway_that_names_the_repository_and_connection() {
+        let problem = Problem::from(GitProviderManagerError::RepositoryOperation {
+            connection_id: 12,
+            repository: "acme/app".to_string(),
+            operation: "commit files",
+            reason: "Failed to push to remote: permission denied".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        let detail = detail(&problem);
+        assert!(detail.contains("'acme/app'"));
+        assert!(detail.contains("connection 12"));
+        assert!(detail.contains("permission denied"));
+    }
+
+    #[test]
+    fn a_provider_failure_stays_a_bad_gateway() {
+        let problem = Problem::from(GitProviderManagerError::RepositoryCreation {
+            connection_id: 12,
+            repository_name: "my-app".to_string(),
+            source: GitProviderError::AuthenticationFailed("bad token".to_string()),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        // The provider's own message is not echoed to the caller.
+        assert!(!detail(&problem).contains("bad token"));
+    }
+
+    #[test]
+    fn a_connection_that_is_not_the_callers_looks_like_a_missing_one() {
+        let problem = Problem::from(GitProviderManagerError::ConnectionNotFound(
+            "12".to_string(),
+        ));
+
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_bad_name_is_a_bad_request() {
+        let problem = Problem::from(GitProviderManagerError::InvalidConfiguration(
+            "Repository name '..' (connection 12) must be 1-100 characters".to_string(),
+        ));
+
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn the_request_defaults_to_a_private_repository() {
+        let request: CreateRepositoryRequest =
+            serde_json::from_str(r#"{"name":"my-app"}"#).expect("minimal body parses");
+
+        assert!(request.private);
+        assert!(request.owner.is_none());
+        assert!(request.description.is_none());
     }
 }
 

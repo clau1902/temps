@@ -333,6 +333,10 @@ pub enum SandboxError {
         reason: String,
     },
 
+    /// A service a sandbox was asked to link to does not exist.
+    #[error("Cannot link sandbox to service {service_id}: no such service")]
+    ServiceNotFound { service_id: i32 },
+
     /// Two linked services exposed the same variable name with different
     /// values. Silently choosing one would connect application code to the
     /// wrong database.

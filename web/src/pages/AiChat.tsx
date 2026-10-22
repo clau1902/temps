@@ -9,22 +9,23 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
 /**
- * Full-screen AI assistant.
+ * The Temps assistant, full screen.
  *
  * Same component as the dock (`DockBody`) with the whole content area instead
- * of a 28rem column — for long diagnostic conversations where the dock is too
- * narrow to read comfortably. The dock stays the default for asking something
- * while you keep working on a page; this is the "sit and read it" surface.
+ * of a 28rem column. The top-bar AI button lands here: with no AI provider it
+ * is the onboarding (paste an OpenRouter key), then a chat with Temps, with
+ * past conversations in the rail. The dock remains for contextual "ask AI
+ * about this" actions, where the page being discussed has to stay visible.
  */
 export function AiChat() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const { close, initialContext } = useAiAssistant()
 
-  usePageTitle('AI Chat')
+  usePageTitle('Temps assistant')
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'AI Chat' }])
+    setBreadcrumbs([{ label: 'Temps assistant' }])
   }, [setBreadcrumbs])
 
   // The dock and this page render the same assistant; showing both at once

@@ -240,10 +240,18 @@ ask first whether `entity.foo_bar bool` would do the job.
 
 ## New features must scale on small resources
 
-Temps runs as a single binary on small machines (reference: 3 vCPU /
-4 GB RAM) while the proxy path may see 100k+ req/s. Every new feature
-must be designed for that from the start — efficiency is a
-requirement, not a follow-up optimization. The full rules live in
+Temps runs as a single binary on small machines while the proxy path
+may see 100k+ req/s. Two hardware targets are requirements:
+
+- **2 vCPU / 4 GB RAM, with Temps and its PostgreSQL/TimescaleDB on
+  the same host:** it must run well.
+- **1 vCPU / 2 GB RAM with an external database** (`TEMPS_DATABASE_URL`
+  on another host or a managed service): it must run, with every
+  feature working and nothing OOM-killed.
+
+Design against the smaller one. Every new feature must be designed for
+that from the start — efficiency is a requirement, not a follow-up
+optimization. The full rules live in
 [`CLAUDE.md` → Scalability & Efficiency](./CLAUDE.md#scalability--efficiency);
 the short version:
 

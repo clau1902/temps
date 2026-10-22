@@ -8,7 +8,7 @@ pub mod pricing;
 mod provider_audit;
 pub mod provider_status;
 pub mod providers;
-mod sse_usage;
+pub(crate) mod sse_usage;
 pub mod structured_output;
 pub mod types;
 pub mod usage;
