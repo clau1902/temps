@@ -4,11 +4,12 @@
 //! Database connection management
 
 use crate::schema_guard::SchemaStatus;
+use sea_orm::sea_query::Query;
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr, Statement,
     TransactionTrait,
 };
-use sea_orm_migration::{MigrationTrait, SchemaManager};
+use sea_orm_migration::{seaql_migrations, MigrationTrait, SchemaManager};
 use sqlx::Acquire;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -663,18 +664,34 @@ async fn apply_migration_on_newer_schema(
     db: &DbConnection,
     migration: &dyn MigrationTrait,
 ) -> Result<(), DbErr> {
-    let txn = db.begin().await?;
-    migration.up(&SchemaManager::new(&txn)).await?;
     let applied_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or(0);
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO seaql_migrations (version, applied_at) VALUES ($1, $2)",
-        [migration.name().into(), applied_at.into()],
-    ))
-    .await?;
+        .map_err(|error| {
+            DbErr::Custom(format!(
+                "Cannot record migration {}: system clock is before the UNIX epoch: {error}",
+                migration.name()
+            ))
+        })?
+        .as_secs() as i64;
+    let record = Query::insert()
+        .into_table(Migrator::migration_table_name())
+        .columns([
+            seaql_migrations::Column::Version,
+            seaql_migrations::Column::AppliedAt,
+        ])
+        .values([migration.name().into(), applied_at.into()])
+        .map_err(|error| {
+            DbErr::Custom(format!(
+                "Cannot build the ledger row for migration {}: {error}",
+                migration.name()
+            ))
+        })?
+        .to_owned();
+
+    let txn = db.begin().await?;
+    migration.up(&SchemaManager::new(&txn)).await?;
+    txn.execute(txn.get_database_backend().build(&record))
+        .await?;
     txn.commit().await
 }
 
@@ -710,34 +727,23 @@ pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
         );
     }
 
-    if let SchemaStatus::NewerThanBinary { pending, .. } = &status {
-        for migration in migrations_named(pending) {
-            match timeout(
-                MIGRATION_TIMEOUT,
-                apply_migration_on_newer_schema(db, migration.as_ref()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    return Err(ServiceError::Database(format!(
-                        "Failed to apply migration {} on a database migrated by a newer \
-                         Temps release: {}",
-                        migration.name(),
-                        e
-                    )))
-                }
-                Err(_) => {
-                    return Err(ServiceError::Database(format!(
-                        "Migration {} timed out after {} seconds on a database migrated \
-                         by a newer Temps release",
-                        migration.name(),
-                        MIGRATION_TIMEOUT.as_secs()
-                    )))
-                }
-            }
-        }
-        return Ok(());
+    if matches!(status, SchemaStatus::NewerThanBinary { .. }) {
+        // Sea-ORM's `Migrator::up` rejects a ledger with unknown entries; the
+        // streaming runner applies this binary's own missing migrations (if
+        // any) without it.
+        let report = run_migrations_streaming(db, |_| {}).await?;
+        return match report.failed() {
+            None => Ok(()),
+            Some(failed) => Err(ServiceError::Database(format!(
+                "Failed to apply migration {} on a database migrated by a newer Temps \
+                 release: {}",
+                failed.name,
+                failed
+                    .error
+                    .as_deref()
+                    .unwrap_or("no error detail reported")
+            ))),
+        };
     }
 
     match timeout(MIGRATION_TIMEOUT, Migrator::up(db, None)).await {
@@ -869,19 +875,24 @@ where
             .map(|migration| migration.name().to_string())
             .collect()
     };
-    let pending = migrations_named(&pending_names);
+    // Only the newer-schema path applies migrations itself, so only it needs
+    // the migration objects; `Migrator::up(db, Some(1))` finds its own.
+    let newer_schema_migrations = if newer_schema {
+        migrations_named(&pending_names)
+    } else {
+        Vec::new()
+    };
 
-    let total = pending.len();
+    let total = pending_names.len();
     let mut report = MigrationRunReport {
-        planned: pending.iter().map(|m| m.name().to_string()).collect(),
+        planned: pending_names.clone(),
         results: Vec::with_capacity(total),
     };
 
     // 2. Apply each pending migration individually so we can time and report it.
     //    `Migrator::up(db, Some(1))` applies exactly the next pending migration.
-    for (i, migration) in pending.iter().enumerate() {
+    for (i, name) in pending_names.into_iter().enumerate() {
         let index = i + 1;
-        let name = migration.name().to_string();
 
         // Announce the migration BEFORE running it: this is the one that might
         // sit for a while on a large table, so the operator needs to see it now.
@@ -893,10 +904,17 @@ where
 
         let started = std::time::Instant::now();
         let apply = async {
-            if newer_schema {
-                apply_migration_on_newer_schema(db, migration.as_ref()).await
-            } else {
-                Migrator::up(db, Some(1)).await
+            if !newer_schema {
+                return Migrator::up(db, Some(1)).await;
+            }
+            match newer_schema_migrations
+                .iter()
+                .find(|migration| migration.name() == name)
+            {
+                Some(migration) => apply_migration_on_newer_schema(db, migration.as_ref()).await,
+                None => Err(DbErr::Custom(format!(
+                    "Migration {name} is not defined in this binary"
+                ))),
             }
         };
         let outcome = match timeout(MIGRATION_TIMEOUT, apply).await {
