@@ -11,12 +11,15 @@ import { listIngressConnectors } from '@/api/client/sdk.gen'
 import type { ConnectorView } from '@/api/client/types.gen'
 
 const TUNNEL_PAGE_SIZE = 100
+/** The control plane's `MAX_CONNECTORS`: it refuses to create more. */
+export const MAX_TUNNELS = 500
 
 /**
  * Every tunnel, for screens that match names against all of them: worker
  * settings, domain choices and a tunnel's own page. The list is paginated,
- * so this reads page after page until it has them all. The key extends the
- * list's own, so invalidating the list refreshes this too.
+ * so this reads page after page until it has them all, never more than
+ * `MAX_TUNNELS`. The key extends the list's own, so invalidating the list
+ * refreshes this too.
  */
 export function allTunnelsOptions() {
   return queryOptions({
@@ -30,17 +33,23 @@ export function allTunnelsOptions() {
     ],
     queryFn: async ({ signal }) => {
       const tunnels: ConnectorView[] = []
-      for (let page = 1; ; page++) {
+      for (let page = 1; page <= MAX_TUNNELS / TUNNEL_PAGE_SIZE; page++) {
         const { data } = await listIngressConnectors({
           query: { page, page_size: TUNNEL_PAGE_SIZE },
           signal,
           throwOnError: true,
         })
+        if (data.total > MAX_TUNNELS) {
+          throw new Error(
+            `This cluster has ${data.total} tunnels, more than the ${MAX_TUNNELS} the console can match names against. Delete tunnels you no longer use from their worker's page in Settings.`
+          )
+        }
         tunnels.push(...data.connectors)
         if (data.connectors.length === 0 || tunnels.length >= data.total) {
-          return tunnels
+          break
         }
       }
+      return tunnels
     },
   })
 }

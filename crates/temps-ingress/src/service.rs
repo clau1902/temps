@@ -52,6 +52,10 @@ const ROTATION_ERROR: &str = "Could not revoke the tunnel secret";
 const STALE: &str = "stale";
 const DEFAULT_PAGE_SIZE: u64 = 20;
 const MAX_PAGE_SIZE: u64 = 100;
+/// Most connectors one cluster may have. The console matches names against
+/// all of them (`web/src/lib/tunnel-domains.ts` loads at most this many), so
+/// the count is bounded where they are created.
+pub const MAX_CONNECTORS: u64 = 500;
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateConnectorRequest {
@@ -657,6 +661,17 @@ impl IngressConnectorService {
             return Err(IngressError::Validation(
                 "The name must be 1-50 lowercase letters, digits or hyphens.".into(),
             )
+            .into());
+        }
+        let existing = ingress_connectors::Entity::find()
+            .count(self.db.as_ref())
+            .await
+            .map_err(IngressError::from)?;
+        if existing >= MAX_CONNECTORS {
+            return Err(IngressError::Validation(format!(
+                "This cluster already has {existing} tunnels, the most it supports is \
+                 {MAX_CONNECTORS}. Delete a tunnel you no longer use, then add this one."
+            ))
             .into());
         }
         let factory = self.registry.get(&request.provider)?;
