@@ -305,6 +305,7 @@ mod tests {
         let status = crate::services::cluster_network::status_of(
             &config(),
             &[node("edge-1", Some("unavailable"), None)],
+            &Default::default(),
             Some("overlay subnet ... Fix: change the cluster compute pool".into()),
         );
         assert!(status.can_change, "{:?}", status.change_blocked_by);
@@ -325,6 +326,7 @@ mod tests {
         let ready = crate::services::cluster_network::status_of(
             &config(),
             &[node("edge-1", Some("ready"), Some("172.20.0.0/24"))],
+            &Default::default(),
             None,
         );
         assert!(!ready.can_change);
@@ -332,9 +334,24 @@ mod tests {
         let silent = crate::services::cluster_network::status_of(
             &config(),
             &[node("old", None, None)],
+            &Default::default(),
             None,
         );
         assert!(!silent.can_change);
         assert!(silent.change_blocked_by[0].contains("has not reported"));
+    }
+
+    #[test]
+    fn a_node_whose_services_hold_addresses_blocks_a_change() {
+        let edge = node("edge-1", Some("unavailable"), None);
+        let status = crate::services::cluster_network::status_of(
+            &config(),
+            std::slice::from_ref(&edge),
+            &[edge.id].into(),
+            None,
+        );
+        assert!(!status.can_change);
+        assert!(status.nodes[0].in_use);
+        assert!(status.change_blocked_by[0].contains("runs services that hold addresses"));
     }
 }

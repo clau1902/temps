@@ -121,9 +121,12 @@ impl ClusterNetworkService {
             .order_by_asc(nodes::Column::Id)
             .all(db)
             .await?;
+        let with_services =
+            temps_network::allocator::nodes_with_overlay_members(db, &members).await?;
         Ok(status_of(
             &cfg,
             &members,
+            &with_services,
             temps_network::control_plane::last_setup_failure(),
         ))
     }
@@ -174,12 +177,13 @@ impl ClusterNetworkService {
 pub(crate) fn status_of(
     cfg: &network_config::Model,
     members: &[nodes::Model],
+    with_services: &std::collections::HashSet<i32>,
     setup_failure: Option<String>,
 ) -> ClusterNetworkStatus {
     let nodes: Vec<ClusterNetworkNode> = members
         .iter()
         .map(|node| {
-            let in_use_reason = temps_network::allocator::allocation_in_use(node);
+            let in_use_reason = temps_network::allocator::allocation_in_use(node, with_services);
             ClusterNetworkNode {
                 id: node.id,
                 name: node.name.clone(),

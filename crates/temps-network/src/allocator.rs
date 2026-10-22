@@ -339,6 +339,7 @@ impl PostgresAllocator {
             .await?;
         validate_pool_against_cluster(requested_pool, &cfg, &members)?;
 
+        let with_services = nodes_with_overlay_members(&txn, &members).await?;
         if cfg.control_plane_overlay_ready {
             let mut users = vec![format!(
                 "the control plane ({})",
@@ -346,25 +347,14 @@ impl PostgresAllocator {
                     .as_deref()
                     .unwrap_or("unknown subnet")
             )];
-            users.extend(nodes_using_pool(&members));
+            users.extend(nodes_using_pool(&members, &with_services));
             return Err(AllocatorError::PoolInUse {
                 current_pool: current.compute_pool_cidr,
                 requested_pool,
                 users,
             });
         }
-        let mut users = nodes_using_pool(&members);
-        let ids: Vec<i32> = members.iter().map(|node| node.id).collect();
-        let with_services = nodes_with_overlay_members(&txn, &ids).await?;
-        users.extend(members.iter().filter_map(|node| {
-            let cidr = node.compute_cidr.as_deref()?;
-            (allocation_in_use(node).is_none() && with_services.contains(&node.id)).then(|| {
-                format!(
-                    "node '{}' ({cidr}, runs services that hold addresses on it)",
-                    node.name
-                )
-            })
-        }));
+        let users = nodes_using_pool(&members, &with_services);
         if !users.is_empty() {
             return Err(AllocatorError::PoolInUse {
                 current_pool: current.compute_pool_cidr,
@@ -517,7 +507,7 @@ impl PostgresAllocator {
             return Ok(None);
         };
         let cause = collision.describe();
-        if nodes_with_overlay_members(&txn, &[node_id])
+        if nodes_with_overlay_members(&txn, std::slice::from_ref(node))
             .await?
             .contains(&node_id)
         {
@@ -1218,11 +1208,18 @@ pub fn occupied_of(node: &nodes::Model) -> Vec<OccupiedRange> {
 }
 
 /// Whether a node's allocation is in use, and why, as one line naming it.
-/// `None` when it may be re-assigned. See [`PostgresAllocator::configure_pool`].
-pub fn allocation_in_use(node: &nodes::Model) -> Option<String> {
+/// `None` when it may be re-assigned. `with_services` comes from
+/// [`nodes_with_overlay_members`]. See [`PostgresAllocator::configure_pool`].
+pub fn allocation_in_use(node: &nodes::Model, with_services: &HashSet<i32>) -> Option<String> {
     let cidr = node.compute_cidr.as_deref()?;
     if node.overlay_ready_cidr.as_deref() == Some(cidr) {
         return Some(format!("node '{}' ({cidr}, overlay up)", node.name));
+    }
+    if with_services.contains(&node.id) {
+        return Some(format!(
+            "node '{}' ({cidr}, runs services that hold addresses on it)",
+            node.name
+        ));
     }
     if node.overlay_status.is_none() {
         return Some(format!(
@@ -1238,18 +1235,18 @@ pub fn allocation_in_use(node: &nodes::Model) -> Option<String> {
 /// allocation is in use even before the node reports the overlay ready:
 /// `service_members.compute_ip`, and the DNS records built from it, would
 /// keep pointing at the old subnet after a move.
-async fn nodes_with_overlay_members<C: ConnectionTrait>(
+pub async fn nodes_with_overlay_members<C: ConnectionTrait>(
     db: &C,
-    node_ids: &[i32],
+    members: &[nodes::Model],
 ) -> Result<HashSet<i32>, DbErr> {
-    if node_ids.is_empty() {
+    if members.is_empty() {
         return Ok(HashSet::new());
     }
     let rows: Vec<Option<i32>> = service_members::Entity::find()
         .select_only()
         .column(service_members::Column::NodeId)
         .distinct()
-        .filter(service_members::Column::NodeId.is_in(node_ids.iter().copied()))
+        .filter(service_members::Column::NodeId.is_in(members.iter().map(|node| node.id)))
         .filter(service_members::Column::ComputeIp.is_not_null())
         .into_tuple()
         .all(db)
@@ -1257,8 +1254,11 @@ async fn nodes_with_overlay_members<C: ConnectionTrait>(
     Ok(rows.into_iter().flatten().collect())
 }
 
-fn nodes_using_pool(members: &[nodes::Model]) -> Vec<String> {
-    members.iter().filter_map(allocation_in_use).collect()
+fn nodes_using_pool(members: &[nodes::Model], with_services: &HashSet<i32>) -> Vec<String> {
+    members
+        .iter()
+        .filter_map(|node| allocation_in_use(node, with_services))
+        .collect()
 }
 
 /// Refuse a pool that would collide with the cluster itself: the mesh pool,
