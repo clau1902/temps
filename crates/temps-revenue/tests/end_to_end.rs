@@ -220,6 +220,105 @@ async fn out_of_order_event_does_not_revive_a_canceled_subscription() {
     assert_eq!(summary.current_mrr_minor, 0);
 }
 
+/// `invoice.paid` for `sub_id` with one monthly line of `amount` minor units
+/// whose billing period starts at `period_start`.
+fn stripe_invoice_paid_payload(
+    event_id: &str,
+    sub_id: &str,
+    amount: i64,
+    period_start: i64,
+    created: i64,
+) -> String {
+    let period_end = period_start + 30 * 86_400;
+    format!(
+        r#"{{
+            "id": "{event_id}",
+            "type": "invoice.paid",
+            "created": {created},
+            "data": {{
+                "object": {{
+                    "id": "in_{event_id}",
+                    "customer": "cus_order",
+                    "subscription": "{sub_id}",
+                    "amount_paid": {amount},
+                    "currency": "usd",
+                    "lines": {{
+                        "data": [
+                            {{
+                                "amount": {amount},
+                                "subscription": "{sub_id}",
+                                "period": {{"start": {period_start}, "end": {period_end}}}
+                            }}
+                        ]
+                    }}
+                }}
+            }}
+        }}"#
+    )
+}
+
+/// An invoice's realized-MRR line is dated at its billing period start,
+/// which precedes the subscription event that opened that period. The
+/// lifecycle ordering fence must not discard it.
+#[tokio::test]
+async fn invoice_realized_mrr_is_projected_after_a_later_lifecycle_event() {
+    let Some(test_db) = try_test_db().await else {
+        return;
+    };
+    let conn = test_db.connection_arc();
+    insert_project(conn.as_ref(), 1005, "invoice-mrr").await;
+
+    let enc = encryption();
+    let integrations = Arc::new(RevenueIntegrationService::new(
+        conn.clone(),
+        enc.clone(),
+        ProviderRegistry::default_registry(),
+    ));
+    let ingestion = Arc::new(RevenueIngestionService::new(
+        conn.clone(),
+        integrations.clone(),
+        ProviderRegistry::default_registry(),
+    ));
+    let analytics = RevenueAnalyticsService::new(conn.clone());
+
+    let signing_secret = "whsec_test_secret_invoice_mrr_0123456789";
+    let integration = integrations
+        .create(CreateIntegrationInput {
+            project_id: 1005,
+            provider: "stripe".into(),
+            signing_secret: signing_secret.into(),
+        })
+        .await
+        .expect("create integration");
+
+    let now = Utc::now().timestamp();
+    let deliveries = [
+        stripe_subscription_event_payload(
+            "evt_inv_created",
+            "customer.subscription.created",
+            "sub_invoice",
+            "active",
+            now - 60,
+        ),
+        // Paid now, for a period that started before the subscription event.
+        stripe_invoice_paid_payload("evt_inv_paid", "sub_invoice", 3000, now - 3600, now),
+    ];
+    for payload in deliveries {
+        let (headers, body) = make_stripe_webhook(signing_secret, &payload);
+        ingestion
+            .ingest("stripe", &integration.webhook_path_token, headers, body)
+            .await
+            .expect("ingest");
+    }
+
+    let summary = analytics.summary(1005, "usd").await.expect("summary");
+    assert_eq!(summary.active_subscriptions, 1);
+    assert_eq!(
+        summary.current_mrr_minor, 3000,
+        "the invoice's realized MRR replaces the subscription's list price"
+    );
+}
+
 #[tokio::test]
 async fn ingest_then_summary_projects_correctly() {
     let Some(test_db) = try_test_db().await else {
