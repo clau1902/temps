@@ -40,6 +40,9 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Node service for listing/getting worker nodes (UI-facing)
     pub node_service: Arc<NodeService>,
+    /// A worker's direct-ingress settings and last reachability check.
+    pub node_public_ingress_service:
+        Arc<crate::services::node_public_ingress::NodePublicIngressService>,
     /// Placement policy for this process, used by the node capability
     /// endpoint to answer "can anything run here?" with the same rules the
     /// deploy path applies.

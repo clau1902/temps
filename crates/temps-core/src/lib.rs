@@ -31,6 +31,7 @@ pub mod notifications;
 pub mod on_demand;
 pub mod openapi;
 pub mod plugin;
+pub mod plugin_builder;
 pub mod problemdetails;
 pub mod project_access;
 pub mod project_deletion;
@@ -69,6 +70,7 @@ pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;
+pub mod worker_ingress;
 pub use docker_handle::{
     worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
     WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,

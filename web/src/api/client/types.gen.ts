@@ -1829,6 +1829,13 @@ export type AppSettings = {
      * disables DNS record sync regardless of per-domain opt-in.
      */
     edge_target?: string | null;
+    /**
+     * Label of a new environment's generated hostname under `preview_domain`,
+     * from `{project}` and `{env}` (ADR 058 D9). `None` means
+     * [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+     * environments created after it is set; existing ones keep their names.
+     */
+    environment_hostname_template?: string | null;
     external_url?: string | null;
     /**
      * Geolocation database refresh policy, MaxMind credential (encrypted at
@@ -1901,6 +1908,12 @@ export type AppSettings = {
      * to match; the generic settings update preserves the stored value.
      */
     preview_gateway?: PreviewGatewaySettings;
+    /**
+     * Label for an environment named `production`, when it should differ
+     * (e.g. `{project}` for `app.example.com`). `None` uses
+     * `environment_hostname_template`.
+     */
+    production_hostname_template?: string | null;
     /**
      * Base URL handed to third parties that call back into Temps: email
      * open/click tracking, git provider webhooks, SES/SNS events, revenue
@@ -4991,9 +5004,12 @@ export type ClusterMemberRequest = {
 };
 
 /**
- * Read-only cluster network state. Pool changes are performed on the control
- * plane through `temps network setup-multi-node`, which enforces that no
- * existing node allocation can be stranded by an in-place edit.
+ * Read-only cluster network state. The pool is changed through
+ * `PUT /settings/cluster-network` or `temps network setup-multi-node`, which
+ * refuse while any allocation is in use (ADR 056). `locked` means only that
+ * allocations exist: allocations never applied are re-assigned by a change,
+ * so whether it is allowed now is `GET /settings/cluster-network`'s
+ * `can_change`.
  */
 export type ClusterNetworkSettings = {
     allocation_count: number;
@@ -5363,6 +5379,12 @@ export type ComposeCheckReport = {
  * The host's Docker Compose CLI as probed at startup.
  */
 export type ComposeHostStatusResponse = {
+    /**
+     * False when this process never runs Compose workloads (a hosted control
+     * plane): the CLI is neither probed nor expected, so a missing or old
+     * Compose is not a problem to report there.
+     */
+    applicable: boolean;
     /**
      * Whether the Compose CLI ran.
      */
@@ -14682,6 +14704,11 @@ export type HeartbeatApiRequest = {
      * Updated node labels for scheduling (allows runtime label changes).
      */
     labels?: unknown;
+    /**
+     * The node's occupied IPv4 ranges (ADR 056), sent when they change.
+     */
+    occupied_ranges?: Array<OccupiedRangeReport> | null;
+    overlay?: OverlayHeartbeat | null;
     public_ingress?: PublicIngressHeartbeat | null;
 };
 
@@ -15712,32 +15739,6 @@ export type InstallPluginResponse = {
     platform: string;
     sha256: string;
     version: string;
-};
-
-export type InstallRepositoryRequest = {
-    grants?: PluginGrantConfig | null;
-    name?: string | null;
-    path?: string | null;
-    progressId?: string | null;
-    ref_name?: string | null;
-    repository_url: string;
-};
-
-export type InstallRepositoryResponse = {
-    message: string;
-    name: string;
-    platform: string;
-    sha256: string;
-    source_commit: string;
-    version: string;
-};
-
-export type InstallationReportingSettings = {
-    /**
-     * Opt in to sharing a plugin name and plugin-specific anonymous identifier
-     * with the official Temps registry after a verified install succeeds.
-     */
-    enabled: boolean;
 };
 
 /**
@@ -17922,6 +17923,18 @@ export type MultiNodeSettings = {
      * workers have re-enrolled with certs.
      */
     require_mtls?: boolean;
+    /**
+     * `ip:port` workers dial for the control plane's end of the WireGuard
+     * mesh, published instead of `private_address` on the mesh port. For a
+     * control plane reachable only through NAT or a forwarded port.
+     *
+     * Owned by `temps serve --wg-endpoint` / `TEMPS_WG_ENDPOINT`: every start
+     * records the flag's value (clearing it when the flag is absent), and a
+     * settings write never changes it. Stored here only so the processes
+     * that set the mesh up (the deployer plugin, `temps network
+     * setup-multi-node`) read the same value.
+     */
+    wg_endpoint?: string | null;
 };
 
 /**
@@ -17974,37 +17987,6 @@ export type MxResult = {
      */
     records: Array<string>;
 };
-
-/**
- * A navigation entry that the plugin contributes to the Temps UI.
- */
-export type NavEntry = {
-    /**
-     * Lucide icon name (e.g., "puzzle", "database", "activity")
-     */
-    icon: string;
-    /**
-     * Display label in the sidebar
-     */
-    label: string;
-    /**
-     * Sort order within the section (lower = higher in list)
-     */
-    order: number;
-    /**
-     * Client-side route path (e.g., "/my-plugin")
-     */
-    path: string;
-    /**
-     * Which sidebar section this entry belongs to
-     */
-    section: NavSection;
-};
-
-/**
- * Where the plugin's nav entry appears in the Temps UI sidebar.
- */
-export type NavSection = 'platform' | 'settings' | 'project';
 
 /**
  * Network configuration
@@ -18303,11 +18285,29 @@ export type NodeInfoResponse = {
      * Resource capacity/usage metrics from the latest heartbeat
      */
     capacity: unknown;
+    /**
+     * This node's subnet of the cluster compute pool, if allocated.
+     */
+    compute_cidr?: string | null;
     created_at: string;
     id: number;
     labels: unknown;
     last_heartbeat?: string | null;
     name: string;
+    /**
+     * Why the overlay is unavailable: the colliding range, its owner and the
+     * fixes.
+     */
+    overlay_last_error?: string | null;
+    /**
+     * The last automatic move of this node's allocation, and why.
+     */
+    overlay_remediation?: string | null;
+    /**
+     * Cross-node overlay (ADR 056): `ready`, `unavailable`, or `None` when
+     * the agent never reported it (older agent, or no heartbeat yet).
+     */
+    overlay_status?: string | null;
     private_address: string;
     public_ingress_certificate_count?: number | null;
     public_ingress_enabled: boolean;
@@ -18353,9 +18353,10 @@ export type NodePairingResponse = {
     mesh_address: string;
     name: string;
     /**
-     * `ip:port` the control plane dials.
+     * `ip:port` the control plane dials; `null` for a worker that joined
+     * outbound only (ADR 055): it dials the control plane instead.
      */
-    node_endpoint: string;
+    node_endpoint?: string | null;
     /**
      * The node that registered with this pairing.
      */
@@ -18698,13 +18699,6 @@ export type NotificationRouteTestResult = {
      * Severity of the sample notification: the lowest one the route matches.
      */
     severity: string;
-};
-
-export type NpmRelease = {
-    binary_path: string;
-    integrity: string;
-    name: string;
-    version: string;
 };
 
 export type NumericRule = {
@@ -20544,184 +20538,16 @@ export type PlatformInfo = {
     platforms: Array<string>;
 };
 
-export type PlatformRelease = {
-    npm?: NpmRelease | null;
-    sha256: string;
-    url: string;
-};
-
-export type PluginActorInfo = {
-    active: boolean;
-    id: string;
-    name: string;
-};
-
-export type PluginAiCapability = {
-    configured: boolean;
-    daily_call_limit: number;
-    max_output_tokens: number;
-    max_prompt_bytes: number;
-    reason?: string | null;
-    setup_path: string;
-};
-
-/**
- * What a plugin is allowed to do with the platform API over the channel.
- *
- * Coarse on purpose. Fine-grained authorization already exists in the
- * permission system and is enforced per request against the acting user;
- * this exists so an operator installing a binary can see at a glance
- * whether it intends to *write* at all, without reading its source.
- */
-export type PluginCapability = 'api_read' | 'api_write';
-
-export type PluginCatalogResponse = {
-    available: boolean;
-    plugins: Array<RegistryPlugin>;
-    reason?: string | null;
-    source: string;
-};
-
 export type PluginGrantConfig = {
     ai_daily_call_limit: number;
     ai_max_output_tokens: number;
     permissions: Array<PluginHostPermission>;
 };
 
-export type PluginGrantsResponse = {
-    actor: PluginActorInfo;
-    ai: PluginAiCapability;
-    permissions: Array<PluginHostPermission>;
-    requested_permissions: Array<PluginHostPermission>;
-};
-
 /**
  * Host-owned permissions granted to one durable external-plugin actor.
  */
 export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environments_read' | 'deployments_read' | 'api_read' | 'api_write' | 'events_read';
-
-/**
- * The complete plugin manifest — the handshake contract.
- */
-export type PluginManifest = {
-    /**
-     * What this plugin may do with the platform's own API over the channel.
-     *
-     * Empty by default, and empty means read-only channel queries and
-     * nothing else: a plugin that never asks cannot deploy, cannot create
-     * projects, and cannot provision databases. Declaring a capability is
-     * not by itself permission to act — every call still runs the real
-     * handler's `permission_guard!` as the user the plugin is acting for,
-     * so a capability can only ever narrow what that user could already do
-     * through the console.
-     */
-    capabilities?: Array<PluginCapability>;
-    /**
-     * Short description of what the plugin does
-     */
-    description?: string | null;
-    /**
-     * Human-readable display name
-     */
-    display_name?: string | null;
-    /**
-     * Platform event types the plugin subscribes to.
-     *
-     * When specified, Temps will POST matching events to the plugin's
-     * `/_events` endpoint. Uses dot-notation event names matching the
-     * webhook event types (e.g., "deployment.succeeded", "project.created").
-     *
-     * Available events:
-     * - `deployment.created`, `deployment.succeeded`, `deployment.failed`,
-     * `deployment.cancelled`, `deployment.ready`
-     * - `project.created`, `project.deleted`
-     * - `domain.created`, `domain.provisioned`
-     */
-    events?: Array<string>;
-    /**
-     * Health check endpoint path (relative to plugin root)
-     */
-    health_path?: string;
-    /**
-     * Suppress the console's own header strip above this plugin's UI.
-     *
-     * The console normally renders the plugin's icon, display name and
-     * version above the iframe. For a plugin whose UI is a full working
-     * surface with its own header, that is a second title bar competing
-     * for the same vertical space — and vertical space is exactly what a
-     * dense full-page layout has none of. Opt out and the frame gets the
-     * full height.
-     *
-     * The nav entry still names the plugin, so nothing becomes
-     * unidentifiable by setting this.
-     */
-    hide_header?: boolean;
-    /**
-     * Host-brokered operations requested by this plugin. These are requests,
-     * not authority: an administrator must grant each one separately.
-     */
-    host_permissions?: Array<PluginHostPermission>;
-    /**
-     * Unique plugin identifier (kebab-case, e.g., "backup-manager")
-     */
-    name: string;
-    /**
-     * Navigation entries for the UI sidebar
-     */
-    nav?: Array<NavEntry>;
-    /**
-     * Routes this plugin authenticates itself, which the platform's proxy
-     * therefore does not gate.
-     *
-     * Every other proxied route requires an authenticated caller before it
-     * reaches the plugin. That is right for anything a signed-in user
-     * drives, and wrong for the endpoints a plugin exposes to clients that
-     * hold no platform session — an agent in a sandbox presenting a
-     * capability token, a share link opened by someone with no account.
-     * This is the external-plugin counterpart of the in-process
-     * `configure_public_routes`.
-     *
-     * Paths are relative to the plugin's mount point and match by prefix,
-     * so `/webhooks/incoming` covers everything beneath it. A listed route is
-     * reachable by anyone who can reach the instance: it **must** check its
-     * own credential. Listing a route that does not is an open door.
-     */
-    public_paths?: Array<string>;
-    /**
-     * Whether the plugin needs database access
-     */
-    requires_db?: boolean;
-    /**
-     * Whether the plugin may read the platform's host data root.
-     *
-     * This is a highly privileged capability: the directory can contain
-     * encryption keys and instance-owned state. It is independent of direct
-     * database access and defaults to `false`.
-     */
-    requires_host_data_access?: boolean;
-    ui?: UiManifest | null;
-    /**
-     * SemVer version string
-     */
-    version: string;
-};
-
-export type PluginSourceResponse = {
-    builder_image: string;
-    commit: string;
-    kind: string;
-    path?: string | null;
-    ref_name: string;
-    repository_url: string;
-    version: string;
-};
-
-export type PluginStatusResponse = {
-    configured: boolean;
-    reason?: string | null;
-    setup_path: string;
-    source?: PluginSourceResponse | null;
-};
 
 /**
  * Which policy decided a test.
@@ -21062,22 +20888,6 @@ export type ProblemDetails = {
      */
     type?: string | null;
 };
-
-export type ProgressSnapshot = {
-    elapsed_ms: number;
-    id: string;
-    stages: Array<ProgressStage>;
-    status: ProgressStatus;
-};
-
-export type ProgressStage = {
-    elapsed_ms: number;
-    message: string;
-    stage: string;
-    status: ProgressStatus;
-};
-
-export type ProgressStatus = 'running' | 'completed' | 'failed';
 
 export type ProjectAccessResponse = {
     created_at: string;
@@ -23229,6 +23039,11 @@ export type RegisterNodeApiRequest = {
      */
     name: string;
     /**
+     * IPv4 ranges this machine already uses (ADR 056), so its overlay
+     * allocation avoids them. Absent from older CLIs.
+     */
+    occupied_ranges?: Array<OccupiedRangeReport> | null;
+    /**
      * The node's *current* token, supplied to prove possession when
      * re-registering (changing the identity of) a node that already exists.
      * Optional; only needed to rebind a still-live node. (ADR-020 WS-1.2.)
@@ -23289,8 +23104,10 @@ export type RegisterRequest = {
 export type RegisterWireguardMeshRequest = {
     /**
      * `ip:port` other nodes dial to reach this node's WireGuard socket.
+     * Absent or `null` for a node nobody can dial (ADR 055): it dials the
+     * control plane, which learns its address from the handshake.
      */
-    endpoint: string;
+    endpoint?: string | null;
     /**
      * Base64 WireGuard public key. The private key never leaves the node.
      */
@@ -23324,23 +23141,6 @@ export type RegistryEnvelope = {
      * Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.
      */
     signature: string;
-};
-
-export type RegistryPlugin = {
-    author: string;
-    category: string;
-    description: string;
-    docs_url?: string | null;
-    keywords?: Array<string>;
-    logo_url?: string | null;
-    name: string;
-    platforms: {
-        [key: string]: PlatformRelease;
-    };
-    repository?: string | null;
-    summary: string;
-    title: string;
-    version: string;
 };
 
 /**
@@ -23389,33 +23189,6 @@ export type ReleaseListResponse = {
     releases: Array<string>;
 };
 
-export type ReloadFailureResponse = {
-    plugin?: string | null;
-    reason: string;
-};
-
-/**
- * Response from the reload endpoint.
- */
-export type ReloadResponse = {
-    /**
-     * Activated installs that could not be verified or started.
-     */
-    failures: Array<ReloadFailureResponse>;
-    /**
-     * Number of plugins successfully loaded after reload
-     */
-    loaded: number;
-    /**
-     * Human-readable status message
-     */
-    message: string;
-    /**
-     * Names of loaded plugins
-     */
-    plugins: Array<string>;
-};
-
 export type RemoteDeploymentResponse = {
     created_at: string;
     environment_id: number;
@@ -23443,6 +23216,13 @@ export type RemotePullCredentials = {
 
 export type RemoveNodeResponse = {
     id: number;
+    /**
+     * Environments that were still serving from the node when it was
+     * removed as gone (`force=true` on an unreachable node, ADR 057). Their
+     * containers there are recorded as orphaned; one with no replicas on
+     * another node serves nothing until it is redeployed.
+     */
+    lost_environments?: Array<string>;
     message: string;
     /**
      * Containers Temps could not confirm were removed from the node before
@@ -23521,45 +23301,6 @@ export type ReportWireguardHandshakesRequest = {
     peers: Array<WireguardHandshakeReport>;
 };
 
-export type RepositoryCatalogPermission = {
-    permission: PluginHostPermission;
-    reason: string;
-    required: boolean;
-};
-
-export type RepositoryCatalogPlugin = {
-    author: string;
-    category: string;
-    commit: string;
-    description: string;
-    docsUrl?: string | null;
-    latestVersion: string;
-    logoUrl?: string | null;
-    name: string;
-    path?: string | null;
-    /**
-     * Author-declared capabilities for display only; never used to grant access.
-     * None means the legacy catalog did not declare permissions.
-     */
-    permissions?: Array<RepositoryCatalogPermission>;
-    platforms: Array<string>;
-    readmeUrl?: string | null;
-    ref?: string | null;
-    repository: string;
-    screenshots: Array<RepositoryScreenshot>;
-    summary: string;
-    title: string;
-    validation: RepositoryValidation;
-};
-
-export type RepositoryCatalogResponse = {
-    available: boolean;
-    platform: string;
-    plugins: Array<RepositoryCatalogPlugin>;
-    reason?: string | null;
-    source: string;
-};
-
 export type RepositoryComposeServicesResponse = {
     path: string;
     repositoryId: number;
@@ -23632,12 +23373,6 @@ export type RepositoryResponse = {
     updated_at: string;
 };
 
-export type RepositoryScreenshot = {
-    alt: string;
-    caption?: string | null;
-    url: string;
-};
-
 /**
  * Returned by `POST /git-connections/{id}/sync` to acknowledge that a
  * sync has been kicked off in the background. Clients should poll the
@@ -23648,11 +23383,6 @@ export type RepositorySyncStartedResponse = {
     connection_id: number;
     started_at: string;
     syncing: boolean;
-};
-
-export type RepositoryValidation = {
-    build: string;
-    metadata: string;
 };
 
 /**
@@ -29847,38 +29577,6 @@ export type TxtRecord = {
 };
 
 /**
- * Describes the plugin's embedded UI bundle.
- */
-export type UiManifest = {
-    /**
-     * CSS files to load
-     */
-    css?: Array<string>;
-    /**
-     * JavaScript entry point filename relative to the bundle root
-     */
-    entry_js: string;
-    /**
-     * Client-side routes the plugin handles
-     */
-    routes?: Array<UiRoute>;
-};
-
-/**
- * A client-side route provided by the plugin UI.
- */
-export type UiRoute = {
-    /**
-     * Route path pattern (e.g., "/my-plugin", "/my-plugin/:id")
-     */
-    path: string;
-    /**
-     * Page title for breadcrumbs
-     */
-    title: string;
-};
-
-/**
  * Response after undraining (reactivating) a node.
  */
 export type UndrainNodeResponse = {
@@ -29926,12 +29624,6 @@ export type UnifiedTrace = {
      * project_ids excluded due to truncation (most-recent first_seen dropped first).
      */
     truncated_projects: Array<number>;
-};
-
-export type UninstallPluginResponse = {
-    data_preserved: boolean;
-    message: string;
-    name: string;
 };
 
 /**
@@ -31080,10 +30772,6 @@ export type UpdateProviderRequest = {
     config?: unknown;
     enabled?: boolean | null;
     name?: string | null;
-};
-
-export type UpdateRepositoryRequest = {
-    ref_name?: string | null;
 };
 
 export type UpdateRouteRequest = {
@@ -32495,7 +32183,11 @@ export type WireguardMeshPeerEntry = {
  */
 export type WireguardMeshSelfEntry = {
     address: string;
-    endpoint: string;
+    /**
+     * `null` for a node nobody dials (ADR 055): it dials its peers, which
+     * learn its address from its handshakes.
+     */
+    endpoint?: string | null;
     public_key: string;
 };
 
@@ -32718,6 +32410,921 @@ export type WriteFilesResponse = {
  */
 export type ZoneListResponse = {
     zones: Array<DnsZone>;
+};
+
+/**
+ * Who makes the published hostnames resolve.
+ */
+export type DnsHandling = 'automatic' | 'manual' | 'provider_hostname';
+
+/**
+ * Body of `POST /internal/nodes/mesh-enroll` (ADR 055).
+ */
+export type MeshEnrollApiRequest = {
+    join_token?: SecretString | null;
+    /**
+     * Scheduling labels the worker will register with; checked against the
+     * token's bound labels and carried over to the pairing's token.
+     */
+    labels?: unknown;
+    /**
+     * The name the worker will register under.
+     */
+    name: string;
+    /**
+     * The worker's base64 WireGuard public key. The private key never
+     * leaves the worker.
+     */
+    wg_public_key: string;
+};
+
+export type SetHostnameChoiceRequest = {
+    /**
+     * Required with mode `tunnel`.
+     */
+    connector_id?: number | null;
+    mode: HostnameMode;
+};
+
+export type LinkView = {
+    client_version?: string | null;
+    /**
+     * The provider's data centre, such as `mad01`.
+     */
+    location?: string | null;
+    /**
+     * The worker holding it, when its connector could be matched.
+     */
+    node_id?: number | null;
+    node_name?: string | null;
+    opened_at?: string | null;
+    reconnecting: boolean;
+};
+
+/**
+ * Cross-node overlay state reported by the agent (ADR 056).
+ */
+export type OverlayHeartbeat = {
+    /**
+     * The allocation the agent applied (when `ready`) or tried to.
+     */
+    compute_cidr?: string | null;
+    /**
+     * Why the overlay is unavailable, with the fix.
+     */
+    last_error?: string | null;
+    /**
+     * `ready` or `unavailable`.
+     */
+    status: string;
+};
+
+/**
+ * How one hostname reaches visitors, as the operator chose it (ADR 058 D9).
+ */
+export type HostnameMode = 'automatic' | 'tunnel' | 'off';
+
+export type ConnectorNodeView = {
+    driver?: string | null;
+    last_error?: string | null;
+    node_id: number;
+    node_name: string;
+    ready_connections?: number | null;
+    reported_at?: string | null;
+    state: string;
+};
+
+export type HostnameCandidate = {
+    auto_publish: boolean;
+    connector_id: number;
+    domain: string;
+    name: string;
+};
+
+/**
+ * One worker's view of the overlay.
+ */
+export type ClusterNetworkNode = {
+    /**
+     * Its subnet of the pool, if allocated.
+     */
+    compute_cidr?: string | null;
+    id: number;
+    /**
+     * Whether its allocation locks the pool, and why when it does.
+     */
+    in_use: boolean;
+    in_use_reason?: string | null;
+    name: string;
+    /**
+     * What the node reported it already uses outside Temps.
+     */
+    occupied_ranges: Array<OccupiedRangeReport>;
+    /**
+     * Why the overlay is unavailable: the colliding range, its owner and
+     * the fixes.
+     */
+    overlay_last_error?: string | null;
+    /**
+     * The last automatic move of its allocation, and why.
+     */
+    overlay_remediation?: string | null;
+    /**
+     * `ready`, `unavailable`, or `None` when its agent never reported it.
+     */
+    overlay_status?: string | null;
+};
+
+export type UpdateConnectorRequest = {
+    /**
+     * Publish every worker-served hostname under the domain (true), or only
+     * hostnames chosen for this tunnel (false).
+     */
+    auto_publish?: boolean | null;
+};
+
+/**
+ * The control plane's overlay.
+ */
+export type ClusterNetworkControlPlane = {
+    compute_cidr?: string | null;
+    overlay_ready: boolean;
+    /**
+     * Why its last overlay setup failed, with the fix, when it did.
+     */
+    setup_failure?: string | null;
+};
+
+export type PublicIngressCheck = {
+    ok: boolean;
+    steps: Array<PublicIngressCheckStep>;
+    summary: string;
+    /**
+     * The address that was dialled.
+     */
+    target?: string | null;
+};
+
+export type SetConnectorNodesRequest = {
+    node_ids: Array<number>;
+};
+
+/**
+ * `PUT /settings/cluster-network` answer.
+ */
+export type ClusterNetworkChangeResponse = {
+    reassigned: Array<ClusterNetworkReassignment>;
+    status: ClusterNetworkStatus;
+};
+
+export type PublicIngressCheckStep = {
+    message: string;
+    ok: boolean;
+    /**
+     * `address`, `http` or `https`.
+     */
+    step: string;
+};
+
+export type FieldKind = {
+    type: 'text';
+} | {
+    type: 'secret';
+} | {
+    provider_type?: string | null;
+    type: 'dns_provider';
+} | {
+    allow_subdomain?: boolean;
+    provider_field: string;
+    type: 'managed_domain';
+};
+
+export type PublicIngressInterface = {
+    address: string;
+    default_route: boolean;
+    name: string;
+    scope: AddressScope;
+};
+
+/**
+ * `GET /settings/cluster-network`.
+ */
+export type ClusterNetworkStatus = {
+    /**
+     * Whether `PUT` can change the pool now.
+     */
+    can_change: boolean;
+    /**
+     * Why it cannot: the members using the pool, or a control-plane setup
+     * in progress.
+     */
+    change_blocked_by: Array<string>;
+    compute_pool_cidr: string;
+    control_plane: ClusterNetworkControlPlane;
+    /**
+     * What a new cluster starts with.
+     */
+    default_compute_pool_cidr: string;
+    mesh_enabled: boolean;
+    /**
+     * The WireGuard mesh pool; a compute pool may not overlap it.
+     */
+    mesh_pool_cidr: string;
+    nodes: Array<ClusterNetworkNode>;
+    /**
+     * Whether an operator has confirmed the pool, or a member already uses
+     * it. The console asks for it once before adding the first node.
+     */
+    pool_confirmed: boolean;
+    subnet_prefix_len: number;
+};
+
+/**
+ * One IPv4 range a node already uses outside Temps (ADR 056).
+ */
+export type OccupiedRangeReport = {
+    /**
+     * IPv4 network, e.g. `172.20.0.0/16`.
+     */
+    cidr: string;
+    /**
+     * Device name for a route, network name for a Docker network.
+     */
+    name: string;
+    /**
+     * `route` (a host route) or `docker` (a Docker network's subnet).
+     */
+    source: string;
+};
+
+/**
+ * One question in a provider's setup form.
+ */
+export type SetupField = {
+    help?: string | null;
+    /**
+     * The key in `values` of the create request.
+     */
+    key: string;
+    kind: FieldKind;
+    label: string;
+    placeholder?: string | null;
+    required: boolean;
+};
+
+export type UpdatePublicIngressSettingsRequest = {
+    enabled: boolean;
+    http_port?: number | null;
+    https_port?: number | null;
+    /**
+     * Local address to bind, or `None` for automatic.
+     */
+    listen_address?: string | null;
+    /**
+     * What DNS points at, or `None` for the listen address.
+     */
+    public_address?: string | null;
+};
+
+export type CreateConnectorRequest = {
+    /**
+     * Lowercase letters, digits and hyphens; names the tunnel `temps-<name>`.
+     */
+    name: string;
+    /**
+     * Nodes that run a connector replica.
+     */
+    node_ids: Array<number>;
+    /**
+     * The provider's `kind`, from `GET /ingress/providers`.
+     */
+    provider: string;
+    /**
+     * Answers to the provider's setup fields, by field key. DNS provider
+     * fields take the provider's id; every other field takes a string.
+     */
+    values?: {
+        [key: string]: unknown;
+    };
+};
+
+/**
+ * What a worker that joins outbound only needs to bring its end of the mesh
+ * up and register over it (ADR 055): a pairing code without its secret.
+ */
+export type MeshEnrollResponse = {
+    /**
+     * SHA-256 fingerprint of the cluster CA the node API presents.
+     */
+    ca_fingerprint: string;
+    /**
+     * The control plane's mesh address; the node API listens there.
+     */
+    control_plane_address: string;
+    /**
+     * `ip:port` the worker dials.
+     */
+    control_plane_endpoint: string;
+    control_plane_public_key: string;
+    /**
+     * When the pairing and its token expire (RFC 3339).
+     */
+    expires_at: string;
+    /**
+     * Single-use join token bound to `name`, accepted only over the mesh
+     * node API from `node_address`.
+     */
+    join_token: string;
+    /**
+     * The mesh UDP port.
+     */
+    listen_port: number;
+    /**
+     * The name the pairing's join token is bound to.
+     */
+    name: string;
+    /**
+     * The worker's mesh address, reserved for it. It registers under it.
+     */
+    node_address: string;
+    /**
+     * TCP port of the node API on the control plane's mesh address.
+     */
+    node_api_port: number;
+    /**
+     * The pairing created for the worker.
+     */
+    pairing_id: number;
+    prefix_len: number;
+};
+
+export type PublicationView = {
+    hostname: string;
+    last_error?: string | null;
+    published_at?: string | null;
+    state: string;
+};
+
+export type ConnectorView = {
+    auto_publish: boolean;
+    created_at: string;
+    dns_provider_id?: number | null;
+    /**
+     * Where published hostnames point.
+     */
+    dns_target?: string | null;
+    domain: string;
+    edge_port: number;
+    external_id?: string | null;
+    id: number;
+    last_error?: string | null;
+    name: string;
+    nodes: Array<ConnectorNodeView>;
+    provider: string;
+    publications: Array<PublicationView>;
+    status: string;
+};
+
+/**
+ * What a provider is, for the console.
+ */
+export type ProviderInfo = {
+    dns: DnsHandling;
+    docs_url?: string | null;
+    fields: Array<SetupField>;
+    /**
+     * Stored on the connector, e.g. `cloudflare_tunnel`.
+     */
+    kind: string;
+    name: string;
+    /**
+     * Whether the worker needs a public address. Tunnels do not.
+     */
+    needs_public_ip: boolean;
+    /**
+     * What the operator needs before starting, one line each.
+     */
+    requirements: Array<string>;
+    summary: string;
+    /**
+     * Whether it works when the ISP puts the worker behind carrier-grade NAT.
+     */
+    works_behind_cgnat: boolean;
+};
+
+/**
+ * Body of `PUT /settings/cluster-network`.
+ */
+export type UpdateClusterNetworkRequest = {
+    /**
+     * New compute pool, an RFC 1918 IPv4 network such as `10.202.0.0/16`.
+     */
+    compute_pool_cidr: string;
+    /**
+     * Prefix of each node's subnet; keeps the current one when omitted.
+     */
+    subnet_prefix_len?: number | null;
+};
+
+export type PublicIngressSettings = {
+    /**
+     * Whether the agent reported its addresses: an agent that predates
+     * console-managed ingress never does, and keeps its flag.
+     */
+    agent_reports: boolean;
+    /**
+     * The listen address is not public but the public address is: traffic
+     * crosses a NAT, so the router must forward the ports.
+     */
+    behind_nat: boolean;
+    checked_at?: string | null;
+    /**
+     * The address DNS should point at, as far as Temps can tell.
+     */
+    effective_public_address?: string | null;
+    effective_public_scope?: AddressScope | null;
+    enabled: boolean;
+    http_port: number;
+    https_port: number;
+    interfaces: Array<PublicIngressInterface>;
+    last_check?: PublicIngressCheck | null;
+    last_error?: string | null;
+    /**
+     * Configured listen address; `None` means automatic.
+     */
+    listen_address?: string | null;
+    listener_error?: string | null;
+    listening_http?: string | null;
+    listening_https?: string | null;
+    mode?: IngressMode | null;
+    node_id: number;
+    /**
+     * Configured public address; `None` means the listen address.
+     */
+    public_address?: string | null;
+    running?: boolean | null;
+};
+
+/**
+ * Who can reach an address.
+ */
+export type AddressScope = 'public' | 'private' | 'cgnat' | 'local';
+
+/**
+ * A tunnel's live connections, read from the provider on request.
+ */
+export type ConnectorLinksView = {
+    links: Array<LinkView>;
+    /**
+     * The provider's own word for the tunnel (Cloudflare: `healthy`,
+     * `degraded`, `down`, `inactive`).
+     */
+    status: string;
+};
+
+/**
+ * A node whose allocation a change moved.
+ */
+export type ClusterNetworkReassignment = {
+    from: string;
+    node_id: number;
+    node_name: string;
+    to: string;
+};
+
+/**
+ * What a worker lets its control plane do with public ingress. Set on the
+ * worker only (`temps join --ingress`, `temps agent ingress`): opening ports
+ * on a machine is its owner's decision, whoever runs the control plane.
+ */
+export type IngressMode = 'off' | 'fixed' | 'delegated';
+
+/**
+ * Where a hostname stands with the tunnels, and why.
+ */
+export type HostnameView = {
+    /**
+     * The tunnels whose domain covers it.
+     */
+    candidates: Array<HostnameCandidate>;
+    /**
+     * The tunnel chosen for it, with mode `tunnel`.
+     */
+    chosen_connector_id?: number | null;
+    /**
+     * The tunnel that publishes it, or would once `detail` is dealt with.
+     */
+    connector_id?: number | null;
+    connector_name?: string | null;
+    /**
+     * What is happening; when it is not published, why and what to do.
+     */
+    detail: string;
+    hostname: string;
+    mode: HostnameMode;
+    published_at?: string | null;
+    /**
+     * Whether workers serve it. A tunnel only publishes those.
+     */
+    served_by_workers: boolean;
+    /**
+     * `published`, `pending`, `error` or `not_published`.
+     */
+    state: string;
+};
+
+export type InstallRepositoryRequest = {
+    grants?: PluginGrantConfig | null;
+    name?: string | null;
+    path?: string | null;
+    progressId?: string | null;
+    ref_name?: string | null;
+    repository_url: string;
+};
+
+export type InstallRepositoryResponse = {
+    message: string;
+    name: string;
+    platform: string;
+    sha256: string;
+    source_commit: string;
+    version: string;
+};
+
+export type InstallationReportingSettings = {
+    /**
+     * Opt in to sharing a plugin name and plugin-specific anonymous identifier
+     * with the official Temps registry after a verified install succeeds.
+     */
+    enabled: boolean;
+};
+
+/**
+ * A navigation entry that the plugin contributes to the Temps UI.
+ */
+export type NavEntry = {
+    /**
+     * Lucide icon name (e.g., "puzzle", "database", "activity")
+     */
+    icon: string;
+    /**
+     * Display label in the sidebar
+     */
+    label: string;
+    /**
+     * Sort order within the section (lower = higher in list)
+     */
+    order: number;
+    /**
+     * Client-side route path (e.g., "/my-plugin")
+     */
+    path: string;
+    /**
+     * Which sidebar section this entry belongs to
+     */
+    section: NavSection;
+};
+
+/**
+ * Where the plugin's nav entry appears in the Temps UI sidebar.
+ */
+export type NavSection = 'platform' | 'settings' | 'project';
+
+export type NpmRelease = {
+    binary_path: string;
+    integrity: string;
+    name: string;
+    version: string;
+};
+
+export type PlatformRelease = {
+    npm?: NpmRelease | null;
+    sha256: string;
+    url: string;
+};
+
+export type PluginActorInfo = {
+    active: boolean;
+    id: string;
+    name: string;
+};
+
+export type PluginAiCapability = {
+    configured: boolean;
+    daily_call_limit: number;
+    max_output_tokens: number;
+    max_prompt_bytes: number;
+    reason?: string | null;
+    setup_path: string;
+};
+
+/**
+ * What a plugin is allowed to do with the platform API over the channel.
+ *
+ * Coarse on purpose. Fine-grained authorization already exists in the
+ * permission system and is enforced per request against the acting user;
+ * this exists so an operator installing a binary can see at a glance
+ * whether it intends to *write* at all, without reading its source.
+ */
+export type PluginCapability = 'api_read' | 'api_write';
+
+export type PluginCatalogResponse = {
+    available: boolean;
+    plugins: Array<RegistryPlugin>;
+    reason?: string | null;
+    source: string;
+};
+
+export type PluginGrantsResponse = {
+    actor: PluginActorInfo;
+    ai: PluginAiCapability;
+    permissions: Array<PluginHostPermission>;
+    requested_permissions: Array<PluginHostPermission>;
+};
+
+/**
+ * The complete plugin manifest — the handshake contract.
+ */
+export type PluginManifest = {
+    /**
+     * What this plugin may do with the platform's own API over the channel.
+     *
+     * Empty by default, and empty means read-only channel queries and
+     * nothing else: a plugin that never asks cannot deploy, cannot create
+     * projects, and cannot provision databases. Declaring a capability is
+     * not by itself permission to act — every call still runs the real
+     * handler's `permission_guard!` as the user the plugin is acting for,
+     * so a capability can only ever narrow what that user could already do
+     * through the console.
+     */
+    capabilities?: Array<PluginCapability>;
+    /**
+     * Short description of what the plugin does
+     */
+    description?: string | null;
+    /**
+     * Human-readable display name
+     */
+    display_name?: string | null;
+    /**
+     * Platform event types the plugin subscribes to.
+     *
+     * When specified, Temps will POST matching events to the plugin's
+     * `/_events` endpoint. Uses dot-notation event names matching the
+     * webhook event types (e.g., "deployment.succeeded", "project.created").
+     *
+     * Available events:
+     * - `deployment.created`, `deployment.succeeded`, `deployment.failed`,
+     * `deployment.cancelled`, `deployment.ready`
+     * - `project.created`, `project.deleted`
+     * - `domain.created`, `domain.provisioned`
+     */
+    events?: Array<string>;
+    /**
+     * Health check endpoint path (relative to plugin root)
+     */
+    health_path?: string;
+    /**
+     * Suppress the console's own header strip above this plugin's UI.
+     *
+     * The console normally renders the plugin's icon, display name and
+     * version above the iframe. For a plugin whose UI is a full working
+     * surface with its own header, that is a second title bar competing
+     * for the same vertical space — and vertical space is exactly what a
+     * dense full-page layout has none of. Opt out and the frame gets the
+     * full height.
+     *
+     * The nav entry still names the plugin, so nothing becomes
+     * unidentifiable by setting this.
+     */
+    hide_header?: boolean;
+    /**
+     * Host-brokered operations requested by this plugin. These are requests,
+     * not authority: an administrator must grant each one separately.
+     */
+    host_permissions?: Array<PluginHostPermission>;
+    /**
+     * Unique plugin identifier (kebab-case, e.g., "backup-manager")
+     */
+    name: string;
+    /**
+     * Navigation entries for the UI sidebar
+     */
+    nav?: Array<NavEntry>;
+    /**
+     * Routes this plugin authenticates itself, which the platform's proxy
+     * therefore does not gate.
+     *
+     * Every other proxied route requires an authenticated caller before it
+     * reaches the plugin. That is right for anything a signed-in user
+     * drives, and wrong for the endpoints a plugin exposes to clients that
+     * hold no platform session — an agent in a sandbox presenting a
+     * capability token, a share link opened by someone with no account.
+     * This is the external-plugin counterpart of the in-process
+     * `configure_public_routes`.
+     *
+     * Paths are relative to the plugin's mount point and match by prefix,
+     * so `/webhooks/incoming` covers everything beneath it. A listed route is
+     * reachable by anyone who can reach the instance: it **must** check its
+     * own credential. Listing a route that does not is an open door.
+     */
+    public_paths?: Array<string>;
+    /**
+     * Whether the plugin needs database access
+     */
+    requires_db?: boolean;
+    /**
+     * Whether the plugin may read the platform's host data root.
+     *
+     * This is a highly privileged capability: the directory can contain
+     * encryption keys and instance-owned state. It is independent of direct
+     * database access and defaults to `false`.
+     */
+    requires_host_data_access?: boolean;
+    ui?: UiManifest | null;
+    /**
+     * SemVer version string
+     */
+    version: string;
+};
+
+export type PluginSourceResponse = {
+    builder_image: string;
+    commit: string;
+    kind: string;
+    path?: string | null;
+    ref_name: string;
+    repository_url: string;
+    version: string;
+};
+
+export type PluginStatusResponse = {
+    configured: boolean;
+    reason?: string | null;
+    setup_path: string;
+    source?: PluginSourceResponse | null;
+};
+
+export type ProgressSnapshot = {
+    elapsed_ms: number;
+    id: string;
+    stages: Array<ProgressStage>;
+    status: ProgressStatus;
+};
+
+export type ProgressStage = {
+    elapsed_ms: number;
+    message: string;
+    stage: string;
+    status: ProgressStatus;
+};
+
+export type ProgressStatus = 'running' | 'completed' | 'failed';
+
+export type RegistryPlugin = {
+    author: string;
+    category: string;
+    description: string;
+    docs_url?: string | null;
+    keywords?: Array<string>;
+    logo_url?: string | null;
+    name: string;
+    platforms: {
+        [key: string]: PlatformRelease;
+    };
+    repository?: string | null;
+    summary: string;
+    title: string;
+    version: string;
+};
+
+export type ReloadFailureResponse = {
+    plugin?: string | null;
+    reason: string;
+};
+
+/**
+ * Response from the reload endpoint.
+ */
+export type ReloadResponse = {
+    /**
+     * Activated installs that could not be verified or started.
+     */
+    failures: Array<ReloadFailureResponse>;
+    /**
+     * Number of plugins successfully loaded after reload
+     */
+    loaded: number;
+    /**
+     * Human-readable status message
+     */
+    message: string;
+    /**
+     * Names of loaded plugins
+     */
+    plugins: Array<string>;
+};
+
+export type RepositoryCatalogPermission = {
+    permission: PluginHostPermission;
+    reason: string;
+    required: boolean;
+};
+
+export type RepositoryCatalogPlugin = {
+    author: string;
+    category: string;
+    commit: string;
+    description: string;
+    docsUrl?: string | null;
+    latestVersion: string;
+    logoUrl?: string | null;
+    name: string;
+    path?: string | null;
+    /**
+     * Author-declared capabilities for display only; never used to grant access.
+     * None means the legacy catalog did not declare permissions.
+     */
+    permissions?: Array<RepositoryCatalogPermission>;
+    platforms: Array<string>;
+    readmeUrl?: string | null;
+    ref?: string | null;
+    repository: string;
+    screenshots: Array<RepositoryScreenshot>;
+    summary: string;
+    title: string;
+    validation: RepositoryValidation;
+};
+
+export type RepositoryCatalogResponse = {
+    available: boolean;
+    platform: string;
+    plugins: Array<RepositoryCatalogPlugin>;
+    reason?: string | null;
+    source: string;
+};
+
+export type RepositoryScreenshot = {
+    alt: string;
+    caption?: string | null;
+    url: string;
+};
+
+export type RepositoryValidation = {
+    build: string;
+    metadata: string;
+};
+
+/**
+ * Describes the plugin's embedded UI bundle.
+ */
+export type UiManifest = {
+    /**
+     * CSS files to load
+     */
+    css?: Array<string>;
+    /**
+     * JavaScript entry point filename relative to the bundle root
+     */
+    entry_js: string;
+    /**
+     * Client-side routes the plugin handles
+     */
+    routes?: Array<UiRoute>;
+};
+
+/**
+ * A client-side route provided by the plugin UI.
+ */
+export type UiRoute = {
+    /**
+     * Route path pattern (e.g., "/my-plugin", "/my-plugin/:id")
+     */
+    path: string;
+    /**
+     * Page title for breadcrumbs
+     */
+    title: string;
+};
+
+export type UninstallPluginResponse = {
+    data_preserved: boolean;
+    message: string;
+    name: string;
+};
+
+export type UpdateRepositoryRequest = {
+    ref_name?: string | null;
+};
+
+/**
+ * One page of tunnels, newest first.
+ */
+export type ConnectorList = {
+    connectors: Array<ConnectorView>;
+    total: number;
+    page: number;
+    page_size: number;
 };
 
 export type CiExecutorSettingsWritable = {
@@ -52283,7 +52890,11 @@ export type AdminRemoveNodeData = {
         /**
          * Remove the node even if containers Temps placed on it could not be
          * confirmed removed (e.g. the host is gone for good). Those containers
-         * are recorded as orphaned instead of being re-homed.
+         * are recorded as orphaned instead of being re-homed. On a node the
+         * control plane can no longer reach (no heartbeat for 90 seconds) this
+         * also covers containers deployments still serve from it:
+         * they are recorded as orphaned too and their environments listed in
+         * `lost_environments` (ADR 057).
          */
         force?: boolean;
     };
@@ -52300,7 +52911,7 @@ export type AdminRemoveNodeErrors = {
      */
     404: unknown;
     /**
-     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)
+     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first). For a node the control plane cannot reach that live deployments still serve from, `force_removes_serving` is set and `serving_environments` names them: force=true removes it anyway (ADR 057)
      */
     409: unknown;
     /**
@@ -81164,6 +81775,653 @@ export type TriggerWeeklyDigestResponses = {
 
 export type TriggerWeeklyDigestResponse = TriggerWeeklyDigestResponses[keyof TriggerWeeklyDigestResponses];
 
+export type IngestSentryEnvelopeData = {
+    /**
+     * Sentry envelope as binary data
+     */
+    body: string;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/{project_id}/envelope/';
+};
+
+export type IngestSentryEnvelopeErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Request body too large (exceeds 2 MiB)
+     */
+    413: unknown;
+};
+
+export type IngestSentryEnvelopeResponses = {
+    /**
+     * Envelope ingested
+     */
+    200: unknown;
+};
+
+export type IngestNelReportsData = {
+    body: string;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/{project_id}/nel/';
+};
+
+export type IngestNelReportsErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    415: unknown;
+    429: unknown;
+};
+
+export type IngestNelReportsResponses = {
+    200: unknown;
+};
+
+export type IngestSecurityReportsData = {
+    body: string;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/{project_id}/security/';
+};
+
+export type IngestSecurityReportsErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    413: unknown;
+    415: unknown;
+    429: unknown;
+};
+
+export type IngestSecurityReportsResponses = {
+    200: unknown;
+};
+
+export type IngestSentryEventData = {
+    body: SentryEventRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/{project_id}/store/';
+};
+
+export type IngestSentryEventErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Request body too large (exceeds 2 MiB)
+     */
+    413: unknown;
+};
+
+export type IngestSentryEventResponses = {
+    /**
+     * Event ingested
+     */
+    200: SentryEventResponse;
+};
+
+export type IngestSentryEventResponse = IngestSentryEventResponses[keyof IngestSentryEventResponses];
+
+export type ListAuditLogsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter logs by operation type (omit for all)
+         */
+        operation_type?: string;
+        /**
+         * Filter logs by user ID (omit for all users)
+         */
+        user_id?: number;
+        /**
+         * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
+         */
+        from?: string;
+        /**
+         * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
+         */
+        to?: string;
+        /**
+         * Maximum number of logs to return
+         */
+        limit?: number;
+        /**
+         * Number of logs to skip
+         */
+        offset?: number;
+    };
+    url: 'audit/logs';
+};
+
+export type ListAuditLogsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListAuditLogsResponses = {
+    /**
+     * List of audit logs
+     */
+    200: Array<AuditLogResponse>;
+};
+
+export type ListAuditLogsResponse = ListAuditLogsResponses[keyof ListAuditLogsResponses];
+
+export type GetAuditLogData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: 'audit/logs/{id}';
+};
+
+export type GetAuditLogErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Audit log not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAuditLogResponses = {
+    /**
+     * Audit log details
+     */
+    200: AuditLogResponse;
+};
+
+export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
+export type SyncIngressConnectorData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/sync';
+};
+
+export type SyncIngressConnectorErrors = {
+    404: unknown;
+    502: unknown;
+};
+
+export type SyncIngressConnectorResponses = {
+    200: ConnectorView;
+};
+
+export type SyncIngressConnectorResponse = SyncIngressConnectorResponses[keyof SyncIngressConnectorResponses];
+
+export type AdminGetNodePublicIngressSettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/settings';
+};
+
+export type AdminGetNodePublicIngressSettingsErrors = {
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminGetNodePublicIngressSettingsResponses = {
+    200: PublicIngressSettings;
+};
+
+export type AdminGetNodePublicIngressSettingsResponse = AdminGetNodePublicIngressSettingsResponses[keyof AdminGetNodePublicIngressSettingsResponses];
+
+export type AdminUpdateNodePublicIngressSettingsData = {
+    body: UpdatePublicIngressSettingsRequest;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/settings';
+};
+
+export type AdminUpdateNodePublicIngressSettingsErrors = {
+    /**
+     * Invalid address or ports, or not a worker
+     */
+    400: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminUpdateNodePublicIngressSettingsResponses = {
+    200: PublicIngressSettings;
+};
+
+export type AdminUpdateNodePublicIngressSettingsResponse = AdminUpdateNodePublicIngressSettingsResponses[keyof AdminUpdateNodePublicIngressSettingsResponses];
+
+export type DeleteIngressConnectorData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}';
+};
+
+export type DeleteIngressConnectorErrors = {
+    404: unknown;
+    502: unknown;
+};
+
+export type DeleteIngressConnectorResponses = {
+    204: void;
+};
+
+export type DeleteIngressConnectorResponse = DeleteIngressConnectorResponses[keyof DeleteIngressConnectorResponses];
+
+export type GetIngressConnectorData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}';
+};
+
+export type GetIngressConnectorErrors = {
+    404: unknown;
+};
+
+export type GetIngressConnectorResponses = {
+    200: ConnectorView;
+};
+
+export type GetIngressConnectorResponse = GetIngressConnectorResponses[keyof GetIngressConnectorResponses];
+
+export type UpdateIngressConnectorData = {
+    body: UpdateConnectorRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}';
+};
+
+export type UpdateIngressConnectorErrors = {
+    404: unknown;
+};
+
+export type UpdateIngressConnectorResponses = {
+    200: ConnectorView;
+};
+
+export type UpdateIngressConnectorResponse = UpdateIngressConnectorResponses[keyof UpdateIngressConnectorResponses];
+
+export type ClusterNetworkGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-network';
+};
+
+export type ClusterNetworkGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ClusterNetworkGetResponses = {
+    /**
+     * Cluster network
+     */
+    200: ClusterNetworkStatus;
+};
+
+export type ClusterNetworkGetResponse = ClusterNetworkGetResponses[keyof ClusterNetworkGetResponses];
+
+export type ClusterNetworkUpdateData = {
+    body: UpdateClusterNetworkRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-network';
+};
+
+export type ClusterNetworkUpdateErrors = {
+    /**
+     * Invalid pool, or it collides with the mesh pool, a node's address or a node's occupied range
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The pool is in use
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ClusterNetworkUpdateResponses = {
+    /**
+     * Pool changed
+     */
+    200: ClusterNetworkChangeResponse;
+};
+
+export type ClusterNetworkUpdateResponse = ClusterNetworkUpdateResponses[keyof ClusterNetworkUpdateResponses];
+
+export type MeshEnrollData = {
+    body: MeshEnrollApiRequest;
+    path?: never;
+    query?: never;
+    url: '/internal/nodes/mesh-enroll';
+};
+
+export type MeshEnrollErrors = {
+    /**
+     * Invalid name or WireGuard key
+     */
+    400: unknown;
+    /**
+     * Missing, unknown or unusable join token
+     */
+    403: unknown;
+    /**
+     * Mesh off or not ready, control plane not dialable, key in use, or too many pairings
+     */
+    409: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MeshEnrollResponses = {
+    /**
+     * Pairing created; register over the mesh next
+     */
+    201: MeshEnrollResponse;
+};
+
+export type MeshEnrollResponse2 = MeshEnrollResponses[keyof MeshEnrollResponses];
+
+export type ListIngressProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/providers';
+};
+
+export type ListIngressProvidersResponses = {
+    200: Array<ProviderInfo>;
+};
+
+export type ListIngressProvidersResponse = ListIngressProvidersResponses[keyof ListIngressProvidersResponses];
+
+export type AdminCheckNodePublicIngressData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/check';
+};
+
+export type AdminCheckNodePublicIngressErrors = {
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminCheckNodePublicIngressResponses = {
+    200: PublicIngressCheck;
+};
+
+export type AdminCheckNodePublicIngressResponse = AdminCheckNodePublicIngressResponses[keyof AdminCheckNodePublicIngressResponses];
+
+export type ListIngressConnectorsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number | null;
+        /**
+         * Number of items per page (default 20, max 100)
+         */
+        page_size?: number | null;
+    };
+    url: '/ingress/connectors';
+};
+
+export type ListIngressConnectorsResponses = {
+    200: ConnectorList;
+};
+
+export type ListIngressConnectorsResponse = ListIngressConnectorsResponses[keyof ListIngressConnectorsResponses];
+
+export type CreateIngressConnectorData = {
+    body: CreateConnectorRequest;
+    path?: never;
+    query?: never;
+    url: '/ingress/connectors';
+};
+
+export type CreateIngressConnectorErrors = {
+    /**
+     * Invalid name, setup answers or nodes
+     */
+    400: unknown;
+    /**
+     * A worker has not delegated public ingress
+     */
+    409: unknown;
+    /**
+     * The provider refused; the detail says what to fix
+     */
+    502: unknown;
+};
+
+export type CreateIngressConnectorResponses = {
+    201: ConnectorView;
+};
+
+export type CreateIngressConnectorResponse = CreateIngressConnectorResponses[keyof CreateIngressConnectorResponses];
+
+export type GetIngressConnectorLinksData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/links';
+};
+
+export type GetIngressConnectorLinksErrors = {
+    /**
+     * The tunnel is not created yet
+     */
+    400: unknown;
+    404: unknown;
+    /**
+     * The provider could not be asked
+     */
+    502: unknown;
+};
+
+export type GetIngressConnectorLinksResponses = {
+    200: ConnectorLinksView;
+};
+
+export type GetIngressConnectorLinksResponse = GetIngressConnectorLinksResponses[keyof GetIngressConnectorLinksResponses];
+
+export type SetIngressConnectorNodesData = {
+    body: SetConnectorNodesRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/nodes';
+};
+
+export type SetIngressConnectorNodesErrors = {
+    404: unknown;
+};
+
+export type SetIngressConnectorNodesResponses = {
+    200: ConnectorView;
+};
+
+export type SetIngressConnectorNodesResponse = SetIngressConnectorNodesResponses[keyof SetIngressConnectorNodesResponses];
+
+export type ListIngressHostnamesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/hostnames';
+};
+
+export type ListIngressHostnamesResponses = {
+    200: Array<HostnameView>;
+};
+
+export type ListIngressHostnamesResponse = ListIngressHostnamesResponses[keyof ListIngressHostnamesResponses];
+
+export type GetIngressHostnameData = {
+    body?: never;
+    path: {
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/hostnames/{hostname}';
+};
+
+export type GetIngressHostnameErrors = {
+    400: unknown;
+};
+
+export type GetIngressHostnameResponses = {
+    200: HostnameView;
+};
+
+export type GetIngressHostnameResponse = GetIngressHostnameResponses[keyof GetIngressHostnameResponses];
+
+export type SetIngressHostnameChoiceData = {
+    body: SetHostnameChoiceRequest;
+    path: {
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/hostnames/{hostname}';
+};
+
+export type SetIngressHostnameChoiceErrors = {
+    /**
+     * Invalid hostname, or the tunnel cannot publish it
+     */
+    400: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+};
+
+export type SetIngressHostnameChoiceResponses = {
+    200: HostnameView;
+};
+
+export type SetIngressHostnameChoiceResponse = SetIngressHostnameChoiceResponses[keyof SetIngressHostnameChoiceResponses];
+
 export type ListExternalPluginsData = {
     body?: never;
     path?: never;
@@ -81527,213 +82785,3 @@ export type UpdateRepositoryResponses = {
 };
 
 export type UpdateRepositoryResponse = UpdateRepositoryResponses[keyof UpdateRepositoryResponses];
-
-export type IngestSentryEnvelopeData = {
-    /**
-     * Sentry envelope as binary data
-     */
-    body: string;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-    };
-    query?: never;
-    url: '/{project_id}/envelope/';
-};
-
-export type IngestSentryEnvelopeErrors = {
-    /**
-     * Bad request
-     */
-    400: unknown;
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Request body too large (exceeds 2 MiB)
-     */
-    413: unknown;
-};
-
-export type IngestSentryEnvelopeResponses = {
-    /**
-     * Envelope ingested
-     */
-    200: unknown;
-};
-
-export type IngestNelReportsData = {
-    body: string;
-    path: {
-        project_id: number;
-    };
-    query?: never;
-    url: '/{project_id}/nel/';
-};
-
-export type IngestNelReportsErrors = {
-    400: unknown;
-    401: unknown;
-    403: unknown;
-    413: unknown;
-    415: unknown;
-    429: unknown;
-};
-
-export type IngestNelReportsResponses = {
-    200: unknown;
-};
-
-export type IngestSecurityReportsData = {
-    body: string;
-    path: {
-        project_id: number;
-    };
-    query?: never;
-    url: '/{project_id}/security/';
-};
-
-export type IngestSecurityReportsErrors = {
-    400: unknown;
-    401: unknown;
-    403: unknown;
-    413: unknown;
-    415: unknown;
-    429: unknown;
-};
-
-export type IngestSecurityReportsResponses = {
-    200: unknown;
-};
-
-export type IngestSentryEventData = {
-    body: SentryEventRequest;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-    };
-    query?: never;
-    url: '/{project_id}/store/';
-};
-
-export type IngestSentryEventErrors = {
-    /**
-     * Bad request
-     */
-    400: unknown;
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Request body too large (exceeds 2 MiB)
-     */
-    413: unknown;
-};
-
-export type IngestSentryEventResponses = {
-    /**
-     * Event ingested
-     */
-    200: SentryEventResponse;
-};
-
-export type IngestSentryEventResponse = IngestSentryEventResponses[keyof IngestSentryEventResponses];
-
-export type ListAuditLogsData = {
-    body?: never;
-    path?: never;
-    query?: {
-        /**
-         * Filter logs by operation type (omit for all)
-         */
-        operation_type?: string;
-        /**
-         * Filter logs by user ID (omit for all users)
-         */
-        user_id?: number;
-        /**
-         * Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
-         */
-        from?: string;
-        /**
-         * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
-         */
-        to?: string;
-        /**
-         * Maximum number of logs to return
-         */
-        limit?: number;
-        /**
-         * Number of logs to skip
-         */
-        offset?: number;
-    };
-    url: 'audit/logs';
-};
-
-export type ListAuditLogsErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type ListAuditLogsResponses = {
-    /**
-     * List of audit logs
-     */
-    200: Array<AuditLogResponse>;
-};
-
-export type ListAuditLogsResponse = ListAuditLogsResponses[keyof ListAuditLogsResponses];
-
-export type GetAuditLogData = {
-    body?: never;
-    path: {
-        id: number;
-    };
-    query?: never;
-    url: 'audit/logs/{id}';
-};
-
-export type GetAuditLogErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Audit log not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetAuditLogResponses = {
-    /**
-     * Audit log details
-     */
-    200: AuditLogResponse;
-};
-
-export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];

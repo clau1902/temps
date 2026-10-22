@@ -2806,6 +2806,16 @@ fn ai_read_allowlist() -> Vec<String> {
         "lookup_dns_a_records",
         // Flat vs. wildcard subdomain preview mode for DNS providers.
         "preview_hostname_mode",
+        // ── Ingress tunnels (ADR 058) ──
+        // Tunnels, where they run, which hostnames each publishes and why
+        // one is not published. Connector secrets never leave the service;
+        // the views carry ids, names, states and provider error text only.
+        "list_ingress_providers",
+        "list_ingress_connectors",
+        "get_ingress_connector",
+        "get_ingress_connector_links",
+        "list_ingress_hostnames",
+        "get_ingress_hostname",
         // ── User preferences + cluster metadata ──
         // Notification preferences for the current user — no credentials.
         "get_preferences",
@@ -3012,6 +3022,8 @@ fn ai_read_allowlist() -> Vec<String> {
         "admin_get_node",
         "admin_list_node_containers",
         "admin_drain_status",
+        "admin_get_node_public_ingress_settings",
+        "ClusterNetworkGet",
         "NodePairingList",
         "WireguardMeshStatusGet",
         "get_private_ip",
@@ -3094,6 +3106,17 @@ fn ai_write_allowlist() -> Vec<String> {
         //    account-global domain create/delete excluded) ──
         "add_environment_domain",
         "delete_environment_domain",
+        // ── Ingress tunnels (ADR 058 D9, D10) ──
+        // Put one hostname through a tunnel (or none), re-sync a tunnel, or
+        // create one for an already managed zone; the human approves each
+        // like every write. Left out on purpose, because one call withdraws
+        // the DNS of every hostname a tunnel carries: deleting it
+        // (`delete_ingress_connector`), emptying its workers
+        // (`set_ingress_connector_nodes`) and switching it to chosen names
+        // only (`update_ingress_connector`). Those stay in the console.
+        "set_ingress_hostname_choice",
+        "sync_ingress_connector",
+        "create_ingress_connector",
         // ── Managed external services (databases, caches, etc.) —
         //    provisioning a new container and linking an existing
         //    one to a project. Both reversible (a service can be
@@ -3859,6 +3882,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering FlagsPlugin");
     let flags_plugin = Box::new(FlagsPlugin::new());
     plugin_manager.register_plugin(flags_plugin);
+
+    // 5.4. IngressPlugin - ingress connectors such as Cloudflare Tunnel
+    // (ADR 058; depends on the DNS plugin and the shared route table)
+    debug!("Registering IngressPlugin");
+    plugin_manager.register_plugin(Box::new(temps_ingress::IngressPlugin::new()));
 
     // 5.5. EnvironmentsPlugin - provides environment management (depends on config)
     debug!("Registering EnvironmentsPlugin");
@@ -5003,6 +5031,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     });
     let route_sync_routes =
         temps_routes::route_sync::configure_routes().with_state(route_sync_state);
+    // Node-token endpoints for ingress connectors (ADR 058): the agent pulls
+    // what to run and reports how it is doing.
+    let ingress_node_routes =
+        temps_ingress::node_routes(Arc::new(temps_ingress::IngressNodeState {
+            db: db.clone(),
+            service: plugin_manager
+                .service_context()
+                .require_service::<temps_ingress::IngressConnectorService>(),
+        }));
 
     // Build the split application: public routes (event ingest, AI gateway,
     // session replay ingest, etc.) and admin routes (auth, dashboard, CRUD).
@@ -5137,7 +5174,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // Agent-facing node + route-sync routes are public (workers anywhere on
     // the internet POST to them with bearer tokens).
-    let public_router = split.public.merge(node_routes).merge(route_sync_routes);
+    let public_router = split
+        .public
+        .merge(node_routes)
+        .merge(route_sync_routes)
+        .merge(ingress_node_routes);
 
     // Use the caller-supplied admin-gate when present (so the proxy and the
     // console share one source of truth) and otherwise build a fresh one.
