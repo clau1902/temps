@@ -3102,6 +3102,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "update_automatic_deploy",
         "update_git_settings",
         "reinstall_gitlab_webhook",
+        "reinstall_github_webhook",
         // ── Environment variables (set / change) ──
         "create_environment_variable",
         "update_environment_variable",
@@ -6744,6 +6745,7 @@ mod ai_tool_allowlist_tests {
             "update_environment_settings",
             "update_git_settings",
             "reinstall_gitlab_webhook",
+            "reinstall_github_webhook",
         ] {
             assert!(
                 writes.contains(operation),
