@@ -50,6 +50,7 @@ import type {
   SecretResponse as AgentSecret,
   UpsertSecretRequest as CreateSecretRequest,
 } from '@/api/client/types.gen'
+import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { secretScopeLabel, secretScopeQuery } from './secretScope'
 
 export function AgentSecrets() {
@@ -276,6 +277,12 @@ function SecretDialog({
   const [value, setValue] = useState('')
   const [mountPath, setMountPath] = useState(secret?.mount_path ?? '')
   const [description, setDescription] = useState(secret?.description ?? '')
+  // `null` is instance-wide. A secret's scope is part of its identity (the
+  // same name can exist in several scopes), so an edit keeps it; moving one
+  // means adding it in the new scope and deleting the old row.
+  const [scopeProjectId, setScopeProjectId] = useState<number | null>(
+    secret?.project_id ?? null
+  )
 
   const handleSubmit = () => {
     if (!name.trim()) {
@@ -305,8 +312,11 @@ function SecretDialog({
 
     onSubmit({
       name: name.trim(),
-      // Editing keeps the secret in its scope; a new secret is instance-wide.
-      ...(secret ? secretScopeQuery(secret) : undefined),
+      ...(secret
+        ? secretScopeQuery(secret)
+        : scopeProjectId == null
+          ? undefined
+          : { project_id: scopeProjectId }),
       secret_type: secretType,
       value: value.trim(),
       mount_path: secretType === 'file' ? mountPath.trim() : undefined,
@@ -352,6 +362,25 @@ function SecretDialog({
                   </code>
                 </>
               )}
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>Scope</Label>
+            <ProjectSelect
+              ariaLabel="Scope"
+              allLabel="Instance-wide (every project)"
+              value={scopeProjectId}
+              onValueChange={setScopeProjectId}
+              disabled={isEdit}
+              className="sm:w-full"
+            />
+            <p className="text-xs text-muted-foreground">
+              {isEdit
+                ? 'The scope of an existing secret cannot be changed. To move it, add it again in the new scope, then delete this one.'
+                : scopeProjectId == null
+                  ? "Injected into every project's agents."
+                  : "Injected only into this project's agents. It takes precedence over an instance-wide secret of the same name."}
             </p>
           </div>
 

@@ -135,3 +135,102 @@ test('editing the project row keeps the secret in its project scope', async () =
   })
   api.restore()
 })
+
+function projectsResponse() {
+  return jsonResponse({
+    projects: [{ id: 3, slug: 'shop', name: 'Shop' }],
+    total: 1,
+    page: 1,
+    per_page: 100,
+  })
+}
+
+async function fillNewSecret(view: ReturnType<typeof renderPage>) {
+  await act(async () => {
+    fireEvent.click(await view.findByRole('button', { name: /^Add Secret/ }))
+  })
+  await act(async () => {
+    fireEvent.change(await view.findByLabelText('Name'), {
+      target: { value: 'DB_PASSWORD' },
+    })
+    fireEvent.change(view.getByLabelText('Value'), {
+      target: { value: 'new-value' },
+    })
+  })
+}
+
+test('a new secret can be scoped to one project', async () => {
+  const bodies: unknown[] = []
+  const api = mockApi({
+    'GET /settings/secrets': listResponse,
+    'GET /projects': projectsResponse,
+    'POST /settings/secrets': async (request) => {
+      bodies.push(await request.json())
+      return jsonResponse(SECRETS[1], 201)
+    },
+  })
+  const view = renderPage()
+  await fillNewSecret(view)
+  await act(async () => {
+    fireEvent.click(view.getByRole('combobox', { name: 'Scope' }))
+  })
+  await act(async () => {
+    fireEvent.click(await view.findByText('Shop'))
+  })
+  expect(
+    await view.findByText("Injected only into this project's agents.", {
+      exact: false,
+    })
+  ).toBeTruthy()
+  await act(async () => {
+    fireEvent.click(view.getByRole('button', { name: 'Save Secret' }))
+  })
+  await waitFor(() => expect(bodies.length).toBe(1))
+  expect(bodies[0]).toMatchObject({ name: 'DB_PASSWORD', project_id: 3 })
+  api.restore()
+})
+
+test('a new secret left on the default scope is instance-wide', async () => {
+  const bodies: Record<string, unknown>[] = []
+  const api = mockApi({
+    'GET /settings/secrets': listResponse,
+    'GET /projects': projectsResponse,
+    'POST /settings/secrets': async (request) => {
+      bodies.push(await request.json())
+      return jsonResponse(SECRETS[0], 201)
+    },
+  })
+  const view = renderPage()
+  await fillNewSecret(view)
+  expect(view.getByRole('combobox', { name: 'Scope' }).textContent).toContain(
+    'Instance-wide (every project)'
+  )
+  await act(async () => {
+    fireEvent.click(view.getByRole('button', { name: 'Save Secret' }))
+  })
+  await waitFor(() => expect(bodies.length).toBe(1))
+  expect(bodies[0].name).toBe('DB_PASSWORD')
+  expect('project_id' in bodies[0]).toBe(false)
+  api.restore()
+})
+
+test('editing shows the scope but explains how to move the secret instead', async () => {
+  const api = mockApi({
+    'GET /settings/secrets': listResponse,
+    'GET /projects': projectsResponse,
+  })
+  const view = renderPage()
+  await act(async () => {
+    fireEvent.click(
+      await view.findByLabelText('Edit API_TOKEN (Instance-wide)')
+    )
+  })
+  const scope = await view.findByRole('combobox', { name: 'Scope' })
+  expect(scope.hasAttribute('disabled')).toBe(true)
+  expect(
+    view.getByText('add it again in the new scope, then delete this one', {
+      exact: false,
+    })
+  ).toBeTruthy()
+  api.restore()
+})
