@@ -13465,3 +13465,602 @@ mod tests {
             .is_some());
     }
 }
+
+/// The `/ai/conversations/{id}` and `/ai/pending-actions/{id}` mutations,
+/// driven through the real handlers. The state's database is a mock that
+/// records every statement, so each test can show not only the status a
+/// caller gets but that a refused call changed nothing.
+#[cfg(test)]
+mod user_route_authorization_tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Statement};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temps_auth::permissions::Role;
+
+    struct NoModel;
+
+    #[async_trait::async_trait]
+    impl temps_ai::AiService for NoModel {
+        async fn is_available(&self) -> bool {
+            false
+        }
+
+        async fn complete(
+            &self,
+            _request: temps_ai::AiRequest,
+        ) -> Result<temps_ai::AiResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn chat_stream_turn(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::ChatTurnStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+    }
+
+    struct NoQueue;
+
+    #[async_trait::async_trait]
+    impl temps_core::JobQueue for NoQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            panic!("authorization tests never subscribe to the job queue")
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingAudit(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl AuditLogger for CountingAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> anyhow::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct Harness {
+        state: Arc<AppState>,
+        db: Arc<DatabaseConnection>,
+        audit: Arc<CountingAudit>,
+    }
+
+    impl Harness {
+        fn new(mock: MockDatabase) -> Self {
+            let db = Arc::new(mock.into_connection());
+            let encryption = Arc::new(
+                temps_core::EncryptionService::new(&"0".repeat(64)).expect("test encryption key"),
+            );
+            let server_config = Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    None,
+                )
+                .expect("test server config"),
+            );
+            let config = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
+            let queue: Arc<dyn temps_core::JobQueue> = Arc::new(NoQueue);
+            // Never dialled: these handlers do not reach Docker, and an HTTP
+            // client needs no socket to exist, so the tests run without one.
+            let docker = Arc::new(
+                bollard::Docker::connect_with_http(
+                    "http://127.0.0.1:2375",
+                    4,
+                    bollard::API_DEFAULT_VERSION,
+                )
+                .expect("unconnected Docker client"),
+            );
+            let external = Arc::new(temps_providers::ExternalServiceManager::new(
+                db.clone(),
+                encryption.clone(),
+                docker,
+                Arc::new(temps_providers::DnsRegistry::new(db.clone())),
+            ));
+            let git = Arc::new(temps_git::GitProviderManager::new(
+                db.clone(),
+                encryption.clone(),
+                queue.clone(),
+                config.clone(),
+            ));
+            let environments = Arc::new(temps_environments::EnvironmentService::new(
+                db.clone(),
+                config.clone(),
+            ));
+            let project_service = Arc::new(temps_projects::ProjectService::new(
+                db.clone(),
+                queue,
+                config,
+                external,
+                git,
+                environments,
+                encryption.clone(),
+            ));
+            let audit = Arc::new(CountingAudit::default());
+            let state = Arc::new(AppState {
+                service: Arc::new(crate::ConversationService::new(
+                    db.clone(),
+                    Arc::new(NoModel),
+                    Vec::new(),
+                )),
+                db: db.clone(),
+                audit_service: audit.clone(),
+                pending_actions: Arc::new(PendingActionService::new(
+                    db.clone(),
+                    Arc::new(temps_ai_api_tools::WriteApiToolsHandle::new()),
+                    encryption.clone(),
+                )),
+                applications: Arc::new(crate::ApplicationService::new(db.clone())),
+                goals: Arc::new(crate::goals::GoalService::new(db.clone())),
+                secret_slots: Arc::new(crate::secret_slots::SecretSlotService::new(
+                    db.clone(),
+                    encryption,
+                )),
+                assistant_attachments: Arc::new(
+                    crate::attachments::AssistantAttachmentService::new(db.clone()),
+                ),
+                attachment_uploads: Arc::new(crate::attachment_uploads::UploadSessions::new()),
+                project_service,
+                application_workspaces: Arc::new(crate::ApplicationWorkspaceService::new(
+                    std::env::temp_dir(),
+                )),
+                config_service: None,
+                application_sandboxes: None,
+                sandbox_snapshots: None,
+                source_drop_deployer: None,
+                project_access_checker: None,
+                application_terminal: None,
+            });
+            Self { state, db, audit }
+        }
+
+        fn state(&self) -> State<Arc<AppState>> {
+            State(self.state.clone())
+        }
+
+        /// Release the state and return the statements the handler issued and
+        /// the number of audit entries it wrote.
+        fn finish(self) -> (Vec<Statement>, usize) {
+            let Harness { state, db, audit } = self;
+            drop(state);
+            let db = Arc::try_unwrap(db)
+                .unwrap_or_else(|_| panic!("a service outlived the state it was built for"));
+            let statements = db
+                .into_transaction_log()
+                .into_iter()
+                .flat_map(|transaction| transaction.statements().to_vec())
+                .collect();
+            (statements, audit.0.load(Ordering::SeqCst))
+        }
+    }
+
+    fn writes(statements: &[Statement]) -> Vec<&Statement> {
+        statements
+            .iter()
+            .filter(|statement| !statement.sql.trim_start().starts_with("SELECT"))
+            .collect()
+    }
+
+    /// Whether `statement` binds `value`, e.g. the status it writes.
+    fn binds(statement: &Statement, value: &str) -> bool {
+        format!("{:?}", statement.values).contains(value)
+    }
+
+    fn owner() -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 1,
+            name: "Owner".to_string(),
+            email: "owner@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// An API key of `role` owned by the conversation's owner.
+    fn key(role: Role) -> RequireAuth {
+        RequireAuth(AuthContext::new_api_key(
+            owner(),
+            Some(role),
+            None,
+            "test-key".to_string(),
+            1,
+        ))
+    }
+
+    fn metadata() -> Extension<RequestMetadata> {
+        Extension(RequestMetadata {
+            ip_address: "203.0.113.7".to_string(),
+            user_agent: "authorization-test".to_string(),
+            headers: HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost:3000".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        })
+    }
+
+    fn conversation(
+        context_type: &str,
+        status: &str,
+        turn_status: &str,
+    ) -> ai_conversations::Model {
+        let now = chrono::Utc::now();
+        let assistant = context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
+        ai_conversations::Model {
+            id: 10,
+            public_id: "conv_1".to_string(),
+            project_id: (!assistant).then_some(1),
+            application_id: None,
+            context_type: context_type.to_string(),
+            context_id: "1".to_string(),
+            title: None,
+            status: status.to_string(),
+            kind: "ai".to_string(),
+            created_by: 1,
+            metadata: None,
+            created_at: now,
+            last_activity_at: now,
+            ai_provider: "openrouter".to_string(),
+            ai_model: "default".to_string(),
+            ai_thinking_level: None,
+            ai_permission_mode: "ask".to_string(),
+            cli_session_id: None,
+            cli_session_fingerprint: None,
+            turn_status: turn_status.to_string(),
+            active_turn_id: None,
+            last_turn_id: None,
+            turn_started_at: None,
+            next_step_suggestions: None,
+        }
+    }
+
+    fn with_status(
+        mut conversation: ai_conversations::Model,
+        status: &str,
+    ) -> ai_conversations::Model {
+        conversation.status = status.to_string();
+        conversation
+    }
+
+    fn proposed_action(required_permission: Option<&str>) -> ai_pending_actions::Model {
+        let now = chrono::Utc::now();
+        ai_pending_actions::Model {
+            id: 20,
+            public_id: "act_1".to_string(),
+            conversation_id: 10,
+            message_id: None,
+            project_id: Some(1),
+            plan_public_id: None,
+            step_index: 0,
+            operation_id: "create_deployment".to_string(),
+            method: "POST".to_string(),
+            summary: "POST /projects/1/deployments".to_string(),
+            params: serde_json::json!({}),
+            required_permission: required_permission.map(str::to_string),
+            status: "proposed".to_string(),
+            result: None,
+            error: None,
+            created_by: 1,
+            confirmed_by: None,
+            created_at: now,
+            confirmed_at: None,
+            executed_at: None,
+        }
+    }
+
+    fn status_of<T: IntoResponse>(result: Result<T, Problem>) -> StatusCode {
+        match result {
+            Ok(response) => response.into_response().status(),
+            Err(problem) => problem.status_code,
+        }
+    }
+
+    /// One mutation route, called with a key and a conversation lookup.
+    #[derive(Clone, Copy, Debug)]
+    enum Mutation {
+        Rename,
+        Archive,
+        Restore,
+        Stop,
+    }
+
+    impl Mutation {
+        const ALL: [Mutation; 4] = [
+            Mutation::Rename,
+            Mutation::Archive,
+            Mutation::Restore,
+            Mutation::Stop,
+        ];
+
+        async fn call(self, harness: &Harness, auth: RequireAuth) -> StatusCode {
+            let id = Path("conv_1".to_string());
+            match self {
+                Mutation::Rename => status_of(
+                    rename_user_conversation(
+                        auth,
+                        harness.state(),
+                        metadata(),
+                        id,
+                        Json(RenameConversationRequest {
+                            title: "Renamed by the key".to_string(),
+                        }),
+                    )
+                    .await,
+                ),
+                Mutation::Archive => status_of(
+                    archive_user_conversation(auth, harness.state(), metadata(), id).await,
+                ),
+                Mutation::Restore => status_of(
+                    restore_user_conversation(auth, harness.state(), metadata(), id).await,
+                ),
+                Mutation::Stop => status_of(stop_user_turn(auth, harness.state(), id).await),
+            }
+        }
+    }
+
+    // The issue: a reader key owned by the conversation's owner changed it.
+    // Every route now refuses it after the ownership lookup, before writing
+    // or auditing anything.
+    #[tokio::test]
+    async fn read_only_keys_cannot_mutate_their_owners_conversations() {
+        for mutation in Mutation::ALL {
+            for context_type in ["project", "deployment", "global"] {
+                for role in [Role::Reader, Role::ApiReader] {
+                    let harness = Harness::new(
+                        MockDatabase::new(DatabaseBackend::Postgres).append_query_results(vec![
+                            vec![conversation(context_type, "active", "running")],
+                        ]),
+                    );
+
+                    let status = mutation.call(&harness, key(role.clone())).await;
+
+                    let (statements, audits) = harness.finish();
+                    let case = format!("{mutation:?} by {role:?} on a {context_type} chat");
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{case}");
+                    assert_eq!(statements.len(), 1, "{case}: only the ownership lookup");
+                    assert!(writes(&statements).is_empty(), "{case}: {statements:?}");
+                    assert_eq!(audits, 0, "{case}");
+                }
+            }
+        }
+    }
+
+    // The same routes still work for a key that holds projects:write, and
+    // each makes exactly the state change it names.
+    #[tokio::test]
+    async fn project_writers_still_rename_archive_restore_and_stop() {
+        let cases = [
+            (
+                Mutation::Rename,
+                conversation("project", "active", "idle"),
+                StatusCode::OK,
+                "Renamed by the key",
+            ),
+            (
+                Mutation::Archive,
+                conversation("project", "active", "idle"),
+                StatusCode::NO_CONTENT,
+                "archived",
+            ),
+            (
+                Mutation::Restore,
+                conversation("project", "archived", "idle"),
+                StatusCode::NO_CONTENT,
+                "active",
+            ),
+        ];
+        for (mutation, before, expected, change) in cases {
+            let updated = with_status(before.clone(), "updated");
+            let harness = Harness::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![before]])
+                    .append_query_results(vec![vec![updated]]),
+            );
+
+            let status = mutation.call(&harness, key(Role::User)).await;
+
+            let (statements, audits) = harness.finish();
+            assert_eq!(status, expected, "{mutation:?}");
+            let writes = writes(&statements);
+            assert_eq!(writes.len(), 1, "{mutation:?}: {statements:?}");
+            assert!(
+                binds(writes[0], change),
+                "{mutation:?} must write {change}: {:?}",
+                writes[0]
+            );
+            assert_eq!(audits, 1, "{mutation:?}");
+        }
+
+        // Stopping clears a running turn with a guarded update.
+        let harness = Harness::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![conversation("project", "active", "running")]])
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }]),
+        );
+        let status = Mutation::Stop.call(&harness, key(Role::User)).await;
+        let (statements, _) = harness.finish();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let writes = writes(&statements);
+        assert_eq!(writes.len(), 1, "{statements:?}");
+        assert!(binds(writes[0], "cancelled"), "{:?}", writes[0]);
+    }
+
+    // Permission is decided before the archive's own state rule: a reader
+    // learns nothing about a running turn, a writer gets the real conflict,
+    // and neither changes the conversation.
+    #[tokio::test]
+    async fn archiving_a_running_turn_is_refused_without_a_write() {
+        for (role, expected) in [
+            (Role::Reader, StatusCode::FORBIDDEN),
+            (Role::User, StatusCode::CONFLICT),
+        ] {
+            let harness = Harness::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![conversation("project", "active", "running")]]),
+            );
+
+            let status = Mutation::Archive.call(&harness, key(role.clone())).await;
+
+            let (statements, audits) = harness.finish();
+            assert_eq!(status, expected, "{role:?}");
+            assert!(writes(&statements).is_empty(), "{role:?}: {statements:?}");
+            assert_eq!(audits, 0, "{role:?}");
+        }
+    }
+
+    // A reader may start an assistant chat and message it, so it may also
+    // archive and restore it; the archive round trip still lands.
+    #[tokio::test]
+    async fn readers_still_manage_their_assistant_chats() {
+        for (mutation, before, change) in [
+            (
+                Mutation::Archive,
+                conversation("assistant", "active", "idle"),
+                "archived",
+            ),
+            (
+                Mutation::Restore,
+                conversation("assistant", "archived", "idle"),
+                "active",
+            ),
+        ] {
+            let updated = with_status(before.clone(), "updated");
+            let harness = Harness::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![before]])
+                    .append_query_results(vec![vec![updated]]),
+            );
+
+            let status = mutation.call(&harness, key(Role::Reader)).await;
+
+            let (statements, audits) = harness.finish();
+            assert_eq!(status, StatusCode::NO_CONTENT, "{mutation:?}");
+            let writes = writes(&statements);
+            assert_eq!(writes.len(), 1, "{mutation:?}: {statements:?}");
+            assert!(binds(writes[0], change), "{:?}", writes[0]);
+            assert_eq!(audits, 1, "{mutation:?}");
+        }
+    }
+
+    async fn reject(harness: &Harness, auth: RequireAuth) -> StatusCode {
+        status_of(
+            reject_user_pending_action(
+                auth,
+                None,
+                harness.state(),
+                metadata(),
+                Path("act_1".to_string()),
+            )
+            .await,
+        )
+    }
+
+    /// The reads every reject makes before deciding: the owned action, its
+    /// conversation, and the service's own load of the action.
+    fn reject_lookups(action: ai_pending_actions::Model) -> MockDatabase {
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![action.clone()]])
+            .append_query_results(vec![vec![conversation("assistant", "active", "idle")]])
+            .append_query_results(vec![vec![action]])
+    }
+
+    // The issue: a reader key rejected a proposal its owner meant to approve.
+    // It is refused before the claim, so the proposal stays proposed.
+    #[tokio::test]
+    async fn read_only_keys_cannot_reject_their_owners_proposals() {
+        for permission in [Some("deployments:create"), None] {
+            for role in [Role::Reader, Role::ApiReader] {
+                let harness = Harness::new(reject_lookups(proposed_action(permission)));
+
+                let status = reject(&harness, key(role.clone())).await;
+
+                let (statements, audits) = harness.finish();
+                let case = format!("{role:?} rejecting an action requiring {permission:?}");
+                assert_eq!(status, StatusCode::FORBIDDEN, "{case}");
+                assert_eq!(statements.len(), 3, "{case}: lookups only");
+                assert!(writes(&statements).is_empty(), "{case}: {statements:?}");
+                assert_eq!(audits, 0, "{case}");
+            }
+        }
+    }
+
+    // A key that could approve the action may reject it. The claim is still
+    // the atomic, status-guarded update, so a concurrent confirm that got
+    // there first wins and this reject reports a conflict instead.
+    #[tokio::test]
+    async fn rejecting_still_claims_the_proposal_atomically() {
+        let mut rejected = proposed_action(Some("deployments:create"));
+        rejected.status = "rejected".to_string();
+        let harness = Harness::new(
+            reject_lookups(proposed_action(Some("deployments:create")))
+                .append_exec_results(vec![MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(vec![vec![rejected]]),
+        );
+
+        let status = reject(&harness, key(Role::User)).await;
+
+        let (statements, audits) = harness.finish();
+        assert_eq!(status, StatusCode::OK);
+        let writes = writes(&statements);
+        assert_eq!(writes.len(), 1, "{statements:?}");
+        let claim = writes[0];
+        assert!(binds(claim, "rejected"), "{claim:?}");
+        assert!(
+            claim.sql.contains(r#"WHERE"#) && binds(claim, "proposed"),
+            "the claim must only flip a still-proposed row: {claim:?}"
+        );
+        assert_eq!(audits, 1);
+
+        let harness = Harness::new(
+            reject_lookups(proposed_action(Some("deployments:create"))).append_exec_results(vec![
+                MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                },
+            ]),
+        );
+
+        let status = reject(&harness, key(Role::User)).await;
+
+        let (_, audits) = harness.finish();
+        assert_eq!(status, StatusCode::CONFLICT, "the race loser is told so");
+        assert_eq!(audits, 0);
+    }
+}
