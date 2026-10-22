@@ -4,9 +4,10 @@
 use chrono::Utc;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::fs;
 use tokio::process::Command;
@@ -119,6 +120,57 @@ pub struct AutofixerService {
     /// `AgentExecutor::prepare_sandbox_workspace`, so any change to the AI
     /// agent environment applies uniformly.
     executor: Arc<AgentExecutor>,
+    /// Runs whose analysis, fix, feedback or PR phase is executing right
+    /// now. `cancel_run` does not wait for that phase, which keeps writing
+    /// logs and its final status after the sandbox is gone, so the run's
+    /// secret values must outlive the cancel until the phase ends.
+    phases_in_flight: Arc<Mutex<HashMap<i32, PhaseInFlight>>>,
+}
+
+/// Bookkeeping for one run in [`AutofixerService::phases_in_flight`].
+#[derive(Debug, Default)]
+struct PhaseInFlight {
+    /// Phases of this run currently executing (normally at most one).
+    active: usize,
+    /// Set by `cancel_run` while a phase was executing: the last phase to end
+    /// drops the run's secret values instead of the cancel.
+    forget_secrets_on_exit: bool,
+}
+
+/// Held for the duration of a phase. Dropping it, including on panic, ends
+/// the phase and performs any secret forget a cancel deferred to it.
+struct PhaseGuard {
+    run_id: i32,
+    phases_in_flight: Arc<Mutex<HashMap<i32, PhaseInFlight>>>,
+    run_service: Arc<AgentRunService>,
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let forget = {
+            let mut phases = self
+                .phases_in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match phases.get_mut(&self.run_id) {
+                Some(entry) if entry.active > 1 => {
+                    entry.active -= 1;
+                    false
+                }
+                Some(_) => phases
+                    .remove(&self.run_id)
+                    .is_some_and(|entry| entry.forget_secrets_on_exit),
+                None => false,
+            }
+        };
+        if forget {
+            tracing::debug!(
+                "Autofixer run {}: phase ended after cancel, dropping its secret values",
+                self.run_id
+            );
+            self.run_service.forget_secret_values(self.run_id);
+        }
+    }
 }
 
 impl AutofixerService {
@@ -142,6 +194,48 @@ impl AutofixerService {
             source_map_service,
             sandbox_registry,
             executor,
+            phases_in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Marks a phase of `run_id` as executing until the guard is dropped.
+    fn begin_phase(&self, run_id: i32) -> PhaseGuard {
+        self.phases_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(run_id)
+            .or_default()
+            .active += 1;
+        PhaseGuard {
+            run_id,
+            phases_in_flight: self.phases_in_flight.clone(),
+            run_service: self.run_service.clone(),
+        }
+    }
+
+    /// Drops the run's secret values now if no phase is executing; otherwise
+    /// leaves that to the phase, whose remaining writes still need them.
+    fn forget_secrets_unless_phase_in_flight(&self, run_id: i32) {
+        let deferred = {
+            let mut phases = self
+                .phases_in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match phases.get_mut(&run_id) {
+                Some(entry) => {
+                    entry.forget_secrets_on_exit = true;
+                    true
+                }
+                None => false,
+            }
+        };
+        if deferred {
+            tracing::debug!(
+                "Autofixer run {}: cancelled mid-phase, keeping secret values until the phase ends",
+                run_id
+            );
+        } else {
+            self.run_service.forget_secret_values(run_id);
         }
     }
 
@@ -244,6 +338,7 @@ impl AutofixerService {
     /// (the caller should spawn this in a background task after creating the record).
     pub async fn run_analysis(&self, run_id: i32) {
         tracing::info!("Autofixer run {}: starting analysis phase", run_id);
+        let _phase = self.begin_phase(run_id);
 
         match self.run_analysis_inner(run_id).await {
             Ok(()) => {
@@ -513,6 +608,7 @@ impl AutofixerService {
     /// Should be spawned as a background task by the handler.
     pub async fn run_fix(&self, run_id: i32) {
         tracing::info!("Autofixer run {}: starting fix phase", run_id);
+        let _phase = self.begin_phase(run_id);
 
         match self.run_fix_inner(run_id).await {
             Ok(()) => {
@@ -796,6 +892,7 @@ impl AutofixerService {
     /// rejects with a conflict-style validation error so the caller knows to
     /// wait instead of racing.
     pub async fn create_pr(&self, run_id: i32) -> Result<PullRequest, AgentError> {
+        let _phase = self.begin_phase(run_id);
         let run = self.run_service.get_run(run_id).await?;
 
         // Idempotency: if we already created a PR for this run, return it
@@ -1103,6 +1200,7 @@ impl AutofixerService {
             "Autofixer run {}: continuing conversation with user feedback",
             run_id
         );
+        let _phase = self.begin_phase(run_id);
 
         match self.continue_with_feedback_inner(run_id).await {
             Ok(()) => {
@@ -1313,9 +1411,11 @@ impl AutofixerService {
             self.executor.revoke_run_token(run_id, token_id).await;
         }
         // Release sandbox, then clean up temp dir. With the sandbox gone the
-        // agent prints nothing more, so its secret values can be dropped.
+        // agent prints nothing more, but a phase still executing keeps
+        // persisting what it already read (and its failure), so its secret
+        // values are only dropped once that phase has ended.
         let _ = self.sandbox_registry.release(run_id).await;
-        self.run_service.forget_secret_values(run_id);
+        self.forget_secrets_unless_phase_in_flight(run_id);
         let work_dir = Self::work_dir(run_id);
         if work_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&work_dir).await {
@@ -1939,6 +2039,62 @@ mod tests {
             run_service.redact(run_id, REDACTION_TEST_SECRET),
             REDACTION_TEST_SECRET
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_phase_keeps_secrets_until_the_phase_ends() {
+        let run_id = run_id_without_work_dir(910_007);
+        let run = make_run_with_analysis(run_id, 10);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run.clone()]]) // get_run
+            .append_query_results(vec![vec![run.clone()]]) // update_status: get_run
+            .append_query_results(vec![vec![run]]) // update_status: UPDATE
+            .append_query_results(vec![vec![redaction_log_row(run_id)]]) // append_log
+            .into_connection();
+        let (autofixer, run_service) = make_autofixer(db);
+        run_service.register_secret_values(run_id, [REDACTION_TEST_SECRET.to_string()]);
+        let phase = autofixer.begin_phase(run_id);
+
+        autofixer.cancel_run(run_id).await.expect("cancel");
+
+        // The phase is still persisting what the agent printed and its own
+        // failure, so those writes must still be redacted.
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            crate::services::run_service::REDACTED_SECRET
+        );
+        drop(phase);
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            REDACTION_TEST_SECRET
+        );
+        assert!(autofixer
+            .phases_in_flight
+            .lock()
+            .expect("phases lock")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_phase_ending_without_a_cancel_keeps_secrets_for_the_next_phase() {
+        let run_id = run_id_without_work_dir(910_008);
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let (autofixer, run_service) = make_autofixer(db);
+        run_service.register_secret_values(run_id, [REDACTION_TEST_SECRET.to_string()]);
+
+        let outer = autofixer.begin_phase(run_id);
+        drop(autofixer.begin_phase(run_id));
+        drop(outer);
+
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            crate::services::run_service::REDACTED_SECRET
+        );
+        assert!(autofixer
+            .phases_in_flight
+            .lock()
+            .expect("phases lock")
+            .is_empty());
     }
 
     #[test]
