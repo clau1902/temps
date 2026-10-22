@@ -21811,6 +21811,14 @@ export type ProjectResponse = {
      */
     git_url?: string | null;
     /**
+     * GitHub repository webhook ID Temps registered on the connected
+     * repository. Only GitHub connections that are not a GitHub App (personal
+     * access token, OAuth) get one; App connections receive pushes through the
+     * App webhook. `null` when none is installed (another provider, a GitHub
+     * App connection, or registration failed / the hook was never created).
+     */
+    github_webhook_id?: number | null;
+    /**
      * GitLab webhook ID installed on the connected repository.
      * `null` when no GitLab webhook is installed (not connected to GitLab,
      * or webhook was removed / never created).
@@ -23070,6 +23078,10 @@ export type PublicationView = {
     hostname: string;
     last_error?: string | null;
     published_at?: string | null;
+    /**
+     * `published`, `error`, or `stale` (its record points at a tunnel that
+     * was replaced; it is being published again).
+     */
     state: string;
 };
 
@@ -23641,6 +23653,20 @@ export type RegistryEnvelope = {
      * Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.
      */
     signature: string;
+};
+
+/**
+ * Response for `POST /projects/{project_id}/github/reinstall-webhook`
+ */
+export type ReinstallGithubWebhookResponse = {
+    /**
+     * The new GitHub repository hook ID that was installed.
+     */
+    hook_id: number;
+    /**
+     * Human-readable status message.
+     */
+    message: string;
 };
 
 /**
@@ -52158,11 +52184,11 @@ export type ListIngressConnectorsData = {
         /**
          * Page number (1-indexed)
          */
-        page?: number | null;
+        page?: number;
         /**
          * Number of items per page (default 20, max 100)
          */
-        page_size?: number | null;
+        page_size?: number;
     };
     url: '/ingress/connectors';
 };
@@ -70499,6 +70525,50 @@ export type UpdateGitSettingsResponses = {
 };
 
 export type UpdateGitSettingsResponse = UpdateGitSettingsResponses[keyof UpdateGitSettingsResponses];
+
+export type ReinstallGithubWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/github/reinstall-webhook';
+};
+
+export type ReinstallGithubWebhookErrors = {
+    /**
+     * Project is not on a GitHub PAT/OAuth connection, or GitHub refused to create the webhook
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ReinstallGithubWebhookResponses = {
+    /**
+     * Webhook installed
+     */
+    200: ReinstallGithubWebhookResponse;
+};
+
+export type ReinstallGithubWebhookResponse2 = ReinstallGithubWebhookResponses[keyof ReinstallGithubWebhookResponses];
 
 export type ReinstallGitlabWebhookData = {
     body?: never;
