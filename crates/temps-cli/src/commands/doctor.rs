@@ -741,35 +741,47 @@ impl DoctorCommand {
                     i64::try_get_by(&row, "count").ok()
                 });
 
-            match Migrator::get_pending_migrations(&db).await {
-                Ok(pending) => {
-                    let pending_n = pending.len();
-                    let applied_str = applied
-                        .map(|c| format!("{c} applied"))
-                        .unwrap_or_else(|| "applied count unknown".to_string());
-                    if pending_n == 0 {
+            // A database migrated by a newer release (e.g. after a binary-only
+            // rollback) has ledger entries Sea-ORM's migrator rejects, so ask
+            // the read-only schema guard first and report that state directly.
+            let newer_schema_warning = temps_database::check_schema_compatibility(&db)
+                .await
+                .ok()
+                .and_then(|status| status.newer_schema_warning());
+
+            if let Some(warning) = newer_schema_warning {
+                report.add("Migrations", CheckResult::Warn(warning));
+            } else {
+                match Migrator::get_pending_migrations(&db).await {
+                    Ok(pending) => {
+                        let pending_n = pending.len();
+                        let applied_str = applied
+                            .map(|c| format!("{c} applied"))
+                            .unwrap_or_else(|| "applied count unknown".to_string());
+                        if pending_n == 0 {
+                            report.add(
+                                "Migrations",
+                                CheckResult::Pass(format!("{applied_str}, up to date")),
+                            );
+                        } else {
+                            report.add(
+                                "Migrations",
+                                CheckResult::Warn(format!(
+                                    "{applied_str}, {pending_n} PENDING — run `temps migrate` \
+                                     before restarting the server"
+                                )),
+                            );
+                        }
+                    }
+                    Err(_) => {
                         report.add(
                             "Migrations",
-                            CheckResult::Pass(format!("{applied_str}, up to date")),
-                        );
-                    } else {
-                        report.add(
-                            "Migrations",
-                            CheckResult::Warn(format!(
-                                "{applied_str}, {pending_n} PENDING — run `temps migrate` \
-                                 before restarting the server"
-                            )),
+                            CheckResult::Warn(
+                                "Migration table not found. Run `temps migrate` to initialize the schema."
+                                    .to_string(),
+                            ),
                         );
                     }
-                }
-                Err(_) => {
-                    report.add(
-                        "Migrations",
-                        CheckResult::Warn(
-                            "Migration table not found. Run `temps migrate` to initialize the schema."
-                                .to_string(),
-                        ),
-                    );
                 }
             }
         }

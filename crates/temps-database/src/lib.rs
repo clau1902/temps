@@ -312,6 +312,74 @@ mod tests {
         Ok(())
     }
 
+    /// An older binary started against a database a newer release migrated
+    /// (a binary-only rollback) must start: the guard warns, the migration
+    /// entry points skip Sea-ORM's migrator (which rejects unknown ledger
+    /// entries), nothing is rolled back, and a migration this binary has but
+    /// the database lacks (a divergent build) is still applied.
+    #[tokio::test]
+    async fn migrations_continue_on_a_database_migrated_by_a_newer_release() -> anyhow::Result<()> {
+        let Some((_container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        let db = db.as_ref();
+        const FUTURE: &str = "m29991231_000001_from_a_newer_release";
+
+        run_migrations(db).await?;
+        db.execute_unprepared(&format!(
+            "INSERT INTO seaql_migrations (version, applied_at) VALUES ('{FUTURE}', 0)"
+        ))
+        .await?;
+
+        // Plain rollback: nothing of ours is pending, every entry point succeeds.
+        assert!(matches!(
+            check_schema_compatibility(db).await?,
+            SchemaStatus::NewerThanBinary { ref unknown, ref pending, .. }
+                if unknown == &vec![FUTURE.to_string()] && pending.is_empty()
+        ));
+        ensure_no_unprotected_upgrade(db).await?;
+        run_migrations(db).await?;
+        assert!(get_pending_migration_names(db).await?.is_empty());
+        let report = run_migrations_streaming(db, |_| {}).await?;
+        assert!(report.planned.is_empty(), "{report:?}");
+
+        // Divergent build: roll back our newest migration (while the ledger
+        // holds only known entries, as Sea-ORM's `down` requires), then add the
+        // unknown entry back. Startup must re-apply ours around the unknown one.
+        db.execute_unprepared(&format!(
+            "DELETE FROM seaql_migrations WHERE version = '{FUTURE}'"
+        ))
+        .await?;
+        Migrator::down(db, Some(1)).await?;
+        let newest = schema_guard::known_migration_names()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("binary defines no migrations"))?;
+        db.execute_unprepared(&format!(
+            "INSERT INTO seaql_migrations (version, applied_at) VALUES ('{FUTURE}', 0)"
+        ))
+        .await?;
+        assert_eq!(get_pending_migration_names(db).await?, vec![newest.clone()]);
+
+        let report = run_migrations_streaming(db, |_| {}).await?;
+        assert_eq!(report.planned, vec![newest.clone()]);
+        assert!(report.all_succeeded(), "{report:?}");
+        assert!(get_pending_migration_names(db).await?.is_empty());
+
+        let ledger: Vec<String> = db
+            .query_all(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT version FROM seaql_migrations".to_owned(),
+            ))
+            .await?
+            .iter()
+            .map(|row| row.try_get::<String>("", "version"))
+            .collect::<Result<_, _>>()?;
+        assert!(ledger.contains(&FUTURE.to_string()), "unknown entry kept");
+        assert!(ledger.contains(&newest), "own migration recorded");
+        Ok(())
+    }
+
     /// Start a throwaway TimescaleDB container and connect (no auto-migrate).
     /// Returns `None` when Docker is unavailable so callers skip gracefully.
     async fn start_fresh_db() -> anyhow::Result<

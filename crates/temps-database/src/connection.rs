@@ -3,8 +3,14 @@
 
 //! Database connection management
 
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
+use crate::schema_guard::SchemaStatus;
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr, Statement,
+    TransactionTrait,
+};
+use sea_orm_migration::{MigrationTrait, SchemaManager};
 use sqlx::Acquire;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::{ServiceError, ServiceResult};
@@ -619,38 +625,75 @@ pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceRe
     Ok(())
 }
 
-/// Run the schema guard and surface a refusal as a [`ServiceError`] whose
-/// message carries the guard's full explanation and remediation.
-async fn ensure_schema_compatible(db: &DbConnection) -> ServiceResult<()> {
+/// Run the schema guard, surfacing an unreadable ledger as a [`ServiceError`].
+///
+/// A database migrated by a newer release is NOT an error: the guard logs a
+/// warning and returns [`SchemaStatus::NewerThanBinary`] so callers can keep
+/// Sea-ORM's migrator (which rejects unknown ledger entries) out of the way.
+async fn ensure_schema_compatible(db: &DbConnection) -> ServiceResult<SchemaStatus> {
     crate::schema_guard::check_schema_compatibility(db)
         .await
-        .map(|_| ())
         .map_err(|error| match error {
-            crate::schema_guard::SchemaGuardError::DatabaseNewerThanBinary { .. } => {
-                ServiceError::Configuration {
-                    message: error.to_string(),
-                }
-            }
             crate::schema_guard::SchemaGuardError::ReadLedger { .. } => {
                 ServiceError::Database(error.to_string())
             }
         })
 }
 
+/// This binary's migrations named in `pending`, in apply order.
+fn migrations_named(pending: &[String]) -> Vec<Box<dyn MigrationTrait>> {
+    let wanted: HashSet<&str> = pending.iter().map(String::as_str).collect();
+    Migrator::migrations()
+        .into_iter()
+        .filter(|migration| wanted.contains(migration.name()))
+        .collect()
+}
+
+/// Apply one migration and record it in `seaql_migrations`, in a single
+/// transaction — the same steps Sea-ORM's `Migrator::up` performs per
+/// migration on PostgreSQL.
+///
+/// Used only when the ledger holds migrations this binary does not define
+/// ([`SchemaStatus::NewerThanBinary`]): `Migrator::up` and
+/// `Migrator::get_pending_migrations` fail outright on such a ledger
+/// ("Migration file of version '…' is missing"), which would turn the guard's
+/// warning back into a refused start. The unknown migrations are never rolled
+/// back — this binary has no `down()` for them.
+async fn apply_migration_on_newer_schema(
+    db: &DbConnection,
+    migration: &dyn MigrationTrait,
+) -> Result<(), DbErr> {
+    let txn = db.begin().await?;
+    migration.up(&SchemaManager::new(&txn)).await?;
+    let applied_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO seaql_migrations (version, applied_at) VALUES ($1, $2)",
+        [migration.name().into(), applied_at.into()],
+    ))
+    .await?;
+    txn.commit().await
+}
+
 /// Apply all pending migrations.
 ///
 /// Uses Sea-ORM's `Migrator::up`, which applies only migrations present in this
 /// binary that are NOT yet recorded in `seaql_migrations`. Before that, the
-/// schema guard ([`crate::schema_guard::check_schema_compatibility`]) refuses a
-/// database that has applied migrations this binary does not define — i.e. one
-/// migrated by a newer release — with an error naming them and the
-/// remediation, instead of letting an older binary run against a newer schema.
+/// schema guard ([`crate::schema_guard::check_schema_compatibility`]) checks
+/// for applied migrations this binary does not define — i.e. a database
+/// migrated by a newer release, typically after a binary-only rollback. That
+/// is logged as a warning and startup continues: the unknown migrations are
+/// left applied and only this binary's own missing migrations (normally none)
+/// are applied, without `Migrator::up`, which would reject the ledger.
 ///
 /// A short session `lock_timeout` is set first so a migration blocked on a
 /// contended lock fails fast (and the operator retries) rather than burning the
 /// entire `MIGRATION_TIMEOUT` budget waiting behind live traffic.
 pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
-    ensure_schema_compatible(db).await?;
+    let status = ensure_schema_compatible(db).await?;
 
     // Fail fast on contended locks rather than hanging the whole budget.
     // Best-effort — non-fatal on setups that reject it.
@@ -665,6 +708,36 @@ pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
             "Could not set lock_timeout for migrations (non-fatal): {}",
             e
         );
+    }
+
+    if let SchemaStatus::NewerThanBinary { pending, .. } = &status {
+        for migration in migrations_named(pending) {
+            match timeout(
+                MIGRATION_TIMEOUT,
+                apply_migration_on_newer_schema(db, migration.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(ServiceError::Database(format!(
+                        "Failed to apply migration {} on a database migrated by a newer \
+                         Temps release: {}",
+                        migration.name(),
+                        e
+                    )))
+                }
+                Err(_) => {
+                    return Err(ServiceError::Database(format!(
+                        "Migration {} timed out after {} seconds on a database migrated \
+                         by a newer Temps release",
+                        migration.name(),
+                        MIGRATION_TIMEOUT.as_secs()
+                    )))
+                }
+            }
+        }
+        return Ok(());
     }
 
     match timeout(MIGRATION_TIMEOUT, Migrator::up(db, None)).await {
@@ -764,8 +837,9 @@ pub async fn run_migrations_streaming<F>(
 where
     F: FnMut(MigrationProgress<'_>),
 {
-    // Refuse a database migrated by a newer release before touching anything.
-    ensure_schema_compatible(db).await?;
+    // Classify the ledger before touching anything. A database migrated by a
+    // newer release is warned about and handled without `Migrator::up`.
+    let status = ensure_schema_compatible(db).await?;
 
     // Fail fast on contended locks rather than hanging (mirrors run_migrations).
     if let Err(e) = db
@@ -782,9 +856,20 @@ where
     }
 
     // 1. Read the plan: which migrations are pending, in apply order.
-    let pending = Migrator::get_pending_migrations(db)
-        .await
-        .map_err(|e| ServiceError::Database(format!("Failed to read pending migrations: {}", e)))?;
+    let newer_schema = matches!(status, SchemaStatus::NewerThanBinary { .. });
+    let pending_names = if newer_schema {
+        status.pending().to_vec()
+    } else {
+        Migrator::get_pending_migrations(db)
+            .await
+            .map_err(|e| {
+                ServiceError::Database(format!("Failed to read pending migrations: {}", e))
+            })?
+            .iter()
+            .map(|migration| migration.name().to_string())
+            .collect()
+    };
+    let pending = migrations_named(&pending_names);
 
     let total = pending.len();
     let mut report = MigrationRunReport {
@@ -807,7 +892,14 @@ where
         });
 
         let started = std::time::Instant::now();
-        let outcome = match timeout(MIGRATION_TIMEOUT, Migrator::up(db, Some(1))).await {
+        let apply = async {
+            if newer_schema {
+                apply_migration_on_newer_schema(db, migration.as_ref()).await
+            } else {
+                Migrator::up(db, Some(1)).await
+            }
+        };
+        let outcome = match timeout(MIGRATION_TIMEOUT, apply).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(format!("{}", e)),
             Err(_) => Err(format!("timed out after {}s", MIGRATION_TIMEOUT.as_secs())),
@@ -861,7 +953,10 @@ pub async fn run_migrations_reported(db: &DbConnection) -> ServiceResult<Migrati
 /// would run before the operator commits. This is read-only: it never mutates
 /// the schema or the migration ledger.
 pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec<String>> {
-    ensure_schema_compatible(db).await?;
+    let status = ensure_schema_compatible(db).await?;
+    if let SchemaStatus::NewerThanBinary { pending, .. } = status {
+        return Ok(pending);
+    }
     let pending = Migrator::get_pending_migrations(db)
         .await
         .map_err(|e| ServiceError::Database(format!("Failed to read pending migrations: {}", e)))?;
