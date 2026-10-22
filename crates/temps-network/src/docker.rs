@@ -524,13 +524,16 @@ pub struct DetachedMember {
 /// Retire the overlay network because the control plane moved this node's
 /// allocation (ADR 056). Docker cannot change a network's subnet, and the old
 /// one is no longer this node's, so detach every member and remove the
-/// network; the caller recreates it on the new subnet and passes the members
-/// to [`reattach_members`]. Refuses a network Temps does not own. A missing
-/// network has no members.
+/// network; the caller recreates it on the new subnet and passes `queue` to
+/// [`reattach_members`]. Each member is added to `queue` before it is
+/// detached, so one detached before a later failure is still reattached once
+/// a retry succeeds. Refuses a network Temps does not own. A missing network
+/// has no members.
 pub async fn retire_network_for_move(
     docker: &Docker,
     config: &NetworkConfig,
-) -> crate::Result<Vec<DetachedMember>> {
+    queue: &mut Vec<DetachedMember>,
+) -> crate::Result<()> {
     let name = config.docker_network_name.as_str();
     match docker
         .inspect_network(name, None::<InspectNetworkOptions>)
@@ -539,7 +542,7 @@ pub async fn retire_network_for_move(
         Ok(_) => {}
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
-        }) => return Ok(Vec::new()),
+        }) => return Ok(()),
         Err(error) => {
             return Err(NetworkError::Docker {
                 op: "inspect_network",
@@ -550,19 +553,20 @@ pub async fn retire_network_for_move(
     }
     validate_owned_network(docker, config).await?;
     let attachments = owned_network_members(docker, name).await?;
+    for (container, endpoint) in &attachments {
+        if !queue.iter().any(|queued| &queued.container == container) {
+            queue.push(DetachedMember {
+                container: container.clone(),
+                aliases: endpoint.aliases.clone(),
+            });
+        }
+    }
     warn!(
         network = %name,
         containers = attachments.len(),
         "overlay allocation moved; removing the Docker network so it is recreated on the new subnet"
     );
-    detach_and_remove(docker, name, &attachments).await?;
-    Ok(attachments
-        .into_iter()
-        .map(|(container, endpoint)| DetachedMember {
-            container,
-            aliases: endpoint.aliases,
-        })
-        .collect())
+    detach_and_remove(docker, name, &attachments).await
 }
 
 /// Attach containers removed by [`retire_network_for_move`] to the recreated

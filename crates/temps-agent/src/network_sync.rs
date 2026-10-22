@@ -1785,14 +1785,13 @@ async fn apply(
                 .map_err(|e| SyncError::Bootstrap(format!("tearing down the old overlay: {e}")))?;
             let docker = Docker::connect_with_local_defaults()
                 .map_err(|error| SyncError::DockerConnect(error.to_string()))?;
-            let retired = temps_network::docker::retire_network_for_move(&docker, manager.config())
+            temps_network::docker::retire_network_for_move(&docker, manager.config(), detached)
                 .await
                 .map_err(|e| {
                     SyncError::Bootstrap(format!(
                         "replacing the overlay Docker network on the old subnet: {e}"
                     ))
                 })?;
-            detached.extend(retired);
             *bootstrapped = None;
         }
     }

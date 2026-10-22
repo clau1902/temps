@@ -2026,6 +2026,70 @@ async fn an_unapplied_colliding_allocation_is_moved_automatically() {
     );
 }
 
+/// A service member on `node_id` that holds an overlay address.
+async fn insert_overlay_member(db: &DatabaseConnection, node_id: i32, compute_ip: &str) {
+    db.execute_unprepared(&format!(
+        "WITH svc AS ( \
+           INSERT INTO external_services (name, service_type, status, topology, created_at, updated_at) \
+           VALUES ('svc-{node_id}', 'postgres', 'running', 'standalone', now(), now()) RETURNING id) \
+         INSERT INTO service_members \
+           (service_id, node_id, role, container_name, status, ordinal, compute_ip, created_at, updated_at) \
+         SELECT id, {node_id}, 'primary', 'svc-{node_id}-0', 'running', 0, '{compute_ip}', now(), now() FROM svc"
+    ))
+    .await
+    .expect("insert service member");
+}
+
+#[tokio::test]
+async fn an_allocation_services_hold_addresses_in_is_not_moved_automatically() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    allocator.allocate_for_node(a).await.unwrap();
+    // Never reported ready, but a service already got an address in it.
+    insert_overlay_member(&fx.db, a, "10.202.0.5").await;
+    set_node(
+        &fx.db,
+        a,
+        &format!(
+            "occupied_ranges = '{}', overlay_status = 'unavailable'",
+            occupied_json(&[("10.202.0.0/23", "shop_default")])
+        ),
+    )
+    .await;
+    assert_eq!(
+        allocator.remediate_unapplied_collision(a).await.unwrap(),
+        None
+    );
+    let row = nodes::Entity::find_by_id(a)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.compute_cidr.as_deref(), Some("10.202.0.0/24"));
+}
+
+#[tokio::test]
+async fn a_pool_change_is_refused_while_services_hold_addresses() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    allocator.allocate_for_node(a).await.unwrap();
+    set_node(&fx.db, a, "overlay_status = 'unavailable'").await;
+    insert_overlay_member(&fx.db, a, "10.202.0.5").await;
+    let error = allocator
+        .configure_pool("10.210.0.0/16".parse().unwrap(), 24)
+        .await
+        .expect_err("services hold addresses in the allocation");
+    match error {
+        AllocatorError::PoolInUse { users, .. } => assert!(
+            users.iter().any(|user| user.contains("runs services")),
+            "{users:?}"
+        ),
+        other => panic!("expected PoolInUse, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn an_applied_allocation_is_never_moved_automatically() {
     let Some(fx) = fixture().await else { return };

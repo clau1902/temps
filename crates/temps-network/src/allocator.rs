@@ -24,13 +24,14 @@ use crate::occupied::{self, OccupiedRange};
 use async_trait::async_trait;
 use ipnet::Ipv4Net;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, DbErr,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection,
+    DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use temps_entities::{network_config as nc, nodes};
+use temps_entities::{network_config as nc, nodes, service_members};
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -352,7 +353,18 @@ impl PostgresAllocator {
                 users,
             });
         }
-        let users = nodes_using_pool(&members);
+        let mut users = nodes_using_pool(&members);
+        let ids: Vec<i32> = members.iter().map(|node| node.id).collect();
+        let with_services = nodes_with_overlay_members(&txn, &ids).await?;
+        users.extend(members.iter().filter_map(|node| {
+            let cidr = node.compute_cidr.as_deref()?;
+            (allocation_in_use(node).is_none() && with_services.contains(&node.id)).then(|| {
+                format!(
+                    "node '{}' ({cidr}, runs services that hold addresses on it)",
+                    node.name
+                )
+            })
+        }));
         if !users.is_empty() {
             return Err(AllocatorError::PoolInUse {
                 current_pool: current.compute_pool_cidr,
@@ -505,6 +517,20 @@ impl PostgresAllocator {
             return Ok(None);
         };
         let cause = collision.describe();
+        if nodes_with_overlay_members(&txn, &[node_id])
+            .await?
+            .contains(&node_id)
+        {
+            warn!(
+                node_id,
+                compute_cidr = %allocated,
+                cause = %cause,
+                "not moving the node's colliding overlay allocation: services on it already hold \
+                 addresses in it, and moving it would leave them unreachable at those addresses; \
+                 free the range on the node"
+            );
+            return Ok(None);
+        }
 
         let mut used = Vec::with_capacity(members.len());
         for other in members.iter().filter(|other| other.id != node_id) {
@@ -572,6 +598,13 @@ impl PostgresAllocator {
                     .add(nodes::Column::OverlayReadyCidr.is_null())
                     .add(nodes::Column::OverlayReadyCidr.ne(raw)),
             )
+            // Same statement as the move, so a service given an address
+            // since the check above still keeps the node where it is.
+            .filter(Expr::cust_with_values(
+                "NOT EXISTS (SELECT 1 FROM service_members sm \
+                 WHERE sm.node_id = $1 AND sm.compute_ip IS NOT NULL)",
+                [node_id],
+            ))
             .exec(&txn)
             .await?;
         txn.commit().await?;
@@ -1199,6 +1232,29 @@ pub fn allocation_in_use(node: &nodes::Model) -> Option<String> {
         ));
     }
     None
+}
+
+/// Nodes whose service members already hold an overlay address. Their
+/// allocation is in use even before the node reports the overlay ready:
+/// `service_members.compute_ip`, and the DNS records built from it, would
+/// keep pointing at the old subnet after a move.
+async fn nodes_with_overlay_members<C: ConnectionTrait>(
+    db: &C,
+    node_ids: &[i32],
+) -> Result<HashSet<i32>, DbErr> {
+    if node_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows: Vec<Option<i32>> = service_members::Entity::find()
+        .select_only()
+        .column(service_members::Column::NodeId)
+        .distinct()
+        .filter(service_members::Column::NodeId.is_in(node_ids.iter().copied()))
+        .filter(service_members::Column::ComputeIp.is_not_null())
+        .into_tuple()
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().flatten().collect())
 }
 
 fn nodes_using_pool(members: &[nodes::Model]) -> Vec<String> {
