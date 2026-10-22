@@ -14575,6 +14575,69 @@ mod user_route_authorization_tests {
         assert_eq!(harness.audit.0.load(Ordering::SeqCst), 4);
     }
 
+    // Archive is a soft, idempotent state change on a real row: repeating it
+    // or restoring an already active chat succeeds without touching anything
+    // else, the row is never deleted, and an archived chat is still guarded,
+    // so a read-only key cannot bring it back.
+    #[tokio::test]
+    async fn archive_and_restore_are_idempotent_soft_state_changes() {
+        let Some(test_db) = database("archive_and_restore_are_idempotent_soft_state_changes").await
+        else {
+            return;
+        };
+        let db = test_db.db.clone();
+        let owner_id = insert_user(&db, "archiver@example.test").await;
+        let chat = insert_chat(&db, owner_id, "conv_soft", "idle").await;
+        let harness = Harness::over(db.clone());
+        let writer = || RequireAuth(auth_of(owner_id, Some(Role::User), None));
+        let reader = || RequireAuth(auth_of(owner_id, Some(Role::Reader), None));
+        let assert_untouched = |row: &ai_conversations::Model, status: &str| {
+            assert_eq!(row.status, status);
+            assert_eq!(row.title.as_deref(), Some("Original title"));
+            assert_eq!(row.turn_status, "idle");
+            assert_eq!(row.created_by, owner_id);
+        };
+
+        // Restoring a chat that was never archived is a no-op success.
+        assert_eq!(
+            Mutation::Restore
+                .call_on(&harness, writer(), "conv_soft")
+                .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_untouched(&reload_chat(&db, chat.id).await, "active");
+
+        for _ in 0..2 {
+            assert_eq!(
+                Mutation::Archive
+                    .call_on(&harness, writer(), "conv_soft")
+                    .await,
+                StatusCode::NO_CONTENT
+            );
+            assert_untouched(&reload_chat(&db, chat.id).await, "archived");
+        }
+
+        assert_eq!(
+            Mutation::Restore
+                .call_on(&harness, reader(), "conv_soft")
+                .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_untouched(&reload_chat(&db, chat.id).await, "archived");
+
+        for _ in 0..2 {
+            assert_eq!(
+                Mutation::Restore
+                    .call_on(&harness, writer(), "conv_soft")
+                    .await,
+                StatusCode::NO_CONTENT
+            );
+            assert_untouched(&reload_chat(&db, chat.id).await, "active");
+        }
+        // Five successful writes, each audited; the refused restore is not.
+        assert_eq!(harness.audit.0.load(Ordering::SeqCst), 5);
+    }
+
     fn race_service(db: &Arc<DatabaseConnection>) -> Arc<PendingActionService> {
         Arc::new(PendingActionService::new(
             db.clone(),
