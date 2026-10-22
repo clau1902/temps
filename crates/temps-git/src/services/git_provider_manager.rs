@@ -619,7 +619,7 @@ fn stage_files_onto(
 }
 
 /// Longest repository name the supported providers accept.
-const MAX_REPOSITORY_NAME_LEN: usize = 100;
+pub(crate) const MAX_REPOSITORY_NAME_LEN: usize = 100;
 /// Longest description GitHub accepts; the strictest of the supported providers.
 const MAX_REPOSITORY_DESCRIPTION_LEN: usize = 350;
 
@@ -670,7 +670,7 @@ fn validate_new_repository(
 
 /// Whether `segment` is an account, group or repository name every supported
 /// provider accepts: letters, digits, `-`, `_` and `.`, and never `.`/`..`.
-fn is_safe_name_segment(segment: &str) -> bool {
+pub(crate) fn is_safe_name_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment != "."
         && segment != ".."
@@ -5628,52 +5628,6 @@ impl GitProviderManager {
             .await
     }
 
-    /// Handle a push delivered by a GitHub App webhook.
-    ///
-    /// Same as [`Self::handle_push_event`], except projects that receive
-    /// pushes through their own repository webhook (a non-App GitHub
-    /// connection, see [`Self::github_repo_webhook_projects`]) are left out:
-    /// when an App also happens to be installed on that repository, both
-    /// webhooks fire for the same push and the project would deploy twice.
-    pub async fn handle_github_app_push_event(
-        &self,
-        owner: String,
-        repo: String,
-        branch: Option<String>,
-        tag: Option<String>,
-        commit: String,
-    ) -> Result<usize, GitProviderManagerError> {
-        if commit.is_empty() || commit.chars().all(|c| c == '0') {
-            tracing::info!(
-                "Ignoring GitHub App push event for {}/{} with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
-                owner,
-                repo,
-                branch,
-                tag
-            );
-            return Ok(0);
-        }
-
-        let matching_projects = projects::Entity::find()
-            .filter(projects::Column::RepoOwner.eq(&owner))
-            .filter(projects::Column::RepoName.eq(&repo))
-            .filter(projects::Column::GithubWebhookSigningToken.is_null())
-            .all(self.db.as_ref())
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    "Failed to find GitHub App projects for {}/{}: {}",
-                    owner,
-                    repo,
-                    e
-                );
-                GitProviderManagerError::DatabaseError(e)
-            })?;
-
-        self.queue_push_event_for_projects(branch, tag, commit, matching_projects)
-            .await
-    }
-
     /// Projects whose own GitHub repository webhook signed this delivery.
     ///
     /// A GitHub connection that is not a GitHub App (personal access token or
@@ -7909,55 +7863,6 @@ mod tests {
             .await
             .unwrap();
         assert!(authorized.is_empty());
-    }
-
-    /// When a GitHub App is also installed on a repository whose project has
-    /// its own repository webhook, the App's delivery must not deploy that
-    /// project a second time.
-    #[tokio::test]
-    async fn github_app_push_skips_projects_with_their_own_repo_webhook() {
-        use sea_orm::{DatabaseBackend, MockDatabase};
-
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([Vec::<projects::Model>::new()])
-                .into_connection(),
-        );
-        let manager = GitProviderManager::new(
-            db.clone(),
-            Arc::new(
-                temps_core::EncryptionService::new(
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                )
-                .unwrap(),
-            ),
-            Arc::new(PanicOnSendJobQueue) as Arc<dyn JobQueue>,
-            create_test_config_service(db.clone()),
-        );
-
-        let queued = manager
-            .handle_github_app_push_event(
-                "example-owner".to_string(),
-                "example-repository".to_string(),
-                Some("main".to_string()),
-                None,
-                "0123456789abcdef0123456789abcdef01234567".to_string(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(queued, 0);
-
-        drop(manager);
-        let log = match Arc::try_unwrap(db) {
-            Ok(db) => db.into_transaction_log(),
-            Err(_) => panic!("the manager was dropped, so the test holds the only database handle"),
-        };
-        let sql = format!("{log:?}");
-        assert!(
-            // `Debug` escapes the identifier quotes.
-            sql.contains(r#"\"github_webhook_signing_token\" IS NULL"#),
-            "the App push lookup must exclude projects with a repository webhook: {sql}"
-        );
     }
 
     fn repository_fixture(connection_id: i32) -> repositories::Model {

@@ -353,11 +353,12 @@ async fn handle_push_event(
 
     let (branch, tag) = push_target(&push_event.r#ref, push_event.base_ref.as_deref());
 
-    // Projects with their own repository webhook are skipped here; that
-    // webhook delivers the same push (see `github_repo_webhook_events`).
+    // A project that also has its own repository webhook (a non-App
+    // connection on a repository where the App is installed) receives this
+    // push twice; deployment creation coalesces deliveries of the same commit.
     if let Err(e) = state
         .git_provider_manager
-        .handle_github_app_push_event(repo_owner, repo_name, branch, tag, push_event.after.clone())
+        .handle_push_event(repo_owner, repo_name, branch, tag, push_event.after.clone())
         .await
     {
         error!(

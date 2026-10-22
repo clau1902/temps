@@ -1793,7 +1793,7 @@ function GitSettingsInline({
                 providerName="GitLab"
                 repository={`${project.repo_owner}/${project.repo_name}`}
                 installed={hasWebhook}
-                missingHint="Your GitLab user needs the Maintainer role on"
+                missingHint="Installing it needs your GitLab user to have the Maintainer role on"
                 isPending={reinstallWebhook.isPending}
                 onInstall={handleReinstallWebhook}
               />
@@ -1804,7 +1804,7 @@ function GitSettingsInline({
                 providerName="GitHub"
                 repository={`${project.repo_owner}/${project.repo_name}`}
                 installed={hasGithubWebhook}
-                missingHint="Your token needs the Webhooks: write permission (fine-grained) or the repo scope (classic), and admin access to"
+                missingHint="Installing it needs a token with the Webhooks: write permission (fine-grained) or the repo scope (classic), and admin access to"
                 isPending={reinstallGithubWebhook.isPending}
                 onInstall={handleReinstallGithubWebhook}
               />
@@ -1863,8 +1863,7 @@ function RepositoryWebhookRow({
             </>
           ) : (
             <>
-              Pushes won’t deploy until it is. We couldn’t install the webhook
-              automatically. {missingHint}{' '}
+              Pushes won’t deploy until it is. {missingHint}{' '}
               <span className="font-mono text-foreground">{repository}</span>.
             </>
           )}

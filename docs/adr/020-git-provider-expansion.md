@@ -86,8 +86,16 @@ registers a repository webhook delivering to
 `POST /webhook/git/github/repo-events`, signed with a per-project secret stored
 encrypted in `projects.github_webhook_signing_token` alongside the hook ID in
 `projects.github_webhook_id` (#1596). A delivery deploys only the projects whose
-own secret verifies its `X-Hub-Signature-256`, and the App path skips those
-projects so a repository with both never deploys a push twice.
+own secret verifies its `X-Hub-Signature-256`. A project on a repository that
+also has the App installed receives the push from both webhooks; deployment
+creation coalesces deliveries of the same commit into one deployment.
+
+GitHub refuses a second hook with the same URL and events on a repository, so
+each project's hook URL carries `?project_id={id}` (the receiver ignores it and
+still identifies projects by signature), letting several projects deploy from
+one repository. For the same reason, reinstalling a project's webhook gives its
+existing hook a new secret in place (`PATCH /repos/{owner}/{repo}/hooks/{id}`)
+and registers a new hook only when GitHub reports the old one gone.
 
 ## Decision
 
