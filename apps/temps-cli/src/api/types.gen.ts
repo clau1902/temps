@@ -17382,10 +17382,7 @@ export type MemberSyncResult = {
  * Body of `POST /internal/nodes/mesh-enroll` (ADR 055).
  */
 export type MeshEnrollApiRequest = {
-    /**
-     * Enrollment token, as for `/internal/nodes/register`.
-     */
-    join_token?: string | null;
+    join_token?: SecretString | null;
     /**
      * Scheduling labels the worker will register with; checked against the
      * token's bound labels and carried over to the pairing's token.

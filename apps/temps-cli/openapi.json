@@ -37409,10 +37409,14 @@
         "description": "Body of `POST /internal/nodes/mesh-enroll` (ADR 055).",
         "properties": {
           "join_token": {
-            "description": "Enrollment token, as for `/internal/nodes/register`.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Enrollment token, as for `/internal/nodes/register`."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "labels": {

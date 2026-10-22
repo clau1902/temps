@@ -1806,7 +1806,7 @@ pub struct MeshEnrollApiRequest {
     /// The name the worker will register under.
     pub name: String,
     /// Enrollment token, as for `/internal/nodes/register`.
-    pub join_token: Option<String>,
+    pub join_token: Option<temps_core::secret_string::SecretString>,
     /// The worker's base64 WireGuard public key. The private key never
     /// leaves the worker.
     pub wg_public_key: String,
@@ -1907,7 +1907,10 @@ async fn mesh_enroll_inner(
     let authorized = authorize_enrollment(
         &app_state,
         &settings,
-        request.join_token.as_deref(),
+        request
+            .join_token
+            .as_ref()
+            .map(temps_core::secret_string::SecretString::expose),
         name,
         request.labels.as_ref(),
         None,
