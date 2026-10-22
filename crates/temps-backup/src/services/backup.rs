@@ -10123,10 +10123,27 @@ mod tests {
         }
     }
 
+    /// A service over a mock database whose Docker client is never dialled:
+    /// these tests exercise authorization and validation only, so they must
+    /// not depend on a local Docker socket being present.
     fn make_scope_test_service(db: Arc<DatabaseConnection>) -> BackupService {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
+                .expect("building an HTTP Docker client does not connect");
+        let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
+            db.clone(),
+            Arc::new(
+                EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(docker),
+            Arc::new(temps_providers::DnsRegistry::new(db.clone())),
+        ));
         BackupService::new(
             db.clone(),
-            create_mock_external_service_manager(db),
+            external_service_manager,
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
