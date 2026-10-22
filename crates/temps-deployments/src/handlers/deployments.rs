@@ -2647,7 +2647,7 @@ pub async fn get_container_metrics_history(
         step,
     };
 
-    let points = store.query_range(query).await.map_err(|e| {
+    let points = store.query_range_filled(query).await.map_err(|e| {
         error!(
             project_id,
             environment_id,

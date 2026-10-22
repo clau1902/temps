@@ -12467,14 +12467,16 @@
             "type": "string"
           },
           "value": {
-            "description": "Averaged metric value for the bucket.",
+            "description": "Averaged metric value for the bucket; `null` when the container\nreported no sample in it (it was stopped, or the server was down), so\ncharts show a gap instead of interpolating across it.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
-          "time",
-          "value"
+          "time"
         ],
         "type": "object"
       },
@@ -17027,6 +17029,11 @@
           "current_status": {
             "type": "string"
           },
+          "downtime_seconds": {
+            "description": "Seconds of the window covered by a non-operational check result.",
+            "format": "int64",
+            "type": "integer"
+          },
           "last_check_at": {
             "format": "date-time",
             "type": [
@@ -17038,15 +17045,31 @@
             "format": "int32",
             "type": "integer"
           },
+          "monitored_seconds": {
+            "description": "Seconds of the window covered by a check result.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "unknown_seconds": {
+            "description": "Seconds of the window (after the monitor was created, up to now) that\nno check covered, so Temps cannot say whether the endpoint was up.",
+            "format": "int64",
+            "type": "integer"
+          },
           "uptime_percentage": {
+            "description": "Share of the window's *monitored* time the endpoint was operational,\nweighted by time rather than by check count. Stretches no check covered\n(Temps or its scheduler was down, the deployment was paused, ...) are\nexcluded from the denominator and reported in `unknown_seconds`\ninstead of silently counting as up. `None` when nothing in the window\nwas monitored.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
           "monitor_id",
           "current_status",
-          "uptime_percentage"
+          "monitored_seconds",
+          "downtime_seconds",
+          "unknown_seconds"
         ],
         "type": "object"
       },
@@ -37135,14 +37158,16 @@
             "type": "string"
           },
           "value": {
-            "description": "Metric value at this bucket.",
+            "description": "Metric value at this bucket. `null` when no sample landed in the\nbucket (the sampler, or the server, was not running), so charts break\nthe line instead of interpolating across the outage. Per-interval\nrequest counters read `0` instead: no sample there means no traffic.\nEvery bucket of a window up to 7 days is present.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
-          "time",
-          "value"
+          "time"
         ],
         "type": "object"
       },
@@ -38364,14 +38389,17 @@
             "$ref": "#/components/schemas/MonitorResponse"
           },
           "uptime_percentage": {
+            "description": "Share of the last 30 days' *monitored* time the endpoint was\noperational. `None` when no check covered any of that time -- \"no\ndata\" is not \"100% up\".",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
           "monitor",
-          "current_status",
-          "uptime_percentage"
+          "current_status"
         ],
         "type": "object"
       },
@@ -59250,6 +59278,7 @@
             ]
           },
           "status": {
+            "description": "\"operational\", \"degraded\", \"down\", or \"unknown\" -- the last for a\nbucket no check landed in. Every bucket of the requested range is\nreturned, so a stretch without checks shows up as \"unknown\" rather than\ndisappearing from the timeline.",
             "type": "string"
           },
           "total_checks": {
@@ -59257,8 +59286,12 @@
             "type": "integer"
           },
           "uptime_percentage": {
+            "description": "`None` for a bucket without checks.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
@@ -59267,8 +59300,7 @@
           "total_checks",
           "operational_count",
           "degraded_count",
-          "down_count",
-          "uptime_percentage"
+          "down_count"
         ],
         "type": "object"
       },

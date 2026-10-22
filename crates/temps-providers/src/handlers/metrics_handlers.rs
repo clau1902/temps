@@ -185,8 +185,12 @@ fn resolve_range_window(
 pub struct MetricDataPoint {
     /// ISO 8601 timestamp with `Z` suffix.
     pub time: String,
-    /// Metric value at this bucket.
-    pub value: f64,
+    /// Metric value at this bucket. `null` when no sample landed in the
+    /// bucket (the sampler, or the server, was not running), so charts break
+    /// the line instead of interpolating across the outage. Per-interval
+    /// request counters read `0` instead: no sample there means no traffic.
+    /// Every bucket of a window up to 7 days is present.
+    pub value: Option<f64>,
 }
 
 /// Request body to toggle metric collection for an external service.
@@ -347,7 +351,7 @@ async fn get_service_metrics_range(
         step,
     };
 
-    let points = store.query_range(query).await.map_err(|e| {
+    let points = store.query_range_filled(query).await.map_err(|e| {
         error!(service_id = id, metric = %params.metric, error = %e, "Failed to query metric range");
         internal_server_error()
             .detail(format!("Failed to query metrics: {}", e))
@@ -1145,7 +1149,7 @@ async fn get_deployment_metrics_range(
         step,
     };
 
-    let points = store.query_range(query).await.map_err(|e| {
+    let points = store.query_range_filled(query).await.map_err(|e| {
         error!(deployment_id = id, metric = %params.metric, error = %e, "Failed to query deployment metric range");
         internal_server_error()
             .detail(format!("Failed to query metrics: {}", e))
@@ -1314,7 +1318,7 @@ async fn get_node_metrics_range(
         step,
     };
 
-    let points = store.query_range(query).await.map_err(|e| {
+    let points = store.query_range_filled(query).await.map_err(|e| {
         error!(node_id = id, metric = %params.metric, error = %e, "Failed to query node metric range");
         internal_server_error()
             .detail(format!("Failed to query metrics: {}", e))
