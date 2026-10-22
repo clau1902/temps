@@ -32,6 +32,17 @@ pub struct AppSettings {
     #[serde(default)]
     pub public_ingress_url: Option<String>,
     pub preview_domain: String,
+    /// Label of a new environment's generated hostname under `preview_domain`,
+    /// from `{project}` and `{env}` (ADR 058 D9). `None` means
+    /// [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+    /// environments created after it is set; existing ones keep their names.
+    #[serde(default)]
+    pub environment_hostname_template: Option<String>,
+    /// Label for an environment named `production`, when it should differ
+    /// (e.g. `{project}` for `app.example.com`). `None` uses
+    /// `environment_hostname_template`.
+    #[serde(default)]
+    pub production_hostname_template: Option<String>,
     /// Public edge target that generated DNS records point at when a managed
     /// domain opts into automatic record sync. An IPv4/IPv6 address produces an
     /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
@@ -1363,6 +1374,17 @@ pub struct MultiNodeSettings {
     /// Used by remote worker nodes to reach services (databases, etc.) running on the control plane.
     /// Set via `--private-address` or `TEMPS_PRIVATE_ADDRESS`.
     pub private_address: Option<String>,
+    /// `ip:port` workers dial for the control plane's end of the WireGuard
+    /// mesh, published instead of `private_address` on the mesh port. For a
+    /// control plane reachable only through NAT or a forwarded port.
+    ///
+    /// Owned by `temps serve --wg-endpoint` / `TEMPS_WG_ENDPOINT`: every start
+    /// records the flag's value (clearing it when the flag is absent), and a
+    /// settings write never changes it. Stored here only so the processes
+    /// that set the mesh up (the deployer plugin, `temps network
+    /// setup-multi-node`) read the same value.
+    #[serde(default)]
+    pub wg_endpoint: Option<String>,
     /// Whether the legacy single shared join token is still accepted for node
     /// registration (ADR-020 WS-1.1). Defaults to `true` so existing clusters
     /// keep working on upgrade; fresh installs should set it `false` and rely on
@@ -1432,6 +1454,7 @@ impl Default for MultiNodeSettings {
         Self {
             join_token_hash: None,
             private_address: None,
+            wg_endpoint: None,
             legacy_shared_token_enabled: true,
             cluster_ca_cert_pem: None,
             cluster_ca_key_encrypted: None,
@@ -2299,6 +2322,8 @@ impl Default for AppSettings {
             internal_url: None,
             public_ingress_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
+            environment_hostname_template: None,
+            production_hostname_template: None,
             edge_target: None,
             cloudflare_new_projects: false,
             bunny_new_projects: false,
