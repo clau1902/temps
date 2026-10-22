@@ -114,6 +114,11 @@ impl AgentRunService {
     /// Register the secret values injected into `run_id`'s sandbox. From now
     /// on every log line and output field persisted for the run has them
     /// replaced with [`REDACTED_SECRET`].
+    ///
+    /// Registering again adds to the run's values and makes it the most
+    /// recent entry, so a run that resumes after sitting idle (an autofixer
+    /// run waiting for "Generate Fix") is protected again even if the cap
+    /// evicted it in the meantime.
     pub fn register_secret_values<I>(&self, run_id: i32, values: I)
     where
         I: IntoIterator<Item = String>,
@@ -146,17 +151,21 @@ impl AgentRunService {
         if values.is_empty() {
             return;
         }
-        // Longest first, so a value containing another is replaced whole.
-        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        values.dedup();
 
         let mut redactions = self
             .redactions
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if redactions.by_run.insert(run_id, Arc::new(values)).is_none() {
-            redactions.order.push_back(run_id);
+        if let Some(existing) = redactions.by_run.get(&run_id) {
+            values.extend(existing.iter().cloned());
         }
+        // Longest first, so a value containing another is replaced whole.
+        values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        values.dedup();
+        if redactions.by_run.insert(run_id, Arc::new(values)).is_some() {
+            redactions.order.retain(|id| *id != run_id);
+        }
+        redactions.order.push_back(run_id);
         while redactions.order.len() > MAX_REDACTED_RUNS {
             if let Some(evicted) = redactions.order.pop_front() {
                 redactions.by_run.remove(&evicted);
@@ -338,7 +347,11 @@ impl AgentRunService {
             tracing::error!("Failed to mark agent run {} as failed: {}", run_id, e);
         }
         if let Err(e) = self.append_log(run_id, "error", log_message, None).await {
-            tracing::error!("Failed to append failure log for agent run {}: {}", run_id, e);
+            tracing::error!(
+                "Failed to append failure log for agent run {}: {}",
+                run_id,
+                e
+            );
         }
         self.forget_secret_values(run_id);
     }
@@ -1178,7 +1191,10 @@ mod tests {
         let line = serde_json::json!({ "type": "tool_result", "content": format!("{pem} / pa\"ss\\word") })
             .to_string();
         let redacted = svc.redact(4, &line);
-        assert!(!redacted.contains("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"), "{redacted}");
+        assert!(
+            !redacted.contains("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"),
+            "{redacted}"
+        );
         assert!(!redacted.contains(r#"pa\"ss"#), "{redacted}");
         assert!(
             redacted.contains(r#""[redacted] / [redacted]""#),
@@ -1218,6 +1234,32 @@ mod tests {
         );
         assert!(!statements.contains("failing-run-secret"), "{statements}");
         assert!(statements.contains(REDACTED_SECRET), "{statements}");
+    }
+
+    /// A run registered again (an autofixer phase resuming in its sandbox)
+    /// keeps its earlier values, gains the new ones, and becomes the most
+    /// recent entry, so the cap evicts idle runs before it.
+    #[test]
+    fn re_registering_a_run_merges_values_and_refreshes_it() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+        svc.register_secret_values(1, ["first-secret".to_string()]);
+        for run_id in 2..(MAX_REDACTED_RUNS as i32) {
+            svc.register_secret_values(run_id, [format!("secret-for-{run_id}")]);
+        }
+        svc.register_secret_values(1, ["second-secret".to_string()]);
+        // Two more runs overflow the cap: run 2, not the refreshed run 1, goes.
+        svc.register_secret_values(1000, ["secret-for-1000".to_string()]);
+        svc.register_secret_values(1001, ["secret-for-1001".to_string()]);
+
+        assert_eq!(
+            svc.redact(1, "first-secret second-secret"),
+            "[redacted] [redacted]"
+        );
+        assert_eq!(svc.redact(2, "secret-for-2"), "secret-for-2");
+        let redactions = svc.redactions.read().unwrap();
+        assert_eq!(redactions.order.len(), MAX_REDACTED_RUNS);
+        assert_eq!(redactions.order.iter().filter(|id| **id == 1).count(), 1);
     }
 
     #[test]

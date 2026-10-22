@@ -550,6 +550,12 @@ impl AutofixerService {
             });
         }
 
+        // The run may have waited in "analyzed" long enough for the bounded
+        // redaction registry to evict it; protect the fix output again.
+        self.executor
+            .register_run_secrets(run_id, run.project_id)
+            .await?;
+
         // Update status → "fixing"
         self.run_service
             .update_status(
@@ -830,6 +836,12 @@ impl AutofixerService {
             });
         }
 
+        // The run may have waited in "fix_ready" long enough for the bounded
+        // redaction registry to evict it; protect the push output again.
+        self.executor
+            .register_run_secrets(run_id, run.project_id)
+            .await?;
+
         let project = projects::Entity::find_by_id(run.project_id)
             .one(self.db.as_ref())
             .await
@@ -1103,7 +1115,11 @@ impl AutofixerService {
                     e
                 );
                 self.run_service
-                    .record_run_failure(run_id, e.to_string(), &format!("Conversation failed: {}", e))
+                    .record_run_failure(
+                        run_id,
+                        e.to_string(),
+                        &format!("Conversation failed: {}", e),
+                    )
                     .await;
             }
         }
@@ -1123,6 +1139,12 @@ impl AutofixerService {
                 ),
             });
         }
+
+        // The run may have waited long enough for the bounded redaction
+        // registry to evict it; protect the conversation's output again.
+        self.executor
+            .register_run_secrets(run_id, run.project_id)
+            .await?;
 
         // Verify work directory still exists (no re-cloning needed)
         let work_dir = Self::work_dir(run_id);

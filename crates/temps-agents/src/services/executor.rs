@@ -1070,6 +1070,22 @@ impl AgentExecutor {
         Ok(handle)
     }
 
+    /// Resolve the secrets `project_id`'s runs receive and register their
+    /// values for redaction on `run_id`. Anything the sandbox prints is
+    /// persisted where the project's members can read it, so every phase
+    /// that runs in a run's sandbox calls this first: the registry is
+    /// bounded and may have evicted a run that sat idle between phases.
+    pub(crate) async fn register_run_secrets(
+        &self,
+        run_id: i32,
+        project_id: i32,
+    ) -> Result<Vec<crate::services::secret_service::ResolvedSecret>, AgentError> {
+        let secrets = self.secret_service.resolve_secrets(project_id).await?;
+        self.run_service
+            .register_secret_values(run_id, secrets.iter().map(|s| s.value.clone()));
+        Ok(secrets)
+    }
+
     /// Inject config repos and secrets into the sandbox.
     ///
     /// Overlay order: repo's own `.claude/` → global config repo → per-agent config repo.
@@ -1104,11 +1120,7 @@ impl AgentExecutor {
         // secrets are never resolved here, so neither the sandbox nor a
         // `${TEMPS_SECRET:...}` placeholder in project-controlled config can
         // reach them.
-        let secrets = self.secret_service.resolve_secrets(project_id).await?;
-        // Anything the sandbox prints is persisted where the project's
-        // members can read it; redact the injected values by value.
-        self.run_service
-            .register_secret_values(run_id, secrets.iter().map(|s| s.value.clone()));
+        let secrets = self.register_run_secrets(run_id, project_id).await?;
         let secret_map: std::collections::HashMap<String, String> = secrets
             .iter()
             .map(|s| (s.name.clone(), s.value.clone()))
@@ -5771,6 +5783,63 @@ mod tests {
             confidence,
             times_used: 0,
         }
+    }
+
+    /// A phase resuming in an idle run's sandbox re-registers the project's
+    /// secret values, so output it persists is redacted even after the
+    /// bounded registry evicted the run.
+    #[tokio::test]
+    async fn register_run_secrets_restores_redaction_for_an_evicted_run() {
+        let enc = make_encryption_service();
+        let secret = temps_entities::agent_secrets::Model {
+            id: 1,
+            project_id: Some(3),
+            name: "DB_PASSWORD".to_string(),
+            secret_type: "env".to_string(),
+            encrypted_value: enc.encrypt_string("evicted-run-secret").unwrap(),
+            mount_path: None,
+            description: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![secret]])
+                .into_connection(),
+        );
+        let recorder = Arc::new(GitRecorder::default());
+        let git: Arc<dyn GitProviderManagerTrait> = Arc::new(FakeGitProvider {
+            recorder,
+            clone_should_fail: false,
+        });
+        let queue: Arc<dyn JobQueue> = Arc::new(FakeJobQueue {
+            sent: Mutex::new(vec![]),
+        });
+        let run_svc = Arc::new(AgentRunService::new(db.clone()));
+        let executor = AgentExecutor::new(
+            db.clone(),
+            git,
+            enc.clone(),
+            queue,
+            run_svc.clone(),
+            Arc::new(AgentConfigService::new(db.clone(), enc)),
+            make_notification_service(db.clone()),
+            make_sandbox_registry(),
+            make_secret_service(db.clone()),
+            make_definition_service(db),
+        );
+        // The run's entry was evicted while it waited between phases.
+        assert_eq!(
+            run_svc.redact(9, "pw=evicted-run-secret"),
+            "pw=evicted-run-secret"
+        );
+
+        executor
+            .register_run_secrets(9, 3)
+            .await
+            .expect("resolving the project's secrets");
+
+        assert_eq!(run_svc.redact(9, "pw=evicted-run-secret"), "pw=[redacted]");
     }
 
     fn make_executor_for_memory_tests() -> AgentExecutor {
