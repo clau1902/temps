@@ -61,6 +61,7 @@ import {
   currentDiskPercent,
   formatRateTick,
   hasNoNodeSamples,
+  lastSampleOf,
   isMetricsUnavailable,
   mergeSeries,
   peakOf,
@@ -121,7 +122,7 @@ function useNodeSeries(
 }
 
 const lastValue = (points: MetricDataPoint[] | undefined) =>
-  points && points.length > 0 ? points[points.length - 1].value : null
+  lastSampleOf(points)?.value ?? null
 
 // ---------------------------------------------------------------------------
 // Presentational pieces
@@ -213,6 +214,16 @@ function UsageCard({
 
 type SeriesDef = ThresholdLineSeries
 
+/** Whether any row holds a value for any of the chart's series. */
+function hasAnySample(
+  data: Record<string, string | number | null>[],
+  series: SeriesDef[]
+): boolean {
+  return data.some((row) =>
+    series.some((s) => typeof row[s.dataKey] === 'number')
+  )
+}
+
 type ChartPanelProps = {
   title: string
   description: string
@@ -259,7 +270,7 @@ function ChartPanel({
           <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
             {errorText}
           </div>
-        ) : data.length === 0 ? (
+        ) : !hasAnySample(data, series) ? (
           <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
             {emptyText}
           </div>
@@ -271,6 +282,9 @@ function ChartPanel({
             thresholds={thresholds}
             height={220}
             syncId={CHART_SYNC_ID}
+            // Buckets nothing was sampled in are null: break the line there
+            // instead of drawing a straight segment across the downtime.
+            connectNulls={false}
             yTickFormatter={tickFormatter ?? valueFormatter}
             tooltipValueFormatter={valueFormatter}
           />
@@ -578,7 +592,9 @@ export function ServerMonitoring() {
         points: diskTotal
           ? disk.data?.map((p) => ({
               time: p.time,
-              value: usagePercent(p.value, diskTotal),
+              // A bucket without a sample stays a gap; usagePercent would
+              // turn the missing reading into 0 %.
+              value: p.value == null ? null : usagePercent(p.value, diskTotal),
             }))
           : undefined,
       },
@@ -600,7 +616,9 @@ export function ServerMonitoring() {
     label
   )
 
-  const lastSampleIso = cpu.data?.[cpu.data.length - 1]?.time
+  // The series carries every bucket of the window, including the trailing
+  // ones nothing was sampled in, so "last sample" is the last non-null one.
+  const lastSampleIso = lastSampleOf(cpu.data)?.time
   // Age at the time the series was fetched (refreshed every 30 s), so render
   // stays pure and the number never drifts between two renders of one fetch.
   const ageSeconds =

@@ -35,6 +35,7 @@ mod m20261020_000003_debug_id_artifacts;
 mod m20261020_000004_client_outcomes;
 mod m20261020_000005_client_outcome_receipts;
 mod m20261020_000006_otel_ingest_receipts;
+mod m20261022_000001_add_github_repo_webhook;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -829,6 +830,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000005_node_public_ingress::Migration),
             // ADR 058 D9: the operator decides what each tunnel publishes.
             Box::new(m20261021_000001_ingress_hostname_choices::Migration),
+            // #1596: per-project GitHub repository webhooks for non-App connections.
+            Box::new(m20261022_000001_add_github_repo_webhook::Migration),
         ]
     }
 }
