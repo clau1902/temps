@@ -143054,10 +143054,7 @@
             "required": false,
             "schema": {
               "format": "int32",
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           }
         ],

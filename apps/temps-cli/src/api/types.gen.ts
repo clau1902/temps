@@ -76472,7 +76472,7 @@ export type DeleteSecretData = {
         /**
          * Project scope; omit for the instance-wide secret.
          */
-        project_id?: number | null;
+        project_id?: number;
     };
     url: '/settings/secrets/{name}';
 };
