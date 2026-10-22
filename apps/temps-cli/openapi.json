@@ -45804,6 +45804,15 @@
               "null"
             ]
           },
+          "github_webhook_id": {
+            "description": "GitHub repository webhook ID Temps registered on the connected\nrepository. Only GitHub connections that are not a GitHub App (personal\naccess token, OAuth) get one; App connections receive pushes through the\nApp webhook. `null` when none is installed (another provider, a GitHub\nApp connection, or registration failed / the hook was never created).",
+            "example": 512345678,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "gitlab_webhook_id": {
             "description": "GitLab webhook ID installed on the connected repository.\n`null` when no GitLab webhook is installed (not connected to GitLab,\nor webhook was removed / never created).",
             "example": 42,
@@ -49492,6 +49501,26 @@
           "key_id",
           "payload",
           "signature"
+        ],
+        "type": "object"
+      },
+      "ReinstallGithubWebhookResponse": {
+        "description": "Response for `POST /projects/{project_id}/github/reinstall-webhook`",
+        "properties": {
+          "hook_id": {
+            "description": "The new GitHub repository hook ID that was installed.",
+            "example": 512345678,
+            "format": "int64",
+            "type": "integer"
+          },
+          "message": {
+            "description": "Human-readable status message.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hook_id",
+          "message"
         ],
         "type": "object"
       },
@@ -131637,6 +131666,60 @@
           }
         ],
         "summary": "Update git settings for a project",
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
+    "/projects/{project_id}/github/reinstall-webhook": {
+      "post": {
+        "description": "For projects on a GitHub connection that is not a GitHub App (personal\naccess token or OAuth). Removes the existing repository webhook (if any)\nand registers a fresh one with a new signing secret. Use this when the\nwebhook could not be registered automatically (the token lacks webhook\npermission) or was deleted on GitHub, and pushes have stopped deploying.",
+        "operationId": "reinstall_github_webhook",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReinstallGithubWebhookResponse"
+                }
+              }
+            },
+            "description": "Webhook installed"
+          },
+          "400": {
+            "description": "Project is not on a GitHub PAT/OAuth connection, or GitHub refused to create the webhook"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Install or reinstall the GitHub repository webhook for a project",
         "tags": [
           "Projects"
         ]
