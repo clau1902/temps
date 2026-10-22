@@ -5,12 +5,12 @@
 //!
 //! The console handlers validate a change against what the worker allows;
 //! this service reads and writes `node_public_ingress` and flips the node's
-//! enabled flag in the order the agents rely on.
+//! enabled flag in the same transaction.
 
 use std::sync::Arc;
 
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ActiveValue::Set, DatabaseConnection, EntityTrait};
+use sea_orm::{ActiveValue::Set, DatabaseConnection, EntityTrait, TransactionTrait};
 use temps_entities::{node_public_ingress, nodes};
 use thiserror::Error;
 
@@ -90,13 +90,15 @@ impl NodePublicIngressService {
             created_at: Set(now),
             updated_at: Set(now),
         };
-        // Turning off goes first, so no snapshot built between the two writes
-        // binds the new ports on a worker that is being turned off.
-        if !change.enabled {
-            self.node_service
-                .set_public_ingress_enabled(node_id, false)
-                .await?;
-        }
+        // One transaction, the node row locked first: snapshots never see
+        // the flag without its settings, and two overlapping saves apply one
+        // after the other instead of mixing one's flag with the other's ports.
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(|source| NodePublicIngressError::Save { node_id, source })?;
+        NodeService::set_public_ingress_enabled_in(&txn, node_id, change.enabled).await?;
         node_public_ingress::Entity::insert(row)
             .on_conflict(
                 OnConflict::column(node_public_ingress::Column::NodeId)
@@ -109,15 +111,13 @@ impl NodePublicIngressService {
                     ])
                     .to_owned(),
             )
-            .exec(self.db.as_ref())
+            .exec(&txn)
             .await
             .map_err(|source| NodePublicIngressError::Save { node_id, source })?;
-        // Also notifies agents, so the new listen settings go out at once.
-        if change.enabled {
-            self.node_service
-                .set_public_ingress_enabled(node_id, true)
-                .await?;
-        }
+        // Agents are notified on commit, so the new settings go out at once.
+        txn.commit()
+            .await
+            .map_err(|source| NodePublicIngressError::Save { node_id, source })?;
         Ok(())
     }
 

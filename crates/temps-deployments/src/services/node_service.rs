@@ -1792,7 +1792,22 @@ impl NodeService {
         node_id: i32,
         enabled: bool,
     ) -> Result<nodes::Model, NodeError> {
-        let node = self.get_by_id(node_id).await?;
+        Self::set_public_ingress_enabled_in(self.db.as_ref(), node_id, enabled).await
+    }
+
+    /// [`Self::set_public_ingress_enabled`] on `db`, which may be a
+    /// transaction. The node row is locked, so concurrent changes to one
+    /// node's ingress apply one after the other.
+    pub(crate) async fn set_public_ingress_enabled_in<C: ConnectionTrait>(
+        db: &C,
+        node_id: i32,
+        enabled: bool,
+    ) -> Result<nodes::Model, NodeError> {
+        let node = nodes::Entity::find_by_id(node_id)
+            .lock_exclusive()
+            .one(db)
+            .await?
+            .ok_or(NodeError::NotFoundById { node_id })?;
         if node.role != "worker" {
             return Err(NodeError::Validation {
                 message: format!(
@@ -1811,12 +1826,11 @@ impl NodeService {
             active.public_ingress_unsupported_route_count = Set(Some(0));
             active.public_ingress_unsupported_reasons = Set(serde_json::json!([]));
         }
-        let updated = active.update(self.db.as_ref()).await?;
-        sea_orm::ConnectionTrait::execute_unprepared(
-            self.db.as_ref(),
-            "SELECT pg_notify('route_table_changes', '')",
-        )
-        .await?;
+        let updated = active.update(db).await?;
+        // Inside a transaction Postgres delivers this at commit, after the
+        // rest of the change is visible.
+        db.execute_unprepared("SELECT pg_notify('route_table_changes', '')")
+            .await?;
         Ok(updated)
     }
 
