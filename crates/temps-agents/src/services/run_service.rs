@@ -135,6 +135,12 @@ impl AgentRunService {
                 };
                 std::iter::once(value).chain(lines)
             })
+            .flat_map(|value| {
+                // Agent CLIs stream JSON, where a value holding a newline,
+                // quote or backslash appears escaped; redact that form too.
+                let escaped = json_escaped(&value).filter(|escaped| *escaped != value);
+                std::iter::once(value).chain(escaped)
+            })
             .filter(|value| value.chars().count() >= MIN_REDACTED_SECRET_LEN)
             .collect();
         if values.is_empty() {
@@ -309,6 +315,32 @@ impl AgentRunService {
             .map_err(AgentError::Database)?;
 
         Ok(model)
+    }
+
+    /// Mark `run_id` failed with `error_message` and append `log_message` as
+    /// an error line, both redacted, then drop the run's secret values:
+    /// nothing more is persisted for a failed run. Best effort -- a failed
+    /// write is logged, and the secret values are dropped either way.
+    pub async fn record_run_failure(&self, run_id: i32, error_message: String, log_message: &str) {
+        if let Err(e) = self
+            .update_status(
+                run_id,
+                UpdateRunFields {
+                    status: Some("failed".to_string()),
+                    phase: Some("failed".to_string()),
+                    error_message: Some(error_message),
+                    completed_at: Some(Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            tracing::error!("Failed to mark agent run {} as failed: {}", run_id, e);
+        }
+        if let Err(e) = self.append_log(run_id, "error", log_message, None).await {
+            tracing::error!("Failed to append failure log for agent run {}: {}", run_id, e);
+        }
+        self.forget_secret_values(run_id);
     }
 
     pub async fn update_status(
@@ -712,6 +744,15 @@ impl AgentRunService {
 
         Ok(count)
     }
+}
+
+/// `value` as it appears inside a JSON string literal, without the quotes.
+fn json_escaped(value: &str) -> Option<String> {
+    let quoted = serde_json::to_string(value).ok()?;
+    quoted
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .map(str::to_string)
 }
 
 fn redact_values(text: &str, values: &[String]) -> String {
@@ -1124,6 +1165,59 @@ mod tests {
             svc.redact(3, "line: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"),
             "line: [redacted]"
         );
+    }
+
+    #[test]
+    fn redaction_catches_json_escaped_values() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+        let pem = "-----BEGIN KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END KEY-----";
+        svc.register_secret_values(4, [pem.to_string(), r#"pa"ss\word"#.to_string()]);
+
+        // The agent's JSON stream carries both values escaped.
+        let line = serde_json::json!({ "type": "tool_result", "content": format!("{pem} / pa\"ss\\word") })
+            .to_string();
+        let redacted = svc.redact(4, &line);
+        assert!(!redacted.contains("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"), "{redacted}");
+        assert!(!redacted.contains(r#"pa\"ss"#), "{redacted}");
+        assert!(
+            redacted.contains(r#""[redacted] / [redacted]""#),
+            "{redacted}"
+        );
+    }
+
+    /// A failed run's error is persisted redacted, and its secret values are
+    /// dropped afterwards rather than held until the registry cap evicts them.
+    #[tokio::test]
+    async fn record_run_failure_redacts_then_forgets_secret_values() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_run(6, 10)]])
+                .append_query_results([vec![make_run(6, 10)]])
+                .append_query_results([vec![log_row(6)]])
+                .into_connection(),
+        );
+        let svc = AgentRunService::new(db.clone());
+        svc.register_secret_values(6, ["failing-run-secret".to_string()]);
+
+        svc.record_run_failure(
+            6,
+            "clone failed: token failing-run-secret rejected".to_string(),
+            "Analysis failed: token failing-run-secret rejected",
+        )
+        .await;
+
+        assert!(svc.secret_values_for(6).is_none());
+        assert!(svc.redactions.read().unwrap().order.is_empty());
+        drop(svc);
+        let statements = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("service dropped")
+                .into_transaction_log()
+        );
+        assert!(!statements.contains("failing-run-secret"), "{statements}");
+        assert!(statements.contains(REDACTED_SECRET), "{statements}");
     }
 
     #[test]

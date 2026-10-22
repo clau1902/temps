@@ -251,22 +251,8 @@ impl AutofixerService {
             }
             Err(e) => {
                 tracing::error!("Autofixer run {}: analysis failed: {}", run_id, e);
-                let _ = self
-                    .run_service
-                    .update_status(
-                        run_id,
-                        UpdateRunFields {
-                            status: Some("failed".to_string()),
-                            phase: Some("failed".to_string()),
-                            error_message: Some(e.to_string()),
-                            completed_at: Some(Utc::now()),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let _ = self
-                    .run_service
-                    .append_log(run_id, "error", &format!("Analysis failed: {}", e), None)
+                self.run_service
+                    .record_run_failure(run_id, e.to_string(), &format!("Analysis failed: {}", e))
                     .await;
             }
         }
@@ -534,22 +520,8 @@ impl AutofixerService {
             }
             Err(e) => {
                 tracing::error!("Autofixer run {}: fix failed: {}", run_id, e);
-                let _ = self
-                    .run_service
-                    .update_status(
-                        run_id,
-                        UpdateRunFields {
-                            status: Some("failed".to_string()),
-                            phase: Some("failed".to_string()),
-                            error_message: Some(e.to_string()),
-                            completed_at: Some(Utc::now()),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let _ = self
-                    .run_service
-                    .append_log(run_id, "error", &format!("Fix failed: {}", e), None)
+                self.run_service
+                    .record_run_failure(run_id, e.to_string(), &format!("Fix failed: {}", e))
                     .await;
             }
         }
@@ -1130,27 +1102,8 @@ impl AutofixerService {
                     run_id,
                     e
                 );
-                let _ = self
-                    .run_service
-                    .update_status(
-                        run_id,
-                        UpdateRunFields {
-                            status: Some("failed".to_string()),
-                            phase: Some("failed".to_string()),
-                            error_message: Some(e.to_string()),
-                            completed_at: Some(Utc::now()),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let _ = self
-                    .run_service
-                    .append_log(
-                        run_id,
-                        "error",
-                        &format!("Conversation failed: {}", e),
-                        None,
-                    )
+                self.run_service
+                    .record_run_failure(run_id, e.to_string(), &format!("Conversation failed: {}", e))
                     .await;
             }
         }
@@ -1337,8 +1290,10 @@ impl AutofixerService {
         if let Some(token_id) = self.executor.run_token_ids.write().await.remove(&run_id) {
             self.executor.revoke_run_token(run_id, token_id).await;
         }
-        // Release sandbox, then clean up temp dir
+        // Release sandbox, then clean up temp dir. With the sandbox gone the
+        // agent prints nothing more, so its secret values can be dropped.
         let _ = self.sandbox_registry.release(run_id).await;
+        self.run_service.forget_secret_values(run_id);
         let work_dir = Self::work_dir(run_id);
         if work_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&work_dir).await {
