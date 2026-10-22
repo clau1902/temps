@@ -1152,7 +1152,7 @@ async fn bridge_address_outside_cidr_rejected() {
 }
 
 #[tokio::test]
-async fn full_pool_collision_is_rejected_without_partial_kernel_state() {
+async fn routed_subnet_collision_is_rejected_without_partial_kernel_state() {
     if std::env::var("TEMPS_IT_PHASE_TESTS").as_deref() != Ok("1") {
         return;
     }
@@ -1186,14 +1186,33 @@ async fn full_pool_collision_is_rejected_without_partial_kernel_state() {
     );
 
     let docker = bollard::Docker::connect_with_local_defaults().expect("docker connect");
-    let error = temps_network::docker::preflight_network_for_pool(
+    let occupied: Ipv4Net = existing_cidr.parse().expect("valid existing CIDR");
+    // ADR 056: only routed subnets matter. With no peer on the occupied
+    // range, the rest of the pool is irrelevant.
+    let own_only = [env.alloc().compute_cidr];
+    if !own_only
+        .iter()
+        .any(|own| own.contains(&occupied.network()) || occupied.contains(&own.network()))
+    {
+        temps_network::docker::preflight_network_for_subnets(
+            &docker,
+            &env.config(),
+            &env.alloc(),
+            &own_only,
+        )
+        .await
+        .expect("a Docker network elsewhere in the pool must not block this node");
+    }
+    assert!(pool.contains(&occupied.network()) || occupied.contains(&pool.network()));
+    // A peer routed over the occupied range is refused, naming the network.
+    let error = temps_network::docker::preflight_network_for_subnets(
         &docker,
         &env.config(),
         &env.alloc(),
-        pool,
+        &[env.alloc().compute_cidr, occupied],
     )
     .await
-    .expect_err("the full cluster pool must reject an occupied future peer subnet");
+    .expect_err("a routed peer subnet over a Docker network must be refused");
     assert!(error.to_string().contains(existing));
     assert!(!link_exists("br-temps0").await);
     assert!(!link_exists("vxlan-temps0").await);
@@ -1274,7 +1293,7 @@ async fn control_plane_stays_running_and_reconciles_worker_later() {
     assert!(route_exists(&existing_app_cidr).await);
     assert!(route_exists(&existing_custom_route).await);
     assert!(docker_container_running(&existing_app_container).await);
-    temps_network::preflight_compute_pool_routes(&cfg, pool)
+    temps_network::preflight_compute_routes(&cfg, &[env.alloc().compute_cidr, env.peer_cidr, pool])
         .await
         .expect("safe cluster pool must not overlap host routes");
     let alloc = env.alloc();
@@ -1317,7 +1336,6 @@ async fn control_plane_stays_running_and_reconciles_worker_later() {
         &docker,
         &cfg,
         &alloc,
-        pool,
         vec![peer.clone()],
     )
     .await

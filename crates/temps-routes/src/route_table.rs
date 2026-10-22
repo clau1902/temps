@@ -3507,6 +3507,18 @@ impl CachedPeerTable {
             .filter(|host| !host.ends_with(".temps.local"))
             .count()
     }
+
+    /// Every public hostname in the route table, whoever serves it.
+    pub fn public_hostnames(&self) -> Vec<String> {
+        self.route_snapshot
+            .load()
+            .legacy
+            .exact
+            .keys()
+            .filter(|host| !host.ends_with(".temps.local"))
+            .cloned()
+            .collect()
+    }
 }
 
 #[temps_core::async_trait::async_trait]

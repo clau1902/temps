@@ -5082,6 +5082,12 @@ mod tests {
             image_builder: Arc::new(MockImageBuilder) as Arc<dyn temps_deployer::ImageBuilder>,
             audit_service: Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>,
             node_service: Arc::new(crate::services::NodeService::new(db.clone())),
+            node_public_ingress_service: Arc::new(
+                crate::services::node_public_ingress::NodePublicIngressService::new(
+                    db.clone(),
+                    Arc::new(crate::services::NodeService::new(db.clone())),
+                ),
+            ),
             node_scheduler: Arc::new(crate::services::NodeScheduler::new(Arc::new(
                 crate::services::NodeService::new(db.clone()),
             ))),
