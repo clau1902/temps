@@ -289,6 +289,17 @@ impl AgentCommand {
             // global notifier passed below; if the agent server exits,
             // the client stops on the next round.
             let route_sync_shutdown = Arc::new(tokio::sync::Notify::new());
+
+            // Cloud-metadata egress guard: installed at start rather than on
+            // the first deploy, so a rebooted node never runs containers
+            // without it, and re-asserted periodically after firewall flushes.
+            tokio::spawn(
+                temps_deployer::metadata_egress::maintain_metadata_egress_block(
+                    std::time::Duration::from_secs(60),
+                    route_sync_shutdown.clone(),
+                ),
+            );
+
             match temps_agent::route_sync_client::RouteSyncClient::new_with_ca(
                 config.control_plane_url.clone(),
                 config.node_id,
