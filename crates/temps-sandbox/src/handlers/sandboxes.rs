@@ -273,6 +273,17 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Placement Settings Unavailable")
                     .with_detail(error.to_string())
             }
+            SandboxError::LimitSettings { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Sandbox Limit Settings Unavailable")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::UserSandboxLimitReached { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-limit-reached")
+                    .with_title("Sandbox Limit Reached")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -542,14 +553,17 @@ pub struct CreateSandboxBody {
     /// Extra env vars baked into the container on create.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// CPU cores, `[0.01, 16]`. Omit for the operator's default.
+    /// CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).
+    /// Omit for the operator's default.
     #[serde(default)]
     pub cpu_limit: Option<f64>,
-    /// Memory in MB, `[6, 32768]`. Omit for the operator's default.
+    /// Memory in MB, `[6, 32768]` (lower if an administrator set a maximum,
+    /// and never more than the host has). Omit for the operator's default.
     #[serde(default)]
     pub memory_limit_mb: Option<u64>,
-    /// Max processes, `[1, 4096]`; `0`/negative (unlimited) is rejected.
-    /// Omit for the platform default (512).
+    /// Max processes, `[1, 4096]` (lower if an administrator set a maximum);
+    /// `0`/negative (unlimited) is rejected. Omit for the platform default
+    /// (512).
     #[serde(default)]
     pub pids_limit: Option<i64>,
     /// Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores
@@ -661,6 +675,10 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             project_id: b.project_id,
             // Snapshot artifact is resolved and injected by the handler;
             // the `From` impl starts with None and the handler sets it.
+            // Every request built from an HTTP body is subject to the
+            // operator's maximums and per-user cap; the service applies them
+            // once it knows which node the sandbox lands on.
+            enforce_operator_limits: true,
             from_snapshot_artifact: None,
             host_work_dir_override: None,
             node: b.node,
@@ -1253,9 +1271,9 @@ async fn build_summary_responses(
     request_body = CreateSandboxBody,
     responses(
         (status = 201, description = "Sandbox created", body = SandboxResponse),
-        (status = 400, description = "Validation error"),
+        (status = 400, description = "Validation error, including a CPU, memory, process or disk limit outside the allowed range or above the administrator's maximum"),
         (status = 401, description = "Unauthorized"),
-        (status = 422, description = "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible"),
+        (status = 422, description = "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible; or the user already has the maximum number of sandboxes an administrator allows"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -3486,6 +3504,141 @@ mod tests {
         };
         let req = CreateSandboxRequest::from(body);
         assert!(validate_resource_limits(&req).is_err());
+    }
+
+    // ── POST /v1/sandboxes, through the router ──────────────────────────────
+    //
+    // These send real requests so the handler wiring is covered, not only the
+    // validator: an account holding the default `user` role must get a 4xx for
+    // limits that would otherwise reach the container runtime.
+
+    struct AllowAll;
+
+    #[async_trait::async_trait]
+    impl temps_core::SensitiveActionAuthorizer for AllowAll {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::Allow)
+        }
+    }
+
+    fn settings_row(agent_sandbox: serde_json::Value) -> temps_entities::settings::Model {
+        temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({ "agent_sandbox": agent_sandbox }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn live_count_row(count: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([("num_items".to_string(), count.into())])
+    }
+
+    /// Router over `db`, authenticated as a default-role user.
+    fn create_app(db: sea_orm::DatabaseConnection) -> axum::Router {
+        let service = Arc::new(
+            crate::services::sandbox_service::tests::preview_test_service_with_db(Arc::new(db)),
+        );
+        let state = Arc::new(SandboxAppState {
+            sandbox_service: service,
+            snapshot_service: None,
+            project_access_checker: None,
+            audit_service: None,
+            sensitive_action_authorizer: Arc::new(AllowAll),
+        });
+        crate::handlers::configure_routes()
+            .with_state(state)
+            .layer(axum::Extension(AuthContext::new_session(
+                test_user(),
+                Role::User,
+            )))
+    }
+
+    /// Status and parsed Problem body of `POST /v1/sandboxes`.
+    async fn post_create(
+        app: axum::Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sandboxes")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unbounded_limits_before_touching_the_database() {
+        // A database that answers nothing: every case must be decided by the
+        // handler, or the unanswered query would surface as a 500.
+        for body in [
+            serde_json::json!({ "pids_limit": -1, "memory_limit_mb": 4_194_304, "cpu_limit": 1 }),
+            serde_json::json!({ "pids_limit": 0 }),
+            serde_json::json!({ "memory_limit_mb": 4_194_304 }),
+            serde_json::json!({ "memory_limit_mb": 5 }),
+            serde_json::json!({ "cpu_limit": 1e-12 }),
+            serde_json::json!({ "resources": { "memory": 4_194_304 } }),
+        ] {
+            let db =
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+            let (status, problem) = post_create(create_app(db), body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {problem}");
+            assert_eq!(problem["title"], "Validation Error", "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_request_over_the_operator_maximum() {
+        // Query order: the placement allow-list, then the limit settings.
+        let row = settings_row(serde_json::json!({ "max_memory_limit_mb": 1024 }));
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![row.clone()], vec![row]])
+            .into_connection();
+
+        let (status, problem) = post_create(
+            create_app(db),
+            serde_json::json!({ "memory_limit_mb": 2048 }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("max_memory_limit_mb"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_user_who_is_at_the_sandbox_cap() {
+        let row = settings_row(serde_json::json!({ "max_sandboxes_per_user": 2 }));
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![row.clone()], vec![row]])
+            // The user already has two live sandboxes.
+            .append_query_results([vec![live_count_row(2)]])
+            .into_connection();
+
+        let (status, problem) = post_create(create_app(db), serde_json::json!({})).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{problem}");
+        assert_eq!(problem["title"], "Sandbox Limit Reached");
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("already has 2") && detail.contains("limit is 2"),
+            "{detail}"
+        );
     }
 
     // ── DTO stability: unknown fields ───────────────────────────────────────

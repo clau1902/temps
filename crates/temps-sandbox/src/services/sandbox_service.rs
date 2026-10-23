@@ -36,6 +36,7 @@ use temps_entities::{
 use temps_git::GitProviderManager;
 
 use crate::error::{from_agent_error, SandboxError};
+use crate::services::create_policy;
 use crate::services::exec::ExecOptions;
 use crate::services::job_tracker::JobTracker;
 use crate::services::placement;
@@ -202,6 +203,12 @@ pub struct CreateSandboxRequest {
     /// automatic placement. Resolved against the operator allow-list by
     /// [`crate::services::placement`].
     pub node: Option<String>,
+    /// Check the request against the operator's sandbox limits
+    /// (`agent_sandbox.max_*` settings, the host's memory and the per-user
+    /// cap; see [`crate::services::create_policy`]). Set by the HTTP create
+    /// handler. Internal callers (application workspaces, agent runs) leave
+    /// it `false`: they choose their own limits and are not the abuse case.
+    pub enforce_operator_limits: bool,
 }
 
 /// First-class sandbox identity for a durable AI application workspace.
@@ -1288,6 +1295,9 @@ pub struct SandboxService {
     /// Worker nodes whose sandboxes are being evicted right now. They take
     /// no new sandboxes, and a second eviction of the same node is refused.
     evicting_nodes: Arc<EvictingNodes>,
+    /// Held from counting a user's sandboxes to inserting the new row, so
+    /// two simultaneous creates cannot both pass the per-user cap.
+    create_cap_gate: tokio::sync::Mutex<()>,
 }
 
 /// Worker nodes with an eviction in progress in this process (ADR-048).
@@ -1360,6 +1370,7 @@ impl SandboxService {
             runtime_credentials: None,
             node_probe,
             evicting_nodes: Arc::new(EvictingNodes::default()),
+            create_cap_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1809,6 +1820,24 @@ impl SandboxService {
         Ok(workers)
     }
 
+    /// Sandboxes `user_id` created through the API that are not destroyed.
+    /// Agent-run sandboxes and managed application workspaces belong to the
+    /// platform, not to the user's quota.
+    async fn live_standalone_sandboxes(&self, user_id: i32) -> Result<u64, SandboxError> {
+        sandboxes::Entity::find()
+            .filter(sandboxes::Column::UserId.eq(user_id))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .filter(sandboxes::Column::AgentRunId.is_null())
+            .filter(
+                sandboxes::Column::Name
+                    .starts_with(APPLICATION_WORKSPACE_NAME_PREFIX)
+                    .not(),
+            )
+            .count(self.db.as_ref())
+            .await
+            .map_err(SandboxError::from)
+    }
+
     /// Node a new sandbox runs on: `None` = control plane.
     async fn place_sandbox(&self, req: &CreateSandboxRequest) -> Result<Option<i32>, SandboxError> {
         let requested = req.node.as_deref().map(placement::RequestedNode::parse);
@@ -2148,6 +2177,27 @@ impl SandboxService {
         // created. Explicit requests are validated against the operator
         // allow-list and never fall back to another node.
         let node_id = self.place_sandbox(&req).await?;
+
+        // Operator limits (HTTP create path only). The settings are read once
+        // and fail closed: an unreadable section must not turn into "no
+        // limits". Host memory is only known for the control plane.
+        let operator_limits = if req.enforce_operator_limits {
+            let settings = self
+                .platform_config
+                .get_agent_sandbox_settings()
+                .await
+                .map_err(|source| SandboxError::LimitSettings { user_id, source })?;
+            let host_memory_mb = if node_id.is_none() {
+                create_policy::control_plane_memory_mb()
+            } else {
+                None
+            };
+            create_policy::check_requested_limits(&req, &settings, host_memory_mb)?;
+            Some(settings)
+        } else {
+            None
+        };
+
         if node_id.is_some() {
             if req.from_snapshot_artifact.is_some() {
                 return Err(SandboxError::Validation {
@@ -2226,6 +2276,20 @@ impl SandboxService {
             }
             (!meta.is_empty()).then_some(serde_json::Value::Object(meta))
         };
+        // Per-user cap: count and insert under one lock so a burst of
+        // simultaneous creates cannot overshoot it.
+        let cap_guard = match operator_limits
+            .as_ref()
+            .filter(|settings| settings.max_sandboxes_per_user.is_some())
+        {
+            Some(settings) => {
+                let guard = self.create_cap_gate.lock().await;
+                let live = self.live_standalone_sandboxes(user_id).await?;
+                create_policy::check_user_sandbox_cap(user_id, live, settings)?;
+                Some(guard)
+            }
+            None => None,
+        };
         let active = sandboxes::ActiveModel {
             public_id: Set(public_id_value.clone()),
             user_id: Set(Some(user_id)),
@@ -2254,7 +2318,9 @@ impl SandboxService {
             node_id: Set(node_id),
             ..Default::default()
         };
-        let mut row = active.insert(self.db.as_ref()).await.map_err(|e| {
+        let inserted = active.insert(self.db.as_ref()).await;
+        drop(cap_guard);
+        let mut row = inserted.map_err(|e| {
             // The chosen node was removed between placement and insert.
             if node_id.is_some()
                 && matches!(
@@ -9527,6 +9593,41 @@ mod storage_cleanup_tests {
         );
         drop(held);
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The per-user cap counts what the user created through the API and
+    /// nothing else: not destroyed rows, not agent-run sandboxes, not managed
+    /// application workspaces.
+    #[tokio::test]
+    async fn the_user_cap_counts_only_live_standalone_sandboxes() {
+        let data_root = unique_data_root("cap-count");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                sea_orm::Value::from(4i64),
+            )])]])
+            .into_connection();
+        let db = Arc::new(db);
+        let (service, registry) = build_service_shared(db.clone(), FakeProvider::new(), data_root);
+
+        let live = service
+            .live_standalone_sandboxes(7)
+            .await
+            .expect("count query");
+
+        assert_eq!(live, 4);
+        drop((service, registry));
+        let log = Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("service still holds the connection"))
+            .into_transaction_log();
+        let sql = format!("{log:?}").replace("\\\"", "\"");
+        assert!(sql.contains("\"sandboxes\".\"user_id\" = $1"), "{sql}");
+        assert!(sql.contains("\"sandboxes\".\"status\" <> $2"), "{sql}");
+        assert!(
+            sql.contains("\"sandboxes\".\"agent_run_id\" IS NULL"),
+            "{sql}"
+        );
+        assert!(sql.contains("NOT \"sandboxes\".\"name\" LIKE"), "{sql}");
     }
 
     /// A malformed allow-list must stop placement, not read as "every node
