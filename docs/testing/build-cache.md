@@ -61,6 +61,14 @@ sccache --show-stats          # "Cache location" should name S3 and the bucket
 
 Never commit credentials. Keep them in your shell profile or a secrets manager.
 
+The `sccache` server reads its environment once, when it starts. After you change
+any `SCCACHE_*` or `AWS_*` variable, run `sccache --stop-server` and then
+`sccache --start-server` (or just rebuild) so the new values take effect.
+
+If the bucket is unreachable, check `sccache --show-stats` and your network first:
+we have not tested how the installed `sccache` version behaves in that case, and
+you can always unset `RUSTC_WRAPPER` to build without it.
+
 ### Untrusted checkouts: read-only credentials
 
 Build scripts (`build.rs`) and procedural macros run arbitrary code during the
@@ -73,13 +81,13 @@ allows only `s3:GetObject` and `s3:ListBucket` on the bucket) and also set:
 export SCCACHE_S3_RW_MODE=READ_ONLY
 ```
 
+Set it before the first `sccache` command in that environment. If a server is
+already running, stop it (`sccache --stop-server`) so the next start picks up the
+read-only mode and the read-only credentials.
+
 The mode alone does not protect the cache: a build that can read write-capable
 credentials can use them directly, so the credentials themselves must be read-only.
 Only trusted builds (your own branches, `main`) should hold the write key.
-
-If the bucket is unreachable, check `sccache --show-stats` and your network first:
-we have not tested how the installed `sccache` version behaves in that case, and
-you can always unset `RUSTC_WRAPPER` to build without it.
 
 ### Making hits work across machines
 
@@ -88,14 +96,19 @@ inputs. Machines only share entries when these match:
 
 - Use the same `rustc` version on every machine (compare `rustc --version`).
 - Use the same target triple. A Linux build and a macOS build do not share entries.
-- Paths can matter. If the repo is checked out at different absolute paths, set
-  `SCCACHE_BASEDIRS` on every machine to that machine's absolute checkout path, so
-  `sccache` strips it before computing cache keys, and restart the `sccache` server
-  after changing it. This needs a recent `sccache`; check
-  [its configuration docs](https://github.com/mozilla/sccache/blob/main/docs/Configuration.md)
-  for your version. Do not use a per-machine `--remap-path-prefix` in `RUSTFLAGS`
-  for this: the flag differs on each machine, so it changes the cache key itself.
-  We have not verified how much path differences reduce hits for this workspace.
+- Use the same absolute checkout path on every machine that should share entries
+  (for example `/workspace` in every sandbox or container). Rust builds embed
+  absolute paths in the compiler arguments and in debug info, and these go into the
+  cache key, so a different path is a miss. This is the setup we recommend.
+- `SCCACHE_BASEDIRS` tells `sccache` to strip a base directory before computing
+  keys, and it may help when paths differ. It is **unverified for Rust builds** here:
+  an upstream report (mozilla/sccache#2652) says it first covered C compiler inputs
+  while Cargo still passes absolute paths in `--extern` and `-L` arguments. We have
+  not tested a version of `sccache` against this workspace, so do not rely on it
+  without checking: build once, then build from a checkout at a different path and
+  confirm the second build reports cache hits in `sccache --show-stats`.
+- Do not add a per-machine `--remap-path-prefix` to `RUSTFLAGS` to work around
+  paths. The flag differs on each machine, so it changes the cache key itself.
 
 ### Running agents in parallel
 
