@@ -51560,6 +51560,32 @@
         ],
         "type": "object"
       },
+      "ResetUserMfaResponse": {
+        "description": "Returned when an administrator removes another user's second factor.",
+        "properties": {
+          "mfa_enabled": {
+            "description": "Always false: the user's TOTP secret and recovery codes are gone.",
+            "type": "boolean"
+          },
+          "password_sign_in_blocked": {
+            "description": "True when this instance requires MFA for admins\n(`require_mfa_for_admins`) and the user is an admin: until they enroll\nagain they cannot sign in with a password, so they must sign in\nthrough SSO, or the setting must be turned off while they re-enroll.",
+            "type": "boolean"
+          },
+          "sessions_revoked": {
+            "description": "How many of the user's sessions were signed out by the reset.",
+            "example": 2,
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mfa_enabled",
+          "sessions_revoked",
+          "password_sign_in_blocked"
+        ],
+        "type": "object"
+      },
       "ResetUserPasswordResponse": {
         "description": "Returned once when an administrator resets another user's password. The\ntemporary password is not stored in retrievable form, so this response is\nthe only place it ever appears. The user must replace it at next sign-in.",
         "properties": {
@@ -148618,6 +148644,63 @@
         ]
       }
     },
+    "/users/{user_id}/mfa": {
+      "delete": {
+        "description": "The recovery path for a user who lost both their authenticator and their\nrecovery codes: their TOTP secret, recovery codes and second-factor\nlockout state are deleted and every session they have is revoked, so they\ncan sign in with their password alone and enroll again. Their password,\nroles and API keys are left alone.\n\nGated exactly like `POST /users/{user_id}/password`: `users:manage`, not\non yourself (use `DELETE /users/me/mfa`, which takes a code), and a recent\nstep-up for an MFA-enrolled administrator. When the instance has no other\nadmin to ask, `temps reset-admin-password --clear-mfa` does the same\noffline.",
+        "operationId": "reset_user_mfa",
+        "parameters": [
+          {
+            "description": "User ID",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetUserMfaResponse"
+                }
+              }
+            },
+            "description": "MFA removed and the user's sessions revoked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "users:manage required, or attempted to reset your own MFA (use DELETE /users/me/mfa)"
+          },
+          "404": {
+            "description": "User not found"
+          },
+          "409": {
+            "description": "User is deleted, or has no MFA enrolled"
+          },
+          "428": {
+            "description": "Recent identity verification (step-up) required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove another user's second factor (admin only).",
+        "tags": [
+          "Users"
+        ]
+      }
+    },
     "/users/{user_id}/password": {
       "post": {
         "description": "The recovery path for a user who lost their password when outbound email\nis not configured. Every browser session of the user is revoked and they\nmust choose a new password at next sign-in. API keys are deliberately left\nalone, matching `POST /users/me/password`: revoking them would silently\nbreak the user's automation. The temporary password is returned once and\ncannot be retrieved again.\n\nAny `users:manage` principal may reset any other user, including another\nadmin. That is the existing trust model for this permission (it can already\ndelete users and change their roles); only resetting yourself is refused.",
@@ -152448,6 +152531,18 @@
       "name": "error-tracking"
     },
     {
+      "description": "Native project feedback inbox",
+      "name": "feedback"
+    },
+    {
+      "description": "Release correlation across native telemetry",
+      "name": "releases"
+    },
+    {
+      "description": "Approximate SDK-reported telemetry discards",
+      "name": "ingestion-health"
+    },
+    {
       "description": "Vulnerability scan management endpoints",
       "name": "Vulnerability Scans"
     },
@@ -152590,18 +152685,6 @@
     {
       "description": "External plugin management and discovery",
       "name": "External Plugins"
-    },
-    {
-      "description": "Native project feedback inbox",
-      "name": "feedback"
-    },
-    {
-      "description": "Release correlation across native telemetry",
-      "name": "releases"
-    },
-    {
-      "description": "Approximate SDK-reported telemetry discards",
-      "name": "ingestion-health"
     }
   ]
 }

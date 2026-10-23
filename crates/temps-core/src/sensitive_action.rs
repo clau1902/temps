@@ -78,6 +78,11 @@ pub enum SensitiveAction {
     ResetUserPassword {
         user_id: i32,
     },
+    /// Remove another user's second factor (TOTP secret and recovery codes),
+    /// revoking all of their sessions. Recovery for a user who lost both.
+    ResetUserMfa {
+        user_id: i32,
+    },
     UpdateAccountEmail,
     RotateClusterCa,
     RestoreExternalService {
@@ -166,6 +171,7 @@ impl SensitiveAction {
             Self::DeleteOidcRoleMapping { .. } => "delete_oidc_role_mapping",
             Self::AssignRole { .. } => "assign_role",
             Self::ResetUserPassword { .. } => "reset_user_password",
+            Self::ResetUserMfa { .. } => "reset_user_mfa",
             Self::UpdateAccountEmail => "update_account_email",
             Self::RotateClusterCa => "rotate_cluster_ca",
             Self::RestoreExternalService { .. } => "restore_external_service",
@@ -309,6 +315,10 @@ mod tests {
         assert_eq!(
             SensitiveAction::ResetUserPassword { user_id: 1 }.as_str(),
             "reset_user_password"
+        );
+        assert_eq!(
+            SensitiveAction::ResetUserMfa { user_id: 1 }.as_str(),
+            "reset_user_mfa"
         );
         assert_eq!(
             SensitiveAction::UpdateAccountEmail.as_str(),

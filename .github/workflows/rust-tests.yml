@@ -1401,7 +1401,10 @@ jobs:
     needs: [changes, build-test-binaries]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.build-test-binaries.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The tests themselves take ~5 minutes, but the apt install and the
+    # shared test-archive download each vary from seconds to ~10 minutes on
+    # hosted runners; 20 minutes left the tests no room when both were slow.
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:

@@ -177,6 +177,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "remove_role",
             "request_password_reset",
             "reset_password",
+            "reset_user_mfa",
             "reset_user_password",
             "restore_user",
             "rotate_api_key",
