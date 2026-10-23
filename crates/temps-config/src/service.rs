@@ -2432,6 +2432,55 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         Ok(current)
     }
 
+    /// Apply the telemetry-export consent carried by Temps Cloud's bootstrap
+    /// file, at most once per instance (ADR-045 Amendment 2): in one locked
+    /// transaction, turn `cloud.telemetry_enabled` on and record
+    /// `cloud.telemetry_consent_bootstrapped`. Returns `None`, writing
+    /// nothing, when an earlier bootstrap already did -- whatever the operator
+    /// has chosen since stands.
+    pub async fn grant_bootstrap_telemetry_consent(
+        &self,
+    ) -> Result<Option<AppSettings>, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        if current.cloud.telemetry_consent_bootstrapped {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        current.cloud.telemetry_enabled = true;
+        current.cloud.telemetry_consent_bootstrapped = true;
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(Some(current))
+    }
+
     /// Persist only the console-access switch under the shared settings lock.
     /// Used when an operator explicitly configures remote console access.
     pub async fn set_console_access_enabled(

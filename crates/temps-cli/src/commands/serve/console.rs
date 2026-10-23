@@ -983,9 +983,11 @@ async fn bootstrap_console_oidc_from_file(
             issuer,
             client_id,
             consent,
+            telemetry,
         }) => {
             report_console_oidc_bootstrap_applied(service_context, &issuer, &client_id, &consent)
                 .await;
+            report_telemetry_bootstrap(service_context, &telemetry).await;
         }
         Err(error) => report_console_oidc_bootstrap_error(service_context, &error).await,
     }
@@ -1054,6 +1056,46 @@ async fn report_console_oidc_bootstrap_error(
                 }
             }
         }
+    }
+}
+
+/// Log and audit what the bootstrap file did to telemetry export.
+async fn report_telemetry_bootstrap(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+    telemetry: &temps_cloud::TelemetryConsent,
+) {
+    match telemetry {
+        temps_cloud::TelemetryConsent::GrantedByBootstrap { .. } => warn!(
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file turned \
+             cloud.telemetry_enabled on (on a Cloud-hosted plane the file is the operator's \
+             consent); logs, traces and metrics now export to Temps Cloud. Disable it in \
+             Settings > Temps Cloud if that is not intended"
+        ),
+        temps_cloud::TelemetryConsent::Failed { reason } => {
+            error!(
+                %reason,
+                "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file asked for telemetry \
+                 export but it could not be switched on; telemetry stays local. Turn it on \
+                 in Settings > Temps Cloud"
+            );
+            return;
+        }
+        _ => return,
+    }
+    match service_context.get_service::<dyn temps_core::AuditLogger>() {
+        Some(audit_logger) => {
+            temps_cloud::record_telemetry_bootstrap_audit(
+                audit_logger.as_ref(),
+                CloudEnrollmentActor::UnattendedBootstrap,
+                telemetry,
+            )
+            .await;
+        }
+        None => error!(
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file turned telemetry export on \
+             but no audit logger is registered; the CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP \
+             audit record was not written"
+        ),
     }
 }
 

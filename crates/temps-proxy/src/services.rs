@@ -73,9 +73,6 @@ impl UpstreamResolverImpl {
         }
     }
 
-    /// Where requests that may only reach the console's public routes go:
-    /// the public-only listener when one exists, the console listener
-    /// otherwise (a split proxy started without an ingress address).
     /// Whether a project route answers this host, by SNI or Host header.
     /// The console's own hostname is reserved, so it never counts.
     fn project_route_claims(&self, host: &str, sni_hostname: Option<&str>) -> bool {
@@ -86,6 +83,9 @@ impl UpstreamResolverImpl {
             || self.route_table.get_route(host).is_some()
     }
 
+    /// Where requests that may only reach the console's public routes go:
+    /// the public-only listener when one exists, the console listener
+    /// otherwise (a split proxy started without an ingress address).
     fn public_surface_address(&self) -> &str {
         self.server_config
             .console_ingress_address
@@ -165,8 +165,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
         // It is the console's only on hosts no project route claims: an app
         // that serves its own `/api/otel` (a Temps console deployed as a
         // project, say) must get its own requests, not a 404 from this one.
-        if path.starts_with(ROUTE_PREFIX_OTEL) && !self.project_route_claims(host, sni_hostname)
-        {
+        if path.starts_with(ROUTE_PREFIX_OTEL) && !self.project_route_claims(host, sni_hostname) {
             let address = self.server_config.console_address.as_str();
             debug!("Routing temps API request to console: {}", address);
             return Ok(console_peer(address));
