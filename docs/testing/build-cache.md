@@ -54,11 +54,29 @@ export AWS_SECRET_ACCESS_KEY=...
 Check that it is active:
 
 ```bash
-sccache --stop-server && sccache --start-server
+sccache --stop-server >/dev/null 2>&1 || true   # fails harmlessly if no server is running
+sccache --start-server
 sccache --show-stats          # "Cache location" should name S3 and the bucket
 ```
 
 Never commit credentials. Keep them in your shell profile or a secrets manager.
+
+### Untrusted checkouts: read-only credentials
+
+Build scripts (`build.rs`) and procedural macros run arbitrary code during the
+build and can read every environment variable, including the AWS credentials. Do
+not give write-capable credentials to builds of untrusted code, such as external
+pull requests. Use a separate read-only principal (an IAM user or key whose policy
+allows only `s3:GetObject` and `s3:ListBucket` on the bucket) and also set:
+
+```bash
+export SCCACHE_S3_RW_MODE=READ_ONLY
+```
+
+The mode alone does not protect the cache: a build that can read write-capable
+credentials can use them directly, so the credentials themselves must be read-only.
+Only trusted builds (your own branches, `main`) should hold the write key.
+
 If the bucket is unreachable, check `sccache --show-stats` and your network first:
 we have not tested how the installed `sccache` version behaves in that case, and
 you can always unset `RUSTC_WRAPPER` to build without it.
@@ -70,9 +88,13 @@ inputs. Machines only share entries when these match:
 
 - Use the same `rustc` version on every machine (compare `rustc --version`).
 - Use the same target triple. A Linux build and a macOS build do not share entries.
-- Paths can matter. If the repo is checked out at different absolute paths, add
-  `--remap-path-prefix=$PWD=/work` to `RUSTFLAGS` on every machine. Changing
-  `RUSTFLAGS` changes cache keys, so make the change on every machine at once.
+- Paths can matter. If the repo is checked out at different absolute paths, set
+  `SCCACHE_BASEDIRS` on every machine to that machine's absolute checkout path, so
+  `sccache` strips it before computing cache keys, and restart the `sccache` server
+  after changing it. This needs a recent `sccache`; check
+  [its configuration docs](https://github.com/mozilla/sccache/blob/main/docs/Configuration.md)
+  for your version. Do not use a per-machine `--remap-path-prefix` in `RUSTFLAGS`
+  for this: the flag differs on each machine, so it changes the cache key itself.
   We have not verified how much path differences reduce hits for this workspace.
 
 ### Running agents in parallel

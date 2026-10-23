@@ -143,6 +143,8 @@ answers to these questions in the PR:
       (sync and async twins, handler and MCP tool, create and update).
 - [ ] Authorization is checked for every new read and write, scoped to the caller's project.
 - [ ] Cancel, timeout, restart and failure paths are handled and cleaned up.
-- [ ] No secret can reach a log line, error message or API response.
+- [ ] No stored or reusable secret can reach a log line, error message or API response.
+      The one exception is a credential minted by the request itself, returned once
+      in plaintext with `Cache-Control: no-store` (see CLAUDE.md).
 - [ ] Reads and parallelism are bounded.
 - [ ] `cargo check`, clippy and the touched crates' tests pass, with no new warnings.
