@@ -316,6 +316,17 @@ pub struct NodePairingCreatedAudit {
     pub node_endpoint: Option<String>,
 }
 
+/// A worker proved it is node `node_id` (its WireGuard key, name and current
+/// agent credential) and started joining the same control plane again, which
+/// updates that node in place when it registers (ADR 060).
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeRejoinStartedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub name: String,
+    pub mesh_address: String,
+}
+
 /// An operator cancelled a pending node pairing.
 #[derive(Debug, Clone, Serialize)]
 pub struct NodePairingCancelledAudit {
@@ -577,6 +588,7 @@ impl_audit_operation!(
 );
 impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
 impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
+impl_audit_operation!(NodeRejoinStartedAudit, "NODE_REJOIN_STARTED");
 impl_audit_operation!(NodeSshEnrollmentStartedAudit, "NODE_SSH_ENROLLMENT_STARTED");
 impl_audit_operation!(
     NodeSshEnrollmentSucceededAudit,

@@ -17,6 +17,7 @@
 use clap::Args;
 
 use super::api_url::management_api_url;
+use super::host_preflight::PlaneMatch;
 
 /// Join this machine to a Temps cluster as a worker node
 #[derive(Args)]
@@ -120,6 +121,12 @@ pub struct JoinCommand {
     /// default one (ADR 059); decided by the preflight.
     #[arg(skip)]
     overlay_network_name: Option<String>,
+
+    /// Whether the control plane being joined is the one the saved agent
+    /// config belongs to (ADR 060); decided by the preflight for an outbound
+    /// join, and by the control plane recognising this node.
+    #[arg(skip)]
+    plane_match: super::host_preflight::PlaneMatch,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -552,14 +559,24 @@ fn load_saved_agent_config() -> Option<temps_agent::AgentConfig> {
     serde_json::from_str(&data).ok()
 }
 
+/// The saved agent config when this join is the same node joining the same
+/// control plane again: same name, and the control plane known to be the
+/// same one (ADR 060), or, when that is unknown, at the saved address. A
+/// control plane known to be another never gets this node's credential.
 fn saved_config_for_reenrollment<'a>(
     saved: Option<&'a temps_agent::AgentConfig>,
     node_name: &str,
     control_plane_url: &str,
+    plane: PlaneMatch,
 ) -> Option<&'a temps_agent::AgentConfig> {
     let saved = saved?;
-    let same_control_plane =
-        saved.control_plane_url.trim_end_matches('/') == control_plane_url.trim_end_matches('/');
+    let same_control_plane = match plane {
+        PlaneMatch::Same => true,
+        PlaneMatch::Different => false,
+        PlaneMatch::Unknown => {
+            saved.control_plane_url.trim_end_matches('/') == control_plane_url.trim_end_matches('/')
+        }
+    };
     (saved.node_name == node_name && same_control_plane).then_some(saved)
 }
 
@@ -567,9 +584,33 @@ fn prior_token_for_reenrollment(
     saved: Option<&temps_agent::AgentConfig>,
     node_name: &str,
     control_plane_url: &str,
+    plane: PlaneMatch,
 ) -> Option<String> {
-    saved_config_for_reenrollment(saved, node_name, control_plane_url)
+    saved_config_for_reenrollment(saved, node_name, control_plane_url, plane)
         .map(|saved| saved.token.clone())
+}
+
+/// Proof for an outbound join that this machine is the node of its saved
+/// agent config (ADR 060): sent unless the control plane is known to be
+/// another one. It is bound to this enrollment's `join_token`, so unlike the
+/// agent token it is no use to a control plane it was sent to by mistake.
+fn rejoin_proof_for(
+    saved: Option<&temps_agent::AgentConfig>,
+    node_name: &str,
+    plane: PlaneMatch,
+    wg_public_key: &str,
+    join_token: &str,
+) -> Option<String> {
+    let saved = saved?;
+    if plane == PlaneMatch::Different || saved.node_name != node_name || saved.token.is_empty() {
+        return None;
+    }
+    temps_core::node_pki::rejoin_proof(
+        &temps_core::node_pki::agent_token_hash(&saved.token),
+        node_name,
+        wg_public_key,
+        join_token,
+    )
 }
 
 fn public_ingress_listener_settings(
@@ -865,13 +906,18 @@ impl JoinCommand {
 
         self.join_url = self.target.clone();
         let saved = load_saved_agent_config();
-        let facts = gather(saved.as_ref()).await;
+        let mut facts = gather(saved.as_ref()).await;
         // Relay mode's target is a cluster id and a pairing code carries no
         // address: neither compares with the saved control plane.
         let target = match self.mode() {
             JoinMode::Direct(_) | JoinMode::Outbound => self.target.clone(),
             JoinMode::Paired(_) | JoinMode::Relay(_) => None,
         };
+        // Who the target is decides whether this is the saved control plane
+        // (ADR 060); asked before the join token goes anywhere.
+        if let (Some(_), Some(target)) = (&facts.saved, target.as_deref()) {
+            facts.target_identity = Some(super::host_preflight::fetch_plane_identity(target).await);
+        }
         let mut ports = vec![80, 443];
         if self.ingress == Some(IngressFlag::Fixed) {
             ports.extend([self.ingress_http_port, self.ingress_https_port]);
@@ -894,6 +940,30 @@ impl JoinCommand {
             anyhow::bail!("{}", blocking.message());
         }
         self.overlay_network_name = assessment.overlay_network_name;
+        // An outbound join registers over the mesh, pinned to the cluster CA:
+        // when the control plane was recognised by the CA this machine
+        // already pins, pin that one, so the agent credential is only ever
+        // sent to it. A direct join sends it before anything is pinned, so
+        // it keeps deciding by address.
+        if matches!(self.mode(), JoinMode::Outbound) {
+            self.plane_match = assessment.plane;
+            if assessment.plane == PlaneMatch::Same && self.ca_fingerprint.is_none() {
+                let saved_ca = facts
+                    .saved
+                    .as_ref()
+                    .and_then(|saved| saved.ca_fingerprint.clone());
+                let announced_ca = facts
+                    .target_identity
+                    .as_ref()
+                    .and_then(|identity| identity.as_ref().ok())
+                    .and_then(|identity| identity.ca_fingerprint.as_ref());
+                if announced_ca.is_some() {
+                    self.ca_fingerprint = saved_ca;
+                }
+            }
+        } else if assessment.plane == PlaneMatch::Different {
+            self.plane_match = PlaneMatch::Different;
+        }
         Ok(())
     }
 
@@ -952,6 +1022,7 @@ impl JoinCommand {
                     saved.as_ref(),
                     &config.node_name,
                     &config.control_plane_url,
+                    self.plane_match,
                 ) {
                     config.ingress = saved.ingress.clone();
                 }
@@ -1059,10 +1130,18 @@ impl JoinCommand {
         let (public_ingress_private_key, public_ingress_public_key) =
             generate_public_ingress_key()?;
         let saved_config = load_saved_agent_config();
-        let matching_saved =
-            saved_config_for_reenrollment(saved_config.as_ref(), node_name, self.target());
-        let prior_token =
-            prior_token_for_reenrollment(saved_config.as_ref(), node_name, self.target());
+        let matching_saved = saved_config_for_reenrollment(
+            saved_config.as_ref(),
+            node_name,
+            self.target(),
+            self.plane_match,
+        );
+        let prior_token = prior_token_for_reenrollment(
+            saved_config.as_ref(),
+            node_name,
+            self.target(),
+            self.plane_match,
+        );
 
         let agent_port = agent_listen_port(&self.agent_address);
         let agent_url_host = socket_authority(private_address, agent_port);
@@ -1413,6 +1492,15 @@ impl JoinCommand {
         // Public roots, HTTPS only and no redirects: this answer carries the
         // CA fingerprint the rest of the join pins.
         let enroll_url = management_api_url(self.target(), "/internal/nodes/mesh-enroll");
+        // ADR 060: when this machine is already a node of this control plane,
+        // it proves so and is updated in place instead of refused.
+        let rejoin_proof = rejoin_proof_for(
+            load_saved_agent_config().as_ref(),
+            node_name,
+            self.plane_match,
+            key.public_key(),
+            self.token(),
+        );
         let response = outbound_enroll_client(&enroll_url)?
             .post(&enroll_url)
             .json(&serde_json::json!({
@@ -1420,6 +1508,7 @@ impl JoinCommand {
                 "join_token": self.token(),
                 "wg_public_key": key.public_key(),
                 "labels": labels,
+                "rejoin_proof": rejoin_proof,
             }))
             .send()
             .await
@@ -1498,11 +1587,23 @@ impl JoinCommand {
             }
             println!("Cluster CA fingerprint verified.");
         }
-        println!(
-            "Reserved mesh address {node_address}. Bringing up the WireGuard mesh (dialing \
-             the control plane at {})...",
-            answer.control_plane_endpoint
-        );
+        if let Some(node_id) = answer.rejoined_node_id {
+            // The control plane checked a proof keyed by this node's agent
+            // token hash: it is the control plane this node belongs to.
+            self.plane_match = PlaneMatch::Same;
+            println!(
+                "This machine is already node '{}' (id {node_id}) of this control plane: it is \
+                 updated in place and keeps its mesh address {node_address}. Bringing up the \
+                 WireGuard mesh (dialing the control plane at {})...",
+                answer.name, answer.control_plane_endpoint
+            );
+        } else {
+            println!(
+                "Reserved mesh address {node_address}. Bringing up the WireGuard mesh (dialing \
+                 the control plane at {})...",
+                answer.control_plane_endpoint
+            );
+        }
 
         // 2. The mesh, with the control plane as the only peer. No endpoint
         // of our own: the control plane learns it from our handshakes.
@@ -1549,15 +1650,21 @@ impl JoinCommand {
             },
         )
         .await
-        .map_err(|error| {
-            anyhow::anyhow!(
+        .map_err(|error| match answer.rejoined_node_id {
+            Some(node_id) => anyhow::anyhow!(
+                "could not bring up the WireGuard mesh: {error}. Node '{name}' (id {node_id}) \
+                 was not changed on the control plane: fix the problem, then run `temps join` \
+                 again on this machine with the same name and a new token.",
+                name = answer.name
+            ),
+            None => anyhow::anyhow!(
                 "could not bring up the WireGuard mesh: {error}. The control plane holds this \
                  machine's enrollment as pending pairing '{name}' until {expires}: fix the \
                  problem, then run `temps join` again on this machine with the same name and a \
                  new token, which resumes it (or cancel it on the Worker Nodes page).",
                 name = answer.name,
                 expires = answer.expires_at
-            )
+            ),
         })?;
 
         // 3. Register over the mesh, under our own mesh address.
@@ -1717,11 +1824,13 @@ impl JoinCommand {
             saved_config.as_ref(),
             node_name,
             relay_response.control_plane_url.as_str(),
+            self.plane_match,
         );
         let prior_token = prior_token_for_reenrollment(
             saved_config.as_ref(),
             node_name,
             relay_response.control_plane_url.as_str(),
+            self.plane_match,
         );
 
         let register_body = serde_json::json!({
@@ -2049,8 +2158,8 @@ mod tests {
         agent_listen_port, apply_saved_public_ingress_settings, find_pinned_ca,
         generate_public_ingress_key, pinned_client_for, pinned_cluster_ca,
         prior_token_for_reenrollment, public_ingress_listener_settings, read_code,
-        relay_registration_trust, require_https_relay, saved_config_for_reenrollment,
-        socket_authority, RelayRegistrationTrust,
+        rejoin_proof_for, relay_registration_trust, require_https_relay,
+        saved_config_for_reenrollment, socket_authority, PlaneMatch, RelayRegistrationTrust,
     };
     use std::sync::Arc;
 
@@ -2383,8 +2492,13 @@ mod tests {
     fn test_reenrollment_proves_existing_matching_node_identity() {
         let saved = saved_config();
         assert_eq!(
-            prior_token_for_reenrollment(Some(&saved), "worker-1", "https://control.example.com")
-                .as_deref(),
+            prior_token_for_reenrollment(
+                Some(&saved),
+                "worker-1",
+                "https://control.example.com",
+                PlaneMatch::Unknown,
+            )
+            .as_deref(),
             Some("existing-agent-token")
         );
     }
@@ -2396,9 +2510,13 @@ mod tests {
         saved.public_ingress_http_port = 8080;
         saved.public_ingress_https_port = 8443;
 
-        let matched =
-            saved_config_for_reenrollment(Some(&saved), "worker-1", "https://control.example.com")
-                .expect("same node identity should match");
+        let matched = saved_config_for_reenrollment(
+            Some(&saved),
+            "worker-1",
+            "https://control.example.com",
+            PlaneMatch::Unknown,
+        )
+        .expect("same node identity should match");
         assert_eq!(matched.public_ingress_address, saved.public_ingress_address);
         assert_eq!(matched.public_ingress_http_port, 8080);
         assert_eq!(matched.public_ingress_https_port, 8443);
@@ -2430,6 +2548,7 @@ mod tests {
             Some(&saved),
             "different-worker",
             "https://control.example.com",
+            PlaneMatch::Unknown,
         )
         .is_none());
         assert_eq!(public_ingress_listener_settings(None), (None, 80, 443));
@@ -2437,6 +2556,7 @@ mod tests {
             Some(&saved),
             "worker-1",
             "https://different-control.example.com",
+            PlaneMatch::Unknown,
         )
         .is_none());
     }
@@ -2487,15 +2607,90 @@ mod tests {
         assert!(prior_token_for_reenrollment(
             Some(&saved),
             "another-worker",
-            "https://control.example.com"
+            "https://control.example.com",
+            PlaneMatch::Same,
         )
         .is_none());
         assert!(prior_token_for_reenrollment(
             Some(&saved),
             "worker-1",
-            "https://attacker.example.com"
+            "https://attacker.example.com",
+            PlaneMatch::Unknown,
         )
         .is_none());
+        // Known to be another control plane: not even at the saved address.
+        assert!(prior_token_for_reenrollment(
+            Some(&saved),
+            "worker-1",
+            "https://control.example.com",
+            PlaneMatch::Different,
+        )
+        .is_none());
+    }
+
+    /// ADR 060: the same control plane under another address (an agent
+    /// that saved the shared mesh address) still gets the node's credential.
+    #[test]
+    fn the_same_control_plane_under_another_address_is_a_reenrollment() {
+        let saved = saved_config();
+        assert_eq!(
+            prior_token_for_reenrollment(
+                Some(&saved),
+                "worker-1",
+                "https://10.201.0.1:51820",
+                PlaneMatch::Same,
+            )
+            .as_deref(),
+            Some("existing-agent-token")
+        );
+    }
+
+    /// The re-join proof is the node's token hash bound to this join token,
+    /// never the token itself, and is not sent to a control plane known to
+    /// be another or for another name.
+    #[test]
+    fn the_rejoin_proof_is_bound_and_never_the_token() {
+        let saved = saved_config();
+        let proof = rejoin_proof_for(
+            Some(&saved),
+            "worker-1",
+            PlaneMatch::Unknown,
+            "key",
+            "join-1",
+        )
+        .expect("a proof for the same node");
+        assert!(!proof.contains("existing-agent-token"));
+        assert_eq!(
+            Some(proof.clone()),
+            temps_core::node_pki::rejoin_proof(
+                &temps_core::node_pki::agent_token_hash("existing-agent-token"),
+                "worker-1",
+                "key",
+                "join-1",
+            )
+        );
+        assert_ne!(
+            rejoin_proof_for(Some(&saved), "worker-1", PlaneMatch::Same, "key", "join-2"),
+            Some(proof)
+        );
+        assert_eq!(
+            rejoin_proof_for(
+                Some(&saved),
+                "worker-1",
+                PlaneMatch::Different,
+                "key",
+                "join-1"
+            ),
+            None
+        );
+        assert_eq!(
+            rejoin_proof_for(Some(&saved), "worker-2", PlaneMatch::Same, "key", "join-1"),
+            None
+        );
+        assert_eq!(
+            rejoin_proof_for(None, "worker-1", PlaneMatch::Same, "key", "join-1"),
+            None
+        );
     }
 
     /// The registration body must omit the architecture rather than assert

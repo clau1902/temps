@@ -41,6 +41,98 @@ pub struct SavedJoin {
     /// The subnet of the overlay the agent last applied (its network
     /// snapshot), which marks a network of that subnet as this node's own.
     pub applied_subnet: Option<String>,
+    /// SHA-256 fingerprint of the cluster CA the agent pins, when its config
+    /// names one that can be read.
+    pub ca_fingerprint: Option<String>,
+    /// The control plane's WireGuard mesh key in the agent's last network
+    /// snapshot.
+    pub control_plane_wg_public_key: Option<String>,
+}
+
+/// What identifies a control plane (ADR 060): the cluster CA every worker
+/// pins and its WireGuard mesh key. Its URL does not: one is reachable under
+/// several, and every cluster's mesh uses the same control-plane address.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct PlaneIdentity {
+    pub ca_fingerprint: Option<String>,
+    pub control_plane_wg_public_key: Option<String>,
+}
+
+/// Whether the control plane being joined is the one the saved agent config
+/// belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlaneMatch {
+    /// Its cluster CA, or else its mesh key, is the saved one.
+    Same,
+    /// It is another control plane.
+    Different,
+    /// Nothing could be compared, or nothing was saved.
+    #[default]
+    Unknown,
+}
+
+/// What comparing the saved control plane with the target found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlaneVerdict {
+    Same,
+    /// Which identity differs, and how.
+    Different(String),
+    /// Why it could not be told.
+    Unknown(String),
+}
+
+fn compare_planes(
+    saved: &SavedJoin,
+    target: Option<&Result<PlaneIdentity, String>>,
+) -> PlaneVerdict {
+    let identity = match target {
+        Some(Ok(identity)) => identity,
+        Some(Err(reason)) => return PlaneVerdict::Unknown(reason.clone()),
+        None => {
+            return PlaneVerdict::Unknown("the control plane was not asked who it is".to_string())
+        }
+    };
+    if let (Some(saved_ca), Some(target_ca)) = (&saved.ca_fingerprint, &identity.ca_fingerprint) {
+        return if saved_ca.trim().eq_ignore_ascii_case(target_ca.trim()) {
+            PlaneVerdict::Same
+        } else {
+            PlaneVerdict::Different(format!(
+                "its cluster CA is {target_ca}; this machine's agent pins {saved_ca}"
+            ))
+        };
+    }
+    if let (Some(saved_key), Some(target_key)) = (
+        &saved.control_plane_wg_public_key,
+        &identity.control_plane_wg_public_key,
+    ) {
+        return if saved_key.trim() == target_key.trim() {
+            PlaneVerdict::Same
+        } else {
+            PlaneVerdict::Different(format!(
+                "its WireGuard mesh key is {target_key}; this machine's mesh peers with \
+                 {saved_key}"
+            ))
+        };
+    }
+    let saved_has = match (&saved.ca_fingerprint, &saved.control_plane_wg_public_key) {
+        (None, None) => "records neither a cluster CA nor a control-plane mesh key",
+        (Some(_), None) => "records only a cluster CA",
+        (None, Some(_)) => "records only a control-plane mesh key",
+        (Some(_), Some(_)) => "records a cluster CA and a control-plane mesh key",
+    };
+    let target_has = match (
+        &identity.ca_fingerprint,
+        &identity.control_plane_wg_public_key,
+    ) {
+        (None, None) => "announced neither",
+        (Some(_), None) => "announced only its cluster CA",
+        (None, Some(_)) => "announced only its mesh key",
+        (Some(_), Some(_)) => "announced both",
+    };
+    PlaneVerdict::Unknown(format!(
+        "there is nothing to compare: this machine's agent config {saved_has}, and the control \
+         plane {target_has}"
+    ))
 }
 
 /// What the checks look at.
@@ -50,6 +142,9 @@ pub struct HostFacts {
     /// Root, or `CAP_NET_ADMIN` in the effective set.
     pub network_admin: bool,
     pub saved: Option<SavedJoin>,
+    /// Who the control plane being joined says it is, or why that is not
+    /// known. `None` when it was not asked.
+    pub target_identity: Option<Result<PlaneIdentity, String>>,
     pub networks: Vec<HostNetwork>,
     /// Network interface names (`/sys/class/net`).
     pub interfaces: Vec<String>,
@@ -61,8 +156,20 @@ pub struct HostFacts {
 pub enum Finding {
     /// Joining changes the host network, which this process may not do.
     NeedsRoot,
-    /// The host is already joined to another control plane.
-    OtherControlPlane { saved: String, target: String },
+    /// The host is already joined to another control plane; `evidence`
+    /// says which identity differs (ADR 060).
+    OtherControlPlane {
+        saved: String,
+        target: String,
+        evidence: String,
+    },
+    /// The host is joined to a control plane at another address, and whether
+    /// it is the same control plane could not be told (ADR 060).
+    ControlPlaneUnverified {
+        saved: String,
+        target: String,
+        reason: String,
+    },
     /// The overlay name is taken by a network this node does not own; the
     /// node uses `chosen` instead.
     OverlayNameTaken {
@@ -84,7 +191,7 @@ impl Finding {
     pub fn blocks_join(&self, force: bool) -> bool {
         match self {
             Self::NeedsRoot => true,
-            Self::OtherControlPlane { .. } => !force,
+            Self::OtherControlPlane { .. } | Self::ControlPlaneUnverified { .. } => !force,
             // Only `temps join` decides names, and it always finds one.
             Self::OverlayNameTaken { .. } => false,
             Self::PortInUse { .. } => false,
@@ -97,11 +204,29 @@ impl Finding {
                  bridge and VXLAN device), which needs root or CAP_NET_ADMIN. Run it with sudo: \
                  `sudo temps join ...`. The join token was not used."
                 .to_string(),
-            Self::OtherControlPlane { saved, target } => format!(
-                "this machine is already joined to the control plane at {saved} (its agent \
-                 config is in {}). Joining {target} replaces that config and the old cluster \
-                 loses this worker. Pass --force to do it anyway; if this is the same cluster \
-                 under another address, --force is safe. The join token was not used.",
+            Self::OtherControlPlane {
+                saved,
+                target,
+                evidence,
+            } => format!(
+                "this machine is already a worker of another control plane (joined at {saved}; \
+                 its agent config is in {}): {target} is not that one, {evidence}. Joining it \
+                 replaces that config and the old cluster loses this worker. Pass --force to \
+                 do it anyway. The join token was not used.",
+                crate::commands::agent::agent_data_dir()
+                    .join("agent.json")
+                    .display()
+            ),
+            Self::ControlPlaneUnverified {
+                saved,
+                target,
+                reason,
+            } => format!(
+                "this machine is already a worker of the control plane it joined at {saved} \
+                 (its agent config is in {}), and it could not be determined whether {target} \
+                 is that same control plane: {reason}. If it is, pass --force. If it is not, \
+                 --force moves this worker there and the old cluster loses it. The join token \
+                 was not used.",
                 crate::commands::agent::agent_data_dir()
                     .join("agent.json")
                     .display()
@@ -156,6 +281,8 @@ pub struct Assessment {
     pub findings: Vec<Finding>,
     /// The overlay network name to register with, when not the cluster's.
     pub overlay_network_name: Option<String>,
+    /// Whether the target is the control plane the saved join belongs to.
+    pub plane: PlaneMatch,
 }
 
 impl Assessment {
@@ -203,21 +330,43 @@ pub fn assess(facts: &HostFacts, purpose: Purpose<'_>, ports: &[u16]) -> Assessm
     let same_cluster = match (&facts.saved, target) {
         (Some(_), _) if purpose == Purpose::ServiceInstall => true,
         (Some(saved), Some(target)) => {
-            let same = same_url(&saved.control_plane_url, target)
-                || saved
-                    .join_url
-                    .as_deref()
-                    .is_some_and(|join_url| same_url(join_url, target));
-            if !same {
-                assessment.findings.push(Finding::OtherControlPlane {
-                    saved: saved
-                        .join_url
-                        .clone()
-                        .unwrap_or_else(|| saved.control_plane_url.clone()),
-                    target: target.to_string(),
-                });
+            let saved_at = saved
+                .join_url
+                .clone()
+                .unwrap_or_else(|| saved.control_plane_url.clone());
+            // The identity decides when it can be compared (ADR 060); the
+            // address only when it cannot, and then a differing address
+            // says "unknown", not "another cluster".
+            match compare_planes(saved, facts.target_identity.as_ref()) {
+                PlaneVerdict::Same => {
+                    assessment.plane = PlaneMatch::Same;
+                    true
+                }
+                PlaneVerdict::Different(evidence) => {
+                    assessment.plane = PlaneMatch::Different;
+                    assessment.findings.push(Finding::OtherControlPlane {
+                        saved: saved_at,
+                        target: target.to_string(),
+                        evidence,
+                    });
+                    false
+                }
+                PlaneVerdict::Unknown(reason) => {
+                    let same = same_url(&saved.control_plane_url, target)
+                        || saved
+                            .join_url
+                            .as_deref()
+                            .is_some_and(|join_url| same_url(join_url, target));
+                    if !same {
+                        assessment.findings.push(Finding::ControlPlaneUnverified {
+                            saved: saved_at,
+                            target: target.to_string(),
+                            reason,
+                        });
+                    }
+                    same
+                }
             }
-            same
         }
         // A pairing code names no address to compare with.
         (Some(_), None) | (None, _) => false,
@@ -352,15 +501,78 @@ pub async fn gather(saved: Option<&temps_agent::AgentConfig>) -> HostFacts {
         join_url: config.join_url.clone(),
         overlay_network_name: config.overlay_network_name.clone(),
         applied_subnet: applied_subnet(&config.mesh_key_dir),
+        ca_fingerprint: config
+            .cluster_ca_path
+            .as_deref()
+            .and_then(saved_ca_fingerprint),
+        control_plane_wg_public_key: saved_control_plane_key(&config.mesh_key_dir),
     });
     HostFacts {
         linux,
         network_admin,
         saved,
+        target_identity: None,
         networks: docker_networks().await,
         interfaces: interface_names(),
         listeners: if linux { listeners() } else { Vec::new() },
     }
+}
+
+/// The fingerprint of the cluster CA certificate at `path`.
+fn saved_ca_fingerprint(path: &std::path::Path) -> Option<String> {
+    let pem = std::fs::read_to_string(path).ok()?;
+    temps_core::node_pki::ca_fingerprint_sha256(&pem).ok()
+}
+
+/// The control plane's mesh key in the agent's last network snapshot.
+fn saved_control_plane_key(mesh_key_dir: &std::path::Path) -> Option<String> {
+    let data = std::fs::read(mesh_key_dir.join("network-snapshot.json")).ok()?;
+    let snapshot: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    control_plane_key_in_snapshot(&snapshot)
+}
+
+fn control_plane_key_in_snapshot(snapshot: &serde_json::Value) -> Option<String> {
+    snapshot
+        .pointer("/wireguard/peers")?
+        .as_array()?
+        .iter()
+        .find(|peer| peer.get("name").and_then(|name| name.as_str()) == Some("control-plane"))?
+        .get("public_key")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Ask the control plane at `target` who it is (ADR 060), before the join
+/// token is sent anywhere. Public data, and only compared: the answer never
+/// decides what is trusted. Every failure is the reason identity is unknown.
+pub async fn fetch_plane_identity(target: &str) -> Result<PlaneIdentity, String> {
+    let url =
+        crate::commands::api_url::management_api_url(target, "/internal/nodes/plane-identity");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("could not build an HTTP client: {error}"))?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("could not reach {url}: {error}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "the control plane answered 404 for {url}, so it predates identity checks; upgrade \
+             it"
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!("the control plane answered {status} for {url}"));
+    }
+    response
+        .json::<PlaneIdentity>()
+        .await
+        .map_err(|error| format!("the answer from {url} is not a control-plane identity: {error}"))
 }
 
 /// The compute subnet in the agent's last network snapshot.
@@ -490,7 +702,142 @@ mod tests {
             join_url: None,
             overlay_network_name: None,
             applied_subnet: None,
+            ca_fingerprint: None,
+            control_plane_wg_public_key: None,
         }
+    }
+
+    fn identity(ca: Option<&str>, key: Option<&str>) -> Option<Result<PlaneIdentity, String>> {
+        Some(Ok(PlaneIdentity {
+            ca_fingerprint: ca.map(str::to_string),
+            control_plane_wg_public_key: key.map(str::to_string),
+        }))
+    }
+
+    /// An agent joined outbound saved only the mesh address, which every
+    /// cluster's control plane shares.
+    fn joined_over_the_mesh(ca: Option<&str>, key: Option<&str>) -> SavedJoin {
+        let mut previous = saved("https://10.201.0.1:51820");
+        previous.ca_fingerprint = ca.map(str::to_string);
+        previous.control_plane_wg_public_key = key.map(str::to_string);
+        previous
+    }
+
+    #[test]
+    fn the_same_control_plane_under_another_address_is_recognised_by_its_ca() {
+        let facts = HostFacts {
+            saved: Some(joined_over_the_mesh(Some("ABCD"), None)),
+            target_identity: identity(Some("abcd"), Some("cp-key")),
+            ..admin()
+        };
+        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        assert_eq!(assessment.plane, PlaneMatch::Same);
+        assert_eq!(assessment.blocking(false), None);
+        assert!(assessment.findings.is_empty(), "{:?}", assessment.findings);
+    }
+
+    #[test]
+    fn without_a_saved_ca_the_mesh_key_identifies_the_control_plane() {
+        let facts = HostFacts {
+            saved: Some(joined_over_the_mesh(None, Some("cp-key"))),
+            target_identity: identity(Some("abcd"), Some("cp-key")),
+            ..admin()
+        };
+        assert_eq!(
+            assess(&facts, join("https://cp.example"), &[]).plane,
+            PlaneMatch::Same
+        );
+
+        let other = HostFacts {
+            saved: Some(joined_over_the_mesh(None, Some("cp-key"))),
+            target_identity: identity(None, Some("other-key")),
+            ..admin()
+        };
+        let assessment = assess(&other, join("https://cp.example"), &[]);
+        assert_eq!(assessment.plane, PlaneMatch::Different);
+        let Some(Finding::OtherControlPlane { evidence, .. }) = assessment.blocking(false) else {
+            panic!("{:?}", assessment.findings);
+        };
+        assert!(evidence.contains("other-key"), "{evidence}");
+    }
+
+    /// The identity outranks the address: a different CA at the saved URL
+    /// is another control plane (a reinstall), and the message says which.
+    #[test]
+    fn another_ca_is_another_control_plane_even_at_the_saved_address() {
+        let mut previous = saved("https://cp.example");
+        previous.ca_fingerprint = Some("abcd".into());
+        let facts = HostFacts {
+            saved: Some(previous),
+            target_identity: identity(Some("ef01"), None),
+            ..admin()
+        };
+        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        assert_eq!(assessment.plane, PlaneMatch::Different);
+        let blocking = assessment.blocking(false).expect("blocks without --force");
+        let message = blocking.message();
+        assert!(
+            message.contains("ef01") && message.contains("abcd"),
+            "{message}"
+        );
+        assert_eq!(assessment.blocking(true), None);
+    }
+
+    /// Identity that cannot be determined is reported as exactly that, with
+    /// why, never as another cluster.
+    #[test]
+    fn an_unknown_identity_says_so_instead_of_claiming_another_cluster() {
+        let facts = HostFacts {
+            saved: Some(joined_over_the_mesh(None, None)),
+            target_identity: Some(Err("the control plane answered 404".into())),
+            ..admin()
+        };
+        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        assert_eq!(assessment.plane, PlaneMatch::Unknown);
+        let Some(Finding::ControlPlaneUnverified { reason, .. }) = assessment.blocking(false)
+        else {
+            panic!("{:?}", assessment.findings);
+        };
+        assert!(reason.contains("404"), "{reason}");
+        let message = assessment.blocking(false).unwrap().message();
+        assert!(message.contains("could not be determined"), "{message}");
+        assert!(!message.contains("another control plane"), "{message}");
+        assert_eq!(assessment.blocking(true), None);
+
+        // Nothing comparable on either side: also unknown, and why.
+        let facts = HostFacts {
+            saved: Some(joined_over_the_mesh(Some("abcd"), None)),
+            target_identity: identity(None, Some("cp-key")),
+            ..admin()
+        };
+        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        let Some(Finding::ControlPlaneUnverified { reason, .. }) = assessment.blocking(false)
+        else {
+            panic!("{:?}", assessment.findings);
+        };
+        assert!(reason.contains("only a cluster CA"), "{reason}");
+        assert!(reason.contains("only its mesh key"), "{reason}");
+    }
+
+    #[test]
+    fn reads_the_control_plane_key_from_a_network_snapshot() {
+        let snapshot = serde_json::json!({
+            "wireguard": {
+                "cidr": "10.201.0.0/24",
+                "peers": [
+                    { "name": "edge-2", "public_key": "peer-key" },
+                    { "name": "control-plane", "public_key": "cp-key" }
+                ]
+            }
+        });
+        assert_eq!(
+            control_plane_key_in_snapshot(&snapshot).as_deref(),
+            Some("cp-key")
+        );
+        assert_eq!(
+            control_plane_key_in_snapshot(&serde_json::json!({ "peers": [] })),
+            None
+        );
     }
 
     fn join(target: &str) -> Purpose<'_> {
@@ -540,9 +887,10 @@ mod tests {
             ..admin()
         };
         let assessment = assess(&facts, join("https://new.example"), &[]);
+        // Nothing identifies either control plane: unknown, not "another".
         assert!(matches!(
             assessment.blocking(false),
-            Some(Finding::OtherControlPlane { .. })
+            Some(Finding::ControlPlaneUnverified { .. })
         ));
         assert_eq!(assessment.blocking(true), None);
     }

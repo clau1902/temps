@@ -17441,6 +17441,7 @@ export type MeshEnrollApiRequest = {
      * The name the worker will register under.
      */
     name: string;
+    rejoin_proof?: SecretString | null;
     /**
      * The worker's base64 WireGuard public key. The private key never
      * leaves the worker.
@@ -17471,8 +17472,8 @@ export type MeshEnrollResponse = {
      */
     expires_at: string;
     /**
-     * Single-use join token bound to `name`, accepted only over the mesh
-     * node API from `node_address`.
+     * Single-use join token bound to `name`. A new pairing's is accepted
+     * only over the mesh node API from `node_address`.
      */
     join_token: string;
     /**
@@ -17480,7 +17481,7 @@ export type MeshEnrollResponse = {
      */
     listen_port: number;
     /**
-     * The name the pairing's join token is bound to.
+     * The name the join token is bound to.
      */
     name: string;
     /**
@@ -17492,10 +17493,17 @@ export type MeshEnrollResponse = {
      */
     node_api_port: number;
     /**
-     * The pairing created for the worker.
+     * The pairing created for the worker; `None` when it joins again as the
+     * node it already is (`rejoined_node_id`).
      */
-    pairing_id: number;
+    pairing_id?: number | null;
     prefix_len: number;
+    /**
+     * The node this worker already is on this control plane, when it proved
+     * it and joins again (ADR 060): it keeps its mesh key and address, and
+     * registering with `join_token` updates that node in place.
+     */
+    rejoined_node_id?: number | null;
 };
 
 export type MessageContent = string | Array<ContentPart>;
@@ -18715,6 +18723,10 @@ export type NodeInfoResponse = {
     id: number;
     labels: unknown;
     last_heartbeat?: string | null;
+    /**
+     * Sandboxes still on this node. Draining does not move them; destroy them before removing the node. `None` for the control plane's own entry.
+     */
+    live_sandboxes?: number | null;
     name: string;
     /**
      * Why the overlay is unavailable: the colliding range, its owner and the
@@ -18739,6 +18751,10 @@ export type NodeInfoResponse = {
     public_ingress_unsupported_reasons: Array<string>;
     public_ingress_unsupported_route_count?: number | null;
     role: string;
+    /**
+     * Containers of current or in-progress deployments on this node (and of the deployment a rollout in progress would fall back to): what a removal refuses on, and what a drain moves. `None` for the control plane's own entry.
+     */
+    serving_containers?: number | null;
     status: string;
 };
 
@@ -20834,6 +20850,24 @@ export type PlacementNode = {
  * Plan complexity indicator
  */
 export type PlanComplexity = 'low' | 'medium' | 'high';
+
+/**
+ * What identifies this control plane to a worker that already joined one
+ * (ADR 060). Both values are public keys' digests or public keys, so they
+ * are served without authentication.
+ */
+export type PlaneIdentityResponse = {
+    /**
+     * SHA-256 fingerprint (hex) of the cluster CA every worker of this
+     * control plane pins. `None` before the first worker joined.
+     */
+    ca_fingerprint?: string | null;
+    /**
+     * The control plane's WireGuard mesh public key. `None` while the mesh
+     * is off or not up yet.
+     */
+    control_plane_wg_public_key?: string | null;
+};
 
 /**
  * Plan metadata
@@ -53221,7 +53255,7 @@ export type MeshEnrollErrors = {
      */
     403: unknown;
     /**
-     * Mesh off or not ready, control plane not dialable, key in use, or too many pairings
+     * Mesh off or not ready, control plane not dialable, key in use (including a node's own key and name without its current agent credential), or too many pairings
      */
     409: unknown;
     /**
@@ -53236,12 +53270,39 @@ export type MeshEnrollErrors = {
 
 export type MeshEnrollResponses = {
     /**
-     * Pairing created; register over the mesh next
+     * Pairing created, or the worker proved it is the node it joins again as; register over the mesh next
      */
     201: MeshEnrollResponse;
 };
 
 export type MeshEnrollResponse2 = MeshEnrollResponses[keyof MeshEnrollResponses];
+
+export type PlaneIdentityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/internal/nodes/plane-identity';
+};
+
+export type PlaneIdentityErrors = {
+    /**
+     * Rate limited
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type PlaneIdentityResponses = {
+    /**
+     * This control plane's identity
+     */
+    200: PlaneIdentityResponse;
+};
+
+export type PlaneIdentityResponse2 = PlaneIdentityResponses[keyof PlaneIdentityResponses];
 
 export type RegisterNodeData = {
     body: RegisterNodeApiRequest;

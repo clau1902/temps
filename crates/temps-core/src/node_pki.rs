@@ -474,6 +474,42 @@ pub fn ca_fingerprint_sha256(cert_pem: &str) -> Result<String, PkiError> {
     Ok(hex::encode(digest))
 }
 
+/// SHA-256 (lowercase hex) of a node's agent token: what the control plane
+/// stores as `nodes.token_hash`.
+pub fn agent_token_hash(agent_token: &str) -> String {
+    hex::encode(Sha256::digest(agent_token.as_bytes()))
+}
+
+/// Proof that a worker joining outbound is a node the control plane already
+/// knows (ADR 060): HMAC-SHA256, keyed by that node's agent token hash, over
+/// the name, mesh public key and the join token of this one enrollment.
+///
+/// The worker holds its agent token; the control plane holds its hash. The
+/// proof is bound to a single-use join token, so a control plane that is not
+/// the one the worker belonged to learns nothing it could replay elsewhere,
+/// unlike the token itself. Lowercase hex; `None` only if HMAC refused the
+/// key, which it does not for any length.
+pub fn rejoin_proof(
+    agent_token_hash: &str,
+    node_name: &str,
+    wg_public_key: &str,
+    join_token: &str,
+) -> Option<String> {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(agent_token_hash.as_bytes()).ok()?;
+    for part in [
+        "temps-node-rejoin/v1",
+        node_name.trim(),
+        wg_public_key.trim(),
+        join_token,
+    ] {
+        mac.update(part.as_bytes());
+        // A separator no part contains, so the parts cannot run together.
+        mac.update(&[0]);
+    }
+    Some(hex::encode(mac.finalize().into_bytes()))
+}
+
 /// Node side: generate a fresh keypair and a CSR. `common_name` is the subject
 /// CN; `sans` are the Subject Alternative Names the leaf must be valid for —
 /// rcgen auto-classifies each entry as an IP or DNS SAN. The control plane
@@ -604,6 +640,28 @@ fn pem_to_der(pem: &str, context: &str) -> Result<Vec<u8>, PkiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejoin_proof_is_bound_to_the_node_its_key_and_the_join_token() {
+        let hash = agent_token_hash("agent-token");
+        assert_eq!(hash.len(), 64);
+        let proof = rejoin_proof(&hash, "edge-1", "key", "join-1").unwrap();
+        assert_eq!(proof.len(), 64);
+        assert_eq!(
+            rejoin_proof(&hash, " edge-1 ", "key", "join-1").unwrap(),
+            proof
+        );
+        for other in [
+            rejoin_proof(&agent_token_hash("other"), "edge-1", "key", "join-1"),
+            rejoin_proof(&hash, "edge-2", "key", "join-1"),
+            rejoin_proof(&hash, "edge-1", "other-key", "join-1"),
+            rejoin_proof(&hash, "edge-1", "key", "join-2"),
+            // Parts cannot be shifted across the separator.
+            rejoin_proof(&hash, "edge-1k", "ey", "join-1"),
+        ] {
+            assert_ne!(other.unwrap(), proof);
+        }
+    }
 
     #[test]
     fn test_ca_generation_produces_pem() {
