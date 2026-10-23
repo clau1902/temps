@@ -1,0 +1,88 @@
+# Shared Rust build cache with sccache and S3
+
+An optional setup for developers and agent machines. It is not used by CI, which has
+its own cache handling in `.github/workflows/rust-tests.yml`.
+
+## What it helps and what it does not
+
+`sccache` caches the output of each `rustc` invocation by a hash of its inputs.
+
+- **Third-party dependencies:** these dominate a cold build (`Cargo.lock` lists
+  about 1,400 packages). A second checkout, a second machine or a cleaned `target/`
+  gets them from the cache instead of recompiling.
+- **Workspace crates:** the `dev` profile in `Cargo.toml` sets `incremental = true`,
+  and `sccache` does not cache incrementally compiled crates. Your own crates keep
+  using normal incremental builds. If you set `CARGO_INCREMENTAL=0` to get cache hits
+  for workspace crates too, single-crate edit-compile loops get slower, so leave it
+  alone unless you are warming a cache.
+- **Linking and test runs:** not cached. Linking time is unchanged.
+
+Measure before you adopt it: run `cargo build --timings` on a cold `target/`, once
+without and once with the cache, and compare. We have not benchmarked it on this
+workspace.
+
+## Local disk cache (no S3)
+
+```bash
+cargo install sccache --locked     # or: brew install sccache
+export RUSTC_WRAPPER=sccache
+sccache --show-stats
+```
+
+Add the `export` to your shell profile. Do not put `RUSTC_WRAPPER` in a committed
+`.cargo/config.toml`: contributors without `sccache` installed would fail to build.
+
+## Shared cache in S3
+
+One bucket can be shared by every machine that builds this repo (for example a
+Linux build host and several Macs). Use a bucket reachable only from your own
+network, and give each machine credentials that can read and write that bucket
+only.
+
+```bash
+export RUSTC_WRAPPER=sccache
+export SCCACHE_BUCKET=temps-sccache
+export SCCACHE_REGION=us-east-1
+export SCCACHE_S3_KEY_PREFIX=temps/rust
+# For an S3-compatible server (MinIO, RustFS, Garage), also set:
+export SCCACHE_ENDPOINT=https://s3.internal.example.com
+# Credentials come from the usual AWS variables or a profile:
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+```
+
+Check that it is active:
+
+```bash
+sccache --stop-server && sccache --start-server
+sccache --show-stats          # "Cache location" should name S3 and the bucket
+```
+
+Never commit credentials. Keep them in your shell profile or a secrets manager.
+If the bucket is unreachable, check `sccache --show-stats` and your network first:
+we have not tested how the installed `sccache` version behaves in that case, and
+you can always unset `RUSTC_WRAPPER` to build without it.
+
+### Making hits work across machines
+
+A cache entry is keyed by the compiler version, flags and the contents of the
+inputs. Machines only share entries when these match:
+
+- Use the same `rustc` version on every machine (compare `rustc --version`).
+- Use the same target triple. A Linux build and a macOS build do not share entries.
+- Paths can matter. If the repo is checked out at different absolute paths, add
+  `--remap-path-prefix=$PWD=/work` to `RUSTFLAGS` on every machine. Changing
+  `RUSTFLAGS` changes cache keys, so make the change on every machine at once.
+  We have not verified how much path differences reduce hits for this workspace.
+
+### Running agents in parallel
+
+Give each agent its own `CARGO_TARGET_DIR` (or its own worktree) so builds do not
+contend on one `target/` lock, and point all of them at the same `sccache` bucket.
+Then a dependency compiled by one agent is a cache hit for the rest.
+
+### Housekeeping
+
+- Add a lifecycle rule to the bucket to expire old objects (for example after
+  30 days), so the cache does not grow without limit.
+- Clear it by deleting the bucket prefix. There is no local state to invalidate.
