@@ -31,6 +31,7 @@ import { WorkerIngressBadge } from '@/components/nodes/WorkerIngressBadge'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import { workerIngressWay } from '@/lib/worker-ingress'
+import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
 import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
@@ -2046,13 +2047,18 @@ export function NodesPage() {
                   through a tunnel (no public IP needed) or open ports on a
                   public IP.
                 </p>
-                <Button asChild size="sm">
-                  <Link
-                    to={`/settings/nodes/${activeWorkers[0].id}#public-ingress`}
-                  >
-                    Set up ingress on {activeWorkers[0].name}
-                  </Link>
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button asChild size="sm">
+                    <Link to={ingressSetupUrl()}>Set up ingress</Link>
+                  </Button>
+                  <Button asChild size="sm" variant="outline">
+                    <Link
+                      to={`/settings/nodes/${activeWorkers[0].id}#public-ingress`}
+                    >
+                      Open {activeWorkers[0].name}
+                    </Link>
+                  </Button>
+                </div>
               </AlertDescription>
             </Alert>
           )}

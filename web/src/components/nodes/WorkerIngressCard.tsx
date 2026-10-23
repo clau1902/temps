@@ -61,6 +61,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { WorkerIngressSummary } from '@/components/nodes/WorkerIngressSummary'
 import { WorkerTunnels } from '@/components/nodes/WorkerTunnels'
+import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 import {
@@ -280,7 +281,13 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
         {!tunnelHere && (
           <p className="text-sm text-muted-foreground">
             The worker connects out to a tunnel provider, and visitors come in
-            through it. No public IP, open port or router change.
+            through it. No public IP, open port or router change.{' '}
+            <Link
+              className="underline"
+              to={ingressSetupUrl({ worker: node.id, via: 'tunnel' })}
+            >
+              Set up Cloudflare Tunnel from your API token
+            </Link>
           </p>
         )}
       </div>
@@ -362,11 +369,18 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
           <div className="space-y-4">
             {unconfigured && (
               <Alert className="border-amber-500/30 bg-amber-500/5">
-                <AlertDescription className="text-amber-700 dark:text-amber-300">
-                  Visitors can&apos;t reach apps through this worker yet. Pick
-                  one way in: a tunnel works from anywhere, with no public IP or
-                  open port; open ports need a public IP that sends 80 and 443
-                  here.
+                <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                  <p>
+                    Visitors can&apos;t reach apps through this worker yet. Pick
+                    one way in: a tunnel works from anywhere, with no public IP
+                    or open port; open ports need a public IP that sends 80 and
+                    443 here.
+                  </p>
+                  <Button asChild size="sm">
+                    <Link to={ingressSetupUrl({ worker: node.id })}>
+                      Set up ingress step by step
+                    </Link>
+                  </Button>
                 </AlertDescription>
               </Alert>
             )}

@@ -36,6 +36,10 @@ const EXEMPT: Record<string, string> = {
     "Calls disconnectChatSandboxProject, which only revokes the sandbox's access to a service's databases; the same button connects it again.",
   'src/pages/Drop.tsx':
     'Calls deleteProject only to roll back the service this same Drop flow just created after a failed upload; automatic cleanup, never user-triggered.',
+  'src/components/nodes/ingress-setup.ts':
+    'The ingress setup run deletes only the tunnel, managed domain and Cloudflare account that this same run created, to roll back a failed or abandoned setup; pre-existing resources are never touched.',
+  'src/pages/settings/IngressSetupPage.tsx':
+    'Removes only the Cloudflare account this page added moments earlier from a pasted token (when the token is swapped), and rolls back what its own run created; it never deletes a pre-existing resource.',
 }
 
 const root = new URL('../../../', import.meta.url).pathname

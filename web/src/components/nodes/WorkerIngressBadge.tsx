@@ -4,13 +4,22 @@
 // How visitors reach a worker, as a badge for the node list and header.
 
 import { useQuery } from '@tanstack/react-query'
+import { Link } from 'react-router'
 import { listIngressProvidersOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { NodeInfoResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
+import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import { workerIngressWay } from '@/lib/worker-ingress'
 
-export function WorkerIngressBadge({ node }: { node: NodeInfoResponse }) {
+export function WorkerIngressBadge({
+  node,
+  linkSetup = true,
+}: {
+  node: NodeInfoResponse
+  /** "No ingress" links to the setup page, except on that page itself. */
+  linkSetup?: boolean
+}) {
   // Shared with the ingress card's queries, so no extra request per row.
   const connectorsQuery = useQuery(allTunnelsOptions())
   const providersQuery = useQuery(listIngressProvidersOptions())
@@ -41,7 +50,7 @@ export function WorkerIngressBadge({ node }: { node: NodeInfoResponse }) {
       </Badge>
     )
   }
-  return (
+  const badge = (
     <Badge
       variant="outline"
       className="border-amber-500/40 text-xs text-amber-700 dark:text-amber-400"
@@ -49,5 +58,17 @@ export function WorkerIngressBadge({ node }: { node: NodeInfoResponse }) {
     >
       No ingress
     </Badge>
+  )
+  if (!linkSetup || node.status !== 'active') return badge
+  return (
+    <Link
+      to={ingressSetupUrl({ worker: node.id })}
+      aria-label={`No ingress on ${node.name}: set it up`}
+      className="rounded-md focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+      // Node rows open the node on click; this opens the setup instead.
+      onClick={(event) => event.stopPropagation()}
+    >
+      {badge}
+    </Link>
   )
 }
