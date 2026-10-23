@@ -6,7 +6,14 @@
 
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CheckCircle2, Loader2, RefreshCw, Trash2, XCircle } from 'lucide-react'
+import {
+  CheckCircle2,
+  ChevronRight,
+  Loader2,
+  RefreshCw,
+  Trash2,
+  XCircle,
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, type UseFormReturn } from 'react-hook-form'
 import { Link } from 'react-router'
@@ -30,11 +37,17 @@ import type {
   ProviderInfo,
   SetupField,
 } from '@/api/client/types.gen'
+import { CloudflareTokenGuide } from '@/components/domains/CloudflareTokenGuide'
 import { TunnelHostnames } from '@/components/domains/TunnelHostnames'
 import { TunnelLinks } from '@/components/nodes/TunnelLinks'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Dialog,
@@ -391,6 +404,8 @@ interface DomainPick {
 }
 
 const EMPTY_PICK: DomainPick = { zone: '', subdomain: '' }
+/** `temps_ingress::cloudflare::KIND`. */
+const CLOUDFLARE_TUNNEL = 'cloudflare_tunnel'
 const TUNNEL_NAME = /^[A-Za-z0-9-]{1,50}$/
 const DNS_LABELS =
   /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/
@@ -543,6 +558,17 @@ function ProviderSetupDialog({
                   <DialogTitle>Set up {provider.name}</DialogTitle>
                   <DialogDescription>{provider.summary}</DialogDescription>
                 </DialogHeader>
+                {provider.kind === CLOUDFLARE_TUNNEL && (
+                  <Collapsible>
+                    <CollapsibleTrigger className="group flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+                      <ChevronRight className="h-4 w-4 transition-transform group-data-[state=open]:rotate-90" />
+                      What the Cloudflare token needs
+                    </CollapsibleTrigger>
+                    <CollapsibleContent className="pt-2">
+                      <CloudflareTokenGuide tunnel="required" />
+                    </CollapsibleContent>
+                  </Collapsible>
+                )}
                 <FormField
                   control={form.control}
                   name="name"

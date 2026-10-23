@@ -81,12 +81,42 @@ struct CpuSnapshot {
     total: u64,
 }
 
+/// Which series a [`NodeMetricsCollector`] emits.
+///
+/// The machine-wide series and the `node.process_*` series belong to different
+/// owners once the console and the proxy run as separate processes (ADR-017):
+/// the host is sampled once, by the console, and each proxy reports only its
+/// own file descriptors. Sampling the host from both would write every
+/// machine-wide series twice under the same node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NodeMetricsScope {
+    /// Everything: one process runs both the console and the proxy.
+    #[default]
+    All,
+    /// Machine-wide series only: CPU, memory, load, disk space, system-wide
+    /// file descriptors, block and network I/O.
+    Host,
+    /// This process's own file descriptors only (`node.process_*`).
+    Process,
+}
+
+impl NodeMetricsScope {
+    fn host(self) -> bool {
+        matches!(self, Self::All | Self::Host)
+    }
+
+    fn process(self) -> bool {
+        matches!(self, Self::All | Self::Process)
+    }
+}
+
 /// Node metric collector.
 ///
 /// Holds CPU baseline state across calls inside a `Mutex` so the collector can
 /// implement `Sync` while mutating the snapshot.  All other metrics are
 /// stateless reads from `/proc` or `statvfs(2)`.
 pub struct NodeMetricsCollector {
+    scope: NodeMetricsScope,
     /// Previous CPU tick snapshot; `None` before the first scrape.
     prev_cpu: Mutex<Option<CpuSnapshot>>,
     /// Cross-platform fallback state (non-Linux only). `sysinfo` computes CPU
@@ -98,7 +128,12 @@ pub struct NodeMetricsCollector {
 
 impl NodeMetricsCollector {
     pub fn new() -> Self {
+        Self::with_scope(NodeMetricsScope::All)
+    }
+
+    pub fn with_scope(scope: NodeMetricsScope) -> Self {
         Self {
+            scope,
             prev_cpu: Mutex::new(None),
             #[cfg(not(target_os = "linux"))]
             fallback: Mutex::new(fallback::FallbackState::new()),
@@ -131,29 +166,35 @@ impl Collector for NodeMetricsCollector {
         let now = Utc::now();
         let mut points = Vec::new();
 
-        // CPU — synchronous (no I/O latency).
-        points.extend(self.collect_cpu(source_id, config, now));
+        if self.scope.host() {
+            // CPU — synchronous (no I/O latency).
+            points.extend(self.collect_cpu(source_id, config, now));
 
-        // Memory — async file read.
-        points.extend(collect_memory(source_id, config, now).await);
+            // Memory — async file read.
+            points.extend(collect_memory(source_id, config, now).await);
 
-        // Load average — async file read.
-        points.extend(collect_loadavg(source_id, config, now).await);
+            // Load average — async file read.
+            points.extend(collect_loadavg(source_id, config, now).await);
 
-        // Disk — synchronous statvfs call.
-        points.extend(collect_disk(source_id, config, Path::new(data_dir), now));
+            // Disk — synchronous statvfs call.
+            points.extend(collect_disk(source_id, config, Path::new(data_dir), now));
 
-        // File descriptors — synchronous /proc reads + getrlimit(2).
-        points.extend(collect_system_fds(source_id, config, now));
-        points.extend(collect_process_fds(source_id, config, now));
+            // System-wide file descriptors — synchronous /proc reads.
+            points.extend(collect_system_fds(source_id, config, now));
 
-        // Block + network I/O — cumulative kernel counters.
-        points.extend(collect_disk_io(source_id, config, now).await);
-        points.extend(collect_network_io(source_id, config, now).await);
+            // Block + network I/O — cumulative kernel counters.
+            points.extend(collect_disk_io(source_id, config, now).await);
+            points.extend(collect_network_io(source_id, config, now).await);
 
-        // Non-Linux: fill whatever `/proc` could not answer from `sysinfo`.
-        #[cfg(not(target_os = "linux"))]
-        points.extend(self.collect_fallback(source_id, config, now));
+            // Non-Linux: fill whatever `/proc` could not answer from `sysinfo`.
+            #[cfg(not(target_os = "linux"))]
+            points.extend(self.collect_fallback(source_id, config, now));
+        }
+
+        // This process's file descriptors — /proc/self/fd + getrlimit(2).
+        if self.scope.process() {
+            points.extend(collect_process_fds(source_id, config, now));
+        }
 
         debug!(
             source_id,

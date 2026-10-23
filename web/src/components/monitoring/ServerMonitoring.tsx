@@ -41,6 +41,7 @@ import {
 import { Progress } from '@/components/ui/progress'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
+import { useNodeCapability } from '@/hooks/useNodeCapability'
 import { useSettings } from '@/hooks/useSettings'
 import { NodeMetricsAccessDenied } from '@/components/monitoring/NodeMetricsAccessDenied'
 import { NoNodeSamplesState } from '@/components/monitoring/NoNodeSamplesState'
@@ -500,6 +501,13 @@ export function ServerMonitoring() {
   // Node metrics need settings:read, which only instance administrators
   // hold. Other roles get one explanation below and send no metric requests.
   const canReadNodeMetrics = useIsInstanceAdmin()
+  // A control-plane-profile install has no Docker daemon by design (its
+  // workloads run on worker nodes), so `docker system df` can only fail
+  // there. Wait for the capability so that request is never sent, but fail
+  // open: an unreadable capability still shows the card.
+  const capability = useNodeCapability()
+  const showDockerDiskUsage =
+    !capability.isPending && capability.data?.local_workloads !== false
 
   const latest = useQuery({
     ...nodeMetricsGetLatestOptions({ path: { id: CONTROL_PLANE_NODE_ID } }),
@@ -797,7 +805,7 @@ export function ServerMonitoring() {
           </>
         )}
         {/* Docker's own `system df` answers without any recorded sample. */}
-        <DockerDiskUsageCard />
+        {showDockerDiskUsage && <DockerDiskUsageCard />}
       </div>
 
       {!noSamples && (

@@ -9,7 +9,7 @@ pub mod store;
 
 // Re-exports for convenient use by downstream crates.
 pub use collector::mongodb::MongoCollector;
-pub use collector::node::NodeMetricsCollector;
+pub use collector::node::{NodeMetricsCollector, NodeMetricsScope};
 pub use collector::postgres::PostgresCollector;
 pub use collector::redis::RedisCollector;
 pub use collector::s3::S3Collector;

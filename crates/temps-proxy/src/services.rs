@@ -76,6 +76,16 @@ impl UpstreamResolverImpl {
     /// Where requests that may only reach the console's public routes go:
     /// the public-only listener when one exists, the console listener
     /// otherwise (a split proxy started without an ingress address).
+    /// Whether a project route answers this host, by SNI or Host header.
+    /// The console's own hostname is reserved, so it never counts.
+    fn project_route_claims(&self, host: &str, sni_hostname: Option<&str>) -> bool {
+        self.route_table
+            .get_route_by_sni(sni_hostname.unwrap_or(host))
+            .is_some()
+            || self.route_table.get_route_by_host(host).is_some()
+            || self.route_table.get_route(host).is_some()
+    }
+
     fn public_surface_address(&self) -> &str {
         self.server_config
             .console_ingress_address
@@ -141,19 +151,23 @@ impl UpstreamResolver for UpstreamResolverImpl {
             ));
         }
 
-        // Route API and OTLP paths directly to the console (API server),
-        // regardless of the Host header — needed for OTLP push from containers
-        // that use host.docker.internal as the host. Public ingest paths go to
-        // the public-only listener, so "reachable from any host" is a property
-        // of what that listener mounts rather than of a path prefix. The OTLP
-        // query API shares the `/api/otel` prefix but is an authenticated
-        // console API, so it keeps going to the full console listener.
-        if path.starts_with(ROUTE_PREFIX_TEMPS) || path.starts_with(ROUTE_PREFIX_OTEL) {
-            let address = if is_public_ingest_path(path) {
-                self.public_surface_address()
-            } else {
-                self.server_config.console_address.as_str()
-            };
+        // Public ingest paths reach the console regardless of the Host
+        // header — needed for OTLP push from containers that use
+        // host.docker.internal as the host. They go to the public-only
+        // listener, so "reachable from any host" is a property of what that
+        // listener mounts rather than of a path prefix.
+        if is_public_ingest_path(path) {
+            let address = self.public_surface_address();
+            debug!("Routing temps ingest request to console: {}", address);
+            return Ok(console_peer(address));
+        }
+        // The rest of `/api/otel` is the console's authenticated query API.
+        // It is the console's only on hosts no project route claims: an app
+        // that serves its own `/api/otel` (a Temps console deployed as a
+        // project, say) must get its own requests, not a 404 from this one.
+        if path.starts_with(ROUTE_PREFIX_OTEL) && !self.project_route_claims(host, sni_hostname)
+        {
+            let address = self.server_config.console_address.as_str();
             debug!("Routing temps API request to console: {}", address);
             return Ok(console_peer(address));
         }
@@ -591,6 +605,36 @@ mod public_ingress_tests {
         // reaching the full console, or the dashboard's own requests 404.
         assert_eq!(
             peer(&resolver, "console.example.com", "/api/otel/traces").await,
+            CONSOLE
+        );
+    }
+
+    // Paused clock: an unmatched host waits out the first-load grace period
+    // on a table that was never loaded from a database.
+    #[tokio::test(start_paused = true)]
+    async fn a_project_keeps_its_own_otel_query_paths() {
+        let resolver = resolver(true, None);
+        // A project that serves `/api/otel` itself (a Temps console deployed
+        // as a project) gets its own query requests.
+        for path in [
+            "/api/otel/traces",
+            "/api/otel/global/trace-summaries?limit=25",
+            "/api/otel/metrics",
+        ] {
+            assert_eq!(
+                peer(&resolver, "seed.example.com", path).await,
+                "127.0.0.1:18080",
+                "{path}"
+            );
+        }
+        // Ingest still goes to this console's public listener on any host.
+        assert_eq!(
+            peer(&resolver, "seed.example.com", "/api/otel/v1/traces").await,
+            INGRESS
+        );
+        // A host no route claims keeps reaching the console's query API.
+        assert_eq!(
+            peer(&resolver, "host.docker.internal", "/api/otel/traces").await,
             CONSOLE
         );
     }

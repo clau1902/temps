@@ -7,6 +7,7 @@ import {
   type DnsProviderCredentials,
   type DnsProviderType as ApiDnsProviderType,
 } from '@/api/client'
+import { CloudflareTokenGuide } from '@/components/domains/CloudflareTokenGuide'
 import { requireDeliveryData } from '@/components/domains/delivery-errors'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -981,10 +982,7 @@ export function AddDnsProvider() {
                         {...field}
                       />
                     </FormControl>
-                    <FormDescription>
-                      Create a token with Zone:Read and DNS:Edit permissions at
-                      dash.cloudflare.com/profile/api-tokens
-                    </FormDescription>
+                    <CloudflareTokenGuide />
                     <FormMessage />
                   </FormItem>
                 )}
