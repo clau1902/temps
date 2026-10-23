@@ -542,10 +542,10 @@ pub struct CreateSandboxBody {
     /// Extra env vars baked into the container on create.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// CPU cores, `(0, 16]`. Omit for the operator's default.
+    /// CPU cores, `[0.01, 16]`. Omit for the operator's default.
     #[serde(default)]
     pub cpu_limit: Option<f64>,
-    /// Memory in MB, `[1, 32768]`. Omit for the operator's default.
+    /// Memory in MB, `[6, 32768]`. Omit for the operator's default.
     #[serde(default)]
     pub memory_limit_mb: Option<u64>,
     /// Max processes, `[1, 4096]`; `0`/negative (unlimited) is rejected.
@@ -676,6 +676,11 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
 /// the host has. Generous enough for real workloads, finite so the host's
 /// pid table and memory stay protected from untrusted code.
 pub const MAX_SANDBOX_CPU_CORES: f64 = 16.0;
+/// Floors below which the request cannot be enforced. Docker takes CPU as
+/// integer NanoCPUs, so a tiny positive value truncates to 0, which Docker
+/// reads as "no CPU quota"; it also rejects memory limits under 6 MB.
+pub const MIN_SANDBOX_CPU_CORES: f64 = 0.01;
+pub const MIN_SANDBOX_MEMORY_MB: u64 = 6;
 pub const MAX_SANDBOX_MEMORY_MB: u64 = 32 * 1024;
 pub const MAX_SANDBOX_PIDS_LIMIT: i64 = 4096;
 pub const MAX_SANDBOX_DISK_MB: u64 = 64 * 1024;
@@ -685,19 +690,19 @@ pub const MAX_SANDBOX_DISK_MB: u64 = 64 * 1024;
 /// operator's defaults.
 fn validate_resource_limits(req: &CreateSandboxRequest) -> Result<(), SandboxError> {
     if let Some(cpu) = req.cpu_limit {
-        if !cpu.is_finite() || cpu <= 0.0 || cpu > MAX_SANDBOX_CPU_CORES {
+        if !cpu.is_finite() || !(MIN_SANDBOX_CPU_CORES..=MAX_SANDBOX_CPU_CORES).contains(&cpu) {
             return Err(SandboxError::Validation {
                 message: format!(
-                    "cpu_limit/vcpus must be greater than 0 and at most {MAX_SANDBOX_CPU_CORES}, got {cpu}"
+                    "cpu_limit/vcpus must be between {MIN_SANDBOX_CPU_CORES} and {MAX_SANDBOX_CPU_CORES}, got {cpu}"
                 ),
             });
         }
     }
     if let Some(memory) = req.memory_limit_mb {
-        if memory == 0 || memory > MAX_SANDBOX_MEMORY_MB {
+        if !(MIN_SANDBOX_MEMORY_MB..=MAX_SANDBOX_MEMORY_MB).contains(&memory) {
             return Err(SandboxError::Validation {
                 message: format!(
-                    "memory_limit_mb/memory must be between 1 and {MAX_SANDBOX_MEMORY_MB} MB, got {memory}"
+                    "memory_limit_mb/memory must be between {MIN_SANDBOX_MEMORY_MB} and {MAX_SANDBOX_MEMORY_MB} MB, got {memory}"
                 ),
             });
         }
@@ -3399,8 +3404,8 @@ mod tests {
         ))
         .is_ok());
         assert!(validate_resource_limits(&request_with_limits(
-            Some(0.5),
-            Some(256),
+            Some(MIN_SANDBOX_CPU_CORES),
+            Some(MIN_SANDBOX_MEMORY_MB),
             Some(1),
             Some(1)
         ))
@@ -3422,7 +3427,12 @@ mod tests {
     #[test]
     fn oversized_or_zero_memory_is_rejected() {
         // The value from the report: 4 TiB.
-        for memory in [0, MAX_SANDBOX_MEMORY_MB + 1, 4_194_304] {
+        for memory in [
+            0,
+            MIN_SANDBOX_MEMORY_MB - 1,
+            MAX_SANDBOX_MEMORY_MB + 1,
+            4_194_304,
+        ] {
             let err =
                 validate_resource_limits(&request_with_limits(None, Some(memory), None, None))
                     .unwrap_err();
@@ -3438,6 +3448,8 @@ mod tests {
         for cpu in [
             0.0,
             -1.0,
+            1e-12,
+            MIN_SANDBOX_CPU_CORES / 2.0,
             f64::NAN,
             f64::INFINITY,
             MAX_SANDBOX_CPU_CORES + 0.5,
