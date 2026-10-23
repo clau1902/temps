@@ -21872,6 +21872,12 @@ export type ProjectResponse = {
     repo_name?: string | null;
     repo_owner?: string | null;
     /**
+     * When true, `/api/_temps*` and `/api/otel*` requests on this project's
+     * domains go to the project's app instead of this Temps instance's
+     * console. Only for an app that is itself a Temps console or API.
+     */
+    serves_own_temps_api: boolean;
+    /**
      * Logo from the immutable service-template release applied to this
      * project. Clients should prefer it over a deployed site's favicon.
      */
@@ -31316,6 +31322,14 @@ export type UpdateProjectSettingsRequest = {
     preview_envs_wake_timeout_seconds?: number | null;
     repo_name?: string | null;
     repo_owner?: string | null;
+    /**
+     * Send `/api/_temps*` and `/api/otel*` requests on this project's domains
+     * to the project's app instead of this Temps instance's console. Turn on
+     * only when the app is itself a Temps console or API: with it on, this
+     * instance's analytics and OpenTelemetry ingest stop receiving the
+     * project's traffic. Omit to leave unchanged.
+     */
+    serves_own_temps_api?: boolean | null;
     slug?: string | null;
     /**
      * Opt in to Trivy vulnerability scanning of this project's deployed Docker

@@ -477,6 +477,10 @@ pub struct ProjectResponse {
     /// OSS global-observability model where any OtelRead holder can query any
     /// project's telemetry).
     pub cross_project_trace_sharing: bool,
+    /// When true, `/api/_temps*` and `/api/otel*` requests on this project's
+    /// domains go to the project's app instead of this Temps instance's
+    /// console. Only for an app that is itself a Temps console or API.
+    pub serves_own_temps_api: bool,
     /// Hours to retain built Docker images before nightly cleanup. Null = use the
     /// system-wide default from settings.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -549,6 +553,7 @@ impl ProjectResponse {
             gitlab_webhook_id: project.gitlab_webhook_id,
             github_webhook_id: project.github_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
+            serves_own_temps_api: project.serves_own_temps_api,
             image_retention_hours: project.image_retention_hours,
             // Filled in by the detail handlers via `with_docker_socket`; the
             // list path deliberately leaves it unset.
@@ -1005,6 +1010,12 @@ pub struct UpdateProjectSettingsRequest {
     /// from appearing in cross-project discovery results. Default true (consistent
     /// with the OSS global-observability model). Omit to leave unchanged.
     pub cross_project_trace_sharing: Option<bool>,
+    /// Send `/api/_temps*` and `/api/otel*` requests on this project's domains
+    /// to the project's app instead of this Temps instance's console. Turn on
+    /// only when the app is itself a Temps console or API: with it on, this
+    /// instance's analytics and OpenTelemetry ingest stop receiving the
+    /// project's traffic. Omit to leave unchanged.
+    pub serves_own_temps_api: Option<bool>,
 }
 
 impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjectSettingsParams {
@@ -1026,6 +1037,7 @@ impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjec
             preset_config: request.preset_config,
             ai_alert_summaries_enabled: request.ai_alert_summaries_enabled,
             cross_project_trace_sharing: request.cross_project_trace_sharing,
+            serves_own_temps_api: request.serves_own_temps_api,
             error_source_context_enabled: request.error_source_context_enabled,
             vulnerability_scanning_enabled: request.vulnerability_scanning_enabled,
             error_source_root: request.error_source_root,

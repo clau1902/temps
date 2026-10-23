@@ -46824,6 +46824,10 @@
               "null"
             ]
           },
+          "serves_own_temps_api": {
+            "description": "When true, `/api/_temps*` and `/api/otel*` requests on this project's\ndomains go to the project's app instead of this Temps instance's\nconsole. Only for an app that is itself a Temps console or API.",
+            "type": "boolean"
+          },
           "service_template_image_url": {
             "description": "Logo from the immutable service-template release applied to this\nproject. Clients should prefer it over a deployed site's favicon.",
             "type": [
@@ -46882,7 +46886,8 @@
           "preview_envs_wake_timeout_seconds",
           "source_type",
           "hosting",
-          "cross_project_trace_sharing"
+          "cross_project_trace_sharing",
+          "serves_own_temps_api"
         ],
         "type": "object"
       },
@@ -67041,6 +67046,13 @@
           "repo_owner": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "serves_own_temps_api": {
+            "description": "Send `/api/_temps*` and `/api/otel*` requests on this project's domains\nto the project's app instead of this Temps instance's console. Turn on\nonly when the app is itself a Temps console or API: with it on, this\ninstance's analytics and OpenTelemetry ingest stop receiving the\nproject's traffic. Omit to leave unchanged.",
+            "type": [
+              "boolean",
               "null"
             ]
           },

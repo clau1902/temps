@@ -541,6 +541,16 @@ pub struct RouteInfo {
 }
 
 impl RouteInfo {
+    /// Whether the route's project answers Temps' own public paths
+    /// (`/api/_temps*`, `/api/otel*`) itself, so the proxy must hand them to
+    /// it rather than to this instance's console. `false` for routes without
+    /// a project (custom routes).
+    pub fn serves_own_temps_api(&self) -> bool {
+        self.project
+            .as_ref()
+            .is_some_and(|project| project.serves_own_temps_api)
+    }
+
     /// Select the next backend (address + container metadata) using round-robin.
     /// Returns a fallback selection if this is a static directory backend.
     pub fn select_backend(&self) -> BackendSelection {
@@ -4469,6 +4479,7 @@ mod tests {
                 bitbucket_webhook_hook_id: None,
                 generic_webhook_token: None,
                 cross_project_trace_sharing: false,
+                serves_own_temps_api: false,
                 ai_api_traffic_summary_enabled: None,
                 image_retention_hours: None,
                 cloud_telemetry_fidelity: Default::default(),
