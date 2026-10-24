@@ -144,7 +144,7 @@ never shown as reachable.
   Review the new plan." Cloudflare has no conditional update, so a change
   in the moment between that read and the write can still be lost; the
   window is one request long, and the overwritten value is kept in the run
-  journal so it can be restored.
+  journal (the *before* state, see Undo below) so it can be restored.
 - `POST …/reachability/apply` takes `{plan_id, answers}` and starts a run.
   It recomputes the fingerprint first; if anything changed since the plan
   (another user added a tunnel, a worker's ingress mode changed, a CLI run
@@ -165,8 +165,23 @@ never shown as reachable.
   resource instead of creating a second one.
 - **Incomplete runs are reconciled.** On start-up and every minute, a run
   with a `pending` step older than its timeout is resolved by looking the
-  resource up by its key. Found means it is recorded and the run continues
-  or stops as the user asked.
+  resource up by its key. For a step that **creates** something, found
+  means it is recorded and the run continues or stops as the user asked.
+- **For a step that changes an existing record, found is not enough.** A
+  lookup by name and type finds the record whether or not the write landed,
+  and may find a value someone else wrote since. Such a step is journaled
+  with its *before* state (as read just before the write) and its intended
+  *after* state, and a DNS write carries the run's ownership marker (ADR 031
+  marker plus the run id) in the record. Reconciling it compares what is
+  there now:
+  - the intended *after* content with this run's marker: the write landed,
+    the step is `done`;
+  - still the *before* content: the write did not land; the step is retried
+    through the normal pre-write check;
+  - anything else: someone else changed it. The step becomes `conflict`,
+    the run stops, and neither resume nor undo touches that record until a
+    user decides ("`myapp.example.com` now points at `other.example.net`,
+    which this setup did not write. Keep it, or let Temps set it again?").
 - **A miss only counts as absence when the lookup can prove it.** A create
   that timed out may still have succeeded, and some provider listings lag
   behind writes. So each step kind declares whether its lookup is
@@ -188,9 +203,17 @@ never shown as reachable.
   waiting on, never a half-finished state as if it were complete; a step
   still ambiguous after an hour is shown with the resource to check by hand
   ("Check whether tunnel `temps-homelab-1a2b3c4d` exists in Cloudflare").
-- **Undo** removes exactly what the journal recorded as created, newest
-  first, found by the same keys, and never anything the run found already
-  there.
+- **Undo** walks the journal newest first:
+  - a resource the run **created** is removed, found by the same key; a
+    resource the run found already there is never removed;
+  - a record the run **changed** is put back to its *before* state, but only
+    if it still holds exactly the run's *after* state. If it was changed
+    again since, undo writes nothing to it, pauses, and reports the conflict
+    with the record's current value, so a later edit by someone else is
+    never overwritten. The user can then skip that record or restore it
+    anyway, and the choice is journaled.
+  - a step in `conflict` or still ambiguous blocks undo of everything before
+    it, since earlier steps may depend on it, and the console says which.
 - The steps move from the console (`web/src/components/nodes/ingress-setup.ts`
   runs them in the browser today) to the server, so a closed tab cannot
   leave half a setup, and the CLI and AI tools get the same behaviour.
