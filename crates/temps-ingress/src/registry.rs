@@ -136,6 +136,12 @@ impl ProviderRegistry {
         }
     }
 
+    /// Exactly these providers, for tests.
+    #[cfg(test)]
+    pub(crate) fn of(factories: Vec<Arc<dyn ProviderFactory>>) -> Self {
+        Self { factories }
+    }
+
     pub fn get(&self, kind: &str) -> Result<Arc<dyn ProviderFactory>, IngressError> {
         self.factories
             .iter()

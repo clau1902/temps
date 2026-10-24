@@ -36,3 +36,6 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 utoipa.workspace = true
+
+[dev-dependencies]
+temps-database = { path = "../temps-database" }
