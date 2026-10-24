@@ -555,19 +555,23 @@ pub struct CreateSandboxBody {
     pub env: HashMap<String, String>,
     /// CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).
     /// Omit for the operator's default.
+    #[schema(minimum = 0.01, maximum = 16.0)]
     #[serde(default)]
     pub cpu_limit: Option<f64>,
     /// Memory in MB, `[6, 32768]` (lower if an administrator set a maximum,
     /// and never more than the host has). Omit for the operator's default.
+    #[schema(minimum = 6, maximum = 32768)]
     #[serde(default)]
     pub memory_limit_mb: Option<u64>,
     /// Max processes, `[1, 4096]` (lower if an administrator set a maximum);
     /// `0`/negative (unlimited) is rejected. Omit for the platform default
     /// (512).
+    #[schema(minimum = 1, maximum = 4096)]
     #[serde(default)]
     pub pids_limit: Option<i64>,
     /// Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores
     /// it). Omit for the platform default (1 GiB).
+    #[schema(minimum = 1, maximum = 65536)]
     #[serde(default)]
     pub disk_size_mb: Option<u64>,
     /// `@vercel/sandbox`'s nested resources object. When present, its
@@ -3628,6 +3632,11 @@ mod tests {
             .append_query_results([vec![row.clone()], vec![row]])
             // The user already has two live sandboxes.
             .append_query_results([vec![live_count_row(2)]])
+            // The per-user advisory lock taken before the count.
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
             .into_connection();
 
         let (status, problem) = post_create(create_app(db), serde_json::json!({})).await;

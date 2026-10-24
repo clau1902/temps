@@ -693,8 +693,10 @@ export type AgentSandboxSettings = {
     /**
      * Most sandboxes (not destroyed) one user may have created through
      * `POST /sandboxes` at a time; a create over the cap is refused.
-     * `None` = unlimited. AI application workspaces and agent runs do not
-     * count and are not refused.
+     * `None` = unlimited. AI application workspaces, agent runs and the
+     * sandboxes the platform creates for AI chat or autofix do not count
+     * and are not refused. Sandboxes created before this setting existed
+     * are not counted either.
      */
     max_sandboxes_per_user?: number | null;
     /**

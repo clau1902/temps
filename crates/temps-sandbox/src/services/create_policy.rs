@@ -16,6 +16,7 @@
 
 use std::sync::OnceLock;
 
+use temps_agents::sandbox::DefaultResourceLimits;
 use temps_core::AgentSandboxSettings;
 
 use crate::error::SandboxError;
@@ -39,21 +40,101 @@ pub fn control_plane_memory_mb() -> Option<u64> {
     })
 }
 
+/// Bring the limits a request leaves out under the operator maximums.
+///
+/// An omitted limit becomes whatever the provider defaults to, which can sit
+/// above a maximum the operator set. Where the provider's default is known
+/// and higher than the maximum, the request is pinned to the maximum. A
+/// default that is unknown is left alone: pinning it would turn a ceiling
+/// into the size of every default sandbox, and the providers that run
+/// sandboxes report their defaults. Limits the caller set are left to
+/// [`check_requested_limits`].
+pub fn clamp_omitted_limits(
+    req: &mut CreateSandboxRequest,
+    settings: &AgentSandboxSettings,
+    defaults: DefaultResourceLimits,
+) {
+    if req.cpu_limit.is_none() {
+        if let (Some(max), Some(default)) = (settings.max_cpu_limit, defaults.cpu_limit) {
+            // A whole-core backend would round a fractional pin back up, so
+            // pin to the whole cores the maximum allows. A maximum under one
+            // core leaves nothing to pin to; the check refuses it.
+            let pin = if defaults.cpu_whole_cores {
+                max.floor()
+            } else {
+                max
+            };
+            if default > max && (!defaults.cpu_whole_cores || pin >= 1.0) {
+                req.cpu_limit = Some(pin);
+            }
+        }
+    }
+    if req.memory_limit_mb.is_none() {
+        if let (Some(max), Some(default)) = (settings.max_memory_limit_mb, defaults.memory_limit_mb)
+        {
+            if default > max {
+                req.memory_limit_mb = Some(max);
+            }
+        }
+    }
+    if req.pids_limit.is_none() {
+        if let (Some(max), Some(default)) = (settings.max_pids_limit, defaults.pids_limit) {
+            if default > max {
+                req.pids_limit = Some(max);
+            }
+        }
+    }
+}
+
+/// Refuse a request whose own `memory_limit_mb` is more than the machine the
+/// sandbox will run on has. `host_memory_mb` is that machine's memory when it
+/// is known (the control plane; a worker reports no figure). Run it on the
+/// request as the caller sent it: a value filled in from an operator maximum
+/// is the operator's choice, not a request for more than the host has.
+pub fn check_host_memory(
+    req: &CreateSandboxRequest,
+    host_memory_mb: Option<u64>,
+) -> Result<(), SandboxError> {
+    if let (Some(memory), Some(host)) = (req.memory_limit_mb, host_memory_mb) {
+        if memory > host {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "memory_limit_mb/memory {memory} exceeds the {host} MB of memory on the \
+                     host this sandbox would run on"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a request that asks for more than the operator allows.
 ///
-/// `host_memory_mb` is the memory of the machine the sandbox will run on,
-/// when it is known (the control plane; a worker reports no figure).
+/// `defaults` are what the backend applies to a limit the request leaves out
+/// (run [`clamp_omitted_limits`] first).
 pub fn check_requested_limits(
     req: &CreateSandboxRequest,
     settings: &AgentSandboxSettings,
-    host_memory_mb: Option<u64>,
+    defaults: DefaultResourceLimits,
 ) -> Result<(), SandboxError> {
-    if let (Some(cpu), Some(max)) = (req.cpu_limit, settings.max_cpu_limit) {
-        if cpu > max {
+    if let (Some(cpu), Some(max)) = (req.cpu_limit.or(defaults.cpu_limit), settings.max_cpu_limit) {
+        // A whole-core backend runs `ceil(cpu)` vCPUs, at least one: that,
+        // not the fractional request, is what the maximum has to bound.
+        let effective = if defaults.cpu_whole_cores {
+            cpu.ceil().max(1.0)
+        } else {
+            cpu
+        };
+        if effective > max {
+            let note = if defaults.cpu_whole_cores {
+                format!(" (this backend rounds {cpu} up to {effective} whole vCPUs, at least 1)")
+            } else {
+                String::new()
+            };
             return Err(SandboxError::Validation {
                 message: format!(
                     "cpu_limit/vcpus {cpu} exceeds the maximum of {max} cores an administrator \
-                     allows for a sandbox (agent_sandbox.max_cpu_limit)"
+                     allows for a sandbox (agent_sandbox.max_cpu_limit){note}"
                 ),
             });
         }
@@ -65,16 +146,6 @@ pub fn check_requested_limits(
                     message: format!(
                         "memory_limit_mb/memory {memory} exceeds the maximum of {max} MB an \
                          administrator allows for a sandbox (agent_sandbox.max_memory_limit_mb)"
-                    ),
-                });
-            }
-        }
-        if let Some(host) = host_memory_mb {
-            if memory > host {
-                return Err(SandboxError::Validation {
-                    message: format!(
-                        "memory_limit_mb/memory {memory} exceeds the {host} MB of memory on the \
-                         host this sandbox would run on"
                     ),
                 });
             }
@@ -133,6 +204,19 @@ mod tests {
         }
     }
 
+    fn none() -> DefaultResourceLimits {
+        DefaultResourceLimits::default()
+    }
+
+    fn vm() -> DefaultResourceLimits {
+        DefaultResourceLimits {
+            cpu_limit: Some(1.0),
+            memory_limit_mb: Some(512),
+            pids_limit: None,
+            cpu_whole_cores: true,
+        }
+    }
+
     fn message(err: SandboxError) -> String {
         match err {
             SandboxError::Validation { message } => message,
@@ -143,42 +227,151 @@ mod tests {
     #[test]
     fn requests_within_the_operator_maximums_pass() {
         let req = request(Some(2.0), Some(4096), Some(256));
-        assert!(check_requested_limits(&req, &settings(), Some(8192)).is_ok());
-        assert!(check_requested_limits(&request(None, None, None), &settings(), None).is_ok());
+        assert!(check_requested_limits(&req, &settings(), none()).is_ok());
+        assert!(check_requested_limits(&request(None, None, None), &settings(), none()).is_ok());
     }
 
     #[test]
     fn unset_maximums_and_unknown_host_memory_add_no_limit() {
         let req = request(Some(16.0), Some(32_768), Some(4096));
-        assert!(check_requested_limits(&req, &AgentSandboxSettings::default(), None).is_ok());
+        assert!(check_requested_limits(&req, &AgentSandboxSettings::default(), none()).is_ok());
     }
 
     #[test]
     fn a_request_over_an_operator_maximum_names_the_setting() {
-        let cpu =
-            check_requested_limits(&request(Some(2.5), None, None), &settings(), None).unwrap_err();
+        let cpu = check_requested_limits(&request(Some(2.5), None, None), &settings(), none())
+            .unwrap_err();
         assert!(message(cpu).contains("max_cpu_limit"));
-        let memory = check_requested_limits(&request(None, Some(4097), None), &settings(), None)
+        let memory = check_requested_limits(&request(None, Some(4097), None), &settings(), none())
             .unwrap_err();
         assert!(message(memory).contains("max_memory_limit_mb"));
-        let pids =
-            check_requested_limits(&request(None, None, Some(257)), &settings(), None).unwrap_err();
+        let pids = check_requested_limits(&request(None, None, Some(257)), &settings(), none())
+            .unwrap_err();
         assert!(message(pids).contains("max_pids_limit"));
     }
 
     #[test]
     fn memory_above_the_host_is_refused_even_without_an_operator_maximum() {
-        let err = check_requested_limits(
-            &request(None, Some(16_384), None),
-            &AgentSandboxSettings::default(),
-            Some(2048),
-        )
-        .unwrap_err();
+        let err = check_host_memory(&request(None, Some(16_384), None), Some(2048)).unwrap_err();
         let message = message(err);
         assert!(
             message.contains("16384") && message.contains("2048"),
             "{message}"
         );
+        assert!(check_host_memory(&request(None, Some(16_384), None), None).is_ok());
+        assert!(check_host_memory(&request(None, None, None), Some(2048)).is_ok());
+    }
+
+    #[test]
+    fn a_memory_pinned_from_the_operator_maximum_is_not_a_request_for_more_than_the_host() {
+        // Host reports 3900 MB, the operator allows up to 4096 and the
+        // provider defaults to 8192: a create that names no memory is pinned
+        // to 4096 and must still be accepted.
+        let defaults = DefaultResourceLimits {
+            memory_limit_mb: Some(8192),
+            ..Default::default()
+        };
+        let mut req = request(None, None, None);
+        check_host_memory(&req, Some(3900)).expect("nothing requested yet");
+        clamp_omitted_limits(&mut req, &settings(), defaults);
+        assert_eq!(req.memory_limit_mb, Some(4096));
+        assert!(check_requested_limits(&req, &settings(), defaults).is_ok());
+    }
+
+    #[test]
+    fn omitted_limits_above_an_operator_maximum_are_pinned_to_it() {
+        let defaults = DefaultResourceLimits {
+            cpu_limit: Some(4.0),
+            memory_limit_mb: Some(8192),
+            pids_limit: Some(512),
+            cpu_whole_cores: false,
+        };
+        let mut req = request(None, None, None);
+        clamp_omitted_limits(&mut req, &settings(), defaults);
+        assert_eq!(req.cpu_limit, Some(2.0));
+        assert_eq!(req.memory_limit_mb, Some(4096));
+        assert_eq!(req.pids_limit, Some(256));
+    }
+
+    #[test]
+    fn omitted_limits_the_provider_already_keeps_under_the_maximum_stay_unset() {
+        let defaults = DefaultResourceLimits {
+            cpu_limit: Some(1.0),
+            memory_limit_mb: Some(1024),
+            pids_limit: Some(128),
+            cpu_whole_cores: false,
+        };
+        let mut req = request(None, None, None);
+        clamp_omitted_limits(&mut req, &settings(), defaults);
+        assert_eq!(req.cpu_limit, None);
+        assert_eq!(req.memory_limit_mb, None);
+        assert_eq!(req.pids_limit, None);
+    }
+
+    #[test]
+    fn unknown_provider_defaults_and_set_values_are_untouched() {
+        let mut req = request(Some(1.5), None, None);
+        clamp_omitted_limits(&mut req, &settings(), DefaultResourceLimits::default());
+        assert_eq!(req.cpu_limit, Some(1.5));
+        assert_eq!(req.memory_limit_mb, None);
+        assert_eq!(req.pids_limit, None);
+        let mut set = request(Some(1.5), Some(100), Some(10));
+        clamp_omitted_limits(
+            &mut set,
+            &settings(),
+            DefaultResourceLimits {
+                cpu_limit: Some(4.0),
+                memory_limit_mb: Some(8192),
+                pids_limit: Some(512),
+                cpu_whole_cores: false,
+            },
+        );
+        assert_eq!(set.cpu_limit, Some(1.5));
+        assert_eq!(set.memory_limit_mb, Some(100));
+        assert_eq!(set.pids_limit, Some(10));
+    }
+
+    #[test]
+    fn a_whole_core_backend_is_bounded_by_the_vcpus_it_will_run() {
+        let cap = |max: f64| AgentSandboxSettings {
+            max_cpu_limit: Some(max),
+            ..Default::default()
+        };
+        // 1.5 cores is 2 vCPUs: over a maximum of 1.5.
+        let err =
+            check_requested_limits(&request(Some(1.5), None, None), &cap(1.5), vm()).unwrap_err();
+        assert!(message(err).contains("2 whole vCPUs"));
+        // 1.2 cores is 2 vCPUs and 1.0 is 1: only the latter fits under 1.5.
+        assert!(check_requested_limits(&request(Some(1.0), None, None), &cap(1.5), vm()).is_ok());
+        // A fractional request still runs one full vCPU: over a 0.5 maximum.
+        assert!(check_requested_limits(&request(Some(0.25), None, None), &cap(0.5), vm()).is_err());
+        // The same fractional values are fine on a backend that honors them.
+        assert!(
+            check_requested_limits(&request(Some(0.25), None, None), &cap(0.5), none()).is_ok()
+        );
+    }
+
+    #[test]
+    fn an_omitted_cpu_on_a_whole_core_backend_is_pinned_to_whole_cores_or_refused() {
+        let cap = |max: f64| AgentSandboxSettings {
+            max_cpu_limit: Some(max),
+            ..Default::default()
+        };
+        let two_vcpus = DefaultResourceLimits {
+            cpu_limit: Some(2.0),
+            ..vm()
+        };
+        // Default 2 vCPUs under a 1.5 maximum: pinned to 1, not to 1.5 (= 2).
+        let mut req = request(None, None, None);
+        clamp_omitted_limits(&mut req, &cap(1.5), two_vcpus);
+        assert_eq!(req.cpu_limit, Some(1.0));
+        assert!(check_requested_limits(&req, &cap(1.5), two_vcpus).is_ok());
+        // Nothing under one vCPU exists: the create is refused, not run on 1.
+        let mut req = request(None, None, None);
+        clamp_omitted_limits(&mut req, &cap(0.5), vm());
+        assert_eq!(req.cpu_limit, None);
+        let err = check_requested_limits(&req, &cap(0.5), vm()).unwrap_err();
+        assert!(message(err).contains("max_cpu_limit"));
     }
 
     #[test]

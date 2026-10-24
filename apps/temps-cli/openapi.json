@@ -1682,7 +1682,7 @@
           },
           "max_sandboxes_per_user": {
             "default": null,
-            "description": "Most sandboxes (not destroyed) one user may have created through\n`POST /sandboxes` at a time; a create over the cap is refused.\n`None` = unlimited. AI application workspaces and agent runs do not\ncount and are not refused.",
+            "description": "Most sandboxes (not destroyed) one user may have created through\n`POST /sandboxes` at a time; a create over the cap is refused.\n`None` = unlimited. AI application workspaces, agent runs and the\nsandboxes the platform creates for AI chat or autofix do not count\nand are not refused. Sandboxes created before this setting existed\nare not counted either.",
             "example": 10,
             "format": "int32",
             "minimum": 0,
@@ -16707,6 +16707,8 @@
           "cpu_limit": {
             "description": "CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).\nOmit for the operator's default.",
             "format": "double",
+            "maximum": 16,
+            "minimum": 0.01,
             "type": [
               "number",
               "null"
@@ -16715,7 +16717,8 @@
           "disk_size_mb": {
             "description": "Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores\nit). Omit for the platform default (1 GiB).",
             "format": "int64",
-            "minimum": 0,
+            "maximum": 65536,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -16755,7 +16758,8 @@
           "memory_limit_mb": {
             "description": "Memory in MB, `[6, 32768]` (lower if an administrator set a maximum,\nand never more than the host has). Omit for the operator's default.",
             "format": "int64",
-            "minimum": 0,
+            "maximum": 32768,
+            "minimum": 6,
             "type": [
               "integer",
               "null"
@@ -16779,6 +16783,8 @@
           "pids_limit": {
             "description": "Max processes, `[1, 4096]` (lower if an administrator set a maximum);\n`0`/negative (unlimited) is rejected. Omit for the platform default\n(512).",
             "format": "int64",
+            "maximum": 4096,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
