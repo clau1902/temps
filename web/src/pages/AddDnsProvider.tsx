@@ -430,7 +430,14 @@ export function AddDnsProvider() {
       toast.success('DNS provider created successfully')
       queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
       if (provider) {
-        navigate(`/dns-providers/${provider.id}`)
+        // Opened from a form that needs a provider (e.g. a tunnel's setup):
+        // go back to it. Only paths inside this app.
+        const back = searchParams.get('return')
+        navigate(
+          back && back.startsWith('/') && !back.startsWith('//')
+            ? back
+            : `/dns-providers/${provider.id}`
+        )
       }
     },
     onError: (err: Error) => {

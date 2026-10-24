@@ -642,7 +642,8 @@ impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
             summary: "The worker connects out to Cloudflare, and visitors reach your apps through Cloudflare's network. No public IP, open port or port forward.".to_string(),
             requirements: vec![
                 "A domain on Cloudflare (the free plan works)".to_string(),
-                "That domain added in Temps under a Cloudflare DNS provider whose API token has 'Zone · Zone · Read', 'Zone · DNS · Edit' and 'Account · Cloudflare Tunnel · Edit', limited to that account and zone".to_string(),
+                "That domain added in Temps under a Cloudflare DNS provider".to_string(),
+                "Its API token with only 'Zone · Zone · Read', 'Zone · DNS · Edit' and 'Account · Cloudflare Tunnel · Edit', limited to that account and zone".to_string(),
             ],
             needs_public_ip: false,
             works_behind_cgnat: true,

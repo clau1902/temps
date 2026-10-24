@@ -44,7 +44,10 @@ import type {
   ManagedDomainResponse,
   NodeInfoResponse,
 } from '@/api/client/types.gen'
-import { CloudflareTokenGuide } from '@/components/domains/CloudflareTokenGuide'
+import {
+  CloudflareTokenChecklist,
+  CloudflareTokenGuide,
+} from '@/components/domains/CloudflareTokenGuide'
 import {
   deliveryError,
   requireDeliveryData,
@@ -943,9 +946,9 @@ function ZonePicker({
         <AlertTitle>Cloudflare didn&apos;t list the zones</AlertTitle>
         <AlertDescription className="space-y-2">
           <p>{deliveryError(zonesQuery.error)}</p>
+          <CloudflareTokenChecklist className="bg-background" />
           <p>
-            The token needs <code>Zone · Zone · Read</code> on the zone you want
-            to use.{' '}
+            Edit the token in Cloudflare to match; it keeps its value.{' '}
             <Button
               variant="link"
               className="h-auto p-0"

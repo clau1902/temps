@@ -9,6 +9,8 @@ import {
   setIngressHostnameChoiceMutation,
   updateIngressConnectorMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { CloudflareTokenChecklist } from '@/components/domains/CloudflareTokenGuide'
+import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -45,7 +47,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { useEnterSubmit } from '@/hooks/useEnterSubmit'
@@ -543,6 +545,12 @@ export function AddDomain() {
                                   </div>
                                 </label>
                               </Card>
+                              {covering.length === 0 &&
+                                !connectorsQuery.isLoading && (
+                                  <NoTunnelYet
+                                    domain={watchedValues.domain ?? ''}
+                                  />
+                                )}
                             </RadioGroup>
                           </FormControl>
                           <FormMessage />
@@ -719,6 +727,49 @@ export function AddDomain() {
         </div>
       </div>
     </div>
+  )
+}
+
+/**
+ * The tunnel way in, before any tunnel covers the domain: what it needs and
+ * where to set it up, so the choice is not silently missing.
+ */
+function NoTunnelYet({ domain }: { domain: string }) {
+  return (
+    <Card className="border-2 border-dashed">
+      <div className="flex items-start gap-4 p-4">
+        <Cloud className="mt-1 h-5 w-5 text-muted-foreground" />
+        <div className="flex-1 space-y-3">
+          <div className="space-y-1">
+            <div className="font-semibold">Through a Cloudflare Tunnel</div>
+            <p className="text-sm text-muted-foreground">
+              No tunnel covers {domain || 'this domain'} yet. With one, a worker
+              connects out to Cloudflare: no public IP or open port, and
+              Cloudflare serves HTTPS, so there is no certificate to issue here.
+            </p>
+          </div>
+          <div className="space-y-1 text-sm">
+            <p className="font-medium">You need</p>
+            <ul className="list-disc space-y-0.5 pl-5 text-muted-foreground">
+              <li>The domain on Cloudflare (the free plan works)</li>
+              <li>A worker node to run the tunnel</li>
+              <li>A Cloudflare API token with these permissions:</li>
+            </ul>
+          </div>
+          <CloudflareTokenChecklist />
+          <div className="flex flex-wrap items-center gap-3">
+            <Button type="button" size="sm" asChild>
+              <Link to={ingressSetupUrl({ via: 'tunnel' })}>
+                Set up a Cloudflare Tunnel
+              </Link>
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Then add {domain || 'the domain'} again: it is offered here.
+            </span>
+          </div>
+        </div>
+      </div>
+    </Card>
   )
 }
 
