@@ -41,6 +41,10 @@ pub struct SavedJoin {
     /// The subnet of the overlay the agent last applied (its network
     /// snapshot), which marks a network of that subnet as this node's own.
     pub applied_subnet: Option<String>,
+    /// The overlay network name the control plane last sent the agent (its
+    /// network snapshot). Stands in for `overlay_network_name` when the
+    /// saved config lost it.
+    pub applied_overlay_network_name: Option<String>,
     /// SHA-256 fingerprint of the cluster CA the agent pins, when its config
     /// names one that can be read.
     pub ca_fingerprint: Option<String>,
@@ -372,13 +376,21 @@ pub fn assess(facts: &HostFacts, purpose: Purpose<'_>, ports: &[u16]) -> Assessm
         (Some(_), None) | (None, _) => false,
     };
 
-    // The name this node runs: what its join asked for when installing the
-    // service or rejoining, else the default.
-    let preferred = facts
+    // The name this node runs when installing the service or rejoining:
+    // what its join asked for, else what the control plane last sent the
+    // agent, else the default.
+    let own_name = facts
         .saved
         .as_ref()
         .filter(|_| same_cluster)
-        .and_then(|saved| saved.overlay_network_name.clone())
+        .and_then(|saved| {
+            saved
+                .overlay_network_name
+                .clone()
+                .or_else(|| saved.applied_overlay_network_name.clone())
+        });
+    let preferred = own_name
+        .clone()
         .unwrap_or_else(|| DEFAULT_OVERLAY_NETWORK_NAME.to_string());
     // A network of the preferred name is this node's own when this is the
     // same cluster and it carries the subnet the agent last applied.
@@ -410,6 +422,11 @@ pub fn assess(facts: &HostFacts, purpose: Purpose<'_>, ports: &[u16]) -> Assessm
             subnets: network.subnets.clone(),
             chosen,
         });
+    } else if matches!(purpose, Purpose::Join { .. }) {
+        // A re-join keeps the name this node already runs. Registering none
+        // would save a config without it, and the next check would take the
+        // other cluster's `temps0` beside it for this node's own.
+        assessment.overlay_network_name = own_name;
     }
 
     for port in ports {
@@ -500,7 +517,8 @@ pub async fn gather(saved: Option<&temps_agent::AgentConfig>) -> HostFacts {
         control_plane_url: config.control_plane_url.clone(),
         join_url: config.join_url.clone(),
         overlay_network_name: config.overlay_network_name.clone(),
-        applied_subnet: applied_subnet(&config.mesh_key_dir),
+        applied_subnet: applied_alloc(&config.mesh_key_dir, "compute_cidr"),
+        applied_overlay_network_name: applied_alloc(&config.mesh_key_dir, "overlay_network_name"),
         ca_fingerprint: config
             .cluster_ca_path
             .as_deref()
@@ -575,12 +593,13 @@ pub async fn fetch_plane_identity(target: &str) -> Result<PlaneIdentity, String>
         .map_err(|error| format!("the answer from {url} is not a control-plane identity: {error}"))
 }
 
-/// The compute subnet in the agent's last network snapshot.
-fn applied_subnet(mesh_key_dir: &std::path::Path) -> Option<String> {
+/// A field of this node's allocation in the agent's last network snapshot.
+fn applied_alloc(mesh_key_dir: &std::path::Path, field: &str) -> Option<String> {
     let data = std::fs::read(mesh_key_dir.join("network-snapshot.json")).ok()?;
     let snapshot: serde_json::Value = serde_json::from_slice(&data).ok()?;
     snapshot
-        .pointer("/alloc/compute_cidr")?
+        .get("alloc")?
+        .get(field)?
         .as_str()
         .map(str::to_string)
 }
@@ -702,6 +721,7 @@ mod tests {
             join_url: None,
             overlay_network_name: None,
             applied_subnet: None,
+            applied_overlay_network_name: None,
             ca_fingerprint: None,
             control_plane_wg_public_key: None,
         }
@@ -945,6 +965,48 @@ mod tests {
             assess(&facts, join("https://cp.example"), &[]),
             Assessment::default()
         );
+    }
+
+    #[test]
+    fn a_rejoin_registers_the_name_this_node_already_runs() {
+        let mut previous = saved("https://cp.example");
+        previous.overlay_network_name = Some("temps1".into());
+        previous.applied_subnet = Some("10.205.4.0/24".into());
+        let facts = HostFacts {
+            saved: Some(previous),
+            networks: vec![
+                network("temps0", "10.202.0.0/24"),
+                network("temps1", "10.205.4.0/24"),
+            ],
+            ..admin()
+        };
+        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        assert_eq!(assessment.overlay_network_name.as_deref(), Some("temps1"));
+        assert_eq!(assessment.findings, vec![]);
+    }
+
+    #[test]
+    fn a_config_that_lost_the_name_falls_back_to_the_applied_one() {
+        // A re-join before this fix saved no overlay name; the snapshot
+        // still says `temps1`, so `temps0` is the other cluster's.
+        let mut previous = saved("https://cp.example");
+        previous.applied_subnet = Some("10.205.4.0/24".into());
+        previous.applied_overlay_network_name = Some("temps1".into());
+        let facts = HostFacts {
+            saved: Some(previous),
+            networks: vec![
+                network("temps0", "10.202.0.0/24"),
+                network("temps1", "10.205.4.0/24"),
+            ],
+            ..admin()
+        };
+        assert_eq!(
+            assess(&facts, Purpose::ServiceInstall, &[]),
+            Assessment::default()
+        );
+        let rejoin = assess(&facts, join("https://cp.example"), &[]);
+        assert_eq!(rejoin.overlay_network_name.as_deref(), Some("temps1"));
+        assert_eq!(rejoin.findings, vec![]);
     }
 
     #[test]
