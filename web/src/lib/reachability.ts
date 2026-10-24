@@ -7,7 +7,9 @@
 
 import type {
   AddressReachability,
+  Decision,
   EnvironmentReachability,
+  JournalEntry,
   PlanOption,
   ReachabilityPlan,
   RunState,
@@ -93,8 +95,67 @@ export function isActiveRun(state: RunState): boolean {
  */
 export function canUndoRun(run: RunView): boolean {
   if (isActiveRun(run.state) || run.state === 'undone') return false
+  // Undo is paused at a conflict: deciding it carries undo on.
+  if (run.state === 'undo_paused') return false
   if (run.journal?.some((e) => e.state === 'pending')) return false
   return run.created.length > 0
+}
+
+/**
+ * The journal entries waiting for the user's decision (ADR 064 D4): while
+ * going forward every one in conflict; while undo is paused, the ones undo
+ * stopped at (a conflict found before writing has nothing to put back).
+ */
+export function conflictsToDecide(run: RunView): JournalEntry[] {
+  if (run.state !== 'conflict' && run.state !== 'undo_paused') return []
+  return (run.journal ?? []).filter(
+    (e) => e.state === 'conflict' && (run.state === 'conflict' || !e.unwritten)
+  )
+}
+
+/** What a journal entry is about, in a few words. */
+export function conflictSubject(entry: JournalEntry): string {
+  const intent = entry.intent
+  switch (intent.type) {
+    case 'dns_record':
+    case 'dns_change':
+      return `The ${intent.record_type} record for ${intent.hostname}`
+    case 'connector':
+      return `Tunnel ${intent.name}`
+    default:
+      return 'This step'
+  }
+}
+
+export interface ConflictChoice {
+  decision: Decision
+  label: string
+}
+
+/**
+ * The answers to one conflict. Undo never deletes a DNS record this run did
+ * not write, so a created record someone changed can only be left.
+ */
+export function conflictChoices(
+  entry: JournalEntry,
+  undoing: boolean
+): ConflictChoice[] {
+  const type = entry.intent.type
+  if (!undoing)
+    return [
+      { decision: 'keep', label: 'Keep their value' },
+      { decision: 'overwrite', label: 'Let Temps set it' },
+    ]
+  if (type === 'connector')
+    return [
+      { decision: 'keep', label: 'Keep the tunnel' },
+      { decision: 'overwrite', label: 'Remove it anyway' },
+    ]
+  if (type === 'dns_record') return [{ decision: 'keep', label: 'Leave it' }]
+  return [
+    { decision: 'keep', label: 'Keep their value' },
+    { decision: 'overwrite', label: 'Restore what was there before' },
+  ]
 }
 
 /** A waiting or interrupted run carries on from its first unfinished step. */

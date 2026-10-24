@@ -41,6 +41,23 @@ export const CLOUDFLARE_TOKEN_PERMISSIONS = [
 ] as const
 
 /**
+ * What Account · Cloudflare Tunnel · Edit really grants (ADR 064 D8):
+ * Cloudflare has no narrower form of it, so a stored token can change every
+ * tunnel in the account. Shown next to the permission, before the token is
+ * saved.
+ */
+export const TUNNEL_SCOPE_NOTE =
+  "Covers every tunnel in this Cloudflare account, not only the ones Temps creates: if this token leaks, all of them are exposed. If other tunnels live in this account, use a separate Cloudflare account for Temps. When the control plane has a fixed outgoing IP address, you can also limit the token to it with Cloudflare's optional Client IP Address Filtering."
+
+export function TunnelScopeNote({ className }: { className?: string }) {
+  return (
+    <p className={cn('text-xs text-amber-700 dark:text-amber-400', className)}>
+      {TUNNEL_SCOPE_NOTE}
+    </p>
+  )
+}
+
+/**
  * What the token must have, at a glance: one line per permission and
  * resource. `CloudflareTokenGuide` walks through creating it.
  */
@@ -71,6 +88,7 @@ export function CloudflareTokenChecklist({
                   ? 'only if workers take traffic through a Cloudflare Tunnel'
                   : `to ${entry.purpose}`}
               </span>
+              {'tunnelOnly' in entry && <TunnelScopeNote className="w-full" />}
             </li>
           ))}
         </ul>
@@ -155,6 +173,9 @@ export function TokenPermissionList({
               <span className="sr-only">{check.state}</span>
               {check.state !== 'present' && (
                 <span className="text-muted-foreground">{check.detail}</span>
+              )}
+              {check.permission === 'tunnel_edit' && (
+                <TunnelScopeNote className="mt-0.5" />
               )}
             </span>
           </li>
@@ -261,6 +282,7 @@ export function CloudflareTokenGuide({
               {tunnel === 'required'
                 ? ', to create the tunnel and run it on your workers'
                 : ', only if workers will take traffic through a Cloudflare Tunnel'}
+              <TunnelScopeNote className="mt-0.5" />
             </li>
           </ul>
         </li>

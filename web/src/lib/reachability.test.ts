@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import type {
   AddressReachability,
   EnvironmentReachability,
+  JournalEntry,
   RunView,
   SetupField,
 } from '@/api/client'
@@ -12,6 +13,9 @@ import {
   applyValues,
   canResumeRun,
   canUndoRun,
+  conflictChoices,
+  conflictSubject,
+  conflictsToDecide,
   resumeNeedsToken,
   stalePlan,
   certificateChoices,
@@ -327,5 +331,71 @@ describe('certificate choices', () => {
         http01Available: true,
       })
     ).toEqual({ showHttp01: false, recommended: 'dns-01', http01Note: null })
+  })
+})
+
+describe('conflicts (ADR 064 D4)', () => {
+  const entry = (
+    overrides: Partial<JournalEntry> & Pick<JournalEntry, 'intent'>
+  ): JournalEntry => ({
+    key: 'run-1/dns_record/app.example.com/A',
+    state: 'conflict',
+    at: '',
+    conflict: 'A 192.0.2.44 (not set by Temps)',
+    ...overrides,
+  })
+  const record = entry({
+    intent: {
+      type: 'dns_record',
+      hostname: 'app.example.com',
+      label: '',
+      record_type: 'A',
+    },
+  })
+  const tunnel = entry({
+    key: 'run-1/connector/homelab',
+    intent: { type: 'connector', name: 'homelab' },
+    conflict: 'other.example.com',
+  })
+  const view = (state: RunView['state'], journal: JournalEntry[]): RunView => ({
+    id: 1,
+    audience: 'public',
+    created: [],
+    journal,
+    created_at: '',
+    updated_at: '',
+    option: 'direct_managed_dns',
+    state,
+    steps: [],
+    undo: [],
+  })
+
+  test('lists what waits for a decision, and only then', () => {
+    expect(conflictsToDecide(view('conflict', [record]))).toHaveLength(1)
+    expect(conflictsToDecide(view('failed', [record]))).toHaveLength(0)
+    // While undoing, one Temps never wrote is not in the way.
+    expect(
+      conflictsToDecide(view('undo_paused', [{ ...record, unwritten: true }]))
+    ).toHaveLength(0)
+    expect(canUndoRun({ ...view('undo_paused', [tunnel]), created: [] })).toBe(
+      false
+    )
+  })
+
+  test('names the record or tunnel and offers what undo may do', () => {
+    expect(conflictSubject(record)).toBe('The A record for app.example.com')
+    expect(conflictSubject(tunnel)).toBe('Tunnel homelab')
+    expect(conflictChoices(tunnel, true).map((c) => c.label)).toEqual([
+      'Keep the tunnel',
+      'Remove it anyway',
+    ])
+    // A record this run did not write is never deleted by undo.
+    expect(conflictChoices(record, true).map((c) => c.decision)).toEqual([
+      'keep',
+    ])
+    expect(conflictChoices(record, false).map((c) => c.decision)).toEqual([
+      'keep',
+      'overwrite',
+    ])
   })
 })

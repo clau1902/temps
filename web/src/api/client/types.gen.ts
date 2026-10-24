@@ -83320,9 +83320,9 @@ export type AddressReachability = {
     way_in?: string | null;
 };
 
-export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns';
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker';
 
-export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability';
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience';
 
 export type PlanStep = {
     kind: StepKind;
@@ -83487,7 +83487,7 @@ export type ResumeRequest = {
     };
 };
 
-export type RunState = 'running' | 'succeeded' | 'waiting' | 'failed' | 'interrupted' | 'recovering' | 'undoing' | 'undone';
+export type RunState = 'running' | 'succeeded' | 'waiting' | 'failed' | 'interrupted' | 'recovering' | 'conflict' | 'undoing' | 'undo_paused' | 'undone';
 
 export type RunStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 
@@ -83533,10 +83533,51 @@ export type RunResource = {
      * `A` or `AAAA`.
      */
     record_type: string;
+    /**
+     * What the run wrote; undo removes the record only while it still
+     * holds it with this run's marker.
+     */
+    content?: string | null;
     type: 'dns_record';
+} | {
+    hostname: string;
+    label: string;
+    record_type: string;
+    before: DnsRecordState;
+    after: string;
+    type: 'dns_change';
+} | {
+    hostname: string;
+    before: AddressAudience;
+    after: AddressAudience;
+    type: 'address_audience';
 } | {
     domain: string;
     type: 'certificate';
+};
+
+/**
+ * A DNS record as the provider had it when Temps read it (ADR 064 D4).
+ */
+export type DnsRecordState = {
+    provider_id: number;
+    label?: string;
+    record_id?: string | null;
+    record_type: string;
+    content: string;
+    modified_on?: string | null;
+    managed?: boolean;
+    run_id?: number | null;
+};
+
+/**
+ * Who one address is for, with what bounds a private one (ADR 064 D5).
+ */
+export type AddressAudience = {
+    audience: Audience;
+    network_range?: string | null;
+    private_node_id?: number | null;
+    private_listener?: string | null;
 };
 
 /**
@@ -83585,11 +83626,41 @@ export type Intent = {
     record_type: string;
     type: 'dns_record';
 } | {
+    hostname: string;
+    label: string;
+    record_type: string;
+    before: DnsRecordState;
+    after: string;
+    type: 'dns_change';
+} | {
+    hostname: string;
+    before: AddressAudience;
+    after: AddressAudience;
+    type: 'address_audience';
+} | {
     domain: string;
     type: 'certificate';
 };
 
-export type JournalState = 'pending' | 'done' | 'absent';
+export type JournalState = 'pending' | 'done' | 'absent' | 'conflict';
+
+/**
+ * A user's answer to a conflict (ADR 064 D4): `keep` leaves the value
+ * someone else wrote; `overwrite` lets Temps set it (a run) or restore what
+ * was there before (undo).
+ */
+export type Decision = 'keep' | 'overwrite';
+
+/**
+ * `POST …/reachability/runs/{run_id}/decide`.
+ */
+export type DecideRequest = {
+    /**
+     * The journal entry in conflict.
+     */
+    key: string;
+    decision: Decision;
+};
 
 /**
  * One entry of a run's journal.
@@ -83600,6 +83671,25 @@ export type JournalEntry = {
     key: string;
     resource?: null | RunResource;
     state: JournalState;
+    pending_since?: string | null;
+    first_miss_at?: string | null;
+    failed_lookups?: number;
+    next_lookup_at?: string | null;
+    /**
+     * For a `conflict`: what is there now, in words.
+     */
+    conflict?: string | null;
+    decision?: null | Decision;
+    undo_decision?: null | Decision;
+    /**
+     * Undo marked this tunnel `deleting`: it is only ever finished.
+     */
+    deleting?: boolean;
+    tunnel_id?: string | null;
+    /**
+     * A conflict found before the write: Temps wrote nothing.
+     */
+    unwritten?: boolean;
 };
 
 /**
@@ -83965,6 +84055,51 @@ export type ResumeReachabilityRunResponses = {
 };
 
 export type ResumeReachabilityRunResponse = ResumeReachabilityRunResponses[keyof ResumeReachabilityRunResponses];
+
+export type DecideReachabilityConflictData = {
+    body: DecideRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/decide';
+};
+
+export type DecideReachabilityConflictErrors = {
+    /**
+     * That entry is not waiting for a decision
+     */
+    400: unknown;
+    /**
+     * A permission or step-up confirmation is missing
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run is not waiting for a decision
+     */
+    409: unknown;
+};
+
+export type DecideReachabilityConflictResponses = {
+    200: RunView;
+};
+
+export type DecideReachabilityConflictResponse = DecideReachabilityConflictResponses[keyof DecideReachabilityConflictResponses];
 
 export type CheckCloudflareTokenData = {
     body: TokenCheckRequest;

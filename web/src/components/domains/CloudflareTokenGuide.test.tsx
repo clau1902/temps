@@ -7,6 +7,7 @@ import {
   CLOUDFLARE_API_TOKENS_URL,
   CLOUDFLARE_TOKEN_TEMPLATE_URL,
   CloudflareTokenChecklist,
+  CloudflareTokenGuide,
   TokenPermissionList,
 } from './CloudflareTokenGuide'
 
@@ -20,6 +21,17 @@ describe('CloudflareTokenChecklist', () => {
     expect(html).toContain('Account Resources')
     expect(html).toContain('Zone Resources')
     expect(html).toContain(CLOUDFLARE_API_TOKENS_URL)
+  })
+
+  test('says the tunnel permission covers every tunnel in the account', () => {
+    for (const html of [
+      renderToStaticMarkup(<CloudflareTokenChecklist />),
+      renderToStaticMarkup(<CloudflareTokenGuide tunnel="required" />),
+    ]) {
+      expect(html).toContain('Covers every tunnel in this Cloudflare account')
+      expect(html).toContain('use a separate Cloudflare account for Temps')
+      expect(html).toContain('Client IP Address Filtering')
+    }
   })
 
   test('marks the tunnel permission optional where a tunnel is optional', () => {
@@ -89,6 +101,8 @@ describe('TokenPermissionList', () => {
       'Add Zone · DNS · Edit for example.com to the token.'
     )
     expect(html).toContain('Account · Cloudflare Tunnel · Edit')
+    // Said while the token is checked, before it is saved.
+    expect(html).toContain('Covers every tunnel in this Cloudflare account')
     expect(html).not.toContain('Sees example.com.')
   })
 

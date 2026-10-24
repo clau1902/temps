@@ -25,6 +25,7 @@ import { toast } from 'sonner'
 import { z } from 'zod'
 import {
   planEnvironmentReachability,
+  type Decision,
   type PlanOption,
   type ReachabilityPlan,
   type RunStep,
@@ -37,6 +38,7 @@ import {
   getReachabilityRunOptions,
   listDnsProvidersOptions,
   listReachabilityRunsOptions,
+  decideReachabilityConflictMutation,
   resumeReachabilityRunMutation,
   undoReachabilityRunMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -80,6 +82,9 @@ import {
   applyValues,
   canResumeRun,
   canUndoRun,
+  conflictChoices,
+  conflictSubject,
+  conflictsToDecide,
   defaultOption,
   isActiveRun,
   missingAnswers,
@@ -236,6 +241,14 @@ export function MakeReachableDialog({
     },
   })
 
+  const decide = useMutation({
+    ...decideReachabilityConflictMutation(),
+    onSuccess: showRun,
+    onError: (error, variables) => {
+      handleSensitiveActionError(error, () => decide.mutate(variables))
+    },
+  })
+
   const submit = (values: Values) => {
     if (!option) return
     const missing = missingAnswers(fields, values.values)
@@ -336,11 +349,28 @@ export function MakeReachableDialog({
                   },
                 })
               }
+              deciding={decide.isPending}
+              decideError={
+                decide.isError
+                  ? problemDetail(
+                      decide.error,
+                      'Could not save your decision. Try again; nothing was changed.'
+                    )
+                  : null
+              }
+              onDecide={(key, decision) =>
+                run.data &&
+                decide.mutate({
+                  path: { ...path, run_id: run.data.id },
+                  body: { key, decision },
+                })
+              }
               onStartOver={() => {
                 setRunId(null)
                 apply.reset()
                 undo.reset()
                 resumeRun.reset()
+                decide.reset()
               }}
             />
           ) : (
@@ -701,6 +731,9 @@ function RunProgress({
   resuming,
   resumeError,
   onResume,
+  deciding,
+  decideError,
+  onDecide,
   onStartOver,
 }: {
   run: RunView | undefined
@@ -711,6 +744,9 @@ function RunProgress({
   resuming: boolean
   resumeError: string | null
   onResume: (token: string | null) => void
+  deciding: boolean
+  decideError: string | null
+  onDecide: (key: string, decision: Decision) => void
   onStartOver: () => void
 }) {
   // The token, when resuming needs it again; it is never stored before the
@@ -734,6 +770,8 @@ function RunProgress({
   const undoFailed = run.undo.filter((u) => !u.ok)
   const resumable = canResumeRun(run)
   const needsToken = resumable && resumeNeedsToken(run)
+  const conflicts = conflictsToDecide(run)
+  const undoPaused = run.state === 'undo_paused'
   return (
     <div className="space-y-4">
       {run.state === 'recovering' && (
@@ -834,6 +872,52 @@ function RunProgress({
       {undoError && (
         <Alert variant="destructive">
           <AlertDescription>{undoError}</AlertDescription>
+        </Alert>
+      )}
+      {conflicts.length > 0 && (
+        <div className="space-y-3 rounded-md border p-3">
+          <p className="text-sm font-medium">
+            {undoPaused
+              ? 'Undo is waiting for you'
+              : 'Someone else changed something this setup works on'}
+          </p>
+          {conflicts.map((entry) => (
+            <div key={entry.key} className="space-y-2 text-sm">
+              <p>
+                {conflictSubject(entry)}
+                {entry.intent.type === 'connector'
+                  ? ' also publishes '
+                  : ' is now '}
+                <span className="font-medium">
+                  {entry.conflict ?? 'something else'}
+                </span>
+                .{' '}
+                <span className="text-muted-foreground">
+                  Temps leaves it as it is until you decide.
+                </span>
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {conflictChoices(entry, undoPaused).map((choice) => (
+                  <Button
+                    key={choice.decision}
+                    size="sm"
+                    variant={
+                      choice.decision === 'keep' ? 'outline' : 'secondary'
+                    }
+                    disabled={deciding}
+                    onClick={() => onDecide(entry.key, choice.decision)}
+                  >
+                    {choice.label}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {decideError && (
+        <Alert variant="destructive">
+          <AlertDescription>{decideError}</AlertDescription>
         </Alert>
       )}
       {needsToken && (
