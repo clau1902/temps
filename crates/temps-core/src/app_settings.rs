@@ -1203,18 +1203,18 @@ pub struct AgentSandboxSettings {
     /// field; this is the ceiling. `None` = the built-in ceiling (16 cores).
     /// A value above the built-in ceiling has no effect.
     #[serde(default)]
-    #[schema(example = 4.0)]
+    #[schema(example = 4.0, minimum = 0.01)]
     pub max_cpu_limit: Option<f64>,
     /// Highest `memory_limit_mb` a `POST /sandboxes` request may ask for.
     /// `None` = the built-in ceiling (32768 MB). On the control plane the
     /// host's physical memory is an additional ceiling.
     #[serde(default)]
-    #[schema(example = 8192)]
+    #[schema(example = 8192, minimum = 6)]
     pub max_memory_limit_mb: Option<u64>,
     /// Highest `pids_limit` a `POST /sandboxes` request may ask for.
     /// `None` = the built-in ceiling (4096).
     #[serde(default)]
-    #[schema(example = 1024)]
+    #[schema(example = 1024, minimum = 1)]
     pub max_pids_limit: Option<i64>,
     /// Most sandboxes (not destroyed) one user may have created through
     /// `POST /sandboxes` at a time; a create over the cap is refused.
@@ -1223,7 +1223,7 @@ pub struct AgentSandboxSettings {
     /// and are not refused. Sandboxes created before this setting existed
     /// are not counted either.
     #[serde(default)]
-    #[schema(example = 10)]
+    #[schema(example = 10, minimum = 1)]
     pub max_sandboxes_per_user: Option<u32>,
 }
 

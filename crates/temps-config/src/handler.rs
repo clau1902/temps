@@ -938,12 +938,16 @@ pub struct AgentSandboxSettingsMasked {
     pub network_mode: String,
     pub sandbox_backend: String,
     /// Operator ceiling for a sandbox create request's `cpu_limit`; `null` = built-in.
+    #[schema(minimum = 0.01)]
     pub max_cpu_limit: Option<f64>,
     /// Operator ceiling for `memory_limit_mb`; `null` = built-in.
+    #[schema(minimum = 6)]
     pub max_memory_limit_mb: Option<u64>,
     /// Operator ceiling for `pids_limit`; `null` = built-in.
+    #[schema(minimum = 1)]
     pub max_pids_limit: Option<i64>,
     /// Most live sandboxes per user; `null` = unlimited.
+    #[schema(minimum = 1)]
     pub max_sandboxes_per_user: Option<u32>,
 }
 

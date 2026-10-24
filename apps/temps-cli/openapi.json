@@ -1654,6 +1654,7 @@
             "description": "Highest `cpu_limit` (cores) a `POST /sandboxes` request may ask for.\n`cpu_limit` above only sets the default for requests that omit the\nfield; this is the ceiling. `None` = the built-in ceiling (16 cores).\nA value above the built-in ceiling has no effect.",
             "example": 4,
             "format": "double",
+            "minimum": 0.01,
             "type": [
               "number",
               "null"
@@ -1664,7 +1665,7 @@
             "description": "Highest `memory_limit_mb` a `POST /sandboxes` request may ask for.\n`None` = the built-in ceiling (32768 MB). On the control plane the\nhost's physical memory is an additional ceiling.",
             "example": 8192,
             "format": "int64",
-            "minimum": 0,
+            "minimum": 6,
             "type": [
               "integer",
               "null"
@@ -1675,6 +1676,7 @@
             "description": "Highest `pids_limit` a `POST /sandboxes` request may ask for.\n`None` = the built-in ceiling (4096).",
             "example": 1024,
             "format": "int64",
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -1685,7 +1687,7 @@
             "description": "Most sandboxes (not destroyed) one user may have created through\n`POST /sandboxes` at a time; a create over the cap is refused.\n`None` = unlimited. AI application workspaces, agent runs and the\nsandboxes the platform creates for AI chat or autofix do not count\nand are not refused. Sandboxes created before this setting existed\nare not counted either.",
             "example": 10,
             "format": "int32",
-            "minimum": 0,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -1759,6 +1761,7 @@
           "max_cpu_limit": {
             "description": "Operator ceiling for a sandbox create request's `cpu_limit`; `null` = built-in.",
             "format": "double",
+            "minimum": 0.01,
             "type": [
               "number",
               "null"
@@ -1767,7 +1770,7 @@
           "max_memory_limit_mb": {
             "description": "Operator ceiling for `memory_limit_mb`; `null` = built-in.",
             "format": "int64",
-            "minimum": 0,
+            "minimum": 6,
             "type": [
               "integer",
               "null"
@@ -1776,6 +1779,7 @@
           "max_pids_limit": {
             "description": "Operator ceiling for `pids_limit`; `null` = built-in.",
             "format": "int64",
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -1784,7 +1788,7 @@
           "max_sandboxes_per_user": {
             "description": "Most live sandboxes per user; `null` = unlimited.",
             "format": "int32",
-            "minimum": 0,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
