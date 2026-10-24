@@ -130,8 +130,21 @@ never shown as reachable.
   carries a `plan_id` and a fingerprint of everything the plan depends on:
   the environment's addresses and their audiences, the cluster's DNS
   providers and managed zones, the tunnels with their domains,
-  `auto_publish` and hostname choices, and the workers' ingress modes.
-  Plans are stored server-side and expire after 15 minutes.
+  `auto_publish` and hostname choices, the workers' ingress modes, and the
+  current content of every existing DNS record the plan would change (its
+  provider id, type, content and modification time, as read from the
+  provider when planning). Plans are stored server-side and expire after
+  15 minutes.
+- **A DNS record edited after planning is never overwritten.** `apply`
+  re-reads those records as part of the fingerprint check, and each "set
+  DNS" step reads its record again immediately before writing and compares
+  it with the plan; if another user or tool changed it in between, the step
+  writes nothing and the run stops with "`myapp.example.com` was changed in
+  Cloudflare after this plan was made (now `CNAME other.example.net`).
+  Review the new plan." Cloudflare has no conditional update, so a change
+  in the moment between that read and the write can still be lost; the
+  window is one request long, and the overwritten value is kept in the run
+  journal so it can be restored.
 - `POST …/reachability/apply` takes `{plan_id, answers}` and starts a run.
   It recomputes the fingerprint first; if anything changed since the plan
   (another user added a tunnel, a worker's ingress mode changed, a CLI run
@@ -152,11 +165,29 @@ never shown as reachable.
   resource instead of creating a second one.
 - **Incomplete runs are reconciled.** On start-up and every minute, a run
   with a `pending` step older than its timeout is resolved by looking the
-  resource up by its key: found means it is recorded and the run continues
-  or stops as the user asked; not found means the step never happened. Only
-  then may the run be undone or resumed, and the console shows "Recovering
-  an interrupted setup" in the meantime, never a half-finished state as if
-  it were complete.
+  resource up by its key. Found means it is recorded and the run continues
+  or stops as the user asked.
+- **A miss only counts as absence when the lookup can prove it.** A create
+  that timed out may still have succeeded, and some provider listings lag
+  behind writes. So each step kind declares whether its lookup is
+  authoritative for absence, and after how long:
+  - Temps' own rows: authoritative at once (same database, read after the
+    step's transaction has ended).
+  - Provider resources: authoritative only where the provider documents a
+    read-after-write consistent lookup by the key, and only once the create
+    request's own timeout plus a settle delay has passed, confirmed by two
+    misses at least that delay apart. Which Cloudflare lookups (DNS records
+    by name and type, tunnels by name) qualify is confirmed during
+    implementation and recorded with the step kind.
+  - Anything else: a miss is ambiguous. The step stays `pending`, the lookup
+    is retried with backoff, and the create is never repeated while the
+    result is ambiguous.
+
+  Only a resolved step lets the run be undone or resumed. Until then the
+  console shows "Recovering an interrupted setup" and which step it is
+  waiting on, never a half-finished state as if it were complete; a step
+  still ambiguous after an hour is shown with the resource to check by hand
+  ("Check whether tunnel `temps-homelab-1a2b3c4d` exists in Cloudflare").
 - **Undo** removes exactly what the journal recorded as created, newest
   first, found by the same keys, and never anything the run found already
   there.
@@ -284,6 +315,17 @@ and the flow step, so adding it is not a redesign.
   filled in: Zone · Zone · Read, Zone · DNS · Edit, Account · Cloudflare
   Tunnel · Edit. The user limits the token to one account and **one zone**,
   the one this address is in, creates it and pastes it.
+- **The zone limit covers DNS, not tunnels.** Cloudflare Tunnel · Edit is an
+  account-level permission with no narrower form for managing tunnels, and
+  Temps needs it after setup too (publishing hostnames, rotating a tunnel's
+  secret when a worker leaves, ADR 058). A stored token can therefore
+  create, change and delete every tunnel in that account. The checklist
+  says so next to the permission ("covers every tunnel in this Cloudflare
+  account"), suggests a separate Cloudflare account for Temps when other
+  tunnels live in it, and offers Cloudflare's optional client IP filter
+  for the token when the control plane has a stable egress address. Temps
+  itself only ever acts on tunnels it created (reused by stored id, never
+  adopted by name, ADR 058).
 - **A token reaching other zones is refused in this flow.** Temps lists the
   zones the pasted token can reach; if it reaches any zone other than the
   chosen one, the token is not saved and the message names the extra zones
@@ -349,8 +391,10 @@ the move is refused with the same message, naming the rule.
   audited.
 - A token is checked before anything is created, with calls that cannot
   create anything (D8), and one that reaches zones beyond the chosen one is
-  not stored by this flow, which keeps the blast radius of a stored token to
-  the zone it serves.
+  not stored by this flow. That limits its **DNS** reach to the zone it
+  serves. Its tunnel permission is account-wide (D8): if the stored token
+  leaks, every tunnel in that Cloudflare account is exposed, which the
+  console states before the token is saved.
 - `apply` acts only on a current plan (D4), so a stale or replayed request
   cannot create resources the user did not see.
 
