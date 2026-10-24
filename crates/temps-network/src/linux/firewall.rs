@@ -1117,23 +1117,33 @@ async fn iptables_output(op: &'static str, args: &[&str]) -> crate::Result<std::
 /// Set of the peers' underlay addresses that may send this node VXLAN.
 const VXLAN_PEERS_SET: &str = "vxlan_peers";
 
-/// The input rules that admit VXLAN only from known peers.
+/// The input rules that admit VXLAN for this overlay only from known peers.
 ///
 /// The kernel binds the VXLAN UDP socket to the wildcard address even when
 /// the device has a `local` address, and decapsulates a packet sent to any of
 /// the host's addresses — its public one included — onto the overlay bridge
 /// without looking at the sender. So this allowlist is the only thing that
-/// keeps the overlay closed: a frame on the VXLAN port is accepted only to
-/// this node's underlay address from a peer's underlay address, and every
-/// other packet to the port is dropped, whatever interface or address it
-/// arrives on. The VNI is no secret (and is guessable in any case), so it is
-/// not relied on.
+/// keeps the overlay closed: a frame is accepted only to this node's
+/// underlay address from a peer's underlay address, and only when it arrived
+/// on the interface this node routes that peer through (`fib saddr . iif`, a
+/// reverse-path check scoped to the VXLAN port), so a peer's address forged
+/// from another network — the public one — is not believed. Every other frame
+/// for this overlay's VNI is dropped, whatever interface or address it
+/// arrives on.
 ///
-/// On the WireGuard mesh the accept is also pinned to the tunnel, where the
-/// peer's source address is authenticated. A LAN underlay is not pinned to
-/// its device: peer VXLAN may legitimately arrive on another one (e.g. a VLAN
-/// sub-interface beside the configured parent), and dropping it there would
-/// cut the overlay.
+/// The reverse-path check rather than a fixed device keeps a LAN underlay
+/// whose peers arrive on another device than the configured parent (e.g. a
+/// VLAN sub-interface) working. On the WireGuard mesh the accept is also
+/// pinned to the tunnel, where the peer's source address is authenticated.
+/// On a LAN underlay nothing authenticates it: a host on the underlay network
+/// itself can still forge a peer's address, which only the mesh prevents.
+///
+/// The drop matches this overlay's VNI (the 24 bits after the 32 bits of
+/// VXLAN flags, past the 8-byte UDP header) rather than the whole port, so
+/// other VXLAN users of the same port on this host — e.g. a Docker Swarm
+/// overlay — keep working: their frames are never delivered to this
+/// overlay's device, so they are theirs to filter. The VNI is not relied on
+/// as a secret.
 ///
 /// Peers are a set rather than a rule each, so the per-packet cost does not
 /// grow with the cluster. Peers of the other address family are left out:
@@ -1142,6 +1152,7 @@ fn render_vxlan_ingress(
     config: &NetworkConfig,
     alloc: &NodeAlloc,
     peers: &[Peer],
+    vni: u32,
     port: u16,
 ) -> String {
     let underlay_device = &config.underlay_dev;
@@ -1176,10 +1187,10 @@ fn render_vxlan_ingress(
         String::new()
     };
     rules.push_str(&format!(
-        "add rule inet {TABLE} input {device}{family} daddr {local} {family} saddr @{VXLAN_PEERS_SET} udp dport {port} accept\n"
+        "add rule inet {TABLE} input {device}{family} daddr {local} {family} saddr @{VXLAN_PEERS_SET} udp dport {port} fib saddr . iif oif exists accept\n"
     ));
     rules.push_str(&format!(
-        "add rule inet {TABLE} input udp dport {port} counter drop\n"
+        "add rule inet {TABLE} input udp dport {port} @th,96,24 {vni} counter drop\n"
     ));
     rules
 }
@@ -1188,7 +1199,7 @@ fn render_baseline(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) ->
     let bridge = &config.bridge_name;
     let cidr = alloc.compute_cidr;
     let vxlan_ingress = match config.transport {
-        Transport::Vxlan { port, .. } => render_vxlan_ingress(config, alloc, peers, port),
+        Transport::Vxlan { vni, port } => render_vxlan_ingress(config, alloc, peers, vni, port),
         Transport::Native => String::new(),
     };
     // A service may already be attached to `temps-app-network` before it is
@@ -1244,7 +1255,7 @@ add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masque
 }
 
 fn baseline_marker(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) -> String {
-    const BASELINE_SCHEMA_VERSION: &str = "v6";
+    const BASELINE_SCHEMA_VERSION: &str = "v7";
 
     let mut peers = peers.to_vec();
     peers.sort_by_key(|peer| (peer.compute_cidr, peer.underlay_address, peer.node_id));
@@ -1378,11 +1389,11 @@ mod tests {
             .expect("peer in the set");
         let allow = script
             .find(
-                "add rule inet temps_network input ip daddr 10.0.0.1 ip saddr @vxlan_peers udp dport 4789 accept",
+                "add rule inet temps_network input ip daddr 10.0.0.1 ip saddr @vxlan_peers udp dport 4789 fib saddr . iif oif exists accept",
             )
             .expect("known peer allow rule");
         let drop = script
-            .find("add rule inet temps_network input udp dport 4789 counter drop")
+            .find("add rule inet temps_network input udp dport 4789 @th,96,24 42 counter drop")
             .expect("drop rule for everything else on the VXLAN port");
         assert!(set < element && element < allow && allow < drop);
         assert!(script.contains(&marker));
@@ -1406,7 +1417,7 @@ mod tests {
             .collect();
         assert_eq!(
             drops,
-            vec!["add rule inet temps_network input udp dport 4789 counter drop"]
+            vec!["add rule inet temps_network input udp dport 4789 @th,96,24 42 counter drop"]
         );
         // The one accept is qualified by this node's address and the peers.
         let accepts: Vec<&str> = script
@@ -1416,7 +1427,7 @@ mod tests {
         assert_eq!(
             accepts,
             vec![
-                "add rule inet temps_network input ip daddr 10.0.0.1 ip saddr @vxlan_peers udp dport 4789 accept"
+                "add rule inet temps_network input ip daddr 10.0.0.1 ip saddr @vxlan_peers udp dport 4789 fib saddr . iif oif exists accept"
             ]
         );
     }
@@ -1430,7 +1441,9 @@ mod tests {
         // syntax error, so it must not be rendered.
         assert!(script.contains("add set inet temps_network vxlan_peers { type ipv4_addr; }"));
         assert!(!script.contains("add element"));
-        assert!(script.contains("add rule inet temps_network input udp dport 4789 counter drop"));
+        assert!(script.contains(
+            "add rule inet temps_network input udp dport 4789 @th,96,24 42 counter drop"
+        ));
     }
 
     #[test]
@@ -1463,9 +1476,11 @@ mod tests {
         assert!(script.contains("add set inet temps_network vxlan_peers { type ipv6_addr; }"));
         assert!(script.contains("add element inet temps_network vxlan_peers { fd00::2 }"));
         assert!(
-            script.contains("input ip6 daddr fd00::1 ip6 saddr @vxlan_peers udp dport 4789 accept")
+            script.contains("input ip6 daddr fd00::1 ip6 saddr @vxlan_peers udp dport 4789 fib saddr . iif oif exists accept")
         );
-        assert!(script.contains("add rule inet temps_network input udp dport 4789 counter drop"));
+        assert!(script.contains(
+            "add rule inet temps_network input udp dport 4789 @th,96,24 42 counter drop"
+        ));
     }
 
     #[test]
@@ -1480,12 +1495,60 @@ mod tests {
         let peer = vxlan_peer(6, IpAddr::V4(Ipv4Addr::new(10, 201, 0, 3)));
         let script = render_baseline(&cfg, &alloc, &[peer]);
         let allow = script
-            .find("input iifname \"temps-wg0\" ip daddr 10.201.0.2 ip saddr @vxlan_peers udp dport 4789 accept")
+            .find("input iifname \"temps-wg0\" ip daddr 10.201.0.2 ip saddr @vxlan_peers udp dport 4789 fib saddr . iif oif exists accept")
             .expect("peer allow rule inside the tunnel");
         let drop = script
-            .find("input udp dport 4789 counter drop")
+            .find("input udp dport 4789 @th,96,24 42 counter drop")
             .expect("drop rule for VXLAN outside the tunnel");
         assert!(allow < drop);
+    }
+
+    #[test]
+    fn only_this_overlays_vni_is_dropped() {
+        // Other VXLAN users of the port (e.g. a Docker Swarm overlay) carry
+        // other VNIs; their frames never reach this overlay's device, so the
+        // drop leaves them alone.
+        let cfg = NetworkConfig {
+            transport: Transport::Vxlan {
+                vni: 4242,
+                port: 8472,
+            },
+            ..NetworkConfig::default()
+        };
+        let alloc = vxlan_alloc(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let script = render_baseline(&cfg, &alloc, &[]);
+        let drops: Vec<&str> = script
+            .lines()
+            .filter(|line| line.contains("udp dport") && line.ends_with("drop"))
+            .collect();
+        assert_eq!(
+            drops,
+            vec!["add rule inet temps_network input udp dport 8472 @th,96,24 4242 counter drop"]
+        );
+    }
+
+    #[test]
+    fn a_peer_address_is_believed_only_on_its_route() {
+        // The accept carries a reverse-path check on every underlay, so a
+        // peer's address forged from another network (the public one) falls
+        // through to the drop.
+        let peer = vxlan_peer(6, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        for underlay_dev in ["eth1.100", "temps-wg0"] {
+            let cfg = NetworkConfig {
+                underlay_dev: underlay_dev.into(),
+                ..NetworkConfig::default()
+            };
+            let alloc = vxlan_alloc(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+            let script = render_baseline(&cfg, &alloc, std::slice::from_ref(&peer));
+            let accept = script
+                .lines()
+                .find(|line| line.contains("udp dport 4789") && line.ends_with("accept"))
+                .expect("peer accept rule");
+            assert!(
+                accept.ends_with("udp dport 4789 fib saddr . iif oif exists accept"),
+                "{underlay_dev}: {accept}"
+            );
+        }
     }
 
     #[test]
@@ -1866,7 +1929,7 @@ mod tests {
             baseline_marker(&cfg, &alloc, &[a.clone(), b.clone()]),
             baseline_marker(&cfg, &alloc, &[b, a])
         );
-        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v6-"));
+        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v7-"));
     }
 
     #[test]

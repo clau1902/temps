@@ -65,7 +65,7 @@ pub struct SetupMultiNodeCommand {
     #[arg(long, env = "TEMPS_PRIVATE_ADDRESS")]
     pub private_address: Option<String>,
 
-    /// Interface carrying the private address (for example enp6s0.4000 or
+    /// Interface carrying the private address (for example eth1.100 or
     /// wg0). Normally detected from the address.
     #[arg(long, env = "TEMPS_UNDERLAY_DEV")]
     pub underlay_dev: Option<String>,
