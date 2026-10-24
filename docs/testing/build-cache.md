@@ -63,7 +63,9 @@ Never commit credentials. Keep them in your shell profile or a secrets manager.
 
 The `sccache` server reads its environment once, when it starts. After you change
 any `SCCACHE_*` or `AWS_*` variable, run `sccache --stop-server` and then
-`sccache --start-server` (or just rebuild) so the new values take effect.
+`sccache --start-server` so the new values take effect. If no server is running,
+a build starts one on demand, but a build never reloads the settings of a server
+that is already running.
 
 If the bucket is unreachable, check `sccache --show-stats` and your network first:
 we have not tested how the installed `sccache` version behaves in that case, and
@@ -112,9 +114,15 @@ inputs. Machines only share entries when these match:
 
 ### Running agents in parallel
 
-Give each agent its own `CARGO_TARGET_DIR` (or its own worktree) so builds do not
-contend on one `target/` lock, and point all of them at the same `sccache` bucket.
-Then a dependency compiled by one agent is a cache hit for the rest.
+Give each agent its own `CARGO_TARGET_DIR` so builds do not contend on one
+`target/` lock, and point all of them at the same `sccache` bucket.
+
+For a dependency compiled by one agent to be a cache hit for the others, the agents
+must build from the same absolute checkout path (see "Making hits work across
+machines"). Run each agent in its own container or sandbox with the checkout mounted
+at the same path, such as `/workspace`. Separate git worktrees on one host have
+different absolute paths, so hits between them are not guaranteed; they depend on
+path normalization that we have not verified for Rust builds.
 
 ### Housekeeping
 
