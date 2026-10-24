@@ -12413,6 +12413,7 @@ dependencies = [
  "temps-deployer",
  "temps-dns-resolver",
  "temps-external-plugins",
+ "temps-metrics",
  "temps-network",
  "temps-providers",
  "temps-runtime-health",

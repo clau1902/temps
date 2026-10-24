@@ -2,26 +2,36 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * ServerMonitoring — resource usage of the machine running the control plane.
+ * ServerMonitoring — resource usage of the machines running Temps: the
+ * control plane, and each worker once it has joined (ADR 061).
  *
  * Route: /monitoring/server (standalone Server page).
  *
  * Six panels, in the shape of the Proxy page: CPU, memory and disk usage
  * (current value + progress bar + history), Docker disk usage (docker system
  * df by images / containers / volumes / build cache), block I/O and network
- * I/O. Everything comes from `GET /nodes/0/metrics*` (the node sampler in
- * the proxy process) and `GET /nodes/0/docker-disk-usage`, through the
- * generated SDK bindings.
+ * I/O. Everything comes from `GET /nodes/{id}/metrics*` (the node sampler in
+ * the proxy process for node 0, pulled from the agent for a worker), the
+ * combined `GET /nodes/metrics/cluster*` for "All nodes", and
+ * `GET /nodes/0/docker-disk-usage`, through the generated SDK bindings.
  */
 
 import { HelpPopover } from '@temps-sdk/ds'
 
 import { PageHeader } from '@temps-sdk/ds'
+import { nodeDockerDiskUsageGetOptions } from '@/api/client/@tanstack/react-query.gen'
 import {
-  nodeDockerDiskUsageGetOptions,
-  nodeMetricsGetLatestOptions,
-  nodeMetricsGetRangeOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+  NodeReportingNotice,
+  NodeScopeSelect,
+} from '@/components/monitoring/NodeScopeSelect'
+import { useMetricNodeScope } from '@/hooks/useMetricNodeScope'
+import {
+  isControlPlaneOnly,
+  nodeLatestQuery,
+  nodeRangeQuery,
+  scopeSubject,
+  type NodeScope,
+} from '@/lib/node-scope'
 import type { MetricDataPoint } from '@/api/client/types.gen'
 import {
   ThresholdLineChart,
@@ -81,7 +91,7 @@ import {
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, Pause, Play, RefreshCw, Settings } from 'lucide-react'
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router'
 
 const METRICS_SETTINGS_PATH = '/settings/metrics-monitoring'
@@ -108,13 +118,11 @@ function useNodeSeries(
   metric: string,
   range: ProxyRangePreset,
   refetchInterval: number | false,
-  enabled: boolean
+  enabled: boolean,
+  scope: NodeScope
 ) {
   return useQuery({
-    ...nodeMetricsGetRangeOptions({
-      path: { id: CONTROL_PLANE_NODE_ID },
-      query: { metric, range },
-    }),
+    ...nodeRangeQuery(scope, { metric, range }),
     staleTime: 15_000,
     refetchInterval: pollInterval(refetchInterval),
     retry: false,
@@ -501,38 +509,49 @@ export function ServerMonitoring() {
   // Node metrics need settings:read, which only instance administrators
   // hold. Other roles get one explanation below and send no metric requests.
   const canReadNodeMetrics = useIsInstanceAdmin()
+  // ADR 061: one node, or all of them. Hidden with only the control plane.
+  const nodes = useMetricNodeScope(canReadNodeMetrics)
+  const scope = nodes.scope
+  const metricsEnabled = canReadNodeMetrics && nodes.ready
+  const controlPlaneOnly = isControlPlaneOnly(scope)
   // A control-plane-profile install has no Docker daemon by design (its
   // workloads run on worker nodes), so `docker system df` can only fail
   // there. Wait for the capability so that request is never sent, but fail
   // open: an unreadable capability still shows the card.
   const capability = useNodeCapability()
+  // Docker disk usage is only read from the control plane's own daemon.
   const showDockerDiskUsage =
-    !capability.isPending && capability.data?.local_workloads !== false
+    controlPlaneOnly &&
+    !capability.isPending &&
+    capability.data?.local_workloads !== false
 
   const latest = useQuery({
-    ...nodeMetricsGetLatestOptions({ path: { id: CONTROL_PLANE_NODE_ID } }),
+    ...nodeLatestQuery(scope),
     staleTime: 15_000,
     refetchInterval: pollInterval(refetchInterval),
     retry: false,
-    enabled: canReadNodeMetrics,
+    enabled: metricsEnabled,
   })
   const cpu = useNodeSeries(
     'node.cpu_percent',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   const memory = useNodeSeries(
     'node.memory_percent',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   const disk = useNodeSeries(
     'node.disk_used_bytes',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   // The projection always reads the longest window: extrapolating a fill
   // date from the last hour turns one image pull into "full in 3 days".
@@ -540,31 +559,36 @@ export function ServerMonitoring() {
     'node.disk_used_bytes',
     '7d',
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   const rx = useNodeSeries(
     'node.network_rx_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   const tx = useNodeSeries(
     'node.network_tx_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   const read = useNodeSeries(
     'node.disk_read_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   const write = useNodeSeries(
     'node.disk_write_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
 
   const snapshot = (latest.data ?? {}) as Record<string, number>
@@ -653,6 +677,16 @@ export function ServerMonitoring() {
       current: [cpuNow, memPct, diskPct],
     })
 
+  const subject = hostSubject(scope, nodes.options)
+  const nodeSelect =
+    nodes.options.length > 1 ? (
+      <NodeScopeSelect
+        options={nodes.options}
+        scope={scope}
+        onChange={nodes.setScope}
+      />
+    ) : null
+
   const bucketCaption = `${step >= 3600 ? `${step / 3600} h` : `${step / 60} min`} buckets · last ${range} · kept ${retentionDays} days`
   const seriesError = (q: { isError: boolean }) =>
     q.isError ? 'Failed to load node metrics' : null
@@ -676,6 +710,8 @@ export function ServerMonitoring() {
           ageSeconds={null}
           paused={paused}
           onTogglePause={() => setPaused((p) => !p)}
+          subject={subject}
+          nodeSelect={nodeSelect}
         />
         <Card className="shadow-none">
           <CardHeader>
@@ -713,9 +749,17 @@ export function ServerMonitoring() {
         ageSeconds={ageSeconds}
         paused={paused}
         onTogglePause={() => setPaused((p) => !p)}
+        subject={subject}
+        nodeSelect={nodeSelect}
       />
 
-      {firstError && (
+      <NodeReportingNotice
+        scope={scope}
+        options={nodes.options}
+        statuses={nodes.statuses}
+      />
+
+      {firstError != null && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Could not read node metrics</AlertTitle>
@@ -736,10 +780,21 @@ export function ServerMonitoring() {
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>No sample for {formatAge(ageSeconds)}</AlertTitle>
           <AlertDescription>
-            The node sampler runs inside the proxy process and writes one sample
-            every {formatAge(scrapeInterval)}. Check that{' '}
-            <code>temps serve</code> is running and that the metrics store
-            accepts writes. The values below are the last ones that arrived.
+            {controlPlaneOnly || scope.kind === 'all' ? (
+              <>
+                The node sampler runs inside the proxy process and writes one
+                sample every {formatAge(scrapeInterval)}. Check that{' '}
+                <code>temps serve</code> is running and that the metrics store
+                accepts writes.
+              </>
+            ) : (
+              <>
+                The control plane pulls this node’s metrics from its agent every{' '}
+                {formatAge(scrapeInterval)}. Check that the agent is running and
+                reachable from the control plane.
+              </>
+            )}{' '}
+            The values below are the last ones that arrived.
           </AlertDescription>
         </Alert>
       )}
@@ -757,7 +812,11 @@ export function ServerMonitoring() {
           <>
             <UsageCard
               title="CPU usage"
-              description="All cores of the control-plane host"
+              description={
+                scope.kind === 'all'
+                  ? 'Mean across nodes of each one’s share of all its cores'
+                  : `All cores of ${subject}`
+              }
               percent={cpuNow}
               absolute={null}
               thresholds={CPU_THRESHOLDS}
@@ -890,6 +949,16 @@ export function ServerMonitoring() {
   )
 }
 
+/** "the control-plane host", a worker's name, or "every node". */
+function hostSubject(
+  scope: NodeScope,
+  options: Parameters<typeof scopeSubject>[1]
+): string {
+  if (scope.kind === 'all') return 'every node'
+  if (scope.id === CONTROL_PLANE_NODE_ID) return 'the control-plane host'
+  return scopeSubject(scope, options)
+}
+
 function SectionIntro({
   range,
   onRange,
@@ -897,6 +966,8 @@ function SectionIntro({
   ageSeconds,
   paused,
   onTogglePause,
+  subject,
+  nodeSelect,
 }: {
   range: ProxyRangePreset
   onRange: (r: ProxyRangePreset) => void
@@ -904,6 +975,8 @@ function SectionIntro({
   ageSeconds: number | null
   paused: boolean
   onTogglePause: () => void
+  subject: string
+  nodeSelect: ReactNode
 }) {
   return (
     <PageHeader
@@ -918,9 +991,8 @@ function SectionIntro({
                 : 'Waiting for a sample'}
             <HelpPopover label="About server metrics">
               <p>
-                Resource usage of the control-plane host. Samples are collected
-                every {formatAge(scrapeInterval)} and refreshed every 30
-                seconds.
+                Resource usage of {subject}. Samples are collected every{' '}
+                {formatAge(scrapeInterval)} and refreshed every 30 seconds.
               </p>
               <p>
                 Hover or focus a chart and use the arrow keys to compare every
@@ -942,6 +1014,7 @@ function SectionIntro({
             )}
             {paused ? 'Resume' : 'Pause'}
           </Button>
+          {nodeSelect && <div className="mr-2">{nodeSelect}</div>}
           {PROXY_RANGE_PRESETS.map((opt) => (
             <Button
               key={opt.value}

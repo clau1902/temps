@@ -5009,6 +5009,43 @@ export type ClusterMemberRequest = {
 };
 
 /**
+ * Nodes to combine for the latest values.
+ */
+export type ClusterMetricsLatestQuery = {
+    /**
+     * Comma-separated node ids (`0` = control plane), at most 64.
+     */
+    node_ids: string;
+};
+
+/**
+ * Query for one metric combined across several nodes.
+ */
+export type ClusterMetricsRangeQuery = {
+    /**
+     * Explicit window end (ISO 8601). Must be paired with `start_time`.
+     */
+    end_time?: string | null;
+    /**
+     * Metric name, e.g. `"proxy.requests"`.
+     */
+    metric: string;
+    /**
+     * Comma-separated node ids (`0` = control plane), at most 64.
+     */
+    node_ids: string;
+    /**
+     * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     * Ignored when `start_time` and `end_time` are both set.
+     */
+    range?: string;
+    /**
+     * Explicit window start (ISO 8601). Must be paired with `end_time`.
+     */
+    start_time?: string | null;
+};
+
+/**
  * `PUT /settings/cluster-network` answer.
  */
 export type ClusterNetworkChangeResponse = {
@@ -18761,6 +18798,29 @@ export type NodeInfoResponse = {
 export type NodeListResponse = {
     nodes: Array<NodeInfoResponse>;
     total: number;
+};
+
+/**
+ * Whether a worker is reporting metrics to the control plane.
+ */
+export type NodeMetricsReportingStatus = {
+    /**
+     * What went wrong, when `state` is not `reporting`.
+     */
+    detail?: string | null;
+    /**
+     * ISO 8601, when the control plane last pulled.
+     */
+    last_attempt_at: string;
+    /**
+     * ISO 8601, when a report from the node was last stored.
+     */
+    last_report_at?: string | null;
+    node_id: number;
+    /**
+     * `reporting`, `agent_too_old`, `unreachable`, `rejected` or `invalid`.
+     */
+    state: string;
 };
 
 export type NodePairingListResponse = {
@@ -56055,6 +56115,128 @@ export type WireguardMeshHubSetResponses = {
 };
 
 export type WireguardMeshHubSetResponse = WireguardMeshHubSetResponses[keyof WireguardMeshHubSetResponses];
+
+export type NodeMetricsGetClusterRangeData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Metric name, e.g. `"proxy.requests"`.
+         */
+        metric: string;
+        /**
+         * Comma-separated node ids (`0` = control plane), at most 64.
+         */
+        node_ids: string;
+        /**
+         * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
+         */
+        range?: string;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
+    };
+    url: '/nodes/metrics/cluster';
+};
+
+export type NodeMetricsGetClusterRangeErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetClusterRangeResponses = {
+    /**
+     * Combined metric time series
+     */
+    200: Array<MetricDataPoint>;
+};
+
+export type NodeMetricsGetClusterRangeResponse = NodeMetricsGetClusterRangeResponses[keyof NodeMetricsGetClusterRangeResponses];
+
+export type NodeMetricsGetClusterLatestData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Comma-separated node ids (`0` = control plane), at most 64.
+         */
+        node_ids: string;
+    };
+    url: '/nodes/metrics/cluster/latest';
+};
+
+export type NodeMetricsGetClusterLatestErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetClusterLatestResponses = {
+    /**
+     * Map of metric name to combined latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type NodeMetricsGetClusterLatestResponse = NodeMetricsGetClusterLatestResponses[keyof NodeMetricsGetClusterLatestResponses];
+
+export type NodeMetricsGetReportingData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/metrics/reporting';
+};
+
+export type NodeMetricsGetReportingErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+};
+
+export type NodeMetricsGetReportingResponses = {
+    /**
+     * Reporting status per worker
+     */
+    200: Array<NodeMetricsReportingStatus>;
+};
+
+export type NodeMetricsGetReportingResponse = NodeMetricsGetReportingResponses[keyof NodeMetricsGetReportingResponses];
 
 export type NodeMetricsGetRangeData = {
     body?: never;

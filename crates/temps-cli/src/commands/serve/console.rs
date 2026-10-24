@@ -4740,6 +4740,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // can retrieve it for HTTP query endpoints.
                     service_context.register_service(metrics_store.clone());
 
+                    // ADR 061: pull each worker's edge-proxy and host metrics
+                    // into the same store, under the worker's node id. The
+                    // board is what the console reads to explain a worker
+                    // with no data (e.g. an agent too old to report).
+                    let worker_metrics_status =
+                        Arc::new(temps_metrics::WorkerMetricsStatusBoard::new());
+                    service_context.register_service(worker_metrics_status.clone());
+                    let worker_metrics = temps_deployments::services::worker_metrics_collector::WorkerMetricsCollector::new(
+                        db.clone(),
+                        metrics_store.clone(),
+                        cfg_svc.clone(),
+                        enc_svc.clone(),
+                        worker_metrics_status,
+                    );
+                    tokio::spawn(worker_metrics.run());
+
                     let mut scraper =
                         MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc);
                     // HA clusters are scraped at their elected primary, which

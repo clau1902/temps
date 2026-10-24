@@ -26,6 +26,7 @@ mod runtime_health;
 pub mod sandbox_handlers;
 pub mod server;
 pub mod service_handlers;
+pub mod worker_metrics;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

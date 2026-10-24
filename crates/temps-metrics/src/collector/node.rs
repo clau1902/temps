@@ -110,6 +110,33 @@ impl NodeMetricsScope {
     }
 }
 
+/// Every series [`NodeMetricsScope::Host`] can emit, on any platform.
+///
+/// This is the closed set a worker may report for its host (ADR 061): the
+/// control plane stores a worker-reported host point only when its name is in
+/// this list, so a worker cannot make the control plane create a series this
+/// collector would never have written. A test keeps it in step with the
+/// collector.
+pub const HOST_METRIC_NAMES: &[&str] = &[
+    "node.cpu_percent",
+    "node.memory_used_bytes",
+    "node.memory_total_bytes",
+    "node.memory_percent",
+    "node.load_avg_1m",
+    "node.load_avg_5m",
+    "node.load_avg_15m",
+    "node.disk_used_bytes",
+    "node.disk_total_bytes",
+    "node.disk_percent",
+    "node.fd_allocated",
+    "node.fd_max",
+    "node.fd_percent",
+    "node.disk_read_bytes_total",
+    "node.disk_write_bytes_total",
+    "node.network_rx_bytes_total",
+    "node.network_tx_bytes_total",
+];
+
 /// Node metric collector.
 ///
 /// Holds CPU baseline state across calls inside a `Mutex` so the collector can
@@ -1480,5 +1507,31 @@ docker0: 777 7 0 0 0 0 0 0 888 8 0 0 0 0 0 0
         assert!(names.contains(&"node.memory_used_bytes"), "{names:?}");
         assert!(names.contains(&"node.memory_total_bytes"), "{names:?}");
         assert!(names.contains(&"node.cpu_percent"), "{names:?}");
+    }
+
+    /// A worker reports its host with this collector in host scope, and the
+    /// control plane accepts only `HOST_METRIC_NAMES`. Anything the collector
+    /// emits outside that list would be silently refused for every worker.
+    #[tokio::test]
+    async fn host_scope_emits_only_names_a_worker_may_report() {
+        let collector = NodeMetricsCollector::with_scope(NodeMetricsScope::Host);
+        let config = make_config(1, "/tmp");
+        // Two passes: the first primes the CPU baseline, the second carries
+        // `node.cpu_percent`.
+        let _ = collector.collect(&config).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let points = collector.collect(&config).await.unwrap();
+        assert!(!points.is_empty());
+        for p in &points {
+            assert!(
+                HOST_METRIC_NAMES.contains(&p.name.as_str()),
+                "host scope emitted {} which a worker could not report",
+                p.name
+            );
+        }
+        // And the list holds nothing process-scoped.
+        assert!(HOST_METRIC_NAMES
+            .iter()
+            .all(|name| !name.starts_with("node.process_")));
     }
 }

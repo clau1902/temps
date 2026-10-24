@@ -64,6 +64,7 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::route_store::{RouteEntry, SharedRouteStore};
+use crate::worker_metrics::RequestRecorder;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PublicTlsSni(pub String);
@@ -418,6 +419,9 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
             Some(entry) => entry,
             None => return error_body(StatusCode::NOT_FOUND, "no public route for this host"),
         };
+        if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
+            recorder.mark_project();
+        }
         if entry.backends.is_empty() {
             return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
         }
@@ -597,7 +601,11 @@ fn public_router_with(
         acme,
         acme_relay: Arc::new(AcmeRelayState::new()),
     });
-    Ok(axum::Router::new().fallback(handle).with_state(state))
+    // ADR 061: public edge traffic is counted like the control plane's proxy.
+    Ok(crate::worker_metrics::recorded(
+        axum::Router::new().fallback(handle).with_state(state),
+        crate::worker_metrics::proxy_metrics(),
+    ))
 }
 
 async fn proxy_acme_challenge(state: &ProxyState, host: &str, req: Request) -> Response {
@@ -975,6 +983,9 @@ async fn proxy_upgrade(
         .extensions()
         .get::<PublicConnectionPermit>()
         .map(|permit| Arc::clone(&permit.0));
+    // Held by the tunnel task, so the session is recorded when it ends.
+    let recorder = req.extensions().get::<RequestRecorder>().cloned();
+    let dialled = Instant::now();
     let original_host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
@@ -1117,6 +1128,9 @@ async fn proxy_upgrade(
             return error_body(StatusCode::BAD_GATEWAY, "upstream malformed");
         }
     };
+    if let Some(recorder) = &recorder {
+        recorder.upstream_answered(dialled);
+    }
 
     // Non-101 ⇒ backend declined the upgrade; relay status+headers
     // and any leftover body, then close. No bidirectional tunnel.
@@ -1156,6 +1170,7 @@ async fn proxy_upgrade(
         // Keep the listener's bounded connection slot owned until the
         // detached upgraded tunnel actually exits.
         let _connection_permit = connection_permit;
+        let _recorder = recorder;
         let upgraded = match tokio::time::timeout(UPSTREAM_TIMEOUT, on_upgrade).await {
             Ok(Ok(u)) => u,
             Ok(Err(e)) => {
@@ -1347,11 +1362,13 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
             .get::<ConnectInfo<SocketAddr>>()
             .map(|peer| PublicPeer(peer.0))
     });
+    let recorder = req.extensions().get::<RequestRecorder>().cloned();
     let metadata = ForwardRequestMetadata {
         method,
         uri,
         headers,
         public_peer,
+        recorder,
     };
     let retryable = metadata.method == axum::http::Method::GET
         || metadata.method == axum::http::Method::HEAD
@@ -1441,6 +1458,8 @@ struct ForwardRequestMetadata {
     uri: Uri,
     headers: HeaderMap,
     public_peer: Option<PublicPeer>,
+    /// Public listeners only (ADR 061).
+    recorder: Option<RequestRecorder>,
 }
 
 async fn forward_once(
@@ -1502,8 +1521,14 @@ async fn forward_once(
     );
     builder = builder.body(reqwest::Body::wrap_stream(stream));
 
+    let dialled = Instant::now();
     let upstream = match builder.send().await {
-        Ok(r) => r,
+        Ok(r) => {
+            if let Some(recorder) = &metadata.recorder {
+                recorder.upstream_answered(dialled);
+            }
+            r
+        }
         Err(e) => {
             warn!(
                 upstream = %upstream_url,
