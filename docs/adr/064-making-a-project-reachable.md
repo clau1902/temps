@@ -47,7 +47,9 @@ Facts this decision relies on:
   user's own domain.
 - Cloudflare's dashboard accepts a token template link
   (`https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=…&accountId=*&zoneId=all&name=…`)
-  that opens the create-token form with permissions filled in.
+  that opens the create-token form with permissions filled in. The link
+  cannot name a zone the user has not chosen yet, so it opens with all
+  zones and the user narrows it in the form (D8).
 
 ## Decision
 
@@ -124,12 +126,39 @@ never shown as reachable.
   steps Temps would take and the fields still needed, in ADR 058 D8's
   descriptor form (`secret`, `dns_provider`, `managed_domain`, `text`), so
   the console renders it with no code per provider.
-- `POST …/reachability/apply` takes the plan's answers and starts a run. Its
-  steps report progress like **Expose your apps** does today (save the DNS
-  provider, create the tunnel, publish the hostname, set DNS, issue the
-  certificate, attach the domain, check reachability).
-- Every resource a run creates is recorded on the run. **Undo** removes
-  exactly those, newest first, and never anything the run found already
+- **A plan is bound to the state it was computed from.** The plan response
+  carries a `plan_id` and a fingerprint of everything the plan depends on:
+  the environment's addresses and their audiences, the cluster's DNS
+  providers and managed zones, the tunnels with their domains,
+  `auto_publish` and hostname choices, and the workers' ingress modes.
+  Plans are stored server-side and expire after 15 minutes.
+- `POST …/reachability/apply` takes `{plan_id, answers}` and starts a run.
+  It recomputes the fingerprint first; if anything changed since the plan
+  (another user added a tunnel, a worker's ingress mode changed, a CLI run
+  got there first), it creates nothing and answers `409` with the new plan,
+  so a stale console tab, CLI call or AI tool never applies steps chosen for
+  a world that no longer exists. Its steps report progress like **Expose
+  your apps** does today (save the DNS provider, create the tunnel, publish
+  the hostname, set DNS, issue the certificate, attach the domain, check
+  reachability).
+- **The run journal is written before each side effect, not after.** A
+  provider call and a database row cannot commit together, so each step is
+  recorded as `pending` with its idempotency key *before* the external call,
+  and as `done` with the resource's id after it. The key is what finds the
+  resource again: tunnels are named deterministically per run and install
+  (`temps-<name>-<install>`, ADR 058), DNS records carry the ADR 031
+  ownership marker plus the run id, and Temps-side rows reference the run.
+  A step is retried with the same key, so a retry after a timeout finds the
+  resource instead of creating a second one.
+- **Incomplete runs are reconciled.** On start-up and every minute, a run
+  with a `pending` step older than its timeout is resolved by looking the
+  resource up by its key: found means it is recorded and the run continues
+  or stops as the user asked; not found means the step never happened. Only
+  then may the run be undone or resumed, and the console shows "Recovering
+  an interrupted setup" in the meantime, never a half-finished state as if
+  it were complete.
+- **Undo** removes exactly what the journal recorded as created, newest
+  first, found by the same keys, and never anything the run found already
   there.
 - The steps move from the console (`web/src/components/nodes/ingress-setup.ts`
   runs them in the browser today) to the server, so a closed tab cannot
@@ -139,10 +168,22 @@ For the public audience the plan follows what exists:
 
 | What the cluster has | What the user does |
 |---|---|
-| A tunnel whose domain covers the hostname | Create (1 action) |
+| A tunnel that would publish the hostname (see below) | Create (1 action) |
+| A tunnel whose domain covers it but would not publish it | Confirm "route `myapp.example.com` through tunnel `homelab`" (2) |
 | A Cloudflare DNS provider, no tunnel | Confirm "create a tunnel on `master`" (2) |
 | Nothing | Paste a Cloudflare token (D8), then Create (3) |
 | A worker with `direct` ingress | Create; DNS set or shown (1–2) |
+
+"Would publish" is ADR 058 D9's effective publication state for the
+hostname, the same function `GET /ingress/hostnames` uses, not whether the
+tunnel's domain covers it: an `ingress_hostname_choices` row wins over
+automatic selection, and a tunnel with `auto_publish` off publishes only
+the hostnames chosen for it. When the hostname would not be published by
+the tunnel the plan picks, the plan says why ("tunnel `homelab` publishes
+only chosen hostnames", "this hostname is set to tunnel `office`", "this
+hostname is set to no tunnel") and adds an explicit step that records the
+D9 choice. A choice another user made, for another tunnel or for none, is
+never overridden without that step being shown and confirmed.
 
 When several fit, the order is: an existing tunnel, an existing direct
 ingress with DNS managed by Temps, a new tunnel. HTTP-01 is only offered
@@ -156,9 +197,15 @@ and `delegated`. Like those, it is the worker owner's decision, saved in
 `agent.json`:
 
 ```
-temps agent ingress private --listen tailscale|<IP> [--https-port 443]
+temps agent ingress private --listen tailscale|<IP>
 temps join … --ingress private --listen tailscale
 ```
+
+The private listener always uses port 443 (and 80 only to redirect to it),
+so a private address is always a plain `https://<hostname>` URL and the
+D7 check dials exactly what users open. A non-standard port is not offered:
+it would have to be carried through the address, the routing, the checks
+and every URL the console shows.
 
 - **What it binds.** Only an address inside `100.64.0.0/10` (Tailscale and
   other CGNAT overlays), RFC 1918, or IPv6 ULA `fd00::/8`. `tailscale`
@@ -180,10 +227,15 @@ temps join … --ingress private --listen tailscale
   publisher (`worker_public_routes`, ADR 058 D9) never publishes it, even
   under `auto_publish`, and `direct` listeners answer it with 404. DNS alone
   is not the boundary.
-- **A second lock.** The run adds an environment IP allow rule for the
+- **A second lock, per address.** Each private address carries its
   network's range (`100.64.0.0/10` for Tailscale, the chosen LAN range
-  otherwise), recorded on the run so undo removes it. It is defence in depth:
-  the boundary is the listener and the routing above.
+  otherwise) in its route-snapshot entry, and the private listener refuses a
+  peer outside it for that address only. It is not an environment-wide IP
+  rule: an environment with a private address and a public one (tunnel or
+  direct) keeps serving the public one to everyone. It is recorded on the
+  run so undo removes it, and it is defence in depth: the boundary is the
+  listener and the routing above. The private listener takes the client
+  address from the TCP peer, never from a forwarded header.
 - **Who in the network.** Temps does not manage Tailscale ACLs. The console
   says "everyone your tailnet's access rules allow to reach `master` on
   443".
@@ -203,8 +255,20 @@ and the flow step, so adding it is not a redesign.
   check, or the tunnel's publishing state).
 - **Private, reachable from inside:** the control plane cannot reach a
   tailnet (a hosted plane runs in Temps Cloud), so the worker's agent makes
-  the request: HTTPS to the environment's own hostname through its own
-  resolver, nothing else. The result is reported in the heartbeat.
+  the check, and it is bound to the environment's recorded private
+  listener, not to whatever DNS says:
+  - it resolves the hostname through its own resolver and compares the
+    answer with the listener address recorded for that address; a mismatch
+    is reported ("`myapp.internal.example.com` resolves to 10.0.0.9, not
+    `master`'s 100.101.102.103") and nothing is dialled;
+  - it then connects to the recorded listener address and port 443 only,
+    with the hostname as TLS SNI and `Host`, verifies the certificate for
+    that hostname, and follows no redirects;
+  - it takes no host, address or URL from the API, only an address id the
+    agent maps to its own route snapshot, so changing DNS cannot point the
+    check at another service on the worker's network.
+
+  The result is reported in the heartbeat.
 - **Private, not reachable from outside:** the control plane resolves the
   hostname and confirms it points only at private addresses and that no
   tunnel record exists for it. Either failing is shown in red: "This
@@ -218,24 +282,49 @@ and the flow step, so adding it is not a redesign.
 
 - The step links to Cloudflare's token template URL with the permissions
   filled in: Zone · Zone · Read, Zone · DNS · Edit, Account · Cloudflare
-  Tunnel · Edit. The user picks the account and zone, creates the token and
-  pastes it.
+  Tunnel · Edit. The user limits the token to one account and **one zone**,
+  the one this address is in, creates it and pastes it.
+- **A token reaching other zones is refused in this flow.** Temps lists the
+  zones the pasted token can reach; if it reaches any zone other than the
+  chosen one, the token is not saved and the message names the extra zones
+  and says how to narrow the token. A DNS provider that deliberately
+  manages several zones is still added from the DNS providers page, where
+  an admin sees every zone it will manage before saving it.
 - The permission keys for Zone and DNS are documented by Cloudflare. The key
   for Cloudflare Tunnel is verified during implementation; if there is none,
   the link fills in what it can and the checklist says what to add by hand.
-- A pasted token is checked straight away: Temps lists its zones and tests
-  each permission, and the checklist marks each one present or missing
-  before anything is created.
+- **Each permission is verified before anything is created, including
+  write access.** Read calls cannot prove write access (an Edit permission
+  and a Read one answer list calls the same way), so:
+  - Zone · Read: the zone list above;
+  - DNS · Edit and Cloudflare Tunnel · Edit: a create request with a
+    deliberately invalid body. Cloudflare checks authorization before
+    validation, so "not authorized" proves the permission missing and a
+    validation error proves it present, and nothing is created. This
+    ordering is confirmed against the live API during implementation and
+    covered by a test with recorded responses.
+  - If a probe cannot tell (an unexpected answer), the permission is marked
+    unverified and the run is refused with "Temps could not confirm that
+    this token can edit DNS in `example.com`. Check the token has Zone · DNS
+    · Edit, or create a new one."
+
+  The checklist marks each permission present, missing or unverified, and a
+  run starts only when all three are present.
 
 ### D9. A tunnel and a private allowlist never combine
 
-The IP access service refuses, with a specific message, an allowlist that
-contains only private ranges on an environment whose addresses are all
-served through a tunnel or `behind_proxy` ingress, because every visitor
-would be blocked ("Visitors through tunnel `homelab` arrive with their
-internet address, so `100.64.0.0/10` would block everyone. To limit this app
-to your tailnet, make it private instead."). It warns when only some
-addresses are affected.
+The IP access service refuses, with a specific message, an
+environment-level allowlist that contains only private ranges when **any**
+of the environment's addresses is served through a tunnel or
+`behind_proxy` ingress, because every visitor on that address would be
+blocked ("Visitors through tunnel `homelab` arrive with their internet
+address, so `100.64.0.0/10` would block everyone on `myapp.example.com`.
+To limit this app to your tailnet, make that address private instead.").
+Environment IP rules apply to all of an environment's addresses, so there
+is no case where such a rule is right for a proxied address; limiting one
+address to a network is what D5's per-address range is for. The same check
+runs when an address is later moved onto a tunnel while such a rule exists:
+the move is refused with the same message, naming the rule.
 
 ## Security
 
@@ -251,13 +340,19 @@ addresses are affected.
 - A public DNS record pointing at a private address reveals that the name
   exists and the internal address. The console says so when the user picks
   their own domain, and offers the tailnet name, which publishes nothing.
-- The agent's inside check requests only the environment's own hostnames;
-  it takes no URL from the API, so it cannot be used to reach other
-  services on the worker's network.
+- The agent's inside check dials only the private listener recorded for the
+  address, follows no redirects, and takes no host, address or URL from the
+  API (D7), so neither the API nor a DNS change can point it at another
+  service on the worker's network.
 - Undo deletes only what the run recorded as created. Credentials pasted into
   a run are handled as in ADR 058: `EncryptionService`, never returned,
   audited.
-- A token is checked with read-only calls before anything is created.
+- A token is checked before anything is created, with calls that cannot
+  create anything (D8), and one that reaches zones beyond the chosen one is
+  not stored by this flow, which keeps the blast radius of a stored token to
+  the zone it serves.
+- `apply` acts only on a current plan (D4), so a stale or replayed request
+  cannot create resources the user did not see.
 
 ## Consequences
 
