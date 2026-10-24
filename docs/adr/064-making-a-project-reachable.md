@@ -220,8 +220,19 @@ never shown as reachable.
     connector (the ADR 058 `ingress_connectors` row, identified by its id
     and the provider tunnel id) to `deleting` and journals that; sync and
     reconcile skip a `deleting` connector entirely, so they never recreate
-    or republish it. Then the provider tunnel and its DNS records are
-    deleted, then the connector row. If undo is interrupted in between, the
+    or republish it. Before that, undo checks what the tunnel serves now:
+    with `auto_publish` (ADR 058 D9) sync may have published hostnames on
+    it that this run never journaled. If so, undo pauses as a conflict
+    naming those hostnames, and the user either keeps the tunnel (undo
+    skips it) or removes it anyway (journaled). Then the provider tunnel is
+    deleted. DNS records go only through their own journaled steps: a
+    record this run created is removed while it still holds the run's
+    after-state and marker, a record it changed is restored through the
+    before/after checks above, and no other record is touched by undo.
+    Records ADR 058 sync published for the tunnel carry sync's marker, not
+    the run's; sync's own cleanup for a removed connector deletes them, so
+    none is left pointing at a deleted tunnel. The connector row is deleted
+    last. If undo is interrupted in between, the
     reconciler finishes the deletion from the `deleting` state, never
     reverting it. A later run that wants a tunnel creates a new connector;
     a `deleting` one is never reused. A tunnel the run found already there
