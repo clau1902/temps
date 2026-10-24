@@ -144,21 +144,17 @@ fn effective_public_address(
     interfaces: &[ReportedInterface],
 ) -> Option<IpAddr> {
     let row = row?;
-    if let Some(ip) = row.public_address.as_deref().and_then(parse_ip) {
-        return Some(ip);
-    }
-    row.listening
+    let listening_http = row
+        .listening
         .as_ref()
         .and_then(|l| l.get("http"))
-        .and_then(|v| v.as_str())
-        .and_then(parse_ip)
-        .or_else(|| row.listen_address.as_deref().and_then(parse_ip))
-        .or_else(|| {
-            interfaces
-                .iter()
-                .find(|i| i.default_route)
-                .and_then(|i| parse_ip(&i.address))
-        })
+        .and_then(|v| v.as_str());
+    temps_core::worker_ingress::effective_public_address(
+        row.public_address.as_deref(),
+        listening_http,
+        row.listen_address.as_deref(),
+        interfaces,
+    )
 }
 
 fn view(node: &nodes::Model, row: Option<&node_public_ingress::Model>) -> PublicIngressSettings {

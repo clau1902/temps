@@ -70,6 +70,10 @@ pub struct CreateConnectorRequest {
     pub values: BTreeMap<String, serde_json::Value>,
     /// Nodes that run a connector replica.
     pub node_ids: Vec<i32>,
+    /// Publish every worker-served hostname under the domain (the default),
+    /// or only the hostnames chosen for this tunnel.
+    #[serde(default)]
+    pub auto_publish: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -177,6 +181,59 @@ pub struct PublicationView {
     pub published_at: Option<DBDateTime>,
 }
 
+/// A tunnel as far as planning a hostname through it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelFact {
+    pub id: i32,
+    pub name: String,
+    pub provider: String,
+    pub dns_provider_id: Option<i32>,
+    pub domain: String,
+    /// The managed zone its domain is in; `None` when no longer managed.
+    pub zone: Option<String>,
+    pub ready: bool,
+    pub has_nodes: bool,
+    pub auto_publish: bool,
+}
+
+/// Which tunnel would publish a hostname, by ADR 058 D9's selection (the
+/// same one behind `GET /ingress/hostnames`), before asking whether workers
+/// serve it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PublicationIntent {
+    /// This tunnel: chosen for the hostname, or picked automatically.
+    Tunnel { connector_id: i32, by_choice: bool },
+    /// The hostname's choice keeps it off tunnels.
+    ChosenOff,
+    /// The tunnel chosen for it no longer exists.
+    ChosenMissing,
+    /// Only tunnels that publish just the hostnames chosen for them cover it.
+    OnlyChosen { connector_id: i32 },
+    /// No tunnel's domain covers it.
+    NoTunnel,
+}
+
+/// What planning a hostname through the tunnels needs, read at once.
+#[derive(Debug, Clone, Default)]
+pub struct TunnelFacts {
+    pub tunnels: Vec<TunnelFact>,
+    /// Hostnames workers serve, the only ones a tunnel can carry.
+    pub served: HashSet<String>,
+    /// Every hostname choice, sorted.
+    pub choices: Vec<(String, Option<i32>)>,
+    /// [`PublicationIntent`] of each hostname asked about.
+    pub intents: HashMap<String, PublicationIntent>,
+}
+
+/// ADR 064 D9 on the tunnel side: may `host` be moved onto `tunnel`? The
+/// reachability module implements it from the environments' IP rules.
+#[async_trait::async_trait]
+pub trait TunnelMoveGuard: Send + Sync {
+    /// `Err` with the refusal, naming the rule, when an IP allow list of
+    /// only private ranges applies to the environment serving `host`.
+    async fn check_move(&self, host: &str, tunnel: &str) -> Result<(), String>;
+}
+
 /// One page of tunnels, newest first.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ConnectorList {
@@ -239,6 +296,8 @@ pub struct IngressConnectorService {
     /// [`Self::set_request_policy`].
     request_policy: OnceLock<Arc<temps_core::RequestPolicyGateSlot>>,
     reconcile_lock: tokio::sync::Mutex<()>,
+    /// See [`Self::set_move_guard`].
+    move_guard: OnceLock<Arc<dyn TunnelMoveGuard>>,
     /// Serializes read-modify-writes of a connector's `settings` (token
     /// holders), so a node recorded while the reconciler rotates is kept.
     settings_lock: tokio::sync::Mutex<()>,
@@ -266,6 +325,7 @@ impl IngressConnectorService {
             registry: ProviderRegistry::builtin(),
             request_policy: OnceLock::new(),
             reconcile_lock: tokio::sync::Mutex::new(()),
+            move_guard: OnceLock::new(),
             settings_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -275,6 +335,13 @@ impl IngressConnectorService {
     /// Until it is known nothing is published.
     pub fn set_request_policy(&self, gate: Arc<temps_core::RequestPolicyGateSlot>) {
         let _ = self.request_policy.set(gate);
+    }
+
+    /// Lets hostname choices refuse a move onto a tunnel that an IP allow
+    /// list of only private ranges would make useless (ADR 064 D9). Later
+    /// calls are ignored.
+    pub fn set_move_guard(&self, guard: Arc<dyn TunnelMoveGuard>) {
+        let _ = self.move_guard.set(guard);
     }
 
     // ----- provider plumbing -------------------------------------------
@@ -703,7 +770,7 @@ impl IngressConnectorService {
             domain: Set(setup.domain.clone().unwrap_or_default()),
             settings: Set(serde_json::Value::Object(settings)),
             edge_port: Set(DEFAULT_EDGE_PORT),
-            auto_publish: Set(true),
+            auto_publish: Set(request.auto_publish.unwrap_or(true)),
             status: Set("pending".into()),
             created_at: Set(now),
             updated_at: Set(now),
@@ -791,6 +858,71 @@ impl IngressConnectorService {
             .collect())
     }
 
+    /// [`Self::hostname`] for several hostnames, planning once. Invalid
+    /// hostnames are left out.
+    pub async fn hostname_views(&self, hosts: &[String]) -> Result<Vec<HostnameView>, IngressError> {
+        let plan = self.plan().await?;
+        let publications = self.publications_by_host().await?;
+        Ok(hosts
+            .iter()
+            .filter_map(|host| normalize_host(host).ok())
+            .map(|host| plan.view(&host, publications.get(&host)))
+            .collect())
+    }
+
+    /// Every tunnel with what decides whether it can publish a hostname, the
+    /// hostnames workers serve (the only ones a tunnel can carry), every
+    /// hostname choice, and which tunnel would publish each of `hosts`.
+    pub async fn tunnel_facts(&self, hosts: &[String]) -> Result<TunnelFacts, IngressError> {
+        let plan = self.plan().await?;
+        let tunnels = plan
+            .connectors
+            .iter()
+            .map(|c| TunnelFact {
+                id: c.model.id,
+                name: c.model.name.clone(),
+                provider: c.model.provider.clone(),
+                dns_provider_id: c.model.dns_provider_id,
+                domain: c.model.domain.clone(),
+                zone: c.zone.clone(),
+                ready: c.model.status == "ready",
+                has_nodes: c.has_nodes,
+                auto_publish: c.model.auto_publish,
+            })
+            .collect();
+        let mut choices: Vec<(String, Option<i32>)> = plan
+            .choices
+            .iter()
+            .map(|(host, choice)| (host.clone(), *choice))
+            .collect();
+        choices.sort();
+        let intents = hosts
+            .iter()
+            .filter_map(|host| normalize_host(host).ok())
+            .map(|host| {
+                let intent = plan.intent(&host);
+                (host, intent)
+            })
+            .collect();
+        Ok(TunnelFacts {
+            tunnels,
+            served: plan.served,
+            choices,
+            intents,
+        })
+    }
+
+    /// The operator's choice for a hostname: `None` without one,
+    /// `Some(None)` kept off tunnels, `Some(Some(id))` through that tunnel.
+    pub async fn hostname_choice(&self, hostname: &str) -> Result<Option<Option<i32>>, IngressError> {
+        let host = normalize_host(hostname)?;
+        Ok(ingress_hostname_choices::Entity::find()
+            .filter(ingress_hostname_choices::Column::Hostname.eq(&host))
+            .one(self.db.as_ref())
+            .await?
+            .map(|choice| choice.connector_id))
+    }
+
     pub async fn hostname(&self, hostname: &str) -> Result<HostnameView, IngressError> {
         let host = normalize_host(hostname)?;
         let plan = self.plan().await?;
@@ -827,6 +959,12 @@ impl IngressConnectorService {
                 let connector = self.find(id).await?;
                 let zone = self.zone_of(&connector).await?;
                 record_label(&host, &connector.domain, &zone)?;
+                if let Some(guard) = self.move_guard.get() {
+                    guard
+                        .check_move(&host, &connector.name)
+                        .await
+                        .map_err(IngressError::Validation)?;
+                }
                 Some(id)
             }
         };
@@ -1695,7 +1833,7 @@ fn has_record(state: &str) -> bool {
 /// The record name of `host` inside `domain`. Cloudflare's free certificate
 /// covers one level under the zone, and tunnel records are always proxied,
 /// so deeper names are refused with what to use instead.
-fn record_label(host: &str, domain: &str, zone: &str) -> Result<String, IngressError> {
+pub(crate) fn record_label(host: &str, domain: &str, zone: &str) -> Result<String, IngressError> {
     if !covers(domain, zone, host) {
         return Err(IngressError::Validation(format!(
             "{host} is not under {domain}"
@@ -1719,7 +1857,7 @@ fn record_label(host: &str, domain: &str, zone: &str) -> Result<String, IngressE
 
 /// Whether a tunnel on `domain` (in `zone`) publishes `host`: anything under
 /// the domain, and a subdomain itself. Never the zone apex.
-fn covers(domain: &str, zone: &str, host: &str) -> bool {
+pub(crate) fn covers(domain: &str, zone: &str, host: &str) -> bool {
     host.ends_with(&format!(".{domain}")) || (host == domain && domain != zone)
 }
 
@@ -1760,58 +1898,75 @@ impl Plan {
             .collect()
     }
 
-    /// Which tunnel publishes `host`. A choice wins; otherwise the most
+    /// Which tunnel would publish `host`. A choice wins; otherwise the most
     /// specific automatic tunnel covering it, the oldest on a tie, so two
     /// tunnels never fight over a record.
-    fn decide(&self, host: &str) -> Decision {
-        let candidates = self.candidates(host);
-        let chosen = match self.choices.get(host) {
-            Some(None) => {
-                return Decision::Skip {
-                    connector: None,
-                    why: "Kept off tunnels by choice. Point its DNS where it should go.".into(),
-                }
-            }
+    fn intent(&self, host: &str) -> PublicationIntent {
+        match self.choices.get(host) {
+            Some(None) => PublicationIntent::ChosenOff,
             Some(Some(id)) => match self.connector(*id) {
-                Some(connector) => connector,
-                None => {
-                    return Decision::Skip {
-                        connector: None,
-                        why: "The tunnel chosen for it no longer exists.".into(),
-                    }
-                }
+                Some(_) => PublicationIntent::Tunnel {
+                    connector_id: *id,
+                    by_choice: true,
+                },
+                None => PublicationIntent::ChosenMissing,
             },
             None => {
-                let automatic =
-                    candidates
-                        .iter()
-                        .filter(|c| c.model.auto_publish)
-                        .max_by(|a, b| {
-                            a.model
-                                .domain
-                                .len()
-                                .cmp(&b.model.domain.len())
-                                .then(b.model.id.cmp(&a.model.id))
-                        });
+                let candidates = self.candidates(host);
+                let automatic = candidates
+                    .iter()
+                    .filter(|c| c.model.auto_publish)
+                    .max_by(|a, b| {
+                        a.model
+                            .domain
+                            .len()
+                            .cmp(&b.model.domain.len())
+                            .then(b.model.id.cmp(&a.model.id))
+                    });
                 match (automatic, candidates.first()) {
-                    (Some(connector), _) => *connector,
-                    (None, Some(connector)) => {
-                        return Decision::Skip {
-                            connector: None,
-                            why: format!(
-                                "Tunnel '{}' covers it but only publishes hostnames chosen for it. Choose that tunnel for this hostname to publish it.",
-                                connector.model.name
-                            ),
-                        }
-                    }
-                    (None, None) => {
-                        return Decision::Skip {
-                            connector: None,
-                            why: "No tunnel's domain covers it.".into(),
-                        }
-                    }
+                    (Some(connector), _) => PublicationIntent::Tunnel {
+                        connector_id: connector.model.id,
+                        by_choice: false,
+                    },
+                    (None, Some(connector)) => PublicationIntent::OnlyChosen {
+                        connector_id: connector.model.id,
+                    },
+                    (None, None) => PublicationIntent::NoTunnel,
                 }
             }
+        }
+    }
+
+    /// Whether the tunnel [`Self::intent`] picks publishes `host` now.
+    fn decide(&self, host: &str) -> Decision {
+        let skip_unowned = |why: String| Decision::Skip {
+            connector: None,
+            why,
+        };
+        let chosen = match self.intent(host) {
+            PublicationIntent::ChosenOff => {
+                return skip_unowned(
+                    "Kept off tunnels by choice. Point its DNS where it should go.".into(),
+                )
+            }
+            PublicationIntent::ChosenMissing => {
+                return skip_unowned("The tunnel chosen for it no longer exists.".into())
+            }
+            PublicationIntent::OnlyChosen { connector_id } => {
+                return skip_unowned(format!(
+                    "Tunnel '{}' covers it but only publishes hostnames chosen for it. Choose that tunnel for this hostname to publish it.",
+                    self.connector(connector_id)
+                        .map(|c| c.model.name.as_str())
+                        .unwrap_or_default()
+                ))
+            }
+            PublicationIntent::NoTunnel => {
+                return skip_unowned("No tunnel's domain covers it.".into())
+            }
+            PublicationIntent::Tunnel { connector_id, .. } => match self.connector(connector_id) {
+                Some(connector) => connector,
+                None => return skip_unowned("The tunnel chosen for it no longer exists.".into()),
+            },
         };
         let id = chosen.model.id;
         let name = &chosen.model.name;
@@ -1940,7 +2095,7 @@ fn is_dns_name(name: &str) -> bool {
         })
 }
 
-fn normalize_host(hostname: &str) -> Result<String, IngressError> {
+pub(crate) fn normalize_host(hostname: &str) -> Result<String, IngressError> {
     let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
     if !is_dns_name(&host) {
         return Err(IngressError::Validation(format!(

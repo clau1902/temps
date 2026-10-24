@@ -14402,14 +14402,19 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "temps-auth",
+ "temps-config",
  "temps-core",
  "temps-dns",
+ "temps-domains",
  "temps-entities",
+ "temps-projects",
  "temps-routes",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]

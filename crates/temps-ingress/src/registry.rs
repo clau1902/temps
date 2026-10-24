@@ -51,7 +51,7 @@ pub enum DnsHandling {
 }
 
 /// One question in a provider's setup form.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, ToSchema)]
 pub struct SetupField {
     /// The key in `values` of the create request.
     pub key: String,
@@ -62,7 +62,7 @@ pub struct SetupField {
     pub placeholder: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FieldKind {
     Text,

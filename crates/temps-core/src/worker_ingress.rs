@@ -104,6 +104,42 @@ pub fn address_scope(ip: IpAddr) -> AddressScope {
     }
 }
 
+/// Parses an address the agent reported, bare (`203.0.113.7`) or with a
+/// port (`203.0.113.7:80`).
+pub fn parse_reported_ip(value: &str) -> Option<IpAddr> {
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| {
+            value
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|address| address.ip())
+        })
+}
+
+/// The address DNS should point at for a worker's direct ingress: the
+/// configured public address, else the address the agent actually bound,
+/// else the configured listen address, else the default-route interface the
+/// agent reported.
+pub fn effective_public_address(
+    public_address: Option<&str>,
+    listening_http: Option<&str>,
+    listen_address: Option<&str>,
+    interfaces: &[ReportedInterface],
+) -> Option<IpAddr> {
+    public_address
+        .and_then(parse_reported_ip)
+        .or_else(|| listening_http.and_then(parse_reported_ip))
+        .or_else(|| listen_address.and_then(parse_reported_ip))
+        .or_else(|| {
+            interfaces
+                .iter()
+                .find(|i| i.default_route)
+                .and_then(|i| parse_reported_ip(&i.address))
+        })
+}
+
 /// What a worker lets its control plane do with public ingress. Set on the
 /// worker only (`temps join --ingress`, `temps agent ingress`): opening ports
 /// on a machine is its owner's decision, whoever runs the control plane.
@@ -199,4 +235,31 @@ pub struct ListenerReport {
     pub mode: Option<IngressMode>,
     /// Why the listener is not bound as configured.
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod effective_address_tests {
+    use super::*;
+
+    #[test]
+    fn configured_public_address_wins_then_bound_then_interface() {
+        let interfaces = vec![ReportedInterface {
+            name: "eth0".into(),
+            address: "198.51.100.4".into(),
+            default_route: true,
+        }];
+        assert_eq!(
+            effective_public_address(Some("203.0.113.7"), Some("10.0.0.2:80"), None, &interfaces),
+            "203.0.113.7".parse().ok()
+        );
+        assert_eq!(
+            effective_public_address(None, Some("10.0.0.2:80"), None, &interfaces),
+            "10.0.0.2".parse().ok()
+        );
+        assert_eq!(
+            effective_public_address(None, None, None, &interfaces),
+            "198.51.100.4".parse().ok()
+        );
+        assert_eq!(effective_public_address(None, None, None, &[]), None);
+    }
 }
