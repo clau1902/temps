@@ -25,6 +25,7 @@ use crate::config::{NetworkConfig, NodeAlloc, Peer, Transport};
 use crate::error::NetworkError;
 use crate::mesh::{LockdownState, MeshLockdown, MESH_INTERFACE};
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -1113,49 +1114,81 @@ async fn iptables_output(op: &'static str, args: &[&str]) -> crate::Result<std::
         })
 }
 
+/// Set of the peers' underlay addresses that may send this node VXLAN.
+const VXLAN_PEERS_SET: &str = "vxlan_peers";
+
+/// The input rules that admit VXLAN only from known peers.
+///
+/// The kernel binds the VXLAN UDP socket to the wildcard address even when
+/// the device has a `local` address, and decapsulates a packet sent to any of
+/// the host's addresses — its public one included — onto the overlay bridge
+/// without looking at the sender. So this allowlist is the only thing that
+/// keeps the overlay closed: a frame on the VXLAN port is accepted only to
+/// this node's underlay address from a peer's underlay address, and every
+/// other packet to the port is dropped, whatever interface or address it
+/// arrives on. The VNI is no secret (and is guessable in any case), so it is
+/// not relied on.
+///
+/// On the WireGuard mesh the accept is also pinned to the tunnel, where the
+/// peer's source address is authenticated. A LAN underlay is not pinned to
+/// its device: peer VXLAN may legitimately arrive on another one (e.g. a VLAN
+/// sub-interface beside the configured parent), and dropping it there would
+/// cut the overlay.
+///
+/// Peers are a set rather than a rule each, so the per-packet cost does not
+/// grow with the cluster. Peers of the other address family are left out:
+/// they could not reach this node's underlay address anyway.
+fn render_vxlan_ingress(
+    config: &NetworkConfig,
+    alloc: &NodeAlloc,
+    peers: &[Peer],
+    port: u16,
+) -> String {
+    let underlay_device = &config.underlay_dev;
+    let local = alloc.underlay_address;
+    let (family, address_type) = if local.is_ipv4() {
+        ("ip", "ipv4_addr")
+    } else {
+        ("ip6", "ipv6_addr")
+    };
+    let mut sources: Vec<IpAddr> = peers
+        .iter()
+        .map(|peer| peer.underlay_address)
+        .filter(|address| address.is_ipv4() == local.is_ipv4())
+        .collect();
+    sources.sort();
+    sources.dedup();
+
+    let mut rules = format!("add set inet {TABLE} {VXLAN_PEERS_SET} {{ type {address_type}; }}\n");
+    if !sources.is_empty() {
+        let elements = sources
+            .iter()
+            .map(IpAddr::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        rules.push_str(&format!(
+            "add element inet {TABLE} {VXLAN_PEERS_SET} {{ {elements} }}\n"
+        ));
+    }
+    let device = if underlay_device == MESH_INTERFACE {
+        format!("iifname \"{underlay_device}\" ")
+    } else {
+        String::new()
+    };
+    rules.push_str(&format!(
+        "add rule inet {TABLE} input {device}{family} daddr {local} {family} saddr @{VXLAN_PEERS_SET} udp dport {port} accept\n"
+    ));
+    rules.push_str(&format!(
+        "add rule inet {TABLE} input udp dport {port} counter drop\n"
+    ));
+    rules
+}
+
 fn render_baseline(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) -> String {
     let bridge = &config.bridge_name;
     let cidr = alloc.compute_cidr;
     let vxlan_ingress = match config.transport {
-        Transport::Vxlan { port, .. } => {
-            let mut rules = String::new();
-            let underlay_device = &config.underlay_dev;
-            let local_family = if alloc.underlay_address.is_ipv4() {
-                "ip"
-            } else {
-                "ip6"
-            };
-            for peer in peers {
-                let family = if peer.underlay_address.is_ipv4() {
-                    "ip"
-                } else {
-                    "ip6"
-                };
-                if family != local_family {
-                    continue;
-                }
-                rules.push_str(&format!(
-                    "add rule inet {TABLE} input iifname \"{underlay_device}\" {family} daddr {} {family} saddr {} udp dport {port} accept\n",
-                    alloc.underlay_address, peer.underlay_address
-                ));
-            }
-            rules.push_str(&format!(
-                "add rule inet {TABLE} input iifname \"{underlay_device}\" {local_family} daddr {} udp dport {port} counter drop\n",
-                alloc.underlay_address
-            ));
-            // The kernel VXLAN socket listens on every interface, and a
-            // decapsulated frame lands on the overlay bridge. On the WireGuard
-            // mesh, overlay traffic only ever arrives inside the tunnel, so
-            // VXLAN on the public NIC is injected, not peer, traffic. (Without
-            // the mesh a LAN underlay may legitimately arrive on another
-            // device, e.g. a VLAN sub-interface, so no such rule there.)
-            if underlay_device == MESH_INTERFACE {
-                rules.push_str(&format!(
-                    "add rule inet {TABLE} input iifname != \"{underlay_device}\" udp dport {port} counter drop\n"
-                ));
-            }
-            rules
-        }
+        Transport::Vxlan { port, .. } => render_vxlan_ingress(config, alloc, peers, port),
         Transport::Native => String::new(),
     };
     // A service may already be attached to `temps-app-network` before it is
@@ -1211,7 +1244,7 @@ add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masque
 }
 
 fn baseline_marker(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) -> String {
-    const BASELINE_SCHEMA_VERSION: &str = "v5";
+    const BASELINE_SCHEMA_VERSION: &str = "v6";
 
     let mut peers = peers.to_vec();
     peers.sort_by_key(|peer| (peer.compute_cidr, peer.underlay_address, peer.node_id));
@@ -1313,32 +1346,126 @@ mod tests {
         );
     }
 
-    #[test]
-    fn vxlan_ingress_is_restricted_to_known_peers() {
-        let cfg = NetworkConfig::default();
-        let alloc = NodeAlloc {
+    fn vxlan_alloc(underlay: IpAddr) -> NodeAlloc {
+        NodeAlloc {
             node_id: Uuid::nil(),
             compute_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
             bridge_address: IpAddr::V4(Ipv4Addr::new(172, 20, 5, 1)),
-            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-        };
-        let peer = Peer {
+            underlay_address: underlay,
+        }
+    }
+
+    fn vxlan_peer(third_octet: u8, underlay: IpAddr) -> Peer {
+        Peer {
             node_id: Uuid::new_v4(),
-            compute_cidr: Ipv4Net::from_str("172.20.6.0/24").unwrap(),
-            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-        };
+            compute_cidr: Ipv4Net::new(Ipv4Addr::new(172, 20, third_octet, 0), 24).unwrap(),
+            underlay_address: underlay,
+        }
+    }
+
+    #[test]
+    fn vxlan_ingress_is_restricted_to_known_peers() {
+        let cfg = NetworkConfig::default();
+        let alloc = vxlan_alloc(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let peer = vxlan_peer(6, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let marker = baseline_marker(&cfg, &alloc, std::slice::from_ref(&peer));
         let script = render_baseline(&cfg, &alloc, &[peer]);
+        let set = script
+            .find("add set inet temps_network vxlan_peers { type ipv4_addr; }")
+            .expect("peer set declared");
+        let element = script
+            .find("add element inet temps_network vxlan_peers { 10.0.0.2 }")
+            .expect("peer in the set");
         let allow = script
             .find(
-                "input iifname \"eth0\" ip daddr 10.0.0.1 ip saddr 10.0.0.2 udp dport 4789 accept",
+                "add rule inet temps_network input ip daddr 10.0.0.1 ip saddr @vxlan_peers udp dport 4789 accept",
             )
             .expect("known peer allow rule");
         let drop = script
-            .find("input iifname \"eth0\" ip daddr 10.0.0.1 udp dport 4789 counter drop")
-            .expect("unknown peer drop rule");
-        assert!(allow < drop);
+            .find("add rule inet temps_network input udp dport 4789 counter drop")
+            .expect("drop rule for everything else on the VXLAN port");
+        assert!(set < element && element < allow && allow < drop);
         assert!(script.contains(&marker));
+    }
+
+    #[test]
+    fn vxlan_to_any_other_address_or_device_is_dropped() {
+        // VXLAN aimed at the public address, or arriving on the public NIC,
+        // reaches the wildcard-bound kernel socket all the same. The drop
+        // must therefore match the port alone — no device or address
+        // qualifier that such a packet could fall outside of.
+        let cfg = NetworkConfig {
+            underlay_dev: "eth1.100".into(),
+            ..NetworkConfig::default()
+        };
+        let alloc = vxlan_alloc(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let script = render_baseline(&cfg, &alloc, &[]);
+        let drops: Vec<&str> = script
+            .lines()
+            .filter(|line| line.contains("udp dport 4789") && line.ends_with("drop"))
+            .collect();
+        assert_eq!(
+            drops,
+            vec!["add rule inet temps_network input udp dport 4789 counter drop"]
+        );
+        // The one accept is qualified by this node's address and the peers.
+        let accepts: Vec<&str> = script
+            .lines()
+            .filter(|line| line.contains("udp dport 4789") && line.ends_with("accept"))
+            .collect();
+        assert_eq!(
+            accepts,
+            vec![
+                "add rule inet temps_network input ip daddr 10.0.0.1 ip saddr @vxlan_peers udp dport 4789 accept"
+            ]
+        );
+    }
+
+    #[test]
+    fn with_no_peers_no_vxlan_is_admitted() {
+        let cfg = NetworkConfig::default();
+        let alloc = vxlan_alloc(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let script = render_baseline(&cfg, &alloc, &[]);
+        // An empty set matches nothing; `add element` with no elements is a
+        // syntax error, so it must not be rendered.
+        assert!(script.contains("add set inet temps_network vxlan_peers { type ipv4_addr; }"));
+        assert!(!script.contains("add element"));
+        assert!(script.contains("add rule inet temps_network input udp dport 4789 counter drop"));
+    }
+
+    #[test]
+    fn the_peer_set_is_sorted_deduplicated_and_of_one_family() {
+        let cfg = NetworkConfig::default();
+        let alloc = vxlan_alloc(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let peers = [
+            vxlan_peer(9, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))),
+            vxlan_peer(6, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+            vxlan_peer(7, "fd00::7".parse().unwrap()),
+            vxlan_peer(8, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+        ];
+        let script = render_baseline(&cfg, &alloc, &peers);
+        assert!(
+            script.contains("add element inet temps_network vxlan_peers { 10.0.0.2, 10.0.0.9 }\n"),
+            "{script}"
+        );
+        assert!(!script.contains("fd00::7"));
+    }
+
+    #[test]
+    fn an_ipv6_underlay_gets_an_ipv6_peer_set() {
+        let cfg = NetworkConfig::default();
+        let alloc = vxlan_alloc("fd00::1".parse().unwrap());
+        let peers = [
+            vxlan_peer(6, "fd00::2".parse().unwrap()),
+            vxlan_peer(7, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+        ];
+        let script = render_baseline(&cfg, &alloc, &peers);
+        assert!(script.contains("add set inet temps_network vxlan_peers { type ipv6_addr; }"));
+        assert!(script.contains("add element inet temps_network vxlan_peers { fd00::2 }"));
+        assert!(
+            script.contains("input ip6 daddr fd00::1 ip6 saddr @vxlan_peers udp dport 4789 accept")
+        );
+        assert!(script.contains("add rule inet temps_network input udp dport 4789 counter drop"));
     }
 
     #[test]
@@ -1349,25 +1476,28 @@ mod tests {
             underlay_dev: "temps-wg0".into(),
             ..NetworkConfig::default()
         };
-        let alloc = NodeAlloc {
-            node_id: Uuid::nil(),
-            compute_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
-            bridge_address: IpAddr::V4(Ipv4Addr::new(172, 20, 5, 1)),
-            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 2)),
-        };
-        let peer = Peer {
-            node_id: Uuid::new_v4(),
-            compute_cidr: Ipv4Net::from_str("172.20.6.0/24").unwrap(),
-            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 3)),
-        };
+        let alloc = vxlan_alloc(IpAddr::V4(Ipv4Addr::new(10, 201, 0, 2)));
+        let peer = vxlan_peer(6, IpAddr::V4(Ipv4Addr::new(10, 201, 0, 3)));
         let script = render_baseline(&cfg, &alloc, &[peer]);
         let allow = script
-            .find("input iifname \"temps-wg0\" ip daddr 10.201.0.2 ip saddr 10.201.0.3 udp dport 4789 accept")
+            .find("input iifname \"temps-wg0\" ip daddr 10.201.0.2 ip saddr @vxlan_peers udp dport 4789 accept")
             .expect("peer allow rule inside the tunnel");
-        let off_underlay = script
-            .find("input iifname != \"temps-wg0\" udp dport 4789 counter drop")
+        let drop = script
+            .find("input udp dport 4789 counter drop")
             .expect("drop rule for VXLAN outside the tunnel");
-        assert!(allow < off_underlay);
+        assert!(allow < drop);
+    }
+
+    #[test]
+    fn native_transport_installs_no_vxlan_rules() {
+        let cfg = NetworkConfig {
+            transport: Transport::Native,
+            ..NetworkConfig::default()
+        };
+        let alloc = vxlan_alloc(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let script = render_baseline(&cfg, &alloc, &[]);
+        assert!(!script.contains(VXLAN_PEERS_SET));
+        assert!(!script.contains("udp dport"));
     }
 
     #[test]
@@ -1705,10 +1835,10 @@ mod tests {
         };
         let script = render_baseline(&mesh, &alloc, &[]);
         assert!(!script.contains("forward iifname \"temps-wg0\""));
-        assert!(script.contains("iifname != \"temps-wg0\" udp dport 4789 counter drop"));
+        assert!(script.contains("input iifname \"temps-wg0\" ip daddr 10.201.0.2"));
         let lan = render_baseline(&NetworkConfig::default(), &alloc, &[]);
         assert!(
-            !lan.contains("iifname !="),
+            !lan.contains("input iifname"),
             "a LAN underlay may deliver VXLAN on another device"
         );
     }
@@ -1736,7 +1866,7 @@ mod tests {
             baseline_marker(&cfg, &alloc, &[a.clone(), b.clone()]),
             baseline_marker(&cfg, &alloc, &[b, a])
         );
-        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v5-"));
+        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v6-"));
     }
 
     #[test]

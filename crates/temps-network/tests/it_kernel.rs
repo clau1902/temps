@@ -281,7 +281,7 @@ async fn cleanup_all() {
         .await;
     // Devices a test set up beside Temps' own: a foreign VXLAN and the
     // dummy parent standing in for a previous underlay.
-    for device in ["temps-it-vx0", "temps-it-d0"] {
+    for device in ["temps-it-vx0", "temps-it-d0", INJECT_DEVICE] {
         let _ = Command::new("ip")
             .args(["link", "del", device])
             .output()
@@ -299,6 +299,10 @@ async fn cleanup_all() {
 
 /// Dummy parent device for the underlay-migration test.
 const OLD_UNDERLAY: &str = "temps-old-ul0";
+
+/// Dummy device holding an address that is not the underlay (standing in for
+/// a public NIC) for the VXLAN injection test.
+const INJECT_DEVICE: &str = "temps-it-pub0";
 
 struct Cleanup;
 impl Drop for Cleanup {
@@ -430,6 +434,20 @@ async fn bootstrap_creates_all_kernel_state() {
         !iptables_chain_contains("TEMPS_OVERLAY_FORWARD", &["-o vxlan-temps0"]).await,
         "Temps must not bypass Docker isolation for locally spoofed VXLAN egress"
     );
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(
+        detail.contains(&format!(" local {} ", env.local_underlay)),
+        "vxlan must source its packets from the underlay address: {detail}"
+    );
+    assert!(
+        nft_table_contains(
+            "inet",
+            "temps_network",
+            &["@vxlan_peers", "udp dport 4789 counter"]
+        )
+        .await,
+        "VXLAN must be admitted only from known peers"
+    );
 }
 
 #[tokio::test]
@@ -539,6 +557,159 @@ async fn a_replacement_that_cannot_be_built_keeps_the_working_vxlan() {
     assert!(has_pair("dev", &env.underlay_dev), "{detail}");
     assert!(has_pair("master", "br-temps0"), "{detail}");
     assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+}
+
+#[tokio::test]
+async fn bootstrap_rebuilds_a_vxlan_created_without_a_local_address() {
+    // Every node set up before the local address was set has a device like
+    // this one; an upgrade must rebuild it rather than adopt it.
+    let (env, mgr, _cleanup) = fixture().await;
+    ip(&[
+        "link",
+        "add",
+        "vxlan-temps0",
+        "type",
+        "vxlan",
+        "id",
+        "42",
+        "dev",
+        &env.underlay_dev,
+        "dstport",
+        "4789",
+        "nolearning",
+    ])
+    .await;
+    assert!(!link_detail("vxlan-temps0").await.contains(" local "));
+
+    mgr.bootstrap(env.alloc(), vec![env.peer()])
+        .await
+        .expect("bootstrap rebuilds the device with its local address");
+
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(
+        detail.contains(&format!(" local {} ", env.local_underlay)),
+        "local address not set: {detail}"
+    );
+    assert!(
+        detail.contains("master br-temps0"),
+        "not re-enslaved: {detail}"
+    );
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+
+    // The rebuilt device is now simply compatible: no further replacement.
+    let index = link_index("vxlan-temps0").await;
+    mgr.bootstrap(env.alloc(), vec![env.peer()])
+        .await
+        .expect("second bootstrap");
+    assert_eq!(
+        link_index("vxlan-temps0").await,
+        index,
+        "device was rebuilt again"
+    );
+}
+
+/// Packets the VXLAN device has decapsulated so far.
+async fn vxlan_rx_packets() -> u64 {
+    tokio::fs::read_to_string("/sys/class/net/vxlan-temps0/statistics/rx_packets")
+        .await
+        .expect("read vxlan rx_packets")
+        .trim()
+        .parse()
+        .expect("rx_packets is a number")
+}
+
+/// Packets the catch-all VXLAN drop rule has dropped so far.
+async fn vxlan_drops() -> u64 {
+    let output = Command::new("nft")
+        .args(["list", "chain", "inet", "temps_network", "input"])
+        .output()
+        .await
+        .expect("list the input chain");
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let rule = listing
+        .lines()
+        .find(|line| line.trim_start().starts_with("udp dport 4789 counter"))
+        .unwrap_or_else(|| panic!("no VXLAN drop rule in:\n{listing}"));
+    let tokens: Vec<&str> = rule.split_whitespace().collect();
+    tokens
+        .windows(2)
+        .find(|pair| pair[0] == "packets")
+        .and_then(|pair| pair[1].parse().ok())
+        .unwrap_or_else(|| panic!("no packet count in: {rule}"))
+}
+
+/// What became of one injected VXLAN frame.
+#[derive(Debug, PartialEq, Eq)]
+struct Injection {
+    /// The VXLAN device decapsulated something meanwhile.
+    decapsulated: bool,
+    /// The catch-all drop rule dropped it.
+    dropped: bool,
+}
+
+/// Send one VXLAN-encapsulated broadcast ARP frame for `vni` from `source` to
+/// `destination`:4789.
+async fn inject_vxlan(source: IpAddr, destination: IpAddr, vni: u32) -> Injection {
+    let (rx, drops) = (vxlan_rx_packets().await, vxlan_drops().await);
+    let vni = vni.to_be_bytes();
+    let mut frame = vec![0x08, 0, 0, 0, vni[1], vni[2], vni[3], 0];
+    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x99]);
+    frame.extend_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0, 6, 4, 0, 1]);
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x99, 172, 20, 1, 99]);
+    frame.extend_from_slice(&[0; 6]);
+    frame.extend_from_slice(&[172, 20, 1, 1]);
+    let socket = tokio::net::UdpSocket::bind((source, 0))
+        .await
+        .expect("bind injection socket");
+    socket
+        .send_to(&frame, (destination, 4789))
+        .await
+        .expect("send VXLAN frame");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Injection {
+        decapsulated: vxlan_rx_packets().await > rx,
+        dropped: vxlan_drops().await == drops + 1,
+    }
+}
+
+#[tokio::test]
+async fn vxlan_to_an_address_other_than_the_underlay_is_not_decapsulated() {
+    // The kernel binds the VXLAN socket to the wildcard address whatever the
+    // device's local address, so without the ingress allowlist a frame sent
+    // to any of the host's addresses lands on the overlay bridge.
+    //
+    // The harness's peer is a loopback address, so frames the bridge floods
+    // to it come straight back and the device's receive count moves on its
+    // own. A rejected frame is therefore recognised by the drop rule's
+    // counter (a drop is final: such a frame never reaches the socket); the
+    // receive count only serves as the positive control.
+    let (env, mgr, _cleanup) = fixture().await;
+    let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+    ip(&["link", "add", INJECT_DEVICE, "type", "dummy"]).await;
+    ip(&["addr", "add", "198.51.100.1/32", "dev", INJECT_DEVICE]).await;
+    ip(&["link", "set", INJECT_DEVICE, "up"]).await;
+
+    mgr.bootstrap(env.alloc(), vec![env.peer()])
+        .await
+        .expect("bootstrap");
+
+    assert_eq!(
+        inject_vxlan(env.peer_underlay, env.local_underlay, 42).await,
+        Injection {
+            decapsulated: true,
+            dropped: false
+        },
+        "VXLAN from the peer to the underlay address must be admitted"
+    );
+    assert!(
+        inject_vxlan(other, other, 42).await.dropped,
+        "VXLAN to a non-underlay address must be dropped"
+    );
+    assert!(
+        inject_vxlan(other, env.local_underlay, 42).await.dropped,
+        "VXLAN from an unknown sender must be dropped"
+    );
 }
 
 /// Run `ip` with `args`, failing the test with its stderr if it fails.

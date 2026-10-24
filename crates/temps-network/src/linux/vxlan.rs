@@ -21,25 +21,46 @@ use tracing::{debug, info, warn};
 /// Ensure that a VXLAN device with the given name and parameters exists,
 /// has the right MTU, and is up. Idempotent: if the device exists already
 /// and is compatible, this is a no-op.
+///
+/// `local` is this node's underlay address. It is the source of every
+/// encapsulated packet, so peers (whose firewall admits VXLAN only from known
+/// underlay addresses) always see the address they know us by. It does NOT
+/// narrow what the device receives: the kernel binds the VXLAN UDP socket to
+/// the wildcard address whatever `local` is, and decapsulates a packet sent
+/// to any of the host's addresses. The ingress allowlist in
+/// [`crate::linux::firewall`] is what restricts VXLAN to known peers.
 pub async fn ensure(
     handle: &Handle,
     name: &str,
     underlay_dev: &str,
+    local: IpAddr,
     vni: u32,
     port: u16,
     mtu: u32,
 ) -> crate::Result<u32> {
     if let Some(idx) = link_index_by_name(handle, name).await? {
         debug!(vxlan = %name, idx, "vxlan device already exists");
-        match existing_topology(name, underlay_dev, vni, port).await? {
+        match existing_topology(name, underlay_dev, local, vni, port).await? {
             Topology::Matches => {}
             Topology::Differs(detail) => {
-                // Our device, built for another parent, VNI or port — e.g. the
-                // underlay moved onto the WireGuard mesh. A VXLAN device's
-                // parent can't be changed in place, so replace it; bootstrap
-                // re-enslaves it and repopulates the FDB right after.
-                warn!(vxlan = %name, parent = %underlay_dev, vni, port, existing = %detail, "recreating vxlan device for a changed topology");
-                return replace(handle, idx, &detail, name, underlay_dev, vni, port, mtu).await;
+                // Our device, built for another parent, local address, VNI or
+                // port — e.g. the underlay moved onto the WireGuard mesh, or
+                // the device predates `local` being set. None of these can be
+                // changed in place, so replace it; bootstrap re-enslaves it
+                // and repopulates the FDB right after.
+                warn!(vxlan = %name, parent = %underlay_dev, %local, vni, port, existing = %detail, "recreating vxlan device for a changed topology");
+                return replace(
+                    handle,
+                    idx,
+                    &detail,
+                    name,
+                    underlay_dev,
+                    local,
+                    vni,
+                    port,
+                    mtu,
+                )
+                .await;
             }
         }
         handle
@@ -62,7 +83,7 @@ pub async fn ensure(
             })?;
         return Ok(idx);
     }
-    create(handle, name, underlay_dev, vni, port, mtu).await
+    create(handle, name, underlay_dev, Some(local), vni, port, mtu).await
 }
 
 /// Replace the device at `old_index` (whose `ip -d -o link show` detail is
@@ -87,6 +108,7 @@ async fn replace(
     previous_detail: &str,
     name: &str,
     underlay_dev: &str,
+    local: IpAddr,
     vni: u32,
     port: u16,
     mtu: u32,
@@ -112,6 +134,7 @@ async fn replace(
     let request = Replacement {
         name: name.into(),
         parent: underlay_dev.into(),
+        local,
         vni,
         port,
         mtu,
@@ -131,10 +154,10 @@ async fn replace(
     let previous = Previous::capture(name, previous_detail).await;
 
     delete(handle, old_index, name, "delete for replacement").await?;
-    match create(handle, name, underlay_dev, vni, port, mtu).await {
+    match create(handle, name, underlay_dev, Some(local), vni, port, mtu).await {
         Ok(index) => {
             forget_refusal(&request);
-            info!(vxlan = %name, vni, port, parent = %underlay_dev, "vxlan device replaced");
+            info!(vxlan = %name, vni, port, parent = %underlay_dev, %local, "vxlan device replaced");
             Ok(index)
         }
         Err(error) => {
@@ -185,6 +208,7 @@ const REPAIRED_PARENT_RETRY: Duration = Duration::from_secs(15);
 struct Replacement {
     name: String,
     parent: String,
+    local: IpAddr,
     vni: u32,
     port: u16,
     mtu: u32,
@@ -339,6 +363,8 @@ fn holder_of(output: &str, name: &str, vni: u32, port: u16) -> Option<String> {
 #[derive(Debug, PartialEq, Eq)]
 struct Previous {
     parent: String,
+    /// `None` for a device created before the local address was set.
+    local: Option<IpAddr>,
     vni: u32,
     port: u16,
     mtu: Option<u32>,
@@ -375,9 +401,17 @@ impl Previous {
     /// parent may not carry the MTU asked of the replacement.
     async fn restore(&self, handle: &Handle, name: &str, requested_mtu: u32) -> Result<(), String> {
         let mtu = self.mtu.unwrap_or(requested_mtu);
-        create(handle, name, &self.parent, self.vni, self.port, mtu)
-            .await
-            .map_err(|error| error.to_string())?;
+        create(
+            handle,
+            name,
+            &self.parent,
+            self.local,
+            self.vni,
+            self.port,
+            mtu,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         if let Some(master) = &self.master {
             enslave_to_bridge(handle, name, master)
                 .await
@@ -393,8 +427,8 @@ impl Previous {
     }
 }
 
-/// The parent, VNI, port, MTU and bridge of a VXLAN device from its
-/// `ip -d -o link show` detail. The FDB is read separately.
+/// The parent, local address, VNI, port, MTU and bridge of a VXLAN device
+/// from its `ip -d -o link show` detail. The FDB is read separately.
 fn parse_previous(detail: &str) -> Option<Previous> {
     let tokens: Vec<&str> = detail.split_whitespace().collect();
     let vxlan_index = tokens.iter().position(|token| *token == "vxlan")?;
@@ -407,6 +441,9 @@ fn parse_previous(detail: &str) -> Option<Previous> {
     };
     Some(Previous {
         parent: value(topology, "dev")?,
+        // An unparsable local address is read as none: restoring the device
+        // without one is how it carried traffic before `local` was set.
+        local: value(topology, "local").and_then(|local| local.parse().ok()),
         vni: value(topology, "id")?.parse().ok()?,
         port: value(topology, "dstport")?.parse().ok()?,
         mtu: value(link, "mtu").and_then(|mtu| mtu.parse().ok()),
@@ -443,10 +480,13 @@ async fn delete(handle: &Handle, index: u32, name: &str, step: &str) -> crate::R
         })
 }
 
+/// Create the device. `local` is `None` only when restoring a device that was
+/// built without one; every new device gets the node's underlay address.
 async fn create(
     handle: &Handle,
     name: &str,
     underlay_dev: &str,
+    local: Option<IpAddr>,
     vni: u32,
     port: u16,
     mtu: u32,
@@ -459,15 +499,18 @@ async fn create(
                 reason: format!("underlay device '{}' not found", underlay_dev),
             })?;
 
+    let builder = LinkVxlan::new(name, vni)
+        .dev(parent_index)
+        .port(port)
+        .learning(false);
+    let builder = match local {
+        Some(IpAddr::V4(local)) => builder.local(local),
+        Some(IpAddr::V6(local)) => builder.local6(local),
+        None => builder,
+    };
     handle
         .link()
-        .add(
-            LinkVxlan::new(name, vni)
-                .dev(parent_index)
-                .port(port)
-                .learning(false)
-                .build(),
-        )
+        .add(builder.build())
         .execute()
         .await
         .map_err(|e| NetworkError::Vxlan {
@@ -492,7 +535,7 @@ async fn create(
         return Err(error);
     }
 
-    info!(vxlan = %name, vni, port, mtu, parent = %underlay_dev, "vxlan device ready");
+    info!(vxlan = %name, vni, port, mtu, parent = %underlay_dev, local = ?local, "vxlan device ready");
     Ok(idx)
 }
 
@@ -521,13 +564,15 @@ async fn bring_up(handle: &Handle, idx: u32, name: &str, mtu: u32) -> crate::Res
 #[derive(Debug, PartialEq, Eq)]
 enum Topology {
     Matches,
-    /// A VXLAN device with another parent, VNI or port (the `ip` detail).
+    /// A VXLAN device with another parent, local address, VNI or port (the
+    /// `ip` detail).
     Differs(String),
 }
 
 async fn existing_topology(
     name: &str,
     underlay_dev: &str,
+    local: IpAddr,
     vni: u32,
     port: u16,
 ) -> crate::Result<Topology> {
@@ -550,7 +595,7 @@ async fn existing_topology(
         });
     }
     let detail = String::from_utf8_lossy(&output.stdout);
-    validate_topology_detail(&detail, underlay_dev, vni, port).map_err(|reason| {
+    validate_topology_detail(&detail, underlay_dev, local, vni, port).map_err(|reason| {
         NetworkError::Vxlan {
             device: name.into(),
             reason,
@@ -563,6 +608,7 @@ async fn existing_topology(
 fn validate_topology_detail(
     detail: &str,
     underlay_dev: &str,
+    local: IpAddr,
     vni: u32,
     port: u16,
 ) -> std::result::Result<Topology, String> {
@@ -578,8 +624,13 @@ fn validate_topology_detail(
     };
     let expected_vni = vni.to_string();
     let expected_port = port.to_string();
+    // `ip` prints addresses in the same canonical form as `Display`
+    // (RFC 5952 for IPv6). A device without `local` — every one created
+    // before it was set — differs, so upgraded nodes rebuild theirs.
+    let expected_local = local.to_string();
     if !has_pair("id", &expected_vni)
         || !has_pair("dev", underlay_dev)
+        || !has_pair("local", &expected_local)
         || !has_pair("dstport", &expected_port)
     {
         return Ok(Topology::Differs(detail.trim().to_string()));
@@ -708,13 +759,60 @@ async fn run_bridge(args: &[&str]) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{validate_topology_detail, Topology};
+    use std::net::IpAddr;
 
-    const DETAIL: &str = "11: vxlan-temps0: <BROADCAST> mtu 1350 vxlan id 42 dev enp6s0.4000 srcport 0 0 dstport 4789 nolearning";
+    const DETAIL: &str = "11: vxlan-temps0: <BROADCAST> mtu 1350 vxlan id 42 local 10.0.0.1 dev bond0.100 srcport 0 0 dstport 4789 nolearning";
+
+    fn local() -> IpAddr {
+        IpAddr::from([10, 0, 0, 1])
+    }
 
     #[test]
     fn accepts_matching_existing_vxlan_topology() {
         assert_eq!(
-            validate_topology_detail(DETAIL, "enp6s0.4000", 42, 4789),
+            validate_topology_detail(DETAIL, "bond0.100", local(), 42, 4789),
+            Ok(Topology::Matches)
+        );
+    }
+
+    #[test]
+    fn a_vxlan_without_a_local_address_is_to_be_recreated() {
+        // Every device created before `local` was set looks like this; it
+        // must be rebuilt on upgrade, not adopted.
+        let legacy = DETAIL.replace("local 10.0.0.1 ", "");
+        assert!(matches!(
+            validate_topology_detail(&legacy, "bond0.100", local(), 42, 4789),
+            Ok(Topology::Differs(_))
+        ));
+    }
+
+    #[test]
+    fn a_vxlan_with_another_local_address_is_to_be_recreated() {
+        assert!(matches!(
+            validate_topology_detail(DETAIL, "bond0.100", IpAddr::from([10, 0, 0, 2]), 42, 4789),
+            Ok(Topology::Differs(_))
+        ));
+        // `local 10.0.0.1` must not match `10.0.0.10` as a prefix.
+        let longer = DETAIL.replace("local 10.0.0.1 ", "local 10.0.0.10 ");
+        assert!(matches!(
+            validate_topology_detail(&longer, "bond0.100", local(), 42, 4789),
+            Ok(Topology::Differs(_))
+        ));
+        // `remote` is not `local`.
+        let remote = DETAIL.replace("local 10.0.0.1 ", "remote 10.0.0.1 ");
+        assert!(matches!(
+            validate_topology_detail(&remote, "bond0.100", local(), 42, 4789),
+            Ok(Topology::Differs(_))
+        ));
+    }
+
+    #[test]
+    fn an_ipv6_local_address_matches_its_canonical_form() {
+        let detail = "11: vxlan-temps0: <BROADCAST> mtu 1350 vxlan id 42 local fd00::1 \
+                      dev bond0.100 srcport 0 0 dstport 4789 nolearning";
+        let expanded: IpAddr = "fd00:0:0:0:0:0:0:1".parse().unwrap();
+        assert_eq!(
+            validate_topology_detail(detail, "bond0.100", expanded, 42, 4789),
             Ok(Topology::Matches)
         );
     }
@@ -725,12 +823,13 @@ mod tests {
         let enslaved = "11: vxlan-temps0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc \
                         noqueue master br-temps0 state UNKNOWN mode DEFAULT \\    \
                         link/ether 02:00:00:00:00:01 brd ff:ff:ff:ff:ff:ff promiscuity 1 \\    \
-                        vxlan id 42 dev enp6s0.4000 srcport 0 0 dstport 4789 nolearning \
-                        bridge_slave state forwarding";
+                        vxlan id 42 local 10.0.0.1 dev bond0.100 srcport 0 0 dstport 4789 \
+                        nolearning bridge_slave state forwarding";
         assert_eq!(
             parse_previous(enslaved),
             Some(Previous {
-                parent: "enp6s0.4000".into(),
+                parent: "bond0.100".into(),
+                local: Some(local()),
                 vni: 42,
                 port: 4789,
                 mtu: Some(1450),
@@ -742,6 +841,11 @@ mod tests {
         assert_eq!(
             parse_previous(DETAIL).and_then(|previous| previous.master),
             None
+        );
+        // A device from before `local` was set is restored without one.
+        assert_eq!(
+            parse_previous(&DETAIL.replace("local 10.0.0.1 ", "")).map(|previous| previous.local),
+            Some(None)
         );
         // Nothing to rebuild a non-VXLAN device from.
         assert_eq!(
@@ -775,6 +879,7 @@ mod tests {
         let request = Replacement {
             name: "vxlan-unit0".into(),
             parent: "temps-wg0".into(),
+            local: IpAddr::from([10, 201, 0, 2]),
             vni: 42,
             port: 4789,
             mtu: 1370,
@@ -878,21 +983,21 @@ mod tests {
     fn a_vxlan_on_another_parent_is_to_be_recreated() {
         // The underlay moved, e.g. onto the WireGuard mesh.
         assert!(matches!(
-            validate_topology_detail(DETAIL, "temps-wg0", 42, 4789),
+            validate_topology_detail(DETAIL, "temps-wg0", local(), 42, 4789),
             Ok(Topology::Differs(_))
         ));
-        // `dev enp6s0` must not match `dev enp6s0.4000` as a prefix.
+        // `dev bond0` must not match `dev bond0.100` as a prefix.
         assert!(matches!(
-            validate_topology_detail(DETAIL, "enp6s0", 42, 4789),
+            validate_topology_detail(DETAIL, "bond0", local(), 42, 4789),
             Ok(Topology::Differs(_))
         ));
     }
 
     #[test]
     fn a_vxlan_without_a_parent_is_to_be_recreated() {
-        let detail = "11: vxlan-temps0: <BROADCAST> mtu 1450 vxlan id 42 srcport 0 0 dstport 4789 nolearning";
+        let detail = "11: vxlan-temps0: <BROADCAST> mtu 1450 vxlan id 42 local 10.0.0.1 srcport 0 0 dstport 4789 nolearning";
         assert!(matches!(
-            validate_topology_detail(detail, "eth0", 42, 4789),
+            validate_topology_detail(detail, "eth0", local(), 42, 4789),
             Ok(Topology::Differs(_))
         ));
     }
@@ -900,11 +1005,11 @@ mod tests {
     #[test]
     fn a_vxlan_with_another_vni_or_port_is_to_be_recreated() {
         assert!(matches!(
-            validate_topology_detail(DETAIL, "enp6s0.4000", 99, 4789),
+            validate_topology_detail(DETAIL, "bond0.100", local(), 99, 4789),
             Ok(Topology::Differs(_))
         ));
         assert!(matches!(
-            validate_topology_detail(DETAIL, "enp6s0.4000", 42, 8472),
+            validate_topology_detail(DETAIL, "bond0.100", local(), 42, 8472),
             Ok(Topology::Differs(_))
         ));
     }
@@ -912,6 +1017,6 @@ mod tests {
     #[test]
     fn a_device_that_is_not_vxlan_is_an_error() {
         let bridge = "11: vxlan-temps0: <BROADCAST> mtu 1500 bridge forward_delay 1500";
-        assert!(validate_topology_detail(bridge, "eth0", 42, 4789).is_err());
+        assert!(validate_topology_detail(bridge, "eth0", local(), 42, 4789).is_err());
     }
 }
