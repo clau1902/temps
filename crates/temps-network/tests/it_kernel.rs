@@ -287,13 +287,7 @@ async fn cleanup_all() {
             .output()
             .await;
     }
-    for device in [
-        "temps-it-vx0",
-        "temps-it-d0",
-        INJECT_DEVICE,
-        PEER_VETH,
-        FOREIGN_VETH,
-    ] {
+    for device in ["temps-it-vx0", "temps-it-d0", PEER_VETH, FOREIGN_VETH] {
         let _ = Command::new("ip")
             .args(["link", "del", device])
             .output()
@@ -311,10 +305,6 @@ async fn cleanup_all() {
 
 /// Dummy parent device for the underlay-migration test.
 const OLD_UNDERLAY: &str = "temps-old-ul0";
-
-/// Dummy device holding an address that is not the underlay (standing in for
-/// a public NIC) for the VXLAN injection test.
-const INJECT_DEVICE: &str = "temps-it-pub0";
 
 /// Network namespace standing in for a peer on the underlay network, and the
 /// host's end of the veth that reaches it.
@@ -711,18 +701,20 @@ struct Injection {
     dropped: bool,
 }
 
-/// Send `frame` from `source` to `destination`:4789, from inside network
-/// namespace `netns` when given. Entering a namespace affects only the
-/// calling thread, so the send happens on a thread of its own.
-fn send_udp(netns: Option<&str>, source: IpAddr, destination: IpAddr, frame: Vec<u8>) {
-    let netns = netns.map(str::to_owned);
+/// Send `frame` from `source` to `destination`:4789 from inside network
+/// namespace `netns`. Entering a namespace affects only the calling thread,
+/// so the send happens on a thread of its own.
+///
+/// Senders always live in a namespace the test built, holding addresses the
+/// test chose: the harness's own addresses differ between the single- and
+/// two-node runs, and the two-node peer is not even on this host.
+fn send_udp(netns: &str, source: IpAddr, destination: IpAddr, frame: Vec<u8>) {
+    let netns = netns.to_owned();
     std::thread::spawn(move || {
-        if let Some(netns) = netns {
-            let namespace = std::fs::File::open(format!("/run/netns/{netns}"))
-                .unwrap_or_else(|error| panic!("open netns {netns}: {error}"));
-            nix::sched::setns(&namespace, nix::sched::CloneFlags::CLONE_NEWNET)
-                .unwrap_or_else(|error| panic!("enter netns {netns}: {error}"));
-        }
+        let namespace = std::fs::File::open(format!("/run/netns/{netns}"))
+            .unwrap_or_else(|error| panic!("open netns {netns}: {error}"));
+        nix::sched::setns(&namespace, nix::sched::CloneFlags::CLONE_NEWNET)
+            .unwrap_or_else(|error| panic!("enter netns {netns}: {error}"));
         let socket = std::net::UdpSocket::bind((source, 0))
             .unwrap_or_else(|error| panic!("bind {source}: {error}"));
         socket
@@ -734,18 +726,8 @@ fn send_udp(netns: Option<&str>, source: IpAddr, destination: IpAddr, frame: Vec
 }
 
 /// Send one VXLAN-encapsulated broadcast ARP frame for `vni` from `source` to
-/// `destination`:4789.
-async fn inject_vxlan(source: IpAddr, destination: IpAddr, vni: u32) -> Injection {
-    inject_vxlan_from(None, source, destination, vni).await
-}
-
-/// [`inject_vxlan`] from inside network namespace `netns`.
-async fn inject_vxlan_from(
-    netns: Option<&str>,
-    source: IpAddr,
-    destination: IpAddr,
-    vni: u32,
-) -> Injection {
+/// `destination`:4789, from inside network namespace `netns`.
+async fn inject_vxlan(netns: &str, source: IpAddr, destination: IpAddr, vni: u32) -> Injection {
     let (rx, drops) = (vxlan_rx_packets().await, vxlan_drops().await);
     let vni = vni.to_be_bytes();
     let mut frame = vec![0x08, 0, 0, 0, vni[1], vni[2], vni[3], 0];
@@ -761,45 +743,6 @@ async fn inject_vxlan_from(
         decapsulated: vxlan_rx_packets().await > rx,
         dropped: vxlan_drops().await == drops + 1,
     }
-}
-
-#[tokio::test]
-async fn vxlan_to_an_address_other_than_the_underlay_is_not_decapsulated() {
-    // The kernel binds the VXLAN socket to the wildcard address whatever the
-    // device's local address, so without the ingress allowlist a frame sent
-    // to any of the host's addresses lands on the overlay bridge.
-    //
-    // The harness's peer is a loopback address, so frames the bridge floods
-    // to it come straight back and the device's receive count moves on its
-    // own. A rejected frame is therefore recognised by the drop rule's
-    // counter (a drop is final: such a frame never reaches the socket); the
-    // receive count only serves as the positive control.
-    let (env, mgr, _cleanup) = fixture().await;
-    let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
-    ip(&["link", "add", INJECT_DEVICE, "type", "dummy"]).await;
-    ip(&["addr", "add", "198.51.100.1/32", "dev", INJECT_DEVICE]).await;
-    ip(&["link", "set", INJECT_DEVICE, "up"]).await;
-
-    mgr.bootstrap(env.alloc(), vec![env.peer()])
-        .await
-        .expect("bootstrap");
-
-    assert_eq!(
-        inject_vxlan(env.peer_underlay, env.local_underlay, 42).await,
-        Injection {
-            decapsulated: true,
-            dropped: false
-        },
-        "VXLAN from the peer to the underlay address must be admitted"
-    );
-    assert!(
-        inject_vxlan(other, other, 42).await.dropped,
-        "VXLAN to a non-underlay address must be dropped"
-    );
-    assert!(
-        inject_vxlan(other, env.local_underlay, 42).await.dropped,
-        "VXLAN from an unknown sender must be dropped"
-    );
 }
 
 /// Restores `net.ipv4.conf.all.rp_filter` when dropped.
@@ -826,10 +769,17 @@ fn disable_rp_filter(device: &str) -> RpFilter {
 #[tokio::test]
 async fn a_peer_address_forged_from_another_network_is_dropped() {
     // A real peer on the underlay network, and a host on another network —
-    // the public one — that claims the peer's address. The kernel would
-    // decapsulate both; only the frame that arrives where the peer is routed
-    // may reach the overlay. A frame for another VNI is no business of this
+    // the public one. The kernel binds the VXLAN socket to the wildcard
+    // address whatever the device's local address, so without the ingress
+    // rules it would decapsulate everything below: the peer's address claimed
+    // from the other network, VXLAN to the public address, and an unknown
+    // sender's VXLAN to the underlay address. Only the peer's own frame may
+    // reach the overlay. A frame for another VNI is no business of this
     // overlay's rules, whoever sends it.
+    //
+    // A rejected frame is recognised by the drop rule's counter (a drop is
+    // final: such a frame never reaches the socket); the receive count is the
+    // positive control.
     let (env, mgr, _cleanup) = fixture().await;
     let underlay: IpAddr = "10.123.45.1".parse().unwrap();
     let peer: IpAddr = "10.123.45.2".parse().unwrap();
@@ -925,7 +875,7 @@ async fn a_peer_address_forged_from_another_network_is_dropped() {
         .expect("bootstrap");
 
     assert_eq!(
-        inject_vxlan_from(Some(PEER_NETNS), peer, underlay, 42).await,
+        inject_vxlan(PEER_NETNS, peer, underlay, 42).await,
         Injection {
             decapsulated: true,
             dropped: false
@@ -933,7 +883,7 @@ async fn a_peer_address_forged_from_another_network_is_dropped() {
         "the peer's VXLAN must be admitted"
     );
     assert_eq!(
-        inject_vxlan_from(Some(FOREIGN_NETNS), peer, underlay, 42).await,
+        inject_vxlan(FOREIGN_NETNS, peer, underlay, 42).await,
         Injection {
             decapsulated: false,
             dropped: true
@@ -941,15 +891,23 @@ async fn a_peer_address_forged_from_another_network_is_dropped() {
         "the peer's address arriving from another network must be dropped"
     );
     assert_eq!(
-        inject_vxlan_from(Some(FOREIGN_NETNS), foreign, public, 42).await,
+        inject_vxlan(FOREIGN_NETNS, foreign, public, 42).await,
         Injection {
             decapsulated: false,
             dropped: true
         },
         "VXLAN to the public address must be dropped"
     );
+    assert_eq!(
+        inject_vxlan(FOREIGN_NETNS, foreign, underlay, 42).await,
+        Injection {
+            decapsulated: false,
+            dropped: true
+        },
+        "an unknown sender's VXLAN to the underlay address must be dropped"
+    );
     assert!(
-        !inject_vxlan_from(Some(FOREIGN_NETNS), foreign, public, 4242)
+        !inject_vxlan(FOREIGN_NETNS, foreign, public, 4242)
             .await
             .dropped,
         "another VNI is left to whoever uses it"
