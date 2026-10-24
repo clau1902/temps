@@ -387,3 +387,49 @@ the move is refused with the same message, naming the rule.
 3. Should the outside check for private addresses also run from Temps Cloud
    for hosted planes, so it does not depend on the control plane's own
    network?
+
+## Implementation notes (phases 0 and 1)
+
+Where the build differs from the text above, and why.
+
+- **Journal keys.** DNS records carry the ADR 031 marker with the scope
+  `{project, environment, controller "reachability"}`, not the run id: the
+  marker's controller is a static name. A pending record is found again by
+  that scope plus its name and type, which is unique per environment. A
+  custom-domain row is found by host and environment, a tunnel by its
+  deterministic name, and the DNS provider by a name picked unused at apply
+  time and stored in the run, so an interrupted run can always look up what
+  it may have created.
+- **Apply request.** `apply` takes `{plan_id, option, answers, confirmed}`.
+  `option` picks one of the stored plan's options (the plan offers several);
+  `confirmed` carries the explicit confirmation a plan option asks for when
+  the tunnel choice for the hostname is elsewhere, off, or auto-publish is
+  off (D4, ADR 058 D9).
+- **Resume** continues a waiting or interrupted run from its journal. It
+  does not recompute the fingerprint: the steps already done are recorded,
+  and each remaining step re-checks its own preconditions.
+- **Plans are rows.** `plan` stores a row under the project read permission
+  so `apply` can bind to it; rows expire after 15 minutes and the
+  reconciler purges them every minute.
+- **D8 probe ordering is not yet confirmed against the live API** (no
+  token was available while building). The recorded-response test pins the
+  behaviour assumed: 401/403 or codes 10000, 10001 and 9109 mean missing,
+  DNS code 9005 means present, and any validation error on the tunnel
+  probe means present (the recorded tunnel body, code 1003, is an
+  assumption to replace with a live capture). If Cloudflare ever validated
+  before authorizing, the failure is still safe: the tunnel or DNS step is
+  refused by Cloudflare, the run stops with that message, and undo removes
+  what was created.
+- **D8 link.** The template link fills Zone · Read and DNS · Edit; Cloudflare
+  Tunnel · Edit is a checklist line the user adds by hand.
+- **D9 scope.** The refusal covers IP access allowlists (environment and
+  project), hostname moves onto a tunnel, and the reachability plan, which
+  offers no tunnel while such a rule exists. Turning on a connector's
+  auto-publish is not yet guarded; the next allowlist change or plan names
+  the conflict.
+- **Expose your apps** (`IngressSetupPage`) still runs its steps in the
+  browser. It now uses the server token check; moving it onto server runs
+  is left for when its own tests cover the run flow.
+- **Phase 2 room.** `audience` is a column per address
+  (`project_custom_domains`, `environment_domains`); a per-address network
+  range for D5 belongs beside it.
