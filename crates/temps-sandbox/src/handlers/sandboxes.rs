@@ -527,8 +527,10 @@ impl From<SourceBody> for SandboxSource {
 #[derive(Debug, Deserialize, ToSchema, Default)]
 pub struct ResourcesBody {
     #[serde(default)]
+    #[schema(minimum = 6, maximum = 32768)]
     pub memory: Option<u64>,
     #[serde(default)]
+    #[schema(minimum = 0.01, maximum = 16.0)]
     pub vcpus: Option<f64>,
 }
 

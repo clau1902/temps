@@ -52028,7 +52028,8 @@
         "properties": {
           "memory": {
             "format": "int64",
-            "minimum": 0,
+            "maximum": 32768,
+            "minimum": 6,
             "type": [
               "integer",
               "null"
@@ -52036,6 +52037,8 @@
           },
           "vcpus": {
             "format": "double",
+            "maximum": 16,
+            "minimum": 0.01,
             "type": [
               "number",
               "null"
