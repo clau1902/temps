@@ -108,6 +108,27 @@ pub fn check_host_memory(
     Ok(())
 }
 
+/// Keep the memory a sandbox ends up with within the machine it runs on.
+///
+/// A request that leaves `memory_limit_mb` out gets the provider's default,
+/// or the operator maximum [`clamp_omitted_limits`] pinned it to; either can
+/// be larger than the host has, so it is capped at the host's memory.
+/// Memory the caller sent was already checked by [`check_host_memory`], so
+/// this only ever changes a value the caller did not choose. A no-op when
+/// the host's memory is unknown (a worker reports no figure).
+pub fn pin_omitted_memory_to_host(
+    req: &mut CreateSandboxRequest,
+    defaults: DefaultResourceLimits,
+    host_memory_mb: Option<u64>,
+) {
+    let Some(host) = host_memory_mb else {
+        return;
+    };
+    if req.memory_limit_mb.or(defaults.memory_limit_mb) > Some(host) {
+        req.memory_limit_mb = Some(host);
+    }
+}
+
 /// Refuse a request that asks for more than the operator allows.
 ///
 /// `defaults` are what the backend applies to a limit the request leaves out
@@ -372,6 +393,29 @@ mod tests {
         assert_eq!(req.cpu_limit, None);
         let err = check_requested_limits(&req, &cap(0.5), vm()).unwrap_err();
         assert!(message(err).contains("max_cpu_limit"));
+    }
+
+    #[test]
+    fn an_omitted_memory_above_the_host_is_capped_at_the_host() {
+        let defaults = DefaultResourceLimits {
+            memory_limit_mb: Some(8192),
+            ..Default::default()
+        };
+        // No operator maximum: the provider default is over the host.
+        let mut req = request(None, None, None);
+        pin_omitted_memory_to_host(&mut req, defaults, Some(3900));
+        assert_eq!(req.memory_limit_mb, Some(3900));
+        // Operator maximum above the host: pinned to it, then capped.
+        let mut req = request(None, None, None);
+        clamp_omitted_limits(&mut req, &settings(), defaults);
+        pin_omitted_memory_to_host(&mut req, defaults, Some(3000));
+        assert_eq!(req.memory_limit_mb, Some(3000));
+        // Within the host, or the host unknown: untouched.
+        let mut req = request(None, None, None);
+        pin_omitted_memory_to_host(&mut req, defaults, Some(16_384));
+        assert_eq!(req.memory_limit_mb, None);
+        pin_omitted_memory_to_host(&mut req, defaults, None);
+        assert_eq!(req.memory_limit_mb, None);
     }
 
     #[test]

@@ -2219,6 +2219,7 @@ impl SandboxService {
             // checked against the result.
             create_policy::check_host_memory(&req, host_memory_mb)?;
             create_policy::clamp_omitted_limits(&mut req, &settings, defaults);
+            create_policy::pin_omitted_memory_to_host(&mut req, defaults, host_memory_mb);
             create_policy::check_requested_limits(&req, &settings, defaults)?;
             Some(settings)
         } else {
