@@ -221,9 +221,10 @@ jobs:
       # The main commit whose binary was reused, or empty when it was built.
       reused-from: ${{ steps.binary-source.outputs.reused-from }}
     # Warm this is ~5 minutes. The ceiling is sized for a fully cold cache,
-    # which took 81 minutes the last time the cargo cache was evicted — a
-    # tighter bound would turn a slow run into a failed one.
-    timeout-minutes: 100
+    # which took 81 minutes once and 93 the next time the cargo cache was
+    # evicted (the compile alone, before the cache save and artifact upload
+    # that follow it) — a tighter bound turns a slow run into a failed one.
+    timeout-minutes: 130
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
