@@ -1771,6 +1771,7 @@ impl DomainDeliveryService {
             project_id: Some(binding.project_id),
             environment_id: Some(binding.environment_id),
             controller: Some("domain-delivery"),
+            run_id: None,
         }
     }
     fn validate_owned_scope(
@@ -2300,6 +2301,7 @@ impl DomainDeliveryService {
             project_id: Some(project_id),
             environment_id: Some(request.environment_id),
             controller: Some(DELIVERY_CONTROLLER),
+            run_id: None,
         };
         // Whether Temps added the hostname to the Bunny Pull Zone: what an
         // earlier attempt for this binding recorded, or `true` once this
