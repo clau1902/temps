@@ -377,6 +377,7 @@ mod m20261022_000001_scope_agent_secrets_to_projects;
 mod m20261022_000002_fence_revenue_subscription_events;
 mod m20261023_000001_add_overlay_network_name;
 mod m20261023_000002_add_serves_own_temps_api_to_projects;
+mod m20261024_000001_reachability;
 
 pub struct Migrator;
 
@@ -841,6 +842,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261023_000001_add_overlay_network_name::Migration),
             // Projects that are themselves a Temps console get /api/_temps and /api/otel.
             Box::new(m20261023_000002_add_serves_own_temps_api_to_projects::Migration),
+            // ADR 064: who each address is for, and the runs that make one reachable.
+            Box::new(m20261024_000001_reachability::Migration),
         ]
     }
 }

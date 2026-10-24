@@ -5015,6 +5015,7 @@ mod tests {
                             environment_id: 1,
                             domain: "worker.example.com".into(),
                             created_at: now,
+                            audience: "public".to_string(),
                         }]])
                         .append_query_results([vec![environment.clone()]])
                         .append_query_results([vec![deployment.clone()]])

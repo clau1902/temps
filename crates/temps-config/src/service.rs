@@ -6541,6 +6541,7 @@ mod tests {
                 updated_at: Utc::now(),
                 certificate_id: None,
                 service_name: None,
+                audience: "public".to_string(),
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
@@ -6558,6 +6559,7 @@ mod tests {
                 environment_id: 4,
                 domain: "hooks.example.com".into(),
                 created_at: Utc::now(),
+                audience: "public".to_string(),
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
@@ -6588,6 +6590,7 @@ mod tests {
                     updated_at: Utc::now(),
                     certificate_id: None,
                     service_name: None,
+                    audience: "public".to_string(),
                 }]])
                 .into_connection(),
         );

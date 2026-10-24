@@ -15,6 +15,10 @@ pub struct Model {
     pub environment_id: i32,
     pub domain: String,
     pub created_at: DBDateTime,
+    /// Who this address is for (ADR 064): `public`, or the reserved
+    /// `private` / `signed_in`. Defaults to `public`.
+    #[serde(default = "crate::audience::default_audience")]
+    pub audience: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

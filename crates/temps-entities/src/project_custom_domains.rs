@@ -25,6 +25,10 @@ pub struct Model {
     pub certificate_id: Option<i32>,
     /// Docker Compose service name this domain routes to (null = all services)
     pub service_name: Option<String>,
+    /// Who this address is for (ADR 064): `public`, or the reserved
+    /// `private` / `signed_in`. Defaults to `public`.
+    #[serde(default = "crate::audience::default_audience")]
+    pub audience: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

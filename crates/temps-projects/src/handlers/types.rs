@@ -1613,6 +1613,7 @@ mod tests {
             updated_at: now,
             certificate_id: None,
             service_name: None,
+            audience: "public".to_string(),
         };
         let response = CustomDomainLookupResponse::from(Some(CustomDomainWithInfo {
             custom_domain: model,

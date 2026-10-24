@@ -4425,6 +4425,7 @@ mod tests {
                 environment_id: 2,
                 domain: "shop.example.com".into(),
                 created_at: chrono::Utc::now(),
+                audience: "public".to_string(),
             }]]);
         let svc = ingress_config_service(db);
         let problem = validate_public_ingress_url(

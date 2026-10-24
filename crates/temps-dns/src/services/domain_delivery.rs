@@ -3413,6 +3413,7 @@ mod apply_resume_and_progress_tests {
             updated_at: now,
             certificate_id: None,
             service_name: None,
+            audience: "public".to_string(),
         };
         let request = request();
         assert!(DomainDeliveryService::route_unchanged(&route, 1, &request));
