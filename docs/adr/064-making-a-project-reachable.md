@@ -488,9 +488,12 @@ the move is refused with the same message, naming the rule.
 Where the build differs from the text above, and why.
 
 - **Journal keys.** DNS records carry the ADR 031 marker with the scope
-  `{project, environment, controller "reachability"}`, not the run id: the
-  marker's controller is a static name. A pending record is found again by
-  that scope plus its name and type, which is unique per environment. A
+  `{project, environment, controller "reachability"}` plus a signed
+  `run_id` (added for the D4 review fixes; a marker without one is
+  byte-for-byte what it was, so older markers still verify). The scope, not
+  the run id, decides who may change a record; the run id tells a run's own
+  write from anyone else's. A pending record is found again by its name and
+  type at the provider, which is unique per environment. A
   custom-domain row is found by host and environment, a tunnel by its
   deterministic name, and the DNS provider by a name picked unused at apply
   time and stored in the run, so an interrupted run can always look up what
@@ -528,3 +531,61 @@ Where the build differs from the text above, and why.
 - **Phase 2 room.** `audience` is a column per address
   (`project_custom_domains`, `environment_domains`); a per-address network
   range for D5 belongs beside it.
+
+## Implementation notes (phase 1 review fixes)
+
+- **Which DNS records a plan holds.** Only the record a run itself writes:
+  the direct ingress's `A`/`AAAA` at the address, in a zone Temps manages.
+  Tunnel records are ADR 058 sync's (its own marker), not the run's, so they
+  are not in the fingerprint. An existing record there that Temps does not
+  manage blocks the managed-DNS option with "remove it there, or use another
+  hostname": Temps never takes over a record, so a change step only ever
+  edits one it already manages. A provider that cannot be read when planning
+  blocks the option too ("try again in a minute") rather than planning blind.
+- **Lookup authority.** Cloudflare documents no read-after-write guarantee
+  for listing DNS records by name and type, nor tunnels by name. DNS steps
+  therefore use the two-miss rule: 30 s (the create request's timeout) plus
+  a 30 s settle delay, then two misses 30 s apart. A tunnel is never looked
+  up at Cloudflare: its lookup is the `ingress_connectors` row, which is
+  committed before Cloudflare is called (a create that fails later leaves
+  the row, `CreateError::Saved`), so it is authoritative at once, like every
+  Temps row. Lookups that cannot answer back off from 30 s, doubling to 15
+  minutes; after an hour the run shows what to check by hand.
+- **A changed record's reconcile** treats "still the before content" as a
+  miss under the same two-miss rule before retrying the write, since a lagging
+  read cannot be told from a write that did not land.
+- **Conflicts** are answered through `POST …/runs/{run_id}/decide` with
+  `{key, decision: keep|overwrite}`, journaled with the entry and audited
+  (`REACHABILITY_CONFLICT_DECIDED`). Going forward `keep` skips the step and
+  `overwrite` writes over the value there now (journaled as the new
+  *before*); the run becomes `interrupted`, to resume. While undoing (state
+  `undo_paused`) `keep` leaves it and `overwrite` restores *before*; undo
+  carries on at once. A conflict found before any write (`unwritten`) has
+  nothing for undo to put back and does not block it.
+- **Undo and DNS records.** A record the run created is removed only while
+  it still holds what the run wrote with the run's marker; gone already is
+  done. "Remove anyway" is not offered for it: Temps never deletes a record
+  it did not write. A changed record is restored with the content and the
+  run id its *before* had.
+- **Tunnels.** `deleting` is a value of `ingress_connectors.status` (a
+  plain `VARCHAR`), so no migration was needed. Marking takes the lock that
+  `ensure` and secret rotation write the row under, and the rotation error
+  write never overwrites `deleting`, so no concurrent write can revert it.
+  Sync refuses a `deleting` connector, `ensure` skips it (and deletes a
+  tunnel it created meanwhile), reconcile, node specs and secret rotation
+  leave it out, and every reconcile pass first finishes removing `deleting`
+  connectors: sync's own records for it (a zone it cannot read now is
+  retried, never skipped), then the provider tunnel when it is still the id
+  undo recorded, then the row. A run picks tunnel names unused by any
+  connector, `deleting` ones included.
+- **A tunnel serving more than the run set up.** Before marking, undo asks
+  the connector service what the tunnel publishes now (its publications and
+  what the D9 plan sends through it). Hostnames the run never journaled
+  pause undo as a conflict naming them. `keep` keeps the tunnel and, since
+  it runs on them, the DNS provider and managed zone the run created for it;
+  `overwrite` removes it anyway.
+- **A tunnel that could not be removed** stops undo there (it stays
+  `deleting` and the reconciler keeps removing it): the older steps, its DNS
+  provider above all, are what removing it needs. Other failed removals are
+  reported and the rest still attempted, as before.
+
