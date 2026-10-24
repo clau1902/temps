@@ -214,6 +214,19 @@ never shown as reachable.
     anyway, and the choice is journaled.
   - a step in `conflict` or still ambiguous blocks undo of everything before
     it, since earlier steps may depend on it, and the console says which.
+  - **a tunnel the run created stays deleted.** ADR 058 recreates a tunnel
+    that is missing at the provider for any connector that still exists,
+    so undo never deletes the provider tunnel first. It first sets the
+    connector (the ADR 058 `ingress_connectors` row, identified by its id
+    and the provider tunnel id) to `deleting` and journals that; sync and
+    reconcile skip a `deleting` connector entirely, so they never recreate
+    or republish it. Then the provider tunnel and its DNS records are
+    deleted, then the connector row. If undo is interrupted in between, the
+    reconciler finishes the deletion from the `deleting` state, never
+    reverting it. A later run that wants a tunnel creates a new connector;
+    a `deleting` one is never reused. A tunnel the run found already there
+    is never deleted: undo only reverts the hostname choice the run made on
+    it.
 - The steps move from the console (`web/src/components/nodes/ingress-setup.ts`
   runs them in the browser today) to the server, so a closed tab cannot
   leave half a setup, and the CLI and AI tools get the same behaviour.
@@ -409,6 +422,10 @@ the move is refused with the same message, naming the rule.
   address, follows no redirects, and takes no host, address or URL from the
   API (D7), so neither the API nor a DNS change can point it at another
   service on the worker's network.
+- A tunnel that undo removes stays removed: its connector is marked
+  `deleting` before the provider tunnel is touched, and ADR 058's sync never
+  recreates or republishes a `deleting` connector (D4). Without that, sync
+  would bring back a public hostname the user just took down.
 - Undo deletes only what the run recorded as created. Credentials pasted into
   a run are handled as in ADR 058: `EncryptionService`, never returned,
   audited.
