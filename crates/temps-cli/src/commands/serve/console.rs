@@ -3983,16 +3983,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // 8.6. AgentsPlugin - MUST be registered before DeploymentsPlugin so DeploymentsPlugin can
     // resolve AgentSyncService via the plugin context. If registered after, DeploymentsPlugin
     // falls back to NoOpAgentSyncService and agent sync is silently skipped on every deployment.
-    // Agent sandboxes ARE local containers. DeploymentsPlugin resolves the
-    // AgentSyncService with `get_service` and falls back to a no-op, so
-    // skipping this is safe — see the ordering note above.
-    if local_workloads {
-        debug!("Registering AgentsPlugin");
-        let agents_plugin = Box::new(AgentsPlugin::new());
-        plugin_manager.register_plugin(agents_plugin);
-    } else {
-        skipped_plugins.push("agents");
-    }
+    //
+    // Registered in EVERY profile (ADR 063). It owns the sandbox provider and
+    // the worker-node resolver the sandbox API needs. Under `control-plane`
+    // it never contacts Docker: the host half of the provider refuses every
+    // sandbox on this host with a typed error (never an unsandboxed
+    // fallback), while sandboxes on worker nodes route over their mTLS agent
+    // API exactly as on a full install.
+    debug!("Registering AgentsPlugin");
+    let agents_plugin = Box::new(AgentsPlugin::new());
+    plugin_manager.register_plugin(agents_plugin);
 
     // 8.7. AI Gateway Plugin - registers the provider-neutral AiService.
     // Application harness turns must see the sandbox provider registered by
@@ -4021,16 +4021,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     plugin_manager.register_plugin(mcp_plugin);
 
     // 8.8. SandboxPlugin - Vercel-compatible `/v1/sandbox/*` API.
-    // Consumes the shared SandboxProvider registered by AgentsPlugin.
     // Consumes the SandboxProvider AgentsPlugin registers, so it goes
-    // wherever AgentsPlugin goes.
-    if local_workloads {
-        debug!("Registering SandboxPlugin");
-        let sandbox_plugin = Box::new(SandboxPlugin::new());
-        plugin_manager.register_plugin(sandbox_plugin);
-    } else {
-        skipped_plugins.push("sandbox");
-    }
+    // wherever AgentsPlugin goes: every profile (ADR 063). Under
+    // `control-plane` placement never picks the control plane, and a create
+    // with no usable worker answers the worker-node-required problem.
+    debug!("Registering SandboxPlugin");
+    let sandbox_plugin = Box::new(SandboxPlugin::new());
+    plugin_manager.register_plugin(sandbox_plugin);
 
     // 9.1. LogAggregatorPlugin - structured log collection, storage, search, and streaming
     // Depends on database, Docker (from DeployerPlugin), and AuditLogger (from AuditPlugin).
