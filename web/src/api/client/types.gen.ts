@@ -7033,6 +7033,11 @@ export type CreateConnectorRequest = {
     values?: {
         [key: string]: unknown;
     };
+    /**
+     * Publish every worker-served hostname under the domain (the default),
+     * or only the hostnames chosen for this tunnel.
+     */
+    auto_publish?: boolean | null;
 };
 
 export type CreateConversationRequest = {
@@ -22014,6 +22019,11 @@ export type ProjectIpAccessResponse = {
     mode: IpAccessMode;
     project_id: number;
     updated_at?: string | null;
+    /**
+     * Things worth knowing about the policy that do not stop it being saved,
+     * such as addresses whose visitors arrive through a tunnel.
+     */
+    warnings?: Array<string>;
 };
 
 export type ProjectLimitOverride = {
@@ -83258,3 +83268,726 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
+/**
+ * Who an address is for.
+ */
+export type Audience = 'public' | 'private' | 'signed_in';
+
+export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
+
+/**
+ * Where an address comes from.
+ */
+export type AddressSource = 'generated' | 'environment_domain' | 'custom_domain';
+
+export type ActionKind = 'make_reachable' | 'deploy' | 'set_dns_record' | 'open_ingress' | 'open_worker' | 'wait' | 'run_command';
+
+/**
+ * What fixes it.
+ */
+export type ReachAction = {
+    /**
+     * A command to run, when that is the fix.
+     */
+    command?: string | null;
+    /**
+     * A console path, when there is a page for it.
+     */
+    href?: string | null;
+    kind: ActionKind;
+    label: string;
+};
+
+/**
+ * One address of an environment and whether its audience can reach it.
+ */
+export type AddressReachability = {
+    action?: null | ReachAction;
+    address: string;
+    audience: Audience;
+    /**
+     * The custom domain row, for a custom domain.
+     */
+    custom_domain_id?: number | null;
+    reason: string;
+    source: AddressSource;
+    state: ReachState;
+    /**
+     * How traffic gets in: `tunnel:<name>`, `direct:<node>`, or
+     * `direct:control-plane`. `None` while nothing does.
+     */
+    way_in?: string | null;
+};
+
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns';
+
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability';
+
+export type PlanStep = {
+    kind: StepKind;
+    label: string;
+};
+
+export type PlanOption = {
+    /**
+     * How many things the user does: answer, confirm, create.
+     */
+    actions: number;
+    description: string;
+    /**
+     * What the user still has to answer (ADR 058 D8 descriptor form).
+     * `address` is answered with [`ReachabilityPlan::address`] by default.
+     */
+    fields: Array<SetupField>;
+    kind: PlanOptionKind;
+    /**
+     * The first option that fits, in the ADR's preference order.
+     */
+    recommended: boolean;
+    /**
+     * Permissions applying it needs on top of `projects:write`.
+     */
+    required_permissions: Array<string>;
+    steps: Array<PlanStep>;
+    title: string;
+    /**
+     * Things worth knowing before choosing it.
+     */
+    warnings: Array<string>;
+    /**
+     * Set when the option changes what another choice decided (ADR 058
+     * D9's hostname choice): what it changes, in words. Applying it needs
+     * `confirmed: true`.
+     */
+    confirmation?: string | null;
+    /**
+     * How traffic will get in, as in [`AddressReachability::way_in`].
+     */
+    way_in: string;
+};
+
+/**
+ * Why no option fits, and what would make one.
+ */
+export type PlanBlocked = {
+    action?: null | ReachAction;
+    reason: string;
+};
+
+export type ReachabilityPlan = {
+    /**
+     * The address asked for, or the one Temps suggests.
+     */
+    address?: string | null;
+    /**
+     * Why the address cannot be used, when it cannot.
+     */
+    address_error?: string | null;
+    audience: Audience;
+    /**
+     * Set when `options` is empty.
+     */
+    blocked?: null | PlanBlocked;
+    /**
+     * In the order Temps prefers them; the first is recommended.
+     */
+    options: Array<PlanOption>;
+    /**
+     * What `apply` names to act on this plan. Plans expire after 15
+     * minutes and are applied once; `null` on the plan attached to
+     * `GET …/reachability`, which is not stored.
+     */
+    plan_id?: string | null;
+    /**
+     * A hash of what the plan depends on; `apply` recomputes it and
+     * refuses a plan the cluster has moved on from.
+     */
+    fingerprint?: string | null;
+    expires_at?: string | null;
+};
+
+/**
+ * Everything about one environment's addresses.
+ */
+export type EnvironmentReachability = {
+    addresses: Array<AddressReachability>;
+    /**
+     * Whether anything is deployed to it.
+     */
+    deployed: boolean;
+    environment_id: number;
+    environment_name: string;
+    /**
+     * What *Make it reachable* would do, while no address is reachable.
+     */
+    plan?: null | ReachabilityPlan;
+    project_id: number;
+    /**
+     * The nodes its containers run on (`control plane` for the local one).
+     */
+    running_on: Array<string>;
+    /**
+     * `reachable` when any address is.
+     */
+    state: ReachState;
+    /**
+     * One line for the header: why nothing reaches it, or where it is.
+     */
+    summary: string;
+};
+
+/**
+ * `POST …/reachability/plan`.
+ */
+export type PlanRequest = {
+    /**
+     * The hostname to make reachable; Temps suggests one without it.
+     */
+    address?: string | null;
+    audience?: Audience;
+};
+
+/**
+ * `POST …/reachability/apply`.
+ */
+export type ApplyRequest = {
+    /**
+     * The plan this acts on, from `POST …/reachability/plan`.
+     */
+    plan_id: string;
+    /**
+     * Which option of the plan to carry out.
+     */
+    option: PlanOptionKind;
+    /**
+     * Answers to the option's fields by key. `address`, when given, must be
+     * the plan's; `dns_provider_id` takes a provider id,
+     * `cloudflare_api_token` the token (held in memory for the run, never
+     * stored on it).
+     */
+    answers?: {
+        [key: string]: unknown;
+    };
+    /**
+     * The user saw and accepted the option's `confirmation`.
+     */
+    confirmed?: boolean;
+};
+
+/**
+ * `POST …/reachability/runs/{run_id}/resume`.
+ */
+export type ResumeRequest = {
+    /**
+     * `cloudflare_api_token`, when the run had not saved the account yet.
+     */
+    answers?: {
+        [key: string]: unknown;
+    };
+};
+
+export type RunState = 'running' | 'succeeded' | 'waiting' | 'failed' | 'interrupted' | 'recovering' | 'undoing' | 'undone';
+
+export type RunStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+
+export type RunStep = {
+    detail?: string | null;
+    kind: StepKind;
+    label: string;
+    status: RunStepStatus;
+};
+
+/**
+ * Something a run made, so undo removes exactly that.
+ */
+export type RunResource = {
+    id: number;
+    name: string;
+    type: 'dns_provider';
+} | {
+    domain: string;
+    provider_id: number;
+    type: 'managed_domain';
+} | {
+    domain: string;
+    provider_id: number;
+    type: 'auto_manage_enabled';
+} | {
+    id: number;
+    name: string;
+    type: 'connector';
+} | {
+    domain: string;
+    id: number;
+    type: 'custom_domain';
+} | {
+    connector_id: number;
+    hostname: string;
+    previous: PreviousChoice;
+    type: 'hostname_choice';
+} | {
+    hostname: string;
+    label: string;
+    /**
+     * `A` or `AAAA`.
+     */
+    record_type: string;
+    type: 'dns_record';
+} | {
+    domain: string;
+    type: 'certificate';
+};
+
+/**
+ * A hostname's ADR 058 D9 choice before a run changed it, so undo puts it
+ * back.
+ */
+export type PreviousChoice = {
+    mode: 'automatic';
+} | {
+    mode: 'off';
+} | {
+    connector_id: number;
+    mode: 'tunnel';
+};
+
+/**
+ * What a run set out to create, with what finds it again (ADR 064 D4):
+ * written to the journal before the call that creates it.
+ */
+export type Intent = {
+    name: string;
+    type: 'dns_provider';
+} | {
+    domain: string;
+    provider_id: number;
+    type: 'managed_domain';
+} | {
+    domain: string;
+    provider_id: number;
+    type: 'auto_manage_enabled';
+} | {
+    name: string;
+    type: 'connector';
+} | {
+    domain: string;
+    environment_id: number;
+    type: 'custom_domain';
+} | {
+    connector_id: number;
+    hostname: string;
+    previous: PreviousChoice;
+    type: 'hostname_choice';
+} | {
+    hostname: string;
+    label: string;
+    record_type: string;
+    type: 'dns_record';
+} | {
+    domain: string;
+    type: 'certificate';
+};
+
+export type JournalState = 'pending' | 'done' | 'absent';
+
+/**
+ * One entry of a run's journal.
+ */
+export type JournalEntry = {
+    at: string;
+    intent: Intent;
+    key: string;
+    resource?: null | RunResource;
+    state: JournalState;
+};
+
+/**
+ * What undoing one resource did.
+ */
+export type UndoResult = {
+    error?: string | null;
+    label: string;
+    ok: boolean;
+    resource: RunResource;
+};
+
+export type RunView = {
+    address?: string | null;
+    audience: Audience;
+    /**
+     * What the run created, oldest first: the journal's `done` entries.
+     */
+    created: Array<RunResource>;
+    /**
+     * Every step's resource, written before the call that creates it.
+     */
+    journal: Array<JournalEntry>;
+    plan_id?: string | null;
+    created_at: string;
+    environment_id?: number | null;
+    /**
+     * What went wrong or what is still missing, and what to do.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    id: number;
+    /**
+     * The address, once it is reachable.
+     */
+    live_url?: string | null;
+    option: string;
+    project_id?: number | null;
+    state: RunState;
+    steps: Array<RunStep>;
+    undo: Array<UndoResult>;
+    updated_at: string;
+};
+
+export type TokenCheckRequest = {
+    /**
+     * The token, as pasted. Used for this check only; not stored.
+     */
+    token: string;
+    /**
+     * The zone the token is meant for; the first zone it sees otherwise.
+     */
+    zone?: string | null;
+};
+
+export type PermissionState = 'present' | 'missing' | 'unverified';
+
+/**
+ * Whether the token is limited to the zone it is for.
+ */
+export type ZoneScope = {
+    detail: string;
+    ok: boolean;
+    /**
+     * How many other zones it reaches in all, listed or not.
+     */
+    other_count: number;
+    /**
+     * Zones it reaches besides `zone`, as far as Cloudflare listed them.
+     */
+    other_zones: Array<string>;
+    zone: string;
+};
+
+export type TokenPermission = 'zone_read' | 'dns_edit' | 'tunnel_edit';
+
+export type PermissionCheck = {
+    /**
+     * Why, and what to change on the token when it is missing.
+     */
+    detail: string;
+    label: string;
+    permission: TokenPermission;
+    state: PermissionState;
+};
+
+export type TokenCheckResult = {
+    /**
+     * The zone DNS Edit was tested on.
+     */
+    checked_zone?: string | null;
+    /**
+     * Why it did not, when it did not.
+     */
+    error?: string | null;
+    permissions: Array<PermissionCheck>;
+    /**
+     * Every permission is present and the token reaches only `zone`.
+     */
+    ready: boolean;
+    /**
+     * Whether it reaches only the zone asked about.
+     */
+    scope?: null | ZoneScope;
+    /**
+     * Where to create a token with the permissions filled in.
+     */
+    template_url: string;
+    /**
+     * Cloudflare accepted the token at all.
+     */
+    valid: boolean;
+    /**
+     * Zones the token sees.
+     */
+    zones: Array<string>;
+};
+
+/**
+ * Whether HTTP-01 can issue a certificate here: a direct ingress answers
+ * on port 80.
+ */
+export type CertificateMethods = {
+    http01_available: boolean;
+};
+
+export type GetEnvironmentReachabilityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability';
+};
+
+export type GetEnvironmentReachabilityErrors = {
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+};
+
+export type GetEnvironmentReachabilityResponses = {
+    200: EnvironmentReachability;
+};
+
+export type GetEnvironmentReachabilityResponse = GetEnvironmentReachabilityResponses[keyof GetEnvironmentReachabilityResponses];
+
+export type PlanEnvironmentReachabilityData = {
+    body: PlanRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/plan';
+};
+
+export type PlanEnvironmentReachabilityErrors = {
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+};
+
+export type PlanEnvironmentReachabilityResponses = {
+    200: ReachabilityPlan;
+};
+
+export type PlanEnvironmentReachabilityResponse = PlanEnvironmentReachabilityResponses[keyof PlanEnvironmentReachabilityResponses];
+
+export type ApplyEnvironmentReachabilityData = {
+    body: ApplyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/apply';
+};
+
+export type ApplyEnvironmentReachabilityErrors = {
+    /**
+     * An answer is missing or invalid
+     */
+    400: unknown;
+    /**
+     * A permission the option needs is missing
+     */
+    403: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+    /**
+     * The option no longer fits, or a run is in progress
+     */
+    409: unknown;
+};
+
+export type ApplyEnvironmentReachabilityResponses = {
+    202: RunView;
+};
+
+export type ApplyEnvironmentReachabilityResponse = ApplyEnvironmentReachabilityResponses[keyof ApplyEnvironmentReachabilityResponses];
+
+export type ListReachabilityRunsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs';
+};
+
+export type ListReachabilityRunsResponses = {
+    200: Array<RunView>;
+};
+
+export type ListReachabilityRunsResponse = ListReachabilityRunsResponses[keyof ListReachabilityRunsResponses];
+
+export type GetReachabilityRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}';
+};
+
+export type GetReachabilityRunErrors = {
+    /**
+     * Run not found
+     */
+    404: unknown;
+};
+
+export type GetReachabilityRunResponses = {
+    200: RunView;
+};
+
+export type GetReachabilityRunResponse = GetReachabilityRunResponses[keyof GetReachabilityRunResponses];
+
+export type UndoReachabilityRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/undo';
+};
+
+export type UndoReachabilityRunErrors = {
+    /**
+     * A permission or step-up confirmation is missing
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run is still going, or nothing is left to undo
+     */
+    409: unknown;
+};
+
+export type UndoReachabilityRunResponses = {
+    200: RunView;
+};
+
+export type UndoReachabilityRunResponse = UndoReachabilityRunResponses[keyof UndoReachabilityRunResponses];
+
+export type ResumeReachabilityRunData = {
+    body: ResumeRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/resume';
+};
+
+export type ResumeReachabilityRunErrors = {
+    /**
+     * The token is needed again, or is not usable
+     */
+    400: unknown;
+    /**
+     * A permission the run needs is missing
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run is going, recovering, or finished
+     */
+    409: unknown;
+};
+
+export type ResumeReachabilityRunResponses = {
+    202: RunView;
+};
+
+export type ResumeReachabilityRunResponse = ResumeReachabilityRunResponses[keyof ResumeReachabilityRunResponses];
+
+export type CheckCloudflareTokenData = {
+    body: TokenCheckRequest;
+    path?: never;
+    query?: never;
+    url: '/ingress/cloudflare/token-check';
+};
+
+export type CheckCloudflareTokenResponses = {
+    200: TokenCheckResult;
+};
+
+export type CheckCloudflareTokenResponse = CheckCloudflareTokenResponses[keyof CheckCloudflareTokenResponses];
+
+export type GetCertificateMethodsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/certificate-methods';
+};
+
+export type GetCertificateMethodsResponses = {
+    200: CertificateMethods;
+};
+
+export type GetCertificateMethodsResponse = GetCertificateMethodsResponses[keyof GetCertificateMethodsResponses];

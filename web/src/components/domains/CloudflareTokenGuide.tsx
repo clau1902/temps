@@ -5,11 +5,29 @@
 // creates it in the Cloudflare dashboard. Temps only lists zones, edits DNS
 // records and, for tunnels, manages the account's Cloudflare Tunnels.
 
-import { ExternalLink } from 'lucide-react'
+import { useMutation } from '@tanstack/react-query'
+import { CheckCircle2, CircleHelp, ExternalLink, XCircle } from 'lucide-react'
+import { useEffect } from 'react'
+import type { PermissionCheck, TokenCheckResult } from '@/api/client'
+import { checkCloudflareTokenMutation } from '@/api/client/@tanstack/react-query.gen'
+import { Skeleton } from '@/components/ui/skeleton'
+import { useDebounce } from '@/hooks/useDebounce'
 import { cn } from '@/lib/utils'
 
 export const CLOUDFLARE_API_TOKENS_URL =
   'https://dash.cloudflare.com/profile/api-tokens'
+
+/**
+ * Cloudflare's "create token" form with Zone · Zone · Read and Zone · DNS ·
+ * Edit already filled in (ADR 064 D8). Cloudflare documents no key for
+ * Account · Cloudflare Tunnel · Edit, so that one is added by hand.
+ */
+export const CLOUDFLARE_TOKEN_TEMPLATE_URL = `${CLOUDFLARE_API_TOKENS_URL}?permissionGroupKeys=${encodeURIComponent(
+  JSON.stringify([
+    { key: 'zone', type: 'read' },
+    { key: 'dns', type: 'edit' },
+  ])
+)}&accountId=*&zoneId=all&name=Temps`
 
 /** The token's permissions, in Cloudflare's own words, and what each is for. */
 export const CLOUDFLARE_TOKEN_PERMISSIONS = [
@@ -72,15 +90,126 @@ export function CloudflareTokenChecklist({
       </div>
       <a
         className="inline-flex items-center gap-0.5 text-foreground underline"
-        href={CLOUDFLARE_API_TOKENS_URL}
+        href={CLOUDFLARE_TOKEN_TEMPLATE_URL}
         target="_blank"
         rel="noreferrer"
       >
         Create it in Cloudflare
         <ExternalLink className="h-3 w-3" />
       </a>
+      <p className="text-muted-foreground">
+        The link fills in both Zone permissions
+        {tunnel === 'required'
+          ? '; add Account · Cloudflare Tunnel · Edit yourself.'
+          : '.'}
+      </p>
     </div>
   )
+}
+
+const permissionIcons = {
+  present: CheckCircle2,
+  missing: XCircle,
+  unverified: CircleHelp,
+} as const
+
+const permissionTone = {
+  present: 'text-emerald-600 dark:text-emerald-400',
+  missing: 'text-destructive',
+  unverified: 'text-amber-600 dark:text-amber-400',
+} as const
+
+/** Each permission a checked token has or lacks, and what to change. */
+export function TokenPermissionList({
+  result,
+  tunnel = 'required',
+}: {
+  result: TokenCheckResult
+  tunnel?: 'required' | 'optional'
+}) {
+  if (!result.valid)
+    return (
+      <p role="status" className="text-xs text-destructive">
+        {result.error ?? 'Cloudflare did not accept this token.'}
+      </p>
+    )
+  const shown = result.permissions.filter(
+    (p: PermissionCheck) =>
+      tunnel === 'required' || p.permission !== 'tunnel_edit'
+  )
+  return (
+    <ul role="status" className="space-y-1 text-xs">
+      {shown.map((check) => {
+        const Icon = permissionIcons[check.state]
+        return (
+          <li key={check.permission} className="flex gap-2">
+            <Icon
+              aria-hidden="true"
+              className={cn(
+                'mt-0.5 size-3.5 shrink-0',
+                permissionTone[check.state]
+              )}
+            />
+            <span>
+              <code className="rounded bg-muted px-1">{check.label}</code>{' '}
+              <span className="sr-only">{check.state}</span>
+              {check.state !== 'present' && (
+                <span className="text-muted-foreground">{check.detail}</span>
+              )}
+            </span>
+          </li>
+        )
+      })}
+      {result.scope && !result.scope.ok && (
+        <li className="flex gap-2">
+          <XCircle
+            aria-hidden="true"
+            className="mt-0.5 size-3.5 shrink-0 text-destructive"
+          />
+          <span>
+            <span className="font-medium">
+              Reaches more than {result.scope.zone}.
+            </span>{' '}
+            <span className="text-muted-foreground">{result.scope.detail}</span>
+          </span>
+        </li>
+      )}
+    </ul>
+  )
+}
+
+/**
+ * Checks a pasted token as soon as it is pasted and marks each permission
+ * present or missing. The token is sent to Temps for the check only.
+ */
+export function CloudflareTokenCheck({
+  token,
+  zone,
+  tunnel = 'required',
+}: {
+  token: string
+  zone?: string | null
+  tunnel?: 'required' | 'optional'
+}) {
+  const pasted = useDebounce(token.trim(), 400)
+  const debouncedZone = useDebounce(zone?.trim() || null, 400)
+  const check = useMutation(checkCloudflareTokenMutation())
+  const { mutate } = check
+  useEffect(() => {
+    if (pasted.length >= 20)
+      mutate({ body: { token: pasted, zone: debouncedZone } })
+  }, [pasted, debouncedZone, mutate])
+  if (pasted.length < 20) return null
+  if (check.isPending) return <Skeleton className="h-12 w-full" />
+  if (check.isError)
+    return (
+      <p role="status" className="text-xs text-muted-foreground">
+        Temps could not check the token now; it is checked again when you
+        continue.
+      </p>
+    )
+  if (!check.data) return null
+  return <TokenPermissionList result={check.data} tunnel={tunnel} />
 }
 
 export function CloudflareTokenGuide({
@@ -105,8 +234,18 @@ export function CloudflareTokenGuide({
             <ExternalLink className="h-3 w-3" />
           </a>{' '}
           in Cloudflare, then <strong>Create Token</strong> →{' '}
-          <strong>Create Custom Token</strong>. Don&apos;t use the Global API
-          Key: it can do anything on your account.
+          <strong>Create Custom Token</strong>, or{' '}
+          <a
+            className="inline-flex items-center gap-0.5 text-foreground underline"
+            href={CLOUDFLARE_TOKEN_TEMPLATE_URL}
+            target="_blank"
+            rel="noreferrer"
+          >
+            start from the filled-in form
+            <ExternalLink className="h-3 w-3" />
+          </a>
+          . Don&apos;t use the Global API Key: it can do anything on your
+          account.
         </li>
         <li>
           Permissions:

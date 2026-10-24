@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  getCertificateMethodsOptions,
   createCustomDomainMutation,
   createDomainMutation,
   getEnvironmentsOptions,
@@ -52,6 +53,7 @@ import { toast } from 'sonner'
 import { z } from 'zod'
 import { useEnterSubmit } from '@/hooks/useEnterSubmit'
 import { problemDetail } from '@/lib/api-problem'
+import { certificateChoices } from '@/lib/reachability'
 import {
   chosenTunnel,
   levelsBelow,
@@ -102,6 +104,13 @@ export function AddDomain() {
     ...allTunnelsOptions(),
     retry: false,
   })
+  // HTTP-01 needs something answering on port 80 (ADR 064 D4).
+  const certificateMethods = useQuery({
+    ...getCertificateMethodsOptions(),
+    retry: false,
+    staleTime: 60_000,
+  })
+  const http01Available = certificateMethods.data?.http01_available
   const [attachProject, setAttachProject] = useState<string>('')
   const [attachEnvironment, setAttachEnvironment] = useState<string>('')
   const projectsQuery = useQuery({
@@ -144,8 +153,14 @@ export function AddDomain() {
           } else if (domain.startsWith('*.')) {
             // Auto-select DNS-01 for wildcard domains
             form.setValue('challengeType', 'dns-01')
+          } else if (
+            http01Available === false &&
+            form.getValues('challengeType') === 'http-01'
+          ) {
+            // Nothing answers on port 80, so HTTP-01 would fail.
+            form.setValue('challengeType', 'dns-01')
           } else if (chosenTunnel(form.getValues('challengeType')) != null) {
-            form.setValue('challengeType', 'http-01')
+            form.setValue('challengeType', http01Available === false ? 'dns-01' : 'http-01')
           }
           setStep('challenge')
         }
@@ -383,6 +398,11 @@ export function AddDomain() {
                     name="challengeType"
                     render={({ field }) => {
                       const isWildcard = watchedValues.domain?.startsWith('*.')
+                      const choices = certificateChoices({
+                        coveringTunnels: covering.length,
+                        wildcard: !!isWildcard,
+                        http01Available,
+                      })
                       return (
                         <FormItem className="space-y-4">
                           <FormLabel>How it gets HTTPS</FormLabel>
@@ -453,7 +473,7 @@ export function AddDomain() {
                                   </Card>
                                 )
                               })}
-                              {!isWildcard && (
+                              {choices.showHttp01 && (
                                 <Card
                                   className={`relative cursor-pointer border-2 transition-colors ${field.value === 'http-01' ? 'border-primary' : 'border-border hover:border-primary/50'}`}
                                 >
@@ -468,7 +488,7 @@ export function AddDomain() {
                                         <Globe className="h-5 w-5 text-primary" />
                                         <div className="font-semibold">
                                           HTTP-01 Challenge
-                                          {covering.length === 0 &&
+                                          {choices.recommended === 'http-01' &&
                                             ' (Recommended)'}
                                         </div>
                                       </div>
@@ -515,6 +535,8 @@ export function AddDomain() {
                                       <Shield className="h-5 w-5 text-primary" />
                                       <div className="font-semibold">
                                         DNS-01 Challenge
+                                        {choices.recommended === 'dns-01' &&
+                                          ' (Recommended)'}
                                       </div>
                                     </div>
                                     <p className="text-sm text-muted-foreground">
@@ -545,6 +567,11 @@ export function AddDomain() {
                                   </div>
                                 </label>
                               </Card>
+                              {choices.http01Note && (
+                                <p className="text-sm text-muted-foreground">
+                                  {choices.http01Note}
+                                </p>
+                              )}
                               {covering.length === 0 &&
                                 !connectorsQuery.isLoading && (
                                   <NoTunnelYet

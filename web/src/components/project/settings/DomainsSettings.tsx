@@ -38,6 +38,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { ChevronDown, EllipsisVertical, Globe } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { EnvironmentReachabilityList } from '@/components/reachability/EnvironmentReachabilityList'
 import { AddDomainDialog } from './AddDomainDialog'
 import { EditDomainDialog } from './EditDomainDialog'
 
@@ -136,6 +137,11 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         Configure domains for your service. Each domain can be assigned to a
         specific environment and optionally set up with redirects.
       </p>
+
+      {/* An app hosted elsewhere is never served by Temps' ingress. */}
+      {project.hosting !== 'external' && project.source_type !== 'external' && (
+        <EnvironmentReachabilityList projectId={project.id} />
+      )}
 
       {isPending ? (
         <Skeleton className="h-24 w-full" />

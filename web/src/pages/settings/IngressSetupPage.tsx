@@ -45,6 +45,7 @@ import type {
   NodeInfoResponse,
 } from '@/api/client/types.gen'
 import {
+  CloudflareTokenCheck,
   CloudflareTokenChecklist,
   CloudflareTokenGuide,
 } from '@/components/domains/CloudflareTokenGuide'
@@ -820,6 +821,7 @@ function TokenForm({
                   <Input type="password" autoComplete="off" {...field} />
                 </FormControl>
                 <FormMessage />
+                <CloudflareTokenCheck token={field.value} />
               </FormItem>
             )}
           />
