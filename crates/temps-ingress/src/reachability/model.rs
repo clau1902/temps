@@ -176,6 +176,10 @@ pub enum PlanOptionKind {
     NewTunnelWithToken,
     /// A direct ingress, with a DNS record the user adds.
     DirectManualDns,
+    /// A worker's private listener, for people on a private network such
+    /// as a tailnet (ADR 064 D5): DNS points at its private address and
+    /// the certificate comes through DNS-01.
+    PrivateWorker,
 }
 
 impl PlanOptionKind {
@@ -186,6 +190,7 @@ impl PlanOptionKind {
             PlanOptionKind::NewTunnelWithToken,
             PlanOptionKind::DirectManagedDns,
             PlanOptionKind::DirectManualDns,
+            PlanOptionKind::PrivateWorker,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == value)
@@ -198,6 +203,7 @@ impl PlanOptionKind {
             PlanOptionKind::NewTunnel => "new_tunnel",
             PlanOptionKind::NewTunnelWithToken => "new_tunnel_with_token",
             PlanOptionKind::DirectManualDns => "direct_manual_dns",
+            PlanOptionKind::PrivateWorker => "private_worker",
         }
     }
 }
@@ -217,6 +223,9 @@ pub enum StepKind {
     IssueCertificate,
     WaitForPublication,
     CheckReachability,
+    /// Records who an address is for, and for a private one the network
+    /// range and the listener that serve it (ADR 064 D5).
+    SetAudience,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -326,7 +335,13 @@ pub enum RunState {
     /// The server stopped during the run; Temps is looking up what its
     /// unfinished steps made before it can be resumed or undone.
     Recovering,
+    /// A record this run changes was changed by someone else meanwhile
+    /// (ADR 064 D4): nothing touches it until a user decides.
+    Conflict,
     Undoing,
+    /// Undo stopped at a record someone else changed after this run wrote
+    /// it: skip it or restore it anyway.
+    UndoPaused,
     Undone,
 }
 
@@ -339,7 +354,9 @@ impl RunState {
             RunState::Failed => "failed",
             RunState::Interrupted => "interrupted",
             RunState::Recovering => "recovering",
+            RunState::Conflict => "conflict",
             RunState::Undoing => "undoing",
+            RunState::UndoPaused => "undo_paused",
             RunState::Undone => "undone",
         }
     }
@@ -353,6 +370,8 @@ impl RunState {
             "undoing" => RunState::Undoing,
             "undone" => RunState::Undone,
             "interrupted" => RunState::Interrupted,
+            "conflict" => RunState::Conflict,
+            "undo_paused" => RunState::UndoPaused,
             // Unknown reads as needing recovery, never as finished.
             _ => RunState::Recovering,
         }
@@ -405,6 +424,56 @@ impl PreviousChoice {
     }
 }
 
+/// A DNS record as the provider had it when Temps read it: what a run
+/// compares with before it writes, and what undo puts back (ADR 064 D4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DnsRecordState {
+    pub provider_id: i32,
+    /// The record's name within its zone (`myapp`, `@`).
+    #[serde(default)]
+    pub label: String,
+    pub record_id: Option<String>,
+    /// `A` or `AAAA`.
+    pub record_type: String,
+    pub content: String,
+    /// When the provider says it last changed.
+    pub modified_on: Option<String>,
+    /// This install's signed ownership marker covers it.
+    #[serde(default)]
+    pub managed: bool,
+    /// The run whose marker it carries.
+    #[serde(default)]
+    pub run_id: Option<i32>,
+}
+
+impl DnsRecordState {
+    /// The same record, unchanged: provider, id, type, content and
+    /// modification time.
+    pub fn unchanged_from(&self, other: &DnsRecordState) -> bool {
+        self.provider_id == other.provider_id
+            && self.record_id == other.record_id
+            && self.record_type == other.record_type
+            && self.content == other.content
+            && self.modified_on == other.modified_on
+    }
+
+    pub fn describe(&self) -> String {
+        format!("{} {}", self.record_type, self.content)
+    }
+}
+
+/// What a plan saw at a hostname it would write a record for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PlannedRecord {
+    /// No record of that type.
+    #[default]
+    Absent,
+    Present { record: DnsRecordState },
+    /// The provider could not be read when planning.
+    Unknown,
+}
+
 /// Something a run made, so undo removes exactly that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -420,13 +489,64 @@ pub enum RunResource {
         connector_id: i32,
         previous: PreviousChoice,
     },
+    /// A record the run created: undo removes it only while it still holds
+    /// `content` with this run's marker.
     DnsRecord {
         hostname: String,
         label: String,
         /// `A` or `AAAA`.
         record_type: String,
+        /// What the run wrote; absent on runs recorded before it was kept.
+        #[serde(default)]
+        content: Option<String>,
+    },
+    /// An existing record the run changed: undo puts `before` back while
+    /// it still holds `after` with this run's marker.
+    DnsChange {
+        hostname: String,
+        label: String,
+        record_type: String,
+        before: DnsRecordState,
+        after: String,
+    },
+    /// An address whose audience the run set: undo puts `before` back.
+    AddressAudience {
+        hostname: String,
+        before: AddressAudience,
+        after: AddressAudience,
     },
     Certificate { domain: String },
+}
+
+/// Who one address is for, with what bounds a private one (ADR 064 D5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+pub struct AddressAudience {
+    pub audience: Audience,
+    /// For `private`: the network range a visitor must come from.
+    #[serde(default)]
+    pub network_range: Option<String>,
+    /// For `private`: the worker whose private listener serves it.
+    #[serde(default)]
+    pub private_node_id: Option<i32>,
+    /// For `private`: that listener's address, which DNS points at and the
+    /// inside check dials.
+    #[serde(default)]
+    pub private_listener: Option<String>,
+}
+
+impl AddressAudience {
+    pub fn public() -> Self {
+        Self::default()
+    }
+
+    pub fn describe(&self) -> String {
+        match (self.audience, &self.network_range) {
+            (Audience::Private, Some(range)) => format!("private to {range}"),
+            (Audience::Private, None) => "private".to_string(),
+            (Audience::Public, _) => "public".to_string(),
+            (Audience::SignedIn, _) => "for people who sign in".to_string(),
+        }
+    }
 }
 
 impl RunResource {
@@ -444,6 +564,19 @@ impl RunResource {
                 _ => format!("Routing {hostname} through the tunnel (its earlier choice is restored on undo)"),
             },
             RunResource::DnsRecord { hostname, .. } => format!("DNS record for {hostname}"),
+            RunResource::DnsChange {
+                hostname, before, ..
+            } => format!(
+                "DNS record for {hostname} (was {}; put back on undo)",
+                before.describe()
+            ),
+            RunResource::AddressAudience {
+                hostname, before, after,
+            } => format!(
+                "{hostname} made {} (was {})",
+                after.describe(),
+                before.describe()
+            ),
             RunResource::Certificate { domain } => format!("Certificate for {domain}"),
         }
     }
@@ -473,10 +606,81 @@ pub enum Intent {
         label: String,
         record_type: String,
     },
+    /// Changes the existing record from `before` (read just before the
+    /// write) to `after`, stamped with this run's marker.
+    DnsChange {
+        hostname: String,
+        label: String,
+        record_type: String,
+        before: DnsRecordState,
+        after: String,
+    },
+    /// Found by the address row's current audience.
+    AddressAudience {
+        hostname: String,
+        before: AddressAudience,
+        after: AddressAudience,
+    },
     Certificate { domain: String },
 }
 
+/// Whether a lookup that misses proves the resource absent (ADR 064 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupAuthority {
+    /// Temps' own rows, read after the step's transaction ended.
+    Immediate,
+    /// A provider resource, or one that spans a provider and a row: a miss
+    /// counts only once `timeout` (the create request's own) plus `settle`
+    /// has passed since the step was journaled, and a second miss at least
+    /// `settle` after the first confirms it. Cloudflare documents no
+    /// read-after-write guarantee for listing DNS records by name and type
+    /// or tunnels by name, so both follow this rule.
+    Settled {
+        timeout: std::time::Duration,
+        settle: std::time::Duration,
+    },
+}
+
 impl Intent {
+    pub fn authority(&self) -> LookupAuthority {
+        use std::time::Duration;
+        match self {
+            Intent::DnsRecord { .. } | Intent::DnsChange { .. } => LookupAuthority::Settled {
+                timeout: Duration::from_secs(30),
+                settle: Duration::from_secs(30),
+            },
+            // A tunnel is found by its Temps row, which is committed
+            // before Temps asks Cloudflare for anything: a create refused
+            // before the row made nothing at Cloudflare, and one that got
+            // further leaves the row (CreateError::Saved). Cloudflare's own
+            // list by name is never what the run relies on.
+            _ => LookupAuthority::Immediate,
+        }
+    }
+
+    /// What a person checks by hand when the lookup cannot tell.
+    pub fn check_by_hand(&self) -> String {
+        match self {
+            Intent::Connector { name } => format!(
+                "Check whether a tunnel named `temps-{name}-…` exists in Cloudflare (Zero \
+                 Trust → Networks → Tunnels)."
+            ),
+            Intent::DnsRecord {
+                hostname,
+                record_type,
+                ..
+            }
+            | Intent::DnsChange {
+                hostname,
+                record_type,
+                ..
+            } => format!(
+                "Check the {record_type} record for `{hostname}` at your DNS provider."
+            ),
+            other => format!("Check whether {} exists.", other.describe()),
+        }
+    }
+
     /// The idempotency key: the same for every attempt of the step.
     pub fn key(&self, run_id: i32) -> String {
         let what = match self {
@@ -492,9 +696,11 @@ impl Intent {
                 format!("custom_domain/{environment_id}/{domain}")
             }
             Intent::HostnameChoice { hostname, .. } => format!("hostname_choice/{hostname}"),
-            Intent::DnsRecord { hostname, record_type, .. } => {
+            Intent::DnsRecord { hostname, record_type, .. }
+            | Intent::DnsChange { hostname, record_type, .. } => {
                 format!("dns_record/{hostname}/{record_type}")
             }
+            Intent::AddressAudience { hostname, .. } => format!("audience/{hostname}"),
             Intent::Certificate { domain } => format!("certificate/{domain}"),
         };
         format!("run-{run_id}/{what}")
@@ -511,6 +717,12 @@ impl Intent {
                 format!("Publishing {hostname} through the tunnel")
             }
             Intent::DnsRecord { hostname, .. } => format!("DNS record for {hostname}"),
+            Intent::DnsChange {
+                hostname, after, record_type, ..
+            } => format!("{record_type} record for {hostname} set to {after}"),
+            Intent::AddressAudience { hostname, after, .. } => {
+                format!("{hostname} made {}", after.describe())
+            }
             Intent::Certificate { domain } => format!("Certificate for {domain}"),
         }
     }
@@ -523,8 +735,32 @@ pub enum JournalState {
     Pending,
     /// Created; `resource` says what.
     Done,
-    /// A lookup after the call found it was never created.
+    /// A lookup after the call found it was never created, or undo
+    /// removed it.
     Absent,
+    /// A record the run changes holds a value neither it nor its `before`
+    /// had: someone else wrote it. Nothing touches it until a user decides.
+    Conflict,
+}
+
+/// A user's answer to a conflict (ADR 064 D4), journaled with the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    /// Keep the value someone else wrote: the run, or its undo, leaves the
+    /// record alone.
+    Keep,
+    /// Let Temps write it: set it again (a run) or restore what was there
+    /// before (undo).
+    Overwrite,
+}
+
+/// `POST …/reachability/runs/{run_id}/decide`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct DecideRequest {
+    /// The journal entry in conflict.
+    pub key: String,
+    pub decision: Decision,
 }
 
 /// One entry of a run's journal.
@@ -536,6 +772,65 @@ pub struct JournalEntry {
     pub resource: Option<RunResource>,
     #[schema(value_type = String, format = DateTime)]
     pub at: temps_core::DBDateTime,
+    /// When the entry was written `pending`, so a lookup knows how long the
+    /// call has had.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub pending_since: Option<temps_core::DBDateTime>,
+    /// The first lookup that missed; a second one a settle delay later
+    /// confirms the miss.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub first_miss_at: Option<temps_core::DBDateTime>,
+    /// Lookups that could not answer, for the backoff.
+    #[serde(default)]
+    pub failed_lookups: u32,
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub next_lookup_at: Option<temps_core::DBDateTime>,
+    /// For a `conflict`: what the record holds now, in words.
+    #[serde(default)]
+    pub conflict: Option<String>,
+    /// The user's answer while the run was going forward.
+    #[serde(default)]
+    pub decision: Option<Decision>,
+    /// The user's answer while undoing: `keep` skips it, `overwrite`
+    /// restores what was there before anyway.
+    #[serde(default)]
+    pub undo_decision: Option<Decision>,
+    /// Undo marked this tunnel `deleting` (ADR 064 D4): from here it is
+    /// only ever finished, never reverted nor reused.
+    #[serde(default)]
+    pub deleting: bool,
+    /// The provider tunnel id the connector had when it was marked.
+    #[serde(default)]
+    pub tunnel_id: Option<String>,
+    /// A conflict found before the write: Temps wrote nothing, so undo has
+    /// nothing to put back for it.
+    #[serde(default)]
+    pub unwritten: bool,
+}
+
+impl JournalEntry {
+    pub fn pending(key: String, intent: Intent, now: temps_core::DBDateTime) -> Self {
+        Self {
+            key,
+            intent,
+            state: JournalState::Pending,
+            resource: None,
+            at: now,
+            pending_since: Some(now),
+            first_miss_at: None,
+            failed_lookups: 0,
+            next_lookup_at: None,
+            conflict: None,
+            decision: None,
+            undo_decision: None,
+            deleting: false,
+            tunnel_id: None,
+            unwritten: false,
+        }
+    }
 }
 
 /// What undoing one resource did.

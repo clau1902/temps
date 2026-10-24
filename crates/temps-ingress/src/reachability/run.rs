@@ -23,6 +23,18 @@
 //!   `waiting` with everything kept: nothing is wrong, it is not live yet.
 //! - Undo never touches what the run found already there; it is not in the
 //!   journal. A hostname choice the run changed is put back as it was.
+//!
+//! Records someone else may change (ADR 064 D4, third review): before a DNS
+//! write the run reads the record and compares it with what the plan saw;
+//! changed, it writes nothing and stops in `conflict` naming the new value.
+//! A change to an existing record journals the value read just before the
+//! write and the value it intends, and stamps the run's id into the record's
+//! ownership marker. A lookup that misses proves the resource absent only
+//! where the lookup is authoritative ([`LookupAuthority`]); otherwise the
+//! entry stays pending and is never created twice. Undo puts a changed
+//! record back only while it still holds exactly what this run wrote, and
+//! stops at anything it cannot account for: nothing older is undone past
+//! it until the user decides ([`decide`]).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -31,9 +43,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    AddressReachability, Intent, JournalEntry, JournalState, PlanOptionKind, PlanStep,
-    PreviousChoice, ReachState, RunResource, RunState, RunStep, RunStepStatus, StepKind,
-    UndoResult,
+    AddressAudience, AddressReachability, Decision, DnsRecordState, Intent, JournalEntry,
+    JournalState, LookupAuthority, PlanOptionKind, PlanStep, PlannedRecord, PreviousChoice,
+    ReachState, RunResource, RunState, RunStep, RunStepStatus, StepKind, UndoResult,
 };
 use super::plan::NamedId;
 use super::token_check::TokenCheckResult;
@@ -80,7 +92,17 @@ pub trait RunOps: Send + Sync {
         node_ids: &[i32],
     ) -> Result<(i32, TunnelStatus), (Option<i32>, String)>;
     async fn tunnel_status(&self, id: i32) -> Result<TunnelStatus, String>;
-    async fn delete_tunnel(&self, id: i32) -> Result<(), String>;
+    /// Marks the connector `id` named `name` `deleting`, so sync never
+    /// recreates it; returns its provider tunnel id. `Ok(None)` when it is
+    /// gone already.
+    async fn mark_tunnel_deleting(&self, id: i32, name: &str) -> Result<Option<String>, String>;
+    /// Every hostname connector `id` publishes, or sync would publish
+    /// through it now (ADR 058 D9, `auto_publish` included).
+    async fn tunnel_hostnames(&self, id: i32) -> Result<Vec<String>, String>;
+    /// Removes a `deleting` connector: sync's own records for it, its
+    /// tunnel (when it is still `tunnel_id`), its row. Gone already is
+    /// done.
+    async fn delete_tunnel(&self, id: i32, tunnel_id: Option<&str>) -> Result<(), String>;
     /// The custom domain with this hostname: `(id, environment id)`.
     async fn find_custom_domain(&self, host: &str) -> Result<Option<(i32, i32)>, String>;
     async fn attach_domain(
@@ -101,8 +123,21 @@ pub trait RunOps: Send + Sync {
     ) -> Result<(), String>;
     /// ADR 058 D9's state and detail.
     async fn hostname_state(&self, host: &str) -> Result<(String, String), String>;
-    /// Creates the record; returns its label, for undo.
-    async fn set_dns_record(&self, host: &str, ip: IpAddr) -> Result<String, String>;
+    /// The `record_type` record at `host` as its DNS provider has it now.
+    async fn read_dns_record(
+        &self,
+        host: &str,
+        record_type: &str,
+    ) -> Result<Option<DnsRecordState>, String>;
+    /// Creates the record, or changes the one Temps already manages, to
+    /// `content`, with `run_id` in its ownership marker. Returns its label.
+    async fn write_dns_record(
+        &self,
+        host: &str,
+        record_type: &str,
+        content: &str,
+        run_id: Option<i32>,
+    ) -> Result<String, WriteError>;
     async fn remove_dns_record(
         &self,
         host: &str,
@@ -110,14 +145,59 @@ pub trait RunOps: Send + Sync {
         record_type: &str,
     ) -> Result<(), String>;
     async fn certificate_exists(&self, host: &str) -> Result<bool, String>;
-    /// Creates the certificate's record; issuing it is [`Self::finish_certificate`].
-    async fn start_certificate(&self, host: &str) -> Result<(), String>;
+    /// Creates the certificate's record, validated by `challenge`
+    /// (`http-01` or `dns-01`); issuing it is [`Self::finish_certificate`].
+    async fn start_certificate(&self, host: &str, challenge: &str) -> Result<(), String>;
     async fn finish_certificate(&self, host: &str, email: &str) -> Result<(), String>;
     async fn delete_certificate(&self, host: &str) -> Result<(), String>;
     async fn resolve(&self, host: &str) -> Vec<IpAddr>;
     async fn reachability(&self, host: &str) -> AddressReachability;
+    /// Who `host` is for now, on the environment it is attached to.
+    async fn address_audience(&self, host: &str) -> Result<Option<AddressAudience>, String>;
+    /// Sets who `host` is for (ADR 064 D5).
+    async fn set_address_audience(
+        &self,
+        host: &str,
+        audience: &AddressAudience,
+    ) -> Result<(), String>;
     async fn sleep(&self, duration: Duration);
 }
+
+/// A write that failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteError {
+    pub message: String,
+    /// The provider may have applied it anyway (a timeout, a dropped
+    /// connection, a server error); `false` when it refused outright.
+    pub maybe_applied: bool,
+}
+
+impl WriteError {
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            maybe_applied: false,
+        }
+    }
+
+    pub fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            maybe_applied: true,
+        }
+    }
+}
+
+/// How long the backoff waits after `failures` lookups that could not
+/// answer: 30 s doubling, at most 15 minutes.
+pub fn lookup_backoff(failures: u32) -> Duration {
+    let base = 30u64.saturating_mul(1u64 << failures.saturating_sub(1).min(5));
+    Duration::from_secs(base.min(15 * 60))
+}
+
+/// After this long an entry Temps still cannot resolve is shown with what
+/// to check by hand.
+pub const CHECK_BY_HAND_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// Where a run's progress goes after every change.
 #[async_trait]
@@ -125,6 +205,27 @@ pub trait RunSink: Send + Sync {
     /// `Err` when it could not be stored. Before a creating call that means
     /// the call is not made.
     async fn save(&self, record: &RunRecord) -> Result<(), String>;
+}
+
+/// Where undo journals a step before the provider call it depends on.
+#[async_trait]
+pub trait JournalSink: Send + Sync {
+    async fn save_journal(&self, journal: &[JournalEntry]) -> Result<(), String>;
+}
+
+/// Journals through a [`RunSink`], for undo inside a run.
+struct RecordJournal<'a> {
+    sink: &'a dyn RunSink,
+    record: tokio::sync::Mutex<RunRecord>,
+}
+
+#[async_trait]
+impl JournalSink for RecordJournal<'_> {
+    async fn save_journal(&self, journal: &[JournalEntry]) -> Result<(), String> {
+        let mut record = self.record.lock().await;
+        record.journal = journal.to_vec();
+        self.sink.save(&record).await
+    }
 }
 
 /// How long the run waits for what happens elsewhere.
@@ -191,6 +292,17 @@ pub struct RunInput {
     pub direct: Option<(String, IpAddr)>,
     /// For Let's Encrypt; the signed-in user's.
     pub acme_email: Option<String>,
+    /// The `direct` record's type at `address` as the plan saw it: what
+    /// the run compares with before it writes (ADR 064 D4).
+    #[serde(default)]
+    pub dns_before: PlannedRecord,
+    /// `dns-01` for a private address no CA can reach; `http-01` otherwise.
+    #[serde(default)]
+    pub certificate_challenge: Option<String>,
+    /// For a private address: who it is for once the run is done, and who
+    /// it was for before.
+    #[serde(default)]
+    pub audience: Option<(AddressAudience, AddressAudience)>,
 }
 
 /// The run as stored.
@@ -236,6 +348,14 @@ impl RunRecord {
             .iter()
             .any(|e| e.state == JournalState::Pending)
     }
+
+    /// Entries waiting for a user's decision.
+    pub fn conflicts(&self) -> Vec<&JournalEntry> {
+        self.journal
+            .iter()
+            .filter(|e| e.state == JournalState::Conflict)
+            .collect()
+    }
 }
 
 /// The `done` entries' resources, oldest first.
@@ -247,28 +367,275 @@ pub fn created(journal: &[JournalEntry]) -> Vec<RunResource> {
         .collect()
 }
 
-/// Resolve every `pending` entry by looking its resource up. `Err` keeps
-/// an entry pending: Temps could not tell, so it does not guess.
+/// What looking an intent up found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Found {
+    Made(RunResource),
+    Missing,
+    /// It holds something neither the run nor what it replaced had.
+    Changed(String),
+}
+
+fn describe_record(current: Option<&DnsRecordState>) -> String {
+    match current {
+        Some(record) if record.managed => format!("{} (set by Temps)", record.describe()),
+        Some(record) => format!("{} (not set by Temps)", record.describe()),
+        None => "no record".to_string(),
+    }
+}
+
+/// The record holds what this run wrote: `content`, with its marker.
+fn holds_this_run(record: &DnsRecordState, content: &str, run_id: i32) -> bool {
+    record.managed && record.content == content && record.run_id == Some(run_id)
+}
+
+async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, String> {
+    match intent {
+        Intent::DnsRecord {
+            hostname,
+            record_type,
+            ..
+        } => Ok(match ops.read_dns_record(hostname, record_type).await? {
+            None => Found::Missing,
+            Some(record) if record.managed && record.run_id == Some(run_id) => {
+                Found::Made(RunResource::DnsRecord {
+                    hostname: hostname.clone(),
+                    label: record.label,
+                    record_type: record_type.clone(),
+                    content: Some(record.content),
+                })
+            }
+            Some(other) => Found::Changed(describe_record(Some(&other))),
+        }),
+        Intent::DnsChange {
+            hostname,
+            label,
+            record_type,
+            before,
+            after,
+        } => Ok(match ops.read_dns_record(hostname, record_type).await? {
+            Some(record) if holds_this_run(&record, after, run_id) => {
+                Found::Made(RunResource::DnsChange {
+                    hostname: hostname.clone(),
+                    label: label.clone(),
+                    record_type: record_type.clone(),
+                    before: before.clone(),
+                    after: after.clone(),
+                })
+            }
+            // Still what it was before the write: the write did not happen.
+            Some(record) if record.unchanged_from(before) => Found::Missing,
+            other => Found::Changed(describe_record(other.as_ref())),
+        }),
+        other => Ok(match ops.find(other).await? {
+            Some(resource) => Found::Made(resource),
+            None => Found::Missing,
+        }),
+    }
+}
+
+/// What resolving a pending entry decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    Done,
+    Absent,
+    /// Temps cannot tell yet.
+    Pending,
+    Conflict,
+}
+
+fn chrono_of(duration: Duration) -> chrono::Duration {
+    chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
+}
+
+/// Look a pending entry up at `now` and record what it found. A miss
+/// proves absence only where the lookup is authoritative: at once for
+/// Temps' own rows; for a provider's records only once the create call's
+/// timeout and a settle delay have passed and a second miss a settle delay
+/// after the first confirms it. A lookup that cannot answer backs off.
+pub async fn resolve_pending(
+    entry: &mut JournalEntry,
+    ops: &dyn RunOps,
+    run_id: i32,
+    now: temps_core::DBDateTime,
+) -> Resolution {
+    if entry.state != JournalState::Pending {
+        return match entry.state {
+            JournalState::Done => Resolution::Done,
+            JournalState::Absent => Resolution::Absent,
+            _ => Resolution::Conflict,
+        };
+    }
+    if entry.next_lookup_at.is_some_and(|at| at > now) {
+        return Resolution::Pending;
+    }
+    let found = match look(ops, run_id, &entry.intent).await {
+        Ok(found) => found,
+        Err(error) => {
+            entry.failed_lookups = entry.failed_lookups.saturating_add(1);
+            entry.next_lookup_at = Some(now + chrono_of(lookup_backoff(entry.failed_lookups)));
+            entry.conflict = Some(format!("The last check could not answer: {error}"));
+            return Resolution::Pending;
+        }
+    };
+    entry.failed_lookups = 0;
+    entry.next_lookup_at = None;
+    entry.conflict = None;
+    match found {
+        Found::Made(resource) => {
+            entry.state = JournalState::Done;
+            entry.resource = Some(resource);
+            entry.first_miss_at = None;
+            entry.at = now;
+            Resolution::Done
+        }
+        Found::Changed(current) => {
+            entry.state = JournalState::Conflict;
+            entry.conflict = Some(current);
+            entry.at = now;
+            Resolution::Conflict
+        }
+        Found::Missing => match entry.intent.authority() {
+            LookupAuthority::Immediate => {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                Resolution::Absent
+            }
+            LookupAuthority::Settled { timeout, settle } => {
+                let since = entry.pending_since.unwrap_or(entry.at);
+                if now < since + chrono_of(timeout + settle) {
+                    // Too soon for a miss to mean anything.
+                    return Resolution::Pending;
+                }
+                match entry.first_miss_at {
+                    None => {
+                        entry.first_miss_at = Some(now);
+                        Resolution::Pending
+                    }
+                    Some(first) if now >= first + chrono_of(settle) => {
+                        entry.state = JournalState::Absent;
+                        entry.at = now;
+                        Resolution::Absent
+                    }
+                    Some(_) => Resolution::Pending,
+                }
+            }
+        },
+    }
+}
+
+/// What a reconcile pass left.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    pub resolved: usize,
+    /// Entries Temps still cannot tell about.
+    pub pending: usize,
+    pub conflicts: usize,
+    /// Pending for more than [`CHECK_BY_HAND_AFTER`]: what to check.
+    pub check_by_hand: Vec<String>,
+    /// Why the last lookups could not answer.
+    pub errors: Vec<String>,
+}
+
+/// Resolve every `pending` entry ([`resolve_pending`]). An entry Temps
+/// cannot tell about stays pending: it does not guess.
 pub async fn reconcile_journal(
     journal: &mut [JournalEntry],
     ops: &dyn RunOps,
-) -> Result<usize, String> {
-    let mut resolved = 0;
+    run_id: i32,
+    now: temps_core::DBDateTime,
+) -> Reconciled {
+    let mut out = Reconciled::default();
     for entry in journal.iter_mut() {
         if entry.state != JournalState::Pending {
+            out.conflicts += usize::from(entry.state == JournalState::Conflict);
             continue;
         }
-        match ops.find(&entry.intent).await? {
-            Some(resource) => {
-                entry.state = JournalState::Done;
-                entry.resource = Some(resource);
+        match resolve_pending(entry, ops, run_id, now).await {
+            Resolution::Done | Resolution::Absent => out.resolved += 1,
+            Resolution::Conflict => {
+                out.resolved += 1;
+                out.conflicts += 1;
             }
-            None => entry.state = JournalState::Absent,
+            Resolution::Pending => {
+                out.pending += 1;
+                if let Some(error) = entry.conflict.clone() {
+                    out.errors.push(error);
+                }
+                let since = entry.pending_since.unwrap_or(entry.at);
+                if now - since >= chrono_of(CHECK_BY_HAND_AFTER) {
+                    out.check_by_hand.push(entry.intent.check_by_hand());
+                }
+            }
         }
-        entry.at = chrono::Utc::now();
-        resolved += 1;
     }
-    Ok(resolved)
+    out
+}
+
+/// Answer a conflict (ADR 064 D4). While undoing, `keep` leaves the record
+/// as someone else set it and `overwrite` restores what was there before;
+/// otherwise `keep` skips the step and `overwrite` takes the value there
+/// now as the one to change. The decision is journaled with the entry.
+pub fn decide(
+    journal: &mut [JournalEntry],
+    key: &str,
+    decision: Decision,
+    undoing: bool,
+) -> Result<(), String> {
+    let entry = journal
+        .iter_mut()
+        .find(|e| e.key == key)
+        .ok_or_else(|| format!("This run has no step `{key}`."))?;
+    if entry.state != JournalState::Conflict {
+        return Err(format!(
+            "{} is not waiting for a decision.",
+            entry.intent.describe()
+        ));
+    }
+    if undoing && decision == Decision::Overwrite && matches!(entry.intent, Intent::DnsRecord { .. })
+    {
+        // Removing a record needs this run's marker on it (ADR 064 D4).
+        return Err(format!(
+            "Temps never deletes a DNS record it did not write, and {} now holds {}, which this \
+             run did not set. Keep it, or remove it yourself at your DNS provider.",
+            entry.intent.describe(),
+            entry.conflict.as_deref().unwrap_or("something else")
+        ));
+    }
+    entry.at = chrono::Utc::now();
+    if undoing {
+        entry.undo_decision = Some(decision);
+        // A change whose outcome was in conflict before undo started has
+        // its before state in the intent: that is what restoring writes.
+        if decision == Decision::Overwrite && entry.resource.is_none() && !entry.unwritten {
+            if let Intent::DnsChange {
+                hostname,
+                label,
+                record_type,
+                before,
+                after,
+            } = &entry.intent
+            {
+                entry.resource = Some(RunResource::DnsChange {
+                    hostname: hostname.clone(),
+                    label: label.clone(),
+                    record_type: record_type.clone(),
+                    before: before.clone(),
+                    after: after.clone(),
+                });
+            }
+        }
+        // Restoring needs what it would restore; a record the run never
+        // wrote has nothing to put back, and is left as it is.
+        entry.state = match (decision, &entry.resource) {
+            (Decision::Overwrite, Some(_)) => JournalState::Done,
+            _ => JournalState::Absent,
+        };
+    } else {
+        entry.decision = Some(decision);
+        entry.state = JournalState::Absent;
+    }
+    Ok(())
 }
 
 enum Outcome {
@@ -277,6 +644,9 @@ enum Outcome {
     Failed(String),
     /// Nothing is wrong, but it is not there yet.
     Stalled(String),
+    /// Someone else changed what the step changes: nothing is touched
+    /// until a user decides.
+    Conflict(String),
 }
 
 /// Whether a journaled step has to make its call.
@@ -285,6 +655,24 @@ enum Begin {
     Have(RunResource),
     /// The pending entry is stored; make the call.
     Go,
+}
+
+/// Why a journaled step cannot make its call.
+enum Hold {
+    Failed(String),
+    /// An earlier attempt may have made it; Temps cannot tell yet.
+    Wait(String),
+    Conflict(String),
+}
+
+impl From<Hold> for Outcome {
+    fn from(hold: Hold) -> Self {
+        match hold {
+            Hold::Failed(error) => Outcome::Failed(error),
+            Hold::Wait(reason) => Outcome::Stalled(reason),
+            Hold::Conflict(reason) => Outcome::Conflict(reason),
+        }
+    }
 }
 
 struct Context {
@@ -299,6 +687,34 @@ struct Runner<'a> {
     timing: Timing,
     record: RunRecord,
     ctx: Context,
+}
+
+/// Why a step waits for an earlier attempt's outcome.
+fn wait_message(entry: &JournalEntry, now: temps_core::DBDateTime) -> String {
+    format!(
+        "An earlier attempt may have made {} already, and Temps cannot tell yet{}. It never \
+         makes it twice: it checks again every minute; resume once it has.{}",
+        entry.intent.describe(),
+        entry
+            .conflict
+            .as_deref()
+            .map(|e| format!(" ({e})"))
+            .unwrap_or_default(),
+        if now - entry.pending_since.unwrap_or(entry.at) >= chrono_of(CHECK_BY_HAND_AFTER) {
+            format!(" {}", entry.intent.check_by_hand())
+        } else {
+            String::new()
+        }
+    )
+}
+
+fn conflict_message(entry: &JournalEntry) -> String {
+    format!(
+        "{} was changed by someone else while this run was working on it: it is now {}. \
+         Temps leaves it alone until you decide: keep that value, or let Temps set it.",
+        entry.intent.describe(),
+        entry.conflict.as_deref().unwrap_or("something else")
+    )
 }
 
 fn record_type(ip: IpAddr) -> &'static str {
@@ -334,47 +750,68 @@ impl Runner<'_> {
     }
 
     /// Before a creating call: reuse what an earlier attempt made, else
-    /// store a pending entry. Nothing is called when that cannot be stored.
-    async fn begin(&mut self, intent: &Intent) -> Result<Begin, String> {
+    /// store a pending entry. Nothing is called when that cannot be stored,
+    /// nor while an earlier attempt's outcome is unknown.
+    async fn begin(&mut self, intent: &Intent) -> Result<Begin, Hold> {
         let key = intent.key(self.input.run_id);
         let now = chrono::Utc::now();
         match self.record.journal.iter().position(|e| e.key == key) {
             Some(at) => {
-                let entry = &self.record.journal[at];
+                let run_id = self.input.run_id;
+                let entry = &mut self.record.journal[at];
+                if entry.deleting {
+                    return Err(Hold::Failed(format!(
+                        "Undo has started removing {}, and a tunnel being removed is never \
+                         reused. Undo this run again to finish, then make it reachable again.",
+                        intent.describe()
+                    )));
+                }
                 match (entry.state, entry.resource.clone()) {
                     (JournalState::Done, Some(resource)) => return Ok(Begin::Have(resource)),
                     (JournalState::Pending, _) => {
-                        if let Some(resource) = self.ops.find(intent).await.map_err(|error| {
-                            format!(
-                                "An earlier attempt at this step may have made {} already, and \
-                                 Temps could not check: {error} Try again in a minute.",
-                                intent.describe()
-                            )
-                        })? {
-                            self.finish(&key, Some(resource.clone())).await;
-                            return Ok(Begin::Have(resource));
+                        let resolution = resolve_pending(entry, self.ops, run_id, now).await;
+                        let entry = entry.clone();
+                        self.save().await;
+                        match resolution {
+                            Resolution::Done => {
+                                if let Some(resource) = entry.resource {
+                                    return Ok(Begin::Have(resource));
+                                }
+                            }
+                            Resolution::Absent => {}
+                            Resolution::Pending => return Err(Hold::Wait(wait_message(&entry, now))),
+                            Resolution::Conflict => {
+                                return Err(Hold::Conflict(conflict_message(&entry)))
+                            }
                         }
+                    }
+                    (JournalState::Conflict, _) => {
+                        return Err(Hold::Conflict(conflict_message(entry)))
                     }
                     _ => {}
                 }
                 let entry = &mut self.record.journal[at];
+                entry.intent = intent.clone();
                 entry.state = JournalState::Pending;
                 entry.resource = None;
                 entry.at = now;
+                entry.pending_since = Some(now);
+                entry.first_miss_at = None;
+                entry.failed_lookups = 0;
+                entry.next_lookup_at = None;
+                entry.conflict = None;
+                entry.unwritten = false;
             }
-            None => self.record.journal.push(JournalEntry {
-                key: key.clone(),
-                intent: intent.clone(),
-                state: JournalState::Pending,
-                resource: None,
-                at: now,
-            }),
+            None => self
+                .record
+                .journal
+                .push(JournalEntry::pending(key.clone(), intent.clone(), now)),
         }
         self.sink.save(&self.record).await.map_err(|error| {
-            format!(
+            Hold::Failed(format!(
                 "Temps could not record that it is about to create {}, so it did not: {error}",
                 intent.describe()
-            )
+            ))
         })?;
         Ok(Begin::Go)
     }
@@ -393,17 +830,210 @@ impl Runner<'_> {
         self.save().await;
     }
 
-    /// After a failed call: it may have made something anyway, so look.
-    async fn finish_failed(&mut self, intent: &Intent) {
+    /// After a failed call: it may have made something anyway, so look,
+    /// unless the provider refused it outright. What cannot be told yet
+    /// stays pending; undo stops there and the reconciler resolves it.
+    async fn finish_failed(&mut self, intent: &Intent, maybe_applied: bool) {
         let key = intent.key(self.input.run_id);
-        match self.ops.find(intent).await {
-            Ok(found) => self.finish(&key, found).await,
-            // Left pending; the reconciler resolves it before undo.
-            Err(error) => tracing::warn!(
-                run = self.input.run_id,
-                "could not tell whether {} was created: {error}",
-                intent.describe()
-            ),
+        if !maybe_applied {
+            return self.finish(&key, None).await;
+        }
+        let run_id = self.input.run_id;
+        if let Some(entry) = self.record.journal.iter_mut().find(|e| e.key == key) {
+            let resolution = resolve_pending(entry, self.ops, run_id, chrono::Utc::now()).await;
+            if resolution == Resolution::Pending {
+                tracing::warn!(
+                    run = run_id,
+                    "could not tell yet whether {} was created",
+                    intent.describe()
+                );
+            }
+        }
+        self.save().await;
+    }
+
+    /// Resolve the pending entry under `key`, if there is one.
+    async fn settle(&mut self, key: &str) -> Resolution {
+        let run_id = self.input.run_id;
+        let Some(entry) = self.record.journal.iter_mut().find(|e| e.key == key) else {
+            return Resolution::Absent;
+        };
+        let resolution = resolve_pending(entry, self.ops, run_id, chrono::Utc::now()).await;
+        self.save().await;
+        resolution
+    }
+
+    /// Point `host` at `ip` (ADR 064 D4): read the record just before
+    /// writing, write nothing when it is not what the plan saw, journal a
+    /// change with the value it replaces.
+    async fn set_dns_record(&mut self, host: &str, ip: IpAddr) -> Outcome {
+        let run_id = self.input.run_id;
+        let kind = record_type(ip).to_string();
+        let content = ip.to_string();
+        let key = Intent::DnsRecord {
+            hostname: host.to_string(),
+            label: String::new(),
+            record_type: kind.clone(),
+        }
+        .key(run_id);
+        let done = Outcome::Done(Some(format!("{host} points at {ip}.")));
+        let mut decision = None;
+        if let Some(entry) = self.record.journal.iter().find(|e| e.key == key).cloned() {
+            decision = entry.decision;
+            match self.settle(&key).await {
+                Resolution::Done => return done,
+                Resolution::Absent => {}
+                Resolution::Pending => {
+                    let entry = self
+                        .record
+                        .journal
+                        .iter()
+                        .find(|e| e.key == key)
+                        .cloned()
+                        .unwrap_or(entry);
+                    return Outcome::Stalled(wait_message(&entry, chrono::Utc::now()));
+                }
+                Resolution::Conflict => {
+                    let entry = self
+                        .record
+                        .journal
+                        .iter()
+                        .find(|e| e.key == key)
+                        .cloned()
+                        .unwrap_or(entry);
+                    return Outcome::Conflict(conflict_message(&entry));
+                }
+            }
+        }
+        if decision == Some(Decision::Keep) {
+            return Outcome::Skipped(format!(
+                "Left the {kind} record for {host} as someone else set it, as you chose."
+            ));
+        }
+        let current = match self.ops.read_dns_record(host, &kind).await {
+            Ok(current) => current,
+            Err(error) => {
+                return Outcome::Failed(format!(
+                    "Temps could not read the {kind} record for {host} just before writing it, \
+                     so it wrote nothing: {error} Try again in a minute."
+                ))
+            }
+        };
+        let before = if decision == Some(Decision::Overwrite) {
+            current.clone()
+        } else {
+            match (&self.input.dns_before, &current) {
+                (PlannedRecord::Absent, None) => None,
+                (PlannedRecord::Present { record }, Some(now)) if now.unchanged_from(record) => {
+                    Some(now.clone())
+                }
+                (PlannedRecord::Unknown, _) => {
+                    return Outcome::Failed(format!(
+                        "When this plan was made Temps could not read the {kind} record for \
+                         {host}, so it will not write over one you have not seen. Plan again."
+                    ))
+                }
+                (planned, now) => {
+                    let was = match planned {
+                        PlannedRecord::Present { record } => describe_record(Some(record)),
+                        _ => "no record".to_string(),
+                    };
+                    let intent = match now {
+                        Some(now) => Intent::DnsChange {
+                            hostname: host.to_string(),
+                            label: now.label.clone(),
+                            record_type: kind.clone(),
+                            before: now.clone(),
+                            after: content.clone(),
+                        },
+                        None => Intent::DnsRecord {
+                            hostname: host.to_string(),
+                            label: String::new(),
+                            record_type: kind.clone(),
+                        },
+                    };
+                    let mut entry = JournalEntry::pending(key.clone(), intent, chrono::Utc::now());
+                    entry.state = JournalState::Conflict;
+                    entry.pending_since = None;
+                    entry.unwritten = true;
+                    entry.conflict = Some(describe_record(now.as_ref()));
+                    self.record.journal.retain(|e| e.key != key);
+                    self.record.journal.push(entry);
+                    self.save().await;
+                    return Outcome::Conflict(format!(
+                        "The {kind} record for {host} changed at your DNS provider after this \
+                         plan was made: it is now {} (the plan saw {was}). Temps wrote \
+                         nothing. Keep that value, or let Temps point {host} at {ip}.",
+                        describe_record(now.as_ref())
+                    ));
+                }
+            }
+        };
+        if before.as_ref().is_some_and(|b| b.content == content) {
+            return Outcome::Skipped(format!("{host} already points at {ip}."));
+        }
+        let intent = match &before {
+            None => Intent::DnsRecord {
+                hostname: host.to_string(),
+                label: String::new(),
+                record_type: kind.clone(),
+            },
+            Some(before) => Intent::DnsChange {
+                hostname: host.to_string(),
+                label: before.label.clone(),
+                record_type: kind.clone(),
+                before: before.clone(),
+                after: content.clone(),
+            },
+        };
+        match self.begin(&intent).await {
+            Err(hold) => hold.into(),
+            Ok(Begin::Have(_)) => done,
+            Ok(Begin::Go) => match self
+                .ops
+                .write_dns_record(host, &kind, &content, Some(run_id))
+                .await
+            {
+                Ok(label) => {
+                    let (resource, detail) = match intent.clone() {
+                        Intent::DnsChange {
+                            hostname,
+                            record_type,
+                            before,
+                            after,
+                            ..
+                        } => {
+                            let detail =
+                                format!("{host} changed from {} to {ip}.", before.describe());
+                            (
+                                RunResource::DnsChange {
+                                    hostname,
+                                    label,
+                                    record_type,
+                                    before,
+                                    after,
+                                },
+                                detail,
+                            )
+                        }
+                        _ => (
+                            RunResource::DnsRecord {
+                                hostname: host.to_string(),
+                                label,
+                                record_type: kind.clone(),
+                                content: Some(content.clone()),
+                            },
+                            format!("{host} points at {ip}."),
+                        ),
+                    };
+                    self.finish(&key, Some(resource)).await;
+                    Outcome::Done(Some(detail))
+                }
+                Err(error) => {
+                    self.finish_failed(&intent, error.maybe_applied).await;
+                    Outcome::Failed(error.message)
+                }
+            },
         }
     }
 
@@ -435,7 +1065,7 @@ impl Runner<'_> {
                     name: new.provider_name.clone(),
                 };
                 let resource = match self.begin(&intent).await {
-                    Err(error) => return Outcome::Failed(error),
+                    Err(hold) => return hold.into(),
                     Ok(Begin::Have(resource)) => resource,
                     Ok(Begin::Go) => {
                         let Some(token) = &input.token else {
@@ -461,7 +1091,7 @@ impl Runner<'_> {
                                 resource
                             }
                             Err(error) => {
-                                self.finish_failed(&intent).await;
+                                self.finish_failed(&intent, true).await;
                                 return Outcome::Failed(error);
                             }
                         }
@@ -511,7 +1141,7 @@ impl Runner<'_> {
                         )
                         .await;
                         match self.begin(&add).await {
-                            Err(error) => return Outcome::Failed(error),
+                            Err(hold) => return hold.into(),
                             Ok(Begin::Have(_)) => {
                                 verified = self
                                     .ops
@@ -525,7 +1155,7 @@ impl Runner<'_> {
                                 if let Err(error) =
                                     self.ops.add_managed_zone(provider_id, &zone).await
                                 {
-                                    self.finish_failed(&add).await;
+                                    self.finish_failed(&add, true).await;
                                     return Outcome::Failed(error);
                                 }
                                 self.finish(
@@ -543,13 +1173,13 @@ impl Runner<'_> {
                         auto_manage: true, ..
                     }) => {}
                     _ => match self.begin(&enable).await {
-                        Err(error) => return Outcome::Failed(error),
+                        Err(hold) => return hold.into(),
                         Ok(Begin::Have(_)) => {}
                         Ok(Begin::Go) => {
                             if let Err(error) =
                                 self.ops.set_auto_manage(provider_id, &zone, true).await
                             {
-                                self.finish_failed(&enable).await;
+                                self.finish_failed(&enable, true).await;
                                 return Outcome::Failed(error);
                             }
                             self.finish(
@@ -602,7 +1232,7 @@ impl Runner<'_> {
                     name: new.name.clone(),
                 };
                 match self.begin(&intent).await {
-                    Err(error) => Outcome::Failed(error),
+                    Err(hold) => hold.into(),
                     Ok(Begin::Have(resource)) => {
                         if let RunResource::Connector { id, .. } = resource {
                             self.ctx.connector_id = Some(id);
@@ -651,7 +1281,7 @@ impl Runner<'_> {
                                     )
                                     .await
                                 }
-                                None => self.finish_failed(&intent).await,
+                                None => self.finish_failed(&intent, true).await,
                             }
                             Outcome::Failed(error)
                         }
@@ -757,7 +1387,7 @@ impl Runner<'_> {
                     }
                 }
                 match self.begin(&intent).await {
-                    Err(error) => Outcome::Failed(error),
+                    Err(hold) => hold.into(),
                     Ok(Begin::Have(_)) => Outcome::Done(None),
                     Ok(Begin::Go) => match self
                         .ops
@@ -776,7 +1406,7 @@ impl Runner<'_> {
                             Outcome::Done(None)
                         }
                         Err(error) => {
-                            self.finish_failed(&intent).await;
+                            self.finish_failed(&intent, true).await;
                             Outcome::Failed(error)
                         }
                     },
@@ -829,7 +1459,7 @@ impl Runner<'_> {
                     return Outcome::Failed("The hostname choice could not be recorded.".into());
                 };
                 match self.begin(&intent).await {
-                    Err(error) => Outcome::Failed(error),
+                    Err(hold) => hold.into(),
                     Ok(Begin::Have(_)) => Outcome::Done(None),
                     Ok(Begin::Go) => match self.ops.route_hostname(&address, connector_id).await {
                         Ok(()) => {
@@ -845,7 +1475,7 @@ impl Runner<'_> {
                             Outcome::Done(None)
                         }
                         Err(error) => {
-                            self.finish_failed(&intent).await;
+                            self.finish_failed(&intent, true).await;
                             Outcome::Failed(error)
                         }
                     },
@@ -855,34 +1485,7 @@ impl Runner<'_> {
                 let Some((_, ip)) = input.direct.clone() else {
                     return Outcome::Failed("No address to point the record at.".into());
                 };
-                let kind = record_type(ip).to_string();
-                let intent = Intent::DnsRecord {
-                    hostname: address.clone(),
-                    label: String::new(),
-                    record_type: kind.clone(),
-                };
-                match self.begin(&intent).await {
-                    Err(error) => Outcome::Failed(error),
-                    Ok(Begin::Have(_)) => Outcome::Done(Some(format!("{address} points at {ip}."))),
-                    Ok(Begin::Go) => match self.ops.set_dns_record(&address, ip).await {
-                        Ok(label) => {
-                            self.finish(
-                                &intent.key(input.run_id),
-                                Some(RunResource::DnsRecord {
-                                    hostname: address.clone(),
-                                    label,
-                                    record_type: kind,
-                                }),
-                            )
-                            .await;
-                            Outcome::Done(Some(format!("{address} points at {ip}.")))
-                        }
-                        Err(error) => {
-                            self.finish_failed(&intent).await;
-                            Outcome::Failed(error)
-                        }
-                    },
-                }
+                self.set_dns_record(&address, ip).await
             }
             StepKind::ShowDnsRecord => {
                 let Some((_, ip)) = input.direct.clone() else {
@@ -932,12 +1535,13 @@ impl Runner<'_> {
                             .into(),
                     );
                 };
+                let challenge = input.certificate_challenge.as_deref().unwrap_or("http-01");
                 match self.begin(&intent).await {
-                    Err(error) => return Outcome::Failed(error),
+                    Err(hold) => return hold.into(),
                     Ok(Begin::Have(_)) => {}
                     Ok(Begin::Go) => {
-                        if let Err(error) = self.ops.start_certificate(&address).await {
-                            self.finish_failed(&intent).await;
+                        if let Err(error) = self.ops.start_certificate(&address, challenge).await {
+                            self.finish_failed(&intent, true).await;
                             return Outcome::Failed(error);
                         }
                         self.finish(
@@ -952,7 +1556,11 @@ impl Runner<'_> {
                 self.set(
                     index,
                     RunStepStatus::Running,
-                    Some("Let's Encrypt is checking the domain over HTTP…".into()),
+                    Some(if challenge == "dns-01" {
+                        "Let's Encrypt is checking a DNS record Temps publishes for it…".into()
+                    } else {
+                        "Let's Encrypt is checking the domain over HTTP…".into()
+                    }),
                 )
                 .await;
                 match self.ops.finish_certificate(&address, &email).await {
@@ -991,6 +1599,55 @@ impl Runner<'_> {
                     waited += self.timing.poll.max(Duration::from_millis(1));
                 }
             }
+            StepKind::SetAudience => {
+                let Some((after, before)) = input.audience.clone() else {
+                    return Outcome::Skipped("Nothing to change.".into());
+                };
+                let intent = Intent::AddressAudience {
+                    hostname: address.clone(),
+                    before,
+                    after: after.clone(),
+                };
+                if !self.known(&intent) {
+                    match self.ops.address_audience(&address).await {
+                        Ok(Some(current)) if current == after => {
+                            return Outcome::Skipped(format!(
+                                "{address} is already {}.",
+                                after.describe()
+                            ))
+                        }
+                        Ok(_) => {}
+                        Err(error) => return Outcome::Failed(error),
+                    }
+                }
+                match self.begin(&intent).await {
+                    Err(hold) => hold.into(),
+                    Ok(Begin::Have(_)) => {
+                        Outcome::Done(Some(format!("{address} is {}.", after.describe())))
+                    }
+                    Ok(Begin::Go) => match self.ops.set_address_audience(&address, &after).await {
+                        Ok(()) => {
+                            let Intent::AddressAudience { before, .. } = intent.clone() else {
+                                return Outcome::Failed("The audience could not be recorded.".into());
+                            };
+                            self.finish(
+                                &intent.key(input.run_id),
+                                Some(RunResource::AddressAudience {
+                                    hostname: address.clone(),
+                                    before,
+                                    after: after.clone(),
+                                }),
+                            )
+                            .await;
+                            Outcome::Done(Some(format!("{address} is {}.", after.describe())))
+                        }
+                        Err(error) => {
+                            self.finish_failed(&intent, true).await;
+                            Outcome::Failed(error)
+                        }
+                    },
+                }
+            }
             StepKind::CheckReachability => {
                 let verdict = self.ops.reachability(&address).await;
                 if verdict.state == ReachState::Reachable {
@@ -1021,29 +1678,60 @@ impl Runner<'_> {
                     self.save().await;
                     return self.record;
                 }
+                Outcome::Conflict(reason) => {
+                    // Everything is kept: undoing now could put back what
+                    // someone else just changed.
+                    self.set(index, RunStepStatus::Failed, Some(reason.clone()))
+                        .await;
+                    self.record.state = RunState::Conflict;
+                    self.record.error = Some(reason);
+                    self.save().await;
+                    return self.record;
+                }
                 Outcome::Failed(error) => {
                     self.set(index, RunStepStatus::Failed, Some(error.clone()))
                         .await;
                     self.record.state = RunState::Undoing;
                     self.save().await;
                     let had = !self.record.created().is_empty() || self.record.has_pending();
-                    let results = undo(&mut self.record.journal, self.ops).await;
-                    let failed: Vec<String> = results
+                    let journal_sink = RecordJournal {
+                        sink: self.sink,
+                        record: tokio::sync::Mutex::new(self.record.clone()),
+                    };
+                    let outcome = undo(
+                        &mut self.record.journal,
+                        self.ops,
+                        self.input.run_id,
+                        &journal_sink,
+                    )
+                    .await;
+                    let failed: Vec<String> = outcome
+                        .results
                         .iter()
                         .filter(|r| !r.ok)
                         .map(|r| r.label.clone())
                         .collect();
-                    self.record.undo = results;
+                    self.record.undo = outcome.results;
                     self.record.state = RunState::Failed;
-                    self.record.error = Some(if !had {
-                        error
-                    } else if failed.is_empty() {
-                        format!("{error} What this run had created was removed.")
-                    } else {
-                        format!(
+                    self.record.error = Some(match outcome.stopped {
+                        Some(Stop::Conflict(why)) => {
+                            self.record.state = RunState::UndoPaused;
+                            format!("{error} Undoing it stopped: {why}")
+                        }
+                        Some(Stop::Pending(why)) => {
+                            // The reconciler resolves it; undo after that.
+                            self.record.state = RunState::Recovering;
+                            format!("{error} Undoing it stopped: {why}")
+                        }
+                        Some(Stop::Failed(why)) => format!("{error} Undoing it stopped: {why}"),
+                        None if !had => error,
+                        None if failed.is_empty() => {
+                            format!("{error} What this run had created was removed.")
+                        }
+                        None => format!(
                             "{error} Could not remove everything this run created: {}.",
                             failed.join("; ")
-                        )
+                        ),
                     });
                     self.save().await;
                     return self.record;
@@ -1131,32 +1819,283 @@ pub async fn resume(
     .await
 }
 
-/// Remove what a run created, newest first, and mark it removed in the
-/// journal. A pending entry is looked up first. Nothing else is touched; a
-/// failure is reported and the rest is still attempted.
-pub async fn undo(journal: &mut [JournalEntry], ops: &dyn RunOps) -> Vec<UndoResult> {
+/// Why undo stopped before the oldest entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// An entry whose outcome Temps cannot tell yet.
+    Pending(String),
+    /// A record someone else changed after this run wrote it.
+    Conflict(String),
+    /// A check undo needed could not be made.
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UndoOutcome {
+    pub results: Vec<UndoResult>,
+    /// Set when undo stopped: nothing older than that entry was touched.
+    pub stopped: Option<Stop>,
+}
+
+fn undo_conflict_message(entry: &JournalEntry) -> String {
+    match &entry.intent {
+        Intent::Connector { name } => format!(
+            "Tunnel {name} now also publishes {}, which this run did not set up (sync published \
+             them through the tunnel's automatic publishing). Removing the tunnel takes them \
+             off the internet. Temps did not touch it, nor anything this run did before it. \
+             Keep the tunnel (undo leaves it and the Cloudflare account it uses), or remove it \
+             anyway.",
+            entry.conflict.as_deref().unwrap_or("other hostnames")
+        ),
+        Intent::DnsRecord { .. } => format!(
+            "{} now holds {}, which this run did not write. Temps never deletes a record \
+             without this run's marker, so it did not touch it, nor anything this run did \
+             before it. Keep it to carry on with the rest.",
+            entry.intent.describe(),
+            entry.conflict.as_deref().unwrap_or("something else")
+        ),
+        _ => format!(
+            "{} was changed by someone else after this run set it: it is now {}. Temps did not \
+             touch it, nor anything this run did before it. Keep that value, or restore what \
+             was there before this run.",
+            entry.intent.describe(),
+            entry.conflict.as_deref().unwrap_or("something else")
+        ),
+    }
+}
+
+/// Every hostname a journal's steps name: what the run itself set up.
+fn journaled_hostnames(journal: &[JournalEntry]) -> std::collections::BTreeSet<String> {
+    journal
+        .iter()
+        .filter_map(|e| match &e.intent {
+            Intent::CustomDomain { domain, .. } => Some(domain.clone()),
+            Intent::HostnameChoice { hostname, .. }
+            | Intent::DnsRecord { hostname, .. }
+            | Intent::DnsChange { hostname, .. }
+            | Intent::AddressAudience { hostname, .. } => Some(hostname.clone()),
+            Intent::Certificate { domain } => Some(domain.clone()),
+            _ => None,
+        })
+        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+        .collect()
+}
+
+/// Mark the entry at `index` in conflict with `current` and stop there.
+fn pause(entry: &mut JournalEntry, current: String, now: temps_core::DBDateTime) -> Stop {
+    entry.state = JournalState::Conflict;
+    entry.unwritten = false;
+    entry.conflict = Some(current);
+    entry.at = now;
+    Stop::Conflict(undo_conflict_message(entry))
+}
+
+/// Remove what a run created and put back what it changed, newest first,
+/// marking each in the journal. Pre-existing resources are never in it.
+///
+/// - A created record is removed only while it still holds what this run
+///   wrote, with its marker; a changed one goes back only while it still
+///   holds exactly this run's *after*. No other DNS record is touched:
+///   the records sync published for a tunnel carry sync's marker and go
+///   with the connector ([`RunOps::delete_tunnel`]).
+/// - A tunnel this run created is checked for hostnames sync published on
+///   it that the run never journaled; then marked `deleting`, journaled,
+///   and only then removed. One the user chose to keep keeps the DNS
+///   provider and zone it depends on too.
+/// - Anything Temps cannot account for (still pending, changed by someone
+///   else, a tunnel serving more) stops undo there, so nothing older is
+///   undone past it. So does a tunnel that could not be removed, since the
+///   older steps (its DNS provider) are what removing it needs.
+/// - Any other failed removal is reported and the rest still attempted.
+pub async fn undo(
+    journal: &mut [JournalEntry],
+    ops: &dyn RunOps,
+    run_id: i32,
+    sink: &dyn JournalSink,
+) -> UndoOutcome {
+    let now = chrono::Utc::now();
     let mut results = Vec::new();
-    for entry in journal.iter_mut().rev() {
-        let resource = match (entry.state, entry.resource.clone()) {
-            (JournalState::Done, Some(resource)) => resource,
-            (JournalState::Pending, _) => match ops.find(&entry.intent).await {
-                Ok(Some(resource)) => resource,
-                Ok(None) => {
-                    entry.state = JournalState::Absent;
-                    continue;
+    let stop = |results: Vec<UndoResult>, stop: Stop| UndoOutcome {
+        results,
+        stopped: Some(stop),
+    };
+    let journaled = journaled_hostnames(journal);
+    let kept_tunnel = journal.iter().find_map(|e| match &e.intent {
+        Intent::Connector { name } if e.undo_decision == Some(Decision::Keep) => Some(name.clone()),
+        _ => None,
+    });
+    for index in (0..journal.len()).rev() {
+        let entry = &mut journal[index];
+        let resource = match entry.state {
+            JournalState::Absent => continue,
+            // Temps wrote nothing there.
+            JournalState::Conflict if entry.unwritten => continue,
+            JournalState::Conflict => {
+                return stop(results, Stop::Conflict(undo_conflict_message(entry)))
+            }
+            JournalState::Pending => match resolve_pending(entry, ops, run_id, now).await {
+                Resolution::Done => match entry.resource.clone() {
+                    Some(resource) => resource,
+                    None => continue,
+                },
+                Resolution::Absent => continue,
+                Resolution::Pending => {
+                    return stop(
+                        results,
+                        Stop::Pending(format!(
+                            "{} Undo continues once it can tell.",
+                            wait_message(entry, now).replace("; resume once it has", "")
+                        )),
+                    )
                 }
-                Err(error) => {
-                    results.push(UndoResult {
-                        resource: placeholder(&entry.intent),
-                        label: format!("Could not tell whether {} exists", entry.intent.describe()),
-                        ok: false,
-                        error: Some(error),
-                    });
-                    continue;
+                Resolution::Conflict => {
+                    return stop(results, Stop::Conflict(undo_conflict_message(entry)))
                 }
             },
-            _ => continue,
+            JournalState::Done => match entry.resource.clone() {
+                Some(resource) => resource,
+                None => continue,
+            },
         };
+        let checked = entry.undo_decision == Some(Decision::Overwrite);
+        match &resource {
+            // What the kept tunnel runs on stays.
+            RunResource::DnsProvider { .. }
+            | RunResource::ManagedDomain { .. }
+            | RunResource::AutoManageEnabled { .. }
+                if kept_tunnel.is_some() =>
+            {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                results.push(UndoResult {
+                    label: format!(
+                        "Kept {}: tunnel {} still uses it",
+                        resource.describe(),
+                        kept_tunnel.as_deref().unwrap_or_default()
+                    ),
+                    resource: resource.clone(),
+                    ok: true,
+                    error: None,
+                });
+                continue;
+            }
+            RunResource::DnsRecord {
+                hostname,
+                record_type,
+                content,
+                ..
+            } => match ops.read_dns_record(hostname, record_type).await {
+                Ok(Some(record))
+                    if record.managed
+                        && record.run_id == Some(run_id)
+                        && content.as_ref().is_none_or(|c| *c == record.content) => {}
+                // Gone already: nothing to remove.
+                Ok(None) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    continue;
+                }
+                Ok(other) => {
+                    return stop(results, pause(entry, describe_record(other.as_ref()), now))
+                }
+                Err(error) => {
+                    return stop(
+                        results,
+                        Stop::Failed(format!(
+                            "Temps could not read the {record_type} record for {hostname} to \
+                             check it still holds what this run wrote, so it touched nothing \
+                             from there on: {error} Undo again to retry."
+                        )),
+                    )
+                }
+            },
+            RunResource::DnsChange {
+                hostname,
+                record_type,
+                before,
+                after,
+                ..
+            } if !checked => match ops.read_dns_record(hostname, record_type).await {
+                Ok(Some(record)) if holds_this_run(&record, after, run_id) => {}
+                // An earlier undo put it back already.
+                Ok(Some(record)) if record.content == before.content => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    continue;
+                }
+                Ok(other) => {
+                    return stop(results, pause(entry, describe_record(other.as_ref()), now))
+                }
+                Err(error) => {
+                    return stop(
+                        results,
+                        Stop::Failed(format!(
+                            "Temps could not read the {record_type} record for {hostname} to \
+                             check it still holds what this run wrote, so it touched nothing \
+                             from there on: {error} Undo again to retry."
+                        )),
+                    )
+                }
+            },
+            // A tunnel is checked for what else it serves, then marked
+            // `deleting`, and that journaled, before any provider call:
+            // sync then never brings it back, and an interrupted undo
+            // finishes the removal instead of reverting it.
+            RunResource::Connector { id, name } if !entry.deleting => {
+                if !checked {
+                    match ops.tunnel_hostnames(*id).await {
+                        Ok(hosts) => {
+                            let extra: Vec<String> = hosts
+                                .into_iter()
+                                .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+                                .filter(|h| !journaled.contains(h))
+                                .collect();
+                            if !extra.is_empty() {
+                                return stop(results, pause(entry, extra.join(", "), now));
+                            }
+                        }
+                        Err(error) => {
+                            return stop(
+                                results,
+                                Stop::Failed(format!(
+                                    "Temps could not tell what tunnel {name} publishes now, so \
+                                     it left the tunnel and everything this run did before it: \
+                                     {error} Undo again to retry."
+                                )),
+                            )
+                        }
+                    }
+                }
+                match ops.mark_tunnel_deleting(*id, name).await {
+                    Ok(tunnel_id) => {
+                        entry.deleting = true;
+                        entry.tunnel_id = tunnel_id;
+                        entry.at = now;
+                    }
+                    Err(error) => {
+                        return stop(
+                            results,
+                            Stop::Failed(format!(
+                                "Temps could not start removing tunnel {name}, so it left it and \
+                                 everything this run did before it: {error} Undo again to retry."
+                            )),
+                        )
+                    }
+                }
+                if let Err(error) = sink.save_journal(journal).await {
+                    return stop(
+                        results,
+                        Stop::Failed(format!(
+                            "Tunnel {name} is marked for removal, but Temps could not record \
+                             that: {error} It finishes removing the tunnel in the background; \
+                             undo again to carry on with the rest."
+                        )),
+                    );
+                }
+            }
+            _ => {}
+        }
+        let entry = &mut journal[index];
         let outcome = match &resource {
             RunResource::DnsProvider { id, .. } => ops.delete_dns_provider(*id).await,
             RunResource::ManagedDomain {
@@ -1167,7 +2106,9 @@ pub async fn undo(journal: &mut [JournalEntry], ops: &dyn RunOps) -> Vec<UndoRes
                 provider_id,
                 domain,
             } => ops.set_auto_manage(*provider_id, domain, false).await,
-            RunResource::Connector { id, .. } => ops.delete_tunnel(*id).await,
+            RunResource::Connector { id, .. } => {
+                ops.delete_tunnel(*id, entry.tunnel_id.as_deref()).await
+            }
             RunResource::CustomDomain { id, .. } => ops.detach_domain(*id).await,
             RunResource::HostnameChoice {
                 hostname, previous, ..
@@ -1176,7 +2117,21 @@ pub async fn undo(journal: &mut [JournalEntry], ops: &dyn RunOps) -> Vec<UndoRes
                 hostname,
                 label,
                 record_type,
+                ..
             } => ops.remove_dns_record(hostname, label, record_type).await,
+            RunResource::DnsChange {
+                hostname,
+                record_type,
+                before,
+                ..
+            } => ops
+                .write_dns_record(hostname, record_type, &before.content, before.run_id)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.message),
+            RunResource::AddressAudience {
+                hostname, before, ..
+            } => ops.set_address_audience(hostname, before).await,
             RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
         };
         let label = match &resource {
@@ -1193,65 +2148,43 @@ pub async fn undo(journal: &mut [JournalEntry], ops: &dyn RunOps) -> Vec<UndoRes
                 previous: PreviousChoice::Tunnel { .. },
                 ..
             } => format!("Put {hostname} back on the tunnel chosen before"),
+            RunResource::DnsChange {
+                hostname, before, ..
+            } => format!("Put {hostname} back to {}", before.describe()),
+            RunResource::AddressAudience {
+                hostname, before, ..
+            } => format!("Made {hostname} {} again", before.describe()),
             other => format!("Removed {}", other.describe()),
         };
         if outcome.is_ok() {
             entry.state = JournalState::Absent;
-            entry.at = chrono::Utc::now();
+            entry.at = now;
         } else {
             entry.state = JournalState::Done;
             entry.resource = Some(resource.clone());
         }
+        let failed_tunnel = match (&resource, &outcome) {
+            (RunResource::Connector { name, .. }, Err(error)) => Some(format!(
+                "Tunnel {name} is being removed but is not gone yet: {error} Temps keeps \
+                 removing it in the background and never brings it back; undo again to carry \
+                 on with what this run did before it."
+            )),
+            _ => None,
+        };
         results.push(UndoResult {
             resource,
             label,
             ok: outcome.is_ok(),
             error: outcome.err(),
         });
+        if let Some(why) = failed_tunnel {
+            // Its DNS provider, older, is what removing it needs.
+            return stop(results, Stop::Failed(why));
+        }
     }
-    results
-}
-
-/// What an intent would have made, for reporting one that could not be
-/// looked up.
-fn placeholder(intent: &Intent) -> RunResource {
-    match intent.clone() {
-        Intent::DnsProvider { name } => RunResource::DnsProvider { id: 0, name },
-        Intent::ManagedDomain {
-            provider_id,
-            domain,
-        } => RunResource::ManagedDomain {
-            provider_id,
-            domain,
-        },
-        Intent::AutoManageEnabled {
-            provider_id,
-            domain,
-        } => RunResource::AutoManageEnabled {
-            provider_id,
-            domain,
-        },
-        Intent::Connector { name } => RunResource::Connector { id: 0, name },
-        Intent::CustomDomain { domain, .. } => RunResource::CustomDomain { id: 0, domain },
-        Intent::HostnameChoice {
-            hostname,
-            connector_id,
-            previous,
-        } => RunResource::HostnameChoice {
-            hostname,
-            connector_id,
-            previous,
-        },
-        Intent::DnsRecord {
-            hostname,
-            label,
-            record_type,
-        } => RunResource::DnsRecord {
-            hostname,
-            label,
-            record_type,
-        },
-        Intent::Certificate { domain } => RunResource::Certificate { domain },
+    UndoOutcome {
+        results,
+        stopped: None,
     }
 }
 
@@ -1263,11 +2196,34 @@ mod tests {
 
     fn done(intent: Intent, resource: RunResource) -> JournalEntry {
         JournalEntry {
-            key: intent.key(0),
-            intent,
             state: JournalState::Done,
             resource: Some(resource),
-            at: chrono::Utc::now(),
+            ..JournalEntry::pending(intent.key(0), intent, chrono::Utc::now())
+        }
+    }
+
+    /// Journals nowhere, remembering what it was given.
+    #[derive(Default)]
+    struct Journaled(Mutex<Vec<Vec<JournalEntry>>>);
+
+    #[async_trait]
+    impl JournalSink for Journaled {
+        async fn save_journal(&self, journal: &[JournalEntry]) -> Result<(), String> {
+            self.0.lock().expect("lock").push(journal.to_vec());
+            Ok(())
+        }
+    }
+
+    fn record(content: &str, run_id: Option<i32>, modified: &str) -> DnsRecordState {
+        DnsRecordState {
+            provider_id: 3,
+            label: "myapp".into(),
+            record_id: Some("rec-1".into()),
+            record_type: "A".into(),
+            content: content.into(),
+            modified_on: Some(modified.into()),
+            managed: true,
+            run_id,
         }
     }
     use std::sync::Mutex;
@@ -1286,6 +2242,11 @@ mod tests {
         polls: Mutex<usize>,
         /// What `find` answers, by intent key without the run prefix.
         found: Mutex<Vec<(String, RunResource)>>,
+        /// The one DNS record there is.
+        dns: Mutex<Option<DnsRecordState>>,
+        audience: Mutex<Option<AddressAudience>>,
+        /// What the tunnel publishes now.
+        served: Mutex<Vec<String>>,
     }
 
     impl Fake {
@@ -1411,7 +2372,22 @@ mod tests {
                 replicas: vec![(2, "ready".into(), Some(4), None)],
             })
         }
-        async fn delete_tunnel(&self, id: i32) -> Result<(), String> {
+        async fn mark_tunnel_deleting(
+            &self,
+            id: i32,
+            _name: &str,
+        ) -> Result<Option<String>, String> {
+            self.log(format!("mark_tunnel_deleting {id}"));
+            Ok(Some(format!("cf-{id}")))
+        }
+        async fn tunnel_hostnames(&self, id: i32) -> Result<Vec<String>, String> {
+            self.log(format!("tunnel_hostnames {id}"));
+            Ok(self.served.lock().expect("lock").clone())
+        }
+        async fn delete_tunnel(&self, id: i32, tunnel_id: Option<&str>) -> Result<(), String> {
+            if let Some(tunnel_id) = tunnel_id {
+                self.log(format!("tunnel_id {tunnel_id}"));
+            }
             self.log(format!("delete_tunnel {id}"));
             if self.fail.contains(&"delete_tunnel") {
                 return Err("Cloudflare is down".into());
@@ -1428,6 +2404,9 @@ mod tests {
         }
         async fn detach_domain(&self, id: i32) -> Result<(), String> {
             self.log(format!("detach_domain {id}"));
+            if self.fail.contains(&"detach_domain") {
+                return Err("database is down".into());
+            }
             Ok(())
         }
         async fn hostname_choice(&self, _host: &str) -> Result<Option<Option<i32>>, String> {
@@ -1456,8 +2435,32 @@ mod tests {
                 ("pending".into(), "Being published.".into())
             })
         }
-        async fn set_dns_record(&self, _host: &str, _ip: IpAddr) -> Result<String, String> {
-            self.result("set_dns_record")?;
+        async fn read_dns_record(
+            &self,
+            _host: &str,
+            _record_type: &str,
+        ) -> Result<Option<DnsRecordState>, String> {
+            self.log("read_dns_record");
+            if self.fail.contains(&"read_dns_record") {
+                return Err("Cloudflare timed out".into());
+            }
+            Ok(self.dns.lock().expect("lock").clone())
+        }
+        async fn write_dns_record(
+            &self,
+            _host: &str,
+            _record_type: &str,
+            content: &str,
+            run_id: Option<i32>,
+        ) -> Result<String, WriteError> {
+            self.log(format!("write_dns_record {content} {run_id:?}"));
+            if self.fail.contains(&"write_dns_record") {
+                return Err(WriteError::unknown("the request timed out"));
+            }
+            if self.fail.contains(&"write_refused") {
+                return Err(WriteError::refused("set_dns_record broke"));
+            }
+            *self.dns.lock().expect("lock") = Some(record(content, run_id, "written"));
             Ok("myapp".into())
         }
         async fn remove_dns_record(
@@ -1473,7 +2476,7 @@ mod tests {
             self.log("certificate_exists");
             Ok(false)
         }
-        async fn start_certificate(&self, _host: &str) -> Result<(), String> {
+        async fn start_certificate(&self, _host: &str, _challenge: &str) -> Result<(), String> {
             self.result("start_certificate")
         }
         async fn finish_certificate(&self, _host: &str, _email: &str) -> Result<(), String> {
@@ -1507,6 +2510,21 @@ mod tests {
                 reason: "checked".into(),
                 action: None,
             }
+        }
+        async fn address_audience(
+            &self,
+            _host: &str,
+        ) -> Result<Option<AddressAudience>, String> {
+            Ok(self.audience.lock().expect("lock").clone())
+        }
+        async fn set_address_audience(
+            &self,
+            _host: &str,
+            audience: &AddressAudience,
+        ) -> Result<(), String> {
+            self.log(format!("set_address_audience {}", audience.describe()));
+            *self.audience.lock().expect("lock") = Some(audience.clone());
+            Ok(())
         }
         async fn sleep(&self, _duration: Duration) {}
     }
@@ -1579,6 +2597,9 @@ mod tests {
             token: Some("secret-token".into()),
             direct: None,
             acme_email: None,
+            dns_before: PlannedRecord::Absent,
+            certificate_challenge: None,
+            audience: None,
         }
     }
 
@@ -1698,7 +2719,7 @@ mod tests {
             ]
         );
         let mut journal = record.journal.clone();
-        let results = undo(&mut journal, &ops).await;
+        let results = undo(&mut journal, &ops, 0, &Journaled::default()).await.results;
         assert_eq!(
             results.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1711,6 +2732,39 @@ mod tests {
 
     #[tokio::test]
     async fn an_undo_failure_is_reported_and_the_rest_still_removed() {
+        let ops = Fake {
+            fail: vec!["detach_domain"],
+            ..Default::default()
+        };
+        let mut journal = vec![
+            done(
+                Intent::DnsProvider { name: "cf".into() },
+                RunResource::DnsProvider {
+                    id: 30,
+                    name: "cf".into(),
+                },
+            ),
+            done(
+                Intent::CustomDomain {
+                    domain: "myapp.example.com".into(),
+                    environment_id: 7,
+                },
+                RunResource::CustomDomain {
+                    id: 50,
+                    domain: "myapp.example.com".into(),
+                },
+            ),
+        ];
+        let results = undo(&mut journal, &ops, 0, &Journaled::default()).await.results;
+        assert!(!results[0].ok);
+        assert_eq!(results[0].error.as_deref(), Some("database is down"));
+        assert!(results[1].ok);
+    }
+
+    /// A tunnel that could not be removed stops undo: its DNS provider,
+    /// older, is what removing it needs. It stays `deleting`.
+    #[tokio::test]
+    async fn a_tunnel_that_could_not_be_removed_keeps_what_it_needs() {
         let ops = Fake {
             fail: vec!["delete_tunnel"],
             ..Default::default()
@@ -1731,10 +2785,512 @@ mod tests {
                 },
             ),
         ];
-        let results = undo(&mut journal, &ops).await;
-        assert!(!results[0].ok);
-        assert_eq!(results[0].error.as_deref(), Some("Cloudflare is down"));
-        assert!(results[1].ok);
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert_eq!(outcome.results.len(), 1);
+        assert!(!outcome.results[0].ok);
+        assert!(matches!(&outcome.stopped, Some(Stop::Failed(why)) if why.contains("never brings it back")));
+        assert!(!ops.calls().iter().any(|c| c.starts_with("delete_dns_provider")));
+        assert!(journal[1].deleting);
+        assert_eq!(journal[1].state, JournalState::Done);
+
+        // Undo again: it is not marked twice, and finishes.
+        let ops = Fake::default();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(!ops.calls().iter().any(|c| c.starts_with("mark_tunnel_deleting")));
+        assert_eq!(
+            ops.calls()
+                .into_iter()
+                .filter(|c| c.starts_with("delete_"))
+                .collect::<Vec<_>>(),
+            vec!["delete_tunnel 40", "delete_dns_provider 30"]
+        );
+    }
+
+    /// ADR 064 D4: the tunnel is marked `deleting`, and that journaled,
+    /// before the provider tunnel is touched.
+    #[tokio::test]
+    async fn undo_marks_a_tunnel_deleting_and_journals_it_before_removing_it() {
+        let ops = Fake::default();
+        let mut journal = vec![done(
+            Intent::Connector { name: "t".into() },
+            RunResource::Connector {
+                id: 40,
+                name: "t".into(),
+            },
+        )];
+        let sink = Journaled::default();
+        let outcome = undo(&mut journal, &ops, 0, &sink).await;
+        assert!(outcome.stopped.is_none());
+        let calls = ops.calls();
+        let mark = calls.iter().position(|c| c == "mark_tunnel_deleting 40").expect("marked");
+        let delete = calls.iter().position(|c| c == "delete_tunnel 40").expect("deleted");
+        assert!(mark < delete);
+        // The provider tunnel id read when marking is what is deleted.
+        assert!(calls.contains(&"tunnel_id cf-40".to_string()));
+        let saved = sink.0.lock().expect("lock");
+        assert!(saved[0][0].deleting, "journaled as deleting first");
+        assert_eq!(saved[0][0].state, JournalState::Done);
+        assert_eq!(journal[0].state, JournalState::Absent);
+    }
+
+    fn tunnel_journal() -> Vec<JournalEntry> {
+        vec![
+            done(
+                Intent::DnsProvider { name: "cf".into() },
+                RunResource::DnsProvider {
+                    id: 30,
+                    name: "cf".into(),
+                },
+            ),
+            done(
+                Intent::Connector { name: "t".into() },
+                RunResource::Connector {
+                    id: 40,
+                    name: "t".into(),
+                },
+            ),
+            done(
+                Intent::HostnameChoice {
+                    hostname: "myapp.example.com".into(),
+                    connector_id: 40,
+                    previous: PreviousChoice::Automatic,
+                },
+                RunResource::HostnameChoice {
+                    hostname: "myapp.example.com".into(),
+                    connector_id: 40,
+                    previous: PreviousChoice::Automatic,
+                },
+            ),
+        ]
+    }
+
+    /// ADR 064 D4 (fourth amendment): sync published another hostname on
+    /// the run's tunnel through auto-publish. Undo pauses naming it, and
+    /// touches neither the tunnel nor what it runs on until the user says.
+    #[tokio::test]
+    async fn a_tunnel_serving_a_hostname_the_run_never_journaled_pauses_undo() {
+        let ops = Fake::default();
+        *ops.served.lock().expect("lock") =
+            vec!["myapp.example.com".into(), "Other.Example.com.".into()];
+        let mut journal = tunnel_journal();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        let Some(Stop::Conflict(why)) = &outcome.stopped else {
+            panic!("expected a conflict, got {:?}", outcome.stopped);
+        };
+        assert!(why.contains("Tunnel t now also publishes other.example.com"), "{why}");
+        // The run's own hostname choice, newer, was put back.
+        assert_eq!(outcome.results.len(), 1);
+        assert!(!ops.calls().iter().any(|c| c.starts_with("mark_tunnel_deleting")
+            || c.starts_with("delete_")));
+        assert_eq!(journal[1].state, JournalState::Conflict);
+
+        // Keep: the tunnel stays, and so does the DNS provider it uses.
+        let mut kept = journal.clone();
+        let key = journal[1].key.clone();
+        decide(&mut kept, &key, Decision::Keep, true).expect("decided");
+        let outcome = undo(&mut kept, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(!ops.calls().iter().any(|c| c.starts_with("delete_")));
+        assert!(outcome.results[0].label.starts_with("Kept Cloudflare account cf")
+            || outcome.results[0].label.starts_with("Kept"), "{:?}", outcome.results);
+        assert_eq!(kept[1].undo_decision, Some(Decision::Keep));
+
+        // Remove anyway: journaled, then removed with what it runs on.
+        let ops = Fake::default();
+        *ops.served.lock().expect("lock") = vec!["other.example.com".into()];
+        let key = journal[1].key.clone();
+        decide(&mut journal, &key, Decision::Overwrite, true).expect("decided");
+        assert_eq!(journal[1].undo_decision, Some(Decision::Overwrite));
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{:?}", outcome.stopped);
+        assert_eq!(
+            ops.calls()
+                .into_iter()
+                .filter(|c| c.starts_with("delete_"))
+                .collect::<Vec<_>>(),
+            vec!["delete_tunnel 40", "delete_dns_provider 30"]
+        );
+    }
+
+    fn created_record(content: &str) -> JournalEntry {
+        done(
+            Intent::DnsRecord {
+                hostname: "myapp.example.com".into(),
+                label: String::new(),
+                record_type: "A".into(),
+            },
+            RunResource::DnsRecord {
+                hostname: "myapp.example.com".into(),
+                label: "myapp".into(),
+                record_type: "A".into(),
+                content: Some(content.into()),
+            },
+        )
+    }
+
+    /// ADR 064 D4: undo removes a record it created only while it still
+    /// holds what this run wrote, with this run's marker.
+    #[tokio::test]
+    async fn undo_never_deletes_a_record_without_the_run_marker() {
+        // Another run (or a person, through Temps) wrote it since.
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(record("203.0.113.5", Some(3), "later"));
+        let mut journal = vec![created_record("203.0.113.5")];
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        assert!(matches!(outcome.stopped, Some(Stop::Conflict(_))));
+        assert!(!ops.calls().iter().any(|c| c.starts_with("remove_dns_record")));
+        // "Remove anyway" is not offered for a record the run did not write.
+        let key = journal[0].key.clone();
+        assert!(decide(&mut journal, &key, Decision::Overwrite, true).is_err());
+        decide(&mut journal, &key, Decision::Keep, true).expect("kept");
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(!ops.calls().iter().any(|c| c.starts_with("remove_dns_record")));
+
+        // Not managed by Temps at all: the same.
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(DnsRecordState {
+            managed: false,
+            ..record("203.0.113.5", None, "later")
+        });
+        let mut journal = vec![created_record("203.0.113.5")];
+        assert!(undo(&mut journal, &ops, 9, &Journaled::default()).await.stopped.is_some());
+        assert!(!ops.calls().iter().any(|c| c.starts_with("remove_dns_record")));
+
+        // Still this run's: removed. Gone already: nothing to do.
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(record("203.0.113.5", Some(9), "written"));
+        let mut journal = vec![created_record("203.0.113.5")];
+        assert!(undo(&mut journal, &ops, 9, &Journaled::default()).await.stopped.is_none());
+        assert!(ops
+            .calls()
+            .contains(&"remove_dns_record myapp.example.com myapp A".to_string()));
+        let ops = Fake::default();
+        let mut journal = vec![created_record("203.0.113.5")];
+        assert!(undo(&mut journal, &ops, 9, &Journaled::default()).await.stopped.is_none());
+        assert!(!ops.calls().iter().any(|c| c.starts_with("remove_dns_record")));
+        assert_eq!(journal[0].state, JournalState::Absent);
+    }
+
+    fn direct_input(run_id: i32, dns_before: PlannedRecord) -> RunInput {
+        RunInput {
+            run_id,
+            option: PlanOptionKind::DirectManagedDns,
+            steps: steps(&[
+                StepKind::AttachDomain,
+                StepKind::SetDnsRecord,
+                StepKind::CheckReachability,
+            ]),
+            new_tunnel: None,
+            token: None,
+            direct: Some(("edge-1".into(), "203.0.113.5".parse().expect("ip"))),
+            dns_before,
+            ..token_input()
+        }
+    }
+
+    fn was() -> DnsRecordState {
+        record("198.51.100.1", None, "before")
+    }
+
+    /// ADR 064 D4: the set-DNS step re-reads the record just before
+    /// writing; changed since the plan, it writes nothing and stops naming
+    /// the new value.
+    #[tokio::test]
+    async fn a_record_changed_after_planning_is_never_written_over() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        // Same content, but edited (and put back) since: still changed.
+        *ops.dns.lock().expect("lock") = Some(record("198.51.100.7", None, "edited"));
+        let input = direct_input(9, PlannedRecord::Present { record: was() });
+        let record_after = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(record_after.state, RunState::Conflict);
+        let error = record_after.error.clone().expect("error");
+        assert!(
+            error.contains("changed at your DNS provider after this plan was made: it is now A \
+                            198.51.100.7"),
+            "{error}"
+        );
+        assert!(error.contains("Temps wrote nothing"));
+        assert!(!ops.calls().iter().any(|c| c.starts_with("write_dns_record")));
+        // Nothing is undone: undo could put back what someone just changed.
+        assert!(record_after.undo.is_empty());
+        // The conflict was found before writing, so undo has nothing to put
+        // back for it and goes past it.
+        let mut journal = record_after.journal.clone();
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{:?}", outcome.stopped);
+        assert!(ops.calls().contains(&"detach_domain 50".to_string()));
+
+        // A record that appeared where the plan saw none: the same.
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(was());
+        let record_after =
+            execute(&direct_input(9, PlannedRecord::Absent), &ops, &Saved::default(), timing())
+                .await;
+        assert_eq!(record_after.state, RunState::Conflict);
+        assert!(!ops.calls().iter().any(|c| c.starts_with("write_dns_record")));
+
+        // Keep: resuming skips the record. Overwrite: it is set, with the
+        // value there now journaled as `before`.
+        let mut kept = record_after.clone();
+        let key = kept.conflicts()[0].key.clone();
+        decide(&mut kept.journal, &key, Decision::Keep, false).expect("decided");
+        let ops_keep = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        *ops_keep.dns.lock().expect("lock") = Some(was());
+        let input = direct_input(9, PlannedRecord::Absent);
+        let resumed = resume(&input, kept, &ops_keep, &Saved::default(), timing()).await;
+        assert_eq!(resumed.state, RunState::Succeeded);
+        assert!(!ops_keep.calls().iter().any(|c| c.starts_with("write_dns_record")));
+
+        let mut overwrite = record_after;
+        decide(&mut overwrite.journal, &key, Decision::Overwrite, false).expect("decided");
+        let ops_over = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        *ops_over.dns.lock().expect("lock") = Some(was());
+        let resumed = resume(&input, overwrite, &ops_over, &Saved::default(), timing()).await;
+        assert_eq!(resumed.state, RunState::Succeeded);
+        assert!(ops_over
+            .calls()
+            .contains(&"write_dns_record 203.0.113.5 Some(9)".to_string()));
+        assert!(resumed.created().iter().any(|r| matches!(
+            r,
+            RunResource::DnsChange { before, after, .. }
+                if before.content == "198.51.100.1" && after == "203.0.113.5"
+        )));
+    }
+
+    /// ADR 064 D4: a change journals the value read just before the write
+    /// and the one it writes, stamped with the run's marker; undo puts the
+    /// old one back only while the record holds exactly this run's.
+    #[tokio::test]
+    async fn undo_restores_a_changed_record_only_while_it_holds_what_the_run_wrote() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        *ops.dns.lock().expect("lock") = Some(was());
+        let input = direct_input(9, PlannedRecord::Present { record: was() });
+        let done_run = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(done_run.state, RunState::Succeeded);
+        assert!(ops
+            .calls()
+            .contains(&"write_dns_record 203.0.113.5 Some(9)".to_string()));
+        let change = done_run
+            .journal
+            .iter()
+            .find(|e| matches!(e.intent, Intent::DnsChange { .. }))
+            .expect("change journaled");
+        let Intent::DnsChange { before, after, .. } = &change.intent else {
+            unreachable!()
+        };
+        assert_eq!(before, &was());
+        assert_eq!(after, "203.0.113.5");
+
+        // Untouched since: restored, and its earlier marker with it.
+        let mut journal = done_run.journal.clone();
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(ops
+            .calls()
+            .contains(&"write_dns_record 198.51.100.1 None".to_string()));
+        assert!(outcome.results.iter().any(|r| r.label == "Put myapp.example.com back to A 198.51.100.1"));
+
+        // Changed again since: nothing written, undo pauses there, and the
+        // older step (the custom domain) is left alone.
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(record("192.0.2.44", None, "later"));
+        let mut journal = done_run.journal.clone();
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        let Some(Stop::Conflict(why)) = &outcome.stopped else {
+            panic!("expected a conflict, got {:?}", outcome.stopped);
+        };
+        assert!(why.contains("it is now A 192.0.2.44"), "{why}");
+        assert!(!ops.calls().iter().any(|c| c.starts_with("write_dns_record")));
+        assert!(!ops.calls().iter().any(|c| c.starts_with("detach_domain")));
+
+        // Skip it: the rest is undone, the record left as they set it.
+        let key = journal
+            .iter()
+            .find(|e| e.state == JournalState::Conflict)
+            .expect("conflict")
+            .key
+            .clone();
+        let mut skipped = journal.clone();
+        decide(&mut skipped, &key, Decision::Keep, true).expect("decided");
+        let outcome = undo(&mut skipped, &ops, 9, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(!ops.calls().iter().any(|c| c.starts_with("write_dns_record")));
+        assert!(ops.calls().contains(&"detach_domain 50".to_string()));
+        assert_eq!(skipped.iter().find(|e| e.key == key).expect("entry").undo_decision, Some(Decision::Keep));
+
+        // Restore anyway: journaled, and written.
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(record("192.0.2.44", None, "later"));
+        decide(&mut journal, &key, Decision::Overwrite, true).expect("decided");
+        let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(ops
+            .calls()
+            .contains(&"write_dns_record 198.51.100.1 None".to_string()));
+    }
+
+    fn pending_change(since: temps_core::DBDateTime) -> JournalEntry {
+        let intent = Intent::DnsChange {
+            hostname: "myapp.example.com".into(),
+            label: "myapp".into(),
+            record_type: "A".into(),
+            before: was(),
+            after: "203.0.113.5".into(),
+        };
+        JournalEntry::pending(intent.key(9), intent, since)
+    }
+
+    /// ADR 064 D4: reconciling a change: this run's after with its marker
+    /// is done; still the before is a write that did not land (confirmed by
+    /// two misses a settle delay apart), retried through the pre-write
+    /// check; anything else is a conflict nothing touches.
+    #[tokio::test]
+    async fn reconciling_a_change_tells_done_retry_and_conflict_apart() {
+        let now = chrono::Utc::now();
+        let since = now - chrono::Duration::minutes(2);
+
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(record("203.0.113.5", Some(9), "written"));
+        let mut journal = vec![pending_change(since)];
+        let out = reconcile_journal(&mut journal, &ops, 9, now).await;
+        assert_eq!(out.resolved, 1);
+        assert_eq!(journal[0].state, JournalState::Done);
+        assert!(matches!(journal[0].resource, Some(RunResource::DnsChange { .. })));
+
+        // The same content written by another run is not this run's.
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(record("203.0.113.5", Some(8), "written"));
+        let mut journal = vec![pending_change(since)];
+        reconcile_journal(&mut journal, &ops, 9, now).await;
+        assert_eq!(journal[0].state, JournalState::Conflict);
+
+        let ops = Fake::default();
+        *ops.dns.lock().expect("lock") = Some(record("192.0.2.44", None, "later"));
+        let mut journal = vec![pending_change(since)];
+        let out = reconcile_journal(&mut journal, &ops, 9, now).await;
+        assert_eq!(out.conflicts, 1);
+        assert_eq!(journal[0].state, JournalState::Conflict);
+        assert_eq!(journal[0].conflict.as_deref(), Some("A 192.0.2.44 (set by Temps)"));
+
+        // Still the before content: absent only after a second look.
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        *ops.dns.lock().expect("lock") = Some(was());
+        let mut journal = vec![pending_change(since)];
+        assert_eq!(reconcile_journal(&mut journal, &ops, 9, now).await.pending, 1);
+        assert_eq!(journal[0].first_miss_at, Some(now));
+        let later = now + chrono::Duration::seconds(31);
+        assert_eq!(reconcile_journal(&mut journal, &ops, 9, later).await.resolved, 1);
+        assert_eq!(journal[0].state, JournalState::Absent);
+        // ...and a resume retries it through the pre-write check.
+        let input = direct_input(9, PlannedRecord::Present { record: was() });
+        let mut stopped = RunRecord::new(&input.steps);
+        stopped.journal = journal;
+        stopped.state = RunState::Interrupted;
+        let resumed = resume(&input, stopped, &ops, &Saved::default(), timing()).await;
+        assert_eq!(resumed.state, RunState::Succeeded);
+        let calls = ops.calls();
+        let read = calls.iter().rposition(|c| c == "read_dns_record").expect("read");
+        let write = calls
+            .iter()
+            .position(|c| c == "write_dns_record 203.0.113.5 Some(9)")
+            .expect("written");
+        assert!(read < write);
+    }
+
+    /// ADR 064 D4: a miss proves nothing until the create's timeout and a
+    /// settle delay have passed and a second miss confirms it; until then
+    /// the step stays pending and the create is never repeated.
+    #[tokio::test]
+    async fn an_ambiguous_miss_never_creates_the_record_twice() {
+        // The write timed out; nothing is visible yet.
+        let ops = Fake {
+            fail: vec!["write_dns_record"],
+            ..Default::default()
+        };
+        let input = direct_input(9, PlannedRecord::Absent);
+        let failed = execute(&input, &ops, &Saved::default(), timing()).await;
+        let writes = |ops: &Fake| {
+            ops.calls()
+                .iter()
+                .filter(|c| c.starts_with("write_dns_record"))
+                .count()
+        };
+        assert_eq!(writes(&ops), 1);
+        // Undo cannot go past a step it cannot tell about.
+        assert_eq!(failed.state, RunState::Recovering, "{:?}", failed.error);
+        assert!(failed.has_pending());
+        assert!(!ops.calls().iter().any(|c| c.starts_with("detach_domain")));
+
+        // A resume while it is still ambiguous waits; it never writes again.
+        let mut stopped = failed.clone();
+        stopped.state = RunState::Interrupted;
+        let ops = Fake::default();
+        let resumed = resume(&input, stopped, &ops, &Saved::default(), timing()).await;
+        assert_eq!(resumed.state, RunState::Waiting);
+        assert!(resumed.error.expect("why").contains("never makes it twice"));
+        assert_eq!(writes(&ops), 0);
+
+        // The reconciler: too soon, a first miss, too soon again, confirmed.
+        let mut journal = failed.journal.clone();
+        let entry = journal
+            .iter()
+            .find(|e| e.state == JournalState::Pending)
+            .expect("pending")
+            .clone();
+        let since = entry.pending_since.expect("since");
+        let at = |s: i64| since + chrono::Duration::seconds(s);
+        assert_eq!(reconcile_journal(&mut journal, &ops, 9, at(10)).await.pending, 1);
+        assert_eq!(reconcile_journal(&mut journal, &ops, 9, at(61)).await.pending, 1);
+        assert_eq!(reconcile_journal(&mut journal, &ops, 9, at(80)).await.pending, 1);
+        assert_eq!(reconcile_journal(&mut journal, &ops, 9, at(92)).await.resolved, 1);
+        assert!(!journal.iter().any(|e| e.state == JournalState::Pending));
+        assert_eq!(writes(&ops), 0);
+
+        // Still unresolved after an hour, it says what to check by hand.
+        let mut journal = failed.journal.clone();
+        let broken = Fake {
+            fail: vec!["read_dns_record"],
+            ..Default::default()
+        };
+        let out = reconcile_journal(&mut journal, &broken, 9, at(3700)).await;
+        assert_eq!(out.pending, 1);
+        assert!(out.check_by_hand[0].contains("Check the A record for `myapp.example.com`"));
+    }
+
+    /// A tunnel's lookup is its Temps row, saved before Cloudflare is
+    /// asked: authoritative at once.
+    #[test]
+    fn a_tunnel_lookup_is_authoritative_and_dns_follows_the_two_miss_rule() {
+        assert_eq!(
+            Intent::Connector { name: "t".into() }.authority(),
+            LookupAuthority::Immediate
+        );
+        assert!(matches!(
+            Intent::DnsRecord {
+                hostname: "a".into(),
+                label: String::new(),
+                record_type: "A".into()
+            }
+            .authority(),
+            LookupAuthority::Settled { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1802,6 +3358,7 @@ mod tests {
                     hostname: "myapp.example.com".into(),
                     label: "myapp".into(),
                     record_type: "A".into(),
+                    content: Some("203.0.113.5".into()),
                 },
                 RunResource::Certificate {
                     domain: "myapp.example.com".into()
@@ -1968,15 +3525,10 @@ mod tests {
                 name: "t".into(),
             },
         );
-        let pending = |intent: Intent| JournalEntry {
-            key: intent.key(0),
-            intent,
-            state: JournalState::Pending,
-            resource: None,
-            at: chrono::Utc::now(),
-        };
+        let pending = |intent: Intent| JournalEntry::pending(intent.key(0), intent, chrono::Utc::now());
         let mut journal = vec![pending(tunnel), pending(domain)];
-        assert_eq!(reconcile_journal(&mut journal, &ops).await, Ok(2));
+        let out = reconcile_journal(&mut journal, &ops, 0, chrono::Utc::now()).await;
+        assert_eq!(out.resolved, 2);
         assert_eq!(journal[0].state, JournalState::Done);
         assert_eq!(journal[1].state, JournalState::Absent);
 
@@ -1986,8 +3538,12 @@ mod tests {
             ..Default::default()
         };
         let mut journal = vec![pending(Intent::Connector { name: "t".into() })];
-        assert!(reconcile_journal(&mut journal, &broken).await.is_err());
+        let out = reconcile_journal(&mut journal, &broken, 0, chrono::Utc::now()).await;
+        assert_eq!(out.pending, 1);
         assert_eq!(journal[0].state, JournalState::Pending);
+        // ...and backs off before looking again.
+        assert_eq!(journal[0].failed_lookups, 1);
+        assert!(journal[0].next_lookup_at.is_some());
     }
 
     #[tokio::test]
@@ -2021,7 +3577,7 @@ mod tests {
             connector_id: 41,
             previous: PreviousChoice::Off,
         }));
-        let results = undo(&mut record.journal, &ops).await;
+        let results = undo(&mut record.journal, &ops, 0, &Journaled::default()).await.results;
         assert!(results.iter().all(|r| r.ok));
         assert!(ops
             .calls()

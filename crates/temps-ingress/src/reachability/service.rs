@@ -52,18 +52,20 @@ use super::compute::{
     AddressInput, DirectIngress, Resolution, TunnelState,
 };
 use super::model::{
-    AddressReachability, AddressSource, ApplyRequest, Audience, EnvironmentReachability, Intent,
-    JournalEntry, PlanOptionKind, PlanRequest, PreviousChoice, ReachabilityPlan, ResumeRequest,
-    RunResource, RunState, RunStep, RunStepStatus, RunView, StepKind,
+    AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience, DecideRequest,
+    DnsRecordState, EnvironmentReachability, Intent, JournalEntry, PlanOptionKind, PlanRequest,
+    PlannedRecord, PreviousChoice, ReachabilityPlan, ResumeRequest, RunResource, RunState,
+    RunStep, RunStepStatus, RunView, StepKind,
 };
 use super::plan::{
-    fingerprint, guess_zone, http01_direct, plan, planned_address, tunnel_domain_for,
+    fingerprint, guess_zone, http01_direct, plan, planned_address, planned_record,
+    record_type_of, records_to_read, tunnel_domain_for,
     tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts, ZoneFact, FIELD_ADDRESS,
     FIELD_DNS_PROVIDER, FIELD_TOKEN,
 };
 use super::run::{
-    created, execute, reconcile_journal, resume, undo, NewTunnel, RunInput, RunOps, RunRecord,
-    RunSink, Timing, TunnelStatus, ZoneState,
+    created, decide, execute, reconcile_journal, resume, undo, NewTunnel, RunInput, RunOps,
+    RunRecord, RunSink, Stop, Timing, TunnelStatus, WriteError, ZoneState,
 };
 use super::token_check::{check_token, TokenCheckRequest, TokenCheckResult};
 use crate::error::IngressError;
@@ -269,32 +271,55 @@ impl ReachabilityService {
             }
         }
         let ops = self.ops(row.project_id, row.environment_id);
-        let outcome = reconcile_journal(&mut journal, &ops).await;
+        let outcome = reconcile_journal(&mut journal, &ops, id, Utc::now()).await;
         active.journal = Set(serde_json::to_value(&journal).unwrap_or(Value::Array(vec![])));
         active.updated_at = Set(Utc::now());
-        match outcome {
-            Ok(resolved) => {
-                active.state = Set(RunState::Interrupted.as_str().to_string());
-                active.error = Set(Some(format!(
-                    "Temps restarted during this run{}. What it had made is listed: resume it \
-                     to carry on, or undo it to remove exactly that.",
-                    match resolved {
-                        0 => String::new(),
-                        1 => "; one unfinished step was checked".to_string(),
-                        n => format!("; {n} unfinished steps were checked"),
-                    }
-                )));
-                active.finished_at = Set(Some(Utc::now()));
-                info!(run_id = id, resolved, "recovered an interrupted reachability run");
+        if outcome.pending > 0 {
+            // Stays recovering; the next pass looks again.
+            let mut message = format!(
+                "{RECOVERING} {} still cannot be told{}; Temps looks again every minute and never \
+                 makes anything twice.",
+                match outcome.pending {
+                    1 => "One step".to_string(),
+                    n => format!("{n} steps"),
+                },
+                outcome
+                    .errors
+                    .first()
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default()
+            );
+            if !outcome.check_by_hand.is_empty() {
+                message.push_str(&format!(
+                    " It has been more than an hour: {}",
+                    outcome.check_by_hand.join(" ")
+                ));
             }
-            Err(error) => {
-                // Stays recovering; the next pass retries.
-                active.state = Set(RunState::Recovering.as_str().to_string());
-                active.error = Set(Some(format!(
-                    "{RECOVERING} It could not check yet ({error}) and tries again every minute."
-                )));
-                warn!(run_id = id, %error, "could not recover a reachability run yet");
-            }
+            active.state = Set(RunState::Recovering.as_str().to_string());
+            active.error = Set(Some(message));
+            warn!(run_id = id, pending = outcome.pending, "could not recover a reachability run yet");
+        } else if outcome.conflicts > 0 {
+            active.state = Set(RunState::Conflict.as_str().to_string());
+            active.error = Set(Some(
+                "Someone else changed a DNS record this run was setting. Temps leaves it alone: \
+                 decide whether to keep that value or let Temps set it, then resume or undo."
+                    .to_string(),
+            ));
+            active.finished_at = Set(Some(Utc::now()));
+            info!(run_id = id, "a recovered reachability run has a conflict to decide");
+        } else {
+            active.state = Set(RunState::Interrupted.as_str().to_string());
+            active.error = Set(Some(format!(
+                "This run stopped before it finished{}. What it had made is listed: resume it \
+                 to carry on, or undo it to remove exactly that.",
+                match outcome.resolved {
+                    0 => String::new(),
+                    1 => "; one unfinished step was checked".to_string(),
+                    n => format!("; {n} unfinished steps were checked"),
+                }
+            )));
+            active.finished_at = Set(Some(Utc::now()));
+            info!(run_id = id, resolved = outcome.resolved, "recovered an interrupted reachability run");
         }
         if let Err(error) = active.update(db).await {
             warn!(run_id = id, %error, "could not save a recovered reachability run");
@@ -771,9 +796,24 @@ impl ReachabilityService {
             directs,
             tunnel_workers,
             workers_refusing,
+            dns_records: Vec::new(),
         };
+        let mut dns_records = Vec::new();
         // The suggested address is known only now; D9 decides it too.
         if let Ok(Some(address)) = planned_address(&facts) {
+            // What a run would change is shown, and held to (D4).
+            let ops = self.ops(None, None);
+            for (host, record_type) in records_to_read(&facts, &address) {
+                let seen = match ops.read_dns_record(&host, &record_type).await {
+                    Ok(None) => PlannedRecord::Absent,
+                    Ok(Some(record)) => PlannedRecord::Present { record },
+                    Err(error) => {
+                        warn!(%host, %error, "could not read a DNS record to plan with");
+                        PlannedRecord::Unknown
+                    }
+                };
+                dns_records.push((host, record_type, seen));
+            }
             if !intents.contains_key(&address) {
                 let more = self
                     .deps
@@ -783,7 +823,11 @@ impl ReachabilityService {
                 intents.extend(more.intents);
             }
         }
-        Ok(PlanFacts { intents, ..facts })
+        Ok(PlanFacts {
+            intents,
+            dns_records,
+            ..facts
+        })
     }
 
     async fn facts_for(
@@ -944,7 +988,8 @@ impl ReachabilityService {
                     &facts,
                     user_id,
                     "Something the plan depends on changed since it was made (addresses, DNS \
-                     providers, tunnels, hostname choices or worker ingress).",
+                     providers, tunnels, hostname choices, worker ingress, or a DNS record it \
+                     would change, edited at your DNS provider).",
                 )
                 .await);
         }
@@ -988,6 +1033,9 @@ impl ReachabilityService {
             route_confirmed: option.confirmation.is_some() && request.confirmed,
             token: None,
             direct: None,
+            dns_before: PlannedRecord::Absent,
+            certificate_challenge: None,
+            audience: None,
             acme_email: settings
                 .letsencrypt
                 .email
@@ -1049,7 +1097,14 @@ impl ReachabilityService {
                     Some(id)
                 };
                 let domain = tunnel_domain_for(&address, &zone);
-                let taken: Vec<String> = facts.tunnels.iter().map(|t| t.name.clone()).collect();
+                // Every name in use, a tunnel being removed's too: a run
+                // never reuses one (ADR 064 D4).
+                let taken: Vec<String> = ingress_connectors::Entity::find()
+                    .all(db)
+                    .await?
+                    .into_iter()
+                    .map(|c| c.name)
+                    .collect();
                 input.new_tunnel = Some(NewTunnel {
                     provider_id,
                     provider_name: self.unused_provider_name(&zone).await?,
@@ -1059,11 +1114,18 @@ impl ReachabilityService {
                     worker,
                 });
             }
+            PlanOptionKind::PrivateWorker => {
+                return Err(ReachabilityError::Validation(
+                    "Private addresses are not available in this version.".into(),
+                ))
+            }
             PlanOptionKind::DirectManagedDns | PlanOptionKind::DirectManualDns => {
                 let direct = http01_direct(&facts).ok_or_else(|| {
                     ReachabilityError::Conflict("No direct ingress takes port 80 any more.".into())
                 })?;
                 input.direct = Some((direct.name.clone(), direct.ips[0]));
+                input.dns_before =
+                    planned_record(&facts, &address, record_type_of(direct.ips[0]));
             }
         }
 
@@ -1226,6 +1288,13 @@ impl ReachabilityService {
         match state {
             RunState::Waiting | RunState::Interrupted => {}
             RunState::Recovering => return Err(ReachabilityError::Conflict(RECOVERING.into())),
+            RunState::Conflict | RunState::UndoPaused => {
+                return Err(ReachabilityError::Conflict(
+                    "Someone else changed a record this run works on. Decide whether to keep \
+                     their value or let Temps set it first."
+                        .into(),
+                ))
+            }
             other if other.is_active() => {
                 return Err(ReachabilityError::Conflict(
                     "The run is still going.".into(),
@@ -1242,6 +1311,13 @@ impl ReachabilityService {
         let record = record_of(&row);
         if record.has_pending() {
             return Err(ReachabilityError::Conflict(RECOVERING.into()));
+        }
+        if record.journal.iter().any(|e| e.deleting) {
+            return Err(ReachabilityError::Conflict(
+                "Undo has started removing this run's tunnel, and a tunnel being removed is \
+                 never reused. Undo the run again to finish, then make it reachable again."
+                    .into(),
+            ));
         }
         let mut input: RunInput = serde_json::from_value(row.context.clone()).map_err(|_| {
             ReachabilityError::Validation(
@@ -1373,7 +1449,7 @@ impl ReachabilityService {
                 "The run is still going. Wait for it to finish, then undo it.".into(),
             ));
         }
-        if record.created().is_empty() {
+        if record.created().is_empty() && record.conflicts().is_empty() {
             return Err(ReachabilityError::Conflict(
                 "Nothing is left to undo: everything this run created is already gone.".into(),
             ));
@@ -1391,19 +1467,36 @@ impl ReachabilityService {
         }
         let ops = self.ops(row.project_id, row.environment_id);
         let mut journal = record.journal.clone();
-        let results = undo(&mut journal, &ops).await;
+        let sink = DbSink {
+            db: self.deps.db.clone(),
+            run_id: row.id,
+        };
+        let outcome = undo(&mut journal, &ops, row.id, &sink).await;
         self.release(environment_id);
         let mut all = record.undo.clone();
-        let failed: Vec<String> = results
+        let failed: Vec<String> = outcome
+            .results
             .iter()
             .filter(|r| !r.ok)
             .map(|r| format!("{}: {}", r.label, r.error.clone().unwrap_or_default()))
             .collect();
-        all.extend(results);
+        all.extend(outcome.results);
         let mut active: reachability_runs::ActiveModel = row.into();
         active.journal = Set(serde_json::to_value(&journal).unwrap_or(Value::Array(vec![])));
         active.undo = Set(Some(serde_json::to_value(&all).unwrap_or(Value::Null)));
-        if failed.is_empty() {
+        if let Some(stopped) = outcome.stopped {
+            let (state, why) = match stopped {
+                Stop::Conflict(why) => (RunState::UndoPaused, why),
+                Stop::Pending(why) => (RunState::Recovering, why),
+                Stop::Failed(why) => (state, why),
+            };
+            active.state = Set(state.as_str().to_string());
+            active.error = Set(Some(if failed.is_empty() {
+                format!("Undo stopped: {why}")
+            } else {
+                format!("Undo stopped: {why} Also not removed: {}.", failed.join("; "))
+            }));
+        } else if failed.is_empty() {
             active.state = Set(RunState::Undone.as_str().to_string());
             active.error = Set(None);
             active.live_url = Set(None);
@@ -1416,6 +1509,54 @@ impl ReachabilityService {
         active.updated_at = Set(Utc::now());
         active.finished_at = Set(Some(Utc::now()));
         let saved = active.update(self.deps.db.as_ref()).await?;
+        Ok(run_view(&saved))
+    }
+
+    /// Answer a run's conflict (ADR 064 D4), journaled with its entry.
+    /// Going forward the run becomes `interrupted`, to resume; while
+    /// undoing, undo carries on at once.
+    pub async fn decide(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        run_id: i32,
+        request: DecideRequest,
+    ) -> Result<RunView, ReachabilityError> {
+        let row = self.find_run(project_id, environment_id, run_id).await?;
+        let state = RunState::parse(&row.state);
+        let undoing = match state {
+            RunState::Conflict => false,
+            RunState::UndoPaused => true,
+            _ => {
+                return Err(ReachabilityError::Conflict(
+                    "This run is not waiting for a decision.".into(),
+                ))
+            }
+        };
+        let mut record = record_of(&row);
+        decide(&mut record.journal, &request.key, request.decision, undoing)
+            .map_err(ReachabilityError::Validation)?;
+        let left = record.conflicts().len();
+        let mut active: reachability_runs::ActiveModel = row.into();
+        active.journal = Set(serde_json::to_value(&record.journal).unwrap_or(Value::Array(vec![])));
+        active.updated_at = Set(Utc::now());
+        if left == 0 {
+            active.state = Set(if undoing {
+                RunState::Failed.as_str().to_string()
+            } else {
+                RunState::Interrupted.as_str().to_string()
+            });
+            active.error = Set(Some(if undoing {
+                "Decided; undo carries on.".to_string()
+            } else {
+                "Decided. Resume the run to carry on, or undo it.".to_string()
+            }));
+        }
+        let saved = active.update(self.deps.db.as_ref()).await?;
+        info!(run_id, key = %request.key, decision = ?request.decision, "reachability conflict decided");
+        if undoing && left == 0 {
+            return self.undo(project_id, environment_id, run_id).await;
+        }
         Ok(run_view(&saved))
     }
 
@@ -1524,6 +1665,22 @@ async fn resolve(host: &str) -> Result<Vec<IpAddr>, String> {
     }
 }
 
+#[async_trait]
+impl super::run::JournalSink for DbSink {
+    async fn save_journal(&self, journal: &[JournalEntry]) -> Result<(), String> {
+        reachability_runs::ActiveModel {
+            id: Set(self.run_id),
+            journal: Set(serde_json::to_value(journal).map_err(text)?),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .update(self.db.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(text)
+    }
+}
+
 /// Saves a run's progress on its row.
 struct DbSink {
     db: Arc<DatabaseConnection>,
@@ -1574,6 +1731,7 @@ impl LiveOps {
             project_id: self.project_id,
             environment_id: self.environment_id,
             controller: Some(DNS_CONTROLLER),
+            run_id: None,
         }
     }
 
@@ -1641,6 +1799,9 @@ impl RunOps for LiveOps {
                 }),
             Intent::Connector { name } => ingress_connectors::Entity::find()
                 .filter(ingress_connectors::Column::Name.eq(name.clone()))
+                .filter(
+                    ingress_connectors::Column::Status.ne(crate::service::STATUS_DELETING),
+                )
                 .one(db)
                 .await
                 .map_err(text)?
@@ -1672,21 +1833,22 @@ impl RunOps for LiveOps {
                     previous: *previous,
                 }
             }),
-            Intent::DnsRecord {
-                hostname,
-                record_type,
-                ..
-            } => dns_managed_record_states::Entity::find()
-                .filter(dns_managed_record_states::Column::Fqdn.eq(hostname.clone()))
-                .filter(dns_managed_record_states::Column::RecordType.eq(record_type.clone()))
-                .filter(dns_managed_record_states::Column::Controller.eq(DNS_CONTROLLER))
-                .one(db)
-                .await
-                .map_err(text)?
-                .map(|r| RunResource::DnsRecord {
+            // Records are looked up by `read_dns_record`, which says who
+            // wrote them (run.rs `look`).
+            Intent::DnsRecord { .. } | Intent::DnsChange { .. } => {
+                return Err("DNS records are looked up at their provider.".to_string())
+            }
+            Intent::AddressAudience { hostname, after, .. } => self
+                .address_audience(hostname)
+                .await?
+                .filter(|current| current == after)
+                .map(|_| RunResource::AddressAudience {
                     hostname: hostname.clone(),
-                    label: r.name,
-                    record_type: record_type.clone(),
+                    before: match intent {
+                        Intent::AddressAudience { before, .. } => before.clone(),
+                        _ => AddressAudience::public(),
+                    },
+                    after: after.clone(),
                 }),
             Intent::Certificate { domain } => domains::Entity::find()
                 .filter(domains::Column::Domain.eq(domain.clone()))
@@ -1846,8 +2008,29 @@ impl RunOps for LiveOps {
         })
     }
 
-    async fn delete_tunnel(&self, id: i32) -> Result<(), String> {
-        self.deps.connectors.delete(id).await.map(|_| ()).map_err(text)
+    async fn mark_tunnel_deleting(&self, id: i32, name: &str) -> Result<Option<String>, String> {
+        match self.deps.connectors.mark_deleting(id, name).await {
+            Ok(tunnel_id) => Ok(tunnel_id),
+            Err(IngressError::NotFound(_)) => Ok(None),
+            Err(error) => Err(text(error)),
+        }
+    }
+
+    async fn tunnel_hostnames(&self, id: i32) -> Result<Vec<String>, String> {
+        self.deps
+            .connectors
+            .hostnames_served(id)
+            .await
+            .map(|hosts| hosts.into_iter().collect())
+            .map_err(text)
+    }
+
+    async fn delete_tunnel(&self, id: i32, tunnel_id: Option<&str>) -> Result<(), String> {
+        self.deps
+            .connectors
+            .finish_deletion(id, tunnel_id)
+            .await
+            .map_err(text)
     }
 
     async fn find_custom_domain(&self, host: &str) -> Result<Option<(i32, i32)>, String> {
@@ -1940,14 +2123,45 @@ impl RunOps for LiveOps {
         Ok((view.state, view.detail))
     }
 
-    async fn set_dns_record(&self, host: &str, ip: IpAddr) -> Result<String, String> {
+    async fn read_dns_record(
+        &self,
+        host: &str,
+        record_type: &str,
+    ) -> Result<Option<DnsRecordState>, String> {
         let label = self.label_of(host).await?;
-        let content = match ip {
-            IpAddr::V4(v4) => DnsRecordContent::A {
-                address: v4.to_string(),
+        let kind = dns_record_type(record_type);
+        let snapshot = self
+            .deps
+            .records
+            .read_record(host, &label, kind)
+            .await
+            .map_err(|e| format!("Could not read the {record_type} record for {host}: {e}"))?;
+        Ok(snapshot.map(|s| DnsRecordState {
+            provider_id: s.provider_id,
+            label: label.clone(),
+            record_id: s.record_id,
+            record_type: s.record_type,
+            content: s.content,
+            modified_on: s.modified_on,
+            managed: s.managed,
+            run_id: s.run_id,
+        }))
+    }
+
+    async fn write_dns_record(
+        &self,
+        host: &str,
+        record_type: &str,
+        content: &str,
+        run_id: Option<i32>,
+    ) -> Result<String, WriteError> {
+        let label = self.label_of(host).await.map_err(WriteError::refused)?;
+        let value = match record_type {
+            "AAAA" => DnsRecordContent::AAAA {
+                address: content.to_string(),
             },
-            IpAddr::V6(v6) => DnsRecordContent::AAAA {
-                address: v6.to_string(),
+            _ => DnsRecordContent::A {
+                address: content.to_string(),
             },
         };
         self.deps
@@ -1956,19 +2170,33 @@ impl RunOps for LiveOps {
                 host,
                 DnsRecordRequest {
                     name: label.clone(),
-                    content,
+                    content: value,
                     ttl: Some(300),
                     proxied: false,
                 },
                 Some(false),
-                self.dns_scope(),
+                OwnershipScope {
+                    run_id,
+                    ..self.dns_scope()
+                },
             )
             .await
             .map_err(|e| {
-                format!(
-                    "Could not point {host} at {ip}: {e}. If a record for it already exists \
-                     and Temps does not manage it, remove that record first."
-                )
+                // A refusal wrote nothing; a dropped call may have.
+                let maybe_applied = matches!(
+                    e,
+                    temps_dns::DnsError::Request(_)
+                        | temps_dns::DnsError::ConnectionFailed(_)
+                        | temps_dns::DnsError::ApiError(_)
+                        | temps_dns::DnsError::Database(_)
+                );
+                WriteError {
+                    message: format!(
+                        "Could not point {host} at {content}: {e}. If a record for it already \
+                         exists and Temps does not manage it, remove that record first."
+                    ),
+                    maybe_applied,
+                }
             })?;
         Ok(label)
     }
@@ -1979,13 +2207,9 @@ impl RunOps for LiveOps {
         label: &str,
         record_type: &str,
     ) -> Result<(), String> {
-        let record_type = match record_type {
-            "AAAA" => DnsRecordType::AAAA,
-            _ => DnsRecordType::A,
-        };
         self.deps
             .records
-            .remove_managed_record(host, label, record_type, self.dns_scope())
+            .remove_managed_record(host, label, dns_record_type(record_type), self.dns_scope())
             .await
             .map_err(text)
     }
@@ -2004,10 +2228,10 @@ impl RunOps for LiveOps {
             .is_some())
     }
 
-    async fn start_certificate(&self, host: &str) -> Result<(), String> {
+    async fn start_certificate(&self, host: &str, challenge: &str) -> Result<(), String> {
         self.deps
             .domains
-            .create_domain(host, "http-01")
+            .create_domain(host, challenge)
             .await
             .map(|_| ())
             .map_err(text)
@@ -2026,8 +2250,9 @@ impl RunOps for LiveOps {
             .map(|_| ())
             .map_err(|e| {
                 format!(
-                    "Let's Encrypt could not check {host} over HTTP: {e}. Its DNS must point at \
-                     this ingress and port 80 must be open to the internet."
+                    "Let's Encrypt could not validate {host}: {e}. Over HTTP-01 its DNS must \
+                     point at this ingress with port 80 open to the internet; over DNS-01 the \
+                     zone's DNS provider in Temps must be able to write TXT records."
                 )
             })
     }
@@ -2074,9 +2299,59 @@ impl RunOps for LiveOps {
             })
     }
 
+    async fn address_audience(&self, host: &str) -> Result<Option<AddressAudience>, String> {
+        Ok(project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.eq(host))
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?
+            .map(|d| address_audience_of(&d)))
+    }
+
+    async fn set_address_audience(
+        &self,
+        host: &str,
+        audience: &AddressAudience,
+    ) -> Result<(), String> {
+        let row = project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.eq(host))
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?
+            .ok_or_else(|| format!("{host} is not attached to any environment."))?;
+        let mut active: project_custom_domains::ActiveModel = row.into();
+        set_address_audience_on(&mut active, audience);
+        active.update(self.deps.db.as_ref()).await.map_err(text)?;
+        Ok(())
+    }
+
     async fn sleep(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
     }
+}
+
+fn dns_record_type(record_type: &str) -> DnsRecordType {
+    match record_type {
+        "AAAA" => DnsRecordType::AAAA,
+        _ => DnsRecordType::A,
+    }
+}
+
+/// Who a custom domain is for, as stored.
+pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudience {
+    AddressAudience {
+        audience: Audience::parse(&row.audience),
+        network_range: None,
+        private_node_id: None,
+        private_listener: None,
+    }
+}
+
+fn set_address_audience_on(
+    active: &mut project_custom_domains::ActiveModel,
+    audience: &AddressAudience,
+) {
+    active.audience = Set(audience.audience.as_str().to_string());
 }
 
 /// ADR 064 D9: how visitors reach each address of a project's environments.

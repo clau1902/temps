@@ -25,7 +25,9 @@
 //! option that changes a hostname's choice says so in `confirmation`.
 //!
 //! [`fingerprint`] hashes everything a plan depends on, so `apply` can tell
-//! a plan the cluster has moved on from.
+//! a plan the cluster has moved on from: that includes the current content
+//! of every DNS record the plan would write (provider, record id, type,
+//! content, modification time), read when planning ([`records_to_read`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,8 +38,8 @@ use temps_auth::permissions::Permission;
 
 use super::compute::{is_local_only, DirectIngress, INGRESS_SETUP_PATH};
 use super::model::{
-    ActionKind, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep, ReachAction,
-    ReachabilityPlan, StepKind,
+    ActionKind, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep, PlannedRecord,
+    ReachAction, ReachabilityPlan, StepKind,
 };
 use crate::registry::{FieldKind, SetupField};
 use crate::service::{covers, normalize_host, record_label, PublicationIntent, TunnelFact};
@@ -99,6 +101,43 @@ pub struct PlanFacts {
     pub choices: Vec<(String, Option<i32>)>,
     /// Active workers and their ingress mode.
     pub worker_modes: Vec<(i32, Option<String>)>,
+    /// What is at each `(hostname, record type)` the plan would write, as
+    /// read when planning ([`records_to_read`]).
+    pub dns_records: Vec<(String, String, PlannedRecord)>,
+}
+
+/// The `A`/`AAAA` record type for an address.
+pub fn record_type_of(ip: std::net::IpAddr) -> &'static str {
+    match ip {
+        std::net::IpAddr::V4(_) => "A",
+        std::net::IpAddr::V6(_) => "AAAA",
+    }
+}
+
+/// The records a plan for `address` could write through a zone Temps
+/// manages: the service reads them before planning, so the plan shows
+/// what would change and its fingerprint holds them.
+pub fn records_to_read(facts: &PlanFacts, address: &str) -> Vec<(String, String)> {
+    if !zone_for(address, &facts.zones).is_some_and(|z| z.verified) {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(direct) = http01_direct(facts) {
+        out.push((address.to_string(), record_type_of(direct.ips[0]).to_string()));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// What the plan saw at `host`'s `record_type` record.
+pub fn planned_record(facts: &PlanFacts, host: &str, record_type: &str) -> PlannedRecord {
+    facts
+        .dns_records
+        .iter()
+        .find(|(h, t, _)| h == host && t == record_type)
+        .map(|(_, _, r)| r.clone())
+        .unwrap_or_default()
 }
 
 /// The address a plan is for: as asked, else a suggestion. `Err` with why
@@ -142,9 +181,11 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
         .collect();
     directs.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let intent = address.map(|a| intent_of(facts, a));
+    let mut records = facts.dns_records.clone();
+    records.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     let canonical = format!(
-        "v1|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
-         {accounts:?}|{directs:?}|{modes:?}|{intent:?}|{:?}",
+        "v2|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
+         {accounts:?}|{directs:?}|{modes:?}|{intent:?}|{:?}|{records:?}",
         facts.audience,
         facts.deployed,
         facts.served_by_workers,
@@ -391,6 +432,9 @@ pub fn permissions_for(kind: PlanOptionKind) -> Vec<Permission> {
             vec![Permission::SettingsWrite, Permission::DnsProvidersWrite]
         }
         PlanOptionKind::DirectManualDns => vec![Permission::DomainsCreate],
+        PlanOptionKind::PrivateWorker => {
+            vec![Permission::DnsProvidersWrite, Permission::DomainsCreate]
+        }
     }
 }
 
@@ -676,9 +720,55 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         .and_then(|host| zone_for(host, &facts.zones))
         .filter(|z| z.verified);
 
-    // 2. A direct ingress with DNS Temps manages.
-    if let (Some(direct), Some(zone)) = (direct, managed_zone) {
+    // 2. A direct ingress with DNS Temps manages. A record already there is
+    //    changed only when Temps manages it, and the plan says so.
+    let existing = match (direct, address.as_deref()) {
+        (Some(direct), Some(host)) => {
+            planned_record(facts, host, record_type_of(direct.ips[0]))
+        }
+        _ => PlannedRecord::Absent,
+    };
+    let dns_label = |ip: std::net::IpAddr, zone: &ZoneFact| match &existing {
+        PlannedRecord::Present { record } if record.content == ip.to_string() => {
+            format!("{shown} already points at {ip} in {}", zone.domain)
+        }
+        PlannedRecord::Present { record } => format!(
+            "Change {shown} from {} to {ip} in {}",
+            record.content, zone.domain
+        ),
+        _ => format!("Point {shown} at {ip} in {}", zone.domain),
+    };
+    let dns_blocked = match (&existing, managed_zone) {
+        (PlannedRecord::Present { record }, Some(zone)) if !record.managed => Some(format!(
+            "{shown} already has an {} record ({}) at {} that Temps did not create. Temps never \
+             changes a record it does not manage: remove it there, or use another hostname.",
+            record.record_type, record.content, zone.provider_name
+        )),
+        (PlannedRecord::Unknown, Some(zone)) => Some(format!(
+            "Temps could not read {shown}'s DNS records at {} just now, so it cannot show what \
+             would change. Try again in a minute.",
+            zone.provider_name
+        )),
+        _ => None,
+    };
+    if let Some(reason) = &dns_blocked {
+        blocked_reasons.push(PlanBlocked {
+            reason: reason.clone(),
+            action: None,
+        });
+    }
+    if let (Some(direct), Some(zone), None) = (direct, managed_zone, &dns_blocked) {
         let ip = direct.ips[0];
+        let mut warnings = Vec::new();
+        if let PlannedRecord::Present { record } = &existing {
+            if record.content != ip.to_string() {
+                warnings.push(format!(
+                    "{shown} points at {} now; this changes it to {ip}. Undo puts {} back while \
+                     nobody else has changed it meanwhile.",
+                    record.content, record.content
+                ));
+            }
+        }
         drafts.push(OptionDraft {
             kind: PlanOptionKind::DirectManagedDns,
             title: format!("Straight to {}", direct.name),
@@ -690,10 +780,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
             way_in: format!("direct:{}", direct.name),
             steps: vec![
                 step(StepKind::AttachDomain, attach_label.clone()),
-                step(
-                    StepKind::SetDnsRecord,
-                    format!("Point {shown} at {ip} in {}", zone.domain),
-                ),
+                step(StepKind::SetDnsRecord, dns_label(ip, zone)),
                 step(
                     StepKind::IssueCertificate,
                     format!("Issue a certificate for {shown}"),
@@ -701,7 +788,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
                 step(StepKind::CheckReachability, format!("Check {shown}")),
             ],
             fields: with_address(Vec::new()),
-            warnings: Vec::new(),
+            warnings,
             confirmation: None,
         });
     }
@@ -1335,5 +1422,73 @@ mod tests {
             fingerprint(&two, Some("shop.example.com")),
             fingerprint(&reversed, Some("shop.example.com"))
         );
+    }
+
+    fn seen(content: &str, modified: &str, managed: bool) -> PlannedRecord {
+        PlannedRecord::Present {
+            record: crate::reachability::model::DnsRecordState {
+                provider_id: 3,
+                label: "myapp".into(),
+                record_id: Some("rec-1".into()),
+                record_type: "A".into(),
+                content: content.into(),
+                modified_on: Some(modified.into()),
+                managed,
+                run_id: None,
+            },
+        }
+    }
+
+    fn direct_facts(record: PlannedRecord) -> PlanFacts {
+        PlanFacts {
+            directs: vec![direct(true)],
+            zones: vec![zone("example.com", "cloudflare")],
+            requested: Some("myapp.example.com".into()),
+            dns_records: vec![("myapp.example.com".into(), "A".into(), record)],
+            ..base()
+        }
+    }
+
+    /// ADR 064 D4: a DNS record edited after planning makes `apply` refuse
+    /// the plan (409 with a new one), because the record is in the
+    /// fingerprint: its content, and its modification time even when the
+    /// content is the same again.
+    #[test]
+    fn a_dns_record_edited_after_planning_changes_the_fingerprint() {
+        let host = Some("myapp.example.com");
+        let planned = direct_facts(seen("198.51.100.1", "2026-10-24T10:00:00Z", true));
+        let print = fingerprint(&planned, host);
+        assert_eq!(print, fingerprint(&planned.clone(), host));
+        let edited = direct_facts(seen("198.51.100.2", "2026-10-24T10:05:00Z", true));
+        assert_ne!(print, fingerprint(&edited, host));
+        let touched = direct_facts(seen("198.51.100.1", "2026-10-24T10:06:00Z", true));
+        assert_ne!(print, fingerprint(&touched, host));
+        let removed = direct_facts(PlannedRecord::Absent);
+        assert_ne!(print, fingerprint(&removed, host));
+        // Only the record a plan would write is read for it.
+        assert_eq!(
+            records_to_read(&planned, "myapp.example.com"),
+            vec![("myapp.example.com".to_string(), "A".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_plan_shows_the_record_it_would_change_and_never_takes_over_one() {
+        let plan = plan(&direct_facts(seen("198.51.100.1", "t", true)));
+        let option = &plan.options[0];
+        assert_eq!(option.kind, PlanOptionKind::DirectManagedDns);
+        let dns = option
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::SetDnsRecord)
+            .expect("dns step");
+        assert!(dns.label.contains("from 198.51.100.1 to 203.0.113.5"), "{}", dns.label);
+        assert!(option.warnings[0].contains("Undo puts 198.51.100.1 back"));
+
+        // A record Temps does not manage is never offered for change.
+        let plan = plan_of(&direct_facts(seen("198.51.100.1", "t", false)));
+        assert!(!kinds(&plan).contains(&PlanOptionKind::DirectManagedDns));
+        let blocked = format!("{:?}", plan.blocked);
+        assert!(blocked.contains("that Temps did not create"), "{blocked}");
     }
 }

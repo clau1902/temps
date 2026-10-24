@@ -28,8 +28,9 @@ use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
 use super::model::{
-    ActionKind, AddressReachability, AddressSource, ApplyRequest, Audience,
-    EnvironmentReachability, Intent, JournalEntry, JournalState, PlanBlocked, PlanOption,
+    ActionKind, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
+    DecideRequest, Decision, DnsRecordState, EnvironmentReachability, Intent, JournalEntry,
+    JournalState, PlanBlocked, PlanOption, PlannedRecord,
     PlanOptionKind, PlanRequest, PlanStep, PreviousChoice, ReachAction, ReachState,
     ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep, RunStepStatus, RunView,
     StepKind, UndoResult,
@@ -65,6 +66,7 @@ pub struct CertificateMethods {
         get_reachability_run,
         resume_reachability_run,
         undo_reachability_run,
+        decide_reachability_conflict,
         check_cloudflare_token,
         get_certificate_methods,
     ),
@@ -95,6 +97,11 @@ pub struct CertificateMethods {
         RunStepStatus,
         RunResource,
         UndoResult,
+        DecideRequest,
+        Decision,
+        DnsRecordState,
+        PlannedRecord,
+        AddressAudience,
         TokenCheckRequest,
         TokenCheckResult,
         PermissionCheck,
@@ -122,6 +129,10 @@ pub fn configure_routes() -> Router<Arc<ReachabilityAppState>> {
         .route(
             &format!("{base}/runs/{{run_id}}/undo"),
             post(undo_reachability_run),
+        )
+        .route(
+            &format!("{base}/runs/{{run_id}}/decide"),
+            post(decide_reachability_conflict),
         )
         .route("/ingress/cloudflare/token-check", post(check_cloudflare_token))
         .route("/ingress/certificate-methods", get(get_certificate_methods))
@@ -523,6 +534,85 @@ async fn undo_reachability_run(
     Ok(Json(run))
 }
 
+/// Answer a conflict: a DNS record someone else changed while the run was
+/// setting it, or after it did (ADR 064 D4).
+///
+/// Going forward, `keep` leaves their value and skips the step, and
+/// `overwrite` lets Temps set it; the run is then `interrupted`, to resume.
+/// While undoing, `keep` leaves their value and `overwrite` restores what
+/// was there before the run; undo then carries on, with undo's checks.
+#[utoipa::path(
+    tag = "Reachability",
+    post,
+    path = "/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/decide",
+    operation_id = "decide_reachability_conflict",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("run_id" = i32, Path, description = "Run ID")
+    ),
+    request_body = DecideRequest,
+    responses(
+        (status = 200, body = RunView),
+        (status = 400, description = "That entry is not waiting for a decision"),
+        (status = 403, description = "A permission or step-up confirmation is missing"),
+        (status = 404, description = "Run not found"),
+        (status = 409, description = "The run is not waiting for a decision")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn decide_reachability_conflict(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ReachabilityAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, environment_id, run_id)): Path<(i32, i32, i32)>,
+    Json(request): Json<DecideRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(auth, ProjectsWrite, project_id, state.project_access_checker);
+    let current = state
+        .service
+        .run(project_id, environment_id, run_id)
+        .await?;
+    // Writing the record either way needs what the run's DNS step needed;
+    // carrying on with undo needs what undo needs.
+    require_all(&auth, &[Permission::DnsProvidersWrite], "Deciding this conflict")?;
+    if current.state == RunState::UndoPaused {
+        let pending = state
+            .service
+            .undo_pending(project_id, environment_id, run_id)
+            .await?;
+        require_all(&auth, &undo_permissions(&pending), "Undoing this run")?;
+        if let Some(domain) = pending.iter().find_map(|r| match r {
+            RunResource::Certificate { domain } => Some(domain.clone()),
+            _ => None,
+        }) {
+            require_sensitive_action(
+                state.sensitive_action_authorizer.as_ref(),
+                &auth,
+                SensitiveAction::DeleteDomain { domain },
+            )
+            .await?;
+        }
+    }
+    let key = request.key.clone();
+    let decision = request.decision;
+    let run = state
+        .service
+        .decide(project_id, environment_id, run_id, request)
+        .await?;
+    audit(
+        &state,
+        "REACHABILITY_CONFLICT_DECIDED",
+        &auth,
+        &metadata,
+        &run,
+        serde_json::json!({ "key": key, "decision": decision, "state": run.state.as_str() }),
+    )
+    .await;
+    Ok(Json(run))
+}
+
 /// What removing `pending` needs, on top of `projects:write`.
 fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
     let mut needed = Vec::new();
@@ -531,11 +621,14 @@ fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
             RunResource::DnsProvider { .. }
             | RunResource::ManagedDomain { .. }
             | RunResource::AutoManageEnabled { .. }
-            | RunResource::DnsRecord { .. } => Permission::DnsProvidersWrite,
+            | RunResource::DnsRecord { .. }
+            | RunResource::DnsChange { .. } => Permission::DnsProvidersWrite,
             RunResource::Connector { .. } | RunResource::HostnameChoice { .. } => {
                 Permission::SettingsWrite
             }
-            RunResource::CustomDomain { .. } => Permission::ProjectsWrite,
+            RunResource::CustomDomain { .. } | RunResource::AddressAudience { .. } => {
+                Permission::ProjectsWrite
+            }
             RunResource::Certificate { .. } => Permission::DomainsDelete,
         };
         if !needed.contains(&permission) {
