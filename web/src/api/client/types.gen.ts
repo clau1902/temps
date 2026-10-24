@@ -21003,10 +21003,19 @@ export type PlatformFeatures = {
      */
     profile: string;
     /**
-     * Agent sandboxes / workspace previews run in this process. Requires a
-     * local Docker daemon.
+     * The standalone sandbox API is served and sandboxes can run on some
+     * node (ADR 063). `true` in both profiles: on a control plane they run
+     * on worker nodes only, and a create with no usable worker answers the
+     * worker-node-required problem pointing at Settings → Nodes.
      */
     sandboxes: boolean;
+    /**
+     * Sandboxes, AI agent runs and application workspaces can run on this
+     * host itself. Requires local workloads (and so a local Docker daemon);
+     * `false` in the `control-plane` profile, where the control plane's own
+     * node takes no sandboxes (ADR 063).
+     */
+    sandboxes_local?: boolean;
     /**
      * This installation uses Postgres, injected secrets and S3 for durable
      * state; its control-plane scratch disk may be discarded.

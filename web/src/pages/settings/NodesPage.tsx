@@ -69,6 +69,7 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   adminListNodesOptions,
@@ -1033,13 +1034,18 @@ function NodeDetail({
   // admins may list other users' sandboxes, so others see an explanation.
   const { user } = useAuth()
   const canSeeSandboxes = canManageSandboxPlacement(user?.role)
+  // A server that does not serve the sandbox API is not asked (its answer
+  // would be a bare 404); the panel says why instead. Unknown features
+  // (loading, or a server that predates them) still ask, as before.
+  const platformFeatures = usePlatformFeatures()
+  const sandboxesAvailable = platformFeatures.data?.sandboxes !== false
   const [sandboxPage, setSandboxPage] = useState(1)
   const sandboxesQuery = useQuery({
     ...listNodeSandboxesOptions({
       path: { node: String(nodeId) },
       query: { page: sandboxPage, page_size: 20 },
     }),
-    enabled: canSeeSandboxes,
+    enabled: canSeeSandboxes && sandboxesAvailable,
     refetchInterval: 15_000,
   })
   const liveSandboxes = sandboxesQuery.data?.total ?? 0
@@ -1560,6 +1566,8 @@ function NodeDetail({
             query={sandboxesQuery}
             page={sandboxPage}
             onPageChange={setSandboxPage}
+            sandboxesAvailable={sandboxesAvailable}
+            sandboxesLocal={platformFeatures.data?.sandboxes_local}
           />
         </TabsContent>
       </Tabs>
