@@ -39,6 +39,7 @@ pub async fn bootstrap(
                 &handle,
                 &config.vxlan_dev_name,
                 &config.underlay_dev,
+                alloc.underlay_address,
                 vni,
                 port,
                 config.transport.bridge_mtu(config.underlay_mtu),
