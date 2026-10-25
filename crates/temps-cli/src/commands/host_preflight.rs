@@ -283,12 +283,19 @@ impl Finding {
                          holds it, or use `temps agent ingress` to move public traffic to other \
                          ports."
                     )
-                } else {
+                } else if *port == 80 {
                     format!(
                         "port {port} is already in use on {address}{holder}. The worker takes \
-                         no public traffic (ingress `off`), but the overlay's internal proxy \
-                         serves port 80 of its bridge address and fails to start while it is \
-                         held. Stop what holds it."
+                         no public traffic, but the overlay's internal proxy serves port 80 of \
+                         its bridge address and fails to start while it is held. Stop what \
+                         holds it."
+                    )
+                } else {
+                    format!(
+                        "port {port} is already in use on {address}{holder}. The worker's \
+                         private listener (ingress `private`) serves HTTPS on port {port} of \
+                         its private address and fails to start while it is held. Stop what \
+                         holds it."
                     )
                 }
             }
@@ -340,16 +347,20 @@ pub enum Purpose<'a> {
 /// The ports a worker with `ingress` serves on, sorted, and whether its
 /// ingress mode listens for public traffic. Port 80 always: the overlay's
 /// internal proxy binds it on the bridge address. `off` binds no public
-/// listener, so 443 and the ingress ports cannot stop it.
+/// listener, so 443 and the ingress ports cannot stop it. `private` binds
+/// only its fixed private ports (ADR 064 D5), and takes no public traffic.
 pub fn served_ports(ingress: &temps_core::worker_ingress::LocalIngress) -> (Vec<u16>, bool) {
-    use temps_core::worker_ingress::IngressMode;
-    if ingress.mode == IngressMode::Off {
-        return (vec![80], false);
-    }
-    let mut ports = vec![80, 443, ingress.http_port, ingress.https_port];
+    use temps_core::worker_ingress::{IngressMode, PRIVATE_HTTPS_PORT, PRIVATE_HTTP_PORT};
+    let (mut ports, serves_public) = match ingress.mode {
+        IngressMode::Off => (vec![80], false),
+        IngressMode::Private => (vec![80, PRIVATE_HTTP_PORT, PRIVATE_HTTPS_PORT], false),
+        IngressMode::Fixed | IngressMode::Delegated => {
+            (vec![80, 443, ingress.http_port, ingress.https_port], true)
+        }
+    };
     ports.sort_unstable();
     ports.dedup();
-    (ports, true)
+    (ports, serves_public)
 }
 
 /// Decide from `facts`. `ports` are the ports the worker will serve on;
@@ -1162,6 +1173,15 @@ mod tests {
             ..LocalIngress::default()
         };
         assert_eq!(served_ports(&fixed), (vec![80, 443, 8080, 8443], true));
+        // `private` serves its own fixed ports, never the public ingress
+        // ports, and takes no public traffic on them.
+        let private = LocalIngress {
+            mode: IngressMode::Private,
+            http_port: 8080,
+            https_port: 8443,
+            ..LocalIngress::default()
+        };
+        assert_eq!(served_ports(&private), (vec![80, 443], false));
 
         let facts = HostFacts {
             listeners: vec![

@@ -129,6 +129,13 @@ pub struct JoinCommand {
     /// join, and by the control plane recognising this node.
     #[arg(skip)]
     plane_match: super::host_preflight::PlaneMatch,
+
+    /// An outbound join sends the saved agent token only to a control plane
+    /// that proved it is this node's: one pinned to the cluster CA this
+    /// machine trusts, or one that answered the rejoin proof. Set when the
+    /// mesh enrollment showed neither (ADR 060).
+    #[arg(skip)]
+    withhold_prior_token: bool,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,6 +621,15 @@ fn rejoin_proof_for(
         wg_public_key,
         join_token,
     )
+}
+
+/// Whether an outbound join may send the saved agent token: only to a
+/// control plane pinned to a cluster CA this machine already trusts, or one
+/// that answered its rejoin proof. Without either, the node re-registers
+/// with the join token alone, which updates a node that is not live (or is
+/// refused for a live one, and says so).
+fn prior_token_may_follow(ca_pinned: bool, acknowledged: bool) -> bool {
+    ca_pinned || acknowledged
 }
 
 /// Whether the control plane answered this join's rejoin proof with
@@ -1180,7 +1196,8 @@ impl JoinCommand {
             node_name,
             self.target(),
             self.plane_match,
-        );
+        )
+        .filter(|_| !self.withhold_prior_token);
 
         let agent_port = agent_listen_port(&self.agent_address);
         let agent_url_host = socket_authority(private_address, agent_port);
@@ -1626,17 +1643,25 @@ impl JoinCommand {
             }
             println!("Cluster CA fingerprint verified.");
         }
-        if let Some(node_id) = answer.rejoined_node_id {
-            // Only a control plane holding this node's agent token hash can
-            // answer the proof: then it is the one this node belongs to. A
-            // bare `rejoined_node_id` proves nothing, so it changes nothing.
-            if rejoin_acknowledged(
+        // Only a control plane holding this node's agent token hash can
+        // answer the proof: then it is the one this node belongs to. A bare
+        // `rejoined_node_id` proves nothing, so it changes nothing.
+        let acknowledged = answer.rejoined_node_id.is_some()
+            && rejoin_acknowledged(
                 load_saved_agent_config().as_ref(),
                 rejoin_proof.as_deref(),
                 answer.rejoin_ack.as_deref(),
-            ) {
-                self.plane_match = PlaneMatch::Same;
-            }
+            );
+        if acknowledged {
+            self.plane_match = PlaneMatch::Same;
+        }
+        // Registration over the mesh is pinned to the CA this answer
+        // announces, which any control plane can choose. The saved agent
+        // token goes only where it is known to belong: a CA this machine
+        // already pinned (checked above), or a proof answered.
+        self.withhold_prior_token =
+            !prior_token_may_follow(self.ca_fingerprint.is_some(), acknowledged);
+        if let Some(node_id) = answer.rejoined_node_id {
             println!(
                 "This machine is already node '{}' (id {node_id}) of this control plane: it is \
                  updated in place and keeps its mesh address {node_address}. Bringing up the \
@@ -2237,8 +2262,8 @@ mod tests {
     use super::{
         agent_listen_port, apply_saved_public_ingress_settings, find_pinned_ca,
         generate_public_ingress_key, pinned_client_for, pinned_cluster_ca,
-        prior_token_for_reenrollment, public_ingress_listener_settings, read_code,
-        rejoin_proof_for, relay_registration_trust, require_https_relay,
+        prior_token_for_reenrollment, prior_token_may_follow, public_ingress_listener_settings,
+        read_code, rejoin_proof_for, relay_registration_trust, require_https_relay,
         saved_config_for_reenrollment, socket_authority, PlaneMatch, RelayRegistrationTrust,
     };
     use std::sync::Arc;
@@ -2679,6 +2704,17 @@ mod tests {
             temps_core::ecies::decrypt_bundle(&old_private, &ephemeral_public, &bundle).is_err(),
             "the prior enrollment key must not decrypt bundles for the rotated identity"
         );
+    }
+
+    #[test]
+    fn an_outbound_join_sends_the_saved_token_only_to_a_proven_control_plane() {
+        // A mesh-key match alone proves nothing: the answer's CA is the
+        // control plane's own choice.
+        assert!(!prior_token_may_follow(false, false));
+        // A CA this machine already pinned, or an answered rejoin proof.
+        assert!(prior_token_may_follow(true, false));
+        assert!(prior_token_may_follow(false, true));
+        assert!(prior_token_may_follow(true, true));
     }
 
     #[test]
