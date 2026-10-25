@@ -40,6 +40,9 @@ pub struct PublicIngressInterface {
     pub address: String,
     pub default_route: bool,
     pub scope: AddressScope,
+    /// The worker's Tailscale address (`tailscale0`, in 100.64.0.0/10).
+    #[serde(default)]
+    pub tailscale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -84,6 +87,11 @@ pub struct PublicIngressSettings {
     pub listening_http: Option<String>,
     pub listening_https: Option<String>,
     pub listener_error: Option<String>,
+    /// In `private` mode (ADR 064 D5): the private address the listener is
+    /// bound on, when it is a private one.
+    pub private_listener: Option<String>,
+    /// That address is the worker's Tailscale one.
+    pub private_on_tailscale: bool,
     pub running: Option<bool>,
     pub last_error: Option<String>,
     /// The listen address is not public but the public address is: traffic
@@ -191,6 +199,15 @@ fn view(node: &nodes::Model, row: Option<&node_public_ingress::Model>) -> Public
             Some(AddressScope::Public)
         )
     );
+    let private_listener = (row.and_then(|r| r.mode.as_deref()) == Some("private"))
+        .then(|| listening_str("https").as_deref().and_then(parse_ip))
+        .flatten()
+        .filter(|ip| temps_core::worker_ingress::check_private_listen(*ip).is_ok());
+    let private_on_tailscale = private_listener.is_some_and(|ip| {
+        interfaces
+            .iter()
+            .any(|i| i.tailscale && parse_ip(&i.address) == Some(ip))
+    });
     PublicIngressSettings {
         node_id: node.id,
         enabled: node.public_ingress_enabled,
@@ -208,6 +225,7 @@ fn view(node: &nodes::Model, row: Option<&node_public_ingress::Model>) -> Public
                 name: i.name,
                 address: i.address,
                 default_route: i.default_route,
+                tailscale: i.tailscale,
             })
             .collect(),
         mode: row
@@ -216,6 +234,8 @@ fn view(node: &nodes::Model, row: Option<&node_public_ingress::Model>) -> Public
         listening_http: listening_str("http"),
         listening_https: listening_str("https"),
         listener_error: listening_str("error"),
+        private_listener: private_listener.map(|ip| ip.to_string()),
+        private_on_tailscale,
         running: node.public_ingress_running,
         last_error: node.public_ingress_last_error.clone(),
         behind_nat,
@@ -336,6 +356,13 @@ pub async fn update_public_ingress_settings(
         Some(IngressMode::Off) if request.enabled => {
             return Err(conflict(
                 "This worker does not allow public traffic. On the worker, run `temps agent ingress delegated` to let Temps choose how it listens, or `temps agent ingress fixed` to choose yourself, then enable it here.",
+            ));
+        }
+        // ADR 064 D5: a private-mode worker listens only on its private
+        // network, on the address and ports its owner chose.
+        Some(IngressMode::Private) if request.enabled => {
+            return Err(conflict(
+                "This worker listens only on its private network (`private` mode), so it takes no public traffic. To take public traffic too, run `temps agent ingress delegated` or `temps agent ingress fixed` on the worker. Private addresses are set up with Make it reachable → Only my private network.",
             ));
         }
         Some(IngressMode::Off | IngressMode::Fixed) => {
