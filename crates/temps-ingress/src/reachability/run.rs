@@ -370,7 +370,7 @@ pub fn created(journal: &[JournalEntry]) -> Vec<RunResource> {
 /// What looking an intent up found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Found {
-    Made(RunResource),
+    Made(Box<RunResource>),
     Missing,
     /// It holds something neither the run nor what it replaced had.
     Changed(String),
@@ -398,12 +398,12 @@ async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, S
         } => Ok(match ops.read_dns_record(hostname, record_type).await? {
             None => Found::Missing,
             Some(record) if record.managed && record.run_id == Some(run_id) => {
-                Found::Made(RunResource::DnsRecord {
+                Found::Made(Box::new(RunResource::DnsRecord {
                     hostname: hostname.clone(),
                     label: record.label,
                     record_type: record_type.clone(),
                     content: Some(record.content),
-                })
+                }))
             }
             Some(other) => Found::Changed(describe_record(Some(&other))),
         }),
@@ -415,20 +415,20 @@ async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, S
             after,
         } => Ok(match ops.read_dns_record(hostname, record_type).await? {
             Some(record) if holds_this_run(&record, after, run_id) => {
-                Found::Made(RunResource::DnsChange {
+                Found::Made(Box::new(RunResource::DnsChange {
                     hostname: hostname.clone(),
                     label: label.clone(),
                     record_type: record_type.clone(),
                     before: before.clone(),
                     after: after.clone(),
-                })
+                }))
             }
             // Still what it was before the write: the write did not happen.
             Some(record) if record.unchanged_from(before) => Found::Missing,
             other => Found::Changed(describe_record(other.as_ref())),
         }),
         other => Ok(match ops.find(other).await? {
-            Some(resource) => Found::Made(resource),
+            Some(resource) => Found::Made(Box::new(resource)),
             None => Found::Missing,
         }),
     }
@@ -484,7 +484,7 @@ pub async fn resolve_pending(
     match found {
         Found::Made(resource) => {
             entry.state = JournalState::Done;
-            entry.resource = Some(resource);
+            entry.resource = Some(*resource);
             entry.first_miss_at = None;
             entry.at = now;
             Resolution::Done
@@ -654,7 +654,7 @@ enum Outcome {
 /// Whether a journaled step has to make its call.
 enum Begin {
     /// An earlier attempt created it already.
-    Have(RunResource),
+    Have(Box<RunResource>),
     /// The pending entry is stored; make the call.
     Go,
 }
@@ -772,7 +772,9 @@ impl Runner<'_> {
                     )));
                 }
                 match (entry.state, entry.resource.clone()) {
-                    (JournalState::Done, Some(resource)) => return Ok(Begin::Have(resource)),
+                    (JournalState::Done, Some(resource)) => {
+                        return Ok(Begin::Have(Box::new(resource)))
+                    }
                     (JournalState::Pending, _) => {
                         let resolution = resolve_pending(entry, self.ops, run_id, now).await;
                         let entry = entry.clone();
@@ -780,7 +782,7 @@ impl Runner<'_> {
                         match resolution {
                             Resolution::Done => {
                                 if let Some(resource) = entry.resource {
-                                    return Ok(Begin::Have(resource));
+                                    return Ok(Begin::Have(Box::new(resource)));
                                 }
                             }
                             Resolution::Absent => {}
@@ -1074,7 +1076,7 @@ impl Runner<'_> {
                 };
                 let resource = match self.begin(&intent).await {
                     Err(hold) => return hold.into(),
-                    Ok(Begin::Have(resource)) => resource,
+                    Ok(Begin::Have(resource)) => *resource,
                     Ok(Begin::Go) => {
                         let Some(token) = &input.token else {
                             self.finish(&intent.key(input.run_id), None).await;
@@ -1242,7 +1244,7 @@ impl Runner<'_> {
                 match self.begin(&intent).await {
                     Err(hold) => hold.into(),
                     Ok(Begin::Have(resource)) => {
-                        if let RunResource::Connector { id, .. } = resource {
+                        if let RunResource::Connector { id, .. } = *resource {
                             self.ctx.connector_id = Some(id);
                         }
                         Outcome::Done(Some(format!(

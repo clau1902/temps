@@ -222,9 +222,9 @@ pub fn read_permission(answer: &Answer) -> PermissionState {
 pub fn write_probe_permission(answer: &Answer) -> PermissionState {
     if answer.denied() {
         PermissionState::Missing
-    } else if answer.status == 400 && !answer.success && !answer.codes.is_empty() {
-        PermissionState::Present
-    } else if answer.success && (200..300).contains(&answer.status) {
+    } else if (answer.status == 400 && !answer.success && !answer.codes.is_empty())
+        || (answer.success && (200..300).contains(&answer.status))
+    {
         PermissionState::Present
     } else {
         PermissionState::Unverified
