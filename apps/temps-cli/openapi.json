@@ -1649,6 +1649,50 @@
             "description": "Sandbox is always enabled — the executor refuses to run any agent\noutside a sandboxed container. Field is retained so existing settings\nrows still deserialize, but it is ignored at runtime.",
             "type": "boolean"
           },
+          "max_cpu_limit": {
+            "default": null,
+            "description": "Highest `cpu_limit` (cores) a `POST /sandboxes` request may ask for.\n`cpu_limit` above only sets the default for requests that omit the\nfield; this is the ceiling. `None` = the built-in ceiling (16 cores).\nA value above the built-in ceiling has no effect.",
+            "example": 4,
+            "format": "double",
+            "minimum": 0.01,
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_memory_limit_mb": {
+            "default": null,
+            "description": "Highest `memory_limit_mb` a `POST /sandboxes` request may ask for.\n`None` = the built-in ceiling (32768 MB). On the control plane the\nhost's physical memory is an additional ceiling.",
+            "example": 8192,
+            "format": "int64",
+            "minimum": 6,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_pids_limit": {
+            "default": null,
+            "description": "Highest `pids_limit` a `POST /sandboxes` request may ask for.\n`None` = the built-in ceiling (4096).",
+            "example": 1024,
+            "format": "int64",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_sandboxes_per_user": {
+            "default": null,
+            "description": "Most sandboxes (not destroyed) one user may have created through\n`POST /sandboxes` at a time; a create over the cap is refused.\n`None` = unlimited. AI application workspaces, agent runs and the\nsandboxes the platform creates for AI chat or autofix do not count\nand are not refused. Sandboxes created before this setting existed\nare not counted either.",
+            "example": 10,
+            "format": "int32",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "memory_limit_mb": {
             "default": 8192,
             "description": "Memory limit in MB for sandbox containers",
@@ -1713,6 +1757,42 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "max_cpu_limit": {
+            "description": "Operator ceiling for a sandbox create request's `cpu_limit`; `null` = built-in.",
+            "format": "double",
+            "minimum": 0.01,
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_memory_limit_mb": {
+            "description": "Operator ceiling for `memory_limit_mb`; `null` = built-in.",
+            "format": "int64",
+            "minimum": 6,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_pids_limit": {
+            "description": "Operator ceiling for `pids_limit`; `null` = built-in.",
+            "format": "int64",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_sandboxes_per_user": {
+            "description": "Most live sandboxes per user; `null` = unlimited.",
+            "format": "int32",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "memory_limit_mb": {
             "format": "int64",
@@ -3592,6 +3672,10 @@
               "custom_image": "",
               "default_provider": "claude_cli",
               "enabled": true,
+              "max_cpu_limit": null,
+              "max_memory_limit_mb": null,
+              "max_pids_limit": null,
+              "max_sandboxes_per_user": null,
               "memory_limit_mb": 8192,
               "network_mode": "full",
               "providers": {},
@@ -16625,16 +16709,20 @@
             ]
           },
           "cpu_limit": {
+            "description": "CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).\nOmit for the operator's default.",
             "format": "double",
+            "maximum": 16,
+            "minimum": 0.01,
             "type": [
               "number",
               "null"
             ]
           },
           "disk_size_mb": {
-            "description": "Root disk size in MB (Firecracker only; Docker ignores it). Omit for\nthe platform default (1 GiB).",
+            "description": "Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores\nit). Omit for the platform default (1 GiB).",
             "format": "int64",
-            "minimum": 0,
+            "maximum": 65536,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -16672,8 +16760,10 @@
             ]
           },
           "memory_limit_mb": {
+            "description": "Memory in MB, `[6, 32768]` (lower if an administrator set a maximum,\nand never more than the host has). Omit for the operator's default.",
             "format": "int64",
-            "minimum": 0,
+            "maximum": 32768,
+            "minimum": 6,
             "type": [
               "integer",
               "null"
@@ -16695,7 +16785,10 @@
             ]
           },
           "pids_limit": {
+            "description": "Max processes, `[1, 4096]` (lower if an administrator set a maximum);\n`0`/negative (unlimited) is rejected. Omit for the platform default\n(512).",
             "format": "int64",
+            "maximum": 4096,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -39938,6 +40031,47 @@
         ],
         "type": "object"
       },
+      "NodeCreateAlertRuleRequest": {
+        "description": "Request body for creating a resource alert on a node.\n\nOnly the usage percentages can be alerted on: `node.cpu_percent`,\n`node.memory_percent` and `node.disk_percent`. `threshold` is a percentage\n(0-100). A node has at most one rule per metric.",
+        "properties": {
+          "comparator": {
+            "description": "One of `>`, `<`, `>=`, `<=`.",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "for_duration_secs": {
+            "description": "Seconds the breach must persist before the alarm fires (0 = immediate).",
+            "format": "int32",
+            "type": "integer"
+          },
+          "metric_name": {
+            "description": "One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "severity": {
+            "description": "`\"warning\"` or `\"critical\"`.",
+            "type": "string"
+          },
+          "threshold": {
+            "description": "Percentage between 0 and 100.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "metric_name",
+          "threshold",
+          "comparator",
+          "severity"
+        ],
+        "type": "object"
+      },
       "NodeDnsStatusEntry": {
         "description": "Per-node DNS resolver health, as last reported by that node's heartbeat.\nPart of `GET /api/cluster/dns/status`.",
         "properties": {
@@ -52003,7 +52137,8 @@
         "properties": {
           "memory": {
             "format": "int64",
-            "minimum": 0,
+            "maximum": 32768,
+            "minimum": 6,
             "type": [
               "integer",
               "null"
@@ -52011,6 +52146,8 @@
           },
           "vcpus": {
             "format": "double",
+            "maximum": 16,
+            "minimum": 0.01,
             "type": [
               "number",
               "null"
@@ -108895,11 +109032,133 @@
           "Metrics"
         ],
         "x-maturity": "beta"
+      },
+      "post": {
+        "description": "Works for workers as well as the control plane (`0`). A worker's series is\nfed by its heartbeats, so a rule only starts evaluating once the node has\nreported at least once.",
+        "operationId": "NodeMetricsCreateAlertRule",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NodeCreateAlertRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAlertRuleResponse"
+                }
+              }
+            },
+            "description": "Alert rule created"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "409": {
+            "description": "The node already has a rule for this metric"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a resource alert (CPU / memory / disk) on a node.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/nodes/{id}/metrics/alert-rules/{rule_id}": {
+      "delete": {
+        "description": "Refused for the control plane (`0`): its default rules are re-created on\nevery start, so use `PATCH` with `enabled: false` to silence one.",
+        "operationId": "NodeMetricsDeleteAlertRule",
+        "parameters": [
+          {
+            "description": "Node ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Alert rule ID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Alert rule deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Alert rule not found on this node"
+          },
+          "409": {
+            "description": "Control-plane default rules cannot be deleted"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a worker's resource alert.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      },
       "patch": {
-        "description": "Deliberately update-only: there is no delete. The control-plane defaults\nare re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted\nrule would silently reappear on the next restart, whereas `enabled: false`\nsurvives re-seeding — disabling is the operation that actually means\n\"stop alerting on this\".",
+        "description": "Worker rules can be deleted. Control-plane defaults are update-only because\nthey are re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted\nrule would silently reappear on the next restart, whereas `enabled: false`\nsurvives re-seeding — disabling is the operation that actually means\n\"stop alerting on this\".",
         "operationId": "NodeMetricsUpdateAlertRule",
         "parameters": [
           {
@@ -149333,13 +149592,13 @@
             "description": "Sandbox created"
           },
           "400": {
-            "description": "Validation error"
+            "description": "Validation error, including a CPU, memory, process or disk limit outside the allowed range or above the administrator's maximum"
           },
           "401": {
             "description": "Unauthorized"
           },
           "422": {
-            "description": "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible"
+            "description": "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible; or the user already has the maximum number of sandboxes an administrator allows"
           },
           "500": {
             "description": "Internal server error"

@@ -3,17 +3,20 @@
 
 /**
  * ServerMonitoring — resource usage of the machines running Temps: the
- * control plane, and each worker once it has joined (ADR 061).
+ * control plane, and each worker once it has joined (ADR 061). The Server
+ * page chooses the node (or "All nodes"); a worker's own page pins `nodeId`.
  *
- * Route: /monitoring/server (standalone Server page).
+ * Route: /monitoring/server (standalone Server page, control plane), and
+ * embedded in the worker node detail page (`embedded`, `nodeId`).
  *
  * Six panels, in the shape of the Proxy page: CPU, memory and disk usage
  * (current value + progress bar + history), Docker disk usage (docker system
  * df by images / containers / volumes / build cache), block I/O and network
  * I/O. Everything comes from `GET /nodes/{id}/metrics*` (the node sampler in
- * the proxy process for node 0, pulled from the agent for a worker), the
- * combined `GET /nodes/metrics/cluster*` for "All nodes", and
- * `GET /nodes/0/docker-disk-usage`, through the generated SDK bindings.
+ * the proxy process for node 0; for a worker, CPU, memory and disk from its
+ * heartbeats and the rest pulled from its agent), the combined
+ * `GET /nodes/metrics/cluster*` for "All nodes", and, for the control plane
+ * only, `GET /nodes/0/docker-disk-usage`, through the generated SDK bindings.
  */
 
 import { HelpPopover } from '@temps-sdk/ds'
@@ -91,7 +94,7 @@ import {
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, Pause, Play, RefreshCw, Settings } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router'
 
 const METRICS_SETTINGS_PATH = '/settings/metrics-monitoring'
@@ -468,6 +471,52 @@ function DockerDiskUsageCard() {
 // Section
 // ---------------------------------------------------------------------------
 
+type SubjectCopy = {
+  /** "the control-plane host", a worker's name, or "every node". */
+  host: string
+  /** Clause completing "This server has no metrics store, so …". */
+  noStoreCause: string
+  /** Panels the section would show, for the unconfigured state. */
+  panelList: string
+  /** Why samples stop, for the silent-sampler alert. */
+  silentCause: string
+  process: string
+  silentCheck: string
+  diskDescription: string
+}
+
+function describeSubject(
+  scope: NodeScope,
+  options: Parameters<typeof scopeSubject>[1]
+): SubjectCopy {
+  const host = hostSubject(scope, options)
+  if (scope.kind === 'all' || scope.id === CONTROL_PLANE_NODE_ID) {
+    return {
+      host,
+      noStoreCause: 'the proxy process is not sampling this host',
+      panelList: `CPU, memory, disk, block I/O and network I/O of ${host}`,
+      silentCause:
+        'The node sampler runs inside the proxy process and writes one sample on a fixed interval.',
+      process: 'temps serve',
+      silentCheck: '',
+      diskDescription:
+        scope.kind === 'all'
+          ? 'Root volumes of every node, summed'
+          : 'Volume under the Temps data directory',
+    }
+  }
+  return {
+    host,
+    noStoreCause: 'nothing records what its agent reports',
+    panelList: `the CPU, memory, disk, block I/O and network I/O of ${host}`,
+    silentCause:
+      'A worker reports CPU, memory and disk with every agent heartbeat, and the control plane pulls the rest from its agent on the scrape interval.',
+    process: 'temps agent',
+    silentCheck: ' on the worker and can reach the control plane',
+    diskDescription: 'Root filesystem (/) of the worker',
+  }
+}
+
 // The shared chart prints a threshold label in the 24px gutter right of the
 // plot, which fits a percentage but not a word; the words go in the card
 // description instead.
@@ -479,18 +528,37 @@ const cpuBands = bandsOf(CPU_THRESHOLDS)
 const memoryBands = bandsOf(MEMORY_THRESHOLDS)
 const diskBands = bandsOf(DISK_THRESHOLDS)
 
-export function ServerMonitoring() {
+export type ServerMonitoringProps = {
+  /**
+   * Node to show, with no node selector. Omitted: the `?node=` scope, which
+   * is the control plane until a worker has joined.
+   */
+  nodeId?: number
+  /**
+   * Render inside another page: a section toolbar instead of the page
+   * header, so the host page keeps the only `<h1>`.
+   */
+  embedded?: boolean
+  /** URL search param that carries the window; distinct from the host page's own params. */
+  rangeParamName?: string
+}
+
+export function ServerMonitoring({
+  nodeId,
+  embedded = false,
+  rangeParamName = 'range',
+}: ServerMonitoringProps = {}) {
   // The window lives in the URL (`?range=6h`) so a link opens on the same
   // view and the browser's back button walks the ranges.
   const [searchParams, setSearchParams] = useSearchParams()
-  const rangeParam = searchParams.get('range')
+  const rangeParam = searchParams.get(rangeParamName)
   const range: ProxyRangePreset = isRangePreset(rangeParam) ? rangeParam : '1h'
   const setRange = (next: ProxyRangePreset) =>
     setSearchParams(
       (prev) => {
         const p = new URLSearchParams(prev)
-        if (next === '1h') p.delete('range')
-        else p.set('range', next)
+        if (next === '1h') p.delete(rangeParamName)
+        else p.set(rangeParamName, next)
         return p
       },
       { replace: true }
@@ -511,8 +579,12 @@ export function ServerMonitoring() {
   const canReadNodeMetrics = useIsInstanceAdmin()
   // ADR 061: one node, or all of them. Hidden with only the control plane.
   const nodes = useMetricNodeScope(canReadNodeMetrics)
-  const scope = nodes.scope
-  const metricsEnabled = canReadNodeMetrics && nodes.ready
+  const pinned = nodeId != null
+  const scope: NodeScope = useMemo(
+    () => (nodeId != null ? { kind: 'node', id: nodeId } : nodes.scope),
+    [nodeId, nodes.scope]
+  )
+  const metricsEnabled = canReadNodeMetrics && (pinned || nodes.ready)
   const controlPlaneOnly = isControlPlaneOnly(scope)
   // A control-plane-profile install has no Docker daemon by design (its
   // workloads run on worker nodes), so `docker system df` can only fail
@@ -677,9 +749,9 @@ export function ServerMonitoring() {
       current: [cpuNow, memPct, diskPct],
     })
 
-  const subject = hostSubject(scope, nodes.options)
+  const subject = describeSubject(scope, nodes.options)
   const nodeSelect =
-    nodes.options.length > 1 ? (
+    !pinned && nodes.options.length > 1 ? (
       <NodeScopeSelect
         options={nodes.options}
         scope={scope}
@@ -694,7 +766,7 @@ export function ServerMonitoring() {
   if (!canReadNodeMetrics) {
     return (
       <div className="space-y-6">
-        <PageHeader title="Server" />
+        {embedded ? null : <PageHeader title="Server" />}
         <NodeMetricsAccessDenied />
       </div>
     )
@@ -710,6 +782,7 @@ export function ServerMonitoring() {
           ageSeconds={null}
           paused={paused}
           onTogglePause={() => setPaused((p) => !p)}
+          embedded={embedded}
           subject={subject}
           nodeSelect={nodeSelect}
         />
@@ -720,10 +793,9 @@ export function ServerMonitoring() {
               Metric collection is not set up
             </CardTitle>
             <CardDescription>
-              This server has no metrics store, so the proxy process is not
-              sampling this host. With one configured, this page shows CPU,
-              memory, disk, Docker disk usage, block I/O and network I/O of the
-              control-plane host every {formatAge(scrapeInterval)}, keeps{' '}
+              This server has no metrics store, so {subject.noStoreCause}. With
+              one configured, this {embedded ? 'section' : 'page'} shows{' '}
+              {subject.panelList} every {formatAge(scrapeInterval)}, keeps{' '}
               {retentionDays} days of history, and says when the disk will fill.
             </CardDescription>
           </CardHeader>
@@ -749,6 +821,7 @@ export function ServerMonitoring() {
         ageSeconds={ageSeconds}
         paused={paused}
         onTogglePause={() => setPaused((p) => !p)}
+        embedded={embedded}
         subject={subject}
         nodeSelect={nodeSelect}
       />
@@ -780,21 +853,9 @@ export function ServerMonitoring() {
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>No sample for {formatAge(ageSeconds)}</AlertTitle>
           <AlertDescription>
-            {controlPlaneOnly || scope.kind === 'all' ? (
-              <>
-                The node sampler runs inside the proxy process and writes one
-                sample every {formatAge(scrapeInterval)}. Check that{' '}
-                <code>temps serve</code> is running and that the metrics store
-                accepts writes.
-              </>
-            ) : (
-              <>
-                The control plane pulls this node’s metrics from its agent every{' '}
-                {formatAge(scrapeInterval)}. Check that the agent is running and
-                reachable from the control plane.
-              </>
-            )}{' '}
-            The values below are the last ones that arrived.
+            {subject.silentCause} Check that <code>{subject.process}</code> is
+            running{subject.silentCheck} and that the metrics store accepts
+            writes. The values below are the last ones that arrived.
           </AlertDescription>
         </Alert>
       )}
@@ -804,6 +865,11 @@ export function ServerMonitoring() {
           range={range}
           scrapeInterval={scrapeInterval}
           settingsPath={METRICS_SETTINGS_PATH}
+          nodeKind={
+            scope.kind === 'node' && scope.id !== CONTROL_PLANE_NODE_ID
+              ? 'worker'
+              : 'control-plane'
+          }
         />
       )}
 
@@ -815,7 +881,7 @@ export function ServerMonitoring() {
               description={
                 scope.kind === 'all'
                   ? 'Mean across nodes of each one’s share of all its cores'
-                  : `All cores of ${subject}`
+                  : `All cores of ${subject.host}`
               }
               percent={cpuNow}
               absolute={null}
@@ -846,7 +912,7 @@ export function ServerMonitoring() {
             />
             <UsageCard
               title="Disk space"
-              description="Volume under the Temps data directory"
+              description={subject.diskDescription}
               percent={diskPct}
               absolute={
                 diskUsed != null && diskTotal != null
@@ -966,6 +1032,7 @@ function SectionIntro({
   ageSeconds,
   paused,
   onTogglePause,
+  embedded,
   subject,
   nodeSelect,
 }: {
@@ -975,58 +1042,63 @@ function SectionIntro({
   ageSeconds: number | null
   paused: boolean
   onTogglePause: () => void
-  subject: string
+  embedded: boolean
+  subject: SubjectCopy
   nodeSelect: ReactNode
 }) {
-  return (
-    <PageHeader
-      title="Server"
-      actions={
-        <div className="flex min-w-0 flex-wrap items-center gap-1">
-          <div className="mr-3 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground">
-            {paused
-              ? 'Updates paused'
-              : ageSeconds != null
-                ? `Updated ${formatAge(ageSeconds)} ago`
-                : 'Waiting for a sample'}
-            <HelpPopover label="About server metrics">
-              <p>
-                Resource usage of {subject}. Samples are collected every{' '}
-                {formatAge(scrapeInterval)} and refreshed every 30 seconds.
-              </p>
-              <p>
-                Hover or focus a chart and use the arrow keys to compare every
-                panel at the same instant.
-              </p>
-            </HelpPopover>
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            aria-pressed={paused}
-            onClick={onTogglePause}
-            className="mr-2"
-          >
-            {paused ? (
-              <Play className="mr-1.5 h-3.5 w-3.5" />
-            ) : (
-              <Pause className="mr-1.5 h-3.5 w-3.5" />
-            )}
-            {paused ? 'Resume' : 'Pause'}
-          </Button>
-          {nodeSelect && <div className="mr-2">{nodeSelect}</div>}
-          {PROXY_RANGE_PRESETS.map((opt) => (
-            <Button
-              key={opt.value}
-              variant={range === opt.value ? 'default' : 'outline'}
-              size="sm"
-              onClick={() => onRange(opt.value)}
-            >
-              {opt.label}
-            </Button>
-          ))}
-        </div>
-      }
-    />
+  const toolbar = (
+    <div className="flex min-w-0 flex-wrap items-center gap-1">
+      <div className="mr-3 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground">
+        {paused
+          ? 'Updates paused'
+          : ageSeconds != null
+            ? `Updated ${formatAge(ageSeconds)} ago`
+            : 'Waiting for a sample'}
+        <HelpPopover label="About server metrics">
+          <p>
+            Resource usage of {subject.host}. Samples are collected every{' '}
+            {formatAge(scrapeInterval)} and refreshed every 30 seconds.
+          </p>
+          <p>
+            Hover or focus a chart and use the arrow keys to compare every panel
+            at the same instant.
+          </p>
+        </HelpPopover>
+      </div>
+      <Button
+        variant="outline"
+        size="sm"
+        aria-pressed={paused}
+        onClick={onTogglePause}
+        className="mr-2"
+      >
+        {paused ? (
+          <Play className="mr-1.5 h-3.5 w-3.5" />
+        ) : (
+          <Pause className="mr-1.5 h-3.5 w-3.5" />
+        )}
+        {paused ? 'Resume' : 'Pause'}
+      </Button>
+      {nodeSelect && <div className="mr-2">{nodeSelect}</div>}
+      {PROXY_RANGE_PRESETS.map((opt) => (
+        <Button
+          key={opt.value}
+          variant={range === opt.value ? 'default' : 'outline'}
+          size="sm"
+          onClick={() => onRange(opt.value)}
+        >
+          {opt.label}
+        </Button>
+      ))}
+    </div>
   )
+  if (embedded) {
+    return (
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-base font-semibold">Resource usage</h2>
+        {toolbar}
+      </div>
+    )
+  }
+  return <PageHeader title="Server" actions={toolbar} />
 }

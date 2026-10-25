@@ -19,6 +19,9 @@
 //!   name is in [`HOST_METRIC_NAMES`], at most once each, and only with a
 //!   finite, non-negative value (percentages no higher than 100). No labels,
 //!   engines or environments are accepted from the wire.
+//! - **One writer per series.** CPU, memory and disk already arrive in every
+//!   heartbeat ([`CAPACITY_METRIC_NAMES`]); the report's copies of those are
+//!   left out rather than stored twice under the same name.
 //! - **Control-plane time.** A report carries no timestamp. Every point is
 //!   stamped with the control plane's receive time, so a worker with a wrong
 //!   clock cannot move its samples, backfill history or write into the future.
@@ -34,6 +37,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::collector::node::HOST_METRIC_NAMES;
+use crate::node_capacity::CAPACITY_METRIC_NAMES;
 use crate::proxy::{proxy_points, MetricsSnapshot};
 use crate::store::{MetricKind, MetricPoint, SourceKind};
 
@@ -206,6 +210,11 @@ pub fn accept_report(
     // ── Host: allow-listed names, once each, sane values ─────────────────
     let mut seen: HashSet<&'static str> = HashSet::new();
     for sample in report.host {
+        // The heartbeat writes these; a current agent sending them too is
+        // expected, not a refusal.
+        if CAPACITY_METRIC_NAMES.contains(&sample.name.as_str()) {
+            continue;
+        }
         let known = HOST_METRIC_NAMES
             .iter()
             .copied()
@@ -400,7 +409,7 @@ mod tests {
         let received_at = plane_now() + chrono::Duration::seconds(30);
         let accepted = accept_report(
             7,
-            report("a", &metrics, vec![sample("node.cpu_percent", 12.5)]),
+            report("a", &metrics, vec![sample("node.load_avg_1m", 0.5)]),
             &mut baseline,
             received_at,
         );
@@ -420,7 +429,7 @@ mod tests {
     fn the_wire_format_carries_no_timestamp_a_worker_could_set() {
         // A worker that adds its own clock reading is ignored, not obeyed.
         let body = br#"{"version":1,"instance_id":"a","time":"2099-01-01T00:00:00Z",
-            "host":[{"name":"node.cpu_percent","value":5,"time":"1999-01-01T00:00:00Z"}]}"#;
+            "host":[{"name":"node.load_avg_1m","value":5,"time":"1999-01-01T00:00:00Z"}]}"#;
         let decoded = decode_report(3, body).expect("unknown fields are ignored");
         let mut baseline = None;
         let accepted = accept_report(3, decoded, &mut baseline, plane_now());
@@ -490,26 +499,46 @@ mod tests {
                 "a",
                 &metrics,
                 vec![
-                    sample("node.cpu_percent", 40.0),
+                    sample("node.load_avg_1m", 0.4),
                     // Duplicate: the first one wins.
-                    sample("node.cpu_percent", 99.0),
-                    sample("node.memory_used_bytes", 1024.0),
+                    sample("node.load_avg_1m", 9.0),
+                    sample("node.fd_allocated", 1024.0),
                     // Not a host series.
                     sample("node.process_open_fds", 10.0),
                     sample("anything.else", 1.0),
                     // Out of range.
-                    sample("node.memory_percent", 250.0),
-                    sample("node.disk_used_bytes", -1.0),
+                    sample("node.fd_percent", 250.0),
+                    sample("node.network_rx_bytes_total", -1.0),
                 ],
             ),
             &mut baseline,
             plane_now(),
         );
         let names: Vec<&str> = accepted.points.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["node.cpu_percent", "node.memory_used_bytes"]);
-        assert_eq!(value_of(&accepted.points, "node.cpu_percent"), Some(40.0));
+        assert_eq!(names, vec!["node.load_avg_1m", "node.fd_allocated"]);
+        assert_eq!(value_of(&accepted.points, "node.load_avg_1m"), Some(0.4));
         assert_eq!(accepted.rejected, 5);
         assert_eq!(accepted.rejected_examples.len(), 5);
+    }
+
+    #[test]
+    fn heartbeat_series_are_left_to_the_heartbeat() {
+        let metrics = ProxyMetrics::default();
+        let mut baseline = None;
+        let host = CAPACITY_METRIC_NAMES
+            .iter()
+            .map(|name| sample(name, 10.0))
+            .chain([sample("node.disk_read_bytes_total", 4096.0)])
+            .collect();
+        let accepted = accept_report(2, report("a", &metrics, host), &mut baseline, plane_now());
+        let names: Vec<&str> = accepted.points.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["node.disk_read_bytes_total"]);
+        assert_eq!(accepted.rejected, 0);
+        // Every heartbeat series is one a worker host may report, so the
+        // skip above is what keeps them single-writer.
+        assert!(CAPACITY_METRIC_NAMES
+            .iter()
+            .all(|name| HOST_METRIC_NAMES.contains(name)));
     }
 
     #[test]
