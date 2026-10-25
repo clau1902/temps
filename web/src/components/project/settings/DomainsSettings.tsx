@@ -243,7 +243,11 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           Optionally manage DNS records and deliver traffic through Cloudflare
           or bunny.net.
         </p>
-        <CollapsibleContent className="space-y-6 pt-4">
+        <CollapsibleContent
+          role="region"
+          aria-label="DNS and CDN settings"
+          className="space-y-6 pt-4"
+        >
           <Button variant="outline" onClick={() => configureDelivery()}>
             Configure delivery
           </Button>

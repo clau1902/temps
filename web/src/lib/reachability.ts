@@ -265,18 +265,19 @@ export function missingAnswers(
 }
 
 export interface CertificateChoices {
-  /** HTTP-01 is listed: something answers on port 80, or Temps cannot tell. */
+  /** HTTP-01 is listed: always, except for a wildcard. */
   showHttp01: boolean
   /** The choice labelled Recommended, if any. */
   recommended: 'tunnel' | 'http-01' | 'dns-01' | null
-  /** Why HTTP-01 is not listed. */
+  /** Why HTTP-01 may not work here. */
   http01Note: string | null
 }
 
 /**
- * Which certificate methods Add Domain offers. HTTP-01 is only offered, and
- * only recommended, when a direct ingress takes port 80 (ADR 064 D4). While
- * Temps cannot tell it stays listed without the label.
+ * Which certificate methods Add Domain offers. HTTP-01 is only recommended
+ * when a direct ingress takes port 80 (ADR 064 D4). It stays listed when
+ * Temps sees none: port forwarding or a load balancer can bring port 80 to
+ * a server that listens elsewhere, which Temps cannot see from inside.
  */
 export function certificateChoices({
   coveringTunnels,
@@ -287,21 +288,20 @@ export function certificateChoices({
   wildcard: boolean
   http01Available: boolean | undefined
 }): CertificateChoices {
-  const showHttp01 = !wildcard && http01Available !== false
   const recommended =
     coveringTunnels > 0
       ? 'tunnel'
-      : showHttp01 && http01Available === true
-        ? 'http-01'
-        : http01Available === false || wildcard
-          ? 'dns-01'
+      : wildcard
+        ? 'dns-01'
+        : http01Available === true
+          ? 'http-01'
           : null
   return {
-    showHttp01,
+    showHttp01: !wildcard,
     recommended,
     http01Note:
-      !wildcard && http01Available === false
-        ? 'HTTP-01 is not offered: nothing in this cluster answers on port 80, which it needs. Use DNS-01, or a tunnel.'
+      !wildcard && coveringTunnels === 0 && http01Available === false
+        ? 'Temps does not see a public listener on port 80. HTTP-01 works only if port 80 reaches this server, for example through port forwarding; otherwise use DNS-01 or a tunnel.'
         : null,
   }
 }

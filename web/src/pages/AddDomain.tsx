@@ -153,14 +153,8 @@ export function AddDomain() {
           } else if (domain.startsWith('*.')) {
             // Auto-select DNS-01 for wildcard domains
             form.setValue('challengeType', 'dns-01')
-          } else if (
-            http01Available === false &&
-            form.getValues('challengeType') === 'http-01'
-          ) {
-            // Nothing answers on port 80, so HTTP-01 would fail.
-            form.setValue('challengeType', 'dns-01')
           } else if (chosenTunnel(form.getValues('challengeType')) != null) {
-            form.setValue('challengeType', http01Available === false ? 'dns-01' : 'http-01')
+            form.setValue('challengeType', 'http-01')
           }
           setStep('challenge')
         }
