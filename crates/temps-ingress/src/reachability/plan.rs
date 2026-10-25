@@ -18,6 +18,13 @@
 //! Direct options issue the certificate with HTTP-01, so they are only
 //! offered when a direct ingress answers on port 80.
 //!
+//! For the private audience (ADR 064 D5) there is one option,
+//! `private_worker`: a worker whose owner put it in `private` mode serves
+//! the address on its private listener, DNS in a zone Temps manages points
+//! at that listener, and the certificate comes over DNS-01. Temps cannot
+//! turn private mode on itself; without such a worker the plan names the
+//! command and the worker to run it on.
+//!
 //! "Would publish" is ADR 058 D9's effective publication state
 //! ([`PublicationIntent`]), not whether a tunnel's domain covers the
 //! hostname: a hostname choice wins over automatic selection, and a tunnel
@@ -36,7 +43,7 @@ use temps_core::ways_in::{private_allow_list_message, PrivateAllowList};
 
 use temps_auth::permissions::Permission;
 
-use super::compute::{is_local_only, DirectIngress, INGRESS_SETUP_PATH};
+use super::compute::{is_local_only, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND};
 use super::model::{
     ActionKind, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep, PlannedRecord,
     ReachAction, ReachabilityPlan, StepKind,
@@ -58,6 +65,25 @@ pub struct ZoneFact {
     pub domain: String,
     pub verified: bool,
     pub auto_manage: bool,
+}
+
+/// A worker in `private` mode (ADR 064 D5), as it reports itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrivateWorkerFact {
+    pub id: i32,
+    pub name: String,
+    /// The private listener's address, when it is bound on a private one.
+    pub listener: Option<std::net::IpAddr>,
+    /// That address is the worker's Tailscale one.
+    pub tailscale: bool,
+    /// Why the listener is not running, as the worker reported it.
+    pub error: Option<String>,
+}
+
+impl PrivateWorkerFact {
+    pub fn ready(&self) -> Option<std::net::IpAddr> {
+        self.listener.filter(|_| self.error.is_none())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -104,6 +130,22 @@ pub struct PlanFacts {
     /// What is at each `(hostname, record type)` the plan would write, as
     /// read when planning ([`records_to_read`]).
     pub dns_records: Vec<(String, String, PlannedRecord)>,
+    /// Workers in `private` mode.
+    pub private_workers: Vec<PrivateWorkerFact>,
+    /// The worker to name when none is in private mode: one the
+    /// environment runs on, else the first active worker.
+    pub suggested_private_worker: Option<String>,
+    /// The environment's private addresses and the range each is bound to.
+    pub private_ranges: Vec<(String, Option<String>)>,
+}
+
+/// The worker a private plan serves through: the first whose private
+/// listener is bound on a private address.
+pub fn private_worker(facts: &PlanFacts) -> Option<(&PrivateWorkerFact, std::net::IpAddr)> {
+    facts
+        .private_workers
+        .iter()
+        .find_map(|w| w.ready().map(|ip| (w, ip)))
 }
 
 /// The `A`/`AAAA` record type for an address.
@@ -122,8 +164,15 @@ pub fn records_to_read(facts: &PlanFacts, address: &str) -> Vec<(String, String)
         return Vec::new();
     }
     let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(direct) = http01_direct(facts) {
-        out.push((address.to_string(), record_type_of(direct.ips[0]).to_string()));
+    if facts.audience == Audience::Private {
+        if let Some((_, ip)) = private_worker(facts) {
+            out.push((address.to_string(), record_type_of(ip).to_string()));
+        }
+    } else if let Some(direct) = http01_direct(facts) {
+        out.push((
+            address.to_string(),
+            record_type_of(direct.ips[0]).to_string(),
+        ));
     }
     out.sort();
     out.dedup();
@@ -177,15 +226,32 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     let mut directs: Vec<_> = facts
         .directs
         .iter()
-        .map(|d| (&d.name, d.node_id, &d.ips, d.takes_port_80, d.check_failed.is_some()))
+        .map(|d| {
+            (
+                &d.name,
+                d.node_id,
+                &d.ips,
+                d.takes_port_80,
+                d.check_failed.is_some(),
+            )
+        })
         .collect();
     directs.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let intent = address.map(|a| intent_of(facts, a));
     let mut records = facts.dns_records.clone();
     records.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let mut private_workers: Vec<_> = facts
+        .private_workers
+        .iter()
+        .map(|w| (w.id, w.listener, w.tailscale, w.error.is_some()))
+        .collect();
+    private_workers.sort();
+    let mut ranges = facts.private_ranges.clone();
+    ranges.sort();
     let canonical = format!(
-        "v2|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
-         {accounts:?}|{directs:?}|{modes:?}|{intent:?}|{:?}|{records:?}",
+        "v3|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
+         {accounts:?}|{directs:?}|{modes:?}|{intent:?}|{:?}|{records:?}|{private_workers:?}|\
+         {ranges:?}",
         facts.audience,
         facts.deployed,
         facts.served_by_workers,
@@ -265,7 +331,10 @@ pub fn tunnel_route<'a>(facts: &'a PlanFacts, host: &str) -> Option<TunnelRoute<
             None => "the tunnel that would publish it is gone".to_string(),
         },
         Some(PublicationIntent::OnlyChosen { .. }) | Some(PublicationIntent::NoTunnel) | None => {
-            format!("tunnel `{}` publishes only hostnames chosen for it", tunnel.name)
+            format!(
+                "tunnel `{}` publishes only hostnames chosen for it",
+                tunnel.name
+            )
         }
     };
     Some(TunnelRoute {
@@ -377,7 +446,11 @@ pub fn unique_tunnel_name(domain: &str, taken: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("-");
     base.truncate(40);
-    let base = if base.is_empty() { "tunnel".to_string() } else { base };
+    let base = if base.is_empty() {
+        "tunnel".to_string()
+    } else {
+        base
+    };
     let taken: HashSet<String> = taken.iter().map(|n| n.to_ascii_lowercase()).collect();
     if !taken.contains(&base) {
         return base;
@@ -545,14 +618,17 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         blocked: Some(blocked),
     };
 
+    if facts.audience == Audience::Private {
+        return plan_private(facts);
+    }
     if facts.audience != Audience::Public {
         return empty(
             facts.audience,
             facts.requested.clone(),
             None,
             PlanBlocked {
-                reason: "Only public addresses can be set up so far. Private and signed-in \
-                         addresses come with private worker ingress."
+                reason: "Addresses for people who sign in are not available yet. Choose \
+                         public, or only your private network."
                     .to_string(),
                 action: None,
             },
@@ -594,6 +670,10 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     } else {
         format!("Attach {shown} to {}", facts.environment_name)
     };
+    // B5: an address that is private now becomes public, and says so.
+    let made_public = address
+        .as_deref()
+        .and_then(|host| becomes_public(facts, host));
 
     // A tunnel only carries what workers serve, and never into an allow
     // list its visitors cannot match (D9).
@@ -603,13 +683,15 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     if let (Some(rule), true) = (&facts.private_rule, tunnels_served) {
         let through = address
             .as_deref()
-            .and_then(|host| tunnel_route(facts, host).or_else(|| {
-                covering_tunnel(facts, host).map(|tunnel| TunnelRoute {
-                    tunnel,
-                    route: false,
-                    confirmation: None,
+            .and_then(|host| {
+                tunnel_route(facts, host).or_else(|| {
+                    covering_tunnel(facts, host).map(|tunnel| TunnelRoute {
+                        tunnel,
+                        route: false,
+                        confirmation: None,
+                    })
                 })
-            }))
+            })
             .map(|r| format!("tunnel `{}`", r.tunnel.name))
             .unwrap_or_else(|| "a tunnel".to_string());
         let reason = format!(
@@ -647,7 +729,9 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     let covering = address
         .as_deref()
         .and_then(|host| covering_tunnel(facts, host));
-    let route = address.as_deref().and_then(|host| tunnel_route(facts, host));
+    let route = address
+        .as_deref()
+        .and_then(|host| tunnel_route(facts, host));
     if let (Some(route), true) = (&route, tunnels_possible) {
         let tunnel = route.tunnel;
         let mut steps = vec![step(StepKind::AttachDomain, attach_label.clone())];
@@ -685,7 +769,10 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
                     tunnel.name
                 )
             } else {
-                format!("Tunnel {} covers {shown} but is not ready yet.", tunnel.name)
+                format!(
+                    "Tunnel {} covers {shown} but is not ready yet.",
+                    tunnel.name
+                )
             },
             action: Some(
                 ReachAction::new(ActionKind::OpenIngress, "Open the tunnel")
@@ -723,9 +810,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     // 2. A direct ingress with DNS Temps manages. A record already there is
     //    changed only when Temps manages it, and the plan says so.
     let existing = match (direct, address.as_deref()) {
-        (Some(direct), Some(host)) => {
-            planned_record(facts, host, record_type_of(direct.ips[0]))
-        }
+        (Some(direct), Some(host)) => planned_record(facts, host, record_type_of(direct.ips[0])),
         _ => PlannedRecord::Absent,
     };
     let dns_label = |ip: std::net::IpAddr, zone: &ZoneFact| match &existing {
@@ -944,6 +1029,20 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         });
     }
 
+    if let Some(warning) = &made_public {
+        for draft in &mut drafts {
+            let at = draft
+                .steps
+                .iter()
+                .position(|s| s.kind == StepKind::AttachDomain)
+                .map_or(0, |i| i + 1);
+            draft.steps.insert(
+                at,
+                step(StepKind::SetAudience, format!("Make {shown} public")),
+            );
+            draft.warnings.insert(0, warning.clone());
+        }
+    }
     let options: Vec<PlanOption> = drafts
         .into_iter()
         .enumerate()
@@ -971,15 +1070,18 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         }
     }
     let blocked = if options.is_empty() {
-        Some(blocked_reasons.into_iter().next().unwrap_or(PlanBlocked {
-            reason: "Nothing in this cluster can take public traffic yet: no tunnel, no worker \
+        Some(
+            blocked_reasons.into_iter().next().unwrap_or(PlanBlocked {
+                reason:
+                    "Nothing in this cluster can take public traffic yet: no tunnel, no worker \
                      that allows one, and no direct ingress."
-                .to_string(),
-            action: Some(
-                ReachAction::new(ActionKind::OpenIngress, "Set up ingress")
-                    .with_href(INGRESS_SETUP_PATH),
-            ),
-        }))
+                        .to_string(),
+                action: Some(
+                    ReachAction::new(ActionKind::OpenIngress, "Set up ingress")
+                        .with_href(INGRESS_SETUP_PATH),
+                ),
+            }),
+        )
     } else {
         None
     };
@@ -992,6 +1094,308 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         address_error: None,
         options,
         blocked,
+    }
+}
+
+/// When `host` is attached here as a private address: what making it
+/// public exposes, in words (ADR 064 Security).
+pub fn becomes_public(facts: &PlanFacts, host: &str) -> Option<String> {
+    let (_, audience) = facts.audiences.iter().find(|(a, _)| a == host)?;
+    if *audience == Audience::Public {
+        return None;
+    }
+    let range = facts
+        .private_ranges
+        .iter()
+        .find(|(a, _)| a == host)
+        .and_then(|(_, r)| r.clone());
+    Some(format!(
+        "{host} is {} now. This makes it public: anyone on the internet can open {host} and \
+         everything {} serves there, not only devices on your private network. It needs a \
+         recent password or passkey confirmation.",
+        match range {
+            Some(range) => format!("private to {range}"),
+            None => "private".to_string(),
+        },
+        facts.environment_name
+    ))
+}
+
+/// The plan for a private address (ADR 064 D5): one worker's private
+/// listener, DNS in a zone Temps manages, a DNS-01 certificate.
+fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
+    let blocked_plan = |address: Option<String>, address_error, blocked| ReachabilityPlan {
+        plan_id: None,
+        fingerprint: None,
+        expires_at: None,
+        audience: Audience::Private,
+        address,
+        address_error,
+        options: Vec::new(),
+        blocked: Some(blocked),
+    };
+    let block = |reason: String, action: Option<ReachAction>| PlanBlocked { reason, action };
+    let ask_address = facts
+        .requested
+        .as_deref()
+        .is_none_or(|r| r.trim().is_empty());
+    let address = match facts.requested.as_deref().map(str::trim) {
+        Some(r) if !r.is_empty() => match planned_address(facts) {
+            Ok(address) => address,
+            Err(error) => {
+                return blocked_plan(
+                    facts.requested.clone(),
+                    Some(error.clone()),
+                    block(error, None),
+                )
+            }
+        },
+        // A private address is suggested only under a zone Temps manages:
+        // it needs a DNS record and a DNS-01 certificate there.
+        _ => {
+            let label = suggested_label(facts);
+            facts
+                .zones
+                .iter()
+                .filter(|z| z.verified)
+                .map(|z| format!("{label}.{}", z.domain.trim_end_matches('.')))
+                .find(|c| !facts.taken_elsewhere.contains(c) && !facts.attached_here.contains(c))
+        }
+    };
+    let shown = address.clone().unwrap_or_else(|| "the address".to_string());
+
+    if facts.deployed && !facts.served_by_workers {
+        return blocked_plan(
+            address,
+            None,
+            block(
+                format!(
+                    "{} runs on the control plane, and a private address is served by a \
+                     worker's private listener, which only carries what workers serve. Deploy \
+                     it to a worker first.",
+                    facts.environment_name
+                ),
+                None,
+            ),
+        );
+    }
+
+    let Some((worker, ip)) = private_worker(facts) else {
+        // Temps cannot open a listener on someone's private network; the
+        // worker's owner does, on the worker.
+        let reason_action = match (
+            facts.private_workers.first(),
+            &facts.suggested_private_worker,
+        ) {
+            (Some(w), _) => (
+                format!(
+                    "{} is in private mode, but its private listener is not running: {}",
+                    w.name,
+                    w.error
+                        .clone()
+                        .unwrap_or_else(|| "it is not bound on a private address.".to_string())
+                ),
+                ReachAction::new(
+                    ActionKind::RunCommand,
+                    format!("On {}, as root, run", w.name),
+                )
+                .with_command(PRIVATE_COMMAND),
+            ),
+            (None, Some(name)) => (
+                format!(
+                    "No worker listens on your private network yet, and Temps cannot turn that \
+                     on by itself: the worker's owner does. Run the command on {name}, then \
+                     plan again."
+                ),
+                ReachAction::new(ActionKind::RunCommand, format!("On {name}, as root, run"))
+                    .with_command(PRIVATE_COMMAND),
+            ),
+            (None, None) => (
+                "A private address is served by a worker on your private network, and this \
+                 cluster has no active worker. Add one with `--ingress private --listen \
+                 tailscale` on its join command."
+                    .to_string(),
+                ReachAction::new(ActionKind::OpenIngress, "Add a worker")
+                    .with_href("/settings/nodes"),
+            ),
+        };
+        return blocked_plan(address, None, block(reason_action.0, Some(reason_action.1)));
+    };
+    let range = temps_core::worker_ingress::private_block(ip).unwrap_or("its private network");
+    let network = if worker.tailscale {
+        "Tailscale".to_string()
+    } else {
+        range.to_string()
+    };
+
+    let Some(zone) = address
+        .as_deref()
+        .and_then(|host| zone_for(host, &facts.zones))
+        .filter(|z| z.verified)
+    else {
+        let zones: Vec<String> = facts
+            .zones
+            .iter()
+            .filter(|z| z.verified)
+            .map(|z| z.domain.clone())
+            .collect();
+        return blocked_plan(
+            address,
+            None,
+            block(
+                format!(
+                    "Temps points {shown} at {}'s private address and gets its certificate over \
+                     DNS-01, and both need its zone managed by a DNS provider in Temps. Add \
+                     the zone under DNS providers{}.",
+                    worker.name,
+                    if zones.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", or use a hostname under {}", zones.join(", "))
+                    }
+                ),
+                Some(
+                    ReachAction::new(ActionKind::OpenIngress, "Add a DNS provider")
+                        .with_href("/dns-providers"),
+                ),
+            ),
+        );
+    };
+    let host = address.clone().unwrap_or_default();
+    let record_type = record_type_of(ip);
+    let existing = planned_record(facts, &host, record_type);
+    match &existing {
+        PlannedRecord::Present { record } if !record.managed => {
+            return blocked_plan(
+                address,
+                None,
+                block(
+                    format!(
+                        "{shown} already has an {} record ({}) at {} that Temps did not create. \
+                         Temps never changes a record it does not manage: remove it there, or \
+                         use another hostname.",
+                        record.record_type, record.content, zone.provider_name
+                    ),
+                    None,
+                ),
+            )
+        }
+        PlannedRecord::Unknown => {
+            return blocked_plan(
+                address,
+                None,
+                block(
+                    format!(
+                        "Temps could not read {shown}'s DNS records at {} just now, so it cannot \
+                         show what would change. Try again in a minute.",
+                        zone.provider_name
+                    ),
+                    None,
+                ),
+            )
+        }
+        _ => {}
+    }
+    let attached = facts.attached_here.contains(&host);
+    let attach_label = if attached {
+        format!("{shown} is already on {}", facts.environment_name)
+    } else {
+        format!("Attach {shown} to {}", facts.environment_name)
+    };
+    let dns_label = match &existing {
+        PlannedRecord::Present { record } if record.content == ip.to_string() => {
+            format!("{shown} already points at {ip} in {}", zone.domain)
+        }
+        PlannedRecord::Present { record } => format!(
+            "Change {shown} from {} to {ip} in {}",
+            record.content, zone.domain
+        ),
+        _ => format!(
+            "Point {shown} at {ip} ({}'s private address) in {}",
+            worker.name, zone.domain
+        ),
+    };
+    let mut warnings = vec![format!(
+        "This adds a public DNS record: anyone can look up {shown} and see that it exists and \
+         that it points at {ip}, an address inside your network. Nobody outside {range} can \
+         connect to it, but the name and the internal address are no longer secret."
+    )];
+    if let PlannedRecord::Present { record } = &existing {
+        if record.content != ip.to_string() {
+            warnings.push(format!(
+                "{shown} points at {} now; this changes it to {ip}. Undo puts {} back while \
+                 nobody else has changed it meanwhile.",
+                record.content, record.content
+            ));
+        }
+    }
+    if attached
+        && facts
+            .audiences
+            .iter()
+            .any(|(a, au)| a == &host && *au == Audience::Public)
+    {
+        warnings.push(format!(
+            "{shown} is public now. This makes it private: only devices on {network} can open \
+             it, and anyone else who uses it loses access. It needs a recent password or \
+             passkey confirmation."
+        ));
+    }
+    if !facts.deployed {
+        warnings.push(format!(
+            "Nothing is deployed to {} yet: it answers once a deployment runs on a worker.",
+            facts.environment_name
+        ));
+    }
+    let mut fields = Vec::new();
+    if ask_address {
+        fields.push(address_field(address.as_deref()));
+    }
+    let option = PlanOption {
+        kind: PlanOptionKind::PrivateWorker,
+        title: format!("Only my private network, through {}", worker.name),
+        description: format!(
+            "{} answers {shown} on its private address {ip} ({network}); only devices in \
+             {range} can connect. Temps points {shown} there through {} and issues its \
+             certificate over DNS-01, which needs nothing reachable from the internet.",
+            worker.name, zone.provider_name
+        ),
+        actions: 1,
+        recommended: true,
+        way_in: format!("private:{}", worker.name),
+        steps: vec![
+            step(StepKind::AttachDomain, attach_label),
+            step(
+                StepKind::SetAudience,
+                format!("Make {shown} private to {range} on {}", worker.name),
+            ),
+            step(StepKind::SetDnsRecord, dns_label),
+            step(
+                StepKind::IssueCertificate,
+                format!("Issue a certificate for {shown} over DNS-01"),
+            ),
+            step(
+                StepKind::CheckReachability,
+                format!("Check {shown} from {} and from outside", worker.name),
+            ),
+        ],
+        fields,
+        warnings,
+        confirmation: None,
+        required_permissions: permissions_for(PlanOptionKind::PrivateWorker)
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    ReachabilityPlan {
+        plan_id: None,
+        fingerprint: None,
+        expires_at: None,
+        audience: Audience::Private,
+        address,
+        address_error: None,
+        options: vec![option],
+        blocked: None,
     }
 }
 
@@ -1062,7 +1466,10 @@ mod tests {
         let facts = PlanFacts {
             tunnels: vec![tunnel("homelab", "example.com", "example.com")],
             zones: vec![zone("example.com", "cloudflare")],
-            cloudflare_accounts: vec![NamedId { id: 3, name: "cf".into() }],
+            cloudflare_accounts: vec![NamedId {
+                id: 3,
+                name: "cf".into(),
+            }],
             tunnel_workers: vec![worker()],
             directs: vec![direct(true)],
             ..base()
@@ -1072,14 +1479,20 @@ mod tests {
         // A covering tunnel makes a new one pointless; direct comes second.
         assert_eq!(
             kinds(&plan),
-            vec![PlanOptionKind::ExistingTunnel, PlanOptionKind::DirectManagedDns]
+            vec![
+                PlanOptionKind::ExistingTunnel,
+                PlanOptionKind::DirectManagedDns
+            ]
         );
         let first = &plan.options[0];
         assert!(first.recommended && !plan.options[1].recommended);
         assert_eq!(first.actions, 1);
         assert_eq!(first.way_in, "tunnel:homelab");
         // Automatic publishing: no hostname choice to make.
-        assert!(!first.steps.iter().any(|s| s.kind == StepKind::RouteHostname));
+        assert!(!first
+            .steps
+            .iter()
+            .any(|s| s.kind == StepKind::RouteHostname));
         assert_eq!(first.fields[0].key, FIELD_ADDRESS);
     }
 
@@ -1107,7 +1520,10 @@ mod tests {
     fn a_cloudflare_account_without_a_tunnel_offers_a_new_tunnel_on_a_worker() {
         let facts = PlanFacts {
             zones: vec![zone("example.com", "cloudflare")],
-            cloudflare_accounts: vec![NamedId { id: 3, name: "cf".into() }],
+            cloudflare_accounts: vec![NamedId {
+                id: 3,
+                name: "cf".into(),
+            }],
             tunnel_workers: vec![worker()],
             ..base()
         };
@@ -1154,7 +1570,10 @@ mod tests {
             requested: Some("myapp.example.com".into()),
             ..base()
         };
-        assert_eq!(kinds(&plan_of(&facts)), vec![PlanOptionKind::DirectManualDns]);
+        assert_eq!(
+            kinds(&plan_of(&facts)),
+            vec![PlanOptionKind::DirectManualDns]
+        );
     }
 
     fn plan_of(facts: &PlanFacts) -> ReachabilityPlan {
@@ -1166,7 +1585,10 @@ mod tests {
         let facts = PlanFacts {
             directs: vec![direct(true)],
             zones: vec![zone("example.com", "cloudflare")],
-            cloudflare_accounts: vec![NamedId { id: 3, name: "cf".into() }],
+            cloudflare_accounts: vec![NamedId {
+                id: 3,
+                name: "cf".into(),
+            }],
             tunnel_workers: vec![worker()],
             ..base()
         };
@@ -1248,7 +1670,10 @@ mod tests {
 
     #[test]
     fn tunnel_domains_and_names() {
-        assert_eq!(tunnel_domain_for("app.example.com", "example.com"), "example.com");
+        assert_eq!(
+            tunnel_domain_for("app.example.com", "example.com"),
+            "example.com"
+        );
         assert_eq!(
             tunnel_domain_for("app.lab.example.com", "example.com"),
             "lab.example.com"
@@ -1283,8 +1708,14 @@ mod tests {
     fn several_cloudflare_accounts_ask_which_one() {
         let facts = PlanFacts {
             cloudflare_accounts: vec![
-                NamedId { id: 3, name: "a".into() },
-                NamedId { id: 4, name: "b".into() },
+                NamedId {
+                    id: 3,
+                    name: "a".into(),
+                },
+                NamedId {
+                    id: 4,
+                    name: "b".into(),
+                },
             ],
             tunnel_workers: vec![worker()],
             requested: Some("myapp.example.net".into()),
@@ -1309,7 +1740,10 @@ mod tests {
         let option = &plan.options[0];
         assert_eq!(option.kind, PlanOptionKind::ExistingTunnel);
         assert_eq!(option.actions, 2);
-        assert!(option.steps.iter().any(|s| s.kind == StepKind::RouteHostname));
+        assert!(option
+            .steps
+            .iter()
+            .any(|s| s.kind == StepKind::RouteHostname));
         let confirmation = option.confirmation.as_deref().expect("confirmation");
         assert!(confirmation.contains("set to no tunnel"), "{confirmation}");
     }
@@ -1323,7 +1757,10 @@ mod tests {
         };
         let option = &plan(&facts).options[0];
         assert_eq!(option.confirmation, None);
-        assert!(!option.steps.iter().any(|s| s.kind == StepKind::RouteHostname));
+        assert!(!option
+            .steps
+            .iter()
+            .any(|s| s.kind == StepKind::RouteHostname));
     }
 
     #[test]
@@ -1384,7 +1821,11 @@ mod tests {
         });
         assert!(planned.options.is_empty());
         let blocked = planned.blocked.expect("blocked");
-        assert!(blocked.reason.contains("100.64.0.0/10"), "{}", blocked.reason);
+        assert!(
+            blocked.reason.contains("100.64.0.0/10"),
+            "{}",
+            blocked.reason
+        );
     }
 
     #[test]
@@ -1482,7 +1923,11 @@ mod tests {
             .iter()
             .find(|s| s.kind == StepKind::SetDnsRecord)
             .expect("dns step");
-        assert!(dns.label.contains("from 198.51.100.1 to 203.0.113.5"), "{}", dns.label);
+        assert!(
+            dns.label.contains("from 198.51.100.1 to 203.0.113.5"),
+            "{}",
+            dns.label
+        );
         assert!(option.warnings[0].contains("Undo puts 198.51.100.1 back"));
 
         // A record Temps does not manage is never offered for change.
@@ -1490,5 +1935,164 @@ mod tests {
         assert!(!kinds(&plan).contains(&PlanOptionKind::DirectManagedDns));
         let blocked = format!("{:?}", plan.blocked);
         assert!(blocked.contains("that Temps did not create"), "{blocked}");
+    }
+
+    fn private_worker_fact(error: Option<&str>) -> PrivateWorkerFact {
+        PrivateWorkerFact {
+            id: 2,
+            name: "homelab".into(),
+            listener: Some("100.101.102.103".parse().expect("ip")),
+            tailscale: true,
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn private_facts() -> PlanFacts {
+        PlanFacts {
+            audience: Audience::Private,
+            requested: Some("internal.example.com".into()),
+            zones: vec![zone("example.com", "cloudflare")],
+            private_workers: vec![private_worker_fact(None)],
+            suggested_private_worker: Some("homelab".into()),
+            // A tunnel and a direct ingress are never what a private
+            // address goes through.
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            directs: vec![direct(true)],
+            ..base()
+        }
+    }
+
+    /// ADR 064 D5: without a worker in private mode the plan names the
+    /// command and the worker; Temps never turns it on itself.
+    #[test]
+    fn a_private_plan_without_a_private_worker_names_the_command_and_worker() {
+        let facts = PlanFacts {
+            private_workers: Vec::new(),
+            ..private_facts()
+        };
+        let plan = plan(&facts);
+        assert!(plan.options.is_empty());
+        let blocked = plan.blocked.expect("blocked");
+        assert!(blocked.reason.contains("homelab"), "{}", blocked.reason);
+        let action = blocked.action.expect("action");
+        assert_eq!(action.kind, ActionKind::RunCommand);
+        assert_eq!(action.command.as_deref(), Some(PRIVATE_COMMAND));
+        assert!(action.label.contains("homelab"));
+
+        let failing = plan_of(&PlanFacts {
+            private_workers: vec![private_worker_fact(Some("tailscale0 has no address"))],
+            ..private_facts()
+        });
+        assert!(failing.options.is_empty());
+        assert!(failing
+            .blocked
+            .expect("blocked")
+            .reason
+            .contains("tailscale0 has no address"));
+    }
+
+    #[test]
+    fn a_private_plan_points_at_the_listener_and_issues_over_dns_01() {
+        let facts = private_facts();
+        let plan = plan(&facts);
+        assert_eq!(kinds(&plan), vec![PlanOptionKind::PrivateWorker]);
+        let option = &plan.options[0];
+        assert_eq!(option.way_in, "private:homelab");
+        assert_eq!(
+            option.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                StepKind::AttachDomain,
+                StepKind::SetAudience,
+                StepKind::SetDnsRecord,
+                StepKind::IssueCertificate,
+                StepKind::CheckReachability
+            ]
+        );
+        assert!(option.steps[2].label.contains("100.101.102.103"));
+        assert!(option.steps[3].label.contains("DNS-01"));
+        assert!(option.steps[1].label.contains("100.64.0.0/10"));
+        assert!(option.description.contains("Tailscale"));
+        // The console shows this before Create.
+        assert!(
+            option.warnings[0].contains("public DNS record")
+                && option.warnings[0].contains("100.101.102.103"),
+            "{:?}",
+            option.warnings
+        );
+        assert_eq!(
+            records_to_read(&facts, "internal.example.com"),
+            vec![("internal.example.com".to_string(), "A".to_string())]
+        );
+
+        // DNS-01 and the record need a zone Temps manages.
+        let unmanaged = plan_of(&PlanFacts {
+            requested: Some("internal.example.org".into()),
+            ..private_facts()
+        });
+        assert!(unmanaged.options.is_empty());
+        assert!(unmanaged
+            .blocked
+            .expect("blocked")
+            .reason
+            .contains("DNS-01"));
+
+        // A record Temps does not manage is never taken over.
+        let mut taken = private_facts();
+        taken.dns_records = vec![(
+            "internal.example.com".into(),
+            "A".into(),
+            seen("10.0.0.9", "2026-10-01", false),
+        )];
+        assert!(plan_of(&taken).options.is_empty());
+
+        // Where the environment runs on the control plane, no worker can.
+        let on_cp = plan_of(&PlanFacts {
+            served_by_workers: false,
+            ..private_facts()
+        });
+        assert!(on_cp.options.is_empty());
+
+        // The fingerprint follows the listener.
+        let mut moved = private_facts();
+        moved.private_workers[0].listener = Some("100.101.102.104".parse().expect("ip"));
+        assert_ne!(
+            fingerprint(&facts, Some("internal.example.com")),
+            fingerprint(&moved, Some("internal.example.com"))
+        );
+    }
+
+    /// ADR 064 Security: making a private address public says what becomes
+    /// public, as a step undo can reverse.
+    #[test]
+    fn a_public_plan_for_a_private_address_says_it_becomes_public() {
+        let facts = PlanFacts {
+            requested: Some("internal.example.com".into()),
+            attached_here: vec!["internal.example.com".into()],
+            audiences: vec![("internal.example.com".into(), Audience::Private)],
+            private_ranges: vec![("internal.example.com".into(), Some("100.64.0.0/10".into()))],
+            directs: vec![direct(true)],
+            zones: vec![zone("example.com", "cloudflare")],
+            ..base()
+        };
+        let plan = plan(&facts);
+        assert!(!plan.options.is_empty());
+        for option in &plan.options {
+            assert!(
+                option.steps.iter().any(|s| s.kind == StepKind::SetAudience),
+                "{:?}",
+                option.steps
+            );
+            assert!(option.warnings[0].contains("anyone on the internet can open"));
+            assert!(option.warnings[0].contains("private to 100.64.0.0/10"));
+        }
+        // A public address gets no such step.
+        let public = plan_of(&PlanFacts {
+            audiences: vec![("internal.example.com".into(), Audience::Public)],
+            ..facts
+        });
+        assert!(public
+            .options
+            .iter()
+            .all(|o| o.steps.iter().all(|s| s.kind != StepKind::SetAudience)));
     }
 }

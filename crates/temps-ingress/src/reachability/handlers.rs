@@ -30,10 +30,9 @@ use utoipa::{OpenApi, ToSchema};
 use super::model::{
     ActionKind, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
     DecideRequest, Decision, DnsRecordState, EnvironmentReachability, Intent, JournalEntry,
-    JournalState, PlanBlocked, PlanOption, PlannedRecord,
-    PlanOptionKind, PlanRequest, PlanStep, PreviousChoice, ReachAction, ReachState,
-    ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep, RunStepStatus, RunView,
-    StepKind, UndoResult,
+    JournalState, PlanBlocked, PlanOption, PlanOptionKind, PlanRequest, PlanStep, PlannedRecord,
+    PreviousChoice, ReachAction, ReachState, ReachabilityPlan, ResumeRequest, RunResource,
+    RunState, RunStep, RunStepStatus, RunView, StepKind, UndoResult,
 };
 use super::plan::permissions_for;
 use super::service::ReachabilityService;
@@ -119,9 +118,15 @@ pub fn configure_routes() -> Router<Arc<ReachabilityAppState>> {
     Router::new()
         .route(base, get(get_environment_reachability))
         .route(&format!("{base}/plan"), post(plan_environment_reachability))
-        .route(&format!("{base}/apply"), post(apply_environment_reachability))
+        .route(
+            &format!("{base}/apply"),
+            post(apply_environment_reachability),
+        )
         .route(&format!("{base}/runs"), get(list_reachability_runs))
-        .route(&format!("{base}/runs/{{run_id}}"), get(get_reachability_run))
+        .route(
+            &format!("{base}/runs/{{run_id}}"),
+            get(get_reachability_run),
+        )
         .route(
             &format!("{base}/runs/{{run_id}}/resume"),
             post(resume_reachability_run),
@@ -134,7 +139,10 @@ pub fn configure_routes() -> Router<Arc<ReachabilityAppState>> {
             &format!("{base}/runs/{{run_id}}/decide"),
             post(decide_reachability_conflict),
         )
-        .route("/ingress/cloudflare/token-check", post(check_cloudflare_token))
+        .route(
+            "/ingress/cloudflare/token-check",
+            post(check_cloudflare_token),
+        )
         .route("/ingress/certificate-methods", get(get_certificate_methods))
 }
 
@@ -247,7 +255,10 @@ async fn get_environment_reachability(
     project_scope_guard!(auth, project_id);
     project_permission_guard!(auth, ProjectsRead, project_id, state.project_access_checker);
     Ok(Json(
-        state.service.environment(project_id, environment_id).await?,
+        state
+            .service
+            .environment(project_id, environment_id)
+            .await?,
     ))
 }
 
@@ -325,12 +336,34 @@ async fn apply_environment_reachability(
     Json(request): Json<ApplyRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     project_scope_guard!(auth, project_id);
-    project_permission_guard!(auth, ProjectsWrite, project_id, state.project_access_checker);
-    require_all(
-        &auth,
-        &permissions_for(request.option),
-        "This way in",
-    )?;
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        state.project_access_checker
+    );
+    require_all(&auth, &permissions_for(request.option), "This way in")?;
+    // Changing who an existing address is for is a sensitive action, both
+    // ways (ADR 064 Security).
+    let answered = request
+        .answers
+        .get(super::plan::FIELD_ADDRESS)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if let Some(action) = audience_action(
+        state
+            .service
+            .audience_change(
+                project_id,
+                environment_id,
+                &request.plan_id,
+                request.option,
+                answered.as_deref(),
+            )
+            .await?,
+    ) {
+        require_sensitive_action(state.sensitive_action_authorizer.as_ref(), &auth, action).await?;
+    }
     let option = request.option;
     let email = auth.user.as_ref().map(|u| u.email.clone());
     let run = state
@@ -443,7 +476,12 @@ async fn resume_reachability_run(
     Json(request): Json<ResumeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     project_scope_guard!(auth, project_id);
-    project_permission_guard!(auth, ProjectsWrite, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        state.project_access_checker
+    );
     let current = state
         .service
         .run(project_id, environment_id, run_id)
@@ -498,7 +536,12 @@ async fn undo_reachability_run(
     Path((project_id, environment_id, run_id)): Path<(i32, i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     project_scope_guard!(auth, project_id);
-    project_permission_guard!(auth, ProjectsWrite, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        state.project_access_checker
+    );
     let pending = state
         .service
         .undo_pending(project_id, environment_id, run_id)
@@ -514,6 +557,9 @@ async fn undo_reachability_run(
             SensitiveAction::DeleteDomain { domain },
         )
         .await?;
+    }
+    if let Some(action) = undo_audience_action(&pending) {
+        require_sensitive_action(state.sensitive_action_authorizer.as_ref(), &auth, action).await?;
     }
     let run = state
         .service
@@ -569,14 +615,23 @@ async fn decide_reachability_conflict(
     Json(request): Json<DecideRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     project_scope_guard!(auth, project_id);
-    project_permission_guard!(auth, ProjectsWrite, project_id, state.project_access_checker);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        state.project_access_checker
+    );
     let current = state
         .service
         .run(project_id, environment_id, run_id)
         .await?;
     // Writing the record either way needs what the run's DNS step needed;
     // carrying on with undo needs what undo needs.
-    require_all(&auth, &[Permission::DnsProvidersWrite], "Deciding this conflict")?;
+    require_all(
+        &auth,
+        &[Permission::DnsProvidersWrite],
+        "Deciding this conflict",
+    )?;
     if current.state == RunState::UndoPaused {
         let pending = state
             .service
@@ -593,6 +648,10 @@ async fn decide_reachability_conflict(
                 SensitiveAction::DeleteDomain { domain },
             )
             .await?;
+        }
+        if let Some(action) = undo_audience_action(&pending) {
+            require_sensitive_action(state.sensitive_action_authorizer.as_ref(), &auth, action)
+                .await?;
         }
     }
     let key = request.key.clone();
@@ -611,6 +670,41 @@ async fn decide_reachability_conflict(
     )
     .await;
     Ok(Json(run))
+}
+
+/// The step-up an apply needs when its option changes an existing
+/// address's audience.
+fn audience_action(change: Option<(String, AddressAudience, Audience)>) -> Option<SensitiveAction> {
+    let (hostname, before, after) = change?;
+    (before.audience != after).then(|| SensitiveAction::ChangeAddressAudience {
+        hostname,
+        from: before.audience.as_str().to_string(),
+        to: after.as_str().to_string(),
+    })
+}
+
+/// The step-up an undo needs when it puts an address back to another
+/// audience. An address the run attached itself is removed instead, and
+/// stays private until then, so that needs none.
+fn undo_audience_action(pending: &[RunResource]) -> Option<SensitiveAction> {
+    pending.iter().find_map(|resource| match resource {
+        RunResource::AddressAudience {
+            hostname,
+            before,
+            after,
+        } if before.audience != after.audience
+            && !pending.iter().any(
+                |r| matches!(r, RunResource::CustomDomain { domain, .. } if domain == hostname),
+            ) =>
+        {
+            Some(SensitiveAction::ChangeAddressAudience {
+                hostname: hostname.clone(),
+                from: after.audience.as_str().to_string(),
+                to: before.audience.as_str().to_string(),
+            })
+        }
+        _ => None,
+    })
 }
 
 /// What removing `pending` needs, on top of `projects:write`.

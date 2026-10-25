@@ -592,7 +592,9 @@ pub fn decide(
             entry.intent.describe()
         ));
     }
-    if undoing && decision == Decision::Overwrite && matches!(entry.intent, Intent::DnsRecord { .. })
+    if undoing
+        && decision == Decision::Overwrite
+        && matches!(entry.intent, Intent::DnsRecord { .. })
     {
         // Removing a record needs this run's marker on it (ADR 064 D4).
         return Err(format!(
@@ -729,7 +731,10 @@ impl Runner<'_> {
     /// the next one carries it.
     async fn save(&self) {
         if let Err(error) = self.sink.save(&self.record).await {
-            tracing::warn!(run = self.input.run_id, "could not save reachability run progress: {error}");
+            tracing::warn!(
+                run = self.input.run_id,
+                "could not save reachability run progress: {error}"
+            );
         }
     }
 
@@ -779,7 +784,9 @@ impl Runner<'_> {
                                 }
                             }
                             Resolution::Absent => {}
-                            Resolution::Pending => return Err(Hold::Wait(wait_message(&entry, now))),
+                            Resolution::Pending => {
+                                return Err(Hold::Wait(wait_message(&entry, now)))
+                            }
                             Resolution::Conflict => {
                                 return Err(Hold::Conflict(conflict_message(&entry)))
                             }
@@ -802,10 +809,11 @@ impl Runner<'_> {
                 entry.conflict = None;
                 entry.unwritten = false;
             }
-            None => self
-                .record
-                .journal
-                .push(JournalEntry::pending(key.clone(), intent.clone(), now)),
+            None => {
+                self.record
+                    .journal
+                    .push(JournalEntry::pending(key.clone(), intent.clone(), now))
+            }
         }
         self.sink.save(&self.record).await.map_err(|error| {
             Hold::Failed(format!(
@@ -1264,10 +1272,7 @@ impl Runner<'_> {
                                         .unwrap_or_else(|| "Cloudflare refused the tunnel.".into()),
                                 );
                             }
-                            Outcome::Done(Some(format!(
-                                "Tunnel {} for {}.",
-                                new.name, new.domain
-                            )))
+                            Outcome::Done(Some(format!("Tunnel {} for {}.", new.name, new.domain)))
                         }
                         Err((saved, error)) => {
                             match saved {
@@ -1575,9 +1580,7 @@ impl Runner<'_> {
                         Ok((state, detail)) if state == "published" => {
                             return Outcome::Done(Some(detail))
                         }
-                        Ok((state, detail)) if state == "error" => {
-                            return Outcome::Stalled(detail)
-                        }
+                        Ok((state, detail)) if state == "error" => return Outcome::Stalled(detail),
                         Ok((_, detail)) => {
                             if waited >= self.timing.publish {
                                 return Outcome::Stalled(format!(
@@ -1628,7 +1631,9 @@ impl Runner<'_> {
                     Ok(Begin::Go) => match self.ops.set_address_audience(&address, &after).await {
                         Ok(()) => {
                             let Intent::AddressAudience { before, .. } = intent.clone() else {
-                                return Outcome::Failed("The audience could not be recorded.".into());
+                                return Outcome::Failed(
+                                    "The audience could not be recorded.".into(),
+                                );
                             };
                             self.finish(
                                 &intent.key(input.run_id),
@@ -1924,6 +1929,17 @@ pub async fn undo(
         Intent::Connector { name } if e.undo_decision == Some(Decision::Keep) => Some(name.clone()),
         _ => None,
     });
+    // Addresses this run attached itself: undo removes them, so their
+    // audience is never put back first (a private one would be public in
+    // between).
+    let attached_here: std::collections::BTreeSet<String> = journal
+        .iter()
+        .filter(|e| e.state == JournalState::Done)
+        .filter_map(|e| match &e.resource {
+            Some(RunResource::CustomDomain { domain, .. }) => Some(domain.clone()),
+            _ => None,
+        })
+        .collect();
     for index in (0..journal.len()).rev() {
         let entry = &mut journal[index];
         let resource = match entry.state {
@@ -1959,6 +1975,19 @@ pub async fn undo(
         };
         let checked = entry.undo_decision == Some(Decision::Overwrite);
         match &resource {
+            RunResource::AddressAudience {
+                hostname, after, ..
+            } if attached_here.contains(hostname) => {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                results.push(UndoResult {
+                    label: format!("Left {hostname} {} until it is removed", after.describe()),
+                    resource: resource.clone(),
+                    ok: true,
+                    error: None,
+                });
+                continue;
+            }
             // What the kept tunnel runs on stays.
             RunResource::DnsProvider { .. }
             | RunResource::ManagedDomain { .. }
@@ -2430,7 +2459,10 @@ mod tests {
             *polls += 1;
             self.log("hostname_state");
             Ok(if *polls > self.published_after {
-                ("published".into(), "Published through tunnel 'example-com'.".into())
+                (
+                    "published".into(),
+                    "Published through tunnel 'example-com'.".into(),
+                )
             } else {
                 ("pending".into(), "Being published.".into())
             })
@@ -2476,7 +2508,8 @@ mod tests {
             self.log("certificate_exists");
             Ok(false)
         }
-        async fn start_certificate(&self, _host: &str, _challenge: &str) -> Result<(), String> {
+        async fn start_certificate(&self, _host: &str, challenge: &str) -> Result<(), String> {
+            self.log(format!("challenge {challenge}"));
             self.result("start_certificate")
         }
         async fn finish_certificate(&self, _host: &str, _email: &str) -> Result<(), String> {
@@ -2509,12 +2542,10 @@ mod tests {
                 },
                 reason: "checked".into(),
                 action: None,
+                network: None,
             }
         }
-        async fn address_audience(
-            &self,
-            _host: &str,
-        ) -> Result<Option<AddressAudience>, String> {
+        async fn address_audience(&self, _host: &str) -> Result<Option<AddressAudience>, String> {
             Ok(self.audience.lock().expect("lock").clone())
         }
         async fn set_address_audience(
@@ -2612,7 +2643,10 @@ mod tests {
         let sink = Saved::default();
         let record = execute(&token_input(), &ops, &sink, timing()).await;
         assert_eq!(record.state, RunState::Succeeded);
-        assert_eq!(record.live_url.as_deref(), Some("https://myapp.example.com"));
+        assert_eq!(
+            record.live_url.as_deref(),
+            Some("https://myapp.example.com")
+        );
         assert_eq!(
             record.created(),
             vec![
@@ -2700,9 +2734,9 @@ mod tests {
         });
         input.token = None;
         input.option = PlanOptionKind::NewTunnel;
-        input.steps.retain(|s| {
-            !matches!(s.kind, StepKind::CheckToken | StepKind::SaveDnsProvider)
-        });
+        input
+            .steps
+            .retain(|s| !matches!(s.kind, StepKind::CheckToken | StepKind::SaveDnsProvider));
         let record = execute(&input, &ops, &Saved::default(), timing()).await;
         assert_eq!(record.state, RunState::Succeeded);
         assert_eq!(
@@ -2719,7 +2753,9 @@ mod tests {
             ]
         );
         let mut journal = record.journal.clone();
-        let results = undo(&mut journal, &ops, 0, &Journaled::default()).await.results;
+        let results = undo(&mut journal, &ops, 0, &Journaled::default())
+            .await
+            .results;
         assert_eq!(
             results.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
             vec![
@@ -2755,7 +2791,9 @@ mod tests {
                 },
             ),
         ];
-        let results = undo(&mut journal, &ops, 0, &Journaled::default()).await.results;
+        let results = undo(&mut journal, &ops, 0, &Journaled::default())
+            .await
+            .results;
         assert!(!results[0].ok);
         assert_eq!(results[0].error.as_deref(), Some("database is down"));
         assert!(results[1].ok);
@@ -2788,8 +2826,13 @@ mod tests {
         let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
         assert_eq!(outcome.results.len(), 1);
         assert!(!outcome.results[0].ok);
-        assert!(matches!(&outcome.stopped, Some(Stop::Failed(why)) if why.contains("never brings it back")));
-        assert!(!ops.calls().iter().any(|c| c.starts_with("delete_dns_provider")));
+        assert!(
+            matches!(&outcome.stopped, Some(Stop::Failed(why)) if why.contains("never brings it back"))
+        );
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_dns_provider")));
         assert!(journal[1].deleting);
         assert_eq!(journal[1].state, JournalState::Done);
 
@@ -2797,7 +2840,10 @@ mod tests {
         let ops = Fake::default();
         let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
         assert!(outcome.stopped.is_none());
-        assert!(!ops.calls().iter().any(|c| c.starts_with("mark_tunnel_deleting")));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("mark_tunnel_deleting")));
         assert_eq!(
             ops.calls()
                 .into_iter()
@@ -2823,8 +2869,14 @@ mod tests {
         let outcome = undo(&mut journal, &ops, 0, &sink).await;
         assert!(outcome.stopped.is_none());
         let calls = ops.calls();
-        let mark = calls.iter().position(|c| c == "mark_tunnel_deleting 40").expect("marked");
-        let delete = calls.iter().position(|c| c == "delete_tunnel 40").expect("deleted");
+        let mark = calls
+            .iter()
+            .position(|c| c == "mark_tunnel_deleting 40")
+            .expect("marked");
+        let delete = calls
+            .iter()
+            .position(|c| c == "delete_tunnel 40")
+            .expect("deleted");
         assert!(mark < delete);
         // The provider tunnel id read when marking is what is deleted.
         assert!(calls.contains(&"tunnel_id cf-40".to_string()));
@@ -2878,11 +2930,16 @@ mod tests {
         let Some(Stop::Conflict(why)) = &outcome.stopped else {
             panic!("expected a conflict, got {:?}", outcome.stopped);
         };
-        assert!(why.contains("Tunnel t now also publishes other.example.com"), "{why}");
+        assert!(
+            why.contains("Tunnel t now also publishes other.example.com"),
+            "{why}"
+        );
         // The run's own hostname choice, newer, was put back.
         assert_eq!(outcome.results.len(), 1);
-        assert!(!ops.calls().iter().any(|c| c.starts_with("mark_tunnel_deleting")
-            || c.starts_with("delete_")));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("mark_tunnel_deleting") || c.starts_with("delete_")));
         assert_eq!(journal[1].state, JournalState::Conflict);
 
         // Keep: the tunnel stays, and so does the DNS provider it uses.
@@ -2892,8 +2949,14 @@ mod tests {
         let outcome = undo(&mut kept, &ops, 0, &Journaled::default()).await;
         assert!(outcome.stopped.is_none());
         assert!(!ops.calls().iter().any(|c| c.starts_with("delete_")));
-        assert!(outcome.results[0].label.starts_with("Kept Cloudflare account cf")
-            || outcome.results[0].label.starts_with("Kept"), "{:?}", outcome.results);
+        assert!(
+            outcome.results[0]
+                .label
+                .starts_with("Kept Cloudflare account cf")
+                || outcome.results[0].label.starts_with("Kept"),
+            "{:?}",
+            outcome.results
+        );
         assert_eq!(kept[1].undo_decision, Some(Decision::Keep));
 
         // Remove anyway: journaled, then removed with what it runs on.
@@ -2939,14 +3002,20 @@ mod tests {
         let mut journal = vec![created_record("203.0.113.5")];
         let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
         assert!(matches!(outcome.stopped, Some(Stop::Conflict(_))));
-        assert!(!ops.calls().iter().any(|c| c.starts_with("remove_dns_record")));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("remove_dns_record")));
         // "Remove anyway" is not offered for a record the run did not write.
         let key = journal[0].key.clone();
         assert!(decide(&mut journal, &key, Decision::Overwrite, true).is_err());
         decide(&mut journal, &key, Decision::Keep, true).expect("kept");
         let outcome = undo(&mut journal, &ops, 9, &Journaled::default()).await;
         assert!(outcome.stopped.is_none());
-        assert!(!ops.calls().iter().any(|c| c.starts_with("remove_dns_record")));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("remove_dns_record")));
 
         // Not managed by Temps at all: the same.
         let ops = Fake::default();
@@ -2955,21 +3024,36 @@ mod tests {
             ..record("203.0.113.5", None, "later")
         });
         let mut journal = vec![created_record("203.0.113.5")];
-        assert!(undo(&mut journal, &ops, 9, &Journaled::default()).await.stopped.is_some());
-        assert!(!ops.calls().iter().any(|c| c.starts_with("remove_dns_record")));
+        assert!(undo(&mut journal, &ops, 9, &Journaled::default())
+            .await
+            .stopped
+            .is_some());
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("remove_dns_record")));
 
         // Still this run's: removed. Gone already: nothing to do.
         let ops = Fake::default();
         *ops.dns.lock().expect("lock") = Some(record("203.0.113.5", Some(9), "written"));
         let mut journal = vec![created_record("203.0.113.5")];
-        assert!(undo(&mut journal, &ops, 9, &Journaled::default()).await.stopped.is_none());
+        assert!(undo(&mut journal, &ops, 9, &Journaled::default())
+            .await
+            .stopped
+            .is_none());
         assert!(ops
             .calls()
             .contains(&"remove_dns_record myapp.example.com myapp A".to_string()));
         let ops = Fake::default();
         let mut journal = vec![created_record("203.0.113.5")];
-        assert!(undo(&mut journal, &ops, 9, &Journaled::default()).await.stopped.is_none());
-        assert!(!ops.calls().iter().any(|c| c.starts_with("remove_dns_record")));
+        assert!(undo(&mut journal, &ops, 9, &Journaled::default())
+            .await
+            .stopped
+            .is_none());
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("remove_dns_record")));
         assert_eq!(journal[0].state, JournalState::Absent);
     }
 
@@ -2988,6 +3072,89 @@ mod tests {
             dns_before,
             ..token_input()
         }
+    }
+
+    fn private_input(run_id: i32) -> RunInput {
+        RunInput {
+            run_id,
+            option: PlanOptionKind::PrivateWorker,
+            steps: steps(&[
+                StepKind::AttachDomain,
+                StepKind::SetAudience,
+                StepKind::SetDnsRecord,
+                StepKind::IssueCertificate,
+                StepKind::CheckReachability,
+            ]),
+            new_tunnel: None,
+            token: None,
+            direct: Some(("homelab".into(), "100.101.102.103".parse().expect("ip"))),
+            dns_before: PlannedRecord::Absent,
+            certificate_challenge: Some("dns-01".into()),
+            audience: Some((
+                AddressAudience {
+                    audience: Audience::Private,
+                    network_range: Some("100.64.0.0/10".into()),
+                    private_node_id: Some(2),
+                    private_listener: Some("100.101.102.103".into()),
+                },
+                AddressAudience::public(),
+            )),
+            acme_email: Some("ops@example.com".into()),
+            ..token_input()
+        }
+    }
+
+    /// ADR 064 D5: a private run points DNS at the worker's private
+    /// listener, issues over DNS-01 only, and records the audience with
+    /// its range; undoing it removes the address it attached without
+    /// making it public first.
+    #[tokio::test]
+    async fn a_private_run_points_at_the_listener_and_undo_never_makes_it_public() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let record = execute(&private_input(12), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        let calls = ops.calls();
+        assert!(
+            calls.contains(&"write_dns_record 100.101.102.103 Some(12)".to_string()),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&"challenge dns-01".to_string()), "{calls:?}");
+        assert!(
+            calls.contains(&"set_address_audience private to 100.64.0.0/10".to_string()),
+            "{calls:?}"
+        );
+        // The audience is set before DNS leads anyone there.
+        let audience_at = calls
+            .iter()
+            .position(|c| c.starts_with("set_address_audience"))
+            .expect("audience set");
+        let dns_at = calls
+            .iter()
+            .position(|c| c.starts_with("write_dns_record"))
+            .expect("dns written");
+        assert!(audience_at < dns_at, "{calls:?}");
+
+        let mut journal = record.journal.clone();
+        let undo_ops = Fake::default();
+        *undo_ops.dns.lock().expect("lock") = ops.dns.lock().expect("lock").clone();
+        let outcome = undo(&mut journal, &undo_ops, 12, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{:?}", outcome.stopped);
+        let undone = undo_ops.calls();
+        assert!(
+            !undone.iter().any(|c| c.starts_with("set_address_audience")),
+            "an address being removed is never made public first: {undone:?}"
+        );
+        assert!(
+            undone.iter().any(|c| c.starts_with("detach_domain")),
+            "{undone:?}"
+        );
+        assert!(
+            undone.iter().any(|c| c.starts_with("remove_dns_record")),
+            "{undone:?}"
+        );
     }
 
     fn was() -> DnsRecordState {
@@ -3010,12 +3177,17 @@ mod tests {
         assert_eq!(record_after.state, RunState::Conflict);
         let error = record_after.error.clone().expect("error");
         assert!(
-            error.contains("changed at your DNS provider after this plan was made: it is now A \
-                            198.51.100.7"),
+            error.contains(
+                "changed at your DNS provider after this plan was made: it is now A \
+                            198.51.100.7"
+            ),
             "{error}"
         );
         assert!(error.contains("Temps wrote nothing"));
-        assert!(!ops.calls().iter().any(|c| c.starts_with("write_dns_record")));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("write_dns_record")));
         // Nothing is undone: undo could put back what someone just changed.
         assert!(record_after.undo.is_empty());
         // The conflict was found before writing, so undo has nothing to put
@@ -3028,11 +3200,18 @@ mod tests {
         // A record that appeared where the plan saw none: the same.
         let ops = Fake::default();
         *ops.dns.lock().expect("lock") = Some(was());
-        let record_after =
-            execute(&direct_input(9, PlannedRecord::Absent), &ops, &Saved::default(), timing())
-                .await;
+        let record_after = execute(
+            &direct_input(9, PlannedRecord::Absent),
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
         assert_eq!(record_after.state, RunState::Conflict);
-        assert!(!ops.calls().iter().any(|c| c.starts_with("write_dns_record")));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("write_dns_record")));
 
         // Keep: resuming skips the record. Overwrite: it is set, with the
         // value there now journaled as `before`.
@@ -3047,7 +3226,10 @@ mod tests {
         let input = direct_input(9, PlannedRecord::Absent);
         let resumed = resume(&input, kept, &ops_keep, &Saved::default(), timing()).await;
         assert_eq!(resumed.state, RunState::Succeeded);
-        assert!(!ops_keep.calls().iter().any(|c| c.starts_with("write_dns_record")));
+        assert!(!ops_keep
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("write_dns_record")));
 
         let mut overwrite = record_after;
         decide(&mut overwrite.journal, &key, Decision::Overwrite, false).expect("decided");
@@ -3102,7 +3284,10 @@ mod tests {
         assert!(ops
             .calls()
             .contains(&"write_dns_record 198.51.100.1 None".to_string()));
-        assert!(outcome.results.iter().any(|r| r.label == "Put myapp.example.com back to A 198.51.100.1"));
+        assert!(outcome
+            .results
+            .iter()
+            .any(|r| r.label == "Put myapp.example.com back to A 198.51.100.1"));
 
         // Changed again since: nothing written, undo pauses there, and the
         // older step (the custom domain) is left alone.
@@ -3114,7 +3299,10 @@ mod tests {
             panic!("expected a conflict, got {:?}", outcome.stopped);
         };
         assert!(why.contains("it is now A 192.0.2.44"), "{why}");
-        assert!(!ops.calls().iter().any(|c| c.starts_with("write_dns_record")));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("write_dns_record")));
         assert!(!ops.calls().iter().any(|c| c.starts_with("detach_domain")));
 
         // Skip it: the rest is undone, the record left as they set it.
@@ -3128,9 +3316,19 @@ mod tests {
         decide(&mut skipped, &key, Decision::Keep, true).expect("decided");
         let outcome = undo(&mut skipped, &ops, 9, &Journaled::default()).await;
         assert!(outcome.stopped.is_none());
-        assert!(!ops.calls().iter().any(|c| c.starts_with("write_dns_record")));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("write_dns_record")));
         assert!(ops.calls().contains(&"detach_domain 50".to_string()));
-        assert_eq!(skipped.iter().find(|e| e.key == key).expect("entry").undo_decision, Some(Decision::Keep));
+        assert_eq!(
+            skipped
+                .iter()
+                .find(|e| e.key == key)
+                .expect("entry")
+                .undo_decision,
+            Some(Decision::Keep)
+        );
 
         // Restore anyway: journaled, and written.
         let ops = Fake::default();
@@ -3169,7 +3367,10 @@ mod tests {
         let out = reconcile_journal(&mut journal, &ops, 9, now).await;
         assert_eq!(out.resolved, 1);
         assert_eq!(journal[0].state, JournalState::Done);
-        assert!(matches!(journal[0].resource, Some(RunResource::DnsChange { .. })));
+        assert!(matches!(
+            journal[0].resource,
+            Some(RunResource::DnsChange { .. })
+        ));
 
         // The same content written by another run is not this run's.
         let ops = Fake::default();
@@ -3184,7 +3385,10 @@ mod tests {
         let out = reconcile_journal(&mut journal, &ops, 9, now).await;
         assert_eq!(out.conflicts, 1);
         assert_eq!(journal[0].state, JournalState::Conflict);
-        assert_eq!(journal[0].conflict.as_deref(), Some("A 192.0.2.44 (set by Temps)"));
+        assert_eq!(
+            journal[0].conflict.as_deref(),
+            Some("A 192.0.2.44 (set by Temps)")
+        );
 
         // Still the before content: absent only after a second look.
         let ops = Fake {
@@ -3193,10 +3397,18 @@ mod tests {
         };
         *ops.dns.lock().expect("lock") = Some(was());
         let mut journal = vec![pending_change(since)];
-        assert_eq!(reconcile_journal(&mut journal, &ops, 9, now).await.pending, 1);
+        assert_eq!(
+            reconcile_journal(&mut journal, &ops, 9, now).await.pending,
+            1
+        );
         assert_eq!(journal[0].first_miss_at, Some(now));
         let later = now + chrono::Duration::seconds(31);
-        assert_eq!(reconcile_journal(&mut journal, &ops, 9, later).await.resolved, 1);
+        assert_eq!(
+            reconcile_journal(&mut journal, &ops, 9, later)
+                .await
+                .resolved,
+            1
+        );
         assert_eq!(journal[0].state, JournalState::Absent);
         // ...and a resume retries it through the pre-write check.
         let input = direct_input(9, PlannedRecord::Present { record: was() });
@@ -3206,7 +3418,10 @@ mod tests {
         let resumed = resume(&input, stopped, &ops, &Saved::default(), timing()).await;
         assert_eq!(resumed.state, RunState::Succeeded);
         let calls = ops.calls();
-        let read = calls.iter().rposition(|c| c == "read_dns_record").expect("read");
+        let read = calls
+            .iter()
+            .rposition(|c| c == "read_dns_record")
+            .expect("read");
         let write = calls
             .iter()
             .position(|c| c == "write_dns_record 203.0.113.5 Some(9)")
@@ -3256,10 +3471,30 @@ mod tests {
             .clone();
         let since = entry.pending_since.expect("since");
         let at = |s: i64| since + chrono::Duration::seconds(s);
-        assert_eq!(reconcile_journal(&mut journal, &ops, 9, at(10)).await.pending, 1);
-        assert_eq!(reconcile_journal(&mut journal, &ops, 9, at(61)).await.pending, 1);
-        assert_eq!(reconcile_journal(&mut journal, &ops, 9, at(80)).await.pending, 1);
-        assert_eq!(reconcile_journal(&mut journal, &ops, 9, at(92)).await.resolved, 1);
+        assert_eq!(
+            reconcile_journal(&mut journal, &ops, 9, at(10))
+                .await
+                .pending,
+            1
+        );
+        assert_eq!(
+            reconcile_journal(&mut journal, &ops, 9, at(61))
+                .await
+                .pending,
+            1
+        );
+        assert_eq!(
+            reconcile_journal(&mut journal, &ops, 9, at(80))
+                .await
+                .pending,
+            1
+        );
+        assert_eq!(
+            reconcile_journal(&mut journal, &ops, 9, at(92))
+                .await
+                .resolved,
+            1
+        );
         assert!(!journal.iter().any(|e| e.state == JournalState::Pending));
         assert_eq!(writes(&ops), 0);
 
@@ -3525,7 +3760,8 @@ mod tests {
                 name: "t".into(),
             },
         );
-        let pending = |intent: Intent| JournalEntry::pending(intent.key(0), intent, chrono::Utc::now());
+        let pending =
+            |intent: Intent| JournalEntry::pending(intent.key(0), intent, chrono::Utc::now());
         let mut journal = vec![pending(tunnel), pending(domain)];
         let out = reconcile_journal(&mut journal, &ops, 0, chrono::Utc::now()).await;
         assert_eq!(out.resolved, 2);
@@ -3577,7 +3813,9 @@ mod tests {
             connector_id: 41,
             previous: PreviousChoice::Off,
         }));
-        let results = undo(&mut record.journal, &ops, 0, &Journaled::default()).await.results;
+        let results = undo(&mut record.journal, &ops, 0, &Journaled::default())
+            .await
+            .results;
         assert!(results.iter().all(|r| r.ok));
         assert!(ops
             .calls()

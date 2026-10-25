@@ -10,7 +10,7 @@
 
 use std::net::IpAddr;
 
-use temps_core::worker_ingress::{address_scope, AddressScope};
+use temps_core::worker_ingress::{address_scope, AddressScope, PrivateCheckOutcome};
 
 use super::model::{
     ActionKind, AddressReachability, AddressSource, Audience, ReachAction, ReachState,
@@ -26,7 +26,48 @@ pub struct AddressInput {
     pub audience: Audience,
     pub source: AddressSource,
     pub custom_domain_id: Option<i32>,
+    /// For a private address: what it was set up on.
+    pub private: Option<PrivateBinding>,
 }
+
+/// What a private address records about the listener serving it (ADR 064
+/// D5), next to its `audience`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrivateBinding {
+    /// `custom:<id>` or `environment:<id>`: what the worker's inside check
+    /// reports it under.
+    pub address_id: String,
+    pub range: Option<String>,
+    pub node_id: Option<i32>,
+    pub listener: Option<String>,
+}
+
+/// The worker's last inside check of a private address (ADR 064 D7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsideCheck {
+    pub outcome: PrivateCheckOutcome,
+    pub message: String,
+    /// When the control plane received it, in minutes before now.
+    pub minutes_ago: i64,
+}
+
+/// What the control plane knows of the worker serving a private address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateFacts {
+    pub worker: String,
+    /// `Err` with why the worker's private listener does not serve the
+    /// recorded listener address right now.
+    pub bound: Result<(), String>,
+    /// The listener is on the worker's Tailscale interface.
+    pub tailscale: bool,
+    pub inside: Option<InsideCheck>,
+}
+
+/// An inside check older than this says the worker stopped reporting.
+pub const INSIDE_CHECK_STALE_MINUTES: i64 = 20;
+
+/// The command that turns a worker's private listener on.
+pub const PRIVATE_COMMAND: &str = "temps agent ingress private --listen tailscale";
 
 /// A way in that is a listener of Temps' own: the control plane's proxy or
 /// a worker's direct ingress.
@@ -72,6 +113,8 @@ pub struct AddressFacts {
     pub resolution: Resolution,
     /// Temps manages a DNS record for it (outside tunnels).
     pub temps_managed_dns: bool,
+    /// For a private address with a recorded worker.
+    pub private: Option<PrivateFacts>,
 }
 
 /// Names that only ever resolve to the machine they are opened on.
@@ -125,6 +168,7 @@ pub fn address_reachability(
         state,
         reason,
         action,
+        network: None,
     };
 
     if is_local_only(address) {
@@ -145,6 +189,9 @@ pub fn address_reachability(
             format!("Nothing is deployed to {environment_name} yet."),
             Some(ReachAction::new(ActionKind::Deploy, "Deploy it")),
         );
+    }
+    if input.audience == Audience::Private {
+        return private_reachability(facts, environment_name);
     }
 
     let mut tunnel_reason = None;
@@ -202,21 +249,19 @@ pub fn address_reachability(
             )
         }
         Resolution::Ips(_) | Resolution::NoRecord => {
-            let reason = tunnel_reason
-                .unwrap_or_else(|| format!("No DNS record for {address} exists yet."));
+            let reason =
+                tunnel_reason.unwrap_or_else(|| format!("No DNS record for {address} exists yet."));
             let target = directs
                 .iter()
                 .find(|d| d.check_failed.is_none() && !d.ips.is_empty());
             let action = match target {
-                Some(direct) => Some(
-                    ReachAction::new(
-                        ActionKind::SetDnsRecord,
-                        format!(
-                            "Add an A record for {address} pointing at {} ({})",
-                            direct.ips[0], direct.name
-                        ),
+                Some(direct) => Some(ReachAction::new(
+                    ActionKind::SetDnsRecord,
+                    format!(
+                        "Add an A record for {address} pointing at {} ({})",
+                        direct.ips[0], direct.name
                     ),
-                ),
+                )),
                 None => Some(make_reachable()),
             };
             return verdict(ReachState::NotReachable, None, reason, action);
@@ -290,6 +335,223 @@ pub fn address_reachability(
     )
 }
 
+/// The outside check of a private address, from the control plane (ADR
+/// 064 D7): its name resolves only to private addresses, among them the
+/// recorded listener, and no tunnel publishes it. `Err` with the verdict.
+pub fn outside_check(
+    address: &str,
+    listener: IpAddr,
+    resolution: &Resolution,
+    tunnel: Option<&TunnelState>,
+) -> Result<(), (ReachState, String, Option<ReachAction>)> {
+    if let Some(tunnel) = tunnel {
+        if matches!(tunnel.state.as_str(), "published" | "pending" | "error") {
+            let name = tunnel
+                .connector_name
+                .clone()
+                .unwrap_or_else(|| "a tunnel".to_string());
+            return Err((
+                ReachState::NotReachable,
+                format!(
+                    "{address} is private, but tunnel {name} publishes it, so anyone on the \
+                     internet can open it through Cloudflare. Keep it off tunnels under Expose \
+                     your apps."
+                ),
+                Some(
+                    ReachAction::new(ActionKind::OpenIngress, "Open the tunnel")
+                        .with_href(INGRESS_SETUP_PATH),
+                ),
+            ));
+        }
+    }
+    let ips = match resolution {
+        Resolution::Ips(ips) if !ips.is_empty() => ips,
+        Resolution::Failed(error) => {
+            return Err((
+                ReachState::Unknown,
+                format!("Could not look up {address}: {error}"),
+                None,
+            ))
+        }
+        Resolution::Skipped => {
+            return Err((
+                ReachState::Unknown,
+                format!("{address} was not checked."),
+                None,
+            ))
+        }
+        Resolution::Ips(_) | Resolution::NoRecord => {
+            return Err((
+                ReachState::NotReachable,
+                format!("No DNS record for {address} exists yet; it should point at {listener}."),
+                Some(make_reachable()),
+            ))
+        }
+    };
+    let public: Vec<IpAddr> = ips
+        .iter()
+        .copied()
+        .filter(|ip| temps_core::worker_ingress::private_block(*ip).is_none())
+        .collect();
+    if !public.is_empty() {
+        return Err((
+            ReachState::NotReachable,
+            format!(
+                "{address} is private, but it resolves to {}, which is not a private address. \
+                 Point it only at {listener}, or something else answers for it.",
+                ip_list(&public)
+            ),
+            Some(ReachAction::new(
+                ActionKind::SetDnsRecord,
+                format!("Point {address} only at {listener}"),
+            )),
+        ));
+    }
+    if !ips.contains(&listener) {
+        return Err((
+            ReachState::NotReachable,
+            format!(
+                "{address} resolves to {}, not to the private listener it was set up on \
+                 ({listener}).",
+                ip_list(ips)
+            ),
+            Some(ReachAction::new(
+                ActionKind::SetDnsRecord,
+                format!("Point {address} at {listener}"),
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// Judge a private address: the outside check, the worker's listener, then
+/// the worker's own inside check (ADR 064 D7).
+fn private_reachability(facts: &AddressFacts, environment_name: &str) -> AddressReachability {
+    let input = &facts.input;
+    let address = input.address.as_str();
+    let binding = input.private.clone().unwrap_or_default();
+    let verdict = |state: ReachState,
+                   way_in: Option<String>,
+                   reason: String,
+                   action: Option<ReachAction>,
+                   network: Option<String>| AddressReachability {
+        address: input.address.clone(),
+        audience: input.audience,
+        source: input.source,
+        custom_domain_id: input.custom_domain_id,
+        way_in,
+        state,
+        reason,
+        action,
+        network,
+    };
+    let listener = binding
+        .listener
+        .as_deref()
+        .and_then(|l| l.parse::<IpAddr>().ok());
+    let (Some(private), Some(listener)) = (&facts.private, listener) else {
+        return verdict(
+            ReachState::NotReachable,
+            None,
+            format!(
+                "{address} is private, but no worker's private listener serves it yet, so \
+                 nobody can open it. Make it reachable on your private network."
+            ),
+            Some(make_reachable()),
+            None,
+        );
+    };
+    let way_in = Some(format!("private:{}", private.worker));
+    let network = Some(if private.tailscale {
+        "Tailscale".to_string()
+    } else {
+        binding
+            .range
+            .clone()
+            .unwrap_or_else(|| "your private network".to_string())
+    });
+    if let Err((state, reason, action)) =
+        outside_check(address, listener, &facts.resolution, facts.tunnel.as_ref())
+    {
+        return verdict(state, way_in, reason, action, network);
+    }
+    if let Err(why) = &private.bound {
+        return verdict(
+            ReachState::NotReachable,
+            way_in,
+            format!(
+                "{address} points at {}'s private listener ({listener}), but it is not \
+                 serving: {why}",
+                private.worker
+            ),
+            Some(
+                ReachAction::new(
+                    ActionKind::RunCommand,
+                    format!("On {}, as root, run", private.worker),
+                )
+                .with_command(PRIVATE_COMMAND),
+            ),
+            network,
+        );
+    }
+    let shown_network = network.clone().unwrap_or_default();
+    match &private.inside {
+        None => verdict(
+            ReachState::Checking,
+            way_in,
+            format!(
+                "Waiting for {} to check {address} from inside {shown_network}; it does after \
+                 each change and every 5 minutes.",
+                private.worker
+            ),
+            Some(ReachAction::new(ActionKind::Wait, "Wait a moment")),
+            network,
+        ),
+        Some(check) if check.minutes_ago > INSIDE_CHECK_STALE_MINUTES => verdict(
+            ReachState::Unknown,
+            way_in,
+            format!(
+                "{} has not reported on {address} for {} minutes, so Temps cannot tell \
+                 whether it still answers. Check that the worker is online.",
+                private.worker, check.minutes_ago
+            ),
+            Some(
+                ReachAction::new(ActionKind::OpenWorker, format!("Check {}", private.worker))
+                    .with_href(INGRESS_SETUP_PATH),
+            ),
+            network,
+        ),
+        Some(check) if check.outcome == PrivateCheckOutcome::Reachable => verdict(
+            ReachState::Reachable,
+            way_in,
+            format!(
+                "Private at {address} ({shown_network}): {} answers over HTTPS at {listener} \
+                 with a valid certificate, and only {} can connect.",
+                private.worker,
+                binding.range.as_deref().unwrap_or("its private network")
+            ),
+            None,
+            network,
+        ),
+        Some(check) => verdict(
+            ReachState::NotReachable,
+            way_in,
+            format!(
+                "{} checked {address} from inside {shown_network}: {}",
+                private.worker, check.message
+            ),
+            match check.outcome {
+                PrivateCheckOutcome::NoRoute => Some(ReachAction::new(
+                    ActionKind::Deploy,
+                    format!("Redeploy {environment_name}"),
+                )),
+                _ => Some(make_reachable()),
+            },
+            network,
+        ),
+    }
+}
+
 /// The environment's overall state: reachable when any address is.
 pub fn overall_state(addresses: &[AddressReachability]) -> ReachState {
     let any = |state: ReachState| addresses.iter().any(|a| a.state == state);
@@ -324,7 +586,13 @@ pub fn summary(
             .min_by_key(|a| rank(a))
     };
     if let Some(address) = best(ReachState::Reachable) {
-        return format!("Public at {}", address.address);
+        return match (address.audience, &address.network) {
+            (Audience::Private, Some(network)) => {
+                format!("Private at {} ({network})", address.address)
+            }
+            (Audience::Private, None) => format!("Private at {}", address.address),
+            _ => format!("Public at {}", address.address),
+        };
     }
     if let Some(address) = best(ReachState::Checking) {
         return format!("Being set up at {}: {}", address.address, address.reason);
@@ -362,6 +630,7 @@ mod tests {
             audience: Audience::Public,
             source,
             custom_domain_id: None,
+            private: None,
         }
     }
 
@@ -371,6 +640,7 @@ mod tests {
             tunnel: None,
             resolution,
             temps_managed_dns: false,
+            private: None,
         }
     }
 
@@ -397,6 +667,7 @@ mod tests {
                 tunnel: None,
                 resolution: Resolution::Ips(vec![ip("127.0.0.1")]),
                 temps_managed_dns: false,
+                private: None,
             },
             &[control_plane()],
             true,
@@ -446,8 +717,16 @@ mod tests {
         let error = address_reachability(&tunneled("error"), &[], true, "production");
         assert_eq!(error.state, ReachState::NotReachable);
         assert_eq!(error.reason, "error detail");
-        assert!(!needs_lookup("app.example.com", true, tunneled("pending").tunnel.as_ref()));
-        assert!(needs_lookup("app.example.com", true, tunneled("not_published").tunnel.as_ref()));
+        assert!(!needs_lookup(
+            "app.example.com",
+            true,
+            tunneled("pending").tunnel.as_ref()
+        ));
+        assert!(needs_lookup(
+            "app.example.com",
+            true,
+            tunneled("not_published").tunnel.as_ref()
+        ));
     }
 
     #[test]
@@ -457,7 +736,9 @@ mod tests {
                 tunnel: Some(TunnelState {
                     state: "not_published".into(),
                     connector_name: None,
-                    detail: "Tunnel 'homelab' covers it but only publishes hostnames chosen for it.".into(),
+                    detail:
+                        "Tunnel 'homelab' covers it but only publishes hostnames chosen for it."
+                            .into(),
                     has_candidates: true,
                 }),
                 ..facts("app.example.com", Resolution::NoRecord)
@@ -514,7 +795,10 @@ mod tests {
         assert!(private.reason.contains("private address"));
 
         let elsewhere = address_reachability(
-            &facts("app.example.com", Resolution::Ips(vec![ip("93.184.215.14")])),
+            &facts(
+                "app.example.com",
+                Resolution::Ips(vec![ip("93.184.215.14")]),
+            ),
             &[control_plane()],
             true,
             "production",
@@ -524,6 +808,7 @@ mod tests {
         let managed = address_reachability(
             &AddressFacts {
                 temps_managed_dns: true,
+                private: None,
                 ..facts("app.example.com", Resolution::Ips(vec![ip("104.16.1.1")]))
             },
             &[control_plane()],
@@ -555,6 +840,7 @@ mod tests {
             state: ReachState::Reachable,
             reason: String::new(),
             action: None,
+            network: None,
         };
         let both = vec![
             reachable("app-production.example.com", AddressSource::Generated),
@@ -580,5 +866,170 @@ mod tests {
             summary(&[], true, "production", &[]),
             "Deployed, but it has no address yet."
         );
+    }
+
+    fn private_facts(
+        resolution: Resolution,
+        tunnel: Option<TunnelState>,
+        bound: Result<(), String>,
+        inside: Option<InsideCheck>,
+    ) -> AddressFacts {
+        AddressFacts {
+            input: AddressInput {
+                audience: Audience::Private,
+                private: Some(PrivateBinding {
+                    address_id: "custom:4".into(),
+                    range: Some("100.64.0.0/10".into()),
+                    node_id: Some(2),
+                    listener: Some("100.101.102.103".into()),
+                }),
+                ..input("internal.example.com", AddressSource::CustomDomain)
+            },
+            tunnel,
+            resolution,
+            temps_managed_dns: true,
+            private: Some(PrivateFacts {
+                worker: "homelab".into(),
+                bound,
+                tailscale: true,
+                inside,
+            }),
+        }
+    }
+
+    fn inside(outcome: PrivateCheckOutcome, minutes_ago: i64) -> Option<InsideCheck> {
+        Some(InsideCheck {
+            outcome,
+            message: "It resolves to 10.0.0.9; nothing was dialled.".into(),
+            minutes_ago,
+        })
+    }
+
+    #[test]
+    fn the_outside_check_wants_only_private_addresses_and_no_tunnel() {
+        let listener = ip("100.101.102.103");
+        assert_eq!(
+            outside_check(
+                "internal.example.com",
+                listener,
+                &Resolution::Ips(vec![listener]),
+                None
+            ),
+            Ok(())
+        );
+        // A public address next to the private one gives the name away to
+        // whatever answers there.
+        let (state, reason, _) = outside_check(
+            "internal.example.com",
+            listener,
+            &Resolution::Ips(vec![listener, ip("203.0.113.7")]),
+            None,
+        )
+        .expect_err("public address");
+        assert_eq!(state, ReachState::NotReachable);
+        assert!(reason.contains("203.0.113.7"), "{reason}");
+        let (_, reason, _) = outside_check(
+            "internal.example.com",
+            listener,
+            &Resolution::Ips(vec![ip("10.0.0.9")]),
+            None,
+        )
+        .expect_err("elsewhere");
+        assert!(reason.contains("not to the private listener"), "{reason}");
+        let tunnel = TunnelState {
+            state: "published".into(),
+            connector_name: Some("homelab".into()),
+            detail: String::new(),
+            has_candidates: true,
+        };
+        let (_, reason, action) = outside_check(
+            "internal.example.com",
+            listener,
+            &Resolution::Ips(vec![listener]),
+            Some(&tunnel),
+        )
+        .expect_err("tunnel");
+        assert!(reason.contains("tunnel homelab publishes it"), "{reason}");
+        assert_eq!(action.expect("action").kind, ActionKind::OpenIngress);
+        let (_, reason, _) = outside_check(
+            "internal.example.com",
+            listener,
+            &Resolution::NoRecord,
+            None,
+        )
+        .expect_err("no record");
+        assert!(reason.contains("100.101.102.103"), "{reason}");
+    }
+
+    #[test]
+    fn a_private_address_is_judged_by_both_checks() {
+        let ok = Resolution::Ips(vec![ip("100.101.102.103")]);
+        let judged = |facts: AddressFacts| address_reachability(&facts, &[], true, "production");
+
+        let reachable = judged(private_facts(
+            ok.clone(),
+            None,
+            Ok(()),
+            inside(PrivateCheckOutcome::Reachable, 1),
+        ));
+        assert_eq!(reachable.state, ReachState::Reachable);
+        assert_eq!(reachable.way_in.as_deref(), Some("private:homelab"));
+        assert_eq!(reachable.network.as_deref(), Some("Tailscale"));
+        assert_eq!(
+            summary(&[reachable], true, "production", &[]),
+            "Private at internal.example.com (Tailscale)"
+        );
+
+        let waiting = judged(private_facts(ok.clone(), None, Ok(()), None));
+        assert_eq!(waiting.state, ReachState::Checking);
+
+        let stale = judged(private_facts(
+            ok.clone(),
+            None,
+            Ok(()),
+            inside(PrivateCheckOutcome::Reachable, 90),
+        ));
+        assert_eq!(stale.state, ReachState::Unknown);
+
+        let failed = judged(private_facts(
+            ok.clone(),
+            None,
+            Ok(()),
+            inside(PrivateCheckOutcome::ResolvesElsewhere, 1),
+        ));
+        assert_eq!(failed.state, ReachState::NotReachable);
+        assert!(
+            failed.reason.contains("nothing was dialled"),
+            "{}",
+            failed.reason
+        );
+
+        let unbound = judged(private_facts(
+            ok.clone(),
+            None,
+            Err("tailscale0 has no address".into()),
+            inside(PrivateCheckOutcome::Reachable, 1),
+        ));
+        assert_eq!(unbound.state, ReachState::NotReachable);
+        assert_eq!(
+            unbound.action.and_then(|a| a.command).as_deref(),
+            Some(PRIVATE_COMMAND)
+        );
+
+        // A good inside check never outweighs a failed outside one.
+        let public = judged(private_facts(
+            Resolution::Ips(vec![ip("203.0.113.7")]),
+            None,
+            Ok(()),
+            inside(PrivateCheckOutcome::Reachable, 1),
+        ));
+        assert_eq!(public.state, ReachState::NotReachable);
+
+        // No worker recorded: never "reachable" through the public paths.
+        let mut nothing = private_facts(ok, None, Ok(()), None);
+        nothing.private = None;
+        let nothing = address_reachability(&nothing, &[control_plane()], true, "production");
+        assert_eq!(nothing.state, ReachState::NotReachable);
+        assert_eq!(nothing.way_in, None);
     }
 }

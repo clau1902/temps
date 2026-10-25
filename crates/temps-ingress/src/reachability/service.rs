@@ -27,15 +27,15 @@ use temps_core::ways_in::{
     WayInKind, WaysInError,
 };
 use temps_core::worker_ingress::{
-    address_scope, effective_public_address, parse_reported_ip, AddressScope, ReportedInterface,
+    address_scope, effective_public_address, parse_reported_ip, private_address_id, AddressScope,
+    ReportedInterface,
 };
 use temps_dns::services::provider_service::{
     AddManagedDomainRequest, CreateProviderRequest, UpdateManagedDomainRequest,
 };
 use temps_dns::{
-    CloudflareCredentials, DnsProviderService, DnsProviderType, DnsRecordContent,
-    DnsRecordRequest, DnsRecordType, ManagedDnsRecordService, OwnershipScope,
-    ProviderCredentials,
+    CloudflareCredentials, DnsProviderService, DnsProviderType, DnsRecordContent, DnsRecordRequest,
+    DnsRecordType, ManagedDnsRecordService, OwnershipScope, ProviderCredentials,
 };
 use temps_domains::DomainService;
 use temps_entities::{
@@ -49,19 +49,20 @@ use tracing::{info, warn};
 
 use super::compute::{
     address_reachability, is_local_only, needs_lookup, overall_state, summary, AddressFacts,
-    AddressInput, DirectIngress, Resolution, TunnelState,
+    AddressInput, DirectIngress, InsideCheck, PrivateBinding, PrivateFacts, Resolution,
+    TunnelState, PRIVATE_COMMAND,
 };
 use super::model::{
     AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience, DecideRequest,
     DnsRecordState, EnvironmentReachability, Intent, JournalEntry, PlanOptionKind, PlanRequest,
-    PlannedRecord, PreviousChoice, ReachabilityPlan, ResumeRequest, RunResource, RunState,
-    RunStep, RunStepStatus, RunView, StepKind,
+    PlannedRecord, PreviousChoice, ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep,
+    RunStepStatus, RunView, StepKind,
 };
 use super::plan::{
-    fingerprint, guess_zone, http01_direct, plan, planned_address, planned_record,
-    record_type_of, records_to_read, tunnel_domain_for,
-    tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts, ZoneFact, FIELD_ADDRESS,
-    FIELD_DNS_PROVIDER, FIELD_TOKEN,
+    fingerprint, guess_zone, http01_direct, plan, planned_address, planned_record, private_worker,
+    record_type_of, records_to_read, tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for,
+    NamedId, PlanFacts, PrivateWorkerFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER,
+    FIELD_TOKEN,
 };
 use super::run::{
     created, decide, execute, reconcile_journal, resume, undo, NewTunnel, RunInput, RunOps,
@@ -229,7 +230,10 @@ impl ReachabilityService {
             .await
         {
             Ok(done) if done.rows_affected > 0 => {
-                info!(purged = done.rows_affected, "purged expired reachability plans")
+                info!(
+                    purged = done.rows_affected,
+                    "purged expired reachability plans"
+                )
             }
             Ok(_) => {}
             Err(error) => warn!(%error, "could not purge expired reachability plans"),
@@ -297,7 +301,11 @@ impl ReachabilityService {
             }
             active.state = Set(RunState::Recovering.as_str().to_string());
             active.error = Set(Some(message));
-            warn!(run_id = id, pending = outcome.pending, "could not recover a reachability run yet");
+            warn!(
+                run_id = id,
+                pending = outcome.pending,
+                "could not recover a reachability run yet"
+            );
         } else if outcome.conflicts > 0 {
             active.state = Set(RunState::Conflict.as_str().to_string());
             active.error = Set(Some(
@@ -306,7 +314,10 @@ impl ReachabilityService {
                     .to_string(),
             ));
             active.finished_at = Set(Some(Utc::now()));
-            info!(run_id = id, "a recovered reachability run has a conflict to decide");
+            info!(
+                run_id = id,
+                "a recovered reachability run has a conflict to decide"
+            );
         } else {
             active.state = Set(RunState::Interrupted.as_str().to_string());
             active.error = Set(Some(format!(
@@ -319,7 +330,11 @@ impl ReachabilityService {
                 }
             )));
             active.finished_at = Set(Some(Utc::now()));
-            info!(run_id = id, resolved = outcome.resolved, "recovered an interrupted reachability run");
+            info!(
+                run_id = id,
+                resolved = outcome.resolved,
+                "recovered an interrupted reachability run"
+            );
         }
         if let Err(error) = active.update(db).await {
             warn!(run_id = id, %error, "could not save a recovered reachability run");
@@ -328,12 +343,18 @@ impl ReachabilityService {
 
     // ----- scope and facts ----------------------------------------------
 
-    async fn scope(&self, project_id: i32, environment_id: i32) -> Result<Scope, ReachabilityError> {
+    async fn scope(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<Scope, ReachabilityError> {
         let project = projects::Entity::find_by_id(project_id)
             .filter(projects::Column::IsDeleted.eq(false))
             .one(self.deps.db.as_ref())
             .await?
-            .ok_or_else(|| ReachabilityError::NotFound(format!("Project {project_id} not found")))?;
+            .ok_or_else(|| {
+                ReachabilityError::NotFound(format!("Project {project_id} not found"))
+            })?;
         let environment = environments::Entity::find_by_id(environment_id)
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::DeletedAt.is_null())
@@ -375,13 +396,18 @@ impl ReachabilityService {
                 PublicHostnameStrategy::Standard.environment_hostname(preview_domain, domain)
             }
         };
-        let mut push = |address: String, audience: Audience, source, id: Option<i32>| {
+        let mut push = |address: String,
+                        audience: Audience,
+                        source,
+                        id: Option<i32>,
+                        private: Option<PrivateBinding>| {
             if !address.is_empty() && !address.starts_with("*.") && seen.insert(address.clone()) {
                 addresses.push(AddressInput {
                     address,
                     audience,
                     source,
                     custom_domain_id: id,
+                    private,
                 });
             }
         };
@@ -394,11 +420,18 @@ impl ReachabilityService {
             if custom.redirect_to.is_some() || custom.service_name.is_some() {
                 continue;
             }
+            let audience = Audience::parse(&custom.audience);
             push(
                 custom.domain.trim_end_matches('.').to_ascii_lowercase(),
-                Audience::parse(&custom.audience),
+                audience,
                 AddressSource::CustomDomain,
                 Some(custom.id),
+                (audience == Audience::Private).then(|| PrivateBinding {
+                    address_id: private_address_id(true, custom.id),
+                    range: custom.private_range.clone(),
+                    node_id: custom.private_node_id,
+                    listener: custom.private_listener.clone(),
+                }),
             );
         }
         let env_domains = environment_domains::Entity::find()
@@ -407,11 +440,18 @@ impl ReachabilityService {
             .all(self.deps.db.as_ref())
             .await?;
         for domain in env_domains {
+            let audience = Audience::parse(&domain.audience);
             push(
                 expand(&domain.domain),
-                Audience::parse(&domain.audience),
+                audience,
                 AddressSource::EnvironmentDomain,
                 None,
+                (audience == Audience::Private).then(|| PrivateBinding {
+                    address_id: private_address_id(false, domain.id),
+                    range: domain.private_range.clone(),
+                    node_id: domain.private_node_id,
+                    listener: domain.private_listener.clone(),
+                }),
             );
         }
         if !preview_domain.trim().is_empty() && !environment.subdomain.is_empty() {
@@ -420,6 +460,7 @@ impl ReachabilityService {
                 expand(&environment.subdomain),
                 Audience::Public,
                 AddressSource::Generated,
+                None,
                 None,
             );
         }
@@ -442,7 +483,10 @@ impl ReachabilityService {
             let mut place = BTreeSet::new();
             for container in &containers {
                 place.insert(match container.node_id {
-                    Some(id) => names.get(&id).cloned().unwrap_or_else(|| format!("node {id}")),
+                    Some(id) => names
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("node {id}")),
                     None => "the control plane".to_string(),
                 });
             }
@@ -598,6 +642,53 @@ impl ReachabilityService {
         }
     }
 
+    /// What the control plane knows of the workers serving `addresses`'
+    /// private ones (ADR 064 D7): their listeners and inside checks.
+    async fn private_facts(&self, addresses: &[AddressInput]) -> HashMap<String, PrivateFacts> {
+        let node_ids: BTreeSet<i32> = addresses
+            .iter()
+            .filter_map(|a| a.private.as_ref()?.node_id)
+            .collect();
+        if node_ids.is_empty() {
+            return HashMap::new();
+        }
+        let db = self.deps.db.as_ref();
+        let nodes: HashMap<i32, nodes::Model> = nodes::Entity::find()
+            .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
+            .all(db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| (n.id, n))
+            .collect();
+        let rows: HashMap<i32, node_public_ingress::Model> = node_public_ingress::Entity::find()
+            .filter(node_public_ingress::Column::NodeId.is_in(node_ids.iter().copied()))
+            .all(db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.node_id, row))
+            .collect();
+        let now = Utc::now();
+        addresses
+            .iter()
+            .filter_map(|input| {
+                let binding = input.private.as_ref()?;
+                let node_id = binding.node_id?;
+                Some((
+                    input.address.clone(),
+                    private_facts_of(
+                        binding,
+                        node_id,
+                        nodes.get(&node_id),
+                        rows.get(&node_id),
+                        now,
+                    ),
+                ))
+            })
+            .collect()
+    }
+
     async fn judge(
         &self,
         addresses: &[AddressInput],
@@ -608,6 +699,7 @@ impl ReachabilityService {
         let hosts: Vec<String> = addresses.iter().map(|a| a.address.clone()).collect();
         let tunnels = self.tunnel_states(&hosts).await;
         let managed = self.temps_managed(&hosts).await;
+        let privates = self.private_facts(addresses).await;
         let mut verdicts = Vec::with_capacity(addresses.len());
         for input in addresses {
             let tunnel = tunnels.get(&input.address).cloned();
@@ -626,6 +718,7 @@ impl ReachabilityService {
                     tunnel,
                     resolution,
                     temps_managed_dns: managed.contains(&input.address),
+                    private: privates.get(&input.address).cloned(),
                 },
                 directs,
                 deployed,
@@ -644,7 +737,9 @@ impl ReachabilityService {
     ) -> Result<EnvironmentReachability, ReachabilityError> {
         let scope = self.scope(project_id, environment_id).await?;
         let settings = self.settings().await?;
-        let gathered = self.gather(&scope.environment, &settings.preview_domain).await?;
+        let gathered = self
+            .gather(&scope.environment, &settings.preview_domain)
+            .await?;
         let directs = self.directs(&settings).await;
         let addresses = self
             .judge(
@@ -692,8 +787,16 @@ impl ReachabilityService {
         requested: Option<String>,
     ) -> Result<PlanFacts, ReachabilityError> {
         let db = self.deps.db.as_ref();
-        let mut hosts: Vec<String> = gathered.addresses.iter().map(|a| a.address.clone()).collect();
-        if let Some(requested) = requested.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        let mut hosts: Vec<String> = gathered
+            .addresses
+            .iter()
+            .map(|a| a.address.clone())
+            .collect();
+        if let Some(requested) = requested
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        {
             hosts.push(requested.to_string());
         }
         let tunnel_facts = self.deps.connectors.tunnel_facts(&hosts).await?;
@@ -735,12 +838,32 @@ impl ReachabilityService {
             .order_by_asc(nodes::Column::Id)
             .all(db)
             .await?;
-        let modes: HashMap<i32, Option<String>> = node_public_ingress::Entity::find()
+        let ingress_rows = node_public_ingress::Entity::find()
             .filter(node_public_ingress::Column::NodeId.is_in(workers.iter().map(|w| w.id)))
             .all(db)
-            .await?
-            .into_iter()
-            .map(|row| (row.node_id, row.mode))
+            .await?;
+        let modes: HashMap<i32, Option<String>> = ingress_rows
+            .iter()
+            .map(|row| (row.node_id, row.mode.clone()))
+            .collect();
+        // ADR 064 D5: workers whose owner put them in private mode.
+        let private_workers: Vec<PrivateWorkerFact> = workers
+            .iter()
+            .filter_map(|worker| {
+                let row = ingress_rows.iter().find(|r| r.node_id == worker.id)?;
+                (row.mode.as_deref() == Some("private")).then(|| private_worker_fact(worker, row))
+            })
+            .collect();
+        let suggested_private_worker = gathered
+            .running_on
+            .iter()
+            .find(|name| workers.iter().any(|w| &w.name == *name))
+            .cloned()
+            .or_else(|| workers.first().map(|w| w.name.clone()));
+        let private_ranges = gathered
+            .addresses
+            .iter()
+            .filter_map(|a| Some((a.address.clone(), a.private.as_ref()?.range.clone())))
             .collect();
         let mut tunnel_workers = Vec::new();
         let mut workers_refusing = Vec::new();
@@ -759,8 +882,11 @@ impl ReachabilityService {
                 Some(_) => workers_refusing.push(worker.name),
             }
         }
-        let attached_here: Vec<String> =
-            gathered.addresses.iter().map(|a| a.address.clone()).collect();
+        let attached_here: Vec<String> = gathered
+            .addresses
+            .iter()
+            .map(|a| a.address.clone())
+            .collect();
         let taken_elsewhere = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::EnvironmentId.ne(scope.environment.id))
             .all(db)
@@ -797,6 +923,9 @@ impl ReachabilityService {
             tunnel_workers,
             workers_refusing,
             dns_records: Vec::new(),
+            private_workers,
+            suggested_private_worker,
+            private_ranges,
         };
         let mut dns_records = Vec::new();
         // The suggested address is known only now; D9 decides it too.
@@ -837,7 +966,9 @@ impl ReachabilityService {
         requested: Option<String>,
     ) -> Result<(PlanFacts, temps_core::AppSettings), ReachabilityError> {
         let settings = self.settings().await?;
-        let gathered = self.gather(&scope.environment, &settings.preview_domain).await?;
+        let gathered = self
+            .gather(&scope.environment, &settings.preview_domain)
+            .await?;
         let directs = self.directs(&settings).await;
         let facts = self
             .plan_facts(scope, &gathered, directs, audience, requested)
@@ -958,7 +1089,12 @@ impl ReachabilityService {
         };
         let Some(stored) = stored else {
             return Err(self
-                .stale(&scope, &facts, user_id, "That plan does not exist for this environment.")
+                .stale(
+                    &scope,
+                    &facts,
+                    user_id,
+                    "That plan does not exist for this environment.",
+                )
                 .await);
         };
         if stored.used_at.is_some() {
@@ -968,16 +1104,28 @@ impl ReachabilityService {
         }
         if stored.expires_at < Utc::now() {
             return Err(self
-                .stale(&scope, &facts, user_id, "That plan is more than 15 minutes old.")
+                .stale(
+                    &scope,
+                    &facts,
+                    user_id,
+                    "That plan is more than 15 minutes old.",
+                )
                 .await);
         }
-        if stored.address.as_deref().is_some_and(|planned| planned != address) {
+        if stored
+            .address
+            .as_deref()
+            .is_some_and(|planned| planned != address)
+        {
             return Err(self
                 .stale(
                     &scope,
                     &facts,
                     user_id,
-                    &format!("The plan was for {}, not {address}.", stored.address.clone().unwrap_or_default()),
+                    &format!(
+                        "The plan was for {}, not {address}.",
+                        stored.address.clone().unwrap_or_default()
+                    ),
                 )
                 .await);
         }
@@ -993,9 +1141,10 @@ impl ReachabilityService {
                 )
                 .await);
         }
-        let planned: ReachabilityPlan = serde_json::from_value(stored.plan.clone()).map_err(|_| {
-            ReachabilityError::Validation("That plan could not be read. Plan again.".into())
-        })?;
+        let planned: ReachabilityPlan =
+            serde_json::from_value(stored.plan.clone()).map_err(|_| {
+                ReachabilityError::Validation("That plan could not be read. Plan again.".into())
+            })?;
         let Some(option) = planned.options.iter().find(|o| o.kind == request.option) else {
             return Err(ReachabilityError::Validation(match &planned.blocked {
                 Some(blocked) => blocked.reason.clone(),
@@ -1014,7 +1163,11 @@ impl ReachabilityService {
             if option.way_in.starts_with("tunnel") {
                 return Err(ReachabilityError::Validation(format!(
                     "{} The rule is {}.",
-                    private_allow_list_message(&option.way_in.replace("tunnel:", "tunnel "), &rule.cidr, &address),
+                    private_allow_list_message(
+                        &option.way_in.replace("tunnel:", "tunnel "),
+                        &rule.cidr,
+                        &address
+                    ),
                     rule.rule
                 )));
             }
@@ -1115,18 +1268,48 @@ impl ReachabilityService {
                 });
             }
             PlanOptionKind::PrivateWorker => {
-                return Err(ReachabilityError::Validation(
-                    "Private addresses are not available in this version.".into(),
-                ))
+                let (worker, ip) = private_worker(&facts).ok_or_else(|| {
+                    ReachabilityError::Conflict(
+                        "No worker's private listener is running any more.".into(),
+                    )
+                })?;
+                let range = temps_core::worker_ingress::private_block(ip).ok_or_else(|| {
+                    ReachabilityError::Conflict(format!(
+                        "{}'s listener {ip} is not a private address.",
+                        worker.name
+                    ))
+                })?;
+                input.direct = Some((worker.name.clone(), ip));
+                input.dns_before = planned_record(&facts, &address, record_type_of(ip));
+                // No CA can reach a private listener: DNS-01 only.
+                input.certificate_challenge = Some("dns-01".to_string());
+                input.audience = Some((
+                    AddressAudience {
+                        audience: Audience::Private,
+                        network_range: Some(range.to_string()),
+                        private_node_id: Some(worker.id),
+                        private_listener: Some(ip.to_string()),
+                    },
+                    self.current_audience(&address).await?,
+                ));
             }
             PlanOptionKind::DirectManagedDns | PlanOptionKind::DirectManualDns => {
                 let direct = http01_direct(&facts).ok_or_else(|| {
                     ReachabilityError::Conflict("No direct ingress takes port 80 any more.".into())
                 })?;
                 input.direct = Some((direct.name.clone(), direct.ips[0]));
-                input.dns_before =
-                    planned_record(&facts, &address, record_type_of(direct.ips[0]));
+                input.dns_before = planned_record(&facts, &address, record_type_of(direct.ips[0]));
             }
+        }
+
+        // B5: an option that turns a private address public says so in a
+        // SetAudience step, and puts the private one back on undo.
+        if input.audience.is_none() && option.steps.iter().any(|s| s.kind == StepKind::SetAudience)
+        {
+            input.audience = Some((
+                AddressAudience::public(),
+                self.current_audience(&address).await?,
+            ));
         }
 
         self.claim(environment_id, &scope.environment.name).await?;
@@ -1208,6 +1391,56 @@ impl ReachabilityService {
         Ok(view)
     }
 
+    /// Who `host` is for now, as stored: public when it is not attached.
+    async fn current_audience(&self, host: &str) -> Result<AddressAudience, ReachabilityError> {
+        Ok(project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.eq(host))
+            .one(self.deps.db.as_ref())
+            .await?
+            .map(|row| address_audience_of(&row))
+            .unwrap_or_default())
+    }
+
+    /// The audience change a stored plan's option makes, for the step-up
+    /// check (ADR 064 Security): the address, who it is for now, and who
+    /// it is for after. `None` when the option changes no audience.
+    pub async fn audience_change(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        plan_id: &str,
+        option: PlanOptionKind,
+        answered_address: Option<&str>,
+    ) -> Result<Option<(String, AddressAudience, Audience)>, ReachabilityError> {
+        let Some(stored) = reachability_plans::Entity::find_by_id(plan_id.to_string())
+            .filter(reachability_plans::Column::ProjectId.eq(project_id))
+            .filter(reachability_plans::Column::EnvironmentId.eq(environment_id))
+            .one(self.deps.db.as_ref())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Ok(planned) = serde_json::from_value::<ReachabilityPlan>(stored.plan.clone()) else {
+            return Ok(None);
+        };
+        let changes = planned
+            .options
+            .iter()
+            .find(|o| o.kind == option)
+            .is_some_and(|o| o.steps.iter().any(|s| s.kind == StepKind::SetAudience));
+        let address = answered_address
+            .map(|a| a.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|a| !a.is_empty())
+            .or(stored.address.clone());
+        match (changes, address) {
+            (true, Some(address)) => {
+                let before = self.current_audience(&address).await?;
+                Ok(Some((address, before, Audience::parse(&stored.audience))))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// A provider name nothing uses yet, so the run can find its own again.
     async fn unused_provider_name(&self, zone: &str) -> Result<String, ReachabilityError> {
         let taken: HashSet<String> = self
@@ -1266,7 +1499,11 @@ impl ReachabilityService {
                 None => execute(&input, &ops, &sink, timing).await,
                 Some(record) => resume(&input, record, &ops, &sink, timing).await,
             };
-            info!(run_id = sink.run_id, state = record.state.as_str(), "reachability run finished");
+            info!(
+                run_id = sink.run_id,
+                state = record.state.as_str(),
+                "reachability run finished"
+            );
             if let Ok(mut active) = active.lock() {
                 active.remove(&environment_id);
             }
@@ -1367,7 +1604,10 @@ impl ReachabilityService {
                 return Err(error.into());
             }
         };
-        info!(run_id, project_id, environment_id, "resuming a reachability run");
+        info!(
+            run_id,
+            project_id, environment_id, "resuming a reachability run"
+        );
         let view = run_view(&row);
         self.spawn(input, Some(record));
         Ok(view)
@@ -1399,7 +1639,9 @@ impl ReachabilityService {
         environment_id: i32,
         run_id: i32,
     ) -> Result<RunView, ReachabilityError> {
-        Ok(run_view(&self.find_run(project_id, environment_id, run_id).await?))
+        Ok(run_view(
+            &self.find_run(project_id, environment_id, run_id).await?,
+        ))
     }
 
     /// The newest runs of an environment.
@@ -1494,7 +1736,10 @@ impl ReachabilityService {
             active.error = Set(Some(if failed.is_empty() {
                 format!("Undo stopped: {why}")
             } else {
-                format!("Undo stopped: {why} Also not removed: {}.", failed.join("; "))
+                format!(
+                    "Undo stopped: {why} Also not removed: {}.",
+                    failed.join("; ")
+                )
             }));
         } else if failed.is_empty() {
             active.state = Set(RunState::Undone.as_str().to_string());
@@ -1627,7 +1872,9 @@ pub async fn private_rule(
         .filter(project_ip_access_rules::Column::ProjectId.eq(project_id))
         .all(db)
         .await?;
-    let own = rows.iter().find(|r| r.environment_id == Some(environment_id));
+    let own = rows
+        .iter()
+        .find(|r| r.environment_id == Some(environment_id));
     let (row, whose) = match own {
         Some(row) => (Some(row), "this environment's"),
         None => (
@@ -1779,13 +2026,14 @@ impl RunOps for LiveOps {
             Intent::ManagedDomain {
                 provider_id,
                 domain,
-            } => self
-                .managed_zone(*provider_id, domain)
-                .await?
-                .map(|_| RunResource::ManagedDomain {
-                    provider_id: *provider_id,
-                    domain: domain.clone(),
-                }),
+            } => {
+                self.managed_zone(*provider_id, domain)
+                    .await?
+                    .map(|_| RunResource::ManagedDomain {
+                        provider_id: *provider_id,
+                        domain: domain.clone(),
+                    })
+            }
             Intent::AutoManageEnabled {
                 provider_id,
                 domain,
@@ -1799,9 +2047,7 @@ impl RunOps for LiveOps {
                 }),
             Intent::Connector { name } => ingress_connectors::Entity::find()
                 .filter(ingress_connectors::Column::Name.eq(name.clone()))
-                .filter(
-                    ingress_connectors::Column::Status.ne(crate::service::STATUS_DELETING),
-                )
+                .filter(ingress_connectors::Column::Status.ne(crate::service::STATUS_DELETING))
                 .one(db)
                 .await
                 .map_err(text)?
@@ -1838,7 +2084,9 @@ impl RunOps for LiveOps {
             Intent::DnsRecord { .. } | Intent::DnsChange { .. } => {
                 return Err("DNS records are looked up at their provider.".to_string())
             }
-            Intent::AddressAudience { hostname, after, .. } => self
+            Intent::AddressAudience {
+                hostname, after, ..
+            } => self
                 .address_audience(hostname)
                 .await?
                 .filter(|current| current == after)
@@ -2073,7 +2321,11 @@ impl RunOps for LiveOps {
     }
 
     async fn hostname_choice(&self, host: &str) -> Result<Option<Option<i32>>, String> {
-        self.deps.connectors.hostname_choice(host).await.map_err(text)
+        self.deps
+            .connectors
+            .hostname_choice(host)
+            .await
+            .map_err(text)
     }
 
     async fn route_hostname(&self, host: &str, connector_id: i32) -> Result<(), String> {
@@ -2276,11 +2528,30 @@ impl RunOps for LiveOps {
             Ok(settings) => service.directs(&settings).await,
             Err(_) => Vec::new(),
         };
+        let row = project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.eq(host))
+            .one(self.deps.db.as_ref())
+            .await
+            .ok()
+            .flatten();
+        let audience = row
+            .as_ref()
+            .map(|r| Audience::parse(&r.audience))
+            .unwrap_or_default();
         let input = AddressInput {
             address: host.to_string(),
-            audience: Audience::Public,
+            audience,
             source: AddressSource::CustomDomain,
-            custom_domain_id: None,
+            custom_domain_id: row.as_ref().map(|r| r.id),
+            private: row
+                .as_ref()
+                .filter(|_| audience == Audience::Private)
+                .map(|r| PrivateBinding {
+                    address_id: private_address_id(true, r.id),
+                    range: r.private_range.clone(),
+                    node_id: r.private_node_id,
+                    listener: r.private_listener.clone(),
+                }),
         };
         service
             .judge(&[input], &directs, true, "the environment")
@@ -2289,13 +2560,14 @@ impl RunOps for LiveOps {
             .next()
             .unwrap_or_else(|| AddressReachability {
                 address: host.to_string(),
-                audience: Audience::Public,
+                audience,
                 source: AddressSource::CustomDomain,
                 custom_domain_id: None,
                 way_in: None,
                 state: super::model::ReachState::Unknown,
                 reason: "Not checked.".into(),
                 action: None,
+                network: None,
             })
     }
 
@@ -2339,19 +2611,150 @@ fn dns_record_type(record_type: &str) -> DnsRecordType {
 
 /// Who a custom domain is for, as stored.
 pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudience {
+    let audience = Audience::parse(&row.audience);
+    let private = audience == Audience::Private;
     AddressAudience {
-        audience: Audience::parse(&row.audience),
-        network_range: None,
-        private_node_id: None,
-        private_listener: None,
+        audience,
+        network_range: row.private_range.clone().filter(|_| private),
+        private_node_id: row.private_node_id.filter(|_| private),
+        private_listener: row.private_listener.clone().filter(|_| private),
     }
 }
 
+/// Write `audience` with what bounds it; a public one clears the private
+/// fields, so nothing stale routes it later.
 fn set_address_audience_on(
     active: &mut project_custom_domains::ActiveModel,
     audience: &AddressAudience,
 ) {
+    let private = audience.audience == Audience::Private;
     active.audience = Set(audience.audience.as_str().to_string());
+    active.private_range = Set(audience.network_range.clone().filter(|_| private));
+    active.private_node_id = Set(audience.private_node_id.filter(|_| private));
+    active.private_listener = Set(audience.private_listener.clone().filter(|_| private));
+}
+
+/// A worker in private mode as its last report describes it.
+pub fn private_worker_fact(
+    worker: &nodes::Model,
+    row: &node_public_ingress::Model,
+) -> PrivateWorkerFact {
+    let listener = temps_routes::route_sync::private_listener_of(Some(row));
+    let interfaces: Vec<ReportedInterface> = row
+        .interfaces
+        .clone()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let error = row
+        .listening
+        .as_ref()
+        .and_then(|l| l.get("error"))
+        .and_then(Value::as_str)
+        .filter(|e| !e.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            listener.is_none().then(|| {
+                "it reports no private listener; run `temps agent ingress status` on it."
+                    .to_string()
+            })
+        });
+    PrivateWorkerFact {
+        id: worker.id,
+        name: worker.name.clone(),
+        listener,
+        tailscale: listener.is_some_and(|ip| {
+            interfaces
+                .iter()
+                .any(|i| i.tailscale && parse_reported_ip(&i.address) == Some(ip))
+        }),
+        error,
+    }
+}
+
+/// What the control plane knows of `node_id` serving `binding` privately:
+/// whether its private listener is on the recorded address, whether that
+/// is its Tailscale address, and its last inside check of the address.
+pub fn private_facts_of(
+    binding: &PrivateBinding,
+    node_id: i32,
+    node: Option<&nodes::Model>,
+    row: Option<&node_public_ingress::Model>,
+    now: chrono::DateTime<Utc>,
+) -> PrivateFacts {
+    let worker = node
+        .map(|n| n.name.clone())
+        .unwrap_or_else(|| format!("node {node_id}"));
+    let recorded = binding
+        .listener
+        .as_deref()
+        .and_then(|l| l.parse::<IpAddr>().ok());
+    let listening_error = row
+        .and_then(|r| r.listening.as_ref())
+        .and_then(|l| l.get("error"))
+        .and_then(Value::as_str)
+        .filter(|e| !e.trim().is_empty())
+        .map(str::to_string);
+    let bound = match (node, row) {
+        (None, _) => Err(format!("{worker} is no longer part of this cluster.")),
+        (Some(n), _) if n.status != "active" => Err(format!(
+            "{worker} is {}. Bring it back, or make the address reachable on another worker.",
+            n.status
+        )),
+        (_, None) => Err(format!("{worker} has not reported its ingress yet.")),
+        (_, Some(r)) if r.mode.as_deref() != Some("private") => Err(format!(
+            "{worker} is not in private mode (it is `{}`). On it, as root, run              `{PRIVATE_COMMAND}`.",
+            r.mode.as_deref().unwrap_or("off")
+        )),
+        _ if listening_error.is_some() => Err(listening_error.clone().unwrap_or_default()),
+        (_, Some(r)) => match (temps_routes::route_sync::private_listener_of(Some(r)), recorded) {
+            (Some(now_on), Some(recorded)) if now_on == recorded => Ok(()),
+            (Some(now_on), Some(recorded)) => Err(format!(
+                "its private listener is on {now_on} now, not {recorded}. Make the address                  reachable again to point it there."
+            )),
+            (None, _) => Err(format!("{worker}'s private listener is not running.")),
+            (Some(_), None) => Err("the address records no listener.".to_string()),
+        },
+    };
+    let tailscale = row
+        .and_then(|r| r.interfaces.clone())
+        .and_then(|v| serde_json::from_value::<Vec<ReportedInterface>>(v).ok())
+        .unwrap_or_default()
+        .iter()
+        .any(|i| {
+            i.tailscale && parse_reported_ip(&i.address).is_some_and(|ip| Some(ip) == recorded)
+        });
+    let inside = row
+        .and_then(|r| r.private_checks.as_ref())
+        .and_then(Value::as_array)
+        .and_then(|checks| {
+            checks.iter().find(|c| {
+                c.get("address_id").and_then(Value::as_str) == Some(binding.address_id.as_str())
+                    && c.get("listener")
+                        .and_then(Value::as_str)
+                        .and_then(|l| l.parse().ok())
+                        == recorded
+            })
+        })
+        .and_then(|c| {
+            let outcome = serde_json::from_value(c.get("outcome")?.clone()).ok()?;
+            let received: chrono::DateTime<Utc> =
+                serde_json::from_value(c.get("received_at")?.clone()).ok()?;
+            Some(InsideCheck {
+                outcome,
+                message: c
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                minutes_ago: (now - received).num_minutes().max(0),
+            })
+        });
+    PrivateFacts {
+        worker,
+        bound,
+        tailscale,
+        inside,
+    }
 }
 
 /// ADR 064 D9: how visitors reach each address of a project's environments.

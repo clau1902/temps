@@ -124,14 +124,20 @@ pub struct AddressReachability {
     pub source: AddressSource,
     /// The custom domain row, for a custom domain.
     pub custom_domain_id: Option<i32>,
-    /// How traffic gets in: `tunnel:<name>`, `direct:<node>`, or
-    /// `direct:control-plane`. `None` while nothing does.
+    /// How traffic gets in: `tunnel:<name>`, `direct:<node>`,
+    /// `direct:control-plane`, or `private:<node>` for a worker's private
+    /// listener. `None` while nothing does.
     #[schema(example = "tunnel:homelab")]
     pub way_in: Option<String>,
     pub state: ReachState,
     #[schema(example = "No DNS record for myapp.example.com exists yet.")]
     pub reason: String,
     pub action: Option<ReachAction>,
+    /// For a private address: the network it is reachable from, `Tailscale`
+    /// or the range (ADR 064 D7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Tailscale")]
+    pub network: Option<String>,
 }
 
 /// Everything about one environment's addresses.
@@ -379,7 +385,10 @@ impl RunState {
 
     /// Whether the run is still doing something.
     pub fn is_active(self) -> bool {
-        matches!(self, RunState::Running | RunState::Undoing | RunState::Recovering)
+        matches!(
+            self,
+            RunState::Running | RunState::Undoing | RunState::Recovering
+        )
     }
 }
 
@@ -411,7 +420,9 @@ pub enum PreviousChoice {
     Automatic,
     /// Kept off tunnels.
     Off,
-    Tunnel { connector_id: i32 },
+    Tunnel {
+        connector_id: i32,
+    },
 }
 
 impl PreviousChoice {
@@ -469,7 +480,9 @@ pub enum PlannedRecord {
     /// No record of that type.
     #[default]
     Absent,
-    Present { record: DnsRecordState },
+    Present {
+        record: DnsRecordState,
+    },
     /// The provider could not be read when planning.
     Unknown,
 }
@@ -478,12 +491,27 @@ pub enum PlannedRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunResource {
-    DnsProvider { id: i32, name: String },
-    ManagedDomain { provider_id: i32, domain: String },
+    DnsProvider {
+        id: i32,
+        name: String,
+    },
+    ManagedDomain {
+        provider_id: i32,
+        domain: String,
+    },
     /// An existing managed domain whose automatic DNS the run turned on.
-    AutoManageEnabled { provider_id: i32, domain: String },
-    Connector { id: i32, name: String },
-    CustomDomain { id: i32, domain: String },
+    AutoManageEnabled {
+        provider_id: i32,
+        domain: String,
+    },
+    Connector {
+        id: i32,
+        name: String,
+    },
+    CustomDomain {
+        id: i32,
+        domain: String,
+    },
     HostnameChoice {
         hostname: String,
         connector_id: i32,
@@ -515,7 +543,9 @@ pub enum RunResource {
         before: AddressAudience,
         after: AddressAudience,
     },
-    Certificate { domain: String },
+    Certificate {
+        domain: String,
+    },
 }
 
 /// Who one address is for, with what bounds a private one (ADR 064 D5).
@@ -588,12 +618,25 @@ impl RunResource {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
     /// Found by its name, which the run picks before creating it.
-    DnsProvider { name: String },
-    ManagedDomain { provider_id: i32, domain: String },
-    AutoManageEnabled { provider_id: i32, domain: String },
+    DnsProvider {
+        name: String,
+    },
+    ManagedDomain {
+        provider_id: i32,
+        domain: String,
+    },
+    AutoManageEnabled {
+        provider_id: i32,
+        domain: String,
+    },
     /// Found by its name; Cloudflare's tunnel is `temps-<name>-<install>`.
-    Connector { name: String },
-    CustomDomain { domain: String, environment_id: i32 },
+    Connector {
+        name: String,
+    },
+    CustomDomain {
+        domain: String,
+        environment_id: i32,
+    },
     HostnameChoice {
         hostname: String,
         connector_id: i32,
@@ -621,7 +664,9 @@ pub enum Intent {
         before: AddressAudience,
         after: AddressAudience,
     },
-    Certificate { domain: String },
+    Certificate {
+        domain: String,
+    },
 }
 
 /// Whether a lookup that misses proves the resource absent (ADR 064 D4).
@@ -674,9 +719,7 @@ impl Intent {
                 hostname,
                 record_type,
                 ..
-            } => format!(
-                "Check the {record_type} record for `{hostname}` at your DNS provider."
-            ),
+            } => format!("Check the {record_type} record for `{hostname}` at your DNS provider."),
             other => format!("Check whether {} exists.", other.describe()),
         }
     }
@@ -685,19 +728,36 @@ impl Intent {
     pub fn key(&self, run_id: i32) -> String {
         let what = match self {
             Intent::DnsProvider { name } => format!("dns_provider/{name}"),
-            Intent::ManagedDomain { provider_id, domain } => {
+            Intent::ManagedDomain {
+                provider_id,
+                domain,
+            } => {
                 format!("managed_domain/{provider_id}/{domain}")
             }
-            Intent::AutoManageEnabled { provider_id, domain } => {
+            Intent::AutoManageEnabled {
+                provider_id,
+                domain,
+            } => {
                 format!("auto_manage/{provider_id}/{domain}")
             }
             Intent::Connector { name } => format!("connector/{name}"),
-            Intent::CustomDomain { domain, environment_id } => {
+            Intent::CustomDomain {
+                domain,
+                environment_id,
+            } => {
                 format!("custom_domain/{environment_id}/{domain}")
             }
             Intent::HostnameChoice { hostname, .. } => format!("hostname_choice/{hostname}"),
-            Intent::DnsRecord { hostname, record_type, .. }
-            | Intent::DnsChange { hostname, record_type, .. } => {
+            Intent::DnsRecord {
+                hostname,
+                record_type,
+                ..
+            }
+            | Intent::DnsChange {
+                hostname,
+                record_type,
+                ..
+            } => {
                 format!("dns_record/{hostname}/{record_type}")
             }
             Intent::AddressAudience { hostname, .. } => format!("audience/{hostname}"),
@@ -718,9 +778,14 @@ impl Intent {
             }
             Intent::DnsRecord { hostname, .. } => format!("DNS record for {hostname}"),
             Intent::DnsChange {
-                hostname, after, record_type, ..
+                hostname,
+                after,
+                record_type,
+                ..
             } => format!("{record_type} record for {hostname} set to {after}"),
-            Intent::AddressAudience { hostname, after, .. } => {
+            Intent::AddressAudience {
+                hostname, after, ..
+            } => {
                 format!("{hostname} made {}", after.describe())
             }
             Intent::Certificate { domain } => format!("Certificate for {domain}"),
