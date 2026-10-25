@@ -234,6 +234,8 @@ impl TempsPlugin for ProvidersPlugin {
 
         // Optional: metrics store, present only when metrics collection is enabled.
         let metrics_store = context.get_service::<dyn temps_metrics::MetricsStore>();
+        let worker_metrics_status =
+            context.get_service::<temps_metrics::WorkerMetricsStatusBoard>();
 
         // DB connection for direct queries (alert rules CRUD, etc.)
         let db = context.require_service::<sea_orm::DatabaseConnection>();
@@ -269,6 +271,7 @@ impl TempsPlugin for ProvidersPlugin {
             query_service,
             health_monitor,
             metrics_store,
+            worker_metrics_status,
             db,
             api_key_service,
             config_service,

@@ -4,6 +4,7 @@
 export const PROJECT_PRIMARY_ROUTES = [
   'project',
   'deployments',
+  'domains',
   'environments',
   'environment-variables',
   'logs',
@@ -26,6 +27,8 @@ export interface ProjectSectionLink {
 export const PROJECT_SECTION_LINKS: Partial<
   Record<ProjectSection, ProjectSectionLink[]>
 > = {
+  // ADR 064 D2: who reaches the app is part of the project, not a setting.
+  domains: [{ title: 'Domains', url: 'domains', aliases: ['settings/domains'] }],
   'environment-variables': [
     {
       title: 'Environment Variables',
@@ -120,7 +123,6 @@ export const PROJECT_SECTION_LINKS: Partial<
         'flags',
       ],
     },
-    { title: 'Domains', url: 'domains', aliases: ['settings/domains'] },
     {
       title: 'Variables',
       url: 'settings/variables',
@@ -149,6 +151,7 @@ export function resolveProjectPrimaryRoute(
   if (matches(route, 'deployments') || route === 'drop') return 'deployments'
   if (matches(route, 'environments')) return 'environments'
   for (const section of [
+    'domains',
     'environment-variables',
     'security',
     'monitoring',

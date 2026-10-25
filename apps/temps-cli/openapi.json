@@ -37612,6 +37612,17 @@
             "description": "The name the worker will register under.",
             "type": "string"
           },
+          "rejoin_proof": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Proof that the worker is the node holding `wg_public_key` under\n`name`, sent only when it joins the control plane it already belongs\nto (ADR 060): `temps_core::node_pki::rejoin_proof`, an HMAC keyed by\nthe hash of its current agent token over the name, the key and this\n`join_token`. With it the node is updated in place instead of refused\nfor a key in use. Never stored."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "wg_public_key": {
             "description": "The worker's base64 WireGuard public key. The private key never\nleaves the worker.",
             "type": "string"
@@ -37646,7 +37657,7 @@
             "type": "string"
           },
           "join_token": {
-            "description": "Single-use join token bound to `name`, accepted only over the mesh\nnode API from `node_address`.",
+            "description": "Single-use join token bound to `name`. A new pairing's is accepted\nonly over the mesh node API from `node_address`.",
             "type": "string"
           },
           "listen_port": {
@@ -37656,7 +37667,7 @@
             "type": "integer"
           },
           "name": {
-            "description": "The name the pairing's join token is bound to.",
+            "description": "The name the join token is bound to.",
             "type": "string"
           },
           "node_address": {
@@ -37670,18 +37681,28 @@
             "type": "integer"
           },
           "pairing_id": {
-            "description": "The pairing created for the worker.",
+            "description": "The pairing created for the worker; `None` when it joins again as the\nnode it already is (`rejoined_node_id`).",
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "prefix_len": {
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "rejoined_node_id": {
+            "description": "The node this worker already is on this control plane, when it proved\nit and joins again (ADR 060): it keeps its mesh key and address, and\nregistering with `join_token` updates that node in place.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
-          "pairing_id",
           "name",
           "control_plane_public_key",
           "control_plane_endpoint",
@@ -40306,6 +40327,15 @@
               "null"
             ]
           },
+          "live_sandboxes": {
+            "description": "Sandboxes (any owner) not destroyed on this node (ADR-048). Draining\ndoes not move them: a node with any cannot be removed. `None` for the\ncontrol plane, or when they could not be counted.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -40377,6 +40407,15 @@
           },
           "role": {
             "type": "string"
+          },
+          "serving_containers": {
+            "description": "Containers on this node that a deployment still uses: a node with\nany is drained before it is removed; one with none is removed in one\nstep. `None` for the control plane, or when it could not be counted.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "status": {
             "type": "string"
@@ -45187,6 +45226,26 @@
         ],
         "type": "object"
       },
+      "PlaneIdentityResponse": {
+        "description": "What identifies this control plane to a worker that already joined one\n(ADR 060). Both values are public keys' digests or public keys, so they\nare served without authentication.",
+        "properties": {
+          "ca_fingerprint": {
+            "description": "SHA-256 fingerprint (hex) of the cluster CA every worker of this\ncontrol plane pins. `None` before the first worker joined.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "control_plane_wg_public_key": {
+            "description": "The control plane's WireGuard mesh public key. `None` while the mesh\nis off or not up yet.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "PlatformFeatures": {
         "description": "Which capabilities this server process actually provides.\n\nA client cannot tell \"this build has no sandboxes\" from \"this process was\nstarted in a profile that does not run them\" by probing endpoints — both\nlook like failure. This endpoint answers the question directly so the\nconsole can render an honest, actionable state (what is unavailable, and\nwhy) instead of a dead button or an empty page.\n\n**Honesty contract**: every field that is `true` MUST be backed by a\nregistered, reachable subsystem. A `true` that is not true is worse than\nthe endpoint not existing — it causes the console to render controls that\nsilently fail instead of showing an onboarding state.",
         "properties": {
@@ -47028,6 +47087,10 @@
               "null"
             ]
           },
+          "serves_own_temps_api": {
+            "description": "When true, `/api/_temps*` and `/api/otel*` requests on this project's\ndomains go to the project's app instead of this Temps instance's\nconsole. Only for an app that is itself a Temps console or API.",
+            "type": "boolean"
+          },
           "service_template_image_url": {
             "description": "Logo from the immutable service-template release applied to this\nproject. Clients should prefer it over a deployed site's favicon.",
             "type": [
@@ -47086,7 +47149,8 @@
           "preview_envs_wake_timeout_seconds",
           "source_type",
           "hosting",
-          "cross_project_trace_sharing"
+          "cross_project_trace_sharing",
+          "serves_own_temps_api"
         ],
         "type": "object"
       },
@@ -67346,6 +67410,13 @@
           "repo_owner": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "serves_own_temps_api": {
+            "description": "Send `/api/_temps*` and `/api/otel*` requests on this project's domains\nto the project's app instead of this Temps instance's console. Turn on\nonly when the app is itself a Temps console or API: with it on, this\ninstance's analytics and OpenTelemetry ingest stop receiving the\nproject's traffic. Omit to leave unchanged.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -104525,7 +104596,7 @@
                 }
               }
             },
-            "description": "Pairing created; register over the mesh next"
+            "description": "Pairing created, or the worker proved it is the node it joins again as; register over the mesh next"
           },
           "400": {
             "description": "Invalid name or WireGuard key"
@@ -104534,7 +104605,7 @@
             "description": "Missing, unknown or unusable join token"
           },
           "409": {
-            "description": "Mesh off or not ready, control plane not dialable, key in use, or too many pairings"
+            "description": "Mesh off or not ready, control plane not dialable, key in use (including a node's own key and name without its current agent credential), or too many pairings"
           },
           "429": {
             "description": "Rate limited"
@@ -104544,6 +104615,34 @@
           }
         },
         "summary": "Enroll a worker on the WireGuard mesh with no address of its own (ADR 055)",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/internal/nodes/plane-identity": {
+      "get": {
+        "description": "`temps join` compares this with the cluster CA and control-plane mesh key\nin the agent config it finds on the machine, before it sends the join\ntoken: the same identity is a re-join of the same control plane, another\none is a move to another cluster.",
+        "operationId": "plane_identity",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlaneIdentityResponse"
+                }
+              }
+            },
+            "description": "This control plane's identity"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Identify this control plane to a joining worker (ADR 060)",
         "tags": [
           "Nodes"
         ]

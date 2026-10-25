@@ -5052,6 +5052,43 @@ export type ClusterMemberRequest = {
 };
 
 /**
+ * Nodes to combine for the latest values.
+ */
+export type ClusterMetricsLatestQuery = {
+    /**
+     * Comma-separated node ids (`0` = control plane), at most 64.
+     */
+    node_ids: string;
+};
+
+/**
+ * Query for one metric combined across several nodes.
+ */
+export type ClusterMetricsRangeQuery = {
+    /**
+     * Explicit window end (ISO 8601). Must be paired with `start_time`.
+     */
+    end_time?: string | null;
+    /**
+     * Metric name, e.g. `"proxy.requests"`.
+     */
+    metric: string;
+    /**
+     * Comma-separated node ids (`0` = control plane), at most 64.
+     */
+    node_ids: string;
+    /**
+     * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+     * Ignored when `start_time` and `end_time` are both set.
+     */
+    range?: string;
+    /**
+     * Explicit window start (ISO 8601). Must be paired with `end_time`.
+     */
+    start_time?: string | null;
+};
+
+/**
  * `PUT /settings/cluster-network` answer.
  */
 export type ClusterNetworkChangeResponse = {
@@ -7052,6 +7089,11 @@ export type CreateConnectorRequest = {
     values?: {
         [key: string]: unknown;
     };
+    /**
+     * Publish every worker-served hostname under the domain (the default),
+     * or only the hostnames chosen for this tunnel.
+     */
+    auto_publish?: boolean | null;
 };
 
 export type CreateConversationRequest = {
@@ -15974,7 +16016,7 @@ export type IngestErrorsResponse = {
  * worker only (`temps join --ingress`, `temps agent ingress`): opening ports
  * on a machine is its owner's decision, whoever runs the control plane.
  */
-export type IngressMode = 'off' | 'fixed' | 'delegated';
+export type IngressMode = 'off' | 'fixed' | 'delegated' | 'private';
 
 export type InheritedEnvVarResponse = {
     /**
@@ -17546,6 +17588,7 @@ export type MeshEnrollApiRequest = {
      * The name the worker will register under.
      */
     name: string;
+    rejoin_proof?: SecretString | null;
     /**
      * The worker's base64 WireGuard public key. The private key never
      * leaves the worker.
@@ -17576,8 +17619,8 @@ export type MeshEnrollResponse = {
      */
     expires_at: string;
     /**
-     * Single-use join token bound to `name`, accepted only over the mesh
-     * node API from `node_address`.
+     * Single-use join token bound to `name`. A new pairing's is accepted
+     * only over the mesh node API from `node_address`.
      */
     join_token: string;
     /**
@@ -17585,7 +17628,7 @@ export type MeshEnrollResponse = {
      */
     listen_port: number;
     /**
-     * The name the pairing's join token is bound to.
+     * The name the join token is bound to.
      */
     name: string;
     /**
@@ -17597,10 +17640,17 @@ export type MeshEnrollResponse = {
      */
     node_api_port: number;
     /**
-     * The pairing created for the worker.
+     * The pairing created for the worker; `None` when it joins again as the
+     * node it already is (`rejoined_node_id`).
      */
-    pairing_id: number;
+    pairing_id?: number | null;
     prefix_len: number;
+    /**
+     * The node this worker already is on this control plane, when it proved
+     * it and joins again (ADR 060): it keeps its mesh key and address, and
+     * registering with `join_token` updates that node in place.
+     */
+    rejoined_node_id?: number | null;
 };
 
 export type MessageContent = string | Array<ContentPart>;
@@ -18852,6 +18902,10 @@ export type NodeInfoResponse = {
     id: number;
     labels: unknown;
     last_heartbeat?: string | null;
+    /**
+     * Sandboxes still on this node. Draining does not move them; destroy them before removing the node. `None` for the control plane's own entry.
+     */
+    live_sandboxes?: number | null;
     name: string;
     /**
      * Why the overlay is unavailable: the colliding range, its owner and the
@@ -18876,12 +18930,39 @@ export type NodeInfoResponse = {
     public_ingress_unsupported_reasons: Array<string>;
     public_ingress_unsupported_route_count?: number | null;
     role: string;
+    /**
+     * Containers of current or in-progress deployments on this node (and of the deployment a rollout in progress would fall back to): what a removal refuses on, and what a drain moves. `None` for the control plane's own entry.
+     */
+    serving_containers?: number | null;
     status: string;
 };
 
 export type NodeListResponse = {
     nodes: Array<NodeInfoResponse>;
     total: number;
+};
+
+/**
+ * Whether a worker is reporting metrics to the control plane.
+ */
+export type NodeMetricsReportingStatus = {
+    /**
+     * What went wrong, when `state` is not `reporting`.
+     */
+    detail?: string | null;
+    /**
+     * ISO 8601, when the control plane last pulled.
+     */
+    last_attempt_at: string;
+    /**
+     * ISO 8601, when a report from the node was last stored.
+     */
+    last_report_at?: string | null;
+    node_id: number;
+    /**
+     * `reporting`, `agent_too_old`, `unreachable`, `rejected` or `invalid`.
+     */
+    state: string;
 };
 
 export type NodePairingListResponse = {
@@ -20973,6 +21054,24 @@ export type PlacementNode = {
 export type PlanComplexity = 'low' | 'medium' | 'high';
 
 /**
+ * What identifies this control plane to a worker that already joined one
+ * (ADR 060). Both values are public keys' digests or public keys, so they
+ * are served without authentication.
+ */
+export type PlaneIdentityResponse = {
+    /**
+     * SHA-256 fingerprint (hex) of the cluster CA every worker of this
+     * control plane pins. `None` before the first worker joined.
+     */
+    ca_fingerprint?: string | null;
+    /**
+     * The control plane's WireGuard mesh public key. `None` while the mesh
+     * is off or not up yet.
+     */
+    control_plane_wg_public_key?: string | null;
+};
+
+/**
  * Plan metadata
  */
 export type PlanMetadata = {
@@ -21106,10 +21205,19 @@ export type PlatformFeatures = {
      */
     profile: string;
     /**
-     * Agent sandboxes / workspace previews run in this process. Requires a
-     * local Docker daemon.
+     * The standalone sandbox API is served and sandboxes can run on some
+     * node (ADR 063). `true` in both profiles: on a control plane they run
+     * on worker nodes only, and a create with no usable worker answers the
+     * worker-node-required problem pointing at Settings → Nodes.
      */
     sandboxes: boolean;
+    /**
+     * Sandboxes, AI agent runs and application workspaces can run on this
+     * host itself. Requires local workloads (and so a local Docker daemon);
+     * `false` in the `control-plane` profile, where the control plane's own
+     * node takes no sandboxes (ADR 063).
+     */
+    sandboxes_local?: boolean;
     /**
      * This installation uses Postgres, injected secrets and S3 for durable
      * state; its control-plane scratch disk may be discarded.
@@ -22048,6 +22156,11 @@ export type ProjectIpAccessResponse = {
     mode: IpAccessMode;
     project_id: number;
     updated_at?: string | null;
+    /**
+     * Things worth knowing about the policy that do not stop it being saved,
+     * such as addresses whose visitors arrive through a tunnel.
+     */
+    warnings?: Array<string>;
 };
 
 export type ProjectLimitOverride = {
@@ -22256,6 +22369,12 @@ export type ProjectResponse = {
     pull_only_root_directory: boolean;
     repo_name?: string | null;
     repo_owner?: string | null;
+    /**
+     * When true, `/api/_temps*` and `/api/otel*` requests on this project's
+     * domains go to the project's app instead of this Temps instance's
+     * console. Only for an app that is itself a Temps console or API.
+     */
+    serves_own_temps_api: boolean;
     /**
      * Logo from the immutable service-template release applied to this
      * project. Clients should prefer it over a deployed site's favicon.
@@ -23233,6 +23352,10 @@ export type PublicIngressInterface = {
     default_route: boolean;
     name: string;
     scope: AddressScope;
+    /**
+     * The worker's Tailscale address (`tailscale0`, in 100.64.0.0/10).
+     */
+    tailscale?: boolean;
 };
 
 export type PublicIngressSettings = {
@@ -23267,6 +23390,15 @@ export type PublicIngressSettings = {
     listening_https?: string | null;
     mode?: IngressMode | null;
     node_id: number;
+    /**
+     * In `private` mode (ADR 064 D5): the private address the listener is
+     * bound on, when it is a private one.
+     */
+    private_listener?: string | null;
+    /**
+     * That address is the worker's Tailscale one.
+     */
+    private_on_tailscale: boolean;
     /**
      * Configured public address; `None` means the listen address.
      */
@@ -31873,6 +32005,14 @@ export type UpdateProjectSettingsRequest = {
     preview_envs_wake_timeout_seconds?: number | null;
     repo_name?: string | null;
     repo_owner?: string | null;
+    /**
+     * Send `/api/_temps*` and `/api/otel*` requests on this project's domains
+     * to the project's app instead of this Temps instance's console. Turn on
+     * only when the app is itself a Temps console or API: with it on, this
+     * instance's analytics and OpenTelemetry ingest stop receiving the
+     * project's traffic. Omit to leave unchanged.
+     */
+    serves_own_temps_api?: boolean | null;
     slug?: string | null;
     /**
      * Opt in to Trivy vulnerability scanning of this project's deployed Docker
@@ -53384,7 +53524,7 @@ export type MeshEnrollErrors = {
      */
     403: unknown;
     /**
-     * Mesh off or not ready, control plane not dialable, key in use, or too many pairings
+     * Mesh off or not ready, control plane not dialable, key in use (including a node's own key and name without its current agent credential), or too many pairings
      */
     409: unknown;
     /**
@@ -53399,12 +53539,39 @@ export type MeshEnrollErrors = {
 
 export type MeshEnrollResponses = {
     /**
-     * Pairing created; register over the mesh next
+     * Pairing created, or the worker proved it is the node it joins again as; register over the mesh next
      */
     201: MeshEnrollResponse;
 };
 
 export type MeshEnrollResponse2 = MeshEnrollResponses[keyof MeshEnrollResponses];
+
+export type PlaneIdentityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/internal/nodes/plane-identity';
+};
+
+export type PlaneIdentityErrors = {
+    /**
+     * Rate limited
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type PlaneIdentityResponses = {
+    /**
+     * This control plane's identity
+     */
+    200: PlaneIdentityResponse;
+};
+
+export type PlaneIdentityResponse2 = PlaneIdentityResponses[keyof PlaneIdentityResponses];
 
 export type RegisterNodeData = {
     body: RegisterNodeApiRequest;
@@ -56181,6 +56348,128 @@ export type WireguardMeshHubSetResponses = {
 };
 
 export type WireguardMeshHubSetResponse = WireguardMeshHubSetResponses[keyof WireguardMeshHubSetResponses];
+
+export type NodeMetricsGetClusterRangeData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Metric name, e.g. `"proxy.requests"`.
+         */
+        metric: string;
+        /**
+         * Comma-separated node ids (`0` = control plane), at most 64.
+         */
+        node_ids: string;
+        /**
+         * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+         * Ignored when `start_time` and `end_time` are both set.
+         */
+        range?: string;
+        /**
+         * Explicit window start (ISO 8601). Must be paired with `end_time`.
+         */
+        start_time?: string | null;
+        /**
+         * Explicit window end (ISO 8601). Must be paired with `start_time`.
+         */
+        end_time?: string | null;
+    };
+    url: '/nodes/metrics/cluster';
+};
+
+export type NodeMetricsGetClusterRangeErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetClusterRangeResponses = {
+    /**
+     * Combined metric time series
+     */
+    200: Array<MetricDataPoint>;
+};
+
+export type NodeMetricsGetClusterRangeResponse = NodeMetricsGetClusterRangeResponses[keyof NodeMetricsGetClusterRangeResponses];
+
+export type NodeMetricsGetClusterLatestData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Comma-separated node ids (`0` = control plane), at most 64.
+         */
+        node_ids: string;
+    };
+    url: '/nodes/metrics/cluster/latest';
+};
+
+export type NodeMetricsGetClusterLatestErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetClusterLatestResponses = {
+    /**
+     * Map of metric name to combined latest value
+     */
+    200: {
+        [key: string]: number;
+    };
+};
+
+export type NodeMetricsGetClusterLatestResponse = NodeMetricsGetClusterLatestResponses[keyof NodeMetricsGetClusterLatestResponses];
+
+export type NodeMetricsGetReportingData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/metrics/reporting';
+};
+
+export type NodeMetricsGetReportingErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+};
+
+export type NodeMetricsGetReportingResponses = {
+    /**
+     * Reporting status per worker
+     */
+    200: Array<NodeMetricsReportingStatus>;
+};
+
+export type NodeMetricsGetReportingResponse = NodeMetricsGetReportingResponses[keyof NodeMetricsGetReportingResponses];
 
 export type NodeMetricsGetRangeData = {
     body?: never;
@@ -83298,3 +83587,867 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
+/**
+ * Who an address is for.
+ */
+export type Audience = 'public' | 'private' | 'signed_in' | 'unsupported';
+
+export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
+
+/**
+ * Where an address comes from.
+ */
+export type AddressSource = 'generated' | 'environment_domain' | 'custom_domain';
+
+export type ActionKind = 'make_reachable' | 'deploy' | 'set_dns_record' | 'open_ingress' | 'open_worker' | 'wait' | 'run_command';
+
+/**
+ * What fixes it.
+ */
+export type ReachAction = {
+    /**
+     * A command to run, when that is the fix.
+     */
+    command?: string | null;
+    /**
+     * A console path, when there is a page for it.
+     */
+    href?: string | null;
+    kind: ActionKind;
+    label: string;
+};
+
+/**
+ * One address of an environment and whether its audience can reach it.
+ */
+export type AddressReachability = {
+    action?: null | ReachAction;
+    address: string;
+    audience: Audience;
+    /**
+     * The custom domain row, for a custom domain.
+     */
+    custom_domain_id?: number | null;
+    reason: string;
+    source: AddressSource;
+    state: ReachState;
+    /**
+     * How traffic gets in: `tunnel:<name>`, `direct:<node>`,
+     * `direct:control-plane`, or `private:<node>` for a worker's private
+     * listener. `None` while nothing does.
+     */
+    way_in?: string | null;
+    /**
+     * For a private address: the network it is reachable from, `Tailscale`
+     * or the range (ADR 064 D7).
+     */
+    network?: string | null;
+};
+
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker';
+
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience';
+
+export type PlanStep = {
+    kind: StepKind;
+    label: string;
+};
+
+export type PlanOption = {
+    /**
+     * How many things the user does: answer, confirm, create.
+     */
+    actions: number;
+    description: string;
+    /**
+     * What the user still has to answer (ADR 058 D8 descriptor form).
+     * `address` is answered with [`ReachabilityPlan::address`] by default.
+     */
+    fields: Array<SetupField>;
+    kind: PlanOptionKind;
+    /**
+     * The first option that fits, in the ADR's preference order.
+     */
+    recommended: boolean;
+    /**
+     * Permissions applying it needs on top of `projects:write`.
+     */
+    required_permissions: Array<string>;
+    steps: Array<PlanStep>;
+    title: string;
+    /**
+     * Things worth knowing before choosing it.
+     */
+    warnings: Array<string>;
+    /**
+     * Set when the option changes what another choice decided (ADR 058
+     * D9's hostname choice): what it changes, in words. Applying it needs
+     * `confirmed: true`.
+     */
+    confirmation?: string | null;
+    /**
+     * How traffic will get in, as in [`AddressReachability::way_in`].
+     */
+    way_in: string;
+};
+
+/**
+ * Why no option fits, and what would make one.
+ */
+export type PlanBlocked = {
+    action?: null | ReachAction;
+    reason: string;
+};
+
+export type ReachabilityPlan = {
+    /**
+     * The address asked for, or the one Temps suggests.
+     */
+    address?: string | null;
+    /**
+     * Why the address cannot be used, when it cannot.
+     */
+    address_error?: string | null;
+    audience: Audience;
+    /**
+     * Set when `options` is empty.
+     */
+    blocked?: null | PlanBlocked;
+    /**
+     * In the order Temps prefers them; the first is recommended.
+     */
+    options: Array<PlanOption>;
+    /**
+     * What `apply` names to act on this plan. Plans expire after 15
+     * minutes and are applied once; `null` on the plan attached to
+     * `GET …/reachability`, which is not stored.
+     */
+    plan_id?: string | null;
+    /**
+     * A hash of what the plan depends on; `apply` recomputes it and
+     * refuses a plan the cluster has moved on from.
+     */
+    fingerprint?: string | null;
+    expires_at?: string | null;
+};
+
+/**
+ * Everything about one environment's addresses.
+ */
+export type EnvironmentReachability = {
+    addresses: Array<AddressReachability>;
+    /**
+     * Whether anything is deployed to it.
+     */
+    deployed: boolean;
+    environment_id: number;
+    environment_name: string;
+    /**
+     * What *Make it reachable* would do, while no address is reachable.
+     */
+    plan?: null | ReachabilityPlan;
+    project_id: number;
+    /**
+     * The nodes its containers run on (`control plane` for the local one).
+     */
+    running_on: Array<string>;
+    /**
+     * `reachable` when any address is.
+     */
+    state: ReachState;
+    /**
+     * One line for the header: why nothing reaches it, or where it is.
+     */
+    summary: string;
+};
+
+/**
+ * `POST …/reachability/plan`.
+ */
+export type PlanRequest = {
+    /**
+     * The hostname to make reachable; Temps suggests one without it.
+     */
+    address?: string | null;
+    audience?: Audience;
+};
+
+/**
+ * `POST …/reachability/apply`.
+ */
+export type ApplyRequest = {
+    /**
+     * The plan this acts on, from `POST …/reachability/plan`.
+     */
+    plan_id: string;
+    /**
+     * Which option of the plan to carry out.
+     */
+    option: PlanOptionKind;
+    /**
+     * Answers to the option's fields by key. `address`, when given, must be
+     * the plan's; `dns_provider_id` takes a provider id,
+     * `cloudflare_api_token` the token (held in memory for the run, never
+     * stored on it).
+     */
+    answers?: {
+        [key: string]: unknown;
+    };
+    /**
+     * The user saw and accepted the option's `confirmation`.
+     */
+    confirmed?: boolean;
+};
+
+/**
+ * `POST …/reachability/runs/{run_id}/resume`.
+ */
+export type ResumeRequest = {
+    /**
+     * `cloudflare_api_token`, when the run had not saved the account yet.
+     */
+    answers?: {
+        [key: string]: unknown;
+    };
+};
+
+export type RunState = 'running' | 'succeeded' | 'waiting' | 'failed' | 'interrupted' | 'recovering' | 'conflict' | 'undoing' | 'undo_paused' | 'undone';
+
+export type RunStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+
+export type RunStep = {
+    detail?: string | null;
+    kind: StepKind;
+    label: string;
+    status: RunStepStatus;
+};
+
+/**
+ * Something a run made, so undo removes exactly that.
+ */
+export type RunResource = {
+    id: number;
+    name: string;
+    type: 'dns_provider';
+} | {
+    domain: string;
+    provider_id: number;
+    type: 'managed_domain';
+} | {
+    domain: string;
+    provider_id: number;
+    type: 'auto_manage_enabled';
+} | {
+    id: number;
+    name: string;
+    type: 'connector';
+} | {
+    domain: string;
+    id: number;
+    type: 'custom_domain';
+} | {
+    connector_id: number;
+    hostname: string;
+    previous: PreviousChoice;
+    type: 'hostname_choice';
+} | {
+    hostname: string;
+    label: string;
+    /**
+     * `A` or `AAAA`.
+     */
+    record_type: string;
+    /**
+     * What the run wrote; undo removes the record only while it still
+     * holds it with this run's marker.
+     */
+    content?: string | null;
+    type: 'dns_record';
+} | {
+    hostname: string;
+    label: string;
+    record_type: string;
+    before: DnsRecordState;
+    after: string;
+    type: 'dns_change';
+} | {
+    hostname: string;
+    before: AddressAudience;
+    after: AddressAudience;
+    type: 'address_audience';
+} | {
+    domain: string;
+    type: 'certificate';
+};
+
+/**
+ * A DNS record as the provider had it when Temps read it (ADR 064 D4).
+ */
+export type DnsRecordState = {
+    provider_id: number;
+    label?: string;
+    record_id?: string | null;
+    record_type: string;
+    content: string;
+    modified_on?: string | null;
+    managed?: boolean;
+    run_id?: number | null;
+};
+
+/**
+ * Who one address is for, with what bounds a private one (ADR 064 D5).
+ */
+export type AddressAudience = {
+    audience: Audience;
+    network_range?: string | null;
+    private_node_id?: number | null;
+    private_listener?: string | null;
+};
+
+/**
+ * A hostname's ADR 058 D9 choice before a run changed it, so undo puts it
+ * back.
+ */
+export type PreviousChoice = {
+    mode: 'automatic';
+} | {
+    mode: 'off';
+} | {
+    connector_id: number;
+    mode: 'tunnel';
+};
+
+/**
+ * What a run set out to create, with what finds it again (ADR 064 D4):
+ * written to the journal before the call that creates it.
+ */
+export type Intent = {
+    name: string;
+    type: 'dns_provider';
+} | {
+    domain: string;
+    provider_id: number;
+    type: 'managed_domain';
+} | {
+    domain: string;
+    provider_id: number;
+    type: 'auto_manage_enabled';
+} | {
+    name: string;
+    type: 'connector';
+} | {
+    domain: string;
+    environment_id: number;
+    type: 'custom_domain';
+} | {
+    connector_id: number;
+    hostname: string;
+    previous: PreviousChoice;
+    type: 'hostname_choice';
+} | {
+    hostname: string;
+    label: string;
+    record_type: string;
+    type: 'dns_record';
+} | {
+    hostname: string;
+    label: string;
+    record_type: string;
+    before: DnsRecordState;
+    after: string;
+    type: 'dns_change';
+} | {
+    hostname: string;
+    before: AddressAudience;
+    after: AddressAudience;
+    type: 'address_audience';
+} | {
+    domain: string;
+    type: 'certificate';
+};
+
+export type JournalState = 'pending' | 'done' | 'absent' | 'conflict';
+
+/**
+ * A user's answer to a conflict (ADR 064 D4): `keep` leaves the value
+ * someone else wrote; `overwrite` lets Temps set it (a run) or restore what
+ * was there before (undo).
+ */
+export type Decision = 'keep' | 'overwrite';
+
+/**
+ * `POST …/reachability/runs/{run_id}/decide`.
+ */
+export type DecideRequest = {
+    /**
+     * The journal entry in conflict.
+     */
+    key: string;
+    decision: Decision;
+};
+
+/**
+ * One entry of a run's journal.
+ */
+export type JournalEntry = {
+    at: string;
+    intent: Intent;
+    key: string;
+    resource?: null | RunResource;
+    state: JournalState;
+    pending_since?: string | null;
+    first_miss_at?: string | null;
+    failed_lookups?: number;
+    next_lookup_at?: string | null;
+    /**
+     * For a `conflict`: what is there now, in words.
+     */
+    conflict?: string | null;
+    decision?: null | Decision;
+    undo_decision?: null | Decision;
+    /**
+     * Undo marked this tunnel `deleting`: it is only ever finished.
+     */
+    deleting?: boolean;
+    tunnel_id?: string | null;
+    /**
+     * A conflict found before the write: Temps wrote nothing.
+     */
+    unwritten?: boolean;
+};
+
+/**
+ * What undoing one resource did.
+ */
+export type UndoResult = {
+    error?: string | null;
+    label: string;
+    ok: boolean;
+    resource: RunResource;
+};
+
+export type RunView = {
+    address?: string | null;
+    audience: Audience;
+    /**
+     * What the run created, oldest first: the journal's `done` entries.
+     */
+    created: Array<RunResource>;
+    /**
+     * Every step's resource, written before the call that creates it.
+     */
+    journal: Array<JournalEntry>;
+    plan_id?: string | null;
+    created_at: string;
+    environment_id?: number | null;
+    /**
+     * What went wrong or what is still missing, and what to do.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    id: number;
+    /**
+     * The address, once it is reachable.
+     */
+    live_url?: string | null;
+    option: string;
+    project_id?: number | null;
+    state: RunState;
+    steps: Array<RunStep>;
+    undo: Array<UndoResult>;
+    updated_at: string;
+};
+
+export type TokenCheckRequest = {
+    /**
+     * The token, as pasted. Used for this check only; not stored.
+     */
+    token: string;
+    /**
+     * The zone the token is meant for; the first zone it sees otherwise.
+     */
+    zone?: string | null;
+};
+
+export type PermissionState = 'present' | 'missing' | 'unverified';
+
+/**
+ * Whether the token is limited to the zone it is for.
+ */
+export type ZoneScope = {
+    detail: string;
+    ok: boolean;
+    /**
+     * How many other zones it reaches in all, listed or not.
+     */
+    other_count: number;
+    /**
+     * Zones it reaches besides `zone`, as far as Cloudflare listed them.
+     */
+    other_zones: Array<string>;
+    zone: string;
+};
+
+export type TokenPermission = 'zone_read' | 'dns_edit' | 'tunnel_edit';
+
+export type PermissionCheck = {
+    /**
+     * Why, and what to change on the token when it is missing.
+     */
+    detail: string;
+    label: string;
+    permission: TokenPermission;
+    state: PermissionState;
+};
+
+export type TokenCheckResult = {
+    /**
+     * The zone DNS Edit was tested on.
+     */
+    checked_zone?: string | null;
+    /**
+     * Why it did not, when it did not.
+     */
+    error?: string | null;
+    permissions: Array<PermissionCheck>;
+    /**
+     * Every permission is present and the token reaches only `zone`.
+     */
+    ready: boolean;
+    /**
+     * Whether it reaches only the zone asked about.
+     */
+    scope?: null | ZoneScope;
+    /**
+     * Where to create a token with the permissions filled in.
+     */
+    template_url: string;
+    /**
+     * Cloudflare accepted the token at all.
+     */
+    valid: boolean;
+    /**
+     * Zones the token sees.
+     */
+    zones: Array<string>;
+};
+
+/**
+ * Whether HTTP-01 can issue a certificate here: a direct ingress answers
+ * on port 80.
+ */
+export type CertificateMethods = {
+    http01_available: boolean;
+};
+
+export type GetEnvironmentReachabilityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability';
+};
+
+export type GetEnvironmentReachabilityErrors = {
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+};
+
+export type GetEnvironmentReachabilityResponses = {
+    200: EnvironmentReachability;
+};
+
+export type GetEnvironmentReachabilityResponse = GetEnvironmentReachabilityResponses[keyof GetEnvironmentReachabilityResponses];
+
+export type PlanEnvironmentReachabilityData = {
+    body: PlanRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/plan';
+};
+
+export type PlanEnvironmentReachabilityErrors = {
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+};
+
+export type PlanEnvironmentReachabilityResponses = {
+    200: ReachabilityPlan;
+};
+
+export type PlanEnvironmentReachabilityResponse = PlanEnvironmentReachabilityResponses[keyof PlanEnvironmentReachabilityResponses];
+
+export type ApplyEnvironmentReachabilityData = {
+    body: ApplyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/apply';
+};
+
+export type ApplyEnvironmentReachabilityErrors = {
+    /**
+     * An answer is missing or invalid
+     */
+    400: unknown;
+    /**
+     * A permission the option needs is missing
+     */
+    403: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+    /**
+     * The option no longer fits, or a run is in progress
+     */
+    409: unknown;
+};
+
+export type ApplyEnvironmentReachabilityResponses = {
+    202: RunView;
+};
+
+export type ApplyEnvironmentReachabilityResponse = ApplyEnvironmentReachabilityResponses[keyof ApplyEnvironmentReachabilityResponses];
+
+export type ListReachabilityRunsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs';
+};
+
+export type ListReachabilityRunsResponses = {
+    200: Array<RunView>;
+};
+
+export type ListReachabilityRunsResponse = ListReachabilityRunsResponses[keyof ListReachabilityRunsResponses];
+
+export type GetReachabilityRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}';
+};
+
+export type GetReachabilityRunErrors = {
+    /**
+     * Run not found
+     */
+    404: unknown;
+};
+
+export type GetReachabilityRunResponses = {
+    200: RunView;
+};
+
+export type GetReachabilityRunResponse = GetReachabilityRunResponses[keyof GetReachabilityRunResponses];
+
+export type UndoReachabilityRunData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/undo';
+};
+
+export type UndoReachabilityRunErrors = {
+    /**
+     * A permission or step-up confirmation is missing
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run is still going, or nothing is left to undo
+     */
+    409: unknown;
+};
+
+export type UndoReachabilityRunResponses = {
+    200: RunView;
+};
+
+export type UndoReachabilityRunResponse = UndoReachabilityRunResponses[keyof UndoReachabilityRunResponses];
+
+export type ResumeReachabilityRunData = {
+    body: ResumeRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/resume';
+};
+
+export type ResumeReachabilityRunErrors = {
+    /**
+     * The token is needed again, or is not usable
+     */
+    400: unknown;
+    /**
+     * A permission the run needs is missing
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run is going, recovering, or finished
+     */
+    409: unknown;
+};
+
+export type ResumeReachabilityRunResponses = {
+    202: RunView;
+};
+
+export type ResumeReachabilityRunResponse = ResumeReachabilityRunResponses[keyof ResumeReachabilityRunResponses];
+
+export type DecideReachabilityConflictData = {
+    body: DecideRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Run ID
+         */
+        run_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/decide';
+};
+
+export type DecideReachabilityConflictErrors = {
+    /**
+     * That entry is not waiting for a decision
+     */
+    400: unknown;
+    /**
+     * A permission or step-up confirmation is missing
+     */
+    403: unknown;
+    /**
+     * Run not found
+     */
+    404: unknown;
+    /**
+     * The run is not waiting for a decision
+     */
+    409: unknown;
+};
+
+export type DecideReachabilityConflictResponses = {
+    200: RunView;
+};
+
+export type DecideReachabilityConflictResponse = DecideReachabilityConflictResponses[keyof DecideReachabilityConflictResponses];
+
+export type CheckCloudflareTokenData = {
+    body: TokenCheckRequest;
+    path?: never;
+    query?: never;
+    url: '/ingress/cloudflare/token-check';
+};
+
+export type CheckCloudflareTokenResponses = {
+    200: TokenCheckResult;
+};
+
+export type CheckCloudflareTokenResponse = CheckCloudflareTokenResponses[keyof CheckCloudflareTokenResponses];
+
+export type GetCertificateMethodsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/certificate-methods';
+};
+
+export type GetCertificateMethodsResponses = {
+    200: CertificateMethods;
+};
+
+export type GetCertificateMethodsResponse = GetCertificateMethodsResponses[keyof GetCertificateMethodsResponses];

@@ -32,6 +32,7 @@ import {
   Gauge,
   GitBranch,
   GitFork,
+  Globe,
   Home,
   Layers,
   LogOut,
@@ -899,6 +900,7 @@ const projectPrimaryItems = [
     icon: GitBranch,
     section: 'deployments',
   },
+  { title: 'Domains', url: 'domains', icon: Globe, section: 'domains' },
   {
     title: 'Environments',
     url: 'environments',
