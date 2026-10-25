@@ -607,7 +607,7 @@ const AUDIENCES = [
   {
     value: 'private',
     label: 'Only my private network',
-    help: 'Served by a worker on your tailnet or LAN; nobody else can connect.',
+    help: 'Served by a worker on your tailnet or LAN, or at its own tailnet name with Tailscale Serve; nobody else can connect.',
   },
 ] as const
 

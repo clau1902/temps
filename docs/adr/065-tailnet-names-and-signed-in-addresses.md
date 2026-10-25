@@ -967,6 +967,64 @@ window in which a phase 2 address is unserved.
 | 4a | D7/D8 Temps gate on every listener: sign-in, cookie, logout, revocation, `gate.v1` capability; D10 checks and monitors |
 | 4b | D9 Cloudflare Access for tunneled addresses: separate token, app creation or reuse, JWT verification, journal and undo |
 
+## Implementation notes
+
+Where the implementation had to settle something the decisions leave open,
+or depart from their letter. Phase 3a:
+
+- **Socket file names.** A Serve socket is
+  `/run/temps/serve/<kind>-<id>.sock` (`custom-12.sock`), not
+  `<address id>.sock`: the colon of `custom:12` would need quoting in a
+  `unix:` proxy target. Ownership is still "a target under
+  `/run/temps/serve/`" (D2).
+- **`AdvertiseServices` has no `Etag`.** The prefs endpoint takes no
+  `If-Match`, so a change another tool makes between the agent's read and
+  its write can be lost. The agent re-reads after writing and only ever
+  adds or removes its own Service names; the Serve config itself keeps the
+  `Etag`/`If-Match`/412 discipline.
+- **A changed `Etag` on an entry already applied.** The agent re-verifies
+  the handler (still its socket, no `AllowFunnel`) and reports `applied`
+  with the new `Etag`, rather than treating any foreign write elsewhere in
+  the config as a conflict.
+- **Where reports live.** The tailscaled report, entry outcomes and D5
+  inside checks travel in one `tailscale` object on the worker's ingress
+  report, stored in `node_public_ingress.tailscale` with a `received_at`;
+  the inside checks are not a separate table.
+- **`tailnet_serve_entries.node_id` has no foreign key**, so a worker
+  removed from the cluster leaves its rows for undo to find; undo then asks
+  the user to confirm (keep) rather than wait for an agent that will never
+  report. Proving the machine left the tailnet needs the API (3b).
+- **`service_addrs` is stored on the entry row** (filled from the journal
+  in 3b), so the snapshot to the agent needs no extra read.
+- **The socket's visitor.** A request on a Serve socket must carry an
+  `X-Forwarded-For` that is a Tailscale address (tailscaled always sets
+  it); anything else is refused. The D5 step 5 probe is answered by the
+  socket only to a request *without* `X-Forwarded-For`, so a tailnet
+  visitor can never reach the probe and the agent's own probe never
+  reaches the app.
+- **Transport failures.** A LocalAPI call that fails in transport (timeout,
+  reset) is reported as an error with the state left `ready`; only an
+  answer the agent does not understand moves it to `not_understood`.
+- **Undo of a Serve entry waits for the agent.** The last reference marks
+  the entry `removing` and undo stops "pending" until the agent reports
+  `removed` or `absent`; the user undoes again to carry on (the run passes
+  through `recovering` then `interrupted` like any pending entry).
+- **A conflict with nothing to decide.** A slot held by something Temps did
+  not write, or Funnel on the name, stops the run in `conflict` with no
+  journal entry in conflict: the worker's owner fixes it on the worker and
+  resumes. `resume` accepts exactly that case.
+- **A name under the tailnet that is no machine's** is refused in 3a with
+  "only a Tailscale Service can give an app any other name there"; 3b turns
+  it into the Service option.
+- **The way in is still `private:<worker>`** in verdicts and plans, as for
+  the listener; the option's title and the verdict's reason say Tailscale
+  Serve, and `network` is `Tailscale`.
+
+Open, found while implementing 3a:
+
+- An entry whose runs are all deleted, or whose custom domain is detached
+  while another run still references it, is not cleaned up by itself yet.
+
 ## Open questions
 
 1. Several hosts for one Service: Tailscale routes to any approved host, so

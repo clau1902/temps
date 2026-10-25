@@ -720,9 +720,9 @@ fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
             RunResource::Connector { .. } | RunResource::HostnameChoice { .. } => {
                 Permission::SettingsWrite
             }
-            RunResource::CustomDomain { .. } | RunResource::AddressAudience { .. } => {
-                Permission::ProjectsWrite
-            }
+            RunResource::CustomDomain { .. }
+            | RunResource::AddressAudience { .. }
+            | RunResource::TailscaleServe { .. } => Permission::ProjectsWrite,
             RunResource::Certificate { .. } => Permission::DomainsDelete,
         };
         if !needed.contains(&permission) {

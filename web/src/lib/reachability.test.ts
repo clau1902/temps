@@ -465,6 +465,27 @@ describe('private addresses (ADR 064 D5)', () => {
   })
 })
 
+describe('tailnet names (ADR 065)', () => {
+  test('a Serve entry in conflict on undo can only be left', () => {
+    const entry = {
+      at: '2026-10-25T10:00:00Z',
+      key: 'run-1:tailscale_serve',
+      state: 'conflict' as const,
+      intent: {
+        type: 'tailscale_serve' as const,
+        node_id: 2,
+        node_name: 'homelab',
+        address_id: 'custom:4',
+        hostname: 'homelab.example.ts.net',
+      },
+    }
+    expect(conflictSubject(entry)).toBe('homelab.example.ts.net on homelab')
+    expect(conflictChoices(entry, true)).toEqual([
+      { decision: 'keep', label: 'Leave the worker as it is' },
+    ])
+  })
+})
+
 describe('plan for the typed address', () => {
   test('is current once the address settled and its own plan arrived', () => {
     expect(

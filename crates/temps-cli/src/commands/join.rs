@@ -101,6 +101,12 @@ pub struct JoinCommand {
     #[arg(long, default_value = "auto")]
     pub listen: String,
 
+    /// With `--ingress private`: let the agent configure this machine's
+    /// tailscaled for tailnet names (ADR 065 D2). May be given without a
+    /// `--listen` address. The agent must run as root.
+    #[arg(long)]
+    pub tailscale_serve: bool,
+
     /// With `--ingress fixed`: local port for public HTTP.
     #[arg(long, default_value_t = 80)]
     pub ingress_http_port: u16,
@@ -1090,8 +1096,17 @@ impl JoinCommand {
             IngressFlag::Off => IngressMode::Off,
             IngressFlag::Fixed => IngressMode::Fixed,
             IngressFlag::Delegated => IngressMode::Delegated,
-            IngressFlag::Private => return super::agent_ingress::private(&self.listen).map(Some),
+            IngressFlag::Private => {
+                return super::agent_ingress::private(Some(&self.listen), self.tailscale_serve)
+                    .map(Some)
+            }
         };
+        if self.tailscale_serve {
+            anyhow::bail!(
+                "--tailscale-serve goes with --ingress private: `temps join … --ingress private \
+                 --listen tailscale --tailscale-serve`."
+            );
+        }
         let mut ingress = LocalIngress {
             mode,
             ..LocalIngress::default()

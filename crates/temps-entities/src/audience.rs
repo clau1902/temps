@@ -19,3 +19,17 @@ pub const ALL: [&str; 3] = [PUBLIC, PRIVATE, SIGNED_IN];
 pub fn default_audience() -> String {
     PUBLIC.to_string()
 }
+
+/// How a private address is served (ADR 065 D1), the `private_via` column.
+pub mod via {
+    /// The worker's own private listener, with DNS at it (ADR 064 D5).
+    pub const LISTENER: &str = "listener";
+    /// The worker's machine name, `<machine>.<tailnet>.ts.net`, through
+    /// Tailscale Serve.
+    pub const TAILSCALE_SERVE: &str = "tailscale_serve";
+    /// A Tailscale Service, `<service>.<tailnet>.ts.net`.
+    pub const TAILSCALE_SERVICE: &str = "tailscale_service";
+
+    /// Every value the database accepts.
+    pub const ALL: [&str; 3] = [LISTENER, TAILSCALE_SERVE, TAILSCALE_SERVICE];
+}

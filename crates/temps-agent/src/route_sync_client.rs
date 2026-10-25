@@ -66,6 +66,27 @@ struct SnapshotPublicIngress {
     listen: Option<crate::route_store::PublicListen>,
     #[serde(default)]
     private_routes: Vec<SnapshotPrivateRoute>,
+    #[serde(default)]
+    serve_entries: Vec<SnapshotServeEntry>,
+}
+
+/// A Serve entry for this worker (ADR 065 D4).
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotServeEntry {
+    entry_id: i32,
+    address_id: String,
+    hostname: String,
+    via: String,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    removing: bool,
+    #[serde(default)]
+    applied_etag: Option<String>,
+    #[serde(default)]
+    route: Option<SnapshotRoute>,
+    #[serde(default)]
+    addrs: Vec<String>,
 }
 
 /// A private address for the private listener (ADR 064 D5).
@@ -347,6 +368,22 @@ impl RouteSyncClient {
                     listener: private.listener,
                 })
                 .collect(),
+            serve_entries: body
+                .public_ingress
+                .serve_entries
+                .into_iter()
+                .map(|entry| crate::route_store::ServeEntry {
+                    entry_id: entry.entry_id,
+                    address_id: entry.address_id,
+                    hostname: entry.hostname,
+                    via: entry.via,
+                    service: entry.service,
+                    removing: entry.removing,
+                    applied_etag: entry.applied_etag,
+                    route: entry.route.map(snapshot_route_into_entry),
+                    addrs: entry.addrs,
+                })
+                .collect(),
         };
         let listen = public_ingress.listen.clone();
         self.store.apply_public_snapshot(public_ingress);
@@ -542,6 +579,7 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            serve_entries: Vec::new(),
         }
     }
 
@@ -664,6 +702,7 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            serve_entries: Vec::new(),
         });
 
         crate::public_ingress::update_snapshot_health(&store);

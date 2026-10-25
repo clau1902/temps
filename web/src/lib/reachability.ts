@@ -158,6 +158,8 @@ export function conflictSubject(entry: JournalEntry): string {
       return `The ${intent.record_type} record for ${intent.hostname}`
     case 'connector':
       return `Tunnel ${intent.name}`
+    case 'tailscale_serve':
+      return `${intent.hostname} on ${intent.node_name}`
     default:
       return 'This step'
   }
@@ -170,7 +172,8 @@ export interface ConflictChoice {
 
 /**
  * The answers to one conflict. Undo never deletes a DNS record this run did
- * not write, so a created record someone changed can only be left.
+ * not write, so a created record someone changed can only be left; nor a
+ * Serve handler on a worker.
  */
 export function conflictChoices(
   entry: JournalEntry,
@@ -188,6 +191,9 @@ export function conflictChoices(
       { decision: 'overwrite', label: 'Remove it anyway' },
     ]
   if (type === 'dns_record') return [{ decision: 'keep', label: 'Leave it' }]
+  // ADR 065 D4: Temps never removes Serve configuration it did not write.
+  if (type === 'tailscale_serve')
+    return [{ decision: 'keep', label: 'Leave the worker as it is' }]
   return [
     { decision: 'keep', label: 'Keep their value' },
     { decision: 'overwrite', label: 'Restore what was there before' },

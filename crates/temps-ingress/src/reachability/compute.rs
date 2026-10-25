@@ -10,6 +10,8 @@
 
 use std::net::IpAddr;
 
+use temps_core::tailnet::{messages as tailnet_messages, TailnetCheckOutcome, TailscaleReport};
+use temps_core::tailnet::{TailscaleState, TAILSCALE_SERVE_COMMAND};
 use temps_core::worker_ingress::{address_scope, AddressScope, PrivateCheckOutcome};
 
 use super::model::{
@@ -40,6 +42,18 @@ pub struct PrivateBinding {
     pub range: Option<String>,
     pub node_id: Option<i32>,
     pub listener: Option<String>,
+    /// ADR 065 D1: `tailscale_serve` or `tailscale_service`; `None` (or
+    /// `listener`) for the phase 2 listener.
+    pub via: Option<String>,
+}
+
+impl PrivateBinding {
+    /// Served through tailscaled rather than the private listener.
+    pub fn on_tailscale(&self) -> bool {
+        self.via
+            .as_deref()
+            .is_some_and(|v| v != temps_entities::audience::via::LISTENER)
+    }
 }
 
 /// The worker's last inside check of a private address (ADR 064 D7).
@@ -61,6 +75,31 @@ pub struct PrivateFacts {
     /// The listener is on the worker's Tailscale interface.
     pub tailscale: bool,
     pub inside: Option<InsideCheck>,
+    /// For an address served through tailscaled (ADR 065 D5).
+    pub tailnet: Option<TailnetFacts>,
+}
+
+/// What the control plane knows of a tailnet name's worker and its Serve
+/// entry (ADR 065 D4, D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailnetFacts {
+    /// The worker's last tailscaled report, with its inside checks.
+    pub report: TailscaleReport,
+    /// How old that report is.
+    pub minutes_ago: i64,
+    /// The address's `tailnet_serve_entries` row on the worker.
+    pub entry: Option<ServeEntryState>,
+}
+
+/// A Serve entry and what the worker last said about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeEntryState {
+    pub entry_id: i32,
+    pub hostname: String,
+    pub removing: bool,
+    /// `applied`, `conflict` or `error`; `None` before the first report.
+    pub report: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// An inside check older than this says the worker stopped reporting.
@@ -445,6 +484,9 @@ fn private_reachability(facts: &AddressFacts, environment_name: &str) -> Address
     let input = &facts.input;
     let address = input.address.as_str();
     let binding = input.private.clone().unwrap_or_default();
+    if binding.on_tailscale() {
+        return tailnet_reachability(facts, environment_name);
+    }
     let verdict = |state: ReachState,
                    way_in: Option<String>,
                    reason: String,
@@ -563,6 +605,328 @@ fn private_reachability(facts: &AddressFacts, environment_name: &str) -> Address
                 _ => Some(make_reachable()),
             },
             network,
+        ),
+    }
+}
+
+/// A report older than this says the worker stopped reporting.
+pub const TAILNET_REPORT_STALE_MINUTES: i64 = 20;
+
+/// Why a worker's tailscaled cannot serve through Serve now, with what
+/// fixes it (ADR 065 D5's messages), in the order the agent decides them:
+/// what the plan refuses and what an address served there shows.
+pub fn tailnet_worker_problem(
+    node: &str,
+    report: &TailscaleReport,
+    minutes_ago: i64,
+) -> Option<(String, Option<ReachAction>)> {
+    let run = |command: &str| {
+        Some(
+            ReachAction::new(ActionKind::RunCommand, format!("On {node}, as root, run"))
+                .with_command(command),
+        )
+    };
+    if minutes_ago > TAILNET_REPORT_STALE_MINUTES {
+        return Some((
+            format!(
+                "{node} has not reported for {minutes_ago} minutes, so Temps cannot tell whether \
+                 Tailscale Serve works there. Check that the worker is online."
+            ),
+            Some(
+                ReachAction::new(ActionKind::OpenWorker, format!("Check {node}"))
+                    .with_href(INGRESS_SETUP_PATH),
+            ),
+        ));
+    }
+    let tailnet = report
+        .tailnet
+        .clone()
+        .unwrap_or_else(|| "your tailnet".into());
+    let name = report
+        .dns_name
+        .clone()
+        .unwrap_or_else(|| format!("{node}.{tailnet}"));
+    let version = report.version.clone().unwrap_or_default();
+    let problem = |message: String| Some((message, None));
+    if !report.consent || report.state == TailscaleState::NoConsent {
+        return Some((
+            tailnet_messages::no_consent(node),
+            run(TAILSCALE_SERVE_COMMAND),
+        ));
+    }
+    if !report.root || report.state == TailscaleState::NotRoot {
+        return problem(tailnet_messages::not_root(
+            node,
+            report.user.as_deref().unwrap_or("another user"),
+        ));
+    }
+    match report.state {
+        TailscaleState::NoSocket => return problem(tailnet_messages::no_socket(node)),
+        TailscaleState::Unsupported => {
+            return problem(tailnet_messages::old_tailscaled(&version, node))
+        }
+        TailscaleState::NotUnderstood => {
+            return problem(report.error.clone().unwrap_or_else(|| {
+                format!("{}.", tailnet_messages::not_understood(&version, node))
+            }))
+        }
+        TailscaleState::NoConsent | TailscaleState::NotRoot | TailscaleState::Ready => {}
+    }
+    match report.backend_state.as_deref() {
+        Some("Running") => {}
+        other => {
+            return Some((
+                tailnet_messages::not_logged_in(node, other.unwrap_or("not running")),
+                run("sudo tailscale up"),
+            ))
+        }
+    }
+    if !report.magic_dns {
+        return problem(tailnet_messages::magic_dns_off(&tailnet));
+    }
+    if !report.https() {
+        return problem(tailnet_messages::https_off(&tailnet, &name));
+    }
+    if report.dns_name.is_none() {
+        return problem(format!(
+            "{}.",
+            tailnet_messages::not_understood(&version, node)
+        ));
+    }
+    None
+}
+
+/// The outside check of a tailnet name (ADR 065 D5): no tunnel publishes
+/// it, and public DNS returns nothing for it or only Tailscale addresses.
+pub fn tailnet_outside_check(
+    address: &str,
+    resolution: &Resolution,
+    tunnel: Option<&TunnelState>,
+) -> Result<(), (ReachState, String, Option<ReachAction>)> {
+    if let Some(tunnel) = tunnel {
+        if matches!(tunnel.state.as_str(), "published" | "pending" | "error") {
+            let name = tunnel
+                .connector_name
+                .clone()
+                .unwrap_or_else(|| "a tunnel".to_string());
+            return Err((
+                ReachState::NotReachable,
+                format!(
+                    "{address} is private to your tailnet, but tunnel {name} publishes it, so \
+                     anyone on the internet can open it through Cloudflare. Keep it off tunnels \
+                     under Expose your apps."
+                ),
+                Some(
+                    ReachAction::new(ActionKind::OpenIngress, "Open the tunnel")
+                        .with_href(INGRESS_SETUP_PATH),
+                ),
+            ));
+        }
+    }
+    match resolution {
+        Resolution::Failed(error) => Err((
+            ReachState::Unknown,
+            format!("Could not look up {address}: {error}"),
+            None,
+        )),
+        Resolution::Ips(ips) => {
+            let outside: Vec<IpAddr> = ips
+                .iter()
+                .copied()
+                .filter(|ip| !temps_core::tailnet::is_tailscale_ip(*ip))
+                .collect();
+            if outside.is_empty() {
+                Ok(())
+            } else {
+                Err((
+                    ReachState::NotReachable,
+                    format!(
+                        "{address} is private to your tailnet, but outside it resolves to {}, \
+                         which is not a Tailscale address, so something else answers for it.",
+                        ip_list(&outside)
+                    ),
+                    None,
+                ))
+            }
+        }
+        Resolution::NoRecord | Resolution::Skipped => Ok(()),
+    }
+}
+
+/// Judge a tailnet name: the outside check, the worker's tailscaled, its
+/// Serve entry, then the worker's inside check (ADR 065 D5).
+fn tailnet_reachability(facts: &AddressFacts, environment_name: &str) -> AddressReachability {
+    let input = &facts.input;
+    let address = input.address.as_str();
+    let network = Some("Tailscale".to_string());
+    let verdict = |state: ReachState,
+                   way_in: Option<String>,
+                   reason: String,
+                   action: Option<ReachAction>| AddressReachability {
+        address: input.address.clone(),
+        audience: input.audience,
+        source: input.source,
+        custom_domain_id: input.custom_domain_id,
+        way_in,
+        state,
+        reason,
+        action,
+        network: network.clone(),
+    };
+    let (Some(private), Some(tailnet)) = (
+        &facts.private,
+        facts.private.as_ref().and_then(|p| p.tailnet.as_ref()),
+    ) else {
+        return verdict(
+            ReachState::NotReachable,
+            None,
+            format!(
+                "{address} is private to your tailnet, but no worker serves it yet, so nobody \
+                 can open it. Make it reachable on your tailnet."
+            ),
+            Some(make_reachable()),
+        );
+    };
+    let node = private.worker.as_str();
+    let way_in = Some(format!("private:{node}"));
+    if let Err((state, reason, action)) =
+        tailnet_outside_check(address, &facts.resolution, facts.tunnel.as_ref())
+    {
+        return verdict(state, way_in, reason, action);
+    }
+    let entry_id = tailnet.entry.as_ref().map(|e| e.entry_id);
+    let funnel = tailnet
+        .report
+        .entries
+        .iter()
+        .any(|e| Some(e.entry_id) == entry_id && e.funnel)
+        || tailnet.report.checks.iter().any(|c| {
+            c.hostname.eq_ignore_ascii_case(address) && c.outcome == TailnetCheckOutcome::Funnel
+        });
+    if funnel {
+        return verdict(
+            ReachState::NotReachable,
+            way_in,
+            tailnet_messages::funnel(node),
+            Some(
+                ReachAction::new(ActionKind::RunCommand, format!("On {node}, as root, run"))
+                    .with_command("tailscale funnel --https=443 off"),
+            ),
+        );
+    }
+    if let Err(why) = &private.bound {
+        return verdict(
+            ReachState::NotReachable,
+            way_in,
+            format!("{address} is served by {node}, but {why}"),
+            Some(
+                ReachAction::new(ActionKind::OpenWorker, format!("Check {node}"))
+                    .with_href(INGRESS_SETUP_PATH),
+            ),
+        );
+    }
+    if let Some((reason, action)) =
+        tailnet_worker_problem(node, &tailnet.report, tailnet.minutes_ago)
+    {
+        let state = if tailnet.minutes_ago > TAILNET_REPORT_STALE_MINUTES {
+            ReachState::Unknown
+        } else {
+            ReachState::NotReachable
+        };
+        return verdict(state, way_in, reason, action);
+    }
+    let Some(entry) = &tailnet.entry else {
+        return verdict(
+            ReachState::NotReachable,
+            way_in,
+            format!(
+                "{address} is private to your tailnet, but Temps no longer asks {node} to serve \
+                 it. Make it reachable again."
+            ),
+            Some(make_reachable()),
+        );
+    };
+    if entry.removing {
+        return verdict(
+            ReachState::NotReachable,
+            way_in,
+            format!("{node} is taking {address} off its Serve config."),
+            Some(make_reachable()),
+        );
+    }
+    match entry.report.as_deref() {
+        Some(temps_entities::tailnet_serve_entries::REPORT_APPLIED) => {}
+        Some(temps_entities::tailnet_serve_entries::REPORT_CONFLICT) => {
+            return verdict(
+                ReachState::NotReachable,
+                way_in,
+                tailnet_messages::slot_taken(
+                    &entry.hostname,
+                    entry.detail.as_deref().unwrap_or("another handler"),
+                ),
+                None,
+            )
+        }
+        Some(temps_entities::tailnet_serve_entries::REPORT_ERROR) => {
+            return verdict(
+                ReachState::NotReachable,
+                way_in,
+                format!(
+                    "{node} could not write {address} to its Serve config: {}",
+                    entry.detail.as_deref().unwrap_or("it did not say why.")
+                ),
+                Some(
+                    ReachAction::new(ActionKind::OpenWorker, format!("Check {node}"))
+                        .with_href(INGRESS_SETUP_PATH),
+                ),
+            )
+        }
+        _ => {
+            return verdict(
+                ReachState::Checking,
+                way_in,
+                format!("Waiting for {node} to serve {address} with Tailscale Serve."),
+                Some(ReachAction::new(ActionKind::Wait, "Wait a moment")),
+            )
+        }
+    }
+    let check = tailnet.report.checks.iter().find(|c| {
+        Some(c.address_id.as_str()) == input.private.as_ref().map(|b| b.address_id.as_str())
+            && c.hostname.eq_ignore_ascii_case(address)
+    });
+    match check {
+        None => verdict(
+            ReachState::Checking,
+            way_in,
+            format!(
+                "Waiting for {node} to check {address} from inside your tailnet; it does after \
+                 each change and every 5 minutes."
+            ),
+            Some(ReachAction::new(ActionKind::Wait, "Wait a moment")),
+        ),
+        Some(check) if check.outcome == TailnetCheckOutcome::Reachable => verdict(
+            ReachState::Reachable,
+            way_in,
+            format!(
+                "Private at {address} (Tailscale): {node} serves it with Tailscale Serve, and \
+                 only devices on your tailnet can open it."
+            ),
+            None,
+        ),
+        Some(check) => verdict(
+            ReachState::NotReachable,
+            way_in,
+            format!(
+                "{node} checked {address} from inside your tailnet: {}",
+                check.message
+            ),
+            match check.outcome {
+                TailnetCheckOutcome::NoRoute => Some(ReachAction::new(
+                    ActionKind::Deploy,
+                    format!("Redeploy {environment_name}"),
+                )),
+                _ => Some(make_reachable()),
+            },
         ),
     }
 }
@@ -917,6 +1281,7 @@ mod tests {
                     range: Some("100.64.0.0/10".into()),
                     node_id: Some(2),
                     listener: Some("100.101.102.103".into()),
+                    via: None,
                 }),
                 ..input("internal.example.com", AddressSource::CustomDomain)
             },
@@ -928,6 +1293,7 @@ mod tests {
                 bound,
                 tailscale: true,
                 inside,
+                tailnet: None,
             }),
         }
     }
@@ -1066,5 +1432,177 @@ mod tests {
         let nothing = address_reachability(&nothing, &[control_plane()], true, "production");
         assert_eq!(nothing.state, ReachState::NotReachable);
         assert_eq!(nothing.way_in, None);
+    }
+
+    fn tailnet_facts(resolution: Resolution, report: Option<&str>) -> AddressFacts {
+        use temps_core::tailnet::{ServeEntryReport, ServeOutcome, TailnetCheck};
+        AddressFacts {
+            input: AddressInput {
+                audience: Audience::Private,
+                private: Some(PrivateBinding {
+                    address_id: "custom:4".into(),
+                    range: None,
+                    node_id: Some(2),
+                    listener: None,
+                    via: Some("tailscale_serve".into()),
+                }),
+                ..input("homelab.example.ts.net", AddressSource::CustomDomain)
+            },
+            tunnel: None,
+            resolution,
+            temps_managed_dns: false,
+            private: Some(PrivateFacts {
+                worker: "homelab".into(),
+                bound: Ok(()),
+                tailscale: true,
+                inside: None,
+                tailnet: Some(TailnetFacts {
+                    report: TailscaleReport {
+                        consent: true,
+                        root: true,
+                        state: TailscaleState::Ready,
+                        version: Some("1.94.1".into()),
+                        backend_state: Some("Running".into()),
+                        dns_name: Some("homelab.example.ts.net".into()),
+                        tailnet: Some("example.ts.net".into()),
+                        magic_dns: true,
+                        cert_domains: vec!["homelab.example.ts.net".into()],
+                        entries: vec![ServeEntryReport {
+                            entry_id: 9,
+                            address_id: "custom:4".into(),
+                            outcome: ServeOutcome::Applied,
+                            etag: Some("\"e1\"".into()),
+                            detail: None,
+                            funnel: false,
+                        }],
+                        checks: vec![TailnetCheck {
+                            address_id: "custom:4".into(),
+                            hostname: "homelab.example.ts.net".into(),
+                            outcome: TailnetCheckOutcome::Reachable,
+                            message: "Reachable.".into(),
+                        }],
+                        ..TailscaleReport::default()
+                    },
+                    minutes_ago: 1,
+                    entry: Some(ServeEntryState {
+                        entry_id: 9,
+                        hostname: "homelab.example.ts.net".into(),
+                        removing: false,
+                        report: report.map(str::to_string),
+                        detail: Some("http://127.0.0.1:3000".into()),
+                    }),
+                }),
+            }),
+        }
+    }
+
+    fn tailnet_of(facts: &mut AddressFacts) -> &mut TailnetFacts {
+        facts
+            .private
+            .as_mut()
+            .and_then(|p| p.tailnet.as_mut())
+            .expect("tailnet facts")
+    }
+
+    /// ADR 065 D5: a tailnet name is reachable only when outside DNS says
+    /// nothing else answers, the agent applied the entry and its inside
+    /// check passed.
+    #[test]
+    fn a_tailnet_name_is_judged_by_outside_dns_its_entry_and_the_inside_check() {
+        let judged = |facts: AddressFacts| {
+            address_reachability(&facts, &[control_plane()], true, "production")
+        };
+        let ok = judged(tailnet_facts(Resolution::NoRecord, Some("applied")));
+        assert_eq!(ok.state, ReachState::Reachable, "{}", ok.reason);
+        assert_eq!(ok.network.as_deref(), Some("Tailscale"));
+        assert_eq!(ok.way_in.as_deref(), Some("private:homelab"));
+        // The control plane on the tailnet sees MagicDNS answers: fine.
+        assert_eq!(
+            judged(tailnet_facts(
+                Resolution::Ips(vec![ip("100.101.102.103")]),
+                Some("applied")
+            ))
+            .state,
+            ReachState::Reachable
+        );
+        // Anything else answering for it outside fails.
+        let public = judged(tailnet_facts(
+            Resolution::Ips(vec![ip("203.0.113.7")]),
+            Some("applied"),
+        ));
+        assert_eq!(public.state, ReachState::NotReachable);
+        assert!(public.reason.contains("203.0.113.7"), "{}", public.reason);
+        // A tunnel publishing it fails, whatever the worker says.
+        let mut tunneled = tailnet_facts(Resolution::Skipped, Some("applied"));
+        tunneled.tunnel = Some(TunnelState {
+            state: "published".into(),
+            connector_name: Some("edge".into()),
+            detail: String::new(),
+            has_candidates: true,
+        });
+        assert!(judged(tunneled).reason.contains("tunnel edge publishes it"));
+
+        // Funnel, from the entry report or the inside check: red, D5's words.
+        let mut funnel = tailnet_facts(Resolution::NoRecord, Some("applied"));
+        tailnet_of(&mut funnel).report.entries[0].funnel = true;
+        let funnel = judged(funnel);
+        assert_eq!(funnel.state, ReachState::NotReachable);
+        assert_eq!(
+            funnel.reason,
+            "This private address is also on Tailscale Funnel, which makes it public. Run \
+             `tailscale funnel --https=443 off` on `homelab`."
+        );
+
+        // The agent's report on the entry.
+        let conflict = judged(tailnet_facts(Resolution::NoRecord, Some("conflict")));
+        assert_eq!(conflict.state, ReachState::NotReachable);
+        assert!(conflict
+            .reason
+            .starts_with("`homelab.example.ts.net` already serves `http://127.0.0.1:3000`"));
+        assert_eq!(
+            judged(tailnet_facts(Resolution::NoRecord, None)).state,
+            ReachState::Checking
+        );
+        let mut removing = tailnet_facts(Resolution::NoRecord, Some("applied"));
+        if let Some(entry) = tailnet_of(&mut removing).entry.as_mut() {
+            entry.removing = true;
+        }
+        assert_eq!(judged(removing).state, ReachState::NotReachable);
+        let mut no_entry = tailnet_facts(Resolution::NoRecord, Some("applied"));
+        tailnet_of(&mut no_entry).entry = None;
+        assert_eq!(
+            judged(no_entry).action.map(|a| a.kind),
+            Some(ActionKind::MakeReachable)
+        );
+
+        // The worker's tailscaled, with D5's message.
+        let mut logged_out = tailnet_facts(Resolution::NoRecord, Some("applied"));
+        tailnet_of(&mut logged_out).report.backend_state = Some("NeedsLogin".into());
+        assert_eq!(
+            judged(logged_out).reason,
+            "Tailscale on `homelab` is `NeedsLogin`. Run `sudo tailscale up`."
+        );
+        let mut stale = tailnet_facts(Resolution::NoRecord, Some("applied"));
+        tailnet_of(&mut stale).minutes_ago = 40;
+        assert_eq!(judged(stale).state, ReachState::Unknown);
+
+        // The inside check.
+        let mut failed = tailnet_facts(Resolution::NoRecord, Some("applied"));
+        tailnet_of(&mut failed).report.checks[0].outcome = TailnetCheckOutcome::NoRoute;
+        let failed = judged(failed);
+        assert_eq!(failed.state, ReachState::NotReachable);
+        assert_eq!(failed.action.map(|a| a.kind), Some(ActionKind::Deploy));
+        let mut unchecked = tailnet_facts(Resolution::NoRecord, Some("applied"));
+        tailnet_of(&mut unchecked).report.checks.clear();
+        assert_eq!(judged(unchecked).state, ReachState::Checking);
+        // Another address's check is not this one's.
+        let mut other = tailnet_facts(Resolution::NoRecord, Some("applied"));
+        tailnet_of(&mut other).report.checks[0].address_id = "custom:5".into();
+        assert_eq!(judged(other).state, ReachState::Checking);
+
+        // No worker recorded: never reachable.
+        let mut nothing = tailnet_facts(Resolution::NoRecord, Some("applied"));
+        nothing.private = None;
+        assert_eq!(judged(nothing).state, ReachState::NotReachable);
     }
 }

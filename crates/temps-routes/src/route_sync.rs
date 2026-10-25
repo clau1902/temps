@@ -121,6 +121,39 @@ pub struct PublicIngressSnapshot {
     /// private mode ignore the field and serve none of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_routes: Vec<PrivateRouteEntryDto>,
+    /// What this worker serves through tailscaled (ADR 065 D4): its
+    /// `tailnet_serve_entries` rows, being removed or not. Never in `routes`
+    /// or `private_routes`; agents that predate it ignore the field and
+    /// never touch tailscaled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub serve_entries: Vec<ServeEntryDto>,
+}
+
+/// One Serve entry for the worker that applies it (ADR 065 D4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServeEntryDto {
+    /// The row, named back in the agent's report.
+    pub entry_id: i32,
+    pub address_id: String,
+    /// The tailnet name.
+    pub hostname: String,
+    /// `tailscale_serve` or `tailscale_service`.
+    pub via: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// No run references it: the agent takes it off and reports.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_etag: Option<String>,
+    /// Where its socket sends requests. `None` while held back (the reason
+    /// is in `unsupported_reasons`) or being removed: the socket answers 404.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteEntryDto>,
+    /// A Service's TailVIPs as Tailscale assigned them, from the run that
+    /// created it: what the inside check accepts for the name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
 }
 
 /// A private address on a worker's private listener (ADR 064 D5).
@@ -696,6 +729,94 @@ pub fn worker_private_routes(
     (routes, held_back)
 }
 
+/// The Serve entries `node_id` applies (ADR 065 D4), each with its route
+/// when the address is one this worker serves through tailscaled and passes
+/// the public worker rules; why any is held back.
+pub fn worker_serve_entries(
+    peer_table: &CachedPeerTable,
+    policy: &WorkerRoutePolicy,
+    node_id: i32,
+    rows: Vec<temps_entities::tailnet_serve_entries::Model>,
+) -> (Vec<ServeEntryDto>, Vec<String>) {
+    use temps_entities::tailnet_serve_entries::STATE_REMOVING;
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut held_back = Vec::new();
+    for row in rows {
+        let removing = row.state == STATE_REMOVING;
+        let route = if removing {
+            None
+        } else {
+            let host = row.hostname.clone();
+            match peer_table.worker_tailnet_route(node_id, &row.hostname) {
+                // The address now names another way in or another worker:
+                // the entry no longer matches it, and serves nothing.
+                None => {
+                    held_back.push(format!(
+                        "{host}: the address is no longer served through Tailscale on this worker"
+                    ));
+                    None
+                }
+                Some((private, _))
+                    if private.address.address_id != row.address_id
+                        || private.address.via.as_deref() != Some(row.private_via.as_str()) =>
+                {
+                    held_back.push(format!(
+                        "{host}: the address is no longer served through this Serve entry"
+                    ));
+                    None
+                }
+                Some((private, servable)) => {
+                    let why = if let Some(policy) = policy.blocking_policies.first() {
+                        Some(format!("{policy}, which only the control plane enforces"))
+                    } else if !servable {
+                        Some("it needs a redirect, static files, wake-up, attack mode, security settings or path routing, which only the control plane serves".to_string())
+                    } else {
+                        None
+                    };
+                    let entry = entry_from_route(host.clone(), &private.route).filter(|entry| {
+                        entry.backends.iter().all(|backend| {
+                            public_backend_is_registered_worker(
+                                &backend.address,
+                                &policy.registered_worker_addresses,
+                            )
+                        })
+                    });
+                    match (why, entry) {
+                        (Some(why), _) => {
+                            held_back.push(format!("{host}: {why}"));
+                            None
+                        }
+                        (None, None) => {
+                            held_back.push(format!(
+                                "{host}: its backends are not on a worker this one can reach"
+                            ));
+                            None
+                        }
+                        (None, Some(route)) => Some(route),
+                    }
+                }
+            }
+        };
+        entries.push(ServeEntryDto {
+            entry_id: row.id,
+            address_id: row.address_id,
+            hostname: row.hostname,
+            via: row.private_via,
+            service: row.service_name,
+            removing,
+            applied_etag: row.applied_etag,
+            route,
+            addrs: row
+                .service_addrs
+                .as_ref()
+                .and_then(|addrs| serde_json::from_value::<Vec<String>>(addrs.clone()).ok())
+                .unwrap_or_default(),
+        });
+    }
+    entries.sort_by(|a, b| a.address_id.cmp(&b.address_id));
+    (entries, held_back)
+}
+
 async fn build_snapshot(
     state: &RouteSyncAppState,
     node: &nodes::Model,
@@ -751,7 +872,36 @@ async fn build_snapshot(
     } else {
         (Vec::new(), Vec::new())
     };
-    let public_ingress =
+    // ADR 065 D4: what this worker serves through tailscaled. Only its own
+    // rows; a worker never learns another's.
+    let serve_rows = {
+        use sea_orm::{ColumnTrait, QueryFilter};
+        temps_entities::tailnet_serve_entries::Entity::find()
+            .filter(temps_entities::tailnet_serve_entries::Column::NodeId.eq(node.id))
+            .all(state.db.as_ref())
+            .await
+            .map_err(|source| SnapshotBuildError::Database {
+                node_id: node.id,
+                operation: "load tailnet serve entries",
+                source,
+            })?
+    };
+    let (serve_entries, serve_held_back) = if serve_rows.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let policy = worker_route_policy(
+            state.db.as_ref(),
+            !state.request_policy_gate.supports_worker_ingress(),
+        )
+        .await
+        .map_err(|(operation, source)| SnapshotBuildError::Database {
+            node_id: node.id,
+            operation,
+            source,
+        })?;
+        worker_serve_entries(&state.peer_table, &policy, node.id, serve_rows)
+    };
+    let mut public_ingress =
         if !private_routes.is_empty() && !node.public_ingress_enabled && !runs_connector {
             let hosts: std::collections::HashSet<String> = private_routes
                 .iter()
@@ -765,6 +915,7 @@ async fn build_snapshot(
                 certificates: encrypt_public_certificates(state, node, &hosts).await?,
                 listen: None,
                 private_routes,
+                serve_entries: Vec::new(),
             }
         } else if node.public_ingress_enabled || runs_connector {
             let WorkerPublicRoutes {
@@ -817,10 +968,19 @@ async fn build_snapshot(
                     None
                 },
                 private_routes,
+                serve_entries: Vec::new(),
             }
         } else {
             PublicIngressSnapshot::default()
         };
+    if !serve_entries.is_empty() {
+        // A worker that only serves through tailscaled still needs the
+        // authorization lease its Serve sockets route under.
+        public_ingress.enabled = true;
+        public_ingress.unsupported_route_count += serve_held_back.len();
+        public_ingress.unsupported_reasons.extend(serve_held_back);
+        public_ingress.serve_entries = serve_entries;
+    }
     Ok(RouteSnapshot {
         generation,
         routes,

@@ -199,6 +199,9 @@ pub enum PlanOptionKind {
     /// as a tailnet (ADR 064 D5): DNS points at its private address and
     /// the certificate comes through DNS-01.
     PrivateWorker,
+    /// The worker's own tailnet name through tailscaled's Serve (ADR 065
+    /// D1): `<machine>.<tailnet>.ts.net`, no DNS record, no ACME.
+    TailscaleServe,
 }
 
 impl PlanOptionKind {
@@ -210,6 +213,7 @@ impl PlanOptionKind {
             PlanOptionKind::DirectManagedDns,
             PlanOptionKind::DirectManualDns,
             PlanOptionKind::PrivateWorker,
+            PlanOptionKind::TailscaleServe,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == value)
@@ -223,6 +227,7 @@ impl PlanOptionKind {
             PlanOptionKind::NewTunnelWithToken => "new_tunnel_with_token",
             PlanOptionKind::DirectManualDns => "direct_manual_dns",
             PlanOptionKind::PrivateWorker => "private_worker",
+            PlanOptionKind::TailscaleServe => "tailscale_serve",
         }
     }
 }
@@ -245,6 +250,9 @@ pub enum StepKind {
     /// Records who an address is for, and for a private one the network
     /// range and the listener that serve it (ADR 064 D5).
     SetAudience,
+    /// Declares the worker's Serve entry for the address and waits for its
+    /// agent to apply it (ADR 065 D4).
+    ConfigureTailscaleServe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -559,6 +567,17 @@ pub enum RunResource {
     Certificate {
         domain: String,
     },
+    /// This run's reference to a worker's Serve entry (ADR 065 D4). Undo
+    /// drops the reference; the entry goes with its last one.
+    TailscaleServe {
+        node_id: i32,
+        node_name: String,
+        address_id: String,
+        hostname: String,
+        entry_id: i32,
+        /// This run created the entry, rather than finding it.
+        created: bool,
+    },
 }
 
 /// Who one address is for, with what bounds a private one (ADR 064 D5).
@@ -575,6 +594,14 @@ pub struct AddressAudience {
     /// inside check dials.
     #[serde(default)]
     pub private_listener: Option<String>,
+    /// For `private`: how it is served (ADR 065 D1), `tailscale_serve` or
+    /// `tailscale_service`. `None` is phase 2's listener, so runs journaled
+    /// before this column compare equal to what they set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_via: Option<String>,
+    /// For `tailscale_service`: the `svc:` name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_service: Option<String>,
 }
 
 impl AddressAudience {
@@ -582,8 +609,14 @@ impl AddressAudience {
         Self::default()
     }
 
+    /// Served through tailscaled (ADR 065 D1), not a listener.
+    pub fn on_tailscale(&self) -> bool {
+        self.audience == Audience::Private && self.private_via.is_some()
+    }
+
     pub fn describe(&self) -> String {
         match (self.audience, &self.network_range) {
+            (Audience::Private, _) if self.on_tailscale() => "private to your tailnet".to_string(),
             (Audience::Private, Some(range)) => format!("private to {range}"),
             (Audience::Private, None) => "private".to_string(),
             (Audience::Public, _) => "public".to_string(),
@@ -622,6 +655,9 @@ impl RunResource {
                 before.describe()
             ),
             RunResource::Certificate { domain } => format!("Certificate for {domain}"),
+            RunResource::TailscaleServe {
+                node_name, hostname, ..
+            } => format!("{node_name} serving {hostname} through Tailscale Serve"),
         }
     }
 }
@@ -680,6 +716,17 @@ pub enum Intent {
     },
     Certificate {
         domain: String,
+    },
+    /// Found by the `tailnet_serve_entries` row and this run's reference to
+    /// it (ADR 065 D4); the step is done only on the agent's report.
+    TailscaleServe {
+        node_id: i32,
+        node_name: String,
+        address_id: String,
+        hostname: String,
+        /// The `svc:` name, for a Service.
+        #[serde(default)]
+        service: Option<String>,
     },
 }
 
@@ -776,6 +823,11 @@ impl Intent {
             }
             Intent::AddressAudience { hostname, .. } => format!("audience/{hostname}"),
             Intent::Certificate { domain } => format!("certificate/{domain}"),
+            Intent::TailscaleServe {
+                node_id,
+                address_id,
+                ..
+            } => format!("tailscale_serve/{node_id}/{address_id}"),
         };
         format!("run-{run_id}/{what}")
     }
@@ -803,6 +855,11 @@ impl Intent {
                 format!("{hostname} made {}", after.describe())
             }
             Intent::Certificate { domain } => format!("Certificate for {domain}"),
+            Intent::TailscaleServe {
+                node_name,
+                hostname,
+                ..
+            } => format!("{node_name} serving {hostname} through Tailscale Serve"),
         }
     }
 }

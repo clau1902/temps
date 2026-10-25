@@ -49,6 +49,8 @@ use super::model::{
 };
 use super::plan::NamedId;
 use super::token_check::TokenCheckResult;
+use temps_core::tailnet::messages as tailnet_messages;
+use temps_entities::tailnet_serve_entries::{REPORT_APPLIED, REPORT_CONFLICT, REPORT_ERROR};
 
 /// A managed zone's state under one DNS provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,76 @@ pub struct TunnelStatus {
     pub last_error: Option<String>,
     /// `(node id, state, ready connections, last error)` per replica.
     pub replicas: Vec<(i32, String, Option<i32>, Option<String>)>,
+}
+
+/// The worker a run has serve an address through tailscaled (ADR 065 D4),
+/// resolved from the plan when the run starts. The address id is known
+/// only once the address is attached, so the step adds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServeTarget {
+    pub node_id: i32,
+    pub node_name: String,
+    /// `tailscale_serve` or `tailscale_service`.
+    pub via: String,
+    /// The `svc:` name, for a Service.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// The tailnet, for a Service's advisory lock.
+    #[serde(default)]
+    pub tailnet: Option<String>,
+}
+
+/// One `tailnet_serve_entries` row a run asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeWish {
+    pub target: ServeTarget,
+    pub address_id: String,
+    pub hostname: String,
+}
+
+/// What claiming a Serve entry found under its advisory lock (ADR 065 D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeClaim {
+    /// No row: the run created it, and its `created` reference.
+    Created { entry_id: i32 },
+    /// The same wish: the run added a `found` reference, nothing else.
+    Found { entry_id: i32 },
+    /// Another wish holds the slot: what the worker serves now, in words.
+    Differs(String),
+    /// The row is `removing`: never revived; wait for the agent.
+    Removing,
+}
+
+/// A Serve entry and what its worker last said about it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServeEntryStatus {
+    pub entry_id: i32,
+    pub removing: bool,
+    /// `applied`, `conflict` or `error`.
+    pub report: Option<String>,
+    /// What holds the slot, or the error.
+    pub detail: Option<String>,
+    pub applied_etag: Option<String>,
+    /// The worker's tailscaled problem from its last report, if any.
+    pub worker_error: Option<String>,
+    /// The node is no longer part of the cluster: no agent will report.
+    pub worker_gone: bool,
+    /// Funnel is on for the entry's name, or reached its socket.
+    pub funnel: bool,
+}
+
+/// What dropping a run's reference to a Serve entry left (ADR 065 D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeRelease {
+    /// The run held no reference: nothing to do.
+    Gone,
+    /// Other runs still reference it, so the worker keeps serving: why.
+    Kept(String),
+    /// The agent wrote nothing (it reported `conflict`): the row was
+    /// deleted without telling the agent anything.
+    Deleted,
+    /// The row is `removing`: the agent takes its own handler off.
+    Removing,
 }
 
 /// Everything a run does to the rest of Temps.
@@ -160,6 +232,34 @@ pub trait RunOps: Send + Sync {
         host: &str,
         audience: &AddressAudience,
     ) -> Result<(), String>;
+    /// Creates the `(node, address)` Serve entry with this run's reference,
+    /// or adds a reference to the same one, in one transaction holding the
+    /// entry's advisory lock (and the Service's first) (ADR 065 D4).
+    async fn claim_serve_entry(&self, run_id: i32, wish: &ServeWish) -> Result<ServeClaim, String>;
+    /// This run's reference to the `(node, address)` entry: `(entry id,
+    /// created)`.
+    async fn serve_reference(
+        &self,
+        run_id: i32,
+        node_id: i32,
+        address_id: &str,
+    ) -> Result<Option<(i32, bool)>, String>;
+    async fn serve_entry(
+        &self,
+        node_id: i32,
+        address_id: &str,
+    ) -> Result<Option<ServeEntryStatus>, String>;
+    /// Drops this run's reference under the entry's lock; the last one
+    /// decides what happens to the entry by the agent's last report.
+    async fn release_serve_entry(
+        &self,
+        run_id: i32,
+        node_id: i32,
+        address_id: &str,
+    ) -> Result<ServeRelease, String>;
+    /// Deletes a `removing` entry the user decided to leave on the worker
+    /// as it is, so nothing more is asked of the agent.
+    async fn forget_serve_entry(&self, entry_id: i32) -> Result<(), String>;
     async fn sleep(&self, duration: Duration);
 }
 
@@ -303,6 +403,9 @@ pub struct RunInput {
     /// it was for before.
     #[serde(default)]
     pub audience: Option<(AddressAudience, AddressAudience)>,
+    /// For a tailnet name: the worker that serves it (ADR 065 D4).
+    #[serde(default)]
+    pub serve: Option<ServeTarget>,
 }
 
 /// The run as stored.
@@ -427,11 +530,67 @@ async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, S
             Some(record) if record.unchanged_from(before) => Found::Missing,
             other => Found::Changed(describe_record(other.as_ref())),
         }),
+        // The row and this run's reference to it: Temps' own rows.
+        Intent::TailscaleServe {
+            node_id,
+            node_name,
+            address_id,
+            hostname,
+            ..
+        } => Ok(
+            match ops.serve_reference(run_id, *node_id, address_id).await? {
+                Some((entry_id, created)) => Found::Made(Box::new(RunResource::TailscaleServe {
+                    node_id: *node_id,
+                    node_name: node_name.clone(),
+                    address_id: address_id.clone(),
+                    hostname: hostname.clone(),
+                    entry_id,
+                    created,
+                })),
+                None => Found::Missing,
+            },
+        ),
         other => Ok(match ops.find(other).await? {
             Some(resource) => Found::Made(Box::new(resource)),
             None => Found::Missing,
         }),
     }
+}
+
+/// Where taking a Serve entry off its worker stands (ADR 065 D4): the
+/// entry is gone once the agent reported `removed` or `absent`.
+async fn serve_removal(ops: &dyn RunOps, resource: &RunResource) -> Result<Found, String> {
+    let RunResource::TailscaleServe {
+        node_id,
+        node_name,
+        address_id,
+        hostname,
+        entry_id,
+        ..
+    } = resource
+    else {
+        return Ok(Found::Missing);
+    };
+    Ok(match ops.serve_entry(*node_id, address_id).await? {
+        Some(status) if status.entry_id == *entry_id && status.removing => {
+            if status.worker_gone {
+                Found::Changed(format!(
+                    "`{node_name}` left the cluster while it served `{hostname}`. Remove it \
+                     from the tailnet, or run `tailscale serve reset` on it, then confirm"
+                ))
+            } else if status.report.as_deref() == Some(REPORT_CONFLICT) {
+                Found::Changed(
+                    status
+                        .detail
+                        .unwrap_or_else(|| "a Serve entry Temps did not write".to_string()),
+                )
+            } else {
+                Found::Made(Box::new(resource.clone()))
+            }
+        }
+        // Removed, or replaced by a new entry since.
+        _ => Found::Missing,
+    })
 }
 
 /// What resolving a pending entry decided.
@@ -468,6 +627,36 @@ pub async fn resolve_pending(
     }
     if entry.next_lookup_at.is_some_and(|at| at > now) {
         return Resolution::Pending;
+    }
+    // Undo is taking a Serve entry off its worker: done once it is gone.
+    if let (true, Some(resource @ RunResource::TailscaleServe { .. })) =
+        (entry.deleting, entry.resource.clone())
+    {
+        return match serve_removal(ops, &resource).await {
+            Ok(Found::Missing) => {
+                entry.state = JournalState::Absent;
+                entry.conflict = None;
+                entry.failed_lookups = 0;
+                entry.at = now;
+                Resolution::Absent
+            }
+            Ok(Found::Changed(current)) => {
+                entry.state = JournalState::Conflict;
+                entry.conflict = Some(current);
+                entry.at = now;
+                Resolution::Conflict
+            }
+            Ok(Found::Made(_)) => {
+                entry.conflict = None;
+                Resolution::Pending
+            }
+            Err(error) => {
+                entry.failed_lookups = entry.failed_lookups.saturating_add(1);
+                entry.next_lookup_at = Some(now + chrono_of(lookup_backoff(entry.failed_lookups)));
+                entry.conflict = Some(format!("The last check could not answer: {error}"));
+                Resolution::Pending
+            }
+        };
     }
     let found = match look(ops, run_id, &entry.intent).await {
         Ok(found) => found,
@@ -603,6 +792,26 @@ pub fn decide(
             entry.intent.describe(),
             entry.conflict.as_deref().unwrap_or("something else")
         ));
+    }
+    if let Intent::TailscaleServe {
+        node_name,
+        hostname,
+        ..
+    } = &entry.intent
+    {
+        // ADR 065 D4: Temps never removes a handler it did not write, so
+        // the only answer is to leave the worker as it is and forget the
+        // entry; undo then deletes the row and carries on.
+        if decision == Decision::Overwrite || !undoing {
+            return Err(format!(
+                "Temps never changes Serve configuration it did not write, so it cannot take \
+                 {hostname} off {node_name} for you. Remove it there yourself, or keep it."
+            ));
+        }
+        entry.at = chrono::Utc::now();
+        entry.undo_decision = Some(Decision::Keep);
+        entry.state = JournalState::Done;
+        return Ok(());
     }
     entry.at = chrono::Utc::now();
     if undoing {
@@ -1044,6 +1253,161 @@ impl Runner<'_> {
                     Outcome::Failed(error.message)
                 }
             },
+        }
+    }
+
+    /// The address's id, from what attached it: the journal, else its row.
+    async fn address_id(&self) -> Result<String, String> {
+        let address = &self.input.address;
+        let attached = created(&self.record.journal)
+            .into_iter()
+            .find_map(|r| match r {
+                RunResource::CustomDomain { id, domain } if domain == *address => Some(id),
+                _ => None,
+            });
+        let id = match attached {
+            Some(id) => id,
+            None => match self.ops.find_custom_domain(address).await? {
+                Some((id, environment_id)) if environment_id == self.input.environment_id => id,
+                _ => {
+                    return Err(format!(
+                        "{address} is not attached to {} any more.",
+                        self.input.environment_name
+                    ))
+                }
+            },
+        };
+        Ok(temps_core::worker_ingress::private_address_id(true, id))
+    }
+
+    /// ADR 065 D4: declare the worker's Serve entry, referenced by this
+    /// run, then wait for its agent to apply it. Done only on `applied`;
+    /// the agent never overwrites what it did not write, so neither does
+    /// this step.
+    async fn configure_serve(&mut self, target: &ServeTarget) -> Outcome {
+        let input = self.input;
+        let host = input.address.clone();
+        let node = target.node_name.clone();
+        let address_id = match self.address_id().await {
+            Ok(id) => id,
+            Err(error) => return Outcome::Failed(error),
+        };
+        let intent = Intent::TailscaleServe {
+            node_id: target.node_id,
+            node_name: node.clone(),
+            address_id: address_id.clone(),
+            hostname: host.clone(),
+            service: target.service.clone(),
+        };
+        match self.begin(&intent).await {
+            Err(hold) => return hold.into(),
+            Ok(Begin::Have(_)) => {}
+            Ok(Begin::Go) => {
+                let wish = ServeWish {
+                    target: target.clone(),
+                    address_id: address_id.clone(),
+                    hostname: host.clone(),
+                };
+                let key = intent.key(input.run_id);
+                match self.ops.claim_serve_entry(input.run_id, &wish).await {
+                    Ok(claim @ (ServeClaim::Created { .. } | ServeClaim::Found { .. })) => {
+                        let (entry_id, created) = match claim {
+                            ServeClaim::Created { entry_id } => (entry_id, true),
+                            ServeClaim::Found { entry_id } => (entry_id, false),
+                            ServeClaim::Differs(_) | ServeClaim::Removing => (0, false),
+                        };
+                        self.finish(
+                            &key,
+                            Some(RunResource::TailscaleServe {
+                                node_id: target.node_id,
+                                node_name: node.clone(),
+                                address_id: address_id.clone(),
+                                hostname: host.clone(),
+                                entry_id,
+                                created,
+                            }),
+                        )
+                        .await;
+                    }
+                    Ok(ServeClaim::Differs(what)) => {
+                        self.finish(&key, None).await;
+                        return Outcome::Conflict(format!(
+                            "{node} already has a Serve entry for {host} that another Temps \
+                             setup asked for: {what}. Temps changes nothing there: undo that \
+                             setup first, then resume this one."
+                        ));
+                    }
+                    Ok(ServeClaim::Removing) => {
+                        self.finish(&key, None).await;
+                        return Outcome::Stalled(format!(
+                            "{node} is still taking an earlier Serve entry for {host} off its \
+                             config, and Temps never revives one being removed. Resume once \
+                             it has; its agent reports every 30 seconds."
+                        ));
+                    }
+                    Err(error) => {
+                        self.finish_failed(&intent, true).await;
+                        return Outcome::Failed(error);
+                    }
+                }
+            }
+        }
+        let mut waited = Duration::ZERO;
+        let mut last = format!(
+            "{node} has not applied the Serve entry for {host} yet; its agent applies it on its \
+             next pass, every 30 seconds."
+        );
+        loop {
+            match self.ops.serve_entry(target.node_id, &address_id).await {
+                Ok(None) => {
+                    return Outcome::Failed(format!(
+                        "The Serve entry for {host} on {node} is gone: something removed it \
+                         while this run waited."
+                    ))
+                }
+                Ok(Some(status)) if status.removing => {
+                    return Outcome::Failed(format!(
+                        "The Serve entry for {host} on {node} is being removed: another run's \
+                         undo took it off while this run waited."
+                    ))
+                }
+                Ok(Some(status)) if status.funnel => {
+                    return Outcome::Conflict(tailnet_messages::funnel(&node))
+                }
+                Ok(Some(status)) => match status.report.as_deref() {
+                    Some(REPORT_APPLIED) => {
+                        return Outcome::Done(Some(format!(
+                            "{node} serves {host} with Tailscale Serve."
+                        )))
+                    }
+                    Some(REPORT_CONFLICT) => {
+                        return Outcome::Conflict(tailnet_messages::slot_taken(
+                            &host,
+                            status
+                                .detail
+                                .as_deref()
+                                .unwrap_or("a Serve entry Temps did not write"),
+                        ))
+                    }
+                    Some(REPORT_ERROR) => {
+                        last = format!(
+                            "{node} could not apply the Serve entry for {host}: {}",
+                            status.detail.unwrap_or_default()
+                        )
+                    }
+                    _ => {
+                        if let Some(error) = status.worker_error {
+                            last = error;
+                        }
+                    }
+                },
+                Err(error) => last = format!("Could not read the Serve entry for {host}: {error}"),
+            }
+            if waited >= self.timing.publish {
+                return Outcome::Stalled(last);
+            }
+            self.ops.sleep(self.timing.poll).await;
+            waited += self.timing.poll.max(Duration::from_millis(1));
         }
     }
 
@@ -1655,6 +2019,12 @@ impl Runner<'_> {
                     },
                 }
             }
+            StepKind::ConfigureTailscaleServe => {
+                let Some(target) = input.serve.clone() else {
+                    return Outcome::Skipped("No worker serves it through Tailscale.".into());
+                };
+                self.configure_serve(&target).await
+            }
             StepKind::CheckReachability => {
                 let verdict = self.ops.reachability(&address).await;
                 if verdict.state == ReachState::Reachable {
@@ -1861,6 +2231,20 @@ fn undo_conflict_message(entry: &JournalEntry) -> String {
             entry.intent.describe(),
             entry.conflict.as_deref().unwrap_or("something else")
         ),
+        Intent::TailscaleServe {
+            node_name,
+            hostname,
+            ..
+        } => format!(
+            "Temps did not take {hostname} off {node_name}: {}. It never removes Serve \
+             configuration it did not write, so it touched nothing there, nor anything this run \
+             did before it. Keep it to forget Temps' Serve entry and leave {node_name} as it is, \
+             then undo carries on.",
+            entry
+                .conflict
+                .as_deref()
+                .unwrap_or("its Serve config holds something else")
+        ),
         _ => format!(
             "{} was changed by someone else after this run set it: it is now {}. Temps did not \
              touch it, nor anything this run did before it. Keep that value, or restore what \
@@ -1882,6 +2266,7 @@ fn journaled_hostnames(journal: &[JournalEntry]) -> std::collections::BTreeSet<S
             | Intent::DnsChange { hostname, .. }
             | Intent::AddressAudience { hostname, .. } => Some(hostname.clone()),
             Intent::Certificate { domain } => Some(domain.clone()),
+            Intent::TailscaleServe { hostname, .. } => Some(hostname.clone()),
             _ => None,
         })
         .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
@@ -1957,6 +2342,27 @@ pub async fn undo(
                     None => continue,
                 },
                 Resolution::Absent => continue,
+                Resolution::Pending if entry.deleting => {
+                    let what = match &entry.intent {
+                        Intent::TailscaleServe {
+                            node_name,
+                            hostname,
+                            ..
+                        } => format!("{node_name} to take {hostname} off its Serve config"),
+                        other => format!("{} to be removed", other.describe()),
+                    };
+                    return stop(
+                        results,
+                        Stop::Pending(format!(
+                            "Waiting for {what}; undo carries on once it is{}.",
+                            entry
+                                .conflict
+                                .as_deref()
+                                .map(|e| format!(" ({e})"))
+                                .unwrap_or_default()
+                        )),
+                    );
+                }
                 Resolution::Pending => {
                     return stop(
                         results,
@@ -1976,6 +2382,109 @@ pub async fn undo(
             },
         };
         let checked = entry.undo_decision == Some(Decision::Overwrite);
+        // ADR 065 D4: this run's reference goes first; the entry, and the
+        // worker's configuration, only with the last one.
+        if let RunResource::TailscaleServe {
+            node_id,
+            node_name,
+            address_id,
+            hostname,
+            entry_id,
+            ..
+        } = &resource
+        {
+            if entry.deleting && entry.undo_decision == Some(Decision::Keep) {
+                let outcome = ops.forget_serve_entry(*entry_id).await;
+                if outcome.is_ok() {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                }
+                results.push(UndoResult {
+                    label: format!(
+                        "Left {node_name}'s Serve config as it is and forgot Temps' entry for \
+                         {hostname}"
+                    ),
+                    resource: resource.clone(),
+                    ok: outcome.is_ok(),
+                    error: outcome.err(),
+                });
+                continue;
+            }
+            if entry.deleting {
+                // Still waiting on the agent (resolved above when pending).
+                return stop(
+                    results,
+                    Stop::Pending(format!(
+                        "Waiting for {node_name} to take {hostname} off its Serve config; \
+                         undo carries on once its agent reports it."
+                    )),
+                );
+            }
+            match ops.release_serve_entry(run_id, *node_id, address_id).await {
+                Ok(ServeRelease::Gone) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                }
+                Ok(ServeRelease::Kept(why)) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    results.push(UndoResult {
+                        label: format!("Kept {hostname} on {node_name}: {why}"),
+                        resource: resource.clone(),
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Ok(ServeRelease::Deleted) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    results.push(UndoResult {
+                        label: format!(
+                            "Removed Temps' Serve entry for {hostname} ({node_name} had written \
+                             nothing for it)"
+                        ),
+                        resource: resource.clone(),
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Ok(ServeRelease::Removing) => {
+                    entry.deleting = true;
+                    entry.state = JournalState::Pending;
+                    entry.pending_since = Some(now);
+                    entry.next_lookup_at = None;
+                    entry.failed_lookups = 0;
+                    entry.at = now;
+                    if let Err(error) = sink.save_journal(journal).await {
+                        return stop(
+                            results,
+                            Stop::Failed(format!(
+                                "{node_name} is taking {hostname} off its Serve config, but \
+                                 Temps could not record that: {error} Undo again to carry on."
+                            )),
+                        );
+                    }
+                    return stop(
+                        results,
+                        Stop::Pending(format!(
+                            "{node_name} is taking {hostname} off its Serve config; undo \
+                             carries on once its agent reports it, within a minute."
+                        )),
+                    );
+                }
+                Err(error) => {
+                    return stop(
+                        results,
+                        Stop::Failed(format!(
+                            "Temps could not release its Serve entry for {hostname} on \
+                             {node_name}, so it touched nothing from there on: {error} Undo \
+                             again to retry."
+                        )),
+                    )
+                }
+            }
+            continue;
+        }
         match &resource {
             RunResource::AddressAudience {
                 hostname, after, ..
@@ -2197,6 +2706,8 @@ pub async fn undo(
                 hostname, before, ..
             } => ops.set_address_audience(hostname, before).await,
             RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
+            // Handled above, before anything is removed.
+            RunResource::TailscaleServe { .. } => Ok(()),
         };
         let label = match &resource {
             RunResource::AutoManageEnabled { domain, .. } => {
@@ -2311,6 +2822,15 @@ mod tests {
         audience: Mutex<Option<AddressAudience>>,
         /// What the tunnel publishes now.
         served: Mutex<Vec<String>>,
+        /// What claiming a Serve entry finds; `None` creates entry 70.
+        serve_claim: Option<ServeClaim>,
+        /// The Serve entry and its worker's last report.
+        serve_status: Mutex<Option<ServeEntryStatus>>,
+        /// What releasing this run's reference leaves; `None` is
+        /// `Removing`.
+        serve_release: Option<ServeRelease>,
+        /// This run's reference to the entry.
+        serve_ref: Mutex<Option<(i32, bool)>>,
     }
 
     impl Fake {
@@ -2592,6 +3112,70 @@ mod tests {
             *self.audience.lock().expect("lock") = Some(audience.clone());
             Ok(())
         }
+        async fn claim_serve_entry(
+            &self,
+            _run_id: i32,
+            wish: &ServeWish,
+        ) -> Result<ServeClaim, String> {
+            self.log(format!(
+                "claim_serve_entry {} {} {}",
+                wish.target.node_name, wish.address_id, wish.hostname
+            ));
+            if self.fail.contains(&"claim_serve_entry") {
+                return Err("database is down".into());
+            }
+            let claim = self
+                .serve_claim
+                .clone()
+                .unwrap_or(ServeClaim::Created { entry_id: 70 });
+            match &claim {
+                ServeClaim::Created { entry_id } => {
+                    *self.serve_ref.lock().expect("lock") = Some((*entry_id, true))
+                }
+                ServeClaim::Found { entry_id } => {
+                    *self.serve_ref.lock().expect("lock") = Some((*entry_id, false))
+                }
+                ServeClaim::Differs(_) | ServeClaim::Removing => {}
+            }
+            Ok(claim)
+        }
+        async fn serve_reference(
+            &self,
+            _run_id: i32,
+            _node_id: i32,
+            address_id: &str,
+        ) -> Result<Option<(i32, bool)>, String> {
+            self.log(format!("serve_reference {address_id}"));
+            Ok(*self.serve_ref.lock().expect("lock"))
+        }
+        async fn serve_entry(
+            &self,
+            _node_id: i32,
+            _address_id: &str,
+        ) -> Result<Option<ServeEntryStatus>, String> {
+            self.log("serve_entry");
+            Ok(self.serve_status.lock().expect("lock").clone())
+        }
+        async fn release_serve_entry(
+            &self,
+            _run_id: i32,
+            _node_id: i32,
+            address_id: &str,
+        ) -> Result<ServeRelease, String> {
+            self.log(format!("release_serve_entry {address_id}"));
+            *self.serve_ref.lock().expect("lock") = None;
+            let release = self.serve_release.clone().unwrap_or(ServeRelease::Removing);
+            if release == ServeRelease::Removing {
+                if let Some(status) = self.serve_status.lock().expect("lock").as_mut() {
+                    status.removing = true;
+                }
+            }
+            Ok(release)
+        }
+        async fn forget_serve_entry(&self, entry_id: i32) -> Result<(), String> {
+            self.log(format!("forget_serve_entry {entry_id}"));
+            Ok(())
+        }
         async fn sleep(&self, _duration: Duration) {}
     }
 
@@ -2666,6 +3250,7 @@ mod tests {
             dns_before: PlannedRecord::Absent,
             certificate_challenge: None,
             audience: None,
+            serve: None,
         }
     }
 
@@ -3131,6 +3716,7 @@ mod tests {
                     network_range: Some("100.64.0.0/10".into()),
                     private_node_id: Some(2),
                     private_listener: Some("100.101.102.103".into()),
+                    ..AddressAudience::default()
                 },
                 AddressAudience::public(),
             )),
@@ -3942,5 +4528,289 @@ mod tests {
         let back: RunInput = serde_json::from_str(&json).expect("input");
         assert_eq!(back.token, None);
         assert_eq!(back.address, input.address);
+    }
+
+    fn serve_input() -> RunInput {
+        RunInput {
+            option: PlanOptionKind::TailscaleServe,
+            address: "homelab.example.ts.net".into(),
+            steps: steps(&[
+                StepKind::AttachDomain,
+                StepKind::SetAudience,
+                StepKind::ConfigureTailscaleServe,
+                StepKind::CheckReachability,
+            ]),
+            new_tunnel: None,
+            token: None,
+            audience: Some((
+                AddressAudience {
+                    audience: Audience::Private,
+                    private_node_id: Some(2),
+                    private_via: Some("tailscale_serve".into()),
+                    ..AddressAudience::default()
+                },
+                AddressAudience::public(),
+            )),
+            serve: Some(ServeTarget {
+                node_id: 2,
+                node_name: "homelab".into(),
+                via: "tailscale_serve".into(),
+                service: None,
+                tailnet: Some("example.ts.net".into()),
+            }),
+            ..token_input()
+        }
+    }
+
+    fn applied() -> ServeEntryStatus {
+        ServeEntryStatus {
+            entry_id: 70,
+            report: Some(REPORT_APPLIED.into()),
+            applied_etag: Some("\"e1\"".into()),
+            ..ServeEntryStatus::default()
+        }
+    }
+
+    fn serve_resource(record: &RunRecord) -> RunResource {
+        record
+            .created()
+            .into_iter()
+            .find(|r| matches!(r, RunResource::TailscaleServe { .. }))
+            .expect("a Serve entry")
+    }
+
+    /// ADR 065 D4: the run declares the entry with its reference, and the
+    /// step is done only once the worker's agent applied it. No DNS record
+    /// and no certificate.
+    #[tokio::test]
+    async fn a_machine_name_run_declares_the_entry_and_waits_for_applied() {
+        let ops = Fake {
+            reachable: true,
+            serve_status: Mutex::new(Some(applied())),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        assert_eq!(
+            serve_resource(&record),
+            RunResource::TailscaleServe {
+                node_id: 2,
+                node_name: "homelab".into(),
+                address_id: "custom:50".into(),
+                hostname: "homelab.example.ts.net".into(),
+                entry_id: 70,
+                created: true,
+            }
+        );
+        let calls = ops.calls();
+        assert!(
+            calls.contains(&"claim_serve_entry homelab custom:50 homelab.example.ts.net".into())
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("write_dns_record")
+            || c.starts_with("challenge")
+            || c == "certificate_exists"));
+        assert_eq!(
+            ops.audience
+                .lock()
+                .expect("lock")
+                .as_ref()
+                .map(|a| a.describe()),
+            Some("private to your tailnet".into())
+        );
+    }
+
+    /// ADR 065 D4: the agent never overwrites a slot it did not write, so
+    /// the run stops in conflict with D5's message and nothing to decide:
+    /// the worker's owner frees it, then resumes.
+    #[tokio::test]
+    async fn a_taken_slot_stops_the_run_in_conflict_with_nothing_to_decide() {
+        let ops = Fake {
+            serve_status: Mutex::new(Some(ServeEntryStatus {
+                entry_id: 70,
+                report: Some(REPORT_CONFLICT.into()),
+                detail: Some("http://127.0.0.1:3000".into()),
+                ..ServeEntryStatus::default()
+            })),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Conflict);
+        assert_eq!(
+            record.error.as_deref(),
+            Some(
+                "`homelab.example.ts.net` already serves `http://127.0.0.1:3000` (set with \
+                 `tailscale serve`, not by Temps). Remove it with `tailscale serve --https=443 \
+                 off`, or give this app a Service name."
+            )
+        );
+        assert!(record.conflicts().is_empty());
+        // The entry is the run's, so undo can take it back.
+        assert!(matches!(
+            serve_resource(&record),
+            RunResource::TailscaleServe { .. }
+        ));
+
+        // Funnel on the name stops it the same way.
+        let funnel = Fake {
+            serve_status: Mutex::new(Some(ServeEntryStatus {
+                funnel: true,
+                ..applied()
+            })),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &funnel, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Conflict);
+        assert!(record
+            .error
+            .unwrap_or_default()
+            .contains("Tailscale Funnel"));
+
+        // Another setup's entry for the slot: nothing is claimed.
+        let differs = Fake {
+            serve_claim: Some(ServeClaim::Differs("`svc:myapp`".into())),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &differs, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Conflict);
+        assert!(!record
+            .created()
+            .iter()
+            .any(|r| matches!(r, RunResource::TailscaleServe { .. })));
+
+        // An agent that never answers: waiting, not failed.
+        let silent = Fake {
+            serve_status: Mutex::new(Some(ServeEntryStatus {
+                entry_id: 70,
+                worker_error: Some("Tailscale on `homelab` is `NeedsLogin`.".into()),
+                ..ServeEntryStatus::default()
+            })),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &silent, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Waiting, "{:?}", record.error);
+        assert!(record.error.unwrap_or_default().contains("NeedsLogin"));
+    }
+
+    /// ADR 065 D4: undo drops the run's reference first; another setup
+    /// still using the entry keeps it, and the worker is left alone.
+    #[tokio::test]
+    async fn undo_keeps_an_entry_another_setup_still_uses() {
+        let ops = Fake {
+            reachable: true,
+            serve_status: Mutex::new(Some(applied())),
+            serve_release: Some(ServeRelease::Kept(
+                "homelab still serves it for another setup (set up on 3 October)".into(),
+            )),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &ops, &Saved::default(), timing()).await;
+        let mut journal = record.journal.clone();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert_eq!(outcome.stopped, None, "{:?}", outcome.results);
+        assert!(outcome.results.iter().any(|r| r
+            .label
+            .starts_with("Kept homelab.example.ts.net on homelab")));
+        assert!(ops
+            .calls()
+            .contains(&"release_serve_entry custom:50".into()));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("forget_serve_entry")));
+    }
+
+    /// ADR 065 D4: the last reference has the agent take its handler off;
+    /// undo waits for its report, then carries on with the older steps.
+    #[tokio::test]
+    async fn undo_waits_for_the_agent_to_remove_the_entry_then_carries_on() {
+        let ops = Fake {
+            reachable: true,
+            serve_status: Mutex::new(Some(applied())),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &ops, &Saved::default(), timing()).await;
+        let mut journal = record.journal.clone();
+        let sink = Journaled::default();
+        let outcome = undo(&mut journal, &ops, 0, &sink).await;
+        let Some(Stop::Pending(why)) = &outcome.stopped else {
+            panic!("expected to wait, got {:?}", outcome.stopped);
+        };
+        assert!(
+            why.contains("homelab is taking homelab.example.ts.net off its Serve config"),
+            "{why}"
+        );
+        // The domain this run attached is untouched while it waits.
+        assert!(!ops.calls().iter().any(|c| c.starts_with("detach_domain")));
+        assert!(journal.iter().any(|e| e.deleting));
+
+        // Still removing: still waiting.
+        let again = undo(&mut journal, &ops, 0, &sink).await;
+        assert!(matches!(again.stopped, Some(Stop::Pending(_))));
+
+        // The agent reported `removed`: the row is gone, undo carries on.
+        *ops.serve_status.lock().expect("lock") = None;
+        let done = undo(&mut journal, &ops, 0, &sink).await;
+        assert_eq!(done.stopped, None, "{:?}", done.results);
+        assert!(ops.calls().contains(&"detach_domain 50".into()));
+    }
+
+    /// ADR 065 D4: something else took the slot while the entry was being
+    /// removed. Temps never removes it; keeping it forgets the entry.
+    #[tokio::test]
+    async fn undo_never_removes_a_handler_temps_did_not_write() {
+        let ops = Fake {
+            reachable: true,
+            serve_status: Mutex::new(Some(applied())),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &ops, &Saved::default(), timing()).await;
+        let mut journal = record.journal.clone();
+        let sink = Journaled::default();
+        let _ = undo(&mut journal, &ops, 0, &sink).await;
+        *ops.serve_status.lock().expect("lock") = Some(ServeEntryStatus {
+            removing: true,
+            report: Some(REPORT_CONFLICT.into()),
+            detail: Some("`http://127.0.0.1:3000`".into()),
+            ..applied()
+        });
+        let outcome = undo(&mut journal, &ops, 0, &sink).await;
+        let Some(Stop::Conflict(why)) = &outcome.stopped else {
+            panic!("expected a conflict, got {:?}", outcome.stopped);
+        };
+        assert!(
+            why.contains("never removes Serve configuration it did not write"),
+            "{why}"
+        );
+        let key = journal
+            .iter()
+            .find(|e| matches!(e.intent, Intent::TailscaleServe { .. }))
+            .map(|e| e.key.clone())
+            .expect("entry");
+        assert!(decide(&mut journal, &key, Decision::Overwrite, true).is_err());
+        decide(&mut journal, &key, Decision::Keep, true).expect("kept");
+        let outcome = undo(&mut journal, &ops, 0, &sink).await;
+        assert_eq!(outcome.stopped, None, "{:?}", outcome.results);
+        assert!(ops.calls().contains(&"forget_serve_entry 70".into()));
+        assert!(ops.calls().contains(&"detach_domain 50".into()));
+    }
+
+    /// A conflict report on the last reference means the agent wrote
+    /// nothing: the row goes, undo does not wait.
+    #[tokio::test]
+    async fn undo_of_an_entry_the_agent_never_wrote_does_not_wait() {
+        let ops = Fake {
+            serve_status: Mutex::new(Some(ServeEntryStatus {
+                entry_id: 70,
+                report: Some(REPORT_CONFLICT.into()),
+                ..ServeEntryStatus::default()
+            })),
+            serve_release: Some(ServeRelease::Deleted),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &ops, &Saved::default(), timing()).await;
+        let mut journal = record.journal.clone();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert_eq!(outcome.stopped, None, "{:?}", outcome.results);
+        assert!(ops.calls().contains(&"detach_domain 50".into()));
     }
 }

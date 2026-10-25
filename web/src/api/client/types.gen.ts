@@ -83645,9 +83645,9 @@ export type AddressReachability = {
     network?: string | null;
 };
 
-export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker';
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve';
 
-export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience';
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'configure_tailscale_serve';
 
 export type PlanStep = {
     kind: StepKind;
@@ -83879,6 +83879,17 @@ export type RunResource = {
 } | {
     domain: string;
     type: 'certificate';
+} | {
+    node_id: number;
+    node_name: string;
+    address_id: string;
+    hostname: string;
+    entry_id: number;
+    /**
+     * This run created the entry, rather than finding it.
+     */
+    created: boolean;
+    type: 'tailscale_serve';
 };
 
 /**
@@ -83903,6 +83914,16 @@ export type AddressAudience = {
     network_range?: string | null;
     private_node_id?: number | null;
     private_listener?: string | null;
+    /**
+     * For `private`: how it is served (ADR 065 D1), `tailscale_serve` or
+     * `tailscale_service`. `None` is phase 2's listener, so runs journaled
+     * before this column compare equal to what they set.
+     */
+    private_via?: string | null;
+    /**
+     * For `tailscale_service`: the `svc:` name.
+     */
+    private_service?: string | null;
 };
 
 /**
@@ -83965,6 +83986,16 @@ export type Intent = {
 } | {
     domain: string;
     type: 'certificate';
+} | {
+    node_id: number;
+    node_name: string;
+    address_id: string;
+    hostname: string;
+    /**
+     * The `svc:` name, for a Service.
+     */
+    service?: string | null;
+    type: 'tailscale_serve';
 };
 
 export type JournalState = 'pending' | 'done' | 'absent' | 'conflict';

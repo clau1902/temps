@@ -22,6 +22,7 @@ use sea_orm::{
 use serde_json::Value;
 use temps_config::ConfigService;
 use temps_core::public_hostname::PublicHostnameStrategy;
+use temps_core::tailnet::TailscaleReport;
 use temps_core::ways_in::{
     only_private, private_allow_list_message, AddressWayIn, EnvironmentWaysIn, PrivateAllowList,
     WayInKind, WaysInError,
@@ -38,10 +39,12 @@ use temps_dns::{
     DnsRecordType, ManagedDnsRecordService, OwnershipScope, ProviderCredentials,
 };
 use temps_domains::DomainService;
+use temps_entities::audience::via;
 use temps_entities::{
     deployment_containers, dns_managed_record_states, domains, environment_domains, environments,
     ingress_connectors, node_public_ingress, nodes, project_custom_domains,
     project_ip_access_rules, projects, reachability_plans, reachability_runs,
+    tailnet_serve_entries,
 };
 use temps_projects::CustomDomainService;
 use thiserror::Error;
@@ -50,7 +53,7 @@ use tracing::{info, warn};
 use super::compute::{
     address_reachability, is_local_only, needs_lookup, overall_state, summary, AddressFacts,
     AddressInput, DirectIngress, InsideCheck, PrivateBinding, PrivateFacts, Resolution,
-    TunnelState, PRIVATE_COMMAND,
+    ServeEntryState, TailnetFacts, TunnelState, PRIVATE_COMMAND,
 };
 use super::model::{
     AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience, DecideRequest,
@@ -59,15 +62,17 @@ use super::model::{
     RunStepStatus, RunView, StepKind,
 };
 use super::plan::{
-    fingerprint, guess_zone, http01_direct, plan, planned_address, planned_record, private_worker,
-    record_type_of, records_to_read, tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for,
-    NamedId, PlanFacts, PrivateWorkerFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER,
-    FIELD_TOKEN,
+    address_for_audience, fingerprint, guess_zone, http01_direct, plan, planned_record,
+    private_worker, record_type_of, records_to_read, tunnel_domain_for, tunnel_route,
+    unique_tunnel_name, zone_for, NamedId, PlanFacts, PrivateWorkerFact, ServeEntryFact,
+    TailnetWorkerFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_TOKEN,
 };
 use super::run::{
     created, decide, execute, reconcile_journal, resume, undo, NewTunnel, RunInput, RunOps,
-    RunRecord, RunSink, Stop, Timing, TunnelStatus, WriteError, ZoneState,
+    RunRecord, RunSink, ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget, ServeWish, Stop,
+    Timing, TunnelStatus, WriteError, ZoneState,
 };
+use super::serve_entries;
 use super::token_check::{check_token, TokenCheckRequest, TokenCheckResult};
 use crate::error::IngressError;
 use crate::service::{
@@ -431,6 +436,7 @@ impl ReachabilityService {
                     range: custom.private_range.clone(),
                     node_id: custom.private_node_id,
                     listener: custom.private_listener.clone(),
+                    via: custom.private_via.clone(),
                 }),
             );
         }
@@ -451,6 +457,7 @@ impl ReachabilityService {
                     range: domain.private_range.clone(),
                     node_id: domain.private_node_id,
                     listener: domain.private_listener.clone(),
+                    via: domain.private_via.clone(),
                 }),
             );
         }
@@ -669,22 +676,47 @@ impl ReachabilityService {
             .into_iter()
             .map(|row| (row.node_id, row))
             .collect();
+        // ADR 065 D4: the Serve entries of the addresses served through
+        // tailscaled.
+        let entries: Vec<tailnet_serve_entries::Model> = if addresses
+            .iter()
+            .any(|a| a.private.as_ref().is_some_and(PrivateBinding::on_tailscale))
+        {
+            tailnet_serve_entries::Entity::find()
+                .filter(tailnet_serve_entries::Column::NodeId.is_in(node_ids.iter().copied()))
+                .all(db)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let now = Utc::now();
         addresses
             .iter()
             .filter_map(|input| {
                 let binding = input.private.as_ref()?;
                 let node_id = binding.node_id?;
-                Some((
-                    input.address.clone(),
+                let facts = if binding.on_tailscale() {
+                    tailnet_facts_of(
+                        binding,
+                        node_id,
+                        nodes.get(&node_id),
+                        rows.get(&node_id),
+                        entries
+                            .iter()
+                            .find(|e| e.node_id == node_id && e.address_id == binding.address_id),
+                        now,
+                    )
+                } else {
                     private_facts_of(
                         binding,
                         node_id,
                         nodes.get(&node_id),
                         rows.get(&node_id),
                         now,
-                    ),
-                ))
+                    )
+                };
+                Some((input.address.clone(), facts))
             })
             .collect()
     }
@@ -854,6 +886,47 @@ impl ReachabilityService {
                 (row.mode.as_deref() == Some("private")).then(|| private_worker_fact(worker, row))
             })
             .collect();
+        // ADR 065 D2: workers that report their tailscaled, and the Serve
+        // entries declared on them.
+        let now = Utc::now();
+        let tailnet_workers: Vec<TailnetWorkerFact> = workers
+            .iter()
+            .filter_map(|worker| {
+                let row = ingress_rows.iter().find(|r| r.node_id == worker.id)?;
+                let (report, minutes_ago) = tailscale_report_of(row, now)?;
+                let private = private_worker_fact(worker, row);
+                Some(TailnetWorkerFact {
+                    id: worker.id,
+                    name: worker.name.clone(),
+                    report,
+                    minutes_ago,
+                    listener_on_tailscale: private
+                        .listener
+                        .filter(|_| private.tailscale && row.mode.as_deref() == Some("private")),
+                })
+            })
+            .collect();
+        let serve_entries: Vec<ServeEntryFact> = if tailnet_workers.is_empty() {
+            Vec::new()
+        } else {
+            tailnet_serve_entries::Entity::find()
+                .filter(
+                    tailnet_serve_entries::Column::NodeId
+                        .is_in(tailnet_workers.iter().map(|w| w.id)),
+                )
+                .order_by_asc(tailnet_serve_entries::Column::Id)
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|e| ServeEntryFact {
+                    node_id: e.node_id,
+                    hostname: e.hostname,
+                    removing: e.state == tailnet_serve_entries::STATE_REMOVING,
+                    via: e.private_via,
+                    service: e.service_name,
+                })
+                .collect()
+        };
         let suggested_private_worker = gathered
             .running_on
             .iter()
@@ -926,10 +999,12 @@ impl ReachabilityService {
             private_workers,
             suggested_private_worker,
             private_ranges,
+            tailnet_workers,
+            serve_entries,
         };
         let mut dns_records = Vec::new();
         // The suggested address is known only now; D9 decides it too.
-        if let Ok(Some(address)) = planned_address(&facts) {
+        if let Ok(Some(address)) = address_for_audience(&facts) {
             // What a run would change is shown, and held to (D4).
             let ops = self.ops(None, None);
             for (host, record_type) in records_to_read(&facts, &address) {
@@ -984,7 +1059,7 @@ impl ReachabilityService {
         user_id: Option<i32>,
     ) -> Result<ReachabilityPlan, ReachabilityError> {
         let mut planned = plan(facts);
-        let address = planned_address(facts).ok().flatten();
+        let address = address_for_audience(facts).ok().flatten();
         let print = fingerprint(facts, address.as_deref());
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -1078,7 +1153,7 @@ impl ReachabilityService {
             .map(|p| Audience::parse(&p.audience))
             .unwrap_or_default();
         let (facts, settings) = self.facts_for(&scope, audience, requested).await?;
-        let address = match planned_address(&facts) {
+        let address = match address_for_audience(&facts) {
             Ok(Some(address)) => address,
             Ok(None) => {
                 return Err(ReachabilityError::Validation(
@@ -1189,6 +1264,7 @@ impl ReachabilityService {
             dns_before: PlannedRecord::Absent,
             certificate_challenge: None,
             audience: None,
+            serve: None,
             acme_email: settings
                 .letsencrypt
                 .email
@@ -1289,6 +1365,38 @@ impl ReachabilityService {
                         network_range: Some(range.to_string()),
                         private_node_id: Some(worker.id),
                         private_listener: Some(ip.to_string()),
+                        private_via: None,
+                        private_service: None,
+                    },
+                    self.current_audience(&address).await?,
+                ));
+            }
+            PlanOptionKind::TailscaleServe => {
+                // ADR 065 D1: the worker whose own name the address is.
+                let worker = facts
+                    .tailnet_workers
+                    .iter()
+                    .find(|w| w.report.dns_name.as_deref() == Some(address.as_str()))
+                    .ok_or_else(|| {
+                        ReachabilityError::Conflict(format!(
+                            "No worker's tailnet name is {address} any more."
+                        ))
+                    })?;
+                input.serve = Some(ServeTarget {
+                    node_id: worker.id,
+                    node_name: worker.name.clone(),
+                    via: via::TAILSCALE_SERVE.to_string(),
+                    service: None,
+                    tailnet: worker.report.tailnet.clone(),
+                });
+                input.audience = Some((
+                    AddressAudience {
+                        audience: Audience::Private,
+                        network_range: None,
+                        private_node_id: Some(worker.id),
+                        private_listener: None,
+                        private_via: Some(via::TAILSCALE_SERVE.to_string()),
+                        private_service: None,
                     },
                     self.current_audience(&address).await?,
                 ));
@@ -1522,8 +1630,13 @@ impl ReachabilityService {
         let scope = self.scope(project_id, environment_id).await?;
         let row = self.find_run(project_id, environment_id, run_id).await?;
         let state = RunState::parse(&row.state);
+        // ADR 065 D4: a Serve slot held by something else, or Funnel on the
+        // name, stops the run in conflict with nothing for Temps to
+        // decide: the worker's owner fixes it, then resumes.
+        let worker_conflict = state == RunState::Conflict && record_of(&row).conflicts().is_empty();
         match state {
             RunState::Waiting | RunState::Interrupted => {}
+            RunState::Conflict if worker_conflict => {}
             RunState::Recovering => return Err(ReachabilityError::Conflict(RECOVERING.into())),
             RunState::Conflict | RunState::UndoPaused => {
                 return Err(ReachabilityError::Conflict(
@@ -2102,6 +2215,10 @@ impl RunOps for LiveOps {
             Intent::DnsRecord { .. } | Intent::DnsChange { .. } => {
                 return Err("DNS records are looked up at their provider.".to_string())
             }
+            // Looked up by this run's reference to it (run.rs `look`).
+            Intent::TailscaleServe { .. } => {
+                return Err("Serve entries are looked up by the run's reference.".to_string())
+            }
             Intent::AddressAudience {
                 hostname, after, ..
             } => self
@@ -2569,6 +2686,7 @@ impl RunOps for LiveOps {
                     range: r.private_range.clone(),
                     node_id: r.private_node_id,
                     listener: r.private_listener.clone(),
+                    via: r.private_via.clone(),
                 }),
         };
         service
@@ -2611,6 +2729,50 @@ impl RunOps for LiveOps {
         Ok(())
     }
 
+    async fn claim_serve_entry(&self, run_id: i32, wish: &ServeWish) -> Result<ServeClaim, String> {
+        serve_entries::claim(self.deps.db.as_ref(), run_id, wish)
+            .await
+            .map_err(text)
+    }
+
+    async fn serve_reference(
+        &self,
+        run_id: i32,
+        node_id: i32,
+        address_id: &str,
+    ) -> Result<Option<(i32, bool)>, String> {
+        serve_entries::reference(self.deps.db.as_ref(), run_id, node_id, address_id)
+            .await
+            .map_err(text)
+    }
+
+    async fn serve_entry(
+        &self,
+        node_id: i32,
+        address_id: &str,
+    ) -> Result<Option<ServeEntryStatus>, String> {
+        serve_entries::status(self.deps.db.as_ref(), node_id, address_id)
+            .await
+            .map_err(text)
+    }
+
+    async fn release_serve_entry(
+        &self,
+        run_id: i32,
+        node_id: i32,
+        address_id: &str,
+    ) -> Result<ServeRelease, String> {
+        serve_entries::release(self.deps.db.as_ref(), run_id, node_id, address_id)
+            .await
+            .map_err(text)
+    }
+
+    async fn forget_serve_entry(&self, entry_id: i32) -> Result<(), String> {
+        serve_entries::forget(self.deps.db.as_ref(), entry_id)
+            .await
+            .map_err(text)
+    }
+
     async fn sleep(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
     }
@@ -2632,6 +2794,12 @@ pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudien
         network_range: row.private_range.clone().filter(|_| private),
         private_node_id: row.private_node_id.filter(|_| private),
         private_listener: row.private_listener.clone().filter(|_| private),
+        // `listener` is phase 2's way in, which journals record as `None`.
+        private_via: row
+            .private_via
+            .clone()
+            .filter(|v| private && v != via::LISTENER),
+        private_service: row.private_service.clone().filter(|_| private),
     }
 }
 
@@ -2646,6 +2814,14 @@ fn set_address_audience_on(
     active.private_range = Set(audience.network_range.clone().filter(|_| private));
     active.private_node_id = Set(audience.private_node_id.filter(|_| private));
     active.private_listener = Set(audience.private_listener.clone().filter(|_| private));
+    // ADR 065 D11: a private row always says how it is served.
+    active.private_via = Set(private.then(|| {
+        audience
+            .private_via
+            .clone()
+            .unwrap_or_else(|| via::LISTENER.to_string())
+    }));
+    active.private_service = Set(audience.private_service.clone().filter(|_| private));
 }
 
 /// A worker in private mode as its last report describes it.
@@ -2768,6 +2944,69 @@ pub fn private_facts_of(
         bound,
         tailscale,
         inside,
+        tailnet: None,
+    }
+}
+
+/// A worker's last tailscaled report (ADR 065 D2) and how many minutes old
+/// it is. `None` when it never sent one, or sent one this version cannot
+/// read.
+pub fn tailscale_report_of(
+    row: &node_public_ingress::Model,
+    now: chrono::DateTime<Utc>,
+) -> Option<(TailscaleReport, i64)> {
+    let value = row.tailscale.as_ref()?;
+    let report: TailscaleReport = serde_json::from_value(value.clone()).ok()?;
+    let received: chrono::DateTime<Utc> = value
+        .get("received_at")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or(row.updated_at);
+    Some((report, (now - received).num_minutes().max(0)))
+}
+
+/// What the control plane knows of `node_id` serving `binding` through
+/// tailscaled (ADR 065 D5): its last report, the address's Serve entry
+/// and the worker's inside check of it.
+pub fn tailnet_facts_of(
+    binding: &PrivateBinding,
+    node_id: i32,
+    node: Option<&nodes::Model>,
+    row: Option<&node_public_ingress::Model>,
+    entry: Option<&tailnet_serve_entries::Model>,
+    now: chrono::DateTime<Utc>,
+) -> PrivateFacts {
+    let worker = node
+        .map(|n| n.name.clone())
+        .unwrap_or_else(|| format!("node {node_id}"));
+    let report = row.and_then(|r| tailscale_report_of(r, now));
+    let bound = match (node, &report) {
+        (None, _) => Err(format!("{worker} is no longer part of this cluster.")),
+        (Some(n), _) if n.status != "active" => Err(format!(
+            "{worker} is {}. Bring it back, or make the address reachable on another worker.",
+            n.status
+        )),
+        (_, None) => Err(format!("{worker} has not reported on Tailscale yet.")),
+        _ => Ok(()),
+    };
+    let (report, minutes_ago) = report.unwrap_or_default();
+    PrivateFacts {
+        worker,
+        bound,
+        tailscale: true,
+        inside: None,
+        tailnet: Some(TailnetFacts {
+            report,
+            minutes_ago,
+            entry: entry
+                .filter(|e| e.address_id == binding.address_id)
+                .map(|e| ServeEntryState {
+                    entry_id: e.id,
+                    hostname: e.hostname.clone(),
+                    removing: e.state == tailnet_serve_entries::STATE_REMOVING,
+                    report: e.report.clone(),
+                    detail: e.report_detail.clone(),
+                }),
+        }),
     }
 }
 

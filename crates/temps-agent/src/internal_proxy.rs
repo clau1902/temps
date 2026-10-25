@@ -48,7 +48,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -188,6 +188,31 @@ struct ProxyState {
     require_sni: bool,
     acme: Option<PublicAcmeConfig>,
     acme_relay: Arc<AcmeRelayState>,
+    /// A Serve socket (ADR 065 D3): serves its one address, and is the only
+    /// listener that passes tailnet identity headers on.
+    serve: Option<Arc<ServeSocket>>,
+}
+
+/// One address's Serve socket (ADR 065 D3). The socket names the address;
+/// nothing in the request can name another.
+pub struct ServeSocket {
+    pub address_id: String,
+    /// A request with `Tailscale-Funnel-Request` reached it: the address is
+    /// public through Funnel. Reported, and cleared only when the agent sees
+    /// Funnel off.
+    pub funnel_seen: AtomicBool,
+    /// The Serve entry has `AllowFunnel`: every request is refused.
+    pub funnel_on: AtomicBool,
+}
+
+impl ServeSocket {
+    pub fn new(address_id: impl Into<String>) -> Self {
+        Self {
+            address_id: address_id.into(),
+            funnel_seen: AtomicBool::new(false),
+            funnel_on: AtomicBool::new(false),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -285,6 +310,7 @@ pub async fn spawn(
         forwarded_proto: "http",
         acme: None,
         acme_relay: Arc::new(AcmeRelayState::new()),
+        serve: None,
     });
     let app = axum::Router::new().fallback(handle).with_state(state);
 
@@ -440,12 +466,111 @@ async fn handle_private(state: &ProxyState, req: Request) -> Response {
         return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
     }
     if is_upgrade_request(req.headers()) {
-        return proxy_upgrade(&entry, req, state.forwarded_proto).await;
+        return proxy_upgrade(&entry, req, state.forwarded_proto, false).await;
     }
     proxy_with_retries(state, &entry, req).await
 }
 
+/// A Serve socket (ADR 065 D3). Only tailscaled can connect (the socket is in
+/// a `0700 root` directory), so what it sets is trusted here and nowhere
+/// else: `X-Forwarded-For` is the visitor, and `Tailscale-User-*` pass on.
+/// The address comes from the socket: `Host` is rewritten to its name and
+/// `X-Forwarded-Host` is ignored.
+async fn handle_serve(state: &ProxyState, socket: &ServeSocket, mut req: Request) -> Response {
+    if req.headers().contains_key("tailscale-funnel-request") {
+        if !socket.funnel_seen.swap(true, Ordering::AcqRel) {
+            warn!(address_id = %socket.address_id, "a Tailscale Funnel request reached a private address; refusing it");
+        }
+        return private_refusal(
+            StatusCode::FORBIDDEN,
+            "funnel",
+            "this private address is not served through Tailscale Funnel",
+        );
+    }
+    if socket.funnel_on.load(Ordering::Acquire) {
+        return private_refusal(
+            StatusCode::FORBIDDEN,
+            "funnel",
+            "this private address is on Tailscale Funnel, which makes it public; it is not served until Funnel is off",
+        );
+    }
+    let Some(entry) = state.store.lookup_serve(&socket.address_id) else {
+        return private_refusal(
+            StatusCode::NOT_FOUND,
+            "no-route",
+            "no private route for this address",
+        );
+    };
+    let Some(route) = entry.route else {
+        return private_refusal(
+            StatusCode::NOT_FOUND,
+            "no-route",
+            "no private route for this address",
+        );
+    };
+    // tailscaled replaces any client copy with the one address it saw; the
+    // last value is that one.
+    let visitor = req
+        .headers()
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+    let Some(visitor) = visitor else {
+        // No visitor: only the agent's own inside check asks without one.
+        if req.uri().path() == temps_core::tailnet::SERVE_PROBE_PATH {
+            let mut response = (StatusCode::OK, socket.address_id.clone()).into_response();
+            response.headers_mut().insert(
+                HeaderName::from_static(PRIVATE_REFUSAL_HEADER),
+                HeaderValue::from_static("probe"),
+            );
+            return response;
+        }
+        return private_refusal(
+            StatusCode::BAD_REQUEST,
+            "no-visitor",
+            "the request did not come through tailscaled",
+        );
+    };
+    if !temps_core::tailnet::is_tailscale_ip(visitor) {
+        return private_refusal(
+            StatusCode::FORBIDDEN,
+            "outside-range",
+            "this address is only for its tailnet",
+        );
+    }
+    match HeaderValue::from_str(&entry.hostname) {
+        Ok(host) => {
+            req.headers_mut().insert(axum::http::header::HOST, host);
+        }
+        Err(_) => {
+            return private_refusal(
+                StatusCode::NOT_FOUND,
+                "no-route",
+                "no private route for this address",
+            )
+        }
+    }
+    req.extensions_mut()
+        .insert(PublicPeer(SocketAddr::new(visitor, 0)));
+    if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
+        recorder.mark_project();
+    }
+    if route.backends.is_empty() {
+        return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
+    }
+    if is_upgrade_request(req.headers()) {
+        return proxy_upgrade(&route, req, "https", true).await;
+    }
+    proxy_with_retries(state, &route, req).await
+}
+
 async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
+    if let Some(socket) = state.serve.clone() {
+        return handle_serve(&state, &socket, req).await;
+    }
     if state.private_mode {
         return handle_private(&state, req).await;
     }
@@ -508,7 +633,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
             return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
         }
         if is_upgrade_request(req.headers()) {
-            return proxy_upgrade(&entry, req, state.forwarded_proto).await;
+            return proxy_upgrade(&entry, req, state.forwarded_proto, false).await;
         }
         return proxy_with_retries(&state, &entry, req).await;
     }
@@ -556,7 +681,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     // RFC 7230 Upgrade target (HTTP/2 prior knowledge isn't supported
     // here — internal traffic is plain HTTP/1.1).
     if is_upgrade_request(req.headers()) {
-        return proxy_upgrade(&entry, req, state.forwarded_proto).await;
+        return proxy_upgrade(&entry, req, state.forwarded_proto, false).await;
     }
 
     proxy_with_retries(&state, &entry, req).await
@@ -664,6 +789,66 @@ pub async fn spawn_tunnel_origin(
     Ok(bound)
 }
 
+/// Serve one address on its Serve socket (ADR 065 D3). The caller creates
+/// the `0700 root` directory; this binds the socket, makes it `0600`, and
+/// serves until `stop` fires or the task is aborted.
+pub async fn spawn_serve_socket(
+    path: &std::path::Path,
+    store: SharedRouteStore,
+    socket: Arc<ServeSocket>,
+    stop: Arc<Notify>,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    // A socket left by an earlier run: only a socket is ever removed.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)?,
+        Ok(_) => {
+            return Err(std::io::Error::other(format!(
+                "{} exists and is not a socket",
+                path.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = tokio::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_TIMEOUT)
+        .read_timeout(PUBLIC_UPSTREAM_IDLE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let address_id = socket.address_id.clone();
+    let state = Arc::new(ProxyState {
+        client,
+        store,
+        docker: None,
+        inspection_quotas: Arc::new(RwLock::new(HashMap::new())),
+        inspection_concurrency: Arc::new(Semaphore::new(1)),
+        caller_identities: Arc::new(RwLock::new(CallerIdentitySnapshot::new(HashMap::new()))),
+        public_mode: true,
+        private_mode: false,
+        forwarded_proto: "https",
+        require_sni: false,
+        acme: None,
+        acme_relay: Arc::new(AcmeRelayState::new()),
+        serve: Some(socket),
+    });
+    let app = crate::worker_metrics::recorded(
+        axum::Router::new().fallback(handle).with_state(state),
+        crate::worker_metrics::proxy_metrics(),
+    );
+    Ok(tokio::spawn(async move {
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            stop.notified().await;
+        });
+        if let Err(error) = server.await {
+            error!(%error, %address_id, "Serve socket listener exited");
+        }
+    }))
+}
+
 fn public_router_with(
     store: SharedRouteStore,
     forwarded_proto: &'static str,
@@ -702,6 +887,7 @@ fn router_with(
         require_sni,
         acme,
         acme_relay: Arc::new(AcmeRelayState::new()),
+        serve: None,
     });
     // ADR 061: public edge traffic is counted like the control plane's proxy.
     Ok(crate::worker_metrics::recorded(
@@ -1058,6 +1244,7 @@ async fn proxy_upgrade(
     entry: &RouteEntry,
     req: Request,
     forwarded_proto: &'static str,
+    serve_socket: bool,
 ) -> Response {
     use rand::prelude::IndexedRandom;
     let backend = {
@@ -1140,7 +1327,7 @@ async fn proxy_upgrade(
         {
             continue;
         }
-        if name_str == "host" {
+        if name_str == "host" || !temps_core::tailnet::forwards_header(name_str, serve_socket) {
             continue;
         }
         wire.extend_from_slice(name_str.as_bytes());
@@ -1591,7 +1778,10 @@ async fn forward_once(
     let mut builder = state.client.request(metadata.method.clone(), &upstream_url);
 
     for (name, value) in metadata.headers.iter() {
-        if HOP_BY_HOP.contains(&name.as_str()) {
+        // Tailnet identity is trusted only from a Serve socket (ADR 065 D3).
+        if HOP_BY_HOP.contains(&name.as_str())
+            || !temps_core::tailnet::forwards_header(name.as_str(), state.serve.is_some())
+        {
             continue;
         }
         builder = builder.header(name.as_str(), value);
@@ -1986,7 +2176,9 @@ mod tests {
                     .insert(PublicConnectionPermit(Arc::clone(&permit)));
                 let entry = entry.clone();
                 async move {
-                    Ok::<_, Infallible>(proxy_upgrade(&entry, request.map(Body::new), "http").await)
+                    Ok::<_, Infallible>(
+                        proxy_upgrade(&entry, request.map(Body::new), "http", false).await,
+                    )
                 }
             });
             hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())

@@ -79,6 +79,41 @@ pub struct PublicIngressSnapshot {
     /// `routes`: the direct listeners and the tunnel origin answer them 404.
     #[serde(default)]
     pub private_routes: Vec<PrivateRouteEntry>,
+    /// What this worker serves through tailscaled (ADR 065 D4). Never in
+    /// `routes` or `private_routes`: only the address's own Serve socket
+    /// answers it.
+    #[serde(default)]
+    pub serve_entries: Vec<ServeEntry>,
+}
+
+/// One Serve entry the control plane declared for this worker (ADR 065 D4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServeEntry {
+    /// The `tailnet_serve_entries` row: what the agent's report names.
+    pub entry_id: i32,
+    /// The address, and so its socket.
+    pub address_id: String,
+    /// The tailnet name visitors open.
+    pub hostname: String,
+    /// `tailscale_serve` or `tailscale_service`.
+    pub via: String,
+    /// The `svc:` name, for a Service.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// No run needs it any more: take it off, then report.
+    #[serde(default)]
+    pub removing: bool,
+    /// The Serve config `Etag` the agent's last write produced, as recorded.
+    #[serde(default)]
+    pub applied_etag: Option<String>,
+    /// Where requests go. `None` while it is held back or being removed:
+    /// the socket then answers 404.
+    #[serde(default)]
+    pub route: Option<RouteEntry>,
+    /// A Service's addresses as Tailscale assigned them (D4): the only
+    /// answers the inside check accepts for its name.
+    #[serde(default)]
+    pub addrs: Vec<String>,
 }
 
 /// A private address and what bounds it (ADR 064 D5).
@@ -136,6 +171,8 @@ pub struct RouteStore {
     public_enabled: AtomicBool,
     public_routes: ArcSwap<HashMap<String, RouteEntry>>,
     private_routes: ArcSwap<HashMap<String, PrivateRouteEntry>>,
+    /// Serve entries with a route, by address id (ADR 065 D3).
+    serve_routes: ArcSwap<HashMap<String, ServeEntry>>,
     public_certificates: RwLock<Option<(String, HashMap<String, PublicIngressCertBundle>)>>,
     public_tls_private_key: RwLock<Option<String>>,
     public_tls_keys: ArcSwap<HashMap<String, Arc<CertifiedKey>>>,
@@ -153,6 +190,7 @@ impl RouteStore {
             public_enabled: AtomicBool::new(false),
             public_routes: ArcSwap::from_pointee(HashMap::new()),
             private_routes: ArcSwap::from_pointee(HashMap::new()),
+            serve_routes: ArcSwap::from_pointee(HashMap::new()),
             public_certificates: RwLock::new(None),
             public_tls_private_key: RwLock::new(None),
             public_tls_keys: ArcSwap::from_pointee(HashMap::new()),
@@ -253,6 +291,26 @@ impl RouteStore {
             .load()
             .get(host.trim_end_matches('.').to_ascii_lowercase().as_str())
             .cloned()
+    }
+
+    /// The address a Serve socket serves (ADR 065 D3), by its id, under the
+    /// same authorization lease as public routes. Only an entry the control
+    /// plane still wants served, with a route.
+    pub fn lookup_serve(&self, address_id: &str) -> Option<ServeEntry> {
+        if !self.public_enabled.load(Ordering::Acquire) || !self.public_ingress_authorized() {
+            return None;
+        }
+        self.serve_routes.load().get(address_id).cloned()
+    }
+
+    /// Every declared Serve entry, being removed or not, for the Serve
+    /// manager. Not gated on the lease: a control plane out of reach is no
+    /// reason to change tailscaled's config, and the sockets refuse on their
+    /// own once the lease lapses.
+    pub fn serve_entries(&self) -> Vec<ServeEntry> {
+        let mut entries = self.public_ingress.read().serve_entries.clone();
+        entries.sort_by(|a, b| a.address_id.cmp(&b.address_id));
+        entries
     }
 
     /// The private addresses currently served, for the inside checks.
@@ -443,6 +501,14 @@ impl RouteStore {
     }
 
     fn rebuild_public_indexes(&self, snapshot: &PublicIngressSnapshot) {
+        self.serve_routes.store(Arc::new(
+            snapshot
+                .serve_entries
+                .iter()
+                .filter(|entry| !entry.removing && entry.route.is_some())
+                .map(|entry| (entry.address_id.clone(), entry.clone()))
+                .collect(),
+        ));
         self.private_routes.store(Arc::new(
             snapshot
                 .private_routes
@@ -722,6 +788,7 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            serve_entries: Vec::new(),
         });
 
         assert!(store.lookup_public("example.com").is_some());
