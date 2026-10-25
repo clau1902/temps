@@ -24,7 +24,7 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { problemDetail } from '@/lib/api-problem'
-import { AUDIENCE_LABELS, addressUrl, wayInLabel } from '@/lib/reachability'
+import { addressUrl, audienceLabel, wayInLabel } from '@/lib/reachability'
 import { MakeReachableDialog } from './MakeReachableDialog'
 import { useMakeReachableDialog } from './ReachabilityStatus'
 
@@ -194,7 +194,7 @@ function AddressRow({
         </a>
         <Badge variant={badge.variant}>{badge.label}</Badge>
         <span className="text-xs text-muted-foreground">
-          {AUDIENCE_LABELS[address.audience]} · {wayInLabel(address.way_in)}
+          {audienceLabel(address)} · {wayInLabel(address.way_in)}
         </span>
       </div>
       {address.state !== 'reachable' && (

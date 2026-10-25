@@ -3,6 +3,8 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  joinIngressFlag,
+  privateIngressSummary,
   workerIngressStatus,
   workerIngressWay,
   type WorkerIngressState,
@@ -117,5 +119,33 @@ describe('workerIngressWay', () => {
         []
       )
     ).toEqual({ kind: 'direct', running: true })
+  })
+})
+
+describe('private ingress (ADR 064 D5)', () => {
+  test('the join command can serve only the tailnet', () => {
+    expect(joinIngressFlag('private')).toBe(
+      ' --ingress private --listen tailscale'
+    )
+    expect(joinIngressFlag('off')).toBe('')
+    expect(joinIngressFlag('delegated')).toBe(' --ingress delegated')
+  })
+
+  test('the worker card names the listener and Tailscale', () => {
+    expect(
+      privateIngressSummary({
+        mode: 'private',
+        private_listener: '100.101.102.103',
+        private_on_tailscale: true,
+      })
+    ).toContain('100.101.102.103 (Tailscale)')
+    expect(
+      privateIngressSummary({
+        mode: 'private',
+        private_listener: null,
+        listener_error: 'Start Tailscale (`tailscale up`) on this worker.',
+      })
+    ).toContain('Start Tailscale')
+    expect(privateIngressSummary({ mode: 'delegated' })).toBeNull()
   })
 })

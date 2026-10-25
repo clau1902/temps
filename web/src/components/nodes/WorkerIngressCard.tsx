@@ -66,8 +66,10 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { problemDetail } from '@/lib/api-problem'
 import {
   ALLOW_INGRESS_COMMANDS,
+  PRIVATE_INGRESS_COMMAND,
   type AddressScope,
   addressScope,
+  privateIngressSummary,
   scopeLabel,
   workerIngressStatus,
 } from '@/lib/worker-ingress'
@@ -248,6 +250,8 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   // predate modes report none and keep the old, console-managed behaviour.
   const mode = settings?.mode ?? null
   const workerOff = mode === 'off'
+  // ADR 064 D5: the worker's owner chose to serve only its private network.
+  const privateOnly = mode === 'private'
   const listenLocked = mode === 'off' || mode === 'fixed'
   const shownCheck = check ?? settings?.last_check ?? null
   // Tunnels expose a worker as much as open ports do, so they need the
@@ -267,6 +271,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   const unconfigured =
     !!settings &&
     !workerOff &&
+    !privateOnly &&
     connectorsQuery.isSuccess &&
     !tunnelHere &&
     !enabled
@@ -332,7 +337,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
               </p>
             )}
           </div>
-          {settings && !unconfigured && (
+          {settings && !unconfigured && !privateOnly && (
             <Button
               size="sm"
               variant={editing ? 'default' : 'outline'}
@@ -357,7 +362,39 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
           </div>
         )}
 
-        {settings && !showEditor && (
+        {settings && privateOnly && (
+          <div className="space-y-2 text-sm">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="secondary">Private network only</Badge>
+              {settings.private_on_tailscale && (
+                <Badge variant="outline">Tailscale detected</Badge>
+              )}
+            </div>
+            <p
+              className={
+                settings.private_listener
+                  ? 'text-muted-foreground'
+                  : 'text-destructive'
+              }
+            >
+              {privateIngressSummary(settings)}
+            </p>
+            {!settings.private_listener && (
+              <WorkerCommand
+                command={PRIVATE_INGRESS_COMMAND}
+                hint="Run as root on the worker once Tailscale is up."
+              />
+            )}
+            <p className="text-xs text-muted-foreground">
+              Apps are reachable here only through addresses made private with
+              Make it reachable → Only my private network. To take public
+              traffic too, run <code>{ALLOW_INGRESS_COMMANDS.delegated}</code>{' '}
+              on the worker.
+            </p>
+          </div>
+        )}
+
+        {settings && !showEditor && !privateOnly && (
           <WorkerIngressSummary
             node={node}
             settings={settings}
@@ -365,7 +402,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
           />
         )}
 
-        {settings && draft && showEditor && (
+        {settings && draft && showEditor && !privateOnly && (
           <div className="space-y-4">
             {unconfigured && (
               <Alert className="border-amber-500/30 bg-amber-500/5">

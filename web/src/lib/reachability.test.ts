@@ -22,6 +22,8 @@ import {
   defaultOption,
   missingAnswers,
   reachabilityHeadline,
+  audienceLabel,
+  privateDnsWarning,
   wayInLabel,
 } from './reachability'
 
@@ -397,5 +399,65 @@ describe('conflicts (ADR 064 D4)', () => {
       'keep',
       'overwrite',
     ])
+  })
+})
+
+describe('private addresses (ADR 064 D5)', () => {
+  test('the headline says private, with the network', () => {
+    const headline = reachabilityHeadline(
+      environment({
+        state: 'reachable',
+        addresses: [
+          address({
+            address: 'internal.example.com',
+            audience: 'private',
+            network: 'Tailscale',
+            state: 'reachable',
+            way_in: 'private:homelab',
+          }),
+        ],
+      })
+    )
+    expect(headline).toEqual({
+      kind: 'private',
+      address: 'internal.example.com',
+      url: 'https://internal.example.com',
+      network: 'Tailscale',
+    })
+    expect(wayInLabel('private:homelab')).toBe('Private listener on homelab')
+  })
+
+  test('Domains names the network a private address is for', () => {
+    expect(audienceLabel({ audience: 'private', network: 'Tailscale' })).toBe(
+      'Private: Tailscale only'
+    )
+    expect(
+      audienceLabel({ audience: 'private', network: '192.168.0.0/16' })
+    ).toBe('Private: 192.168.0.0/16 only')
+    expect(audienceLabel({ audience: 'private', network: null })).toBe(
+      'Private'
+    )
+    expect(audienceLabel({ audience: 'public' })).toBe('Anyone')
+  })
+
+  test('the private option warns that its DNS record reveals the name', () => {
+    const option = {
+      kind: 'private_worker' as const,
+      title: 'Only my private network, through homelab',
+      description: '',
+      actions: 1,
+      recommended: true,
+      way_in: 'private:homelab',
+      steps: [],
+      fields: [],
+      warnings: [
+        'This adds a public DNS record: anyone can look up internal.example.com and see that it exists and that it points at 100.101.102.103.',
+      ],
+      required_permissions: [],
+    }
+    expect(privateDnsWarning(option)).toContain('100.101.102.103')
+    expect(
+      privateDnsWarning({ ...option, kind: 'direct_managed_dns' })
+    ).toBeNull()
   })
 })

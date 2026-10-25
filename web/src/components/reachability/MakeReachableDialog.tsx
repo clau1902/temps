@@ -88,12 +88,15 @@ import {
   defaultOption,
   isActiveRun,
   missingAnswers,
+  privateDnsWarning,
   resumeNeedsToken,
   stalePlan,
 } from '@/lib/reachability'
 import { cn } from '@/lib/utils'
 
 const schema = z.object({
+  /** Who can open the address (ADR 064 D5). */
+  audience: z.enum(['public', 'private']),
   address: z.string().trim(),
   option: z.string().min(1, 'Pick a way in.'),
   values: z.record(z.string(), z.string()),
@@ -125,13 +128,26 @@ export function MakeReachableDialog({
 
   const form = useForm<Values>({
     resolver: zodResolver(schema),
-    defaultValues: { address: '', option: '', values: {}, confirmed: false },
+    defaultValues: {
+      audience: 'public',
+      address: '',
+      option: '',
+      values: {},
+      confirmed: false,
+    },
   })
   const typedAddress = useWatch({ control: form.control, name: 'address' })
   const requested = useDebounce(typedAddress.trim(), 500)
   const chosen = useWatch({ control: form.control, name: 'option' })
   const answers = useWatch({ control: form.control, name: 'values' })
-  const planKey = ['reachabilityPlan', projectId, environmentId, requested]
+  const audience = useWatch({ control: form.control, name: 'audience' })
+  const planKey = [
+    'reachabilityPlan',
+    projectId,
+    environmentId,
+    audience,
+    requested,
+  ]
 
   // A run already going on this environment is picked up, not duplicated.
   const runs = useQuery({
@@ -160,7 +176,7 @@ export function MakeReachableDialog({
     queryFn: async ({ signal }) => {
       const { data } = await planEnvironmentReachability({
         path,
-        body: { audience: 'public', address: requested || null },
+        body: { audience, address: requested || null },
         signal,
         throwOnError: true,
       })
@@ -210,7 +226,11 @@ export function MakeReachableDialog({
   const apply = useMutation({
     ...applyEnvironmentReachabilityMutation(),
     onSuccess: (started) => setRunId(started.id),
-    onError: (error) => {
+    onError: (error, variables) => {
+      // Changing who an existing address is for needs a recent
+      // confirmation (ADR 064 Security).
+      if (handleSensitiveActionError(error, () => apply.mutate(variables)))
+        return
       // Nothing was created: show the plan the cluster has now.
       const fresh = stalePlan(error)
       if (fresh) {
@@ -302,9 +322,9 @@ export function MakeReachableDialog({
           <DialogHeader>
             <DialogTitle>Make it reachable</DialogTitle>
             <DialogDescription>
-              Give {environmentName ?? 'this environment'} an address anyone on
-              the internet can open. Temps sets up only what is missing, and can
-              undo it.
+              Give {environmentName ?? 'this environment'} an address, open to
+              anyone on the internet or only to your private network. Temps sets
+              up only what is missing, and can undo it.
             </DialogDescription>
           </DialogHeader>
           {runId !== null ? (
@@ -380,6 +400,52 @@ export function MakeReachableDialog({
                 onSubmit={form.handleSubmit(submit)}
                 className="space-y-5"
               >
+                <FormField
+                  control={form.control}
+                  name="audience"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Who can open it</FormLabel>
+                      <FormControl>
+                        <RadioGroup
+                          aria-label="Who can open it"
+                          value={field.value}
+                          onValueChange={(next) => {
+                            field.onChange(next)
+                            form.setValue('option', '')
+                            form.setValue('confirmed', false)
+                          }}
+                          className="grid gap-2 sm:grid-cols-2"
+                        >
+                          {AUDIENCES.map((choice) => (
+                            <label
+                              key={choice.value}
+                              className={cn(
+                                'flex cursor-pointer items-start gap-2 rounded-md border p-3',
+                                field.value === choice.value
+                                  ? 'border-primary'
+                                  : 'border-border hover:border-primary/50'
+                              )}
+                            >
+                              <RadioGroupItem
+                                value={choice.value}
+                                className="mt-0.5"
+                              />
+                              <span className="space-y-0.5">
+                                <span className="block text-sm font-medium">
+                                  {choice.label}
+                                </span>
+                                <span className="block text-xs text-muted-foreground">
+                                  {choice.help}
+                                </span>
+                              </span>
+                            </label>
+                          ))}
+                        </RadioGroup>
+                      </FormControl>
+                    </FormItem>
+                  )}
+                />
                 <FormField
                   control={form.control}
                   name="address"
@@ -470,6 +536,14 @@ export function MakeReachableDialog({
                     </FormItem>
                   )}
                 />
+                {option && privateDnsWarning(option) && (
+                  <Alert variant="warning">
+                    <AlertTriangle className="h-4 w-4" />
+                    <AlertDescription>
+                      {privateDnsWarning(option)}
+                    </AlertDescription>
+                  </Alert>
+                )}
                 {apply.isError && (
                   <Alert
                     variant={stalePlan(apply.error) ? 'warning' : 'destructive'}
@@ -511,6 +585,19 @@ export function MakeReachableDialog({
     </>
   )
 }
+
+const AUDIENCES = [
+  {
+    value: 'public',
+    label: 'Anyone on the internet',
+    help: 'A public address with HTTPS.',
+  },
+  {
+    value: 'private',
+    label: 'Only my private network',
+    help: 'Served by a worker on your tailnet or LAN; nobody else can connect.',
+  },
+] as const
 
 function PlanChoices({
   plan,

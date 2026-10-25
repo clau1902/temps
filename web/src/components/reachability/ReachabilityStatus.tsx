@@ -69,6 +69,21 @@ export function ReachabilityStatus({
           </a>
         </span>
       )
+    } else if (headline.kind === 'private') {
+      line = (
+        <span className="truncate">
+          Private at{' '}
+          <a
+            href={headline.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-medium text-foreground underline-offset-4 hover:underline"
+          >
+            {headline.address}
+          </a>
+          {headline.network && ` (${headline.network})`}
+        </span>
+      )
     } else if (headline.kind === 'not_reachable') {
       offerFix = headline.canFix
       line = (

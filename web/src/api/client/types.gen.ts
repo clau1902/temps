@@ -15942,7 +15942,7 @@ export type IngestErrorsResponse = {
  * worker only (`temps join --ingress`, `temps agent ingress`): opening ports
  * on a machine is its owner's decision, whoever runs the control plane.
  */
-export type IngressMode = 'off' | 'fixed' | 'delegated';
+export type IngressMode = 'off' | 'fixed' | 'delegated' | 'private';
 
 export type InheritedEnvVarResponse = {
     /**
@@ -23215,6 +23215,10 @@ export type PublicIngressInterface = {
     default_route: boolean;
     name: string;
     scope: AddressScope;
+    /**
+     * The worker's Tailscale address (`tailscale0`, in 100.64.0.0/10).
+     */
+    tailscale?: boolean;
 };
 
 export type PublicIngressSettings = {
@@ -23249,6 +23253,15 @@ export type PublicIngressSettings = {
     listening_https?: string | null;
     mode?: IngressMode | null;
     node_id: number;
+    /**
+     * In `private` mode (ADR 064 D5): the private address the listener is
+     * bound on, when it is a private one.
+     */
+    private_listener?: string | null;
+    /**
+     * That address is the worker's Tailscale one.
+     */
+    private_on_tailscale: boolean;
     /**
      * Configured public address; `None` means the listen address.
      */
@@ -83314,10 +83327,16 @@ export type AddressReachability = {
     source: AddressSource;
     state: ReachState;
     /**
-     * How traffic gets in: `tunnel:<name>`, `direct:<node>`, or
-     * `direct:control-plane`. `None` while nothing does.
+     * How traffic gets in: `tunnel:<name>`, `direct:<node>`,
+     * `direct:control-plane`, or `private:<node>` for a worker's private
+     * listener. `None` while nothing does.
      */
     way_in?: string | null;
+    /**
+     * For a private address: the network it is reachable from, `Tailscale`
+     * or the range (ADR 064 D7).
+     */
+    network?: string | null;
 };
 
 export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker';

@@ -138,10 +138,40 @@ export function scopeLabel(scope: AddressScope): string {
  * What a new worker allows, chosen in Add worker and passed to `temps join`.
  * Only the worker can change it afterwards (`temps agent ingress`).
  */
-export type JoinIngressChoice = 'off' | 'delegated' | 'fixed'
+export type JoinIngressChoice = 'off' | 'delegated' | 'fixed' | 'private'
 
 export function joinIngressFlag(choice: JoinIngressChoice): string {
-  return choice === 'off' ? '' : ` --ingress ${choice}`
+  if (choice === 'off') return ''
+  // Private mode serves only the tailnet (ADR 064 D5); the listen address
+  // is the worker's `tailscale0` one.
+  if (choice === 'private') return ' --ingress private --listen tailscale'
+  return ` --ingress ${choice}`
+}
+
+/** The command, run on the worker, that serves only its private network. */
+export const PRIVATE_INGRESS_COMMAND =
+  'temps agent ingress private --listen tailscale'
+
+/**
+ * A private-mode worker's listener in words: where it listens and whether
+ * that is its Tailscale address (ADR 064 D5).
+ */
+export function privateIngressSummary(settings: {
+  mode?: string | null
+  private_listener?: string | null
+  private_on_tailscale?: boolean
+  listener_error?: string | null
+}): string | null {
+  if (settings.mode !== 'private') return null
+  if (!settings.private_listener) {
+    return settings.listener_error
+      ? `Private network only, not listening: ${settings.listener_error}`
+      : 'Private network only, not listening yet.'
+  }
+  const where = settings.private_on_tailscale
+    ? `${settings.private_listener} (Tailscale)`
+    : settings.private_listener
+  return `Private network only: listening on ${where}, port 443; port 80 redirects to HTTPS.`
 }
 
 /** The commands, run on the worker, that let it take public traffic. */

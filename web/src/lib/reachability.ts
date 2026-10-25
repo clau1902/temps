@@ -19,6 +19,9 @@ import type {
 
 export type ReachabilityHeadline =
   | { kind: 'public'; address: string; url: string }
+  /** Reachable only from a private network: `network` is `Tailscale` or
+   * the range (ADR 064 D7). */
+  | { kind: 'private'; address: string; url: string; network: string | null }
   | { kind: 'not_reachable'; reason: string; canFix: boolean }
   | { kind: 'unknown'; reason: string }
   | { kind: 'checking'; reason: string }
@@ -45,6 +48,13 @@ export function reachabilityHeadline(
   reachability: EnvironmentReachability
 ): ReachabilityHeadline {
   const best = bestAddress(reachability.addresses)
+  if (best?.audience === 'private')
+    return {
+      kind: 'private',
+      address: best.address,
+      url: addressUrl(best.address),
+      network: best.network ?? null,
+    }
   if (best)
     return {
       kind: 'public',
@@ -69,9 +79,34 @@ export function wayInLabel(wayIn: string | null | undefined): string {
   if (wayIn === 'tunnel:new') return 'A new tunnel'
   const [kind, name] = wayIn.split(':', 2)
   if (kind === 'tunnel') return `Tunnel ${name}`
+  if (kind === 'private') return `Private listener on ${name}`
   if (kind === 'direct')
     return name === 'control-plane' ? 'This server' : `Straight to ${name}`
   return wayIn
+}
+
+/**
+ * For the private option: the warning that its public DNS record reveals
+ * the name and the internal address, shown before Create.
+ */
+export function privateDnsWarning(option: PlanOption): string | null {
+  if (option.kind !== 'private_worker') return null
+  return option.warnings.find((w) => w.includes('public DNS record')) ?? null
+}
+
+/**
+ * Who an address is for, as the Domains list says it: a private one names
+ * its network, `Tailscale` or the range (ADR 064 D7).
+ */
+export function audienceLabel(
+  address: Pick<AddressReachability, 'audience' | 'network'>
+): string {
+  if (address.audience !== 'private') return AUDIENCE_LABELS[address.audience]
+  const network = address.network
+  if (!network) return 'Private'
+  return network === 'Tailscale' || network === '100.64.0.0/10'
+    ? 'Private: Tailscale only'
+    : `Private: ${network} only`
 }
 
 export const AUDIENCE_LABELS: Record<AddressReachability['audience'], string> =
