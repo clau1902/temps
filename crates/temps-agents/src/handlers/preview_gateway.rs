@@ -192,19 +192,16 @@ pub async fn get_preview_gateway_logs(
     // an instance with a custom container tails a container it doesn't own
     // (or, more likely, none at all).
     let settings = preview_gateway::load_settings(&state.db).await;
-    let lines = preview_gateway::tail_logs(
-        &docker,
-        &preview_gateway::container_name(&settings),
-        tail,
-    )
-    .await
-    .map_err(|e| {
-        internal(anyhow_detail(
-            "failed to tail logs",
-            &e,
-            &[&settings.shared_secret],
-        ))
-    })?;
+    let lines =
+        preview_gateway::tail_logs(&docker, &preview_gateway::container_name(&settings), tail)
+            .await
+            .map_err(|e| {
+                internal(anyhow_detail(
+                    "failed to tail logs",
+                    &e,
+                    &[&settings.shared_secret],
+                ))
+            })?;
     Ok(Json(PreviewGatewayLogsResponse { lines }))
 }
 

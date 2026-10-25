@@ -747,7 +747,10 @@ mod tests {
             crate::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
         );
         let detail = body["detail"].as_str().unwrap();
-        assert!(detail.starts_with("An AI agent run needs a sandbox"), "{detail}");
+        assert!(
+            detail.starts_with("An AI agent run needs a sandbox"),
+            "{detail}"
+        );
         assert!(detail.contains("worker nodes"), "{detail}");
         assert!(detail.contains("/settings/nodes"), "{detail}");
     }

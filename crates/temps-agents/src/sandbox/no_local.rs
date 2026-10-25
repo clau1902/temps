@@ -103,7 +103,11 @@ impl SandboxProvider for NoLocalSandboxProvider {
         Self::refuse("Stopping processes")
     }
 
-    async fn destroy(&self, _handle: &SandboxHandle, _purge_volumes: bool) -> Result<(), AgentError> {
+    async fn destroy(
+        &self,
+        _handle: &SandboxHandle,
+        _purge_volumes: bool,
+    ) -> Result<(), AgentError> {
         // Nothing can exist here, so there is nothing to destroy. Succeeding
         // lets a row left from before the instance was re-profiled be
         // cleaned up instead of becoming undeletable.

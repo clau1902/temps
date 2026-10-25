@@ -379,7 +379,10 @@ fn why_no_worker(policy: &PlacementPolicy, workers: &[WorkerNode]) -> String {
             format!("node '{}': {why}", w.name)
         })
         .collect();
-    format!("none of its worker nodes can take one ({})", reasons.join("; "))
+    format!(
+        "none of its worker nodes can take one ({})",
+        reasons.join("; ")
+    )
 }
 
 /// [`candidates`] without asking any worker: the node placement would try
@@ -944,12 +947,18 @@ pub(crate) mod tests {
         let SandboxError::NoWorkerNodeForSandboxes { detail } = &err else {
             panic!("expected NoWorkerNodeForSandboxes, got {err:?}");
         };
-        assert!(detail.contains("node 'worker-1': node is a build-only node"), "{detail}");
+        assert!(
+            detail.contains("node 'worker-1': node is a build-only node"),
+            "{detail}"
+        );
         assert!(
             detail.contains("node 'worker-2': excluded by sandbox placement settings"),
             "{detail}"
         );
-        assert!(detail.contains("node 'worker-3': node is offline"), "{detail}");
+        assert!(
+            detail.contains("node 'worker-3': node is offline"),
+            "{detail}"
+        );
 
         // The same server running workloads keeps the old error.
         let err = choose(&only(&[5]), &workers(), &HashMap::new(), None).unwrap_err();

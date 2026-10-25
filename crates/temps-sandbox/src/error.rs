@@ -895,14 +895,23 @@ mod tests {
             problem.body["error_code"],
             temps_core::WORKER_NODE_REQUIRED_ERROR_CODE
         );
-        assert_eq!(problem.body["setup_path"], temps_core::WORKER_NODE_SETUP_PATH);
+        assert_eq!(
+            problem.body["setup_path"],
+            temps_core::WORKER_NODE_SETUP_PATH
+        );
         let detail = problem.body["detail"].as_str().unwrap();
         assert!(
             detail.contains("runs no workloads, so sandboxes run only on worker nodes"),
             "{detail}"
         );
-        assert!(detail.contains("no worker node has joined it yet"), "{detail}");
-        assert!(detail.contains(temps_core::WORKER_NODE_REQUIRED_REMEDY), "{detail}");
+        assert!(
+            detail.contains("no worker node has joined it yet"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(temps_core::WORKER_NODE_REQUIRED_REMEDY),
+            "{detail}"
+        );
     }
 
     #[test]

@@ -9704,7 +9704,10 @@ mod storage_cleanup_tests {
             node: Some("control-plane".into()),
             ..Default::default()
         };
-        let err = service.place_sandbox(&req).await.expect_err("no local host");
+        let err = service
+            .place_sandbox(&req)
+            .await
+            .expect_err("no local host");
         assert!(matches!(err, SandboxError::NoLocalHost { .. }), "{err:?}");
     }
 
@@ -9746,7 +9749,10 @@ mod storage_cleanup_tests {
             host_work_dir_override: Some(PathBuf::from("/tmp/app-workspace")),
             ..Default::default()
         };
-        let err = service.place_sandbox(&req).await.expect_err("no local host");
+        let err = service
+            .place_sandbox(&req)
+            .await
+            .expect_err("no local host");
         let SandboxError::NoLocalHost { message } = &err else {
             panic!("expected NoLocalHost, got {err:?}");
         };
@@ -9760,7 +9766,8 @@ mod storage_cleanup_tests {
     /// resolves to the control plane instead of "node does not exist".
     #[tokio::test]
     async fn the_control_planes_own_row_lists_the_control_planes_sandboxes() {
-        let mut cp_row = crate::services::placement::tests::node_row("control-plane", "active", Some(1));
+        let mut cp_row =
+            crate::services::placement::tests::node_row("control-plane", "active", Some(1));
         cp_row.id = 1;
         cp_row.name = "cp-1".into();
         for local_workloads in [true, false] {
