@@ -31,6 +31,9 @@ pub struct PublicIngressConfig {
     pub control_plane_ca: Option<crate::ControlPlaneCa>,
     pub node_id: i32,
     pub node_token: String,
+    /// The private listener (ADR 064 D5): serves only private addresses,
+    /// each to its own range, with no ACME relay; port 80 only redirects.
+    pub private: bool,
 }
 
 #[derive(Debug, Error)]
@@ -89,9 +92,7 @@ pub fn update_snapshot_health(store: &SharedRouteStore) {
     let snapshot = store.public_ingress_snapshot();
     let (configured_enabled, authorized, prepared_certificate_count) =
         store.public_ingress_runtime_status();
-    let missing_certificates = snapshot
-        .routes
-        .len()
+    let missing_certificates = (snapshot.routes.len() + snapshot.private_routes.len())
         .saturating_sub(prepared_certificate_count);
     let health = HEALTH.get_or_init(|| {
         RwLock::new(PublicIngressHealth {
@@ -192,36 +193,54 @@ pub async fn spawn(
             reason: error.to_string(),
         })?;
 
-    let acme_client = crate::with_control_plane_trust(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none()),
-        config.control_plane_ca.clone(),
-    )
-    .build()
-    .map_err(|error| PublicIngressError::Bind {
-        address: http_address,
-        reason: format!("control-plane client: {error}"),
-    })?;
-    let http_router = crate::internal_proxy::public_router(
-        Arc::clone(&store),
-        "http",
-        Some(crate::internal_proxy::PublicAcmeConfig {
-            control_plane_url: config.control_plane_url.clone(),
-            client: acme_client,
-            node_id: config.node_id,
-            node_token: config.node_token.clone(),
-        }),
-    )
-    .map_err(|error| PublicIngressError::Bind {
-        address: http_address,
-        reason: error.to_string(),
-    })?;
-    let https_router = crate::internal_proxy::public_router(Arc::clone(&store), "https", None)
-        .map_err(|error| PublicIngressError::Tls {
-            address: https_address,
+    let (http_router, https_router) = if config.private {
+        (
+            crate::internal_proxy::private_router(Arc::clone(&store), "http").map_err(|error| {
+                PublicIngressError::Bind {
+                    address: http_address,
+                    reason: error.to_string(),
+                }
+            })?,
+            crate::internal_proxy::private_router(Arc::clone(&store), "https").map_err(
+                |error| PublicIngressError::Tls {
+                    address: https_address,
+                    reason: error.to_string(),
+                },
+            )?,
+        )
+    } else {
+        let acme_client = crate::with_control_plane_trust(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none()),
+            config.control_plane_ca.clone(),
+        )
+        .build()
+        .map_err(|error| PublicIngressError::Bind {
+            address: http_address,
+            reason: format!("control-plane client: {error}"),
+        })?;
+        let http_router = crate::internal_proxy::public_router(
+            Arc::clone(&store),
+            "http",
+            Some(crate::internal_proxy::PublicAcmeConfig {
+                control_plane_url: config.control_plane_url.clone(),
+                client: acme_client,
+                node_id: config.node_id,
+                node_token: config.node_token.clone(),
+            }),
+        )
+        .map_err(|error| PublicIngressError::Bind {
+            address: http_address,
             reason: error.to_string(),
         })?;
+        let https_router = crate::internal_proxy::public_router(Arc::clone(&store), "https", None)
+            .map_err(|error| PublicIngressError::Tls {
+                address: https_address,
+                reason: error.to_string(),
+            })?;
+        (http_router, https_router)
+    };
     store.configure_public_tls(config.private_key_b64);
     let running = Arc::new(AtomicBool::new(true));
     LISTENER_RUNNING.store(true, Ordering::Release);
@@ -234,7 +253,10 @@ pub async fn spawn(
         Arc::clone(&running),
     )));
 
-    let resolver = Arc::new(SnapshotCertResolver::new(Arc::clone(&store)));
+    let resolver = Arc::new(SnapshotCertResolver::new(
+        Arc::clone(&store),
+        config.private,
+    ));
     let tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
@@ -246,7 +268,7 @@ pub async fn spawn(
         tls_shutdown,
         Arc::clone(&running),
     )));
-    info!(%http_address, %https_address, "public worker ingress listening");
+    info!(%http_address, %https_address, private = config.private, "worker ingress listening");
     let snapshot = store.public_ingress_snapshot();
     let (_, _, prepared_certificate_count) = store.public_ingress_runtime_status();
     let health = HEALTH.get_or_init(|| {
@@ -291,6 +313,8 @@ pub async fn spawn(
 
 struct SnapshotCertResolver {
     store: SharedRouteStore,
+    /// Hand out certificates for private addresses only, never public ones.
+    private: bool,
 }
 
 impl std::fmt::Debug for SnapshotCertResolver {
@@ -302,12 +326,16 @@ impl std::fmt::Debug for SnapshotCertResolver {
 }
 
 impl SnapshotCertResolver {
-    fn new(store: SharedRouteStore) -> Self {
-        Self { store }
+    fn new(store: SharedRouteStore, private: bool) -> Self {
+        Self { store, private }
     }
 
     fn load(&self, host: &str) -> Option<Arc<CertifiedKey>> {
-        self.store.lookup_public(host)?;
+        if self.private {
+            self.store.lookup_private(host)?;
+        } else {
+            self.store.lookup_public(host)?;
+        }
         self.store.lookup_public_tls_key(host)
     }
 }
