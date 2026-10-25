@@ -4952,6 +4952,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         encryption_service: encryption_service_for_nodes,
         telemetry: node_telemetry,
         rate_limiter: Arc::new(temps_deployments::handlers::nodes::RegistrationRateLimiter::new()),
+        plane_identity_rate_limiter: Arc::new(
+            temps_deployments::handlers::nodes::RegistrationRateLimiter::new(),
+        ),
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
         alarm_service: service_context.get_service::<AlarmService>(),
         audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),

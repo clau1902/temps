@@ -105,7 +105,10 @@ fn compare_planes(
             ))
         };
     }
-    if let (Some(saved_key), Some(target_key)) = (
+    // A pinned CA is the identity: a target that does not announce one is
+    // not told apart by its mesh key, which any control plane can repeat.
+    if let (None, Some(saved_key), Some(target_key)) = (
+        &saved.ca_fingerprint,
         &saved.control_plane_wg_public_key,
         &identity.control_plane_wg_public_key,
     ) {
@@ -181,11 +184,14 @@ pub enum Finding {
         subnets: Vec<String>,
         chosen: Option<String>,
     },
-    /// A port the worker serves on is already held.
+    /// A port the worker serves on is already held. `serves_public` is
+    /// whether the worker's ingress mode listens for public traffic; with
+    /// `off` only the overlay's internal proxy needs the port.
     PortInUse {
         port: u16,
         address: SocketAddr,
         process: Option<String>,
+        serves_public: bool,
     },
 }
 
@@ -263,17 +269,28 @@ impl Finding {
                 port,
                 address,
                 process,
+                serves_public,
             } => {
                 let holder = process
                     .as_deref()
                     .map(|process| format!(" by {process}"))
                     .unwrap_or_default();
-                format!(
-                    "port {port} is already in use on {address}{holder}. The worker serves \
-                     public traffic on 80/443 and the overlay's internal proxy on port 80 of \
-                     its bridge address; while it is held they fail to start. Stop what holds \
-                     it, or use `temps agent ingress` to move public traffic to other ports."
-                )
+                if *serves_public {
+                    format!(
+                        "port {port} is already in use on {address}{holder}. The worker serves \
+                         public traffic on 80/443 and the overlay's internal proxy on port 80 \
+                         of its bridge address; while it is held they fail to start. Stop what \
+                         holds it, or use `temps agent ingress` to move public traffic to other \
+                         ports."
+                    )
+                } else {
+                    format!(
+                        "port {port} is already in use on {address}{holder}. The worker takes \
+                         no public traffic (ingress `off`), but the overlay's internal proxy \
+                         serves port 80 of its bridge address and fails to start while it is \
+                         held. Stop what holds it."
+                    )
+                }
             }
         }
     }
@@ -320,8 +337,29 @@ pub enum Purpose<'a> {
     ServiceInstall,
 }
 
-/// Decide from `facts`. `ports` are the ports the worker will serve on.
-pub fn assess(facts: &HostFacts, purpose: Purpose<'_>, ports: &[u16]) -> Assessment {
+/// The ports a worker with `ingress` serves on, sorted, and whether its
+/// ingress mode listens for public traffic. Port 80 always: the overlay's
+/// internal proxy binds it on the bridge address. `off` binds no public
+/// listener, so 443 and the ingress ports cannot stop it.
+pub fn served_ports(ingress: &temps_core::worker_ingress::LocalIngress) -> (Vec<u16>, bool) {
+    use temps_core::worker_ingress::IngressMode;
+    if ingress.mode == IngressMode::Off {
+        return (vec![80], false);
+    }
+    let mut ports = vec![80, 443, ingress.http_port, ingress.https_port];
+    ports.sort_unstable();
+    ports.dedup();
+    (ports, true)
+}
+
+/// Decide from `facts`. `ports` are the ports the worker will serve on;
+/// `serves_public` whether its ingress mode takes public traffic on them.
+pub fn assess(
+    facts: &HostFacts,
+    purpose: Purpose<'_>,
+    ports: &[u16],
+    serves_public: bool,
+) -> Assessment {
     let mut assessment = Assessment::default();
     if facts.linux && !facts.network_admin {
         assessment.findings.push(Finding::NeedsRoot);
@@ -440,6 +478,7 @@ pub fn assess(facts: &HostFacts, purpose: Purpose<'_>, ports: &[u16]) -> Assessm
                 port: *port,
                 address: listener.address,
                 process: listener.process.clone(),
+                serves_public,
             });
         }
     }
@@ -605,7 +644,7 @@ fn applied_alloc(mesh_key_dir: &std::path::Path, field: &str) -> Option<String> 
 }
 
 async fn docker_networks() -> Vec<HostNetwork> {
-    let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+    let Ok(docker) = bollard::Docker::connect_with_defaults() else {
         return Vec::new();
     };
     let listed = tokio::time::timeout(
@@ -750,7 +789,7 @@ mod tests {
             target_identity: identity(Some("abcd"), Some("cp-key")),
             ..admin()
         };
-        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        let assessment = assess(&facts, join("https://cp.example"), &[], true);
         assert_eq!(assessment.plane, PlaneMatch::Same);
         assert_eq!(assessment.blocking(false), None);
         assert!(assessment.findings.is_empty(), "{:?}", assessment.findings);
@@ -764,7 +803,7 @@ mod tests {
             ..admin()
         };
         assert_eq!(
-            assess(&facts, join("https://cp.example"), &[]).plane,
+            assess(&facts, join("https://cp.example"), &[], true).plane,
             PlaneMatch::Same
         );
 
@@ -773,12 +812,28 @@ mod tests {
             target_identity: identity(None, Some("other-key")),
             ..admin()
         };
-        let assessment = assess(&other, join("https://cp.example"), &[]);
+        let assessment = assess(&other, join("https://cp.example"), &[], true);
         assert_eq!(assessment.plane, PlaneMatch::Different);
         let Some(Finding::OtherControlPlane { evidence, .. }) = assessment.blocking(false) else {
             panic!("{:?}", assessment.findings);
         };
         assert!(evidence.contains("other-key"), "{evidence}");
+    }
+
+    /// A pinned CA is not traded for the mesh key: a control plane that
+    /// omits its CA but repeats the saved (public) mesh key is not known to
+    /// be the same one, so it is never handed this node's agent token.
+    #[test]
+    fn a_target_without_a_ca_is_not_matched_by_mesh_key_against_a_pinned_ca() {
+        let facts = HostFacts {
+            saved: Some(joined_over_the_mesh(Some("abcd"), Some("cp-key"))),
+            target_identity: identity(None, Some("cp-key")),
+            ..admin()
+        };
+        assert_eq!(
+            assess(&facts, join("https://cp.example"), &[], true).plane,
+            PlaneMatch::Unknown
+        );
     }
 
     /// The identity outranks the address: a different CA at the saved URL
@@ -792,7 +847,7 @@ mod tests {
             target_identity: identity(Some("ef01"), None),
             ..admin()
         };
-        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        let assessment = assess(&facts, join("https://cp.example"), &[], true);
         assert_eq!(assessment.plane, PlaneMatch::Different);
         let blocking = assessment.blocking(false).expect("blocks without --force");
         let message = blocking.message();
@@ -812,7 +867,7 @@ mod tests {
             target_identity: Some(Err("the control plane answered 404".into())),
             ..admin()
         };
-        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        let assessment = assess(&facts, join("https://cp.example"), &[], true);
         assert_eq!(assessment.plane, PlaneMatch::Unknown);
         let Some(Finding::ControlPlaneUnverified { reason, .. }) = assessment.blocking(false)
         else {
@@ -830,7 +885,7 @@ mod tests {
             target_identity: identity(None, Some("cp-key")),
             ..admin()
         };
-        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        let assessment = assess(&facts, join("https://cp.example"), &[], true);
         let Some(Finding::ControlPlaneUnverified { reason, .. }) = assessment.blocking(false)
         else {
             panic!("{:?}", assessment.findings);
@@ -876,7 +931,7 @@ mod tests {
 
     #[test]
     fn a_clean_host_passes() {
-        let assessment = assess(&admin(), join("https://cp.example"), &[80, 443]);
+        let assessment = assess(&admin(), join("https://cp.example"), &[80, 443], true);
         assert_eq!(assessment, Assessment::default());
     }
 
@@ -886,7 +941,7 @@ mod tests {
             network_admin: false,
             ..admin()
         };
-        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        let assessment = assess(&facts, join("https://cp.example"), &[], true);
         assert_eq!(assessment.blocking(true), Some(&Finding::NeedsRoot));
         assert!(Finding::NeedsRoot.message().contains("sudo"));
         // Not on another OS: nothing there needs it.
@@ -895,7 +950,7 @@ mod tests {
             ..facts
         };
         assert_eq!(
-            assess(&mac, join("https://cp.example"), &[]).blocking(false),
+            assess(&mac, join("https://cp.example"), &[], true).blocking(false),
             None
         );
     }
@@ -906,7 +961,7 @@ mod tests {
             saved: Some(saved("https://old.example")),
             ..admin()
         };
-        let assessment = assess(&facts, join("https://new.example"), &[]);
+        let assessment = assess(&facts, join("https://new.example"), &[], true);
         // Nothing identifies either control plane: unknown, not "another".
         assert!(matches!(
             assessment.blocking(false),
@@ -924,7 +979,7 @@ mod tests {
             ..admin()
         };
         assert_eq!(
-            assess(&facts, join("https://cp.example"), &[]).blocking(false),
+            assess(&facts, join("https://cp.example"), &[], true).blocking(false),
             None
         );
     }
@@ -938,7 +993,7 @@ mod tests {
             ],
             ..admin()
         };
-        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        let assessment = assess(&facts, join("https://cp.example"), &[], true);
         assert_eq!(assessment.overlay_network_name.as_deref(), Some("temps2"));
         assert_eq!(
             assessment.findings,
@@ -962,7 +1017,7 @@ mod tests {
             ..admin()
         };
         assert_eq!(
-            assess(&facts, join("https://cp.example"), &[]),
+            assess(&facts, join("https://cp.example"), &[], true),
             Assessment::default()
         );
     }
@@ -980,7 +1035,7 @@ mod tests {
             ],
             ..admin()
         };
-        let assessment = assess(&facts, join("https://cp.example"), &[]);
+        let assessment = assess(&facts, join("https://cp.example"), &[], true);
         assert_eq!(assessment.overlay_network_name.as_deref(), Some("temps1"));
         assert_eq!(assessment.findings, vec![]);
     }
@@ -1001,10 +1056,10 @@ mod tests {
             ..admin()
         };
         assert_eq!(
-            assess(&facts, Purpose::ServiceInstall, &[]),
+            assess(&facts, Purpose::ServiceInstall, &[], true),
             Assessment::default()
         );
-        let rejoin = assess(&facts, join("https://cp.example"), &[]);
+        let rejoin = assess(&facts, join("https://cp.example"), &[], true);
         assert_eq!(rejoin.overlay_network_name.as_deref(), Some("temps1"));
         assert_eq!(rejoin.findings, vec![]);
     }
@@ -1018,7 +1073,7 @@ mod tests {
             networks: vec![network("temps0", "10.202.4.0/24")],
             ..admin()
         };
-        let assessment = assess(&facts, join("https://new.example"), &[]);
+        let assessment = assess(&facts, join("https://new.example"), &[], true);
         assert_eq!(assessment.overlay_network_name.as_deref(), Some("temps1"));
     }
 
@@ -1029,7 +1084,7 @@ mod tests {
             interfaces: vec!["br-temps1".into()],
             ..admin()
         };
-        let assessment = assess(&facts, Purpose::Join { target: None }, &[]);
+        let assessment = assess(&facts, Purpose::Join { target: None }, &[], true);
         assert_eq!(assessment.overlay_network_name.as_deref(), Some("temps2"));
     }
 
@@ -1044,7 +1099,7 @@ mod tests {
             ..admin()
         };
         assert_eq!(
-            assess(&facts, Purpose::ServiceInstall, &[]),
+            assess(&facts, Purpose::ServiceInstall, &[], true),
             Assessment::default()
         );
 
@@ -1053,7 +1108,7 @@ mod tests {
             networks: vec![network("temps1", "172.20.9.0/24")],
             ..admin()
         };
-        let assessment = assess(&taken, Purpose::ServiceInstall, &[]);
+        let assessment = assess(&taken, Purpose::ServiceInstall, &[], true);
         assert_eq!(assessment.overlay_network_name, None);
         assert!(matches!(
             assessment.findings.as_slice(),
@@ -1076,17 +1131,64 @@ mod tests {
             ],
             ..admin()
         };
-        let assessment = assess(&facts, join("https://cp.example"), &[80, 443]);
+        let assessment = assess(&facts, join("https://cp.example"), &[80, 443], true);
         assert_eq!(
             assessment.findings,
             vec![Finding::PortInUse {
                 port: 80,
                 address: "0.0.0.0:80".parse().unwrap(),
                 process: Some("nginx (pid 42)".into()),
+                serves_public: true,
             }]
         );
         assert_eq!(assessment.blocking(false), None);
         assert!(assessment.findings[0].message().contains("nginx (pid 42)"));
+        assert!(assessment.findings[0]
+            .message()
+            .contains("public traffic on 80/443"));
+    }
+
+    /// Ingress `off` binds no public listener: 443 held cannot stop the
+    /// worker, and the message about 80 does not blame public traffic.
+    #[test]
+    fn ingress_off_checks_only_the_overlay_proxy_port() {
+        use temps_core::worker_ingress::{IngressMode, LocalIngress};
+        let off = LocalIngress::default();
+        assert_eq!(served_ports(&off), (vec![80], false));
+        let fixed = LocalIngress {
+            mode: IngressMode::Fixed,
+            http_port: 8080,
+            https_port: 8443,
+            ..LocalIngress::default()
+        };
+        assert_eq!(served_ports(&fixed), (vec![80, 443, 8080, 8443], true));
+
+        let facts = HostFacts {
+            listeners: vec![
+                Listener {
+                    address: "0.0.0.0:80".parse().unwrap(),
+                    process: None,
+                },
+                Listener {
+                    address: "0.0.0.0:443".parse().unwrap(),
+                    process: None,
+                },
+            ],
+            ..admin()
+        };
+        let (ports, serves_public) = served_ports(&off);
+        let assessment = assess(&facts, Purpose::ServiceInstall, &ports, serves_public);
+        assert!(matches!(
+            assessment.findings.as_slice(),
+            [Finding::PortInUse {
+                port: 80,
+                serves_public: false,
+                ..
+            }]
+        ));
+        let message = assessment.findings[0].message();
+        assert!(message.contains("no public traffic"), "{message}");
+        assert!(!message.contains("80/443"), "{message}");
     }
 
     #[test]
@@ -1100,11 +1202,11 @@ mod tests {
             ..admin()
         };
         assert_eq!(
-            assess(&facts, Purpose::ServiceInstall, &[80, 443]),
+            assess(&facts, Purpose::ServiceInstall, &[80, 443], true),
             Assessment::default()
         );
         assert_eq!(
-            assess(&facts, join("https://cp.example"), &[443])
+            assess(&facts, join("https://cp.example"), &[443], true)
                 .findings
                 .len(),
             1

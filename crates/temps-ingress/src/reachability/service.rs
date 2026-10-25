@@ -1973,6 +1973,24 @@ fn text(error: impl std::fmt::Display) -> String {
 }
 
 impl LiveOps {
+    /// `host` as attached to the run's own environment. An address on any
+    /// other environment, or a run without one, is never read or changed
+    /// here: a run, or its undo, only ever acts on its own addresses.
+    async fn own_address(
+        &self,
+        host: &str,
+    ) -> Result<Option<project_custom_domains::Model>, String> {
+        let Some(environment_id) = self.environment_id else {
+            return Ok(None);
+        };
+        project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.eq(host))
+            .filter(project_custom_domains::Column::EnvironmentId.eq(environment_id))
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)
+    }
+
     fn dns_scope(&self) -> OwnershipScope {
         OwnershipScope {
             project_id: self.project_id,
@@ -2572,11 +2590,9 @@ impl RunOps for LiveOps {
     }
 
     async fn address_audience(&self, host: &str) -> Result<Option<AddressAudience>, String> {
-        Ok(project_custom_domains::Entity::find()
-            .filter(project_custom_domains::Column::Domain.eq(host))
-            .one(self.deps.db.as_ref())
-            .await
-            .map_err(text)?
+        Ok(self
+            .own_address(host)
+            .await?
             .map(|d| address_audience_of(&d)))
     }
 
@@ -2585,12 +2601,10 @@ impl RunOps for LiveOps {
         host: &str,
         audience: &AddressAudience,
     ) -> Result<(), String> {
-        let row = project_custom_domains::Entity::find()
-            .filter(project_custom_domains::Column::Domain.eq(host))
-            .one(self.deps.db.as_ref())
-            .await
-            .map_err(text)?
-            .ok_or_else(|| format!("{host} is not attached to any environment."))?;
+        let row = self
+            .own_address(host)
+            .await?
+            .ok_or_else(|| format!("{host} is not attached to this environment any more."))?;
         let mut active: project_custom_domains::ActiveModel = row.into();
         set_address_audience_on(&mut active, audience);
         active.update(self.deps.db.as_ref()).await.map_err(text)?;

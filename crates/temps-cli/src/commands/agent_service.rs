@@ -126,13 +126,16 @@ fn warn_about_host(config: &Path) {
     let saved: Option<temps_agent::AgentConfig> = std::fs::read_to_string(config)
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok());
-    let mut ports = vec![80, 443];
-    if let Some(saved) = &saved {
-        let ingress = saved.local_ingress();
-        ports.extend([ingress.http_port, ingress.https_port]);
-    }
-    ports.sort_unstable();
-    ports.dedup();
+    // Without a readable config the mode is unknown: check what a public
+    // listener would need rather than miss a held port.
+    let ingress = saved.as_ref().map_or_else(
+        || temps_core::worker_ingress::LocalIngress {
+            mode: temps_core::worker_ingress::IngressMode::Fixed,
+            ..Default::default()
+        },
+        temps_agent::AgentConfig::local_ingress,
+    );
+    let (ports, serves_public) = super::host_preflight::served_ports(&ingress);
     let facts = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -143,7 +146,7 @@ fn warn_about_host(config: &Path) {
             return;
         }
     };
-    assess(&facts, Purpose::ServiceInstall, &ports).print_warnings();
+    assess(&facts, Purpose::ServiceInstall, &ports, serves_public).print_warnings();
 }
 
 fn uninstall() -> anyhow::Result<()> {

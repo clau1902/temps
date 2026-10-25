@@ -84,6 +84,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   Form,
@@ -420,14 +421,25 @@ function TunnelSetup({
         abort.current.signal
       )
     },
-    onSuccess: async (outcome) => {
+    onSuccess: async (outcome, plan) => {
       if (outcome.kind === 'failed') {
         // The account it added is gone again: the token can be reconnected.
         const removed = outcome.undo.some((u) => u.ok && u.what === 'provider')
         if (removed) setConnected(null)
         toast.error('Tunnel setup failed', { description: outcome.error })
-      } else if (outcome.kind === 'done') {
-        toast.success(`Apps under ${outcome.connector.domain} are reachable`)
+      } else {
+        if (outcome.kind === 'done') {
+          toast.success(`Apps under ${outcome.connector.domain} are reachable`)
+        }
+        // The tunnel this run kept now uses the account the pasted token
+        // added, so from here on it is an existing account like any other:
+        // "Use a different token" (which deletes it) must not be offered for
+        // it, or one click would leave the tunnel without its credentials.
+        if (plan.provider.createdThisRun) {
+          setModeChoice('existing')
+          setExistingChoice(plan.provider.id)
+          setConnected(null)
+        }
       }
       await refresh()
     },
@@ -442,9 +454,14 @@ function TunnelSetup({
     onSuccess: async (results) => {
       if (results.every((r) => r.ok)) {
         toast.success('Removed what this page created')
-        if (results.some((r) => r.what === 'provider')) setConnected(null)
       } else {
         toast.error('Some of it could not be removed')
+      }
+      // The account the run adopted is gone: fall back to the defaults.
+      if (results.some((r) => r.ok && r.what === 'provider')) {
+        setConnected(null)
+        setExistingChoice(null)
+        setModeChoice(null)
       }
       await refresh()
     },
@@ -609,6 +626,11 @@ function TunnelSetup({
           {outcome && (
             <OutcomePanel
               outcome={outcome}
+              addedAccount={
+                run.variables?.provider.createdThisRun
+                  ? run.variables.provider.name
+                  : undefined
+              }
               undoResults={undo.data}
               undoing={undo.isPending}
               onUndo={() => undo.mutate(outcome)}
@@ -883,7 +905,10 @@ function ConnectedNote({
   onReplace: (account: ConnectedAccount | null) => void
 }) {
   const queryClient = useQueryClient()
-  // Added on this page a moment ago, so replacing the token removes it.
+  const [confirming, setConfirming] = useState(false)
+  // Added on this page a moment ago and not used by any tunnel yet (a
+  // finished run turns it into an existing account), so replacing the token
+  // removes it.
   const remove = useMutation({
     mutationFn: async () => {
       const { error } = await deleteDnsProvider({ path: { id: account.id } })
@@ -896,10 +921,12 @@ function ConnectedNote({
         queryClient.invalidateQueries({ queryKey: ['dnsProviders'] }),
       ])
     },
-    onError: (error) =>
+    onError: (error) => {
+      setConfirming(false)
       toast.error(`Could not remove ${account.name}`, {
         description: deliveryError(error),
-      }),
+      })
+    },
   })
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-3">
@@ -911,10 +938,20 @@ function ConnectedNote({
         size="sm"
         variant="ghost"
         disabled={remove.isPending}
-        onClick={() => remove.mutate()}
+        onClick={() => setConfirming(true)}
       >
         Use a different token
       </Button>
+      <ConfirmDeleteDialog
+        open={confirming}
+        onOpenChange={setConfirming}
+        resourceType="Cloudflare account"
+        resourceName={account.name}
+        verb="Remove"
+        consequences="Temps forgets this account and its API token so you can paste a different one. Nothing set up on this page uses it yet."
+        isPending={remove.isPending}
+        onConfirm={() => remove.mutate()}
+      />
     </div>
   )
 }
@@ -1326,15 +1363,19 @@ function UndoList({ results }: { results: UndoResult[] }) {
 
 function OutcomePanel({
   outcome,
+  addedAccount,
   undoResults,
   undoing,
   onUndo,
 }: {
   outcome: SetupOutcome
+  /** The Cloudflare account this run added from a pasted token, if any. */
+  addedAccount: string | undefined
   undoResults: UndoResult[] | undefined
   undoing: boolean
   onUndo: () => void
 }) {
+  const [confirmUndo, setConfirmUndo] = useState(false)
   if (outcome.kind === 'failed') {
     const leftovers = outcome.undo.some((r) => !r.ok)
     return (
@@ -1406,12 +1447,46 @@ function OutcomePanel({
             size="sm"
             variant="outline"
             disabled={undoing}
-            onClick={onUndo}
+            onClick={() => setConfirmUndo(true)}
           >
             {undoing && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
             Undo what this page created
           </Button>
         )}
+        <ConfirmDeleteDialog
+          open={confirmUndo}
+          onOpenChange={setConfirmUndo}
+          resourceType="tunnel"
+          resourceName={outcome.connector.name}
+          verb="Remove"
+          consequences={
+            <ul className="list-disc space-y-1 pl-5">
+              <li>Its DNS records in Cloudflare go with it.</li>
+              {outcome.created.managedDomain && (
+                <li>
+                  {outcome.created.managedDomain.domain} is removed from Temps.
+                </li>
+              )}
+              {outcome.created.autoManageEnabled && (
+                <li>
+                  Automatic DNS for {outcome.created.autoManageEnabled.domain}{' '}
+                  is turned back off.
+                </li>
+              )}
+              {outcome.created.providerId != null && (
+                <li>
+                  The Cloudflare account{' '}
+                  {addedAccount ? <strong>{addedAccount}</strong> : 'it'} added
+                  on this page is removed from Temps.
+                </li>
+              )}
+            </ul>
+          }
+          onConfirm={() => {
+            setConfirmUndo(false)
+            onUndo()
+          }}
+        />
       </AlertDescription>
     </Alert>
   )

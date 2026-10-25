@@ -227,6 +227,26 @@ export function stalePlan(error: unknown): ReachabilityPlan | null {
     : null
 }
 
+/**
+ * Whether the plan on screen is the one for the address typed now, so it can
+ * be applied. Not while the typed address is still settling (`requested` is
+ * its debounced value, which keys the plan query) or while the plan for it is
+ * loading (the previous one is shown as placeholder data): applying then
+ * would pair the old `plan_id` with the new address, and the server refuses
+ * that as stale.
+ */
+export function planIsCurrent({
+  typed,
+  requested,
+  placeholder,
+}: {
+  typed: string
+  requested: string
+  placeholder: boolean
+}): boolean {
+  return !placeholder && typed.trim() === requested
+}
+
 /** The option to preselect: the recommended one, else the first. */
 export function defaultOption(options: PlanOption[]): PlanOption | undefined {
   return options.find((o) => o.recommended) ?? options[0]

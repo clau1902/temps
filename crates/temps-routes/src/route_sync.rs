@@ -783,8 +783,12 @@ async fn build_snapshot(
                 operation,
                 source,
             })?;
+            // A node gets keys only for what it terminates itself: its public
+            // routes when it listens publicly, and its private routes. A
+            // connector-only node terminates none of the public ones.
             let allowed_certificate_hosts: std::collections::HashSet<String> = public_routes
                 .iter()
+                .filter(|_| node.public_ingress_enabled)
                 .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
                 .chain(
                     private_routes

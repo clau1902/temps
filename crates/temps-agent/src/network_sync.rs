@@ -227,6 +227,20 @@ fn overlay_fingerprint(
     hasher.finish()
 }
 
+/// The overlay the occupied-range collection leaves out: the built manager's,
+/// else the latest snapshot's (the manager may not be built yet, and until it
+/// is `overlay_name::current()` still says `temps0`), else `temps0`'s.
+fn occupied_scan_config(
+    built: Option<&NetworkConfig>,
+    snapshot_names: Option<&OverlayNames>,
+) -> NetworkConfig {
+    match (built, snapshot_names) {
+        (Some(config), _) => config.clone(),
+        (None, Some(names)) => NetworkConfig::default().with_overlay_names(names),
+        (None, None) => NetworkConfig::default().with_overlay_names(&overlay_name::current()),
+    }
+}
+
 /// The ranges this host already uses outside Temps, for the control plane
 /// (ADR 056). Routes the overlay itself installed towards peers (a native
 /// transport puts them on the underlay device) are left out: they are
@@ -563,25 +577,32 @@ async fn run(
     // the peer subnets it routed, until its VXLAN device and routes are
     // released (ADR 059). Seeded from the snapshot the last run applied, so a
     // rename across a restart is handled too.
-    let mut renamed_from: Option<PreviousOverlay> = {
+    let last_snapshot = {
         let path = snapshot_path.clone();
         tokio::task::spawn_blocking(move || load_snapshot(&path))
             .await
             .ok()
             .flatten()
-            .and_then(|snapshot| PreviousOverlay::from_snapshot(&snapshot))
     };
+    let mut renamed_from: Option<PreviousOverlay> = last_snapshot
+        .as_ref()
+        .and_then(PreviousOverlay::from_snapshot);
+    // The overlay names of the latest snapshot (the one the last run applied,
+    // then each polled one), so the occupied-range collection leaves this
+    // node's own bridge and Docker network out before a manager is built.
+    let mut snapshot_names: Option<OverlayNames> = last_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.alloc.as_ref())
+        .and_then(|alloc| alloc.overlay_names().ok());
     // Peer subnets of the last applied payload, for `renamed_from`.
     let mut applied_peer_subnets: Vec<Ipv4Net> = Vec::new();
 
     loop {
         let occupied = {
-            let net_config = manager
-                .as_ref()
-                .map(|(manager, _)| manager.config().clone())
-                .unwrap_or_else(|| {
-                    NetworkConfig::default().with_overlay_names(&overlay_name::current())
-                });
+            let net_config = occupied_scan_config(
+                manager.as_ref().map(|(manager, _)| manager.config()),
+                snapshot_names.as_ref(),
+            );
             match collect_occupied_ranges(&net_config, &peer_subnets).await {
                 Ok(ranges) => {
                     if occupied_error.take().is_some() {
@@ -747,6 +768,7 @@ async fn run(
                     }
                     None => OverlayNames::default(),
                 };
+                snapshot_names = Some(names.clone());
                 let node_id = payload
                     .alloc
                     .as_ref()
@@ -2846,6 +2868,22 @@ mod tests {
         assert!(!serde_json::to_string(&alloc)
             .unwrap()
             .contains("overlay_network_name"));
+    }
+
+    // Before the first manager build `overlay_name::current()` still says
+    // `temps0`; the collection must leave out the snapshot's overlay instead.
+    #[test]
+    fn the_occupied_scan_leaves_out_the_snapshot_overlay_before_a_build() {
+        let temps1 = OverlayNames::new("temps1").unwrap();
+        let config = occupied_scan_config(None, Some(&temps1));
+        assert_eq!(config.docker_network_name, "temps1");
+        assert_eq!(config.bridge_name, "br-temps1");
+        assert_eq!(config.vxlan_dev_name, "vxlan-temps1");
+        // A built manager is authoritative.
+        let built =
+            NetworkConfig::default().with_overlay_names(&OverlayNames::new("temps2").unwrap());
+        let config = occupied_scan_config(Some(&built), Some(&temps1));
+        assert_eq!(config.docker_network_name, "temps2");
     }
 
     #[test]

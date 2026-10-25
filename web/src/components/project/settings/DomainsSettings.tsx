@@ -138,11 +138,6 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         specific environment and optionally set up with redirects.
       </p>
 
-      {/* An app hosted elsewhere is never served by Temps' ingress. */}
-      {project.hosting !== 'external' && project.source_type !== 'external' && (
-        <EnvironmentReachabilityList projectId={project.id} />
-      )}
-
       {isPending ? (
         <Skeleton className="h-24 w-full" />
       ) : error ? (
@@ -230,6 +225,13 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
             </Button>
           }
         />
+      )}
+
+      {/* Domains lead the page (DESIGN.md); each environment's reachability
+          follows them. An app hosted elsewhere is never served by Temps'
+          ingress. */}
+      {project.hosting !== 'external' && project.source_type !== 'external' && (
+        <EnvironmentReachabilityList projectId={project.id} />
       )}
 
       <Collapsible className="border-t pt-6">

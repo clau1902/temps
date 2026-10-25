@@ -116,6 +116,36 @@ struct Bound {
 /// How often the private listener's addresses are checked from inside
 /// (ADR 064 D7), when nothing changed.
 const PRIVATE_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+/// Most private addresses checked in one pass, as `private_check::check_all`.
+const PRIVATE_CHECK_LIMIT: usize = 64;
+/// Private addresses checked at once. Each check can take ~20 s (lookup and
+/// connect timeouts), and the manager loop waits for the pass: one at a time,
+/// 64 addresses would hold off re-reading agent.json, rebinding and the
+/// listener report for over 20 minutes.
+const PRIVATE_CHECK_CONCURRENCY: usize = 8;
+
+/// Check the private listener's addresses (ADR 064 D7) a few at a time,
+/// reporting them in the snapshot's order.
+async fn check_private_routes(
+    routes: &[crate::route_store::PrivateRouteEntry],
+) -> Vec<temps_core::worker_ingress::PrivateCheck> {
+    use futures::StreamExt;
+    use temps_core::worker_ingress::PRIVATE_HTTPS_PORT;
+
+    use crate::private_check::{check, SystemResolver};
+
+    // The futures are built up front: a lazily mapped stream inside the
+    // spawned manager task trips rustc's "FnOnce is not general enough".
+    let checks: Vec<_> = routes
+        .iter()
+        .take(PRIVATE_CHECK_LIMIT)
+        .map(|entry| check(entry, &SystemResolver, None, PRIVATE_HTTPS_PORT))
+        .collect();
+    futures::stream::iter(checks)
+        .buffered(PRIVATE_CHECK_CONCURRENCY)
+        .collect()
+        .await
+}
 
 async fn run(
     config: ManagerConfig,
@@ -274,7 +304,7 @@ async fn run(
                     *checked != routes || at.elapsed() >= PRIVATE_CHECK_INTERVAL
                 });
                 if due {
-                    private_checks = crate::private_check::check_all(&routes, None).await;
+                    private_checks = check_private_routes(&routes).await;
                     private_checked = Some((routes, tokio::time::Instant::now()));
                 }
             }
@@ -645,6 +675,33 @@ async fn send_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Checked a few at a time, the results keep the snapshot's order and the
+    // pass stops at the limit. A listener that is not an address fails
+    // before any lookup, so nothing here touches the network.
+    #[tokio::test]
+    async fn private_checks_keep_the_snapshot_order_and_stop_at_the_limit() {
+        use crate::route_store::{PrivateRouteEntry, RouteEntry};
+        let routes: Vec<PrivateRouteEntry> = (0..PRIVATE_CHECK_LIMIT + 6)
+            .map(|i| PrivateRouteEntry {
+                route: RouteEntry {
+                    host: format!("app{i}.tail.example"),
+                    backends: Vec::new(),
+                    deployment_id: None,
+                    project_id: None,
+                    environment_id: None,
+                },
+                address_id: format!("a{i}"),
+                range: "100.64.0.0/10".into(),
+                listener: "not-an-address".into(),
+            })
+            .collect();
+        let checks = check_private_routes(&routes).await;
+        assert_eq!(checks.len(), PRIVATE_CHECK_LIMIT);
+        for (i, check) in checks.iter().enumerate() {
+            assert_eq!(check.address_id, format!("a{i}"));
+        }
+    }
 
     fn host() -> Vec<(String, IpAddr)> {
         vec![

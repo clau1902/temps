@@ -88,12 +88,25 @@ pub fn record_failure(error: impl Into<String>) {
     }
 }
 
+/// Routes this worker's listener serves: the public ones, or on a private
+/// listener (ADR 064 D5) the private ones; each needs a prepared certificate.
+fn served_route_count(snapshot: &crate::route_store::PublicIngressSnapshot) -> usize {
+    snapshot.routes.len() + snapshot.private_routes.len()
+}
+
+fn missing_certificates_error(missing: usize) -> String {
+    format!(
+        "{missing} route(s) have no prepared exact TLS certificate; HTTPS is unavailable for \
+         those hosts"
+    )
+}
+
 pub fn update_snapshot_health(store: &SharedRouteStore) {
     let snapshot = store.public_ingress_snapshot();
     let (configured_enabled, authorized, prepared_certificate_count) =
         store.public_ingress_runtime_status();
-    let missing_certificates = (snapshot.routes.len() + snapshot.private_routes.len())
-        .saturating_sub(prepared_certificate_count);
+    let missing_certificates =
+        served_route_count(&snapshot).saturating_sub(prepared_certificate_count);
     let health = HEALTH.get_or_init(|| {
         RwLock::new(PublicIngressHealth {
             running: false,
@@ -108,7 +121,7 @@ pub fn update_snapshot_health(store: &SharedRouteStore) {
         let listener_running = LISTENER_RUNNING.load(Ordering::Acquire);
         health.running = listener_running && configured_enabled && authorized;
         health.certificate_count = prepared_certificate_count as i64;
-        health.route_count = snapshot.routes.len() as i64;
+        health.route_count = served_route_count(&snapshot) as i64;
         health.unsupported_route_count = snapshot.unsupported_route_count as i64;
         health
             .unsupported_reasons
@@ -123,9 +136,7 @@ pub fn update_snapshot_health(store: &SharedRouteStore) {
                     .to_string(),
             );
         } else if missing_certificates > 0 {
-            health.last_error = Some(format!(
-                "{missing_certificates} public route(s) have no prepared exact TLS certificate; HTTPS is unavailable for those hosts"
-            ));
+            health.last_error = Some(missing_certificates_error(missing_certificates));
             health.unsupported_reasons.push(
                 "wildcard certificate keys are not distributed to workers; affected hosts require exact leaf certificates"
                     .to_string(),
@@ -276,7 +287,7 @@ pub async fn spawn(
             running: true,
             last_error: None,
             certificate_count: prepared_certificate_count as i64,
-            route_count: snapshot.routes.len() as i64,
+            route_count: served_route_count(&snapshot) as i64,
             unsupported_route_count: snapshot.unsupported_route_count as i64,
             unsupported_reasons: snapshot.unsupported_reasons.clone(),
         })
@@ -286,7 +297,7 @@ pub async fn spawn(
             running: true,
             last_error: None,
             certificate_count: prepared_certificate_count as i64,
-            route_count: snapshot.routes.len() as i64,
+            route_count: served_route_count(&snapshot) as i64,
             unsupported_route_count: snapshot.unsupported_route_count as i64,
             unsupported_reasons: snapshot.unsupported_reasons.clone(),
         };
@@ -488,4 +499,42 @@ async fn serve_http(
     }
     running.store(false, Ordering::Release);
     LISTENER_RUNNING.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::route_store::{PrivateRouteEntry, PublicIngressSnapshot, RouteEntry};
+
+    fn route(host: &str) -> RouteEntry {
+        RouteEntry {
+            host: host.into(),
+            backends: Vec::new(),
+            deployment_id: None,
+            project_id: None,
+            environment_id: None,
+        }
+    }
+
+    // A private-mode worker gets private routes and no public ones; they
+    // count, and the certificate error does not call them public.
+    #[test]
+    fn private_routes_count_and_the_certificate_error_is_neutral() {
+        let snapshot = PublicIngressSnapshot {
+            private_routes: vec![PrivateRouteEntry {
+                route: route("app.tail.example"),
+                address_id: "a1".into(),
+                range: "100.64.0.0/10".into(),
+                listener: "100.64.0.7".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(served_route_count(&snapshot), 1);
+        let message = missing_certificates_error(1);
+        assert!(
+            message.starts_with("1 route(s) have no prepared"),
+            "{message}"
+        );
+        assert!(!message.contains("public"), "{message}");
+    }
 }

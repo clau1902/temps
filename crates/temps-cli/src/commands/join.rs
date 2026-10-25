@@ -616,6 +616,24 @@ fn rejoin_proof_for(
     )
 }
 
+/// Whether the control plane answered this join's rejoin proof with
+/// [`temps_core::node_pki::rejoin_ack`] keyed by the saved agent token's
+/// hash, which only the control plane this node belongs to holds.
+fn rejoin_acknowledged(
+    saved: Option<&temps_agent::AgentConfig>,
+    proof: Option<&str>,
+    ack: Option<&str>,
+) -> bool {
+    let (Some(saved), Some(proof), Some(ack)) = (saved, proof, ack) else {
+        return false;
+    };
+    temps_core::node_pki::rejoin_ack_matches(
+        &temps_core::node_pki::agent_token_hash(&saved.token),
+        proof,
+        ack,
+    )
+}
+
 fn public_ingress_listener_settings(
     matching_saved: Option<&temps_agent::AgentConfig>,
 ) -> (Option<std::net::IpAddr>, u16, u16) {
@@ -907,6 +925,10 @@ impl JoinCommand {
     async fn preflight(&mut self) -> anyhow::Result<()> {
         use super::host_preflight::{assess, gather, Purpose};
 
+        // A bad `--ingress`/`--listen` would otherwise only surface when the
+        // agent config is saved, after the control plane accepted the
+        // registration and the join token was spent.
+        let requested_ingress = self.requested_ingress()?;
         self.join_url = self.target.clone();
         let saved = load_saved_agent_config();
         let mut facts = gather(saved.as_ref()).await;
@@ -921,18 +943,19 @@ impl JoinCommand {
         if let (Some(_), Some(target)) = (&facts.saved, target.as_deref()) {
             facts.target_identity = Some(super::host_preflight::fetch_plane_identity(target).await);
         }
-        let mut ports = vec![80, 443];
-        if self.ingress == Some(IngressFlag::Fixed) {
-            ports.extend([self.ingress_http_port, self.ingress_https_port]);
-        }
-        ports.sort_unstable();
-        ports.dedup();
+        // Without `--ingress` a rejoin keeps the saved mode and a new worker
+        // starts `off`.
+        let ingress = requested_ingress
+            .or_else(|| saved.as_ref().map(temps_agent::AgentConfig::local_ingress))
+            .unwrap_or_default();
+        let (ports, serves_public) = super::host_preflight::served_ports(&ingress);
         let assessment = assess(
             &facts,
             Purpose::Join {
                 target: target.as_deref(),
             },
             &ports,
+            serves_public,
         );
         for finding in &assessment.findings {
             if !finding.blocks_join(self.force) {
@@ -1017,8 +1040,7 @@ impl JoinCommand {
 
     /// `--ingress`, else what this worker allowed before a rejoin, else off.
     fn apply_ingress(&self, config: &mut temps_agent::AgentConfig) -> anyhow::Result<()> {
-        use temps_core::worker_ingress::{IngressMode, LocalIngress};
-        let Some(flag) = self.ingress else {
+        let Some(ingress) = self.requested_ingress()? else {
             if config.ingress.is_none() {
                 let saved = load_saved_agent_config();
                 if let Some(saved) = saved_config_for_reenrollment(
@@ -1032,15 +1054,27 @@ impl JoinCommand {
             }
             return Ok(());
         };
+        config.ingress = Some(ingress);
+        // The legacy listen fields would disagree with an explicit mode.
+        config.public_ingress_address = None;
+        Ok(())
+    }
+
+    /// The ingress `--ingress` asks for, validated with its `--listen` and
+    /// port flags; `None` without `--ingress`. The preflight calls this so a
+    /// bad flag stops the join before anything is registered.
+    fn requested_ingress(
+        &self,
+    ) -> anyhow::Result<Option<temps_core::worker_ingress::LocalIngress>> {
+        use temps_core::worker_ingress::{IngressMode, LocalIngress};
+        let Some(flag) = self.ingress else {
+            return Ok(None);
+        };
         let mode = match flag {
             IngressFlag::Off => IngressMode::Off,
             IngressFlag::Fixed => IngressMode::Fixed,
             IngressFlag::Delegated => IngressMode::Delegated,
-            IngressFlag::Private => {
-                config.ingress = Some(super::agent_ingress::private(&self.listen)?);
-                config.public_ingress_address = None;
-                return Ok(());
-            }
+            IngressFlag::Private => return super::agent_ingress::private(&self.listen).map(Some),
         };
         let mut ingress = LocalIngress {
             mode,
@@ -1068,10 +1102,7 @@ impl JoinCommand {
             ingress.http_port = self.ingress_http_port;
             ingress.https_port = self.ingress_https_port;
         }
-        config.ingress = Some(ingress);
-        // The legacy listen fields would disagree with an explicit mode.
-        config.public_ingress_address = None;
-        Ok(())
+        Ok(Some(ingress))
     }
 
     fn target(&self) -> &str {
@@ -1596,9 +1627,16 @@ impl JoinCommand {
             println!("Cluster CA fingerprint verified.");
         }
         if let Some(node_id) = answer.rejoined_node_id {
-            // The control plane checked a proof keyed by this node's agent
-            // token hash: it is the control plane this node belongs to.
-            self.plane_match = PlaneMatch::Same;
+            // Only a control plane holding this node's agent token hash can
+            // answer the proof: then it is the one this node belongs to. A
+            // bare `rejoined_node_id` proves nothing, so it changes nothing.
+            if rejoin_acknowledged(
+                load_saved_agent_config().as_ref(),
+                rejoin_proof.as_deref(),
+                answer.rejoin_ack.as_deref(),
+            ) {
+                self.plane_match = PlaneMatch::Same;
+            }
             println!(
                 "This machine is already node '{}' (id {node_id}) of this control plane: it is \
                  updated in place and keeps its mesh address {node_address}. Bringing up the \
@@ -2115,6 +2153,40 @@ mod tests {
         use clap::Parser;
         let argv = std::iter::once("temps-join").chain(args.iter().copied());
         JoinCli::try_parse_from(argv).map(|cli| cli.join)
+    }
+
+    /// The preflight refuses a bad ingress flag before the join token is
+    /// spent, for every mode, not only once the config is saved.
+    #[test]
+    fn ingress_flags_are_checked_before_registration() {
+        let join = |args: &[&str]| {
+            let mut argv = vec!["https://cp.example.com", "token"];
+            argv.extend_from_slice(args);
+            parse_join(&argv).unwrap()
+        };
+        assert!(join(&[]).requested_ingress().unwrap().is_none());
+        for refused in [
+            &["--ingress", "private"][..],
+            &["--ingress", "private", "--listen", "203.0.113.7"],
+            &["--ingress", "private", "--listen", "eth0"],
+            &["--ingress", "fixed", "--listen", "not-an-ip"],
+            &["--ingress", "fixed", "--listen", "127.0.0.1"],
+            &["--ingress", "fixed", "--ingress-http-port", "443"],
+        ] {
+            assert!(join(refused).requested_ingress().is_err(), "{refused:?}");
+        }
+        for accepted in [
+            &["--ingress", "off"][..],
+            &["--ingress", "delegated"],
+            &["--ingress", "fixed"],
+            &["--ingress", "private", "--listen", "tailscale"],
+            &["--ingress", "private", "--listen", "192.168.1.8"],
+        ] {
+            assert!(
+                join(accepted).requested_ingress().unwrap().is_some(),
+                "{accepted:?}"
+            );
+        }
     }
 
     /// ADR 055: a URL and a token with no address is a join of its own,

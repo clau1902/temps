@@ -21,6 +21,7 @@ import {
   certificateChoices,
   defaultOption,
   missingAnswers,
+  planIsCurrent,
   reachabilityHeadline,
   audienceLabel,
   privateDnsWarning,
@@ -461,5 +462,37 @@ describe('private addresses (ADR 064 D5)', () => {
     expect(
       privateDnsWarning({ ...option, kind: 'direct_managed_dns' })
     ).toBeNull()
+  })
+})
+
+describe('plan for the typed address', () => {
+  test('is current once the address settled and its own plan arrived', () => {
+    expect(
+      planIsCurrent({
+        typed: ' app.example.com ',
+        requested: 'app.example.com',
+        placeholder: false,
+      })
+    ).toBe(true)
+  })
+
+  test('is not while the typed address is still being debounced', () => {
+    expect(
+      planIsCurrent({
+        typed: 'shop.example.com',
+        requested: 'app.example.com',
+        placeholder: false,
+      })
+    ).toBe(false)
+  })
+
+  test('is not while the previous plan stands in as placeholder data', () => {
+    expect(
+      planIsCurrent({
+        typed: 'shop.example.com',
+        requested: 'shop.example.com',
+        placeholder: true,
+      })
+    ).toBe(false)
   })
 })

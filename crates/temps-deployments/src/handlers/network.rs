@@ -895,6 +895,7 @@ mod tests {
             encryption_service: encryption_service(),
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             rate_limiter: Arc::new(RegistrationRateLimiter::new()),
+            plane_identity_rate_limiter: Arc::new(RegistrationRateLimiter::new()),
             enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db)),
             alarm_service: None,
             audit_service: Arc::new(

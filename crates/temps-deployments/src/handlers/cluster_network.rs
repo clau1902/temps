@@ -186,23 +186,6 @@ pub async fn update_cluster_network(
         ip_address: Some(metadata.ip_address.clone()),
         user_agent: metadata.user_agent.clone(),
     };
-    if let Some(name) = request.overlay_network_name.as_deref() {
-        let previous = state
-            .service
-            .change_overlay_network_name(name)
-            .await
-            .map_err(problem)?;
-        if previous != name.trim() {
-            let audit = ClusterOverlayNetworkNameChangedAudit {
-                context: context.clone(),
-                from: previous,
-                to: name.trim().to_owned(),
-            };
-            if let Err(error) = state.audit_service.create_audit_log(&audit).await {
-                error!(%error, "cluster overlay network name changed but audit record failed");
-            }
-        }
-    }
     let pool = format!(
         "{}/{}",
         change.config.compute_pool_cidr, change.config.subnet_prefix_len
@@ -220,7 +203,7 @@ pub async fn update_cluster_network(
         || before.subnet_prefix_len != change.config.subnet_prefix_len
     {
         let audit = ClusterComputePoolChangedAudit {
-            context,
+            context: context.clone(),
             from: format!("{}/{}", before.compute_pool_cidr, before.subnet_prefix_len),
             to: pool,
             reassigned: reassigned
@@ -230,6 +213,25 @@ pub async fn update_cluster_network(
         };
         if let Err(error) = state.audit_service.create_audit_log(&audit).await {
             error!(%error, "cluster compute pool changed but audit record failed");
+        }
+    }
+    // After the pool audit records: the pool change has already committed,
+    // so a failed rename must not leave it unaudited.
+    if let Some(name) = request.overlay_network_name.as_deref() {
+        let previous = state
+            .service
+            .change_overlay_network_name(name)
+            .await
+            .map_err(problem)?;
+        if previous != name.trim() {
+            let audit = ClusterOverlayNetworkNameChangedAudit {
+                context,
+                from: previous,
+                to: name.trim().to_owned(),
+            };
+            if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+                error!(%error, "cluster overlay network name changed but audit record failed");
+            }
         }
     }
     Ok(Json(ClusterNetworkChangeResponse {

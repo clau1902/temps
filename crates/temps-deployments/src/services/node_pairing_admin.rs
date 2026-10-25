@@ -137,8 +137,10 @@ pub enum OutboundEnrollmentKind {
     Pairing(Box<node_pairings::Model>),
     /// The worker is node `node_id` joining the same control plane again
     /// (ADR 060): it proved it is that node, keeps its mesh key and address,
-    /// and registers again to update the node in place.
-    Rejoin { node_id: i32 },
+    /// and registers again to update the node in place. `ack` is
+    /// [`temps_core::node_pki::rejoin_ack`] over its proof, so the worker
+    /// can tell this is the control plane it belongs to.
+    Rejoin { node_id: i32, ack: Option<String> },
 }
 
 /// The enrollment token and encrypted secret a new pairing is created with.
@@ -338,6 +340,7 @@ impl NodePairingAdminService {
                 name: name.to_string(),
             });
         }
+        let proof = rejoin.as_ref().map(|claim| claim.proof.to_string());
         let rejoining = crate::services::node_service::proven_rejoin(db, name, public_key, rejoin)
             .await
             .map_err(NodePairingAdminError::Rejoin)?;
@@ -376,7 +379,12 @@ impl NodePairingAdminService {
                 name, "a node joins its control plane again; it keeps its mesh key and address"
             );
             return Ok(OutboundEnrollment {
-                kind: OutboundEnrollmentKind::Rejoin { node_id: node.id },
+                kind: OutboundEnrollmentKind::Rejoin {
+                    node_id: node.id,
+                    ack: proof.as_deref().and_then(|proof| {
+                        temps_core::node_pki::rejoin_ack(&node.token_hash, proof)
+                    }),
+                },
                 name: node.name,
                 expires_at: token.expires_at,
                 control_plane_public_key: control_plane.public_key,

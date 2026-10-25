@@ -159,7 +159,8 @@ impl CloudflareTunnelProvider {
             return Err(IngressError::Provider(format!(
                 "Cloudflare refused the API token of DNS provider '{}' to {operation}: {detail}. \
                  Edit that token in Cloudflare (My Profile → API Tokens) so it has \
-                 'Account · Cloudflare Tunnel · Edit' and 'Zone · DNS · Edit', then retry.",
+                 'Zone · Zone · Read', 'Zone · DNS · Edit' and \
+                 'Account · Cloudflare Tunnel · Edit', then retry.",
                 self.credential_label
             )));
         }

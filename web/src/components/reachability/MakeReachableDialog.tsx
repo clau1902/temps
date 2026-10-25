@@ -15,6 +15,7 @@ import {
   Circle,
   CircleDot,
   ExternalLink,
+  Loader2,
   MinusCircle,
   XCircle,
 } from 'lucide-react'
@@ -88,6 +89,7 @@ import {
   defaultOption,
   isActiveRun,
   missingAnswers,
+  planIsCurrent,
   privateDnsWarning,
   resumeNeedsToken,
   stalePlan,
@@ -187,6 +189,13 @@ export function MakeReachableDialog({
     retry: false,
   })
 
+  // Until the plan for the address typed now arrives, nothing can be applied.
+  const planCurrent = planIsCurrent({
+    typed: typedAddress,
+    requested,
+    placeholder: plan.isPlaceholderData,
+  })
+
   // The suggested address fills the field once; the chosen option follows
   // the plan's recommendation unless the user picked one that still fits.
   const suggested = plan.data?.address
@@ -278,7 +287,7 @@ export function MakeReachableDialog({
       })
       return
     }
-    const planId = plan.data?.plan_id
+    const planId = planCurrent ? plan.data?.plan_id : undefined
     if (!planId) {
       form.setError('values', {
         message: 'The plan is still being worked out. Try again in a moment.',
@@ -472,7 +481,7 @@ export function MakeReachableDialog({
                 />
                 <PlanChoices
                   plan={plan.data}
-                  loading={plan.isPending}
+                  loading={plan.isPending || !planCurrent}
                   error={
                     plan.isError
                       ? problemDetail(
@@ -568,8 +577,11 @@ export function MakeReachableDialog({
                 <Button
                   type="submit"
                   form="make-reachable"
-                  disabled={!option || apply.isPending}
+                  disabled={!option || !planCurrent || apply.isPending}
                 >
+                  {option && !planCurrent && (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  )}
                   {option ? option.title : 'Make it reachable'}
                 </Button>
               </>
@@ -651,9 +663,10 @@ function PlanChoices({
   return (
     <RadioGroup
       aria-label="Way in"
+      aria-busy={loading || undefined}
       value={value}
       onValueChange={onChange}
-      className="grid gap-3"
+      className={cn('grid gap-3', loading && 'opacity-60')}
     >
       {plan.options.map((option) => (
         <OptionCard

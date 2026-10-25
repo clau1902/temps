@@ -2068,6 +2068,39 @@ pub async fn undo(
                     )
                 }
             },
+            // An audience goes back only while the address, on this run's
+            // environment, still holds exactly what the run set: a later
+            // change, or the address moving elsewhere, is never reverted.
+            RunResource::AddressAudience {
+                hostname,
+                before,
+                after,
+            } if !checked => match ops.address_audience(hostname).await {
+                Ok(Some(current)) if current == *after => {}
+                // An earlier undo put it back already, or it is not here
+                // any more: nothing to restore.
+                Ok(Some(current)) if current == *before => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    continue;
+                }
+                Ok(None) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    continue;
+                }
+                Ok(Some(current)) => return stop(results, pause(entry, current.describe(), now)),
+                Err(error) => {
+                    return stop(
+                        results,
+                        Stop::Failed(format!(
+                            "Temps could not read who {hostname} is for to check it still \
+                             holds what this run set, so it touched nothing from there on: \
+                             {error} Undo again to retry."
+                        )),
+                    )
+                }
+            },
             // A tunnel is checked for what else it serves, then marked
             // `deleting`, and that journaled, before any provider call:
             // sync then never brings it back, and an interrupted undo
@@ -3156,6 +3189,64 @@ mod tests {
         assert!(
             undone.iter().any(|c| c.starts_with("remove_dns_record")),
             "{undone:?}"
+        );
+    }
+
+    /// Undo puts an existing address's audience back only while it still
+    /// holds what the run set: one changed since, by anyone, is left as it
+    /// is and undo stops there.
+    #[tokio::test]
+    async fn undo_never_reverts_an_audience_changed_after_the_run() {
+        let ops = Fake {
+            reachable: true,
+            existing_domain: Some((51, 7)),
+            ..Default::default()
+        };
+        let record = execute(&private_input(13), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        let set = ops
+            .audience
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("audience set");
+
+        // Still what the run set: it goes back to public.
+        let mut journal = record.journal.clone();
+        let undo_ops = Fake::default();
+        *undo_ops.dns.lock().expect("lock") = ops.dns.lock().expect("lock").clone();
+        *undo_ops.audience.lock().expect("lock") = Some(set.clone());
+        let outcome = undo(&mut journal, &undo_ops, 13, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none(), "{:?}", outcome.stopped);
+        assert!(
+            undo_ops
+                .calls()
+                .contains(&"set_address_audience public".to_string()),
+            "{:?}",
+            undo_ops.calls()
+        );
+
+        // Changed since: left alone, and undo stops on it.
+        let mut journal = record.journal.clone();
+        let undo_ops = Fake::default();
+        *undo_ops.dns.lock().expect("lock") = ops.dns.lock().expect("lock").clone();
+        *undo_ops.audience.lock().expect("lock") = Some(AddressAudience {
+            network_range: Some("10.0.0.0/8".into()),
+            ..set
+        });
+        let outcome = undo(&mut journal, &undo_ops, 13, &Journaled::default()).await;
+        assert!(
+            matches!(outcome.stopped, Some(Stop::Conflict(_))),
+            "{:?}",
+            outcome.stopped
+        );
+        assert!(
+            !undo_ops
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("set_address_audience")),
+            "{:?}",
+            undo_ops.calls()
         );
     }
 

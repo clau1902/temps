@@ -13756,12 +13756,6 @@ echo "[restore] Pre-seed complete"
         Ok((container_name, internal_port, host_port))
     }
 
-    /// Docker name of the multi-host overlay network this process
-    /// reconciles (`temps0` unless the cluster names another, ADR 059).
-    fn overlay_network_name() -> String {
-        temps_network::overlay_name::current().docker_network
-    }
-
     /// Best-effort dual-attach of a locally-managed container to the
     /// multi-host overlay, returning the IP it ended up with there.
     ///
@@ -13775,8 +13769,11 @@ echo "[restore] Pre-seed complete"
     /// (single-node installs), which is not an error: single-node installs
     /// never need a cross-node address in the first place.
     async fn attach_container_to_overlay(&self, container_ref: &str) -> Option<String> {
-        let overlay = Self::overlay_network_name();
-        let network_config = temps_network::NetworkConfig::default();
+        // One read of the selected overlay (ADR 059), so the network
+        // validated is the one connected to.
+        let names = temps_network::overlay_name::current();
+        let network_config = temps_network::NetworkConfig::default().with_overlay_names(&names);
+        let overlay = names.docker_network;
         let docker = match self.docker.get() {
             Some(d) => d,
             None => {

@@ -61,9 +61,39 @@ const tunnel = (state: string) => ({
   nodes: [{ node_id: 1, node_name: 'worker-a', state, ready_connections: 4 }],
 })
 
+const cloudflareAccount = (id: number, name: string) => ({
+  id,
+  name,
+  provider_type: 'cloudflare',
+  is_active: true,
+  credentials: {},
+  flat_hostnames_supported: true,
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
+})
+
 function setup() {
   const posted: { path: string; body: unknown }[] = []
+  // A pasted token adds account 2 next to the existing account 1.
+  const accounts = [cloudflareAccount(1, 'Cloudflare')]
+  const perAccount = (id: number) => ({
+    [`GET /dns-providers/${id}/zones`]: () =>
+      jsonResponse({
+        zones: [
+          { id: 'z1', name: 'example.com', status: 'active', nameservers: [] },
+        ],
+      }),
+    [`GET /dns-providers/${id}/domains`]: () => jsonResponse([]),
+    [`POST /dns-providers/${id}/domains`]: async (request: Request) => {
+      posted.push({ path: 'domains', body: await request.json() })
+      return jsonResponse(managedDomain(false), 201)
+    },
+    [`POST /dns-providers/${id}/domains/example.com/verify`]: () =>
+      jsonResponse(managedDomain(true)),
+  })
   const api = mockApi({
+    ...perAccount(1),
+    ...perAccount(2),
     'GET /internal/nodes': () =>
       jsonResponse({
         nodes: [
@@ -91,32 +121,16 @@ function setup() {
       ]),
     'GET /ingress/connectors': () =>
       jsonResponse({ connectors: [], total: 0, page: 1, page_size: 100 }),
-    'GET /dns-providers': () =>
-      jsonResponse([
-        {
-          id: 1,
-          name: 'Cloudflare',
-          provider_type: 'cloudflare',
-          is_active: true,
-          credentials: {},
-          flat_hostnames_supported: true,
-          created_at: '2026-01-01T00:00:00Z',
-          updated_at: '2026-01-01T00:00:00Z',
-        },
-      ]),
-    'GET /dns-providers/1/zones': () =>
-      jsonResponse({
-        zones: [
-          { id: 'z1', name: 'example.com', status: 'active', nameservers: [] },
-        ],
-      }),
-    'GET /dns-providers/1/domains': () => jsonResponse([]),
-    'POST /dns-providers/1/domains': async (request) => {
-      posted.push({ path: 'domains', body: await request.json() })
-      return jsonResponse(managedDomain(false), 201)
+    'GET /dns-providers': () => jsonResponse(accounts),
+    'POST /dns-providers': () => {
+      const added = cloudflareAccount(2, 'Cloudflare 2')
+      accounts.push(added)
+      return jsonResponse(added, 201)
     },
-    'POST /dns-providers/1/domains/example.com/verify': () =>
-      jsonResponse(managedDomain(true)),
+    'DELETE /dns-providers/2': () => {
+      accounts.splice(1)
+      return new Response(null, { status: 204 })
+    },
     'POST /ingress/connectors': async (request) => {
       posted.push({ path: 'connectors', body: await request.json() })
       return jsonResponse(tunnel('pending'), 201)
@@ -206,4 +220,59 @@ test('open ports hands over to each worker’s own page', async () => {
     name: 'Set up open ports on worker-a',
   })
   expect(link.getAttribute('href')).toBe('/settings/nodes/1#public-ingress')
+})
+
+async function connectToken() {
+  fireEvent.click(
+    await screen.findByRole('radio', { name: /Paste an API token/ })
+  )
+  fireEvent.change(await screen.findByLabelText('API token'), {
+    target: { value: 'cf-token' },
+  })
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Check token and continue' })
+  )
+  return screen.findByRole('button', { name: 'Use a different token' })
+}
+
+test('replacing a pasted token asks before removing the account it added', async () => {
+  const { api } = setup()
+  fireEvent.click(await connectToken())
+
+  const dialog = await screen.findByRole('alertdialog')
+  expect(dialog.textContent).toContain(
+    'Remove Cloudflare account Cloudflare 2?'
+  )
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+  expect(api.called('DELETE', '/dns-providers/2')).toBe(false)
+
+  fireEvent.click(screen.getByRole('button', { name: 'Use a different token' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+  await screen.findByRole('button', { name: 'Check token and continue' })
+  expect(api.called('DELETE', '/dns-providers/2')).toBe(true)
+})
+
+test('after a run, the account its tunnel uses is no longer offered for removal', async () => {
+  const { api } = setup()
+  await connectToken()
+  fireEvent.click(await screen.findByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+  await screen.findByText('Visitors can reach apps under example.com')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Set up another' }))
+  // The account is now an existing one, picked, with nothing to delete.
+  await waitFor(() =>
+    expect(
+      screen
+        .getByRole('radio', { name: 'Cloudflare 2' })
+        .getAttribute('data-state')
+    ).toBe('checked')
+  )
+  expect(
+    screen.queryByRole('button', { name: 'Use a different token' })
+  ).toBeNull()
+  expect(api.called('DELETE', '/dns-providers/2')).toBe(false)
 })

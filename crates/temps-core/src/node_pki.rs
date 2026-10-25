@@ -510,6 +510,46 @@ pub fn rejoin_proof(
     Some(hex::encode(mac.finalize().into_bytes()))
 }
 
+/// The control plane's answer to a valid [`rejoin_proof`] (ADR 060):
+/// HMAC-SHA256 keyed by the same agent token hash, over the proof. Only a
+/// control plane holding that hash can compute it, so a worker that checks
+/// it knows it is joining the plane it belongs to before it sends anything
+/// that plane alone should see (its agent token). Lowercase hex.
+pub fn rejoin_ack(agent_token_hash: &str, proof: &str) -> Option<String> {
+    use hmac::Mac;
+    Some(hex::encode(
+        rejoin_ack_mac(agent_token_hash, proof)?
+            .finalize()
+            .into_bytes(),
+    ))
+}
+
+/// Worker side of [`rejoin_ack`]: whether `ack` answers `proof` under the
+/// hash of the agent token it holds, compared in constant time.
+pub fn rejoin_ack_matches(agent_token_hash: &str, proof: &str, ack: &str) -> bool {
+    use hmac::Mac;
+    let (Some(mac), Ok(ack)) = (
+        rejoin_ack_mac(agent_token_hash, proof),
+        hex::decode(ack.trim()),
+    ) else {
+        return false;
+    };
+    mac.verify_slice(&ack).is_ok()
+}
+
+fn rejoin_ack_mac(agent_token_hash: &str, proof: &str) -> Option<hmac::Hmac<Sha256>> {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(agent_token_hash.as_bytes()).ok()?;
+    for part in [
+        "temps-node-rejoin-ack/v1",
+        &proof.trim().to_ascii_lowercase(),
+    ] {
+        mac.update(part.as_bytes());
+        mac.update(&[0]);
+    }
+    Some(mac)
+}
+
 /// Node side: generate a fresh keypair and a CSR. `common_name` is the subject
 /// CN; `sans` are the Subject Alternative Names the leaf must be valid for —
 /// rcgen auto-classifies each entry as an IP or DNS SAN. The control plane
@@ -661,6 +701,25 @@ mod tests {
         ] {
             assert_ne!(other.unwrap(), proof);
         }
+    }
+
+    #[test]
+    fn only_the_holder_of_the_token_hash_can_acknowledge_a_rejoin() {
+        let hash = agent_token_hash("agent-token");
+        let proof = rejoin_proof(&hash, "edge-1", "key", "join-1").unwrap();
+        let ack = rejoin_ack(&hash, &proof).unwrap();
+        assert!(rejoin_ack_matches(&hash, &proof, &ack));
+        assert!(rejoin_ack_matches(&hash, &proof, &ack.to_ascii_uppercase()));
+        assert!(!rejoin_ack_matches(
+            &agent_token_hash("other"),
+            &proof,
+            &ack
+        ));
+        let other_proof = rejoin_proof(&hash, "edge-1", "key", "join-2").unwrap();
+        assert!(!rejoin_ack_matches(&hash, &other_proof, &ack));
+        // The proof itself is no acknowledgement.
+        assert!(!rejoin_ack_matches(&hash, &proof, &proof));
+        assert!(!rejoin_ack_matches(&hash, &proof, "not hex"));
     }
 
     #[test]

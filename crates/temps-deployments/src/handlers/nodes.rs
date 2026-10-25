@@ -55,6 +55,11 @@ pub struct NodeAppState {
     /// Per-IP + global rate limiter for the registration endpoint
     /// (ADR-020 WS-1.3 / enroll-3).
     pub rate_limiter: Arc<RegistrationRateLimiter>,
+    /// Its own window for `/internal/nodes/plane-identity` (ADR 060): it
+    /// serves only public data, and one `temps join` asks it before it
+    /// registers, so sharing the registration window would spend that
+    /// window twice per join and rate-limit workers behind one NAT.
+    pub plane_identity_rate_limiter: Arc<RegistrationRateLimiter>,
     /// Short-lived, single-use node enrollment tokens (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
     /// Alarm pipeline — used to resolve the node-offline alarm when a node
@@ -1884,6 +1889,11 @@ pub struct MeshEnrollResponse {
     /// registering with `join_token` updates that node in place.
     #[serde(default)]
     pub rejoined_node_id: Option<i32>,
+    /// With `rejoined_node_id`: `temps_core::node_pki::rejoin_ack` over the
+    /// worker's proof, keyed by the node's agent token hash. The worker
+    /// checks it before treating this as the control plane it belongs to.
+    #[serde(default)]
+    pub rejoin_ack: Option<String>,
     /// The name the join token is bound to.
     pub name: String,
     pub control_plane_public_key: String,
@@ -2063,7 +2073,7 @@ async fn mesh_enroll_inner(
         ip_address: Some(addr.ip().to_string()),
         user_agent: "temps-join/mesh-enroll".to_string(),
     };
-    let (pairing_id, rejoined_node_id) = match &enrollment.kind {
+    let (pairing_id, rejoined_node_id, rejoin_ack) = match &enrollment.kind {
         OutboundEnrollmentKind::Pairing(pairing) => {
             info!(
                 node = %name,
@@ -2080,9 +2090,9 @@ async fn mesh_enroll_inner(
             if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
                 error!(%error, "mesh enrollment created a pairing but its audit record failed");
             }
-            (Some(pairing.id), None)
+            (Some(pairing.id), None, None)
         }
-        OutboundEnrollmentKind::Rejoin { node_id } => {
+        OutboundEnrollmentKind::Rejoin { node_id, ack } => {
             info!(
                 node = %name,
                 node_id,
@@ -2098,13 +2108,14 @@ async fn mesh_enroll_inner(
             if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
                 error!(%error, node_id, "a node started joining again but its audit record failed");
             }
-            (None, Some(*node_id))
+            (None, Some(*node_id), ack.clone())
         }
     };
 
     let response = MeshEnrollResponse {
         pairing_id,
         rejoined_node_id,
+        rejoin_ack,
         name: enrollment.name.clone(),
         control_plane_public_key: enrollment.control_plane_public_key,
         control_plane_endpoint: enrollment.control_plane_endpoint,
@@ -2158,7 +2169,14 @@ async fn plane_identity(
     State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Result<impl IntoResponse, Problem> {
-    check_enrollment_rate(&app_state, addr.ip(), "plane-identity")?;
+    if let Err(retry_after) = app_state.plane_identity_rate_limiter.check(addr.ip()) {
+        warn!(ip = %addr.ip(), retry_after, "Plane identity rate-limited");
+        return Err(problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+            .with_title("Too Many Requests")
+            .with_detail(format!(
+                "Control-plane identity rate limit exceeded; retry in {retry_after}s"
+            )));
+    }
     let settings = app_state
         .config_service
         .get_settings()
@@ -5816,6 +5834,7 @@ mod tests {
             encryption_service,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             rate_limiter: Arc::new(RegistrationRateLimiter::new()),
+            plane_identity_rate_limiter: Arc::new(RegistrationRateLimiter::new()),
             enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(
                 test_db_for_enrollment,
             )),
