@@ -217,7 +217,11 @@ pub struct RecordSnapshot {
 }
 
 impl RecordSnapshot {
-    fn of(provider_id: i32, record_type: DnsRecordType, ownership: RecordOwnership) -> Option<Self> {
+    fn of(
+        provider_id: i32,
+        record_type: DnsRecordType,
+        ownership: RecordOwnership,
+    ) -> Option<Self> {
         let (record, marker) = match ownership {
             RecordOwnership::Owned(record, marker) => (record, Some(marker)),
             RecordOwnership::Unmanaged(record) | RecordOwnership::OwnedByOther(record, _) => {
@@ -716,7 +720,11 @@ impl ManagedDnsRecordService {
             .await?
             .ok_or_else(|| DnsError::DomainNotManaged(domain.to_string()))?;
         let ownership = self.record_ownership(domain, name, record_type).await?;
-        Ok(RecordSnapshot::of(provider_model.id, record_type, ownership))
+        Ok(RecordSnapshot::of(
+            provider_model.id,
+            record_type,
+            ownership,
+        ))
     }
 
     async fn validate_scope(&self, scope: OwnershipScope) -> Result<(), DnsError> {

@@ -345,13 +345,14 @@ pub fn assemble(
     permissions.push(probe(TokenPermission::TunnelEdit, tunnel_probe));
 
     let scope = wanted_zone.map(|zone| {
-        let other_zones: Vec<String> =
-            zone_names.iter().filter(|z| *z != zone).cloned().collect();
+        let other_zones: Vec<String> = zone_names.iter().filter(|z| *z != zone).cloned().collect();
         let total = zones
             .and_then(|a| a.total_count)
             .unwrap_or(zone_names.len() as u64);
         let reaches_wanted = zone_names.iter().any(|z| z == zone);
-        let other_count = total.saturating_sub(u64::from(reaches_wanted)).max(other_zones.len() as u64);
+        let other_count = total
+            .saturating_sub(u64::from(reaches_wanted))
+            .max(other_zones.len() as u64);
         let ok = reaches_wanted && other_count == 0;
         let detail = if ok {
             format!("Limited to {zone}.")
@@ -490,7 +491,14 @@ pub async fn check_token(
     let wanted_zone = wanted_zone
         .map(|z| z.trim().trim_end_matches('.').to_ascii_lowercase())
         .filter(|z| !z.is_empty());
-    let verify = call(http, token, reqwest::Method::GET, "/user/tokens/verify", None).await;
+    let verify = call(
+        http,
+        token,
+        reqwest::Method::GET,
+        "/user/tokens/verify",
+        None,
+    )
+    .await;
     if !verify.success || verify.denied() {
         return assemble(&verify, None, None, None, wanted_zone.as_deref());
     }
@@ -627,17 +635,33 @@ mod tests {
             Some("example.com"),
         );
         assert!(!result.ready);
-        assert_eq!(state(&result, TokenPermission::ZoneRead), PermissionState::Present);
-        assert_eq!(state(&result, TokenPermission::DnsEdit), PermissionState::Missing);
-        assert_eq!(state(&result, TokenPermission::TunnelEdit), PermissionState::Missing);
+        assert_eq!(
+            state(&result, TokenPermission::ZoneRead),
+            PermissionState::Present
+        );
+        assert_eq!(
+            state(&result, TokenPermission::DnsEdit),
+            PermissionState::Missing
+        );
+        assert_eq!(
+            state(&result, TokenPermission::TunnelEdit),
+            PermissionState::Missing
+        );
         let refusal = result.refusal().expect("refused");
         assert!(refusal.contains("Zone · DNS · Edit"), "{refusal}");
-        assert!(refusal.contains("Account · Cloudflare Tunnel · Edit"), "{refusal}");
+        assert!(
+            refusal.contains("Account · Cloudflare Tunnel · Edit"),
+            "{refusal}"
+        );
     }
 
     #[test]
     fn an_answer_that_proves_nothing_is_unverified_and_refused() {
-        for (status, body) in [(502, SERVER_ERROR), (404, SERVER_ERROR), (400, SERVER_ERROR)] {
+        for (status, body) in [
+            (502, SERVER_ERROR),
+            (404, SERVER_ERROR),
+            (400, SERVER_ERROR),
+        ] {
             assert_eq!(
                 write_probe_permission(&answer(status, body)),
                 PermissionState::Unverified,
@@ -652,7 +676,10 @@ mod tests {
             Some("example.com"),
         );
         assert!(!result.ready);
-        assert_eq!(state(&result, TokenPermission::DnsEdit), PermissionState::Unverified);
+        assert_eq!(
+            state(&result, TokenPermission::DnsEdit),
+            PermissionState::Unverified
+        );
         let refusal = result.refusal().expect("refused");
         assert!(
             refusal.starts_with(
@@ -677,7 +704,10 @@ mod tests {
         assert_eq!(scope.other_zones, vec!["other.org"]);
         assert_eq!(scope.other_count, 2);
         let refusal = result.refusal().expect("refused");
-        assert!(refusal.contains("also reaches other.org and 1 more"), "{refusal}");
+        assert!(
+            refusal.contains("also reaches other.org and 1 more"),
+            "{refusal}"
+        );
         assert!(refusal.contains("Specific zone · example.com"), "{refusal}");
 
         // Without a zone to keep to (the DNS providers page), several are fine.
@@ -695,14 +725,26 @@ mod tests {
     fn a_token_that_reaches_no_zone_is_missing_zone_read() {
         let result = assemble(
             &answer(200, VERIFY_OK),
-            Some(&answer(200, r#"{"result":[],"result_info":{"total_count":0},"success":true,"errors":[]}"#)),
+            Some(&answer(
+                200,
+                r#"{"result":[],"result_info":{"total_count":0},"success":true,"errors":[]}"#,
+            )),
             None,
             None,
             None,
         );
-        assert_eq!(state(&result, TokenPermission::ZoneRead), PermissionState::Missing);
-        assert_eq!(state(&result, TokenPermission::DnsEdit), PermissionState::Unverified);
-        assert_eq!(state(&result, TokenPermission::TunnelEdit), PermissionState::Unverified);
+        assert_eq!(
+            state(&result, TokenPermission::ZoneRead),
+            PermissionState::Missing
+        );
+        assert_eq!(
+            state(&result, TokenPermission::DnsEdit),
+            PermissionState::Unverified
+        );
+        assert_eq!(
+            state(&result, TokenPermission::TunnelEdit),
+            PermissionState::Unverified
+        );
     }
 
     #[test]

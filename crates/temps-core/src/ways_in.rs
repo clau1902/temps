@@ -108,7 +108,11 @@ pub fn cidr_is_private(cidr: &str) -> Option<bool> {
             }
             let net = u128::from(v6);
             PRIVATE_V6.iter().any(|&(block, len)| {
-                let mask = if len == 0 { 0 } else { u128::MAX << (128 - len) };
+                let mask = if len == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - len)
+                };
                 prefix >= len && net & mask == block
             })
         }
@@ -178,15 +182,20 @@ mod tests {
         assert_eq!(cidr_is_private("172.32.0.0/16"), Some(false));
         assert_eq!(cidr_is_private("not a range"), None);
         assert!(only_private(&["100.64.0.0/10".into(), "10.0.0.0/8".into()]));
-        assert!(!only_private(&["100.64.0.0/10".into(), "93.184.215.0/24".into()]));
+        assert!(!only_private(&[
+            "100.64.0.0/10".into(),
+            "93.184.215.0/24".into()
+        ]));
         assert!(!only_private(&[]));
     }
 
     #[test]
     fn the_message_names_the_way_in_the_range_and_the_address() {
-        let through = WayInKind::Tunnel { name: "homelab".into() }
-            .proxied_through()
-            .expect("proxied");
+        let through = WayInKind::Tunnel {
+            name: "homelab".into(),
+        }
+        .proxied_through()
+        .expect("proxied");
         assert_eq!(
             private_allow_list_message(&through, "100.64.0.0/10", "myapp.example.com"),
             "Visitors through tunnel `homelab` arrive with their internet address, so \

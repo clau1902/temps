@@ -835,8 +835,8 @@ impl ProjectIpAccessService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::ways_in::WayInKind;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use temps_core::ways_in::WayInKind;
 
     fn entry(cidr: &str) -> IpAccessCidrEntry {
         IpAccessCidrEntry {
@@ -1254,7 +1254,10 @@ mod tests {
             "127.0.0.1/32",
         ])));
         // One internet range is enough for a tunnel visitor to match.
-        assert!(!only_private_ranges(&networks(&["10.0.0.0/8", "203.0.113.0/24"])));
+        assert!(!only_private_ranges(&networks(&[
+            "10.0.0.0/8",
+            "203.0.113.0/24"
+        ])));
         // A range that only starts private is not private.
         assert!(!only_private_ranges(&networks(&["0.0.0.0/0"])));
         assert!(!only_private_ranges(&networks(&["::/0"])));
