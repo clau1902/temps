@@ -66,6 +66,32 @@ mod tests {
         }
     }
 
+    /// Print the part of the PostgreSQL server log that explains a failed
+    /// statement.
+    ///
+    /// The client only sees `deadlock detected`; the server log is where
+    /// PostgreSQL names both sessions and the statements they were running,
+    /// and it is gone as soon as the container is dropped. Print the report
+    /// when there is one, otherwise the tail of the log.
+    async fn print_server_log(container: &testcontainers::ContainerAsync<GenericImage>) {
+        let raw = match container.stderr_to_vec().await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => {
+                eprintln!("Could not read the PostgreSQL server log: {error}");
+                return;
+            }
+        };
+        let lines: Vec<&str> = raw.lines().collect();
+        let excerpt = match lines
+            .iter()
+            .position(|line| line.contains("deadlock detected"))
+        {
+            Some(at) => &lines[at.saturating_sub(2)..(at + 14).min(lines.len())],
+            None => &lines[lines.len().saturating_sub(40)..],
+        };
+        eprintln!("--- PostgreSQL server log ---\n{}", excerpt.join("\n"));
+    }
+
     #[tokio::test]
     async fn test_establish_connection() -> anyhow::Result<()> {
         // Start TimescaleDB container
@@ -135,8 +161,12 @@ mod tests {
         // Heavy audit index creation is deliberately outside the migration
         // transaction. Prove the post-migration path is idempotent and creates
         // the expected partial concurrent index against a real PostgreSQL.
-        run_post_migration_indexes(connection.as_ref()).await?;
-        run_post_migration_indexes(connection.as_ref()).await?;
+        for _ in 0..2 {
+            if let Err(error) = run_post_migration_indexes(connection.as_ref()).await {
+                print_server_log(&postgres_container).await;
+                return Err(error.into());
+            }
+        }
         let index = connection
             .query_one(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
@@ -460,6 +490,61 @@ mod tests {
 
     /// Start a throwaway TimescaleDB container and connect (no auto-migrate).
     /// Returns `None` when Docker is unavailable so callers skip gracefully.
+    /// A reference index build that loses a lock race must be retried, not
+    /// reported as a failure.
+    ///
+    /// `CREATE INDEX CONCURRENTLY` waits for every transaction that holds a
+    /// write lock on the table, and PostgreSQL ends the wait with a deadlock
+    /// or a lock timeout when it cannot be granted. Both are transient. Here a
+    /// transaction keeps a write lock on `visitor` for longer than the
+    /// maintenance connection's 5 s lock timeout, so the first attempt at
+    /// `idx_visitor_last_seen` must fail; once the lock is released the
+    /// retry has to build the index, which also requires removing the invalid
+    /// leftover the failed attempt created.
+    #[tokio::test]
+    async fn test_post_migration_indexes_retry_a_transient_lock_timeout() -> anyhow::Result<()> {
+        use sea_orm::TransactionTrait;
+
+        let Some((container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        run_migrations(db.as_ref()).await?;
+
+        let blocker = db.begin().await?;
+        blocker
+            .execute_unprepared("LOCK TABLE visitor IN ROW EXCLUSIVE MODE")
+            .await?;
+
+        let builder = {
+            let db = db.clone();
+            tokio::spawn(async move { run_post_migration_indexes(db.as_ref()).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(6500)).await;
+        blocker.commit().await?;
+
+        let outcome = builder.await?;
+        if outcome.is_err() {
+            print_server_log(&container).await;
+        }
+        outcome?;
+
+        let state = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT indisvalid AS is_valid FROM pg_index \
+                 WHERE indexrelid = to_regclass('idx_visitor_last_seen')"
+                    .to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("idx_visitor_last_seen was not created"))?;
+        assert!(
+            state.try_get::<bool>("", "is_valid")?,
+            "idx_visitor_last_seen must be valid after the retry"
+        );
+        Ok(())
+    }
+
     async fn start_fresh_db() -> anyhow::Result<
         Option<(
             testcontainers::ContainerAsync<GenericImage>,
