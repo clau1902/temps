@@ -767,6 +767,35 @@ pub struct PrivateAddress {
     pub listener: Option<String>,
 }
 
+/// How a non-public address is bounded. Only `private` is served, by the
+/// listener and to the range it names. Any other audience (`signed_in`
+/// before phase 4, or a value a newer version wrote) admits nobody: it is
+/// never served to the whole private range, so a rolled-back control plane
+/// cannot widen it (ADR 065 D6).
+fn private_address(
+    audience: &str,
+    address_id: String,
+    range: Option<String>,
+    node_id: Option<i32>,
+    listener: Option<String>,
+) -> PrivateAddress {
+    if audience == temps_entities::audience::PRIVATE {
+        PrivateAddress {
+            address_id,
+            range,
+            node_id,
+            listener,
+        }
+    } else {
+        PrivateAddress {
+            address_id,
+            range: None,
+            node_id: None,
+            listener: None,
+        }
+    }
+}
+
 /// A private address with the route it would take. Never part of the maps
 /// this proxy serves from, and never exported as a public worker route.
 #[derive(Clone, Debug)]
@@ -1732,15 +1761,13 @@ impl CachedPeerTable {
             if env_domain.audience != temps_entities::audience::PUBLIC {
                 private_meta.insert(
                     env_domain.domain.clone(),
-                    PrivateAddress {
-                        address_id: temps_core::worker_ingress::private_address_id(
-                            false,
-                            env_domain.id,
-                        ),
-                        range: env_domain.private_range.clone(),
-                        node_id: env_domain.private_node_id,
-                        listener: env_domain.private_listener.clone(),
-                    },
+                    private_address(
+                        &env_domain.audience,
+                        temps_core::worker_ingress::private_address_id(false, env_domain.id),
+                        env_domain.private_range.clone(),
+                        env_domain.private_node_id,
+                        env_domain.private_listener.clone(),
+                    ),
                 );
             }
             // Fetch environment if not cached (skip soft-deleted)
@@ -2021,15 +2048,13 @@ impl CachedPeerTable {
             if custom_domain.audience != temps_entities::audience::PUBLIC {
                 private_meta.insert(
                     custom_domain.domain.clone(),
-                    PrivateAddress {
-                        address_id: temps_core::worker_ingress::private_address_id(
-                            true,
-                            custom_domain.id,
-                        ),
-                        range: custom_domain.private_range.clone(),
-                        node_id: custom_domain.private_node_id,
-                        listener: custom_domain.private_listener.clone(),
-                    },
+                    private_address(
+                        &custom_domain.audience,
+                        temps_core::worker_ingress::private_address_id(true, custom_domain.id),
+                        custom_domain.private_range.clone(),
+                        custom_domain.private_node_id,
+                        custom_domain.private_listener.clone(),
+                    ),
                 );
             }
             // Fetch environment if not cached (skip soft-deleted)
@@ -4680,6 +4705,32 @@ mod tests {
                 .map(|(host, _)| host)
                 .collect();
             assert_eq!(hosts, vec!["api.example.com"]);
+        }
+
+        /// ADR 065 D6: only `private` is served to a range. `signed_in` before
+        /// phase 4, or a value a newer version wrote, admits nobody, so a
+        /// rolled-back control plane never serves it to a whole network.
+        #[test]
+        fn only_a_private_audience_is_served_to_its_range() {
+            let bounded = |audience: &str| {
+                private_address(
+                    audience,
+                    "custom:7".into(),
+                    Some("100.64.0.0/10".into()),
+                    Some(3),
+                    Some("100.101.102.103".into()),
+                )
+            };
+            let private = bounded(temps_entities::audience::PRIVATE);
+            assert_eq!(private.range.as_deref(), Some("100.64.0.0/10"));
+            assert_eq!(private.node_id, Some(3));
+            for audience in [temps_entities::audience::SIGNED_IN, "tailnet_users", ""] {
+                let nobody = bounded(audience);
+                assert_eq!(nobody.address_id, "custom:7", "{audience}");
+                assert_eq!(nobody.range, None, "{audience}");
+                assert_eq!(nobody.node_id, None, "{audience}");
+                assert_eq!(nobody.listener, None, "{audience}");
+            }
         }
 
         /// ADR 064 D5: a private address is served by nobody but the private

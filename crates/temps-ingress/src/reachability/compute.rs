@@ -171,6 +171,21 @@ pub fn address_reachability(
         network: None,
     };
 
+    if !input.audience.is_served() {
+        // Routing serves these to nobody (`temps-routes`); say so rather
+        // than judge the public ways in.
+        let reason = match input.audience {
+            Audience::SignedIn => format!(
+                "{address} is for people who sign in, which this version of Temps cannot \
+                 serve yet, so nobody can open it."
+            ),
+            _ => format!(
+                "{address} was set up by a newer version of Temps for an audience this one \
+                 does not know, so nobody can open it until Temps is upgraded again."
+            ),
+        };
+        return verdict(ReachState::NotReachable, None, reason, None);
+    }
     if is_local_only(address) {
         return verdict(
             ReachState::NotReachable,
@@ -656,6 +671,26 @@ mod tests {
             takes_port_80: true,
             check_failed: None,
         }
+    }
+
+    /// ADR 065 D6: an audience this version cannot serve is served to
+    /// nobody, and the verdict says so instead of judging a public way in.
+    #[test]
+    fn an_audience_this_version_cannot_serve_is_not_reachable() {
+        for (stored, words) in [("signed_in", "sign in"), ("tailnet_users", "newer version")] {
+            let mut facts = facts("app.example.com", Resolution::Ips(vec![ip("203.0.113.10")]));
+            facts.input.audience = Audience::parse(stored);
+            let verdict = address_reachability(&facts, &[control_plane()], true, "production");
+            assert_eq!(verdict.state, ReachState::NotReachable, "{stored}");
+            assert!(
+                verdict.reason.contains(words),
+                "{stored}: {}",
+                verdict.reason
+            );
+        }
+        assert_eq!(Audience::parse("tailnet_users"), Audience::Unsupported);
+        assert_eq!(Audience::parse("private"), Audience::Private);
+        assert!(!Audience::Unsupported.is_served());
     }
 
     #[test]

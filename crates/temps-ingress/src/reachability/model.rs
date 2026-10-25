@@ -19,6 +19,10 @@ pub enum Audience {
     Private,
     /// Anyone who signs in. Reserved (phase 4).
     SignedIn,
+    /// A stored value this version does not know, written by a newer one.
+    /// Served to nobody and never changed by a run, so a rolled-back
+    /// control plane cannot widen it to a whole network (ADR 065 D6).
+    Unsupported,
 }
 
 impl Audience {
@@ -27,16 +31,25 @@ impl Audience {
             Audience::Public => temps_entities::audience::PUBLIC,
             Audience::Private => temps_entities::audience::PRIVATE,
             Audience::SignedIn => temps_entities::audience::SIGNED_IN,
+            Audience::Unsupported => "unsupported",
         }
     }
 
-    /// The stored value; an unknown one reads as the narrowest audience
-    /// rather than as public.
+    /// Whether this version can serve the audience (`signed_in` arrives in
+    /// phase 4). Anything else is served to nobody.
+    pub fn is_served(self) -> bool {
+        matches!(self, Audience::Public | Audience::Private)
+    }
+
+    /// The stored value. An unknown one is [`Audience::Unsupported`], never
+    /// `private` or `public`: either would serve it to more people than it
+    /// was meant for.
     pub fn parse(value: &str) -> Self {
         match value {
             temps_entities::audience::PUBLIC => Audience::Public,
+            temps_entities::audience::PRIVATE => Audience::Private,
             temps_entities::audience::SIGNED_IN => Audience::SignedIn,
-            _ => Audience::Private,
+            _ => Audience::Unsupported,
         }
     }
 }
@@ -575,6 +588,7 @@ impl AddressAudience {
             (Audience::Private, None) => "private".to_string(),
             (Audience::Public, _) => "public".to_string(),
             (Audience::SignedIn, _) => "for people who sign in".to_string(),
+            (Audience::Unsupported, _) => "set by a newer version of Temps".to_string(),
         }
     }
 }

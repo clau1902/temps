@@ -83469,7 +83469,7 @@ export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponse
 /**
  * Who an address is for.
  */
-export type Audience = 'public' | 'private' | 'signed_in';
+export type Audience = 'public' | 'private' | 'signed_in' | 'unsupported';
 
 export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
 

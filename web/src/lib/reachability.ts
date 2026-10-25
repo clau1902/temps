@@ -114,6 +114,7 @@ export const AUDIENCE_LABELS: Record<AddressReachability['audience'], string> =
     public: 'Anyone',
     private: 'My network',
     signed_in: 'Signed-in people',
+    unsupported: 'Set by a newer Temps',
   }
 
 /**

@@ -45,8 +45,8 @@ use temps_auth::permissions::Permission;
 
 use super::compute::{is_local_only, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND};
 use super::model::{
-    ActionKind, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep, PlannedRecord,
-    ReachAction, ReachabilityPlan, StepKind,
+    ActionKind, AddressAudience, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep,
+    PlannedRecord, ReachAction, ReachabilityPlan, StepKind,
 };
 use crate::registry::{FieldKind, SetupField};
 use crate::service::{covers, normalize_host, record_label, PublicationIntent, TunnelFact};
@@ -618,6 +618,14 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         blocked: Some(blocked),
     };
 
+    if let Some(blocked) = facts
+        .requested
+        .as_deref()
+        .map(str::trim)
+        .and_then(|host| unchangeable_audience(facts, host))
+    {
+        return empty(facts.audience, facts.requested.clone(), None, blocked);
+    }
     if facts.audience == Audience::Private {
         return plan_private(facts);
     }
@@ -1097,6 +1105,29 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     }
 }
 
+/// An address whose current audience this version cannot serve is left as
+/// it is: a run would otherwise widen it, and its undo could not write the
+/// value back (ADR 065 D6).
+fn unchangeable_audience(facts: &PlanFacts, host: &str) -> Option<PlanBlocked> {
+    let (_, current) = facts
+        .audiences
+        .iter()
+        .find(|(a, _)| a.eq_ignore_ascii_case(host))?;
+    (!current.is_served()).then(|| PlanBlocked {
+        reason: format!(
+            "{host} is set to an audience this version of Temps cannot serve ({}), so it is \
+             left as it is. Change it with the version that set it, or choose another \
+             hostname.",
+            AddressAudience {
+                audience: *current,
+                ..AddressAudience::default()
+            }
+            .describe()
+        ),
+        action: None,
+    })
+}
+
 /// When `host` is attached here as a private address: what making it
 /// public exposes, in words (ADR 064 Security).
 pub fn becomes_public(facts: &PlanFacts, host: &str) -> Option<String> {
@@ -1459,6 +1490,30 @@ mod tests {
 
     fn kinds(plan: &ReachabilityPlan) -> Vec<PlanOptionKind> {
         plan.options.iter().map(|o| o.kind).collect()
+    }
+
+    /// ADR 065 D6: an address whose audience this version cannot serve is
+    /// never changed by a run, in either direction.
+    #[test]
+    fn an_address_with_an_audience_this_version_cannot_serve_is_left_alone() {
+        for requested in [Audience::Public, Audience::Private] {
+            let facts = PlanFacts {
+                audience: requested,
+                requested: Some("app.example.com".into()),
+                attached_here: vec!["app.example.com".into()],
+                audiences: vec![("app.example.com".into(), Audience::parse("tailnet_users"))],
+                zones: vec![zone("example.com", "cloudflare")],
+                ..base()
+            };
+            let plan = plan(&facts);
+            assert!(plan.options.is_empty(), "{requested:?}");
+            let blocked = plan.blocked.expect("blocked");
+            assert!(
+                blocked.reason.contains("newer version"),
+                "{}",
+                blocked.reason
+            );
+        }
     }
 
     #[test]
