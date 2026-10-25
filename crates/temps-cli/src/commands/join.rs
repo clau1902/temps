@@ -86,16 +86,18 @@ pub struct JoinCommand {
     pub underlay_mtu: Option<u32>,
 
     /// Whether this worker takes public traffic (ADR 058 D7): `off` (no
-    /// public ports), `fixed` (listen where --listen says) or `delegated`
+    /// public ports), `fixed` (listen where --listen says), `delegated`
     /// (the console chooses: a tunnel, or open ports on one of this
-    /// worker's addresses). Without it a rejoin keeps the saved setting,
-    /// and a new worker starts `off`. Change it later with
-    /// `temps agent ingress`.
+    /// worker's addresses) or `private` (only a tailnet or LAN address,
+    /// `--listen tailscale` or a private IP, ADR 064 D5). Without it a
+    /// rejoin keeps the saved setting, and a new worker starts `off`.
+    /// Change it later with `temps agent ingress`.
     #[arg(long, value_enum)]
     pub ingress: Option<IngressFlag>,
 
     /// With `--ingress fixed`: local address to listen on, or `auto` for the
-    /// interface holding the default route.
+    /// interface holding the default route. With `--ingress private`:
+    /// `tailscale`, or a private address of this machine.
     #[arg(long, default_value = "auto")]
     pub listen: String,
 
@@ -134,6 +136,7 @@ pub enum IngressFlag {
     Off,
     Fixed,
     Delegated,
+    Private,
 }
 
 /// Response body from the control plane registration endpoint.
@@ -1033,6 +1036,11 @@ impl JoinCommand {
             IngressFlag::Off => IngressMode::Off,
             IngressFlag::Fixed => IngressMode::Fixed,
             IngressFlag::Delegated => IngressMode::Delegated,
+            IngressFlag::Private => {
+                config.ingress = Some(super::agent_ingress::private(&self.listen)?);
+                config.public_ingress_address = None;
+                return Ok(());
+            }
         };
         let mut ingress = LocalIngress {
             mode,
