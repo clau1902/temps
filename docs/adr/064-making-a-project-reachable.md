@@ -589,3 +589,70 @@ Where the build differs from the text above, and why.
   provider above all, are what removing it needs. Other failed removals are
   reported and the rest still attempted, as before.
 
+
+## Implementation notes (phase 2)
+
+- **Where the per-address bounds live.** `private_range`, `private_node_id`
+  and `private_listener` sit next to `audience` on `project_custom_domains`
+  and `environment_domains` (migration `m20261025_000001_private_audience`);
+  `node_public_ingress.private_checks` holds the worker's inside checks.
+  A public audience clears all three, so nothing stale routes the address
+  later. The range is the private block of the listener's address
+  (`100.64.0.0/10` on Tailscale), not a user choice in this phase.
+- **Routing.** The route table withdraws every non-public address from
+  every map the control plane's proxy serves (exact, HTTP/TLS routes,
+  wildcards via `is_reserved`, the wake path) and from
+  `worker_public_routes`, so neither the control plane, a hosted plane,
+  a direct listener nor a tunnel ever answers it. It is sent, in the route
+  snapshot's `private_routes`, only to the recorded worker, and only while
+  that worker reports `private` mode bound on a private address
+  (`private_listener_of`). Cluster-wide blocking policies hold private
+  routes back as they do public ones. The private listener answers 404 for
+  a host it has no private route for and 403 for a TCP peer outside the
+  route's range; both carry `x-temps-private-ingress` (`no-route`,
+  `outside-range`) so the inside check can tell the listener's refusal from
+  the app's own answer. The range check runs before the port-80 redirect.
+- **Bind state in the heartbeat.** `ListenerReport` carries the mode, the
+  bound address, the error, `interfaces[].tailscale` and `private_checks`.
+  The control plane refuses a private-mode report whose HTTPS listener is
+  not on a private address (recorded as the listener error, naming the
+  command) and never routes a private address to it. Each check is stamped
+  with when the control plane received it, never the worker's time.
+- **Inside checks** run on the agent after every change to its private
+  routes and every 5 minutes, not on request from the control plane: that
+  keeps the "only an address id" rule trivially true, since the control
+  plane sends nothing at all. A check older than 20 minutes reads as
+  `unknown` ("has not reported … for N minutes").
+- **Outside check** (control plane): no tunnel publishes or is publishing
+  the hostname, it resolves, every answer is private, and the recorded
+  listener is among them. A failed outside check wins over a good inside
+  one. The verdict carries `network` (`Tailscale` or the range) and the
+  header reads "Private at … (Tailscale)".
+- **Plan.** `private_worker` steps: attach, set audience (private + range
+  + worker + listener), the A/AAAA record through a managed zone with the
+  run's marker, the certificate over DNS-01, the checks. The audience is
+  set before DNS points anywhere. No private worker: the plan names
+  `temps agent ingress private --listen tailscale` and the worker to run it
+  on (one the environment runs on, else the first active worker). No zone
+  Temps manages, an unmanaged record at the name, or an environment on the
+  control plane block the plan with the reason. The fingerprint (now `v3`)
+  holds each private worker's listener, Tailscale flag and error, and the
+  environment's private ranges.
+- **Audience changes.** `SensitiveAction::ChangeAddressAudience {hostname,
+  from, to}` guards `apply` when its option changes an existing address's
+  audience (either way) and `undo`/`decide` when undo would put one back.
+  A public plan for an address that is private now gets a `set_audience`
+  step and a first warning naming what becomes public. Undo never restores
+  the audience of an address the same run attached: that address is removed
+  a step later, and it stays private until then.
+- **D9 and `auto_publish`.** Turning a tunnel's `auto_publish` on runs the
+  tunnel move guard for every served hostname it would then publish by
+  itself (no choice made, it is the most specific automatic tunnel), and
+  refuses with the guard's message.
+- **A private-mode worker** refuses being enabled for public traffic from
+  the console (409, naming `temps agent ingress delegated|fixed`), and its
+  card shows the private listener, whether it is the Tailscale address,
+  and the listener error.
+- **Not in this phase:** a LAN range other than the listener's own private
+  block, several private listeners per address, and the tailnet name
+  (phase 3).
