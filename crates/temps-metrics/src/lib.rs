@@ -4,6 +4,7 @@
 pub mod cluster;
 pub mod collector;
 pub mod error;
+pub mod node_capacity;
 pub mod node_sampler;
 pub mod proxy;
 pub mod scraper;

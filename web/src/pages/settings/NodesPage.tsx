@@ -131,6 +131,8 @@ import {
 } from '@/components/ui/alert-dialog'
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
+import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
+import { ServerMonitoring } from '@/components/monitoring/ServerMonitoring'
 
 // ── Helpers ──
 
@@ -1452,6 +1454,15 @@ function NodeDetail({
             )}
         </div>
       )}
+
+      {/* History and alerts. Always rendered: with no samples yet, or no
+          metrics store, ServerMonitoring explains what is missing. */}
+      <ServerMonitoring
+        nodeId={nodeId}
+        embedded
+        rangeParamName="metrics_range"
+      />
+      <NodeAlertRules nodeId={nodeId} />
 
       {/* Edge Analytics (only for edge nodes) */}
       {node.role === 'edge' && <EdgeAnalyticsSection nodeId={nodeId} />}

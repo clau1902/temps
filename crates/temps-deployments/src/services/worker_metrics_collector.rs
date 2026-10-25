@@ -371,8 +371,8 @@ mod tests {
             instance_id: "agent-a".to_string(),
             proxy: proxy.snapshot(),
             host: vec![HostSample {
-                name: "node.cpu_percent".to_string(),
-                value: 12.5,
+                name: "node.load_avg_1m".to_string(),
+                value: 0.5,
             }],
         }
     }

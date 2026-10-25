@@ -901,6 +901,7 @@ mod tests {
                 crate::handlers::wireguard_mesh::admin_test_support::RecordingAuditLogger::default(
                 ),
             ),
+            metrics_store: None,
         });
         Router::new()
             .route("/internal/nodes/{node_id}/network/peers", get(list_peers))

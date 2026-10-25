@@ -3335,7 +3335,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "create_notification_route",
         "update_notification_route",
         "delete_notification_route",
-        // ── Coverage audit: reversible configuration and lifecycle, proposed for approval; DELETEs always wait ──
+        // ── Coverage audit: reversible configuration and lifecycle, proposed for approval; deletions always wait ──
         // Project source and deployment settings
         "set_alternate_sources",
         "change_project_source",
@@ -3359,6 +3359,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "DeploymentMetricsToggle",
         "ExternalServiceMetricsCreateAlertRule",
         "ExternalServiceMetricsUpdateAlertRule",
+        "NodeMetricsCreateAlertRule",
         "NodeMetricsUpdateAlertRule",
         "kv_enable",
         "kv_update",
@@ -4953,6 +4954,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
         alarm_service: service_context.get_service::<AlarmService>(),
         audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
+        metrics_store: service_context.get_service::<dyn temps_metrics::MetricsStore>(),
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);
@@ -7403,7 +7405,7 @@ mod console_oidc_bootstrap_audit_tests {
     }
 
     #[tokio::test]
-    async fn unreadable_and_unparseable_files_are_not_audited() {
+    async fn unreadable_and_unparsable_files_are_not_audited() {
         let (context, recorder) = context_with_logger();
 
         report_console_oidc_bootstrap_error(
