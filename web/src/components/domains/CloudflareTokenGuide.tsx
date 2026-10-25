@@ -132,9 +132,9 @@ const permissionIcons = {
 } as const
 
 const permissionTone = {
-  present: 'text-emerald-600 dark:text-emerald-400',
+  present: 'text-emerald-700 dark:text-emerald-400',
   missing: 'text-destructive',
-  unverified: 'text-amber-600 dark:text-amber-400',
+  unverified: 'text-amber-700 dark:text-amber-400',
 } as const
 
 /** Each permission a checked token has or lacks, and what to change. */

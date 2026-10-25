@@ -804,7 +804,7 @@ const stepIcons = {
 const stepTone = {
   pending: 'text-muted-foreground',
   running: 'text-primary animate-pulse',
-  done: 'text-emerald-600 dark:text-emerald-400',
+  done: 'text-emerald-700 dark:text-emerald-400',
   failed: 'text-destructive',
   skipped: 'text-muted-foreground',
 } as const
