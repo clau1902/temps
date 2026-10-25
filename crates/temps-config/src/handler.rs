@@ -4426,6 +4426,9 @@ mod tests {
                 domain: "shop.example.com".into(),
                 created_at: chrono::Utc::now(),
                 audience: "public".to_string(),
+                private_range: None,
+                private_node_id: None,
+                private_listener: None,
             }]]);
         let svc = ingress_config_service(db);
         let problem = validate_public_ingress_url(

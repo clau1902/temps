@@ -3416,6 +3416,9 @@ mod apply_resume_and_progress_tests {
             certificate_id: None,
             service_name: None,
             audience: "public".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
         };
         let request = request();
         assert!(DomainDeliveryService::route_unchanged(&route, 1, &request));

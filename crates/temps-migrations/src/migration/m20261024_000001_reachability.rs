@@ -115,8 +115,7 @@ mod tests {
     /// plans and runs cascade with their environment, and `down` then `up`
     /// again is clean.
     #[tokio::test]
-    async fn audience_defaults_public_and_runs_cascade() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn audience_defaults_public_and_runs_cascade() -> Result<(), Box<dyn std::error::Error>> {
         let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
             eprintln!("Docker unavailable; skipping reachability migration integration");
             return Ok(());

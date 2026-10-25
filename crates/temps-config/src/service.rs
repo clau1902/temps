@@ -6542,6 +6542,9 @@ mod tests {
                 certificate_id: None,
                 service_name: None,
                 audience: "public".to_string(),
+                private_range: None,
+                private_node_id: None,
+                private_listener: None,
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
@@ -6560,6 +6563,9 @@ mod tests {
                 domain: "hooks.example.com".into(),
                 created_at: Utc::now(),
                 audience: "public".to_string(),
+                private_range: None,
+                private_node_id: None,
+                private_listener: None,
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
@@ -6591,6 +6597,9 @@ mod tests {
                     certificate_id: None,
                     service_name: None,
                     audience: "public".to_string(),
+                    private_range: None,
+                    private_node_id: None,
+                    private_listener: None,
                 }]])
                 .into_connection(),
         );

@@ -378,6 +378,7 @@ mod m20261022_000002_fence_revenue_subscription_events;
 mod m20261023_000001_add_overlay_network_name;
 mod m20261023_000002_add_serves_own_temps_api_to_projects;
 mod m20261024_000001_reachability;
+mod m20261025_000001_private_audience;
 
 pub struct Migrator;
 
@@ -844,6 +845,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261023_000002_add_serves_own_temps_api_to_projects::Migration),
             // ADR 064: who each address is for, and the runs that make one reachable.
             Box::new(m20261024_000001_reachability::Migration),
+            // ADR 064 D5: the range, worker and listener that bound a private address.
+            Box::new(m20261025_000001_private_audience::Migration),
         ]
     }
 }

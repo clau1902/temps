@@ -1614,6 +1614,9 @@ mod tests {
             certificate_id: None,
             service_name: None,
             audience: "public".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
         };
         let response = CustomDomainLookupResponse::from(Some(CustomDomainWithInfo {
             custom_domain: model,
