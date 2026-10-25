@@ -843,6 +843,27 @@ impl IngressConnectorService {
     ) -> Result<ConnectorView, IngressError> {
         let connector = self.find(id).await?;
         if let Some(auto_publish) = request.auto_publish {
+            // ADR 064 D9: turning automatic publishing on is refused when it
+            // would publish a hostname whose environment admits only
+            // private ranges, which no visitor through a tunnel has.
+            if auto_publish && !connector.auto_publish {
+                if let Some(guard) = self.move_guard.get() {
+                    let mut plan = self.plan().await?;
+                    for host in plan.published_automatically_once_on(id) {
+                        guard
+                            .check_move(&host, &connector.name)
+                            .await
+                            .map_err(|refusal| {
+                                IngressError::Validation(format!(
+                                    "Automatic publishing stays off for tunnel {}: {refusal} \
+                                     Or keep it off and choose the hostnames this tunnel \
+                                     publishes.",
+                                    connector.name
+                                ))
+                            })?;
+                    }
+                }
+            }
             let mut row: ingress_connectors::ActiveModel = connector.into();
             row.auto_publish = Set(auto_publish);
             row.updated_at = Set(Utc::now());
@@ -874,7 +895,10 @@ impl IngressConnectorService {
 
     /// [`Self::hostname`] for several hostnames, planning once. Invalid
     /// hostnames are left out.
-    pub async fn hostname_views(&self, hosts: &[String]) -> Result<Vec<HostnameView>, IngressError> {
+    pub async fn hostname_views(
+        &self,
+        hosts: &[String],
+    ) -> Result<Vec<HostnameView>, IngressError> {
         let plan = self.plan().await?;
         let publications = self.publications_by_host().await?;
         Ok(hosts
@@ -928,7 +952,10 @@ impl IngressConnectorService {
 
     /// The operator's choice for a hostname: `None` without one,
     /// `Some(None)` kept off tunnels, `Some(Some(id))` through that tunnel.
-    pub async fn hostname_choice(&self, hostname: &str) -> Result<Option<Option<i32>>, IngressError> {
+    pub async fn hostname_choice(
+        &self,
+        hostname: &str,
+    ) -> Result<Option<Option<i32>>, IngressError> {
         let host = normalize_host(hostname)?;
         Ok(ingress_hostname_choices::Entity::find()
             .filter(ingress_hostname_choices::Column::Hostname.eq(&host))
@@ -1056,8 +1083,14 @@ impl IngressConnectorService {
         }
         if !is_deleting(&connector) {
             ingress_connectors::Entity::update_many()
-                .col_expr(ingress_connectors::Column::Status, Expr::value(STATUS_DELETING))
-                .col_expr(ingress_connectors::Column::UpdatedAt, Expr::value(Utc::now()))
+                .col_expr(
+                    ingress_connectors::Column::Status,
+                    Expr::value(STATUS_DELETING),
+                )
+                .col_expr(
+                    ingress_connectors::Column::UpdatedAt,
+                    Expr::value(Utc::now()),
+                )
                 .filter(ingress_connectors::Column::Id.eq(id))
                 .exec(self.db.as_ref())
                 .await?;
@@ -1527,8 +1560,14 @@ impl IngressConnectorService {
         // Never over a `deleting` status set since the row was read.
         ingress_connectors::Entity::update_many()
             .col_expr(ingress_connectors::Column::Status, Expr::value("error"))
-            .col_expr(ingress_connectors::Column::LastError, Expr::value(Some(message)))
-            .col_expr(ingress_connectors::Column::UpdatedAt, Expr::value(Utc::now()))
+            .col_expr(
+                ingress_connectors::Column::LastError,
+                Expr::value(Some(message)),
+            )
+            .col_expr(
+                ingress_connectors::Column::UpdatedAt,
+                Expr::value(Utc::now()),
+            )
             .filter(ingress_connectors::Column::Id.eq(connector.id))
             .filter(ingress_connectors::Column::Status.ne(STATUS_DELETING))
             .exec(self.db.as_ref())
@@ -2046,6 +2085,30 @@ enum Decision {
 }
 
 impl Plan {
+    /// The served hostnames tunnel `id` would publish by itself, with no
+    /// choice made for them, once its `auto_publish` is on.
+    fn published_automatically_once_on(&mut self, id: i32) -> Vec<String> {
+        for connector in &mut self.connectors {
+            if connector.model.id == id {
+                connector.model.auto_publish = true;
+            }
+        }
+        let mut hosts: Vec<String> = self
+            .served
+            .iter()
+            .filter(|host| {
+                self.intent(host)
+                    == PublicationIntent::Tunnel {
+                        connector_id: id,
+                        by_choice: false,
+                    }
+            })
+            .cloned()
+            .collect();
+        hosts.sort();
+        hosts
+    }
+
     fn connector(&self, id: i32) -> Option<&PlannedConnector> {
         self.connectors.iter().find(|c| c.model.id == id)
     }
@@ -2076,16 +2139,17 @@ impl Plan {
             },
             None => {
                 let candidates = self.candidates(host);
-                let automatic = candidates
-                    .iter()
-                    .filter(|c| c.model.auto_publish)
-                    .max_by(|a, b| {
-                        a.model
-                            .domain
-                            .len()
-                            .cmp(&b.model.domain.len())
-                            .then(b.model.id.cmp(&a.model.id))
-                    });
+                let automatic =
+                    candidates
+                        .iter()
+                        .filter(|c| c.model.auto_publish)
+                        .max_by(|a, b| {
+                            a.model
+                                .domain
+                                .len()
+                                .cmp(&b.model.domain.len())
+                                .then(b.model.id.cmp(&a.model.id))
+                        });
                 match (automatic, candidates.first()) {
                     (Some(connector), _) => PublicationIntent::Tunnel {
                         connector_id: connector.model.id,
@@ -2404,6 +2468,62 @@ mod tests {
         );
     }
 
+    fn connector_model(id: i32, domain: &str, auto_publish: bool) -> ingress_connectors::Model {
+        ingress_connectors::Model {
+            id,
+            name: format!("tunnel-{id}"),
+            provider: "cloudflare_tunnel".into(),
+            dns_provider_id: Some(3),
+            domain: domain.into(),
+            external_id: None,
+            settings: serde_json::json!({}),
+            secret_encrypted: None,
+            edge_port: 443,
+            auto_publish,
+            status: "ready".into(),
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// ADR 064 D9: what turning `auto_publish` on would publish, which the
+    /// guard checks against private-only allow lists before it is saved.
+    #[test]
+    fn auto_publish_would_publish_only_unchosen_hostnames_under_its_domain() {
+        let mut plan = Plan {
+            connectors: vec![
+                PlannedConnector {
+                    model: connector_model(1, "example.com", false),
+                    zone: Some("example.com".into()),
+                    has_nodes: true,
+                },
+                PlannedConnector {
+                    model: connector_model(2, "apps.example.com", true),
+                    zone: Some("example.com".into()),
+                    has_nodes: true,
+                },
+            ],
+            choices: HashMap::from([("chosen.example.com".to_string(), None)]),
+            served: [
+                "internal.example.com",
+                "chosen.example.com",
+                "x.apps.example.com",
+                "other.example.org",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            blocking: Vec::new(),
+        };
+        // A choice wins, a more specific automatic tunnel wins, and other
+        // domains are not its to publish.
+        assert_eq!(
+            plan.published_automatically_once_on(1),
+            vec!["internal.example.com".to_string()]
+        );
+    }
+
     #[test]
     fn only_a_different_tunnel_id_marks_publications_stale() {
         assert!(tunnel_replaced(Some("old"), "new"));
@@ -2458,7 +2578,11 @@ mod tests {
                     secrets: BTreeMap::new(),
                 }
             }
-            async fn publish(&self, _h: &TunnelHandle, _host: &str) -> Result<DnsIntent, IngressError> {
+            async fn publish(
+                &self,
+                _h: &TunnelHandle,
+                _host: &str,
+            ) -> Result<DnsIntent, IngressError> {
                 Ok(DnsIntent::None)
             }
             async fn unpublish(&self, _h: &TunnelHandle, _host: &str) -> Result<(), IngressError> {
@@ -2528,14 +2652,15 @@ mod tests {
             let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
                 Ok(db) => db,
                 Err(error) => {
-                    eprintln!("Docker/Postgres unavailable; skipping deleting-connector test: {error}");
+                    eprintln!(
+                        "Docker/Postgres unavailable; skipping deleting-connector test: {error}"
+                    );
                     return None;
                 }
             };
             let db = test_db.connection_arc();
-            let encryption = Arc::new(
-                EncryptionService::new("0123456789abcdef0123456789abcdef").expect("key"),
-            );
+            let encryption =
+                Arc::new(EncryptionService::new("0123456789abcdef0123456789abcdef").expect("key"));
             let providers = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
             let records = Arc::new(ManagedDnsRecordService::new(
                 db.clone(),
@@ -2550,8 +2675,7 @@ mod tests {
                 records,
                 Arc::new(CachedPeerTable::new(db.clone())),
             );
-            service.registry =
-                ProviderRegistry::of(vec![Arc::new(FakeFactory(calls.clone()))]);
+            service.registry = ProviderRegistry::of(vec![Arc::new(FakeFactory(calls.clone()))]);
             let now = Utc::now();
             let connector = ingress_connectors::ActiveModel {
                 name: Set("homelab".into()),
@@ -2587,7 +2711,10 @@ mod tests {
             assert_eq!(tunnel_id.as_deref(), Some("tunnel-1"));
             // The provider call fails: undo was interrupted half-way.
             calls.fail_delete_once.store(true, Ordering::SeqCst);
-            assert!(service.finish_deletion(id, tunnel_id.as_deref()).await.is_err());
+            assert!(service
+                .finish_deletion(id, tunnel_id.as_deref())
+                .await
+                .is_err());
             let row = service.find(id).await.expect("still there");
             assert_eq!(row.status, STATUS_DELETING);
 
@@ -2600,7 +2727,10 @@ mod tests {
             service.reconcile_all().await;
             assert_eq!(calls.ensure.load(Ordering::SeqCst), 0);
             assert_eq!(calls.delete.load(Ordering::SeqCst), 2);
-            assert!(matches!(service.find(id).await, Err(IngressError::NotFound(_))));
+            assert!(matches!(
+                service.find(id).await,
+                Err(IngressError::NotFound(_))
+            ));
             drop(test_db);
         }
 
