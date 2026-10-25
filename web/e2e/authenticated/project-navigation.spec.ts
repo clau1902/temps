@@ -55,13 +55,12 @@ test('direct project links and direct flat settings navigation', async ({
   await expect(settings.getByRole('link')).toHaveText([
     'General',
     'Build & deploy',
-    'Domains',
     'Variables',
     'Automation',
     'Integrations',
     'Telemetry',
   ])
-  await expect(settings.locator('a > svg')).toHaveCount(7)
+  await expect(settings.locator('a > svg')).toHaveCount(6)
   await settings
     .getByRole('link', { name: 'Build & deploy', exact: true })
     .click()
