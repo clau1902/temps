@@ -7,6 +7,88 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}/api` | (string & {});
 };
 
+export type AccessPermission = 'apps_edit' | 'organizations_read';
+
+export type AccessPermissionCheck = {
+    /**
+     * Why, and what to change on the token when it is not present.
+     */
+    detail: string;
+    label: string;
+    permission: AccessPermission;
+    state: PermissionState;
+};
+
+/**
+ * A saved Access token. The token itself is never returned.
+ */
+export type AccessProviderResponse = {
+    account_id: string;
+    /**
+     * How many addresses it protects.
+     */
+    addresses: number;
+    /**
+     * Always `***`.
+     */
+    api_token: string;
+    created_at: string;
+    id: number;
+    /**
+     * How many signing keys listeners have for it now.
+     */
+    key_count: number;
+    /**
+     * When the team's signing keys were last fetched.
+     */
+    keys_fetched_at?: string | null;
+    name: string;
+    /**
+     * `<team>.cloudflareaccess.com`.
+     */
+    team_domain: string;
+};
+
+export type AccessTokenCheckRequest = {
+    /**
+     * The Cloudflare account the Access applications live in (32 hex
+     * characters, from the dashboard URL or the account's overview page).
+     */
+    account_id: string;
+    /**
+     * The token, as pasted. Used for this check only; not stored.
+     */
+    token: SecretString;
+};
+
+export type AccessTokenCheckResult = {
+    /**
+     * Why it did not, or why the account could not be checked.
+     */
+    error?: string | null;
+    permissions: Array<AccessPermissionCheck>;
+    /**
+     * Every permission is present and the team domain is known.
+     */
+    ready: boolean;
+    /**
+     * `<team>.cloudflareaccess.com`, when Organizations Read is present.
+     */
+    team_domain?: string | null;
+    /**
+     * Where to create a token.
+     */
+    token_url: string;
+    /**
+     * Cloudflare accepted the token at all.
+     */
+    valid: boolean;
+    /**
+     * What the token can do beyond Temps' own apps.
+     */
+    warning: string;
+};
+
 export type AcmeOrderResponse = {
     authorizations?: unknown;
     certificate_url?: string | null;
@@ -6971,6 +7053,18 @@ export type CostAnalysis = {
 
 export type CreatableServiceTypeRoute = 'mariadb' | 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob' | 'rustfs';
 
+export type CreateAccessProviderRequest = {
+    account_id: string;
+    /**
+     * A name to tell tokens apart.
+     */
+    name: string;
+    /**
+     * Checked, then sealed; never returned.
+     */
+    token: SecretString;
+};
+
 export type CreateAlertRuleRequest = {
     /**
      * Minimum minutes between notifications for same rule+group
@@ -13140,6 +13234,15 @@ export type FeedbackView = {
     url?: string | null;
 };
 
+/**
+ * One answer a [`FieldKind::Choice`] field offers.
+ */
+export type FieldChoice = {
+    help?: string | null;
+    label: string;
+    value: string;
+};
+
 export type FieldKind = {
     type: 'text';
 } | {
@@ -13151,6 +13254,15 @@ export type FieldKind = {
     allow_subdomain?: boolean;
     provider_field: string;
     type: 'managed_domain';
+} | {
+    type: 'teams';
+} | {
+    type: 'users';
+} | {
+    choices: Array<FieldChoice>;
+    type: 'choice';
+} | {
+    type: 'text_list';
 };
 
 export type FieldResponse = {
@@ -23411,15 +23523,6 @@ export type ProxyLogResponse = {
     response_time_ms?: number | null;
     routing_status: string;
     session_id?: number | null;
-    /**
-     * The lists that hold the client, and the range on each.
-     */
-    shield_reasons: Array<string>;
-    /**
-     * What Shield would have done with the request: `log`, `challenge` or
-     * `block`. `None` when no reputation list holds the client.
-     */
-    shield_verdict?: string | null;
     status_code: number;
     timestamp: string;
     upstream_host?: string | null;
@@ -28264,6 +28367,13 @@ export type SiblingRef = {
      * URL slug used to link into the sibling project's single-project trace view.
      */
     project_slug: string;
+};
+
+export type SignOutOfAppsResponse = {
+    /**
+     * Gate sessions revoked.
+     */
+    revoked: number;
 };
 
 /**
@@ -44488,6 +44598,134 @@ export type GetCloudStatusResponses = {
 
 export type GetCloudStatusResponse = GetCloudStatusResponses[keyof GetCloudStatusResponses];
 
+export type ListAccessProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloudflare-access/providers';
+};
+
+export type ListAccessProvidersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type ListAccessProvidersError = ListAccessProvidersErrors[keyof ListAccessProvidersErrors];
+
+export type ListAccessProvidersResponses = {
+    200: Array<AccessProviderResponse>;
+};
+
+export type ListAccessProvidersResponse = ListAccessProvidersResponses[keyof ListAccessProvidersResponses];
+
+export type CreateAccessProviderData = {
+    body: CreateAccessProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/cloudflare-access/providers';
+};
+
+export type CreateAccessProviderErrors = {
+    /**
+     * The token is missing a permission
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateAccessProviderError = CreateAccessProviderErrors[keyof CreateAccessProviderErrors];
+
+export type CreateAccessProviderResponses = {
+    201: AccessProviderResponse;
+};
+
+export type CreateAccessProviderResponse = CreateAccessProviderResponses[keyof CreateAccessProviderResponses];
+
+export type CheckAccessProviderData = {
+    body: AccessTokenCheckRequest;
+    path?: never;
+    query?: never;
+    url: '/cloudflare-access/providers/check';
+};
+
+export type CheckAccessProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type CheckAccessProviderError = CheckAccessProviderErrors[keyof CheckAccessProviderErrors];
+
+export type CheckAccessProviderResponses = {
+    200: AccessTokenCheckResult;
+};
+
+export type CheckAccessProviderResponse = CheckAccessProviderResponses[keyof CheckAccessProviderResponses];
+
+export type DeleteAccessProviderData = {
+    body?: never;
+    path: {
+        /**
+         * Saved token
+         */
+        provider_id: number;
+    };
+    query?: never;
+    url: '/cloudflare-access/providers/{provider_id}';
+};
+
+export type DeleteAccessProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Not found
+     */
+    404: ProblemDetails;
+    /**
+     * An address uses it
+     */
+    409: ProblemDetails;
+};
+
+export type DeleteAccessProviderError = DeleteAccessProviderErrors[keyof DeleteAccessProviderErrors];
+
+export type DeleteAccessProviderResponses = {
+    /**
+     * Deleted
+     */
+    204: void;
+};
+
+export type DeleteAccessProviderResponse = DeleteAccessProviderResponses[keyof DeleteAccessProviderResponses];
+
 export type ClusterDnsStatusData = {
     body?: never;
     path?: never;
@@ -51358,6 +51596,34 @@ export type GetFlagSnapshotResponses = {
 };
 
 export type GetFlagSnapshotResponse = GetFlagSnapshotResponses[keyof GetFlagSnapshotResponses];
+
+export type SignOutOfAppsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/gate/sign-out-of-apps';
+};
+
+export type SignOutOfAppsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Not a user
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SignOutOfAppsResponses = {
+    200: SignOutOfAppsResponse;
+};
+
+export type SignOutOfAppsResponse2 = SignOutOfAppsResponses[keyof SignOutOfAppsResponses];
 
 export type GetGeoDatabaseStatusData = {
     body?: never;
@@ -72385,6 +72651,54 @@ export type GetFunnelMetricsResponses = {
 };
 
 export type GetFunnelMetricsResponse = GetFunnelMetricsResponses[keyof GetFunnelMetricsResponses];
+
+export type SignEveryoneOutOfAddressData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * `custom:<id>` or `environment:<id>`
+         */
+        address_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/gate/addresses/{address_id}/sign-everyone-out';
+};
+
+export type SignEveryoneOutOfAddressErrors = {
+    /**
+     * Malformed address id
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Address not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SignEveryoneOutOfAddressResponses = {
+    /**
+     * Everyone signed out
+     */
+    204: void;
+};
+
+export type SignEveryoneOutOfAddressResponse = SignEveryoneOutOfAddressResponses[keyof SignEveryoneOutOfAddressResponses];
 
 export type UpdateGitSettingsData = {
     body: UpdateGitSettingsRequest;
