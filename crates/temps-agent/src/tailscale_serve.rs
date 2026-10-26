@@ -714,12 +714,14 @@ impl ServeManager {
             for _ in 0..MAX_WRITE_ATTEMPTS {
                 let next = merge_advertised(&current, &add, &drop);
                 if next == current {
-                    return Ok(());
+                    return Ok(current);
                 }
                 api.set_advertise_services(&next).await?;
                 current = api.prefs().await?.advertise_services.unwrap_or_default();
                 if add.iter().all(|service| current.contains(service)) {
-                    return Ok(());
+                    // A dropped name still there is reported below, not
+                    // removed again: another writer may have put it back.
+                    return Ok(current);
                 }
                 warn!(
                     advertised = ?current,
@@ -734,13 +736,38 @@ impl ServeManager {
             })
         }
         .await;
-        if let Err(error) = result {
+        // An entry taken off is only reported removed once its name is no
+        // longer advertised: the control plane deletes the row on `removed`,
+        // and nothing would drop the name after that.
+        let still_advertised = |service: &str| match &result {
+            Ok(current) => current.iter().any(|name| name == service),
+            Err(_) => true,
+        };
+        if let Err(error) = &result {
             warn!(%error, "could not update the advertised Tailscale Services");
-            for (entry, outcome) in entries.iter().zip(outcomes.iter_mut()) {
-                if entry.service.is_some() && !entry.removing {
+        }
+        for (entry, outcome) in entries.iter().zip(outcomes.iter_mut()) {
+            let Some(service) = entry.service.as_deref().map(service_key) else {
+                continue;
+            };
+            match &result {
+                Err(error) if !entry.removing => {
                     outcome.outcome = ServeOutcome::Error;
                     outcome.detail = Some(format!("advertising the Service failed: {error}"));
                 }
+                _ if entry.removing && drop.contains(&service) && still_advertised(&service) => {
+                    outcome.outcome = ServeOutcome::Error;
+                    outcome.detail = Some(match &result {
+                        Err(error) => {
+                            format!("removing {service} from AdvertiseServices failed: {error}")
+                        }
+                        Ok(_) => format!(
+                            "{service} is still in AdvertiseServices after this worker removed it; \
+                             another writer may have added it back"
+                        ),
+                    });
+                }
+                _ => {}
             }
         }
     }
@@ -1439,6 +1466,27 @@ mod tests {
             shared.prefs["AdvertiseServices"],
             serde_json::json!(["svc:someone-else"])
         );
+    }
+
+    /// A Service still advertised after this worker dropped it is not
+    /// reported removed (the row would be deleted and the name left behind),
+    /// and its removal is not retried within the pass.
+    #[tokio::test]
+    async fn a_dropped_service_still_advertised_is_an_error_not_removed() {
+        let mut state = fake::running();
+        state.prefs["AdvertiseServices"] = serde_json::json!(["svc:someone-else", "svc:myapp"]);
+        state
+            .advertise_after_write
+            .push_back(serde_json::json!(["svc:someone-else", "svc:myapp"]));
+        let mut removing = service_entry();
+        removing.removing = true;
+        removing.route = None;
+        let (mut manager, shared, _dir) = manager(state, vec![removing]).await;
+        let report = manager.pass(&input()).await;
+        assert_eq!(report.entries[0].outcome, ServeOutcome::Error);
+        let detail = report.entries[0].detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("still in AdvertiseServices"), "{detail}");
+        assert_eq!(shared.lock().prefs_writes, 1);
     }
 
     /// A name another writer removed after this write is not put back.

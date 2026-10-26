@@ -1083,13 +1083,17 @@ Open, found while implementing 3a:
   307/308 would re-send the token exchange's body, `client_secret`
   included. A tailnet name made only of dots is refused.
 
+- **The worker must be in the credential's tailnet.** Before a Service
+  run starts, the worker that will host it is looked up through the
+  credential by its stable node id (`GET /device/{nodeId}`, within
+  `devices:core:read`). Tailscale answers 404 for a device of any other
+  tailnet, so this needs no tailnet name: a credential's tailnet `-` means
+  the OAuth client's own tailnet, which Temps could not otherwise name.
+  Not found, a worker that has not reported its node id yet, or an answer
+  Temps cannot get all refuse the run before anything is created.
+
 Open, found in review of 3b:
 
-- Nothing checks that the worker hosting a Service is a device of the
-  credential's tailnet. It fails closed (the host check never matches),
-  but the conflict and ownership reads then run against the credential's
-  tailnet rather than the worker's. Checking the worker's node id against
-  the tailnet's devices (`devices:core:read`) would say so plainly.
 - The outside check reads a Service's hosts but not its definition; it
   could also compare the definition with the fixed one and check the
   marker, through the same 30-second cache.

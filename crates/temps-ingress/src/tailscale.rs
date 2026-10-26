@@ -586,6 +586,21 @@ fn text(item: &Value, keys: &[&str]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `GET /device/{nodeId}`: whether it is a device of the credential's
+/// tailnet. Tailscale answers 404 for a device of any other tailnet; a 200
+/// naming another node counts as not found, never as found.
+pub fn parse_device(answer: &Answer, node_id: &str) -> Result<bool, TailscaleApiError> {
+    match answer.status {
+        200..=299 => Ok(text(&answer.body, &["nodeId"]).as_deref() == Some(node_id)),
+        404 => Ok(false),
+        _ => Err(refusal(
+            answer,
+            &format!("look up the worker's device `{node_id}`"),
+            false,
+        )),
+    }
+}
+
 /// `GET …/services/{name}/devices`: the devices advertising it. A Service
 /// that does not exist has none.
 pub fn parse_hosts(answer: &Answer, name: &str) -> Result<Vec<ServiceHost>, TailscaleApiError> {
@@ -716,6 +731,14 @@ pub trait TailnetApi: Send + Sync {
         credential: &TailscaleCredential,
         name: &str,
     ) -> Result<Vec<ServiceHost>, TailscaleApiError>;
+    /// Whether the node with stable id `node_id` is a device of the
+    /// credential's tailnet: the check that the worker hosting a Service is
+    /// in the tailnet the Service is created in.
+    async fn has_device(
+        &self,
+        credential: &TailscaleCredential,
+        node_id: &str,
+    ) -> Result<bool, TailscaleApiError>;
 }
 
 /// Tailscale's API over HTTPS.
@@ -1020,6 +1043,24 @@ impl TailnetApi for TailscaleClient {
             )
             .await?;
         parse_hosts(&answer, name)
+    }
+
+    async fn has_device(
+        &self,
+        credential: &TailscaleCredential,
+        node_id: &str,
+    ) -> Result<bool, TailscaleApiError> {
+        let id: String = url::form_urlencoded::byte_serialize(node_id.as_bytes()).collect();
+        let answer = self
+            .call(
+                credential,
+                reqwest::Method::GET,
+                format!("{}/device/{id}", self.base),
+                None,
+                &format!("look up the worker's device `{node_id}`"),
+            )
+            .await?;
+        parse_device(&answer, node_id)
     }
 }
 
@@ -1398,6 +1439,29 @@ mod tests {
     }
 
     #[test]
+    fn a_device_counts_only_when_its_tailnet_answers_with_that_node() {
+        let found = answer(200, json!({"nodeId": "nWORKER"}));
+        assert!(parse_device(&found, "nWORKER").unwrap());
+        assert!(!parse_device(&found, "nOTHER").unwrap());
+        assert!(!parse_device(&answer(200, json!({})), "nWORKER").unwrap());
+        assert!(!parse_device(&answer(404, json!({"message": "not found"})), "nWORKER").unwrap());
+        assert!(matches!(
+            parse_device(&answer(403, json!({})), "nWORKER"),
+            Err(TailscaleApiError::Forbidden { .. })
+        ));
+        assert!(parse_device(&answer(500, json!({})), "nWORKER").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_worker_is_looked_up_in_the_credentials_tailnet() {
+        let (base, _) = fake_api().await;
+        let client = TailscaleClient::with_base(base);
+        let credential = credential("right");
+        assert!(client.has_device(&credential, "nWORKER").await.unwrap());
+        assert!(!client.has_device(&credential, "nELSEWHERE").await.unwrap());
+    }
+
+    #[test]
     fn the_auto_approvers_snippet_names_the_service_and_tag() {
         assert_eq!(
             auto_approvers_snippet("myapp", "tag:temps"),
@@ -1459,6 +1523,27 @@ mod tests {
                     },
                 ),
             );
+        // Only `nWORKER` is a device of the credential's tailnet.
+        let app = app.route(
+            "/api/v2/device/{id}",
+            get(
+                |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    if id == "nWORKER" {
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(
+                                json!({"nodeId": "nWORKER", "name": "master.example.ts.net"}),
+                            ),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::NOT_FOUND,
+                            axum::Json(json!({"message": "not found"})),
+                        )
+                    }
+                },
+            ),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");

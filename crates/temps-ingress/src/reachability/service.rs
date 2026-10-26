@@ -1384,6 +1384,56 @@ impl ReachabilityService {
         })
     }
 
+    /// ADR 065 3b: the worker that will host `service` must be a device of
+    /// the tailnet the credential creates it in. A credential's tailnet
+    /// `-` is whichever tailnet the OAuth client belongs to, so the worker is
+    /// looked up through it by its stable node id rather than by comparing
+    /// names. Not found, or not answerable, refuses before anything is made.
+    async fn check_worker_in_credentials_tailnet(
+        &self,
+        entered: Option<&TailscaleCredential>,
+        worker: &TailnetWorkerFact,
+        service: &str,
+    ) -> Result<(), ReachabilityError> {
+        let credential = match entered {
+            Some(credential) => credential.clone(),
+            None => match load_tailscale_credential(&self.deps.connectors).await {
+                Ok(Some((_, _, credential))) => credential,
+                Ok(None) => {
+                    return Err(ReachabilityError::Conflict(format!(
+                        "The cluster's Tailscale OAuth client is gone; plan `{service}` again."
+                    )))
+                }
+                Err(error) => return Err(ReachabilityError::Validation(error)),
+            },
+        };
+        let Some(node_id) = worker.report.node_id.as_deref().filter(|id| !id.is_empty()) else {
+            return Err(ReachabilityError::Validation(format!(
+                "{} has not reported its Tailscale node id yet, so Temps cannot check it is in \
+                 the tailnet `{service}` would be created in. Try again once its agent has \
+                 reported.",
+                worker.name
+            )));
+        };
+        match self.tailnet.has_device(&credential, node_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ReachabilityError::Validation(format!(
+                "{} is not a device of the tailnet this Tailscale OAuth client manages \
+                 (`{}`), so `{service}` would be created where {} cannot host it. Use an OAuth \
+                 client of {}'s own tailnet.",
+                worker.name,
+                credential.tailnet,
+                worker.name,
+                worker.report.tailnet.as_deref().unwrap_or("the worker's"),
+            ))),
+            Err(error) => Err(ReachabilityError::Validation(format!(
+                "Temps could not check that {} is in the tailnet `{service}` would be created \
+                 in: {error}",
+                worker.name
+            ))),
+        }
+    }
+
     async fn facts_for(
         &self,
         scope: &Scope,
@@ -1808,6 +1858,12 @@ impl ReachabilityService {
                 } else {
                     String::new()
                 };
+                self.check_worker_in_credentials_tailnet(
+                    input.tailscale_credential.as_ref(),
+                    worker,
+                    &service,
+                )
+                .await?;
                 let seen = match &facts.service_seen {
                     Some((name, ServiceSeen::Found(definition))) if *name == service => {
                         Some(definition.clone())
