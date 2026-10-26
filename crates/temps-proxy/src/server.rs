@@ -703,7 +703,17 @@ pub fn setup_proxy_server(
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics.clone())
     .with_request_policy_gate(request_policy_gate)
-    .with_shield_lists(shield_lists);
+    .with_shield_lists(shield_lists)
+    // Signed-in addresses (ADR 065 D8). The proxy redeems sign-in codes in
+    // process, so it needs the database and the gate key's sealing key; in
+    // split topology both are available here as they are to the console.
+    .with_gate(Arc::new(crate::handler::gate::ProxyGate::new(
+        route_table.clone(),
+        Arc::new(temps_routes::gate::GateService::new(
+            db.clone(),
+            encryption_service.clone(),
+        )),
+    )));
     if let Some(gate) = admin_gate {
         lb = lb.with_admin_gate(gate);
     }

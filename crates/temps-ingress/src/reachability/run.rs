@@ -42,10 +42,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::access::{AccessApp, AccessPolicyAnswer};
 use super::model::{
-    AddressAudience, AddressReachability, Decision, DnsRecordState, Intent, JournalEntry,
-    JournalState, LookupAuthority, PlanOptionKind, PlanStep, PlannedRecord, PreviousChoice,
-    ReachState, RunResource, RunState, RunStep, RunStepStatus, StepKind, UndoResult,
+    AccessBinding, AddressAudience, AddressReachability, Audience, Decision, DnsRecordState,
+    Intent, JournalEntry, JournalState, LookupAuthority, PlanOptionKind, PlanStep, PlannedRecord,
+    PreviousChoice, ReachState, RunResource, RunState, RunStep, RunStepStatus, StepKind,
+    UndoResult,
 };
 use super::plan::NamedId;
 use super::token_check::TokenCheckResult;
@@ -289,11 +291,14 @@ pub trait RunOps: Send + Sync {
     async fn delete_tunnel(&self, id: i32, tunnel_id: Option<&str>) -> Result<(), String>;
     /// The custom domain with this hostname: `(id, environment id)`.
     async fn find_custom_domain(&self, host: &str) -> Result<Option<(i32, i32)>, String>;
+    /// Attaches `host`, already `initial` when given: an address a run
+    /// makes signed-in is never in the route table without its gate.
     async fn attach_domain(
         &self,
         project_id: i32,
         environment_id: i32,
         host: &str,
+        initial: Option<&AddressAudience>,
     ) -> Result<i32, String>;
     async fn detach_domain(&self, id: i32) -> Result<(), String>;
     /// See `IngressConnectorService::hostname_choice`.
@@ -344,6 +349,19 @@ pub trait RunOps: Send + Sync {
         host: &str,
         audience: &AddressAudience,
     ) -> Result<(), String>;
+    /// Access application `id` in `provider_id`'s account (ADR 065 D9);
+    /// `None` when it no longer exists.
+    async fn access_app(&self, provider_id: i32, id: &str) -> Result<Option<AccessApp>, String>;
+    /// Creates the Access application `name` protecting `host`, letting in
+    /// who `policy` says.
+    async fn create_access_app(
+        &self,
+        provider_id: i32,
+        name: &str,
+        host: &str,
+        policy: &AccessPolicyAnswer,
+    ) -> Result<AccessApp, WriteError>;
+    async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String>;
     /// Creates the `(node, address)` Serve entry with this run's reference,
     /// or adds a reference to the same one, in one transaction holding the
     /// entry's advisory lock (and the Service's first) (ADR 065 D4).
@@ -551,6 +569,9 @@ pub struct RunInput {
     /// it was for before.
     #[serde(default)]
     pub audience: Option<(AddressAudience, AddressAudience)>,
+    /// For a Cloudflare Access address (ADR 065 D9): the app in front of it.
+    #[serde(default)]
+    pub access: Option<AccessRun>,
     /// For a tailnet name: the worker that serves it (ADR 065 D4).
     #[serde(default)]
     pub serve: Option<ServeTarget>,
@@ -563,7 +584,17 @@ pub struct RunInput {
     pub tailscale_credential: Option<TailscaleCredential>,
 }
 
-/// The run as stored.
+/// The Cloudflare Access application a run puts in front of its address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessRun {
+    pub provider_id: i32,
+    /// An app that already covers the address: used as found, never
+    /// journaled, so undo never touches it.
+    pub existing: Option<AccessApp>,
+    /// Otherwise the app the run creates: `temps-<host>-<install>`.
+    pub name: String,
+    pub policy: AccessPolicyAnswer,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
     pub state: RunState,
@@ -1089,6 +1120,8 @@ impl From<Hold> for Outcome {
 struct Context {
     provider_id: Option<i32>,
     connector_id: Option<i32>,
+    /// The Access application in front of the address, once known.
+    access: Option<AccessBinding>,
 }
 
 struct Runner<'a> {
@@ -1280,6 +1313,94 @@ impl Runner<'_> {
         let resolution = resolve_pending(entry, self.ops, run_id, chrono::Utc::now()).await;
         self.save().await;
         resolution
+    }
+
+    /// Put a Cloudflare Access app in front of `host` (ADR 065 D9): the
+    /// one the plan found, re-read so a deleted or moved app is not used,
+    /// or one this run creates and journals.
+    async fn access_app(&mut self, host: &str) -> Outcome {
+        let input = self.input;
+        let Some(access) = input.access.clone() else {
+            return Outcome::Failed(format!(
+                "This run has no Cloudflare Access app to put in front of {host}. Plan again."
+            ));
+        };
+        if let Some(existing) = &access.existing {
+            return match self.ops.access_app(access.provider_id, &existing.id).await {
+                Ok(Some(app)) if super::access::covers(&app, host) => {
+                    self.ctx.access = Some(AccessBinding {
+                        provider_id: access.provider_id,
+                        app_id: app.id.clone(),
+                        aud: app.aud.clone(),
+                    });
+                    Outcome::Skipped(format!(
+                        "Access app {} already protects {host}; used as it is.",
+                        app.name
+                    ))
+                }
+                Ok(Some(app)) => Outcome::Failed(format!(
+                    "Access app {} no longer protects {host} (it is for {}). Plan again.",
+                    app.name, app.domain
+                )),
+                Ok(None) => Outcome::Failed(format!(
+                    "Access app {} was deleted in Cloudflare after planning. Plan again.",
+                    existing.name
+                )),
+                Err(error) => Outcome::Failed(error),
+            };
+        }
+        let name = super::access::run_app_name(&access.name, input.run_id);
+        let intent = Intent::AccessApp {
+            provider_id: access.provider_id,
+            name: name.clone(),
+            hostname: host.to_string(),
+        };
+        let bind = |ctx: &mut Context, resource: &RunResource| {
+            if let RunResource::AccessApp {
+                provider_id,
+                id,
+                aud,
+                ..
+            } = resource
+            {
+                ctx.access = Some(AccessBinding {
+                    provider_id: *provider_id,
+                    app_id: id.clone(),
+                    aud: aud.clone(),
+                });
+            }
+        };
+        match self.begin(&intent).await {
+            Err(hold) => hold.into(),
+            Ok(Begin::Have(resource)) => {
+                bind(&mut self.ctx, &resource);
+                Outcome::Done(Some(format!("{} protects {host}.", resource.describe())))
+            }
+            Ok(Begin::Go) => match self
+                .ops
+                .create_access_app(access.provider_id, &name, host, &access.policy)
+                .await
+            {
+                Ok(app) => {
+                    let resource = RunResource::AccessApp {
+                        provider_id: access.provider_id,
+                        id: app.id,
+                        name: app.name,
+                        hostname: host.to_string(),
+                        aud: app.aud,
+                        policies: app.policies,
+                    };
+                    bind(&mut self.ctx, &resource);
+                    let detail = format!("{} protects {host}.", resource.describe());
+                    self.finish(&intent.key(input.run_id), Some(resource)).await;
+                    Outcome::Done(Some(detail))
+                }
+                Err(error) => {
+                    self.finish_failed(&intent, error.maybe_applied).await;
+                    Outcome::Failed(error.message)
+                }
+            },
+        }
     }
 
     /// Point `host` at `ip` (ADR 064 D4): read the record just before
@@ -2015,6 +2136,43 @@ impl Runner<'_> {
         }
     }
 
+    /// ADR 065 D9: an Access address names the app whose JWTs the listener
+    /// accepts; without one it is never set.
+    fn bound_to_access(
+        &self,
+        mut after: AddressAudience,
+        address: &str,
+    ) -> Result<AddressAudience, String> {
+        if after.gate == Some(temps_core::gate::GateKind::CloudflareAccess) {
+            match self.ctx.access.clone() {
+                Some(binding) => after.gate_access = Some(binding),
+                None => {
+                    return Err(format!(
+                        "No Cloudflare Access app is known for {address}, so Temps did not \
+                         change who it is for."
+                    ))
+                }
+            }
+        }
+        Ok(after)
+    }
+
+    /// The audience to attach `address` with: the signed-in one this run
+    /// sets, when it sets one.
+    fn signed_in_on_attach(&self, address: &str) -> Result<Option<AddressAudience>, String> {
+        let sets_audience = self
+            .input
+            .steps
+            .iter()
+            .any(|step| step.kind == StepKind::SetAudience);
+        match self.input.audience.clone() {
+            Some((after, _)) if sets_audience && after.audience == Audience::SignedIn => {
+                self.bound_to_access(after, address).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
     async fn step(&mut self, index: usize, kind: StepKind) -> Outcome {
         let input = self.input;
         let address = input.address.clone();
@@ -2361,12 +2519,24 @@ impl Runner<'_> {
                         Err(error) => return Outcome::Failed(error),
                     }
                 }
+                // ADR 065: an address this run makes signed-in is attached
+                // with its gate already set, so no route table ever serves
+                // it open between this step and SetAudience.
+                let initial = match self.signed_in_on_attach(&address) {
+                    Ok(initial) => initial,
+                    Err(error) => return Outcome::Failed(error),
+                };
                 match self.begin(&intent).await {
                     Err(hold) => hold.into(),
                     Ok(Begin::Have(_)) => Outcome::Done(None),
                     Ok(Begin::Go) => match self
                         .ops
-                        .attach_domain(input.project_id, input.environment_id, &address)
+                        .attach_domain(
+                            input.project_id,
+                            input.environment_id,
+                            &address,
+                            initial.as_ref(),
+                        )
                         .await
                     {
                         Ok(id) => {
@@ -2576,6 +2746,10 @@ impl Runner<'_> {
                 let Some((after, before)) = input.audience.clone() else {
                     return Outcome::Skipped("Nothing to change.".into());
                 };
+                let after = match self.bound_to_access(after, &address) {
+                    Ok(after) => after,
+                    Err(error) => return Outcome::Failed(error),
+                };
                 let intent = Intent::AddressAudience {
                     hostname: address.clone(),
                     before,
@@ -2623,6 +2797,7 @@ impl Runner<'_> {
                     },
                 }
             }
+            StepKind::AccessApp => self.access_app(&address).await,
             StepKind::ConfigureTailscaleServe => {
                 let Some(target) = input.serve.clone() else {
                     return Outcome::Skipped("No worker serves it through Tailscale.".into());
@@ -2737,11 +2912,30 @@ fn context(input: &RunInput, journal: &[JournalEntry]) -> Context {
     let mut ctx = Context {
         provider_id: input.new_tunnel.as_ref().and_then(|t| t.provider_id),
         connector_id: None,
+        access: input.access.as_ref().and_then(|access| {
+            access.existing.as_ref().map(|app| AccessBinding {
+                provider_id: access.provider_id,
+                app_id: app.id.clone(),
+                aud: app.aud.clone(),
+            })
+        }),
     };
     for resource in created(journal) {
         match resource {
             RunResource::DnsProvider { id, .. } => ctx.provider_id = Some(id),
             RunResource::Connector { id, .. } => ctx.connector_id = Some(id),
+            RunResource::AccessApp {
+                provider_id,
+                id,
+                aud,
+                ..
+            } => {
+                ctx.access = Some(AccessBinding {
+                    provider_id,
+                    app_id: id,
+                    aud,
+                })
+            }
             _ => {}
         }
     }
@@ -2831,6 +3025,12 @@ fn undo_conflict_message(entry: &JournalEntry) -> String {
              anyway.",
             entry.conflict.as_deref().unwrap_or("other hostnames")
         ),
+        Intent::AccessApp { name, .. } => format!(
+            "Access app {name} was edited in Cloudflare after this run created it ({}). Temps \
+             did not touch it, nor anything this run did before it. Keep it (undo leaves the \
+             app as it is now), or delete it anyway.",
+            entry.conflict.as_deref().unwrap_or("its policies changed")
+        ),
         Intent::DnsRecord { .. } => format!(
             "{} now holds {}, which this run did not write. Temps never deletes a record \
              without this run's marker, so it did not touch it, nor anything this run did \
@@ -2878,6 +3078,7 @@ fn journaled_hostnames(journal: &[JournalEntry]) -> std::collections::BTreeSet<S
             | Intent::DnsChange { hostname, .. }
             | Intent::AddressAudience { hostname, .. } => Some(hostname.clone()),
             Intent::Certificate { domain } => Some(domain.clone()),
+            Intent::AccessApp { hostname, .. } => Some(hostname.clone()),
             Intent::TailscaleServe { hostname, .. } => Some(hostname.clone()),
             _ => None,
         })
@@ -3430,6 +3631,59 @@ pub async fn undo(
                     )
                 }
             },
+            // An Access app goes only while it is still this address's
+            // app, and, unless the user said to delete it anyway, while its
+            // policies are what the run created (ADR 065 D9).
+            RunResource::AccessApp {
+                provider_id,
+                id,
+                name,
+                hostname,
+                policies,
+                ..
+            } => match ops.access_app(*provider_id, id).await {
+                Ok(None) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    continue;
+                }
+                Ok(Some(app))
+                    if !app
+                        .domain
+                        .trim_end_matches('.')
+                        .eq_ignore_ascii_case(hostname.trim_end_matches('.')) =>
+                {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    results.push(UndoResult {
+                        label: format!(
+                            "Left Access app {name}: it protects {} now, not {hostname}",
+                            app.domain
+                        ),
+                        resource: resource.clone(),
+                        ok: true,
+                        error: None,
+                    });
+                    continue;
+                }
+                Ok(Some(app)) if !checked && app.policies != *policies => {
+                    return stop(
+                        results,
+                        pause(entry, "its policies were changed".to_string(), now),
+                    )
+                }
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    return stop(
+                        results,
+                        Stop::Failed(format!(
+                            "Temps could not read Access app {name} to check it is still the \
+                             one this run created, so it touched nothing from there on: \
+                             {error} Undo again to retry."
+                        )),
+                    )
+                }
+            },
             // A tunnel is checked for what else it serves, then marked
             // `deleting`, and that journaled, before any provider call:
             // sync then never brings it back, and an interrupted undo
@@ -3526,6 +3780,9 @@ pub async fn undo(
                 hostname, before, ..
             } => ops.set_address_audience(hostname, before).await,
             RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
+            RunResource::AccessApp {
+                provider_id, id, ..
+            } => ops.delete_access_app(*provider_id, id).await,
             // Handled above, before anything is removed.
             RunResource::TailscaleServe { .. }
             | RunResource::TailscaleService { .. }
@@ -3644,6 +3901,8 @@ mod tests {
         audience: Mutex<Option<AddressAudience>>,
         /// What the tunnel publishes now.
         served: Mutex<Vec<String>>,
+        /// The Access applications in Cloudflare.
+        access_apps: Mutex<Vec<AccessApp>>,
         /// What claiming a Serve entry finds; `None` creates entry 70.
         serve_claim: Option<ServeClaim>,
         /// The Serve entry and its worker's last report.
@@ -3817,8 +4076,20 @@ mod tests {
             self.log("find_custom_domain");
             Ok(self.existing_domain)
         }
-        async fn attach_domain(&self, _p: i32, _e: i32, _host: &str) -> Result<i32, String> {
+        async fn attach_domain(
+            &self,
+            _p: i32,
+            _e: i32,
+            _host: &str,
+            initial: Option<&AddressAudience>,
+        ) -> Result<i32, String> {
+            if let Some(initial) = initial {
+                self.log(format!("attach_domain as {}", initial.describe()));
+            }
             self.result("attach_domain")?;
+            if let Some(initial) = initial {
+                *self.audience.lock().expect("lock") = Some(initial.clone());
+            }
             Ok(50)
         }
         async fn detach_domain(&self, id: i32) -> Result<(), String> {
@@ -3945,6 +4216,46 @@ mod tests {
         ) -> Result<(), String> {
             self.log(format!("set_address_audience {}", audience.describe()));
             *self.audience.lock().expect("lock") = Some(audience.clone());
+            Ok(())
+        }
+        async fn access_app(
+            &self,
+            _provider_id: i32,
+            id: &str,
+        ) -> Result<Option<AccessApp>, String> {
+            self.result("access_app")?;
+            Ok(self
+                .access_apps
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|a| a.id == id)
+                .cloned())
+        }
+        async fn create_access_app(
+            &self,
+            provider_id: i32,
+            name: &str,
+            host: &str,
+            policy: &AccessPolicyAnswer,
+        ) -> Result<AccessApp, WriteError> {
+            self.log(format!(
+                "create_access_app {provider_id} {name} {host} {}",
+                policy.emails.join(",")
+            ));
+            if self.fail.contains(&"create_access_app") {
+                return Err(WriteError::refused("Cloudflare refused it"));
+            }
+            let app = access_app_named("app-1", name, host, "policy-v1");
+            self.access_apps.lock().expect("lock").push(app.clone());
+            Ok(app)
+        }
+        async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String> {
+            self.log(format!("delete_access_app {provider_id} {id}"));
+            self.access_apps
+                .lock()
+                .expect("lock")
+                .retain(|a| a.id != id);
             Ok(())
         }
         async fn claim_serve_entry(
@@ -4081,6 +4392,375 @@ mod tests {
         async fn sleep(&self, _duration: Duration) {}
     }
 
+    fn access_app_named(id: &str, name: &str, host: &str, policies: &str) -> AccessApp {
+        AccessApp {
+            id: id.into(),
+            name: name.into(),
+            app_type: super::super::access::SELF_HOSTED.into(),
+            domain: host.into(),
+            aud: format!("aud-{id}"),
+            domains: vec![host.into()],
+            policies: policies.into(),
+        }
+    }
+
+    fn access_input(existing: Option<AccessApp>) -> RunInput {
+        RunInput {
+            option: PlanOptionKind::ExistingTunnel,
+            steps: steps(&[
+                StepKind::AccessApp,
+                StepKind::AttachDomain,
+                StepKind::SetAudience,
+                StepKind::CheckReachability,
+            ]),
+            new_tunnel: None,
+            token: None,
+            audience: Some((
+                AddressAudience::signed_in(temps_core::gate::GateKind::CloudflareAccess, None),
+                AddressAudience::public(),
+            )),
+            access: Some(AccessRun {
+                provider_id: 7,
+                existing,
+                name: "temps-myapp.example.com-abcd".into(),
+                policy: AccessPolicyAnswer {
+                    emails: vec!["ana@example.com".into()],
+                    email_domains: vec![],
+                },
+            }),
+            ..token_input()
+        }
+    }
+
+    /// An address the run makes signed-in is attached with its gate, bound
+    /// to its Access app, in the same write: no route table ever has it
+    /// open. Setting the audience afterwards then has nothing to change.
+    #[tokio::test]
+    async fn a_signed_in_address_is_attached_already_gated() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let record = execute(&access_input(None), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        let calls = ops.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("attach_domain as ")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("set_address_audience")),
+            "{calls:?}"
+        );
+        let audience = ops
+            .audience
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("attached");
+        assert_eq!(
+            audience.gate_access.map(|binding| binding.app_id),
+            Some("app-1".to_string())
+        );
+
+        // A public address is attached as before.
+        let plain = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let record = execute(&token_input(), &plain, &Saved::default(), timing()).await;
+        assert!(
+            !plain
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("attach_domain as ")),
+            "{:?} {:?}",
+            record.state,
+            plain.calls()
+        );
+    }
+
+    /// ADR 065 D9: the app is created and journaled before the address is
+    /// attached, and the address records it, so the listener checks that
+    /// app's AUD.
+    #[tokio::test]
+    async fn an_access_run_creates_the_app_first_and_binds_the_address_to_it() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let record = execute(&access_input(None), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        let calls = ops.calls();
+        let created_at = calls
+            .iter()
+            .position(|c| c.starts_with("create_access_app 7 temps-myapp.example.com-abcd"))
+            .expect("created");
+        let attached_at = calls
+            .iter()
+            .position(|c| c.starts_with("attach_domain"))
+            .expect("attached");
+        assert!(created_at < attached_at, "{calls:?}");
+        assert_eq!(
+            record.created()[0],
+            RunResource::AccessApp {
+                provider_id: 7,
+                id: "app-1".into(),
+                name: "temps-myapp.example.com-abcd-r0".into(),
+                hostname: "myapp.example.com".into(),
+                aud: "aud-app-1".into(),
+                policies: "policy-v1".into(),
+            }
+        );
+        let audience = ops.audience.lock().expect("lock").clone().expect("set");
+        assert_eq!(
+            audience.gate_access,
+            Some(AccessBinding {
+                provider_id: 7,
+                app_id: "app-1".into(),
+                aud: "aud-app-1".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_access_app_is_used_as_found_and_never_journaled_or_deleted() {
+        let existing = access_app_named("theirs", "team app", "myapp.example.com", "p");
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        ops.access_apps.lock().expect("lock").push(existing.clone());
+        let record = execute(
+            &access_input(Some(existing)),
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("create_access_app")));
+        assert!(record
+            .journal
+            .iter()
+            .all(|e| !matches!(e.intent, Intent::AccessApp { .. })));
+        let audience = ops.audience.lock().expect("lock").clone().expect("set");
+        assert_eq!(
+            audience.gate_access.map(|b| b.app_id),
+            Some("theirs".to_string())
+        );
+
+        let mut journal = record.journal.clone();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_access_app")));
+    }
+
+    #[tokio::test]
+    async fn an_existing_access_app_deleted_since_planning_fails_the_run() {
+        let existing = access_app_named("theirs", "team app", "myapp.example.com", "p");
+        let ops = Fake::default();
+        let record = execute(
+            &access_input(Some(existing)),
+            &ops,
+            &Saved::default(),
+            timing(),
+        )
+        .await;
+        assert_eq!(record.state, RunState::Failed);
+        assert!(record
+            .error
+            .expect("error")
+            .contains("deleted in Cloudflare"));
+        assert!(!ops.calls().iter().any(|c| c.starts_with("attach_domain")));
+    }
+
+    #[tokio::test]
+    async fn an_access_address_is_never_set_without_its_app() {
+        let input = RunInput {
+            steps: steps(&[StepKind::SetAudience]),
+            access: None,
+            ..access_input(None)
+        };
+        let ops = Fake::default();
+        let record = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Failed);
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("set_address_audience")));
+    }
+
+    /// A create that timed out is found again by name and domain, so each
+    /// run names its app for itself: an app another run made for the same
+    /// address is never journaled as this run's, nor deleted by its undo.
+    #[tokio::test]
+    async fn each_run_names_its_access_app_for_itself() {
+        let mut names = Vec::new();
+        for run_id in [41, 42] {
+            let ops = Fake {
+                reachable: true,
+                ..Default::default()
+            };
+            let input = RunInput {
+                run_id,
+                ..access_input(None)
+            };
+            let record = execute(&input, &ops, &Saved::default(), timing()).await;
+            assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+            let Some(Intent::AccessApp { name, .. }) = record
+                .journal
+                .iter()
+                .map(|e| e.intent.clone())
+                .find(|i| matches!(i, Intent::AccessApp { .. }))
+            else {
+                panic!("journaled");
+            };
+            let created = format!("create_access_app 7 {name} myapp.example.com");
+            assert!(
+                ops.calls().iter().any(|c| c.starts_with(&created)),
+                "{:?}",
+                ops.calls()
+            );
+            names.push(name);
+        }
+        assert_eq!(
+            names,
+            vec![
+                "temps-myapp.example.com-abcd-r41".to_string(),
+                "temps-myapp.example.com-abcd-r42".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_access_app_is_journaled_absent_not_pending() {
+        let ops = Fake {
+            fail: vec!["create_access_app"],
+            ..Default::default()
+        };
+        let record = execute(&access_input(None), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Failed);
+        let entry = record
+            .journal
+            .iter()
+            .find(|e| matches!(e.intent, Intent::AccessApp { .. }))
+            .expect("journaled before the call");
+        assert_eq!(entry.state, JournalState::Absent);
+        assert!(!ops.calls().iter().any(|c| c.starts_with("attach_domain")));
+    }
+
+    fn access_journal() -> Vec<JournalEntry> {
+        vec![done(
+            Intent::AccessApp {
+                provider_id: 7,
+                name: "temps-myapp.example.com-abcd".into(),
+                hostname: "myapp.example.com".into(),
+            },
+            RunResource::AccessApp {
+                provider_id: 7,
+                id: "app-1".into(),
+                name: "temps-myapp.example.com-abcd".into(),
+                hostname: "myapp.example.com".into(),
+                aud: "aud-app-1".into(),
+                policies: "policy-v1".into(),
+            },
+        )]
+    }
+
+    #[tokio::test]
+    async fn undo_deletes_the_access_app_it_created_while_unchanged() {
+        let ops = Fake::default();
+        ops.access_apps.lock().expect("lock").push(access_app_named(
+            "app-1",
+            "temps-myapp.example.com-abcd",
+            "myapp.example.com",
+            "policy-v1",
+        ));
+        let mut journal = access_journal();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(ops
+            .calls()
+            .contains(&"delete_access_app 7 app-1".to_string()));
+        assert_eq!(journal[0].state, JournalState::Absent);
+    }
+
+    #[tokio::test]
+    async fn undo_pauses_on_an_access_app_whose_policies_were_edited() {
+        let ops = Fake::default();
+        ops.access_apps.lock().expect("lock").push(access_app_named(
+            "app-1",
+            "temps-myapp.example.com-abcd",
+            "myapp.example.com",
+            "policy-edited",
+        ));
+        let mut journal = access_journal();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert!(
+            matches!(&outcome.stopped, Some(Stop::Conflict(why)) if why.contains("was edited in Cloudflare")),
+            "{outcome:?}"
+        );
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_access_app")));
+        assert_eq!(journal[0].state, JournalState::Conflict);
+
+        // Keep: undo leaves it.
+        let mut kept = journal.clone();
+        decide(&mut kept, &journal[0].key, Decision::Keep, true).expect("decide");
+        let outcome = undo(&mut kept, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_access_app")));
+
+        // Delete it anyway.
+        decide(&mut journal, &kept[0].key, Decision::Overwrite, true).expect("decide");
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(ops
+            .calls()
+            .contains(&"delete_access_app 7 app-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn undo_leaves_an_access_app_moved_to_another_domain_or_already_gone() {
+        let ops = Fake::default();
+        ops.access_apps.lock().expect("lock").push(access_app_named(
+            "app-1",
+            "temps-myapp.example.com-abcd",
+            "other.example.com",
+            "policy-v1",
+        ));
+        let mut journal = access_journal();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(outcome.results[0].label.starts_with("Left Access app"));
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_access_app")));
+
+        let ops = Fake::default();
+        let mut journal = access_journal();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert!(outcome.stopped.is_none());
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_access_app")));
+        assert_eq!(journal[0].state, JournalState::Absent);
+    }
+
     #[derive(Default)]
     struct Saved(Mutex<Vec<RunRecord>>, bool);
 
@@ -4152,6 +4832,7 @@ mod tests {
             dns_before: PlannedRecord::Absent,
             certificate_challenge: None,
             audience: None,
+            access: None,
             serve: None,
             tailscale_service: None,
             tailscale_credential: None,

@@ -19,6 +19,13 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{configure_routes, IngressApiDoc, IngressAppState};
+use crate::reachability::access_handlers::{
+    configure_routes as access_routes, AccessApiDoc, AccessAppState,
+};
+use crate::reachability::access_service::AccessProviderService;
+use crate::reachability::gate_handlers::{
+    configure_routes as gate_routes, GateApiDoc, GateConsoleState,
+};
 use crate::reachability::handlers::{
     configure_routes as reachability_routes, ReachabilityApiDoc, ReachabilityAppState,
 };
@@ -66,6 +73,22 @@ impl TempsPlugin for IngressPlugin {
             let ways_in: Arc<dyn temps_core::ways_in::EnvironmentWaysIn> = ways;
             context.register_service(ways_in);
             context.register_service(service);
+            // ADR 065 D9: saved Cloudflare Access tokens. The server
+            // registers the key service, which refreshes their signing
+            // keys, before plugins register theirs.
+            let access_http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .map_err(|e| PluginError::PluginRegistrationFailed {
+                    plugin_name: "ingress".to_string(),
+                    error: format!("could not build the Cloudflare Access HTTP client: {e}"),
+                })?;
+            context.register_service(Arc::new(AccessProviderService::new(
+                context.require_service::<DatabaseConnection>(),
+                context.require_service::<EncryptionService>(),
+                context.require_service::<temps_routes::access_keys::AccessKeyService>(),
+                access_http,
+            )));
             Ok(())
         })
     }
@@ -87,6 +110,7 @@ impl TempsPlugin for IngressPlugin {
             custom_domains: context.require_service::<temps_projects::CustomDomainService>(),
             domains: context.require_service::<temps_domains::DomainService>(),
             config: context.require_service::<ConfigService>(),
+            access: context.require_service::<AccessProviderService>(),
         }));
         // Runs a restart left behind are reconciled now and every minute.
         reachability.clone().start_reconciler();
@@ -97,6 +121,17 @@ impl TempsPlugin for IngressPlugin {
             sensitive_action_authorizer: context
                 .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
         });
+        // Signed-in addresses (ADR 065 D8); the server registers the gate
+        // service before plugins configure their routes.
+        let gate_state = Arc::new(GateConsoleState {
+            gate: context.require_service::<temps_routes::gate::GateService>(),
+            audit_service: audit_service.clone(),
+            project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+        });
+        let access_state = Arc::new(AccessAppState {
+            service: context.require_service::<AccessProviderService>(),
+            audit_service: audit_service.clone(),
+        });
         let state = Arc::new(IngressAppState {
             service,
             audit_service,
@@ -104,13 +139,17 @@ impl TempsPlugin for IngressPlugin {
         Some(PluginRoutes::new(
             configure_routes()
                 .with_state(state)
-                .merge(reachability_routes().with_state(reachability_state)),
+                .merge(reachability_routes().with_state(reachability_state))
+                .merge(gate_routes().with_state(gate_state))
+                .merge(access_routes().with_state(access_state)),
         ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
         let mut doc = <IngressApiDoc as OpenApiTrait>::openapi();
         doc.merge(<ReachabilityApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<GateApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<AccessApiDoc as OpenApiTrait>::openapi());
         Some(doc)
     }
 }
