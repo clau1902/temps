@@ -58,11 +58,15 @@ pub fn primary_address(addresses: &[AddressReachability]) -> Option<PrimaryAddre
 }
 
 /// D4: why the environment has no address, only when reachability is sure
-/// that none is reachable. While an address is being set up, or Temps
-/// cannot tell, there is no reason: the monitor keeps probing and the open
-/// button stays.
+/// that no way in was ever set up for any of its addresses. While an
+/// address is being set up, when Temps cannot tell, or when a way in that
+/// was set up broke (a tunnel in error, a failed direct check, a custom
+/// domain whose record went away), there is no reason: the monitor keeps
+/// probing, so an outage is recorded as one, and the open button stays.
 pub fn no_address_reason(addresses: &[AddressReachability]) -> Option<String> {
-    if overall_state(addresses) != ReachState::NotReachable {
+    if overall_state(addresses) != ReachState::NotReachable
+        || !addresses.iter().all(|a| a.nothing_set_up)
+    {
         return None;
     }
     let first = addresses.iter().min_by_key(|a| rank(a));
@@ -262,6 +266,9 @@ pub fn reachability_warning(facts: &WarningFacts<'_>) -> Option<ReachabilityWarn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reachability::compute::{
+        address_reachability, AddressFacts, AddressInput, TunnelState,
+    };
     use crate::reachability::model::ReachAction;
 
     fn address(
@@ -280,6 +287,7 @@ mod tests {
             reason: format!("{host} reason"),
             action: None::<ReachAction>,
             network: None,
+            nothing_set_up: state == ReachState::NotReachable,
         }
     }
 
@@ -356,6 +364,109 @@ mod tests {
             );
         }
         assert!(no_address_reason(&[]).is_some());
+    }
+
+    fn judged(
+        host: &str,
+        source: AddressSource,
+        tunnel: Option<TunnelState>,
+        resolution: Resolution,
+        directs: &[DirectIngress],
+    ) -> AddressReachability {
+        let facts = AddressFacts {
+            input: AddressInput {
+                address: host.into(),
+                audience: Audience::Public,
+                source,
+                custom_domain_id: None,
+                private: None,
+            },
+            tunnel,
+            resolution,
+            temps_managed_dns: false,
+            private: None,
+        };
+        address_reachability(&facts, directs, true, "production")
+    }
+
+    #[test]
+    fn a_way_in_that_broke_is_an_outage_not_no_address() {
+        // A tunnel host whose tunnel is in error.
+        let tunnel = judged(
+            "app-production.example.com",
+            AddressSource::TunnelHost,
+            Some(TunnelState {
+                state: "error".into(),
+                connector_name: Some("edge".into()),
+                detail: "The tunnel rejected the hostname.".into(),
+                has_candidates: true,
+            }),
+            Resolution::NoRecord,
+            &[],
+        );
+        assert_eq!(tunnel.state, ReachState::NotReachable);
+        assert!(!tunnel.nothing_set_up);
+        let local = judged(
+            "app-production.localho.st",
+            AddressSource::Generated,
+            None,
+            Resolution::Skipped,
+            &[],
+        );
+        assert!(local.nothing_set_up);
+        assert_eq!(no_address_reason(&[local.clone(), tunnel.clone()]), None);
+        assert!(reachability_warning(&warning_facts(&[local.clone(), tunnel], &[])).is_none());
+
+        // DNS points at a worker that failed its last check.
+        let mut failed = direct(&["203.0.113.10"]);
+        failed.check_failed = Some("connection refused".into());
+        let direct = judged(
+            "app-production.example.dev",
+            AddressSource::Generated,
+            None,
+            Resolution::Ips(vec![ip("203.0.113.10")]),
+            &[failed],
+        );
+        assert_eq!(direct.state, ReachState::NotReachable);
+        assert!(!direct.nothing_set_up);
+        assert_eq!(no_address_reason(std::slice::from_ref(&direct)), None);
+
+        // A custom domain whose record went away.
+        let custom = judged(
+            "app.example.org",
+            AddressSource::CustomDomain,
+            None,
+            Resolution::NoRecord,
+            &[],
+        );
+        assert!(!custom.nothing_set_up);
+        assert_eq!(no_address_reason(&[local.clone(), custom]), None);
+
+        // Only ways in never set up read as no address: local-only, the
+        // generated host without a record or a tunnel covering it, or
+        // nothing deployed.
+        let unrecorded = judged(
+            "app-production.example.dev",
+            AddressSource::Generated,
+            None,
+            Resolution::NoRecord,
+            &[],
+        );
+        assert!(unrecorded.nothing_set_up);
+        assert!(no_address_reason(&[local.clone(), unrecorded]).is_some());
+        let covered = judged(
+            "app-production.example.com",
+            AddressSource::Generated,
+            Some(TunnelState {
+                state: "not_published".into(),
+                connector_name: Some("edge".into()),
+                detail: "The edge tunnel covers it but does not publish it.".into(),
+                has_candidates: true,
+            }),
+            Resolution::NoRecord,
+            &[],
+        );
+        assert!(!covered.nothing_set_up);
     }
 
     fn direct(ips: &[&str]) -> DirectIngress {

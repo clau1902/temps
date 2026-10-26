@@ -169,6 +169,13 @@ pub fn address_reachability(
         reason,
         action,
         network: None,
+        nothing_set_up: false,
+    };
+    // ADR 068 D4: only these verdicts may read as "no address"; every other
+    // not-reachable one is a way in that broke.
+    let never_set_up = |mut verdict: AddressReachability| {
+        verdict.nothing_set_up = true;
+        verdict
     };
 
     if !input.audience.is_served() {
@@ -184,10 +191,10 @@ pub fn address_reachability(
                  does not know, so nobody can open it until Temps is upgraded again."
             ),
         };
-        return verdict(ReachState::NotReachable, None, reason, None);
+        return never_set_up(verdict(ReachState::NotReachable, None, reason, None));
     }
     if is_local_only(address) {
-        return verdict(
+        return never_set_up(verdict(
             ReachState::NotReachable,
             None,
             format!(
@@ -195,15 +202,15 @@ pub fn address_reachability(
                  reach it."
             ),
             Some(make_reachable()),
-        );
+        ));
     }
     if !deployed {
-        return verdict(
+        return never_set_up(verdict(
             ReachState::NotReachable,
             None,
             format!("Nothing is deployed to {environment_name} yet."),
             Some(ReachAction::new(ActionKind::Deploy, "Deploy it")),
-        );
+        ));
     }
     if input.audience == Audience::Private {
         return private_reachability(facts, environment_name);
@@ -264,6 +271,10 @@ pub fn address_reachability(
             )
         }
         Resolution::Ips(_) | Resolution::NoRecord => {
+            // The generated host with no record and no tunnel covering it
+            // was never given a way in. A custom or environment domain
+            // without a record was set up by someone, so it is an outage.
+            let never = input.source == AddressSource::Generated && tunnel_reason.is_none();
             let reason =
                 tunnel_reason.unwrap_or_else(|| format!("No DNS record for {address} exists yet."));
             let target = directs
@@ -279,7 +290,12 @@ pub fn address_reachability(
                 )),
                 None => Some(make_reachable()),
             };
-            return verdict(ReachState::NotReachable, None, reason, action);
+            let verdict = verdict(ReachState::NotReachable, None, reason, action);
+            return if never {
+                never_set_up(verdict)
+            } else {
+                verdict
+            };
         }
     };
 
@@ -459,6 +475,7 @@ fn private_reachability(facts: &AddressFacts, environment_name: &str) -> Address
         reason,
         action,
         network,
+        nothing_set_up: false,
     };
     let listener = binding
         .listener
@@ -876,6 +893,7 @@ mod tests {
             reason: String::new(),
             action: None,
             network: None,
+            nothing_set_up: false,
         };
         let both = vec![
             reachable("app-production.example.com", AddressSource::Generated),

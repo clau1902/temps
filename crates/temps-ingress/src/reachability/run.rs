@@ -2636,6 +2636,7 @@ mod tests {
                 reason: "checked".into(),
                 action: None,
                 network: None,
+                nothing_set_up: false,
             }
         }
         async fn address_audience(&self, _host: &str) -> Result<Option<AddressAudience>, String> {

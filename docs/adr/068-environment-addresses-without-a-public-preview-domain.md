@@ -141,12 +141,21 @@ Every surface that means "the app's address" uses it: the header, the
 open-in-new-tab button, the deployment page, notifications, and the uptime
 monitor. `environment.domains` in the API lists the primary address first.
 
-With no reachable address:
+With no reachable address because no way in was ever set up -- the
+generated host only resolves locally or has no DNS record and no tunnel
+covers it, its audience is one routing does not serve, or nothing is
+deployed:
 
 - the open button is disabled with the reason;
 - the uptime monitor does not probe. It reports `no_address` ("nothing to
   check: nobody can reach this environment yet"), drawn grey, never `down`;
 - the monitor resumes on the next primary address without being recreated.
+
+A way in that was set up and broke is an outage, not `no_address`: a tunnel
+whose publication is in error, a worker or the control plane failing its
+direct check, a custom or environment domain whose DNS record went away. The
+monitor then probes the generated URL as before and records `down` or
+`major_outage`.
 
 A monitor whose check path was set by the user keeps that path on the new
 address. A monitor created by hand with an explicit URL is not changed.
@@ -219,7 +228,9 @@ reachable". It is done when the preview domain is `usable` or a tunnel has
   audiences are set per address, and a generated host must not widen them.
 - The D4 monitor change removes a probe; it adds no outbound request. The
   `no_address` state is not a way to silence a real outage: it is only set
-  when reachability reports no reachable address.
+  when no way in was ever set up for any of the environment's addresses. A
+  way in that broke (a tunnel in error, a failed direct check, a custom
+  domain losing its DNS record) keeps the probe and is recorded as an outage.
 - The D5 warning carries hostnames and node names the viewer can already see.
   Notifications follow the existing preferences.
 
@@ -261,10 +272,15 @@ or the code reads it a particular way, the choice is listed here.
 ### Phase 1
 
 - **Only a sure answer warns.** The D5 warning and the D4 `no_address` state
-  are set only when reachability settles on "not reachable". While it is
-  still checking, or cannot tell (a DNS lookup failed), the environment keeps
-  today's behaviour: the open button links the stored domain, the monitor
-  probes as before, and no warning is written.
+  are set only when reachability settles on "not reachable" *and* no way in
+  was ever set up for any address. Each verdict carries that as a flag
+  (`nothing_set_up`, internal, not in the API), set only for a local-only
+  host, an audience routing does not serve, nothing deployed, and the
+  generated host with no DNS record and no tunnel covering it. While
+  reachability is still checking, cannot tell (a DNS lookup failed), or a
+  way in broke, the environment keeps today's behaviour: the open button
+  links the stored domain, the monitor probes as before and records an
+  outage if the probe fails, and no warning is written.
 - **The monitor dials the primary address only when it differs from today.**
   A custom-domain or tunnel-host primary is probed over `https` through the
   public probe; a generated or private primary keeps the URL and routing the

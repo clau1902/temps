@@ -153,6 +153,13 @@ pub struct AddressReachability {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "Tailscale")]
     pub network: Option<String>,
+    /// ADR 068 D4: no way in was ever set up for it -- it is local-only,
+    /// for an audience routing does not serve, not deployed, or the
+    /// generated host with no DNS record and no tunnel covering it. A way
+    /// in that was set up and broke is `false`, so an outage is never read
+    /// as "nothing to check". Not part of the API.
+    #[serde(skip)]
+    pub nothing_set_up: bool,
 }
 
 /// Everything about one environment's addresses.

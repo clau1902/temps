@@ -2924,6 +2924,90 @@ mod tests {
         assert!(log.contains("no_address"), "{log}");
     }
 
+    #[tokio::test]
+    async fn health_probe_of_a_broken_way_in_records_an_outage_not_no_address() {
+        // ADR 068 D4: the primary was a tunnel host and the tunnel is now in
+        // error. Reachability gives no primary and no `no_address` reason --
+        // a way in was set up and broke -- so the monitor probes the
+        // generated URL as before and records the outage.
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+        struct ExpectOutage;
+        #[async_trait::async_trait]
+        impl JobQueue for ExpectOutage {
+            async fn send(&self, job: Job) -> Result<(), QueueError> {
+                match job {
+                    Job::StatusCheckCompleted(job) => {
+                        assert_eq!(job.status, "major_outage");
+                        assert_ne!(job.error_message.as_deref(), Some(NO_ADDRESS_MESSAGE));
+                    }
+                    _ => panic!("only the outage check is emitted"),
+                }
+                Ok(())
+            }
+            fn subscribe(&self) -> Box<dyn JobReceiver> {
+                panic!("not used")
+            }
+        }
+        let monitor = make_monitor(1, Some(1));
+        let now = Utc::now();
+        // `.invalid` never resolves (RFC 6761), so the probe fails without
+        // reaching any network.
+        let settings = temps_entities::settings::Model {
+            id: 1,
+            data: temps_core::AppSettings {
+                preview_domain: "apps.example.invalid".into(),
+                ..temps_core::AppSettings::default()
+            }
+            .to_json(),
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![health_probe_counts(1, 1)]])
+                .append_query_results([vec![settings]])
+                // persist_check_if_current
+                .append_query_results([vec![monitor.clone()]])
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![monitor.clone()]])
+                .append_query_results([vec![status_checks::Model {
+                    id: 1,
+                    monitor_id: 1,
+                    status: "major_outage".into(),
+                    checked_at: now,
+                    created_at: now,
+                    response_time_ms: None,
+                    error_message: Some("DNS resolution failed".into()),
+                }]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(None, None)));
+        HealthCheckService::check_monitor_with(
+            db.clone(),
+            test_config_service(&db, "postgres://localhost/test"),
+            monitor,
+            Arc::new(ExpectOutage),
+            Some(addresses),
+        )
+        .await
+        .expect("the outage is recorded");
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("one owner")
+                .into_transaction_log()
+        );
+        assert!(log.contains("major_outage"), "{log}");
+        assert!(!log.contains(NO_ADDRESS_STATUS), "{log}");
+    }
+
     struct RejectHealthProbeJobs;
     #[async_trait::async_trait]
     impl JobQueue for RejectHealthProbeJobs {
