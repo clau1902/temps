@@ -7,6 +7,16 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}/api` | (string & {});
 };
 
+/**
+ * The Cloudflare Access application in front of a signed-in address
+ * (ADR 065 D9): its JWTs carry `aud`, from the team of `provider_id`.
+ */
+export type AccessBinding = {
+    app_id: string;
+    aud: string;
+    provider_id: number;
+};
+
 export type AccessPermission = 'apps_edit' | 'organizations_read';
 
 export type AccessPermissionCheck = {
@@ -489,10 +499,18 @@ export type AddStatusPageDomainRequest = {
  */
 export type AddressAudience = {
     audience: Audience;
+    gate?: GateKind | null;
+    gate_access?: AccessBinding | null;
+    gate_allow?: GateAllowList | null;
     /**
      * For `private`: the network range a visitor must come from.
      */
     network_range?: string | null;
+    /**
+     * For `tailnet_users`: who it admits (ADR 065 D6), normalized. Undo
+     * puts the earlier list back with the audience.
+     */
+    principals?: Array<TailnetPrincipal>;
     /**
      * For `private`: that listener's address, which DNS points at and the
      * inside check dials.
@@ -502,6 +520,16 @@ export type AddressAudience = {
      * For `private`: the worker whose private listener serves it.
      */
     private_node_id?: number | null;
+    /**
+     * For `tailscale_service`: the `svc:` name.
+     */
+    private_service?: string | null;
+    /**
+     * For `private`: how it is served (ADR 065 D1), `tailscale_serve` or
+     * `tailscale_service`. `None` is phase 2's listener, so runs journaled
+     * before this column compare equal to what they set.
+     */
+    private_via?: string | null;
 };
 
 /**
@@ -2065,6 +2093,14 @@ export type AppSettings = {
     kv?: KvSettings;
     letsencrypt?: LetsEncryptSettings;
     /**
+     * The header a trusted loopback proxy puts the visitor's JA4 TLS
+     * fingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer
+     * `trust_loopback_forwarded_ip` trusts, and removed from every request
+     * before it goes upstream. `None` records no JA4 behind such a proxy.
+     * Set through [`normalize_loopback_ja4_header`].
+     */
+    loopback_ja4_header?: string | null;
+    /**
      * MCP server settings (ADR-039). Off by default — enable via the Settings
      * UI to expose the MCP endpoint to the Temps CLI wizard.
      */
@@ -2282,6 +2318,11 @@ export type AppSettingsResponse = {
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
+    /**
+     * The header a trusted loopback proxy sends the visitor's JA4 in.
+     * `None` records no JA4 behind such a proxy.
+     */
+    loopback_ja4_header?: string | null;
     /**
      * MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
      * content — passed through as-is so the settings UI can show and edit it.
@@ -2714,7 +2755,7 @@ export type AttributeKeysResponse = {
 /**
  * Who an address is for.
  */
-export type Audience = 'public' | 'private' | 'signed_in' | 'unsupported';
+export type Audience = 'public' | 'private' | 'signed_in' | 'tailnet_users' | 'unsupported';
 
 /**
  * IP address information in audit log
@@ -13576,6 +13617,21 @@ export type FunnelResponse = {
 };
 
 /**
+ * Who may sign in to a Temps-gated address besides being able to see the
+ * project (ADR 065 D7): stored in `gate_allow`. Empty lists mean no list.
+ */
+export type GateAllowList = {
+    teams?: Array<number>;
+    users?: Array<number>;
+};
+
+/**
+ * Which gate an address has (D7). Unknown values read as `Unsupported`, and
+ * an unsupported gate admits nobody.
+ */
+export type GateKind = 'temps' | 'cloudflare_access' | 'unsupported';
+
+/**
  * Detailed gateway container status surfaced to the settings UI.
  */
 export type GatewayStatus = {
@@ -16662,6 +16718,32 @@ export type Intent = {
 } | {
     domain: string;
     type: 'certificate';
+} | {
+    hostname: string;
+    name: string;
+    provider_id: number;
+    type: 'access_app';
+} | {
+    address_id: string;
+    hostname: string;
+    node_id: number;
+    node_name: string;
+    /**
+     * The `svc:` name, for a Service.
+     */
+    service?: string | null;
+    type: 'tailscale_serve';
+} | {
+    name: string;
+    type: 'tailscale_credential';
+} | {
+    /**
+     * `temps:<install>:<this run>`.
+     */
+    marker: string;
+    name: string;
+    tailnet: string;
+    type: 'tailscale_service';
 };
 
 /**
@@ -16775,6 +16857,7 @@ export type JournalEntry = {
      */
     pending_since?: string | null;
     resource?: RunResource | null;
+    shown_service?: ServiceDefinition | null;
     state: JournalState;
     /**
      * The provider tunnel id the connector had when it was marked.
@@ -21567,7 +21650,7 @@ export type PlanOption = {
 /**
  * One way to make the address reachable.
  */
-export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker';
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve' | 'tailscale_service' | 'tailscale_service_with_credential';
 
 /**
  * `POST …/reachability/plan`.
@@ -21578,6 +21661,12 @@ export type PlanRequest = {
      */
     address?: string | null;
     audience?: Audience;
+    gate?: GateKind | null;
+    /**
+     * For `tailnet_users`: the tailnet logins and tags it admits (ADR 065
+     * D6). At least one; checked and lower-cased.
+     */
+    principals?: Array<TailnetPrincipal>;
 };
 
 export type PlanSourceBackup = {
@@ -22082,6 +22171,11 @@ export type PreviousChoice = {
 export type PricingResponse = {
     models: Array<ModelPricing>;
 };
+
+/**
+ * What a `tailnet_users` entry names (ADR 065 D6).
+ */
+export type PrincipalKind = 'login' | 'tag';
 
 /**
  * Information about private/local IP addresses
@@ -23490,6 +23584,15 @@ export type ProxyLogResponse = {
     ip_geolocation_id?: number | null;
     is_bot?: boolean | null;
     is_system_request: boolean;
+    /**
+     * The client's JA4 TLS fingerprint, when its source gives one.
+     */
+    ja4?: string | null;
+    /**
+     * Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+     * `edge`.
+     */
+    ja4_source?: string | null;
     method: string;
     operating_system?: string | null;
     path: string;
@@ -23523,6 +23626,15 @@ export type ProxyLogResponse = {
     response_time_ms?: number | null;
     routing_status: string;
     session_id?: number | null;
+    /**
+     * The lists that hold the client, and the range on each.
+     */
+    shield_reasons: Array<string>;
+    /**
+     * What Shield would have done with the request: `log`, `challenge` or
+     * `block`. `None` when no reputation list holds the client.
+     */
+    shield_verdict?: string | null;
     status_code: number;
     timestamp: string;
     upstream_host?: string | null;
@@ -24150,6 +24262,7 @@ export type ReachabilityPlan = {
      * moved on from.
      */
     fingerprint?: string | null;
+    gate?: GateKind | null;
     /**
      * In the order Temps prefers them; the first is recommended.
      */
@@ -24160,6 +24273,11 @@ export type ReachabilityPlan = {
      * `GET …/reachability`, which is not stored.
      */
     plan_id?: string | null;
+    /**
+     * For `tailnet_users`: who the address will admit, as the plan was
+     * made for them (ADR 065 D6). Apply sets exactly this list.
+     */
+    principals?: Array<TailnetPrincipal>;
 };
 
 /**
@@ -25790,6 +25908,54 @@ export type RunResource = {
 } | {
     domain: string;
     type: 'certificate';
+} | {
+    aud: string;
+    hostname: string;
+    id: string;
+    name: string;
+    /**
+     * The policies' fingerprint when the run created it.
+     */
+    policies: string;
+    provider_id: number;
+    type: 'access_app';
+} | {
+    address_id: string;
+    /**
+     * This run created the entry, rather than finding it.
+     */
+    created: boolean;
+    entry_id: number;
+    hostname: string;
+    node_id: number;
+    node_name: string;
+    type: 'tailscale_serve';
+} | {
+    id: number;
+    name: string;
+    type: 'tailscale_credential';
+} | {
+    /**
+     * This run created it (`created`), rather than finding it.
+     */
+    created: boolean;
+    /**
+     * The run whose marker it carries.
+     */
+    creator_run_id: number;
+    /**
+     * As read back once the step was done, with its addresses.
+     */
+    definition: ServiceDefinition;
+    /**
+     * `svc:myapp`.
+     */
+    name: string;
+    /**
+     * The tailnet's MagicDNS suffix, for the Service's lock and messages.
+     */
+    tailnet: string;
+    type: 'tailscale_service';
 };
 
 export type RunState = 'running' | 'succeeded' | 'waiting' | 'failed' | 'interrupted' | 'recovering' | 'conflict' | 'undoing' | 'undo_paused' | 'undone';
@@ -27389,6 +27555,23 @@ export type ServiceCreateAlertRuleRequest = {
      */
     severity: string;
     threshold: number;
+};
+
+/**
+ * A Tailscale Service as the API returns it, with the fields D4 compares.
+ */
+export type ServiceDefinition = {
+    /**
+     * The TailVIPs Tailscale assigned.
+     */
+    addrs?: Array<string>;
+    comment?: string;
+    /**
+     * `svc:myapp`.
+     */
+    name: string;
+    ports?: Array<string>;
+    tags?: Array<string>;
 };
 
 /**
@@ -29534,7 +29717,7 @@ export type StepConversionResponse = {
     step_order: number;
 };
 
-export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience';
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'access_app' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval';
 
 /**
  * What kind of resource a migration step operates on
@@ -29797,6 +29980,15 @@ export type TailLogsRequest = {
     project_id: number;
     service: string;
     text?: string | null;
+};
+
+/**
+ * One person or tag a `tailnet_users` address admits. `value` is always
+ * ASCII-lower-cased: it is compared that way (D6).
+ */
+export type TailnetPrincipal = {
+    kind: PrincipalKind;
+    value: string;
 };
 
 /**

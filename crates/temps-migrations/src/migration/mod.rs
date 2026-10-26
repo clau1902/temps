@@ -383,6 +383,7 @@ mod m20261025_000002_add_log_ingest_overrides;
 mod m20261026_000001_create_shield;
 mod m20261026_000001_tailnet_serve;
 mod m20261026_000002_tailnet_principals;
+mod m20261026_000003_add_ja4_to_proxy_logs;
 mod m20261027_000001_signed_in_gate;
 mod m20261027_000002_cloudflare_access;
 
@@ -860,6 +861,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261026_000001_tailnet_serve::Migration),
             // ADR 065 D6: `tailnet_users` and who it admits.
             Box::new(m20261026_000002_tailnet_principals::Migration),
+            // ADR 066 phase 3: the client's JA4 on the request log.
+            Box::new(m20261026_000003_add_ja4_to_proxy_logs::Migration),
             // ADR 065 D7/D8: the Temps gate for signed-in addresses.
             Box::new(m20261027_000001_signed_in_gate::Migration),
             Box::new(m20261027_000002_cloudflare_access::Migration),
