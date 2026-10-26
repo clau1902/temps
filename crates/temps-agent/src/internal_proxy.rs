@@ -1370,10 +1370,14 @@ fn is_upgrade_request(headers: &HeaderMap) -> bool {
 /// side closes.
 async fn proxy_upgrade(
     entry: &RouteEntry,
-    req: Request,
+    mut req: Request,
     forwarded_proto: &'static str,
     serve_socket: bool,
 ) -> Response {
+    // The gate's cookies never reach an app, admitted or not, gated host or
+    // not: a cookie left from before an address stopped being signed-in is
+    // still a token (ADR 065 D8).
+    temps_core::gate::strip_gate_cookies(req.headers_mut());
     use rand::prelude::IndexedRandom;
     let backend = {
         let mut rng = rand::rng();
@@ -1791,7 +1795,9 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
     // the body issue is moot. Methods with bodies get one shot.
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let headers = req.headers().clone();
+    let mut headers = req.headers().clone();
+    // As in `proxy_upgrade`: no app ever receives the gate's cookies.
+    temps_core::gate::strip_gate_cookies(&mut headers);
     let public_peer = req.extensions().get::<PublicPeer>().copied().or_else(|| {
         req.extensions()
             .get::<ConnectInfo<SocketAddr>>()
@@ -1935,8 +1941,11 @@ async fn forward_once(
     let mut builder = state.client.request(metadata.method.clone(), &upstream_url);
 
     for (name, value) in metadata.headers.iter() {
-        // Tailnet identity is trusted only from a Serve socket (ADR 065 D3).
+        // Every `x-temps-*` header is Temps' to set, below; a client's copy
+        // never passes, as on the upgrade path. Tailnet identity is trusted
+        // only from a Serve socket (ADR 065 D3).
         if HOP_BY_HOP.contains(&name.as_str())
+            || name.as_str().starts_with("x-temps-")
             || !temps_core::tailnet::forwards_header(name.as_str(), state.serve.is_some())
         {
             continue;

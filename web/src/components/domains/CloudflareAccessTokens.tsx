@@ -287,7 +287,7 @@ function AddAccessTokenForm({ onDone }: { onDone: () => void }) {
   )
 }
 
-function SavedAccessToken({
+export function SavedAccessToken({
   provider,
   canManage,
   onDelete,
@@ -297,6 +297,10 @@ function SavedAccessToken({
   onDelete: (provider: AccessProviderResponse) => void
 }) {
   const blocked = deleteBlockedReason(provider.addresses)
+  // Visible, not only a tooltip: a disabled button takes no focus and touch
+  // screens show no `title`, yet the reason names the step that unblocks it.
+  const blockedId = `access-token-${provider.id}-delete-blocked`
+  const showBlocked = canManage && blocked !== null
   return (
     <li className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center">
       <div className="flex min-w-0 flex-1 items-center gap-3">
@@ -311,6 +315,11 @@ function SavedAccessToken({
             {keysLabel(provider.key_count, provider.keys_fetched_at)} · added{' '}
             <TimeAgo date={provider.created_at} />
           </p>
+          {showBlocked && (
+            <p id={blockedId} className="text-xs text-muted-foreground">
+              {blocked}
+            </p>
+          )}
         </div>
       </div>
       {canManage && (
@@ -318,7 +327,7 @@ function SavedAccessToken({
           variant="outline"
           size="sm"
           disabled={blocked !== null}
-          title={blocked ?? undefined}
+          aria-describedby={showBlocked ? blockedId : undefined}
           onClick={() => onDelete(provider)}
         >
           <Trash2 className="h-4 w-4 sm:mr-2" aria-hidden="true" />

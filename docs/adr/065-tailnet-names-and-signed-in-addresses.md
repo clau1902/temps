@@ -1349,6 +1349,31 @@ from their letter:
   comma-separated list (`gate.v1,tailnet_identity.v1`), read from every
   header line, and the ingress report stores them together in
   `node_public_ingress.listening`; there is no separate column.
+- **The gate's cookies and every `x-temps-user*` header are dropped from
+  every request to every app, admitted or not.** Dropping the cookies only
+  when the gate admits a request let an address that stopped being
+  signed-in pass a still-valid token to its app. The control-plane proxy
+  strips them on every upstream request and the agent on both of its
+  forwarding paths; a request without a gate cookie is left as sent. A
+  client's `x-temps-user*` headers are dropped by prefix, so the tailnet
+  login and any later identity header are covered, and the agent's plain
+  forwarding path drops every client `x-temps-*` header, as its upgrade
+  path already did.
+- **A monitor trusts `x-temps-gate` only from Temps' own proxy.** A probe
+  through the local proxy sees the header only from the gate, since the
+  proxy and the agent drop it from every app response. A probe straight to
+  the public address may reach anything, so there the header proves
+  nothing: such a monitor reports "behind sign-in" only for a redirect to
+  the sign-in of the Access team the address is bound to, and any other
+  answer is classified by its status as usual.
+- **The gate runs before Shield.** On the control plane the gate answers
+  before wake-on-request (D8), which comes before the project's IP rules,
+  rate limits and Shield's challenge. A visitor who is not signed in gets
+  the sign-in and never reaches the app; a signed-in request then goes
+  through the IP rules, rate limits and Shield like any other. ADR 066 does
+  not order the two; challenging first would need the project resolved,
+  which today happens after wake-on-request. Workers do not run Shield
+  yet; when they do (ADR 066 I5), the same order applies there.
 
 ## Sources
 

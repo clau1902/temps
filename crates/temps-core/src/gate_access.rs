@@ -24,6 +24,40 @@ use serde::Deserialize;
 
 use crate::gate::{page, AccessGate, GateResponse, GATE_ACCESS, GATE_HEADER, USER_EMAIL_HEADER};
 
+/// Cloudflare's team domains all end with this.
+pub const TEAM_DOMAIN_SUFFIX: &str = ".cloudflareaccess.com";
+
+/// `<team>.cloudflareaccess.com`, lower-cased, when `value` is one: a
+/// single DNS label before the suffix, so nothing else can be named.
+pub fn team_domain(value: &str) -> Option<String> {
+    let host = value
+        .trim()
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let team = host.strip_suffix(TEAM_DOMAIN_SUFFIX)?;
+    let label_ok = !team.is_empty()
+        && team.len() <= 63
+        && !team.starts_with('-')
+        && !team.ends_with('-')
+        && team
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    label_ok.then_some(host)
+}
+
+/// Whether `location` sends the browser to the sign-in of the Access team
+/// `team` (its team domain): an `https` URL on exactly that host. Another
+/// team's sign-in means another account's app answers there, whose tokens
+/// the address refuses.
+pub fn is_team_sign_in(location: Option<&str>, team: &str) -> bool {
+    let Some(rest) = location.and_then(|l| l.trim().strip_prefix("https://")) else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    team_domain(host).is_some_and(|host| host.eq_ignore_ascii_case(team))
+}
+
 /// The header Access puts its JWT in, lower-case.
 pub const ACCESS_JWT_HEADER: &str = "cf-access-jwt-assertion";
 /// Clock skew allowed on `exp` and `nbf`.

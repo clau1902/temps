@@ -17,7 +17,8 @@ use temps_core::url_validation::{
 };
 use temps_core::{Job, JobQueue, JobReceiver, QueueError, StatusCheckCompletedJob};
 use temps_entities::{
-    deployment_containers, deployments, environments, projects, status_checks, status_monitors,
+    cloudflare_access_providers, deployment_containers, deployments, environment_domains,
+    environments, project_custom_domains, projects, status_checks, status_monitors,
 };
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
@@ -266,35 +267,116 @@ fn local_listener_for_url<'a>(
 const PROXY_HTTPS_REDIRECT_HEADER: &str = "x-temps-proxy-https-redirect";
 const PROXY_PROBE_CAPABILITY_HEADER: &str = "x-temps-proxy-probe-capable";
 
+/// Where a probe's answer came from, which decides what in it is evidence
+/// of the gate (ADR 065 D10).
+#[derive(Debug, Clone, Copy)]
+enum ProbeOrigin<'a> {
+    /// Through this server's own proxy, which drops `x-temps-gate` from
+    /// every app response: the header can only be the gate's.
+    LocalProxy,
+    /// Straight to the public address. Anything may answer there, so the
+    /// header proves nothing; only a redirect to the sign-in of the
+    /// Cloudflare Access team the address is bound to counts.
+    Direct { access_team: Option<&'a str> },
+}
+
 /// What a monitor reports when the address it checks is behind sign-in
 /// (ADR 065 D10): the gate answered, so the address is up, but the app's
 /// own health is out of the monitor's sight.
-fn behind_sign_in(response: &reqwest::Response) -> Option<String> {
-    gate_note(
-        response
-            .headers()
-            .get(temps_core::gate::GATE_HEADER)
-            .and_then(|value| value.to_str().ok()),
-    )
-}
-
-/// Only an answer that is the gate doing its job counts: the Temps sign-in
-/// or a Cloudflare Access refusal at the origin. `unavailable` means the
-/// gate itself cannot run, so the address is down, and an unknown value is
-/// not trusted either.
-fn gate_note(gate_header: Option<&str>) -> Option<String> {
-    let value = gate_header?;
-    if !value.eq_ignore_ascii_case(temps_core::gate::GATE_SIGN_IN)
-        && !value.eq_ignore_ascii_case(temps_core::gate::GATE_ACCESS)
-    {
-        return None;
-    }
-    Some(
+///
+/// Through the local proxy, only an answer that is the gate doing its job
+/// counts: the Temps sign-in or a Cloudflare Access refusal at the origin.
+/// `unavailable` means the gate itself cannot run, so the address is down,
+/// and an unknown value is not trusted either.
+fn sign_in_note(
+    origin: ProbeOrigin<'_>,
+    status: u16,
+    gate_header: Option<&str>,
+    location: Option<&str>,
+) -> Option<String> {
+    let gated = match origin {
+        ProbeOrigin::LocalProxy => gate_header.is_some_and(|value| {
+            value.eq_ignore_ascii_case(temps_core::gate::GATE_SIGN_IN)
+                || value.eq_ignore_ascii_case(temps_core::gate::GATE_ACCESS)
+        }),
+        ProbeOrigin::Direct { access_team } => {
+            matches!(status, 302 | 303)
+                && access_team
+                    .is_some_and(|team| temps_core::gate_access::is_team_sign_in(location, team))
+        }
+    };
+    gated.then(|| {
         "Behind sign-in: this address only lets in people who sign in, so the monitor sees \
          the sign-in, not the app. Temps offers no way past it. Container health checks \
          (restarts, out-of-memory kills, exits) watch the app itself."
-            .to_string(),
-    )
+            .to_string()
+    })
+}
+
+/// The team of the Cloudflare Access account the address a direct probe
+/// asked for is bound to, looked up only when the answer redirects to some
+/// Access sign-in: every other direct answer needs no lookup.
+async fn direct_access_team(
+    db: &DatabaseConnection,
+    monitor_id: i32,
+    url: &str,
+    status: u16,
+    location: Option<&str>,
+) -> Option<String> {
+    if !matches!(status, 302 | 303)
+        || !location.is_some_and(|l| l.contains(temps_core::gate_access::TEAM_DOMAIN_SUFFIX))
+    {
+        return None;
+    }
+    let host = reqwest::Url::parse(url)
+        .ok()?
+        .host_str()?
+        .to_ascii_lowercase();
+    match access_team_of_host(db, &host).await {
+        Ok(team) => team,
+        Err(error) => {
+            warn!(
+                monitor_id,
+                host = %host,
+                %error,
+                "Could not read the Cloudflare Access account of the probed address"
+            );
+            None
+        }
+    }
+}
+
+/// The team domain of the Cloudflare Access account `host` is bound to, when
+/// it is a signed-in address behind Access.
+async fn access_team_of_host(
+    db: &DatabaseConnection,
+    host: &str,
+) -> Result<Option<String>, sea_orm::DbErr> {
+    use temps_entities::audience::{GATE_CLOUDFLARE_ACCESS, SIGNED_IN};
+    let custom = project_custom_domains::Entity::find()
+        .filter(project_custom_domains::Column::Domain.eq(host))
+        .filter(project_custom_domains::Column::Audience.eq(SIGNED_IN))
+        .filter(project_custom_domains::Column::Gate.eq(GATE_CLOUDFLARE_ACCESS))
+        .one(db)
+        .await?
+        .and_then(|d| d.gate_access_provider_id);
+    let provider_id = match custom {
+        Some(id) => Some(id),
+        None => environment_domains::Entity::find()
+            .filter(environment_domains::Column::Domain.eq(host))
+            .filter(environment_domains::Column::Audience.eq(SIGNED_IN))
+            .filter(environment_domains::Column::Gate.eq(GATE_CLOUDFLARE_ACCESS))
+            .one(db)
+            .await?
+            .and_then(|d| d.gate_access_provider_id),
+    };
+    let Some(provider_id) = provider_id else {
+        return Ok(None);
+    };
+    Ok(cloudflare_access_providers::Entity::find_by_id(provider_id)
+        .one(db)
+        .await?
+        .map(|p| p.team_domain))
 }
 
 fn proxy_supports_probe_markers(response: &reqwest::Response) -> bool {
@@ -1067,7 +1149,28 @@ impl HealthCheckService {
                 Ok(Ok(response)) => {
                     // ADR 065 D10: a signed-in address answers with its
                     // gate, never the app, and Temps offers no way past it.
-                    if let Some(note) = behind_sign_in(&response) {
+                    let status = response.status().as_u16();
+                    let location = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|value| value.to_str().ok());
+                    let gate_header = response
+                        .headers()
+                        .get(temps_core::gate::GATE_HEADER)
+                        .and_then(|value| value.to_str().ok());
+                    let access_team = if is_local_probe {
+                        None
+                    } else {
+                        direct_access_team(&db, monitor.id, &health_url, status, location).await
+                    };
+                    let origin = if is_local_probe {
+                        ProbeOrigin::LocalProxy
+                    } else {
+                        ProbeOrigin::Direct {
+                            access_team: access_team.as_deref(),
+                        }
+                    };
+                    if let Some(note) = sign_in_note(origin, status, gate_header, location) {
                         return Self::record_check(
                             &db,
                             probe.clone(),
@@ -1801,18 +1904,57 @@ mod tests {
 
     #[test]
     fn a_gated_answer_is_reported_behind_sign_in() {
-        assert!(gate_note(Some("sign-in")).is_some_and(|note| note.starts_with("Behind sign-in")));
-        assert!(gate_note(Some("access")).is_some());
-        assert!(gate_note(None).is_none());
+        let local = |header| sign_in_note(ProbeOrigin::LocalProxy, 302, header, None);
+        assert!(local(Some("sign-in")).is_some_and(|note| note.starts_with("Behind sign-in")));
+        assert!(sign_in_note(ProbeOrigin::LocalProxy, 403, Some("access"), None).is_some());
+        assert!(local(None).is_none());
     }
 
     /// A gate that cannot run is an outage, not "behind sign-in", and a
     /// value the gate never sends is not taken for it.
     #[test]
     fn an_unavailable_gate_is_not_reported_behind_sign_in() {
-        assert!(gate_note(Some(temps_core::gate::GATE_UNAVAILABLE)).is_none());
-        assert!(gate_note(Some("anything-else")).is_none());
-        assert!(gate_note(Some("")).is_none());
+        let local = |header| sign_in_note(ProbeOrigin::LocalProxy, 503, header, None);
+        assert!(local(Some(temps_core::gate::GATE_UNAVAILABLE)).is_none());
+        assert!(local(Some("anything-else")).is_none());
+        assert!(local(Some("")).is_none());
+    }
+
+    /// A direct probe reaches whatever answers at the public address, so a
+    /// gate header there proves nothing: an app failing with
+    /// `x-temps-gate: access` stays an outage.
+    #[test]
+    fn a_direct_probe_does_not_trust_the_gate_header() {
+        let direct = ProbeOrigin::Direct {
+            access_team: Some("team.cloudflareaccess.com"),
+        };
+        for header in ["access", "sign-in"] {
+            assert!(sign_in_note(direct, 503, Some(header), None).is_none());
+            assert!(sign_in_note(direct, 403, Some(header), None).is_none());
+        }
+        assert!(!HealthCheckService::is_operational_http_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+    }
+
+    /// Directly, only a redirect to the sign-in of the address's own Access
+    /// team is the gate.
+    #[test]
+    fn a_direct_probe_recognises_its_own_access_sign_in() {
+        let own = "https://team.cloudflareaccess.com/cdn-cgi/access/login/app.example.com";
+        let other = "https://other.cloudflareaccess.com/cdn-cgi/access/login/app.example.com";
+        let direct = ProbeOrigin::Direct {
+            access_team: Some("team.cloudflareaccess.com"),
+        };
+        assert!(sign_in_note(direct, 302, None, Some(own)).is_some());
+        assert!(sign_in_note(direct, 303, None, Some(own)).is_some());
+        assert!(sign_in_note(direct, 302, None, Some(other)).is_none());
+        assert!(sign_in_note(direct, 200, None, Some(own)).is_none());
+        assert!(
+            sign_in_note(direct, 302, None, Some("http://team.cloudflareaccess.com/")).is_none()
+        );
+        let unbound = ProbeOrigin::Direct { access_team: None };
+        assert!(sign_in_note(unbound, 302, Some("access"), Some(own)).is_none());
     }
 
     #[test]

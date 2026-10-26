@@ -277,6 +277,45 @@ async fn test_public_ingress_app_cannot_send_the_gate_header() {
     );
 }
 
+/// A host that is not signed-in (any more) never passes the gate's cookies
+/// or a client's `x-temps-*` headers to its app: a gate cookie left from
+/// before is still a token, and only Temps sets `x-temps-*` (ADR 065 D8).
+#[tokio::test]
+async fn test_public_ingress_never_forwards_gate_cookies_or_client_temps_headers() {
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let ingress = IngressHarness::start(backend_address, true).await;
+
+    let response = ingress
+        .request(
+            "GET / HTTP/1.1\r\nHost: app.example.test\r\n\
+             Cookie: a=1; __Host-temps_gate=old-token; __Host-temps_gate_state=s; b=2\r\n\
+             X-Temps-User: 1\r\nX-Temps-User-Role: admin\r\nX-Temps-Anything: x\r\n\
+             Connection: close\r\n\r\n",
+        )
+        .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+    let backend_request = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed")
+        .to_ascii_lowercase();
+    assert!(
+        backend_request.contains("cookie: a=1; b=2\r\n"),
+        "{backend_request}"
+    );
+    assert!(!backend_request.contains("temps_gate"), "{backend_request}");
+    assert!(
+        !backend_request.contains("x-temps-user"),
+        "{backend_request}"
+    );
+    assert!(
+        !backend_request.contains("x-temps-anything"),
+        "{backend_request}"
+    );
+    backend_shutdown.notify_waiters();
+}
+
 #[tokio::test]
 async fn test_public_ingress_unknown_host_returns_not_found_without_backend_access() {
     let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;

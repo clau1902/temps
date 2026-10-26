@@ -34,8 +34,7 @@ use tracing::{debug, info, warn};
 pub const HOURLY: Duration = Duration::from_secs(60 * 60);
 /// The least time between two fetches of one provider's keys.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// Cloudflare's team domains all end with this.
-pub const TEAM_DOMAIN_SUFFIX: &str = ".cloudflareaccess.com";
+pub use temps_core::gate_access::{is_team_sign_in, team_domain, TEAM_DOMAIN_SUFFIX};
 /// A certs answer larger than this is not Cloudflare's.
 const MAX_CERTS_BYTES: usize = 64 * 1024;
 /// More keys than this are not Cloudflare's (it publishes two).
@@ -62,25 +61,6 @@ pub enum AccessKeyError {
         #[source]
         source: sea_orm::DbErr,
     },
-}
-
-/// `<team>.cloudflareaccess.com`, lower-cased, when `value` is one: a
-/// single DNS label before the suffix, so nothing else can be named.
-pub fn team_domain(value: &str) -> Option<String> {
-    let host = value
-        .trim()
-        .trim_start_matches("https://")
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
-    let team = host.strip_suffix(TEAM_DOMAIN_SUFFIX)?;
-    let label_ok = !team.is_empty()
-        && team.len() <= 63
-        && !team.starts_with('-')
-        && !team.ends_with('-')
-        && team
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    label_ok.then_some(host)
 }
 
 /// The JWT issuer for a team domain.

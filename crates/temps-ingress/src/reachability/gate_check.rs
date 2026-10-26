@@ -38,19 +38,6 @@ pub enum GateProbe {
     Unchecked(String),
 }
 
-/// Whether `location` sends the browser to the sign-in of the address's own
-/// Access team: an `https` URL on exactly `team_domain`. Another team's
-/// sign-in means another account's app answers there, whose tokens this
-/// address refuses.
-fn is_access_sign_in(location: Option<&str>, team_domain: &str) -> bool {
-    let Some(rest) = location.and_then(|l| l.trim().strip_prefix("https://")) else {
-        return false;
-    };
-    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    temps_routes::access_keys::team_domain(host)
-        .is_some_and(|host| host.eq_ignore_ascii_case(team_domain))
-}
-
 /// Classify an answer for `gate`. `team_domain` is the address's Access
 /// team (Cloudflare Access only); `location` is the redirect's target.
 pub fn classify(
@@ -82,7 +69,9 @@ pub fn classify(
         (GateKind::Temps, _) => GateProbe::Open { status },
         (GateKind::CloudflareAccess, _)
             if matches!(status, 302 | 303)
-                && team_domain.is_some_and(|team| is_access_sign_in(location, team)) =>
+                && team_domain.is_some_and(|team| {
+                    temps_core::gate_access::is_team_sign_in(location, team)
+                }) =>
         {
             GateProbe::InFront
         }

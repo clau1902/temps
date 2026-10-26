@@ -20,7 +20,7 @@ use bytes::Bytes;
 use pingora_http::{RequestHeader, ResponseHeader};
 use temps_core::gate::{
     self, GateClaims, GateDecision, GateLogoutRequest, GatePolicy, GateRedeemRequest, GateRequest,
-    GateResponse, GATE_COOKIE, IDENTITY_HEADERS,
+    GateResponse, GATE_COOKIE,
 };
 use temps_core::gate_access::{self, AccessRejection};
 use temps_routes::gate::{GateService, GateServiceError};
@@ -217,28 +217,44 @@ pub fn gate_hostname(host: &str) -> String {
     without_port.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Remove the identity headers a client sent. Runs on every request, gated
-/// or not: only the gate may tell an app who is signed in.
+/// Remove every identity header a client sent (`x-temps-user*`). Runs on
+/// every request, gated or not: only Temps may tell an app who is signed in.
 pub fn strip_client_identity(request: &mut RequestHeader) {
-    for name in IDENTITY_HEADERS {
-        let _ = request.remove_header(name);
+    let names: Vec<_> = request
+        .headers
+        .keys()
+        .filter(|name| gate::is_user_identity_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in names {
+        let _ = request.remove_header(&name);
     }
+}
+
+/// Remove the gate's cookies from a request on its way to an app. Runs on
+/// every upstream request, admitted or not: a cookie left from before an
+/// address stopped being signed-in is still a token. A request without one
+/// is left as it is.
+pub fn strip_gate_cookies(request: &mut RequestHeader) -> pingora::Result<()> {
+    if !gate::may_hold_gate_cookie(&request.headers) {
+        return Ok(());
+    }
+    let mut cookies = HeaderMap::new();
+    for value in request.headers.get_all(axum::http::header::COOKIE) {
+        cookies.append(axum::http::header::COOKIE, value.clone());
+    }
+    gate::strip_gate_cookies(&mut cookies);
+    let _ = request.remove_header("cookie");
+    for value in cookies.get_all(axum::http::header::COOKIE) {
+        request.append_header("cookie", value.clone())?;
+    }
+    Ok(())
 }
 
 /// An admitted request: the gate's cookies never reach the app, and the app
 /// learns who signed in.
 pub fn admit(request: &mut RequestHeader, claims: &GateClaims) -> pingora::Result<()> {
-    let mut cookies = HeaderMap::new();
-    for value in request.headers.get_all(axum::http::header::COOKIE) {
-        cookies.append(axum::http::header::COOKIE, value.clone());
-    }
-    if !cookies.is_empty() {
-        gate::strip_gate_cookies(&mut cookies);
-        let _ = request.remove_header("cookie");
-        for value in cookies.get_all(axum::http::header::COOKIE) {
-            request.append_header("cookie", value.clone())?;
-        }
-    }
+    strip_gate_cookies(request)?;
     strip_client_identity(request);
     for (name, value) in gate::identity_headers(claims) {
         request.insert_header(name, value)?;
@@ -677,9 +693,37 @@ mod tests {
         request
             .insert_header("X-Temps-User-Email", "spoof@example.test")
             .unwrap();
+        request
+            .insert_header("X-Temps-User-Login", "someone@example.test")
+            .unwrap();
+        request.insert_header("X-Temps-User-Role", "admin").unwrap();
+        request.insert_header("X-Other", "kept").unwrap();
         strip_client_identity(&mut request);
         assert!(request.headers.get("x-temps-user").is_none());
         assert!(request.headers.get("x-temps-user-email").is_none());
+        assert!(request.headers.get("x-temps-user-login").is_none());
+        assert!(request.headers.get("x-temps-user-role").is_none());
+        assert_eq!(request.headers.get("x-other").unwrap(), "kept");
+    }
+
+    /// A request the gate never admitted -- a host that is no longer
+    /// signed-in -- still loses the gate's cookies on its way to the app.
+    #[test]
+    fn gate_cookies_never_reach_an_app_unadmitted() {
+        let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .append_header("cookie", format!("a=1; {GATE_COOKIE}=old-token"))
+            .unwrap();
+        request.append_header("cookie", "b=2").unwrap();
+        strip_gate_cookies(&mut request).unwrap();
+        let cookies: Vec<_> = request.headers.get_all("cookie").iter().collect();
+        assert_eq!(cookies, vec![HeaderValue::from_static("a=1; b=2")]);
+
+        let mut plain = RequestHeader::build("GET", b"/", None).unwrap();
+        plain.append_header("cookie", "a=1").unwrap();
+        plain.append_header("cookie", "b=2").unwrap();
+        strip_gate_cookies(&mut plain).unwrap();
+        assert_eq!(plain.headers.get_all("cookie").iter().count(), 2);
     }
 
     #[test]

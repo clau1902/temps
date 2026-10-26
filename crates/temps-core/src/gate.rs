@@ -49,6 +49,11 @@ pub const USER_EMAIL_HEADER: &str = "x-temps-user-email";
 /// Headers only the gate may set on a request to the app. Stripped from
 /// client input on every listener, gated host or not.
 pub const IDENTITY_HEADERS: [&str; 2] = [USER_HEADER, USER_EMAIL_HEADER];
+/// Every identity header Temps sets for an app starts with this: the gate's
+/// [`IDENTITY_HEADERS`] and the tailnet login (`x-temps-user-login`). No
+/// client copy of any name under it is ever passed on, so a name Temps adds
+/// later is covered too.
+pub const IDENTITY_HEADER_PREFIX: &str = "x-temps-user";
 /// Paths owned by the gate on a gated host.
 pub const GATE_PATH_PREFIX: &str = "/_temps/gate";
 pub const CALLBACK_PATH: &str = "/_temps/gate/callback";
@@ -593,9 +598,28 @@ fn is_gate_cookie_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(GATE_COOKIE) || name.eq_ignore_ascii_case(GATE_STATE_COOKIE)
 }
 
+/// Whether any `Cookie` field may hold a gate cookie: a check that
+/// allocates nothing, so requests without one pass untouched.
+pub fn may_hold_gate_cookie(headers: &HeaderMap) -> bool {
+    const NEEDLE: &[u8] = b"__host-temps_gate";
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .any(|field| {
+            field
+                .as_bytes()
+                .windows(NEEDLE.len())
+                .any(|window| window.eq_ignore_ascii_case(NEEDLE))
+        })
+}
+
 /// Remove the gate cookies from the request before the app sees it. Leaves a
-/// single `Cookie` field with the rest, or none if nothing is left.
+/// single `Cookie` field with the rest, or none if nothing is left. A request
+/// without a gate cookie is left as it is.
 pub fn strip_gate_cookies(headers: &mut HeaderMap) {
+    if !may_hold_gate_cookie(headers) {
+        return;
+    }
     let fields: Vec<String> = headers
         .get_all(axum::http::header::COOKIE)
         .iter()
@@ -650,9 +674,26 @@ pub fn drop_gate_set_cookies(headers: &mut HeaderMap) {
     }
 }
 
-/// Remove the identity headers a client sent: only the gate sets them.
+/// Whether `name` is under [`IDENTITY_HEADER_PREFIX`]. Lower-case `name`,
+/// as `HeaderName` always is.
+pub fn is_user_identity_header(name: &str) -> bool {
+    name.starts_with(IDENTITY_HEADER_PREFIX)
+}
+
+/// Remove every identity header a client sent: only Temps sets them.
 pub fn strip_identity_headers(headers: &mut HeaderMap) {
-    for name in IDENTITY_HEADERS {
+    if !headers
+        .keys()
+        .any(|name| is_user_identity_header(name.as_str()))
+    {
+        return;
+    }
+    let names: Vec<_> = headers
+        .keys()
+        .filter(|name| is_user_identity_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in names {
         headers.remove(name);
     }
 }
@@ -1560,6 +1601,13 @@ mod tests {
         let mut only = headers(&[("cookie", &format!("{GATE_COOKIE}=t"))]);
         strip_gate_cookies(&mut only);
         assert!(only.get("cookie").is_none());
+        let mut lower = headers(&[("cookie", "__host-temps_gate=t; a=1")]);
+        strip_gate_cookies(&mut lower);
+        assert_eq!(lower.get("cookie").unwrap(), "a=1");
+        // Without a gate cookie the fields are left exactly as sent.
+        let mut none = headers(&[("cookie", "a=1"), ("cookie", "b=2")]);
+        strip_gate_cookies(&mut none);
+        assert_eq!(none.get_all("cookie").iter().count(), 2);
 
         let mut resp = headers(&[
             ("set-cookie", "app=1; Path=/"),
@@ -1576,11 +1624,15 @@ mod tests {
         let mut h = headers(&[
             ("x-temps-user", "1"),
             ("X-Temps-User-Email", "admin@example.test"),
+            ("x-temps-user-login", "someone@example.test"),
+            ("x-temps-user-role", "admin"),
             ("x-other", "kept"),
         ]);
         strip_identity_headers(&mut h);
         assert!(h.get("x-temps-user").is_none());
         assert!(h.get("x-temps-user-email").is_none());
+        assert!(h.get("x-temps-user-login").is_none());
+        assert!(h.get("x-temps-user-role").is_none());
         assert!(h.get("x-other").is_some());
     }
 

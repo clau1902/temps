@@ -7946,6 +7946,10 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        // ADR 065 D8: no app receives the gate's cookies, admitted or not,
+        // gated host or not. A cookie left from before an address stopped
+        // being signed-in is still a token.
+        crate::handler::gate::strip_gate_cookies(upstream_request)?;
         // A stripping path route forwards `/api/users` as `/users` and tells
         // the target where it is mounted, for apps that build absolute URLs.
         // Only the platform sets that header on routed requests: a client
