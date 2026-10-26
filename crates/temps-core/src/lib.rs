@@ -180,20 +180,21 @@ pub use utils::*;
 // Re-export external dependencies
 pub use anyhow;
 pub use app_settings::{
-    AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
-    AnalyticsRetentionSettings, AppSettings, BlobSettings, BuildLimitsSettings, CeilingEnforcement,
-    ClickHouseCompression, ClickHouseSettings, CloudSettings, ClusterDnsSettings,
-    ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
-    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
-    ImageRetentionSettings, KvSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
-    MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, OnDemandTlsSettings, ParseClickHouseCompressionError,
-    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, RequestTimeoutSettings,
-    ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
-    DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
-    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
-    DEFAULT_GEO_STALE_LOOKUP_DAYS, DEFAULT_UNREFERENCED_IP_RETENTION_DAYS, GEO_CHECK_STATUS_ERROR,
-    GEO_CHECK_STATUS_OK, GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
+    normalize_loopback_ja4_header, AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings,
+    AiWorkspaceFileLimitsSettings, AnalyticsRetentionSettings, AppSettings, BlobSettings,
+    BuildLimitsSettings, CeilingEnforcement, ClickHouseCompression, ClickHouseSettings,
+    CloudSettings, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
+    DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, GeoLicenseKeyIntent,
+    GeoSettings, GeoSettingsError, ImageRetentionSettings, KvSettings, LetsEncryptSettings,
+    LoopbackJa4HeaderError, McpServerSettings, MetricsStoreKind, MonitoringSettings,
+    MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    OnDemandTlsSettings, ParseClickHouseCompressionError, PreviewGatewaySettings, ProviderConfig,
+    RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    SelfUpdateSettings, TenantResourceCeilings, DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS,
+    DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+    DEFAULT_GEO_REFRESH_INTERVAL_HOURS, DEFAULT_GEO_STALE_LOOKUP_DAYS,
+    DEFAULT_UNREFERENCED_IP_RETENTION_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
+    GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
     GEO_SOURCE_MAXMIND_OFFICIAL, IP_REFERENCE_SLACK_DAYS, MAX_ANALYTICS_RETENTION_DAYS,
     MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MAX_GEO_REFRESH_INTERVAL_HOURS,
     MAX_GEO_STALE_LOOKUP_DAYS, MIN_ANALYTICS_RETENTION_DAYS,
@@ -245,7 +246,8 @@ pub mod drop_entries;
 /// never calls. Likewise `bincode` (RUSTSEC-2025-0141) is ignored only
 /// because the microsandbox SDK requires it. An ignore covers the whole
 /// advisory, so it would also hide anything else starting to depend on these
-/// crates; these tests fail on that instead. `Cargo.lock` is embedded at
+/// crates; these tests fail on that instead. `ttf-parser` (RUSTSEC-2026-0192)
+/// is not ignored at all: it is kept out of the lockfile entirely. `Cargo.lock` is embedded at
 /// compile time, so they also run from prebuilt nextest archives.
 #[cfg(test)]
 mod unmaintained_dependency_guard_tests {
@@ -329,6 +331,18 @@ mod unmaintained_dependency_guard_tests {
             "{unexpected:?} depend on bincode, which is unmaintained (RUSTSEC-2025-0141). \
              The dependency-scan.yml exception only covers the microsandbox SDK's crates; \
              use postcard or serde_json instead of adding a new bincode user."
+        );
+    }
+
+    #[test]
+    fn workspace_does_not_depend_on_unmaintained_ttf_parser() {
+        let dependents = dependents_of(CARGO_LOCK, "ttf-parser");
+        assert!(
+            dependents.is_empty(),
+            "{dependents:?} depend on ttf-parser, which is unmaintained (RUSTSEC-2026-0192). \
+             lopdf 0.42 required it; lopdf 0.46+ only uses the maintained skrifa behind its \
+             `font_embedding` feature. PDF text is read with lopdf directly in \
+             temps-ai-chat's attachments.rs, not through pdf-extract, which pins lopdf 0.42."
         );
     }
 }
