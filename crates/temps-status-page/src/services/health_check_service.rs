@@ -313,6 +313,25 @@ fn sign_in_note(
     })
 }
 
+/// [`sign_in_note`] for an answer that came through this server's own proxy:
+/// the first answer of a local probe, and the answer to its HTTPS follow-up,
+/// where a Cloudflare Access refusal at the origin shows up when the address
+/// forces HTTPS.
+fn local_sign_in_note(response: &reqwest::Response) -> Option<String> {
+    sign_in_note(
+        ProbeOrigin::LocalProxy,
+        response.status().as_u16(),
+        response
+            .headers()
+            .get(temps_core::gate::GATE_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
 /// The team of the Cloudflare Access account the address a direct probe
 /// asked for is bound to, looked up only when the answer redirects to some
 /// Access sign-in: every other direct answer needs no lookup.
@@ -1267,6 +1286,22 @@ impl HealthCheckService {
                         response
                     };
 
+                    // The follow-up came through the local proxy too, so its
+                    // gate answer counts the same way as the first one's.
+                    if is_local_probe {
+                        if let Some(note) = local_sign_in_note(&response) {
+                            return Self::record_check(
+                                &db,
+                                probe.clone(),
+                                "operational".to_string(),
+                                Some(total_response_time_ms),
+                                Some(note),
+                                &job_queue,
+                            )
+                            .await;
+                        }
+                    }
+
                     if is_local_probe
                         && response.status().is_redirection()
                         && !proxy_supports_probe_markers(&response)
@@ -2002,6 +2037,19 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn spawn_test_tls_server(hostname: &str) -> (SocketAddr, reqwest::Certificate) {
+        spawn_test_tls_server_answering(
+            hostname,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+    }
+
+    /// A TLS server for `hostname` that answers one `GET /ready` with
+    /// `response`.
+    async fn spawn_test_tls_server_answering(
+        hostname: &str,
+        response: &'static [u8],
+    ) -> (SocketAddr, reqwest::Certificate) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec![hostname.to_string()])
@@ -2037,7 +2085,7 @@ mod tests {
                 String::from_utf8_lossy(&request[..size]).starts_with("GET /ready HTTP/1.1\r\n")
             );
             stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .write_all(response)
                 .await
                 .expect("write HTTPS response");
         });
@@ -2334,6 +2382,29 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
         assert_eq!(attempts, 1);
         assert_eq!(response.url().host_str(), Some(hostname));
+    }
+
+    /// An address that forces HTTPS shows its gate only on the follow-up:
+    /// a Cloudflare Access refusal at the origin, marked by the proxy, comes
+    /// back over the pinned TLS connection and counts as behind sign-in.
+    #[tokio::test]
+    async fn gate_answer_on_the_https_follow_up_is_behind_sign_in() {
+        let hostname = "gated-probe.invalid";
+        let (destination, root) = spawn_test_tls_server_answering(
+            hostname,
+            b"HTTP/1.1 403 Forbidden\r\nX-Temps-Gate: access\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let logical_url = format!("https://{hostname}/ready");
+        let client = local_proxy_client_with_roots(&logical_url, &destination.to_string(), &[root])
+            .expect("build pinned TLS client with test root");
+
+        let (response, _) =
+            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1))
+                .await
+                .expect("HTTPS follow-up succeeds");
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        assert!(local_sign_in_note(&response).is_some());
     }
 
     #[tokio::test]

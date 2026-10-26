@@ -1214,11 +1214,12 @@ from their letter:
   064), so that is where a plan sets `signed_in`. Environment domains have
   the same columns and listeners enforce them, but nothing in the console
   sets them yet.
-- **Attach, then gate.** A run attaches the address and sets `signed_in` in
-  the next step, before anything publishes it (DNS, tunnel route,
-  certificate), as phase 2 does for private addresses. Only an address
-  whose DNS and certificate already existed before the run could be served
-  open in between, for the moment between the two steps.
+- **Attached already gated.** A run that makes an address signed-in
+  attaches it with its gate set, the Access app's binding included, in the
+  same insert: no route table ever holds it open, even when its DNS and
+  certificate existed before the run. The audience step after it then has
+  nothing to change. Private addresses are still attached first and made
+  private in the next step, before anything publishes them, as in phase 2.
 - **The reachability check (D10) dials only addresses the outbound policy
   accepts**, pinned to them, with no redirect followed. An address it cannot
   check is shown as unknown, never as a pass.
@@ -1254,11 +1255,12 @@ from their letter:
   the two. The app names the hostname as its domain, so it protects it as
   soon as the tunnel publishes it.
 - **A create that timed out is found by name and domain.** D9 says it is
-  resolved by listing apps by domain. The run picks the name
-  (`temps-<hostname>-<install>`) before creating, and the lookup requires
-  both, so an app someone else made for the hostname is never mistaken for
-  the run's own (and then deleted by undo). Undo still checks the domain
-  before deleting, and an app that now protects another domain is left.
+  resolved by listing apps by domain. The run names the app for itself
+  before creating it (`temps-<hostname>-<install>-r<run>`), and the lookup
+  requires both, so neither an app someone else made for the hostname nor
+  one another run made for it is mistaken for this run's own (and then
+  deleted by undo). Undo still checks the domain before deleting, and an
+  app that now protects another domain is left.
 - **An existing app is re-read when the run starts.** One deleted, or
   moved to another domain, since planning fails the run before anything is
   attached.

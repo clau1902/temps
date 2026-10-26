@@ -532,13 +532,7 @@ impl ReachabilityService {
         let mut service_addresses = BTreeSet::new();
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::new();
-        let expand = |domain: &str| {
-            if domain.contains('.') {
-                domain.trim_end_matches('.').to_ascii_lowercase()
-            } else {
-                PublicHostnameStrategy::Standard.environment_hostname(preview_domain, domain)
-            }
-        };
+        let expand = |domain: &str| expand_environment_domain(domain, preview_domain);
         let mut push = |address: String,
                         audience: Audience,
                         source,
@@ -1095,6 +1089,15 @@ impl ReachabilityService {
         let db = self.deps.db.as_ref();
         let mut gates = HashMap::new();
         let mut bound: HashMap<String, i32> = HashMap::new();
+        // Environment domains may be stored as the label under the preview
+        // domain; `gather` expands them, so look up both forms and key each
+        // gate by the address `judge` asks about.
+        let preview_domain = self
+            .settings()
+            .await
+            .map(|settings| settings.preview_domain)
+            .unwrap_or_default();
+        let environment_names = names_with_preview_labels(hosts, &preview_domain);
         match project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::Domain.is_in(hosts.to_vec()))
             .filter(
@@ -1115,18 +1118,19 @@ impl ReachabilityService {
             Err(error) => warn!(%error, "could not read the gates of signed-in custom domains"),
         }
         match environment_domains::Entity::find()
-            .filter(environment_domains::Column::Domain.is_in(hosts.to_vec()))
+            .filter(environment_domains::Column::Domain.is_in(environment_names))
             .filter(environment_domains::Column::Audience.eq(temps_entities::audience::SIGNED_IN))
             .all(db)
             .await
         {
             Ok(rows) => {
                 for row in rows {
+                    let host = expand_environment_domain(&row.domain, &preview_domain);
                     let gate = row.gate.as_deref().map(GateKind::parse).unwrap_or_default();
                     if let Some(provider_id) = row.gate_access_provider_id {
-                        bound.insert(row.domain.clone(), provider_id);
+                        bound.insert(host.clone(), provider_id);
                     }
-                    gates.insert(row.domain, (gate, None));
+                    gates.insert(host, (gate, None));
                 }
             }
             Err(error) => {
@@ -3407,18 +3411,37 @@ impl RunOps for LiveOps {
         project_id: i32,
         environment_id: i32,
         host: &str,
+        initial: Option<&AddressAudience>,
     ) -> Result<i32, String> {
+        let Some(initial) = initial else {
+            return self
+                .deps
+                .custom_domains
+                .create_custom_domain(
+                    project_id,
+                    environment_id,
+                    host.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(|d| d.id)
+                .map_err(text);
+        };
+        refuse_signed_in_wildcard(host, initial)?;
+        // Tailnet principals live in their own table, keyed by the row's
+        // id: only an audience without them is written with the row.
+        if initial.audience == Audience::TailnetUsers {
+            return Err("A tailnet audience is set after attaching, not with it.".into());
+        }
+        let initial = initial.clone();
         self.deps
             .custom_domains
-            .create_custom_domain(
-                project_id,
-                environment_id,
-                host.to_string(),
-                None,
-                None,
-                None,
-                None,
-            )
+            .create_custom_domain_shaped(project_id, environment_id, host.to_string(), move |row| {
+                set_address_audience_on(row, &AddressAudience::public(), &initial)
+            })
             .await
             .map(|d| d.id)
             .map_err(text)
@@ -3979,6 +4002,39 @@ fn planned_gate(stored: &reachability_plans::Model) -> GateKind {
         .unwrap_or_default()
 }
 
+/// The label `host` is stored under when it sits directly under the preview
+/// domain: environment domains and generated hostnames may be kept as the
+/// bare label, which [`expand_environment_domain`] turns back into `host`.
+fn preview_label(host: &str, preview_domain: &str) -> Option<String> {
+    if preview_domain.trim().is_empty() {
+        return None;
+    }
+    host.strip_suffix(&format!(".{}", preview_domain.trim_start_matches("*.")))
+        .filter(|label| !label.is_empty() && !label.contains('.'))
+        .map(str::to_string)
+}
+
+/// `hosts` and the label each is stored under, for looking up environment
+/// domain rows in either form.
+fn names_with_preview_labels(hosts: &[String], preview_domain: &str) -> Vec<String> {
+    let mut names = hosts.to_vec();
+    names.extend(
+        hosts
+            .iter()
+            .filter_map(|host| preview_label(host, preview_domain)),
+    );
+    names
+}
+
+/// The address an environment domain row stands for, as `gather` builds it.
+fn expand_environment_domain(domain: &str, preview_domain: &str) -> String {
+    if domain.contains('.') {
+        domain.trim_end_matches('.').to_ascii_lowercase()
+    } else {
+        PublicHostnameStrategy::Standard.environment_hostname(preview_domain, domain)
+    }
+}
+
 fn dns_record_type(record_type: &str) -> DnsRecordType {
     match record_type {
         "AAAA" => DnsRecordType::AAAA,
@@ -4313,13 +4369,7 @@ impl EnvironmentWaysIn for WaysIn {
             .map_err(|e| failed(e.to_string()))?;
         let env_ids: Vec<i32> = envs.iter().map(|e| e.id).collect();
         let mut pairs: Vec<(i32, String)> = Vec::new();
-        let expand = |domain: &str| {
-            if domain.contains('.') {
-                domain.trim_end_matches('.').to_ascii_lowercase()
-            } else {
-                PublicHostnameStrategy::Standard.environment_hostname(&preview_domain, domain)
-            }
-        };
+        let expand = |domain: &str| expand_environment_domain(domain, &preview_domain);
         for env in &envs {
             if !preview_domain.trim().is_empty() && !env.subdomain.is_empty() {
                 pairs.push((env.id, expand(&env.subdomain)));
@@ -4449,8 +4499,19 @@ impl TunnelMoveGuard for WaysIn {
             .count(db)
             .await
             .map_err(unreadable)?;
+        let preview_domain = self
+            .config
+            .get_settings()
+            .await
+            .map(|s| s.preview_domain)
+            .unwrap_or_default();
         let environment = environment_domains::Entity::find()
-            .filter(environment_domains::Column::Domain.eq(host))
+            .filter(
+                environment_domains::Column::Domain.is_in(names_with_preview_labels(
+                    &[host.to_string()],
+                    &preview_domain,
+                )),
+            )
             .filter(environment_domains::Column::Audience.eq(temps_entities::audience::SIGNED_IN))
             .filter(environment_domains::Column::Gate.eq(access))
             .count(db)
@@ -4484,10 +4545,7 @@ impl TunnelMoveGuard for WaysIn {
             .map(|s| s.preview_domain)
             .unwrap_or_default();
         let mut names = vec![host.to_string()];
-        let label = host
-            .strip_suffix(&format!(".{}", preview_domain.trim_start_matches("*.")))
-            .filter(|label| !preview_domain.trim().is_empty() && !label.contains('.'))
-            .map(str::to_string);
+        let label = preview_label(host, &preview_domain);
         names.extend(label.clone());
         let mut env_ids: Vec<i32> = environment_domains::Entity::find()
             .filter(environment_domains::Column::Domain.is_in(names))
@@ -4549,5 +4607,134 @@ mod tests {
         assert!(refuse_signed_in_wildcard("app.example.com", &signed_in).is_ok());
         // Public and private wildcards are unchanged.
         assert!(refuse_signed_in_wildcard("*.example.com", &AddressAudience::public()).is_ok());
+    }
+
+    /// An environment domain stored as the bare label under the preview
+    /// domain is the same address `gather` expands it to, so lookups by
+    /// address have to try the label too.
+    #[test]
+    fn preview_labels_round_trip_with_their_expansion() {
+        let preview = "apps.example.test";
+        let host = expand_environment_domain("shop", preview);
+        assert_eq!(preview_label(&host, preview).as_deref(), Some("shop"));
+        assert_eq!(
+            names_with_preview_labels(&[host.clone(), "other.example.com".into()], preview),
+            vec![host, "other.example.com".to_string(), "shop".to_string()]
+        );
+        // Deeper names, other domains and an unset preview domain have no
+        // label form.
+        assert_eq!(preview_label("a.shop.apps.example.test", preview), None);
+        assert_eq!(preview_label("shop.example.com", preview), None);
+        assert_eq!(preview_label("shop.apps.example.test", ""), None);
+        assert_eq!(
+            expand_environment_domain("Shop.Example.COM.", preview),
+            "shop.example.com"
+        );
+    }
+
+    /// ADR 065 D9: a Cloudflare Access address stays on its tunnel even
+    /// when its environment domain row holds only the label.
+    #[tokio::test]
+    async fn an_access_address_stored_as_a_label_is_not_moved_off_its_tunnel() {
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            eprintln!("Docker/Postgres unavailable; skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let preview = "apps.example.test";
+        let server = temps_config::ServerConfig::new(
+            "127.0.0.1:0".to_string(),
+            test_db.database_url.clone(),
+            None,
+            None,
+        )
+        .expect("server config");
+        let config = Arc::new(ConfigService::new(Arc::new(server), db.clone()));
+        let mut settings = config.get_settings().await.expect("settings");
+        settings.preview_domain = preview.to_string();
+        config
+            .update_settings(settings)
+            .await
+            .expect("save settings");
+
+        let now = Utc::now();
+        let project = projects::ActiveModel {
+            name: Set("Access label".into()),
+            repo_name: Set("access-label".into()),
+            repo_owner: Set("owner".into()),
+            slug: Set("access-label".into()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/".into()),
+            main_branch: Set("main".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".into()),
+            slug: Set("production".into()),
+            subdomain: Set("access-label-production".into()),
+            host: Set(String::new()),
+            upstreams: Set(Default::default()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("environment");
+        environment_domains::ActiveModel {
+            environment_id: Set(environment.id),
+            domain: Set("shop".into()),
+            audience: Set(temps_entities::audience::SIGNED_IN.into()),
+            gate: Set(Some(
+                temps_entities::audience::GATE_CLOUDFLARE_ACCESS.into(),
+            )),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("label-form environment domain");
+
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("0123456789abcdef0123456789abcdef").expect("key"),
+        );
+        let providers = Arc::new(temps_dns::DnsProviderService::new(
+            db.clone(),
+            encryption.clone(),
+        ));
+        let records = Arc::new(temps_dns::ManagedDnsRecordService::new(
+            db.clone(),
+            providers.clone(),
+            encryption.clone(),
+        ));
+        let ways_in = WaysIn {
+            db: db.clone(),
+            connectors: Arc::new(IngressConnectorService::new(
+                db.clone(),
+                encryption,
+                providers,
+                records,
+                Arc::new(temps_routes::CachedPeerTable::new(db.clone())),
+            )),
+            config,
+        };
+
+        let host = expand_environment_domain("shop", preview);
+        assert_eq!(
+            ways_in.check_move_off(&host).await,
+            Err(ACCESS_TUNNEL_ONLY.to_string())
+        );
+        assert_eq!(
+            ways_in.check_move_off("unrelated.example.com").await,
+            Ok(())
+        );
     }
 }

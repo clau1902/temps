@@ -44,8 +44,8 @@ use serde::{Deserialize, Serialize};
 
 use super::access::{AccessApp, AccessPolicyAnswer};
 use super::model::{
-    AccessBinding, AddressAudience, AddressReachability, Decision, DnsRecordState, Intent,
-    JournalEntry, JournalState, LookupAuthority, PlanOptionKind, PlanStep, PlannedRecord,
+    AccessBinding, AddressAudience, AddressReachability, Audience, Decision, DnsRecordState,
+    Intent, JournalEntry, JournalState, LookupAuthority, PlanOptionKind, PlanStep, PlannedRecord,
     PreviousChoice, ReachState, RunResource, RunState, RunStep, RunStepStatus, StepKind,
     UndoResult,
 };
@@ -291,11 +291,14 @@ pub trait RunOps: Send + Sync {
     async fn delete_tunnel(&self, id: i32, tunnel_id: Option<&str>) -> Result<(), String>;
     /// The custom domain with this hostname: `(id, environment id)`.
     async fn find_custom_domain(&self, host: &str) -> Result<Option<(i32, i32)>, String>;
+    /// Attaches `host`, already `initial` when given: an address a run
+    /// makes signed-in is never in the route table without its gate.
     async fn attach_domain(
         &self,
         project_id: i32,
         environment_id: i32,
         host: &str,
+        initial: Option<&AddressAudience>,
     ) -> Result<i32, String>;
     async fn detach_domain(&self, id: i32) -> Result<(), String>;
     /// See `IngressConnectorService::hostname_choice`.
@@ -1346,9 +1349,10 @@ impl Runner<'_> {
                 Err(error) => Outcome::Failed(error),
             };
         }
+        let name = super::access::run_app_name(&access.name, input.run_id);
         let intent = Intent::AccessApp {
             provider_id: access.provider_id,
-            name: access.name.clone(),
+            name: name.clone(),
             hostname: host.to_string(),
         };
         let bind = |ctx: &mut Context, resource: &RunResource| {
@@ -1374,7 +1378,7 @@ impl Runner<'_> {
             }
             Ok(Begin::Go) => match self
                 .ops
-                .create_access_app(access.provider_id, &access.name, host, &access.policy)
+                .create_access_app(access.provider_id, &name, host, &access.policy)
                 .await
             {
                 Ok(app) => {
@@ -2132,6 +2136,43 @@ impl Runner<'_> {
         }
     }
 
+    /// ADR 065 D9: an Access address names the app whose JWTs the listener
+    /// accepts; without one it is never set.
+    fn bound_to_access(
+        &self,
+        mut after: AddressAudience,
+        address: &str,
+    ) -> Result<AddressAudience, String> {
+        if after.gate == Some(temps_core::gate::GateKind::CloudflareAccess) {
+            match self.ctx.access.clone() {
+                Some(binding) => after.gate_access = Some(binding),
+                None => {
+                    return Err(format!(
+                        "No Cloudflare Access app is known for {address}, so Temps did not \
+                         change who it is for."
+                    ))
+                }
+            }
+        }
+        Ok(after)
+    }
+
+    /// The audience to attach `address` with: the signed-in one this run
+    /// sets, when it sets one.
+    fn signed_in_on_attach(&self, address: &str) -> Result<Option<AddressAudience>, String> {
+        let sets_audience = self
+            .input
+            .steps
+            .iter()
+            .any(|step| step.kind == StepKind::SetAudience);
+        match self.input.audience.clone() {
+            Some((after, _)) if sets_audience && after.audience == Audience::SignedIn => {
+                self.bound_to_access(after, address).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
     async fn step(&mut self, index: usize, kind: StepKind) -> Outcome {
         let input = self.input;
         let address = input.address.clone();
@@ -2478,12 +2519,24 @@ impl Runner<'_> {
                         Err(error) => return Outcome::Failed(error),
                     }
                 }
+                // ADR 065: an address this run makes signed-in is attached
+                // with its gate already set, so no route table ever serves
+                // it open between this step and SetAudience.
+                let initial = match self.signed_in_on_attach(&address) {
+                    Ok(initial) => initial,
+                    Err(error) => return Outcome::Failed(error),
+                };
                 match self.begin(&intent).await {
                     Err(hold) => hold.into(),
                     Ok(Begin::Have(_)) => Outcome::Done(None),
                     Ok(Begin::Go) => match self
                         .ops
-                        .attach_domain(input.project_id, input.environment_id, &address)
+                        .attach_domain(
+                            input.project_id,
+                            input.environment_id,
+                            &address,
+                            initial.as_ref(),
+                        )
                         .await
                     {
                         Ok(id) => {
@@ -2690,22 +2743,13 @@ impl Runner<'_> {
                 }
             }
             StepKind::SetAudience => {
-                let Some((mut after, before)) = input.audience.clone() else {
+                let Some((after, before)) = input.audience.clone() else {
                     return Outcome::Skipped("Nothing to change.".into());
                 };
-                // ADR 065 D9: an Access address names the app whose JWTs
-                // the listener accepts; without one it is never set.
-                if after.gate == Some(temps_core::gate::GateKind::CloudflareAccess) {
-                    match self.ctx.access.clone() {
-                        Some(binding) => after.gate_access = Some(binding),
-                        None => {
-                            return Outcome::Failed(format!(
-                                "No Cloudflare Access app is known for {address}, so Temps did \
-                                 not change who it is for."
-                            ))
-                        }
-                    }
-                }
+                let after = match self.bound_to_access(after, &address) {
+                    Ok(after) => after,
+                    Err(error) => return Outcome::Failed(error),
+                };
                 let intent = Intent::AddressAudience {
                     hostname: address.clone(),
                     before,
@@ -4032,8 +4076,20 @@ mod tests {
             self.log("find_custom_domain");
             Ok(self.existing_domain)
         }
-        async fn attach_domain(&self, _p: i32, _e: i32, _host: &str) -> Result<i32, String> {
+        async fn attach_domain(
+            &self,
+            _p: i32,
+            _e: i32,
+            _host: &str,
+            initial: Option<&AddressAudience>,
+        ) -> Result<i32, String> {
+            if let Some(initial) = initial {
+                self.log(format!("attach_domain as {}", initial.describe()));
+            }
             self.result("attach_domain")?;
+            if let Some(initial) = initial {
+                *self.audience.lock().expect("lock") = Some(initial.clone());
+            }
             Ok(50)
         }
         async fn detach_domain(&self, id: i32) -> Result<(), String> {
@@ -4376,6 +4432,54 @@ mod tests {
         }
     }
 
+    /// An address the run makes signed-in is attached with its gate, bound
+    /// to its Access app, in the same write: no route table ever has it
+    /// open. Setting the audience afterwards then has nothing to change.
+    #[tokio::test]
+    async fn a_signed_in_address_is_attached_already_gated() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let record = execute(&access_input(None), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        let calls = ops.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("attach_domain as ")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("set_address_audience")),
+            "{calls:?}"
+        );
+        let audience = ops
+            .audience
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("attached");
+        assert_eq!(
+            audience.gate_access.map(|binding| binding.app_id),
+            Some("app-1".to_string())
+        );
+
+        // A public address is attached as before.
+        let plain = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let record = execute(&token_input(), &plain, &Saved::default(), timing()).await;
+        assert!(
+            !plain
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("attach_domain as ")),
+            "{:?} {:?}",
+            record.state,
+            plain.calls()
+        );
+    }
+
     /// ADR 065 D9: the app is created and journaled before the address is
     /// attached, and the address records it, so the listener checks that
     /// app's AUD.
@@ -4402,7 +4506,7 @@ mod tests {
             RunResource::AccessApp {
                 provider_id: 7,
                 id: "app-1".into(),
-                name: "temps-myapp.example.com-abcd".into(),
+                name: "temps-myapp.example.com-abcd-r0".into(),
                 hostname: "myapp.example.com".into(),
                 aud: "aud-app-1".into(),
                 policies: "policy-v1".into(),
@@ -4491,6 +4595,48 @@ mod tests {
             .calls()
             .iter()
             .any(|c| c.starts_with("set_address_audience")));
+    }
+
+    /// A create that timed out is found again by name and domain, so each
+    /// run names its app for itself: an app another run made for the same
+    /// address is never journaled as this run's, nor deleted by its undo.
+    #[tokio::test]
+    async fn each_run_names_its_access_app_for_itself() {
+        let mut names = Vec::new();
+        for run_id in [41, 42] {
+            let ops = Fake {
+                reachable: true,
+                ..Default::default()
+            };
+            let input = RunInput {
+                run_id,
+                ..access_input(None)
+            };
+            let record = execute(&input, &ops, &Saved::default(), timing()).await;
+            assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+            let Some(Intent::AccessApp { name, .. }) = record
+                .journal
+                .iter()
+                .map(|e| e.intent.clone())
+                .find(|i| matches!(i, Intent::AccessApp { .. }))
+            else {
+                panic!("journaled");
+            };
+            let created = format!("create_access_app 7 {name} myapp.example.com");
+            assert!(
+                ops.calls().iter().any(|c| c.starts_with(&created)),
+                "{:?}",
+                ops.calls()
+            );
+            names.push(name);
+        }
+        assert_eq!(
+            names,
+            vec![
+                "temps-myapp.example.com-abcd-r41".to_string(),
+                "temps-myapp.example.com-abcd-r42".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

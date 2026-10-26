@@ -94,6 +94,11 @@ const MAX_TOKEN_LEN: usize = 4096;
 const TOKEN_VERSION: &str = "v1";
 const SIGNING_CONTEXT: &str = "temps-gate-v1.";
 const STATE_VERSION: &str = "v1";
+/// The longest return path the state cookie carries. Base64 makes it a
+/// third longer, and the cookie has to stay inside the browser's 4 KB limit
+/// for one cookie and [`MAX_TOKEN_LEN`], or the callback never sees it and
+/// sign-in from that address fails every time. A longer path returns to `/`.
+const MAX_RETURN_TO_LEN: usize = 2048;
 
 #[derive(Debug, Error)]
 pub enum GateError {
@@ -413,7 +418,7 @@ impl GateState {
         Ok(GateState {
             state: new_random_value("sign-in state")?,
             verifier: new_verifier()?,
-            return_to: sanitize_return_to(return_to).to_string(),
+            return_to: bounded_return_to(return_to).to_string(),
             expires_at: now + STATE_TTL.as_secs() as i64,
         })
     }
@@ -464,6 +469,17 @@ impl GateState {
 /// A same-origin path, or `/` (the password wall's rule).
 pub fn sanitize_return_to(path: &str) -> &str {
     crate::preview_grant::sanitize_preview_next_ref(path)
+}
+
+/// [`sanitize_return_to`], and `/` for a path too long for the state cookie
+/// ([`MAX_RETURN_TO_LEN`]).
+fn bounded_return_to(path: &str) -> &str {
+    let path = sanitize_return_to(path);
+    if path.len() > MAX_RETURN_TO_LEN {
+        "/"
+    } else {
+        path
+    }
 }
 
 /// `Set-Cookie` for the gate session, valid for `max_age_secs`.
@@ -1349,6 +1365,28 @@ mod tests {
         assert_eq!(s.return_to, "/");
         let s = GateState::new("https://evil.example/", 100).unwrap();
         assert_eq!(s.return_to, "/");
+    }
+
+    /// The longest kept path still fits the cookie; one byte more returns
+    /// to `/` rather than break sign-in from that address.
+    #[test]
+    fn a_return_path_too_long_for_the_state_cookie_returns_to_root() {
+        let longest = format!("/a?q={}", "x".repeat(MAX_RETURN_TO_LEN - 5));
+        let s = GateState::new(&longest, 100).unwrap();
+        assert_eq!(s.return_to, longest);
+        let cookie = state_cookie(&s);
+        let value = cookie
+            .split(';')
+            .next()
+            .and_then(|pair| pair.split_once('='))
+            .map(|(_, value)| value)
+            .unwrap();
+        assert!(value.len() <= MAX_TOKEN_LEN);
+        assert!(cookie.split(';').next().unwrap().len() < 4096);
+        assert_eq!(GateState::decode(value, 200), Some(s));
+
+        let too_long = format!("{longest}x");
+        assert_eq!(GateState::new(&too_long, 100).unwrap().return_to, "/");
     }
 
     #[test]

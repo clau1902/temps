@@ -495,6 +495,15 @@ pub fn app_name(host: &str, install: &str) -> String {
     }
 }
 
+/// The name a run gives the app it creates: [`app_name`] and the run. A
+/// create that timed out is found again by name and domain (ADR 065 D9), so
+/// the name has to be this run's alone, or an app another run, or someone,
+/// made for the same address would be taken for it, and undo would then
+/// delete it.
+pub fn run_app_name(planned: &str, run_id: i32) -> String {
+    format!("{planned}-r{run_id}")
+}
+
 /// Who an app Temps creates lets in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessPolicyAnswer {
