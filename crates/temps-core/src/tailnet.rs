@@ -51,11 +51,20 @@ pub fn is_identity_header(name: &str) -> bool {
     name.starts_with("tailscale-") || name == TAILNET_LOGIN_HEADER
 }
 
+/// The identity headers tailscaled replaces on every request it serves
+/// (`addTailscaleIdentityHeaders`): it deletes any client copy and sets its
+/// own. Any other `Tailscale-User-*` name is the client's, not tailscaled's.
+pub const SERVE_IDENTITY_HEADERS: [&str; 3] = [
+    "tailscale-user-login",
+    "tailscale-user-name",
+    "tailscale-user-profile-pic",
+];
+
 /// Whether an incoming identity header is passed to the app: only the
-/// `Tailscale-User-*` headers tailscaled set, and only on a Serve socket.
+/// [`SERVE_IDENTITY_HEADERS`] tailscaled sets, and only on a Serve socket.
 /// Anything else that is not an identity header always passes.
 pub fn forwards_header(name: &str, serve_socket: bool) -> bool {
-    !is_identity_header(name) || (serve_socket && name.starts_with("tailscale-user-"))
+    !is_identity_header(name) || (serve_socket && SERVE_IDENTITY_HEADERS.contains(&name))
 }
 
 /// The tailscaled resolver, asked directly by the inside check.
@@ -579,9 +588,13 @@ mod tests {
             assert!(forwards_header(name, true), "{name}");
             assert!(!forwards_header(name, false), "{name}");
         }
-        // Funnel and anything else tailscaled may add, and Temps' own
-        // login header, never reach the app from a request.
+        // Funnel, anything else tailscaled may add, any `Tailscale-User-*`
+        // it does not replace (a client could send it through tailscaled),
+        // and Temps' own login header never reach the app from a request.
         for name in [
+            "tailscale-user-role",
+            "tailscale-user-groups",
+            "tailscale-user-",
             "tailscale-funnel-request",
             "tailscale-app-capabilities",
             "tailscale-headers-info",

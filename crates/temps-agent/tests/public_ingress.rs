@@ -1453,7 +1453,8 @@ async fn socket_request(path: &std::path::Path, request: &str) -> String {
 /// ADR 065 D3: the socket names the address. `Host` is rewritten to its
 /// tailnet name and `X-Forwarded-Host` ignored; only a visitor tailscaled
 /// vouched for (a Tailscale `X-Forwarded-For`) is served; Funnel is
-/// refused; `Tailscale-User-*` passes on, Temps' own login header never.
+/// refused; tailscaled's `Tailscale-User-Login`/`-Name`/`-Profile-Pic` pass
+/// on, any other `Tailscale-User-*` and Temps' own login header never.
 #[tokio::test]
 async fn test_serve_socket_serves_only_its_address_to_tailnet_visitors() {
     let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
@@ -1481,7 +1482,7 @@ async fn test_serve_socket_serves_only_its_address_to_tailnet_visitors() {
 
     let response = socket_request(
         &path,
-        "GET /app HTTP/1.1\r\nHost: other.example.test\r\nX-Forwarded-Host: attacker.example\r\nX-Forwarded-For: 100.101.102.200\r\nTailscale-User-Login: alice@example.com\r\nX-Temps-User-Login: mallory@example.com\r\nConnection: close\r\n\r\n",
+        "GET /app HTTP/1.1\r\nHost: other.example.test\r\nX-Forwarded-Host: attacker.example\r\nX-Forwarded-For: 100.101.102.200\r\nTailscale-User-Login: alice@example.com\r\nTailscale-User-Role: admin\r\nTailscale-User-Groups: group:admins\r\nX-Temps-User-Login: mallory@example.com\r\nConnection: close\r\n\r\n",
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
@@ -1498,6 +1499,10 @@ async fn test_serve_socket_serves_only_its_address_to_tailnet_visitors() {
         "{seen}"
     );
     assert!(!seen.contains("mallory"), "{seen}");
+    // Only the headers tailscaled replaces pass; a `Tailscale-User-*` it
+    // does not set is the client's own and is dropped.
+    assert!(!seen.contains("tailscale-user-role"), "{seen}");
+    assert!(!seen.contains("tailscale-user-groups"), "{seen}");
 
     // Funnel: refused, and remembered for the agent's report.
     let funnel = socket_request(
