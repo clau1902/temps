@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useQuery } from '@tanstack/react-query'
+import type { PreviewDomainStatusResponse } from '@/api/client'
 import {
   listConnectionsOptions,
   listDomainsOptions,
@@ -210,11 +211,11 @@ export function useActivationSignals(): ActivationSignals {
     domainsData?.domains?.some((d) => d.is_wildcard && d.status === 'active') ??
     false
 
-  // Who cannot read the preview domain status keeps the wildcard-domain
-  // signal, the closest thing they can see.
-  const appsReachable = isAdmin
-    ? previewStatus?.status === 'usable'
-    : wildcardDomainReady
+  const appsReachable = appsReachableSignal(
+    isAdmin,
+    previewStatus,
+    wildcardDomainReady
+  )
 
   const hasProject = (projectsData?.projects?.length ?? 0) > 0
   const firstDeploySucceeded = hasCompletedDeployment(projectStatistics)
@@ -272,4 +273,24 @@ export function useActivationSignals(): ActivationSignals {
     completedCount: completed,
     totalCount: TOTAL - unreadableCount,
   }
+}
+
+/**
+ * "Make your apps reachable" (ADR 068): done when the preview domain is
+ * usable or a tunnel gives every environment an address. Who cannot read
+ * the preview domain status keeps the wildcard-domain signal, the closest
+ * thing they can see.
+ */
+export function appsReachableSignal(
+  isAdmin: boolean,
+  previewStatus:
+    | Pick<PreviewDomainStatusResponse, 'status' | 'tunnel_environment_hosts'>
+    | undefined,
+  wildcardDomainReady: boolean
+): boolean {
+  if (!isAdmin) return wildcardDomainReady
+  return (
+    previewStatus?.status === 'usable' ||
+    !!previewStatus?.tunnel_environment_hosts
+  )
 }

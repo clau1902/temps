@@ -11,8 +11,8 @@ use std::time::Duration;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use temps_core::{DBDateTime, EncryptionService};
@@ -21,8 +21,8 @@ use temps_dns::{
     OwnershipScope,
 };
 use temps_entities::{
-    ingress_connector_nodes, ingress_connectors, ingress_hostname_choices, ingress_publications,
-    node_public_ingress, nodes,
+    environment_domains, ingress_connector_nodes, ingress_connectors, ingress_hostname_choices,
+    ingress_publications, node_public_ingress, nodes,
 };
 use temps_routes::CachedPeerTable;
 use tracing::{debug, info, warn};
@@ -166,6 +166,9 @@ pub struct ConnectorView {
     pub last_error: Option<String>,
     pub edge_port: i32,
     pub auto_publish: bool,
+    /// Publishes every environment as `<label>.<domain>` (ADR 068 D3).
+    /// At most one tunnel does.
+    pub environment_hosts: bool,
     pub nodes: Vec<ConnectorNodeView>,
     pub publications: Vec<PublicationView>,
     #[schema(value_type = String, format = DateTime)]
@@ -208,6 +211,8 @@ pub struct TunnelFact {
     pub ready: bool,
     pub has_nodes: bool,
     pub auto_publish: bool,
+    /// Publishes every environment's host (ADR 068 D3).
+    pub environment_hosts: bool,
 }
 
 /// Which tunnel would publish a hostname, by ADR 058 D9's selection (the
@@ -246,6 +251,14 @@ pub trait TunnelMoveGuard: Send + Sync {
     /// `Err` with the refusal, naming the rule, when an IP allow list of
     /// only private ranges applies to the environment serving `host`.
     async fn check_move(&self, host: &str, tunnel: &str) -> Result<(), String>;
+}
+
+/// ADR 068 D3: keeps the hosts a tunnel generates for environments in line
+/// with the environments. The reachability module implements it; it runs
+/// at the start of every reconcile, under the reconcile lock.
+#[async_trait::async_trait]
+pub trait EnvironmentHostSync: Send + Sync {
+    async fn sync(&self);
 }
 
 /// One page of tunnels, newest first.
@@ -315,6 +328,8 @@ pub struct IngressConnectorService {
     /// Serializes read-modify-writes of a connector's `settings` (token
     /// holders), so a node recorded while the reconciler rotates is kept.
     settings_lock: tokio::sync::Mutex<()>,
+    /// See [`Self::set_environment_host_sync`].
+    environment_hosts: OnceLock<Arc<dyn EnvironmentHostSync>>,
 }
 
 impl IngressConnectorService {
@@ -341,6 +356,7 @@ impl IngressConnectorService {
             reconcile_lock: tokio::sync::Mutex::new(()),
             move_guard: OnceLock::new(),
             settings_lock: tokio::sync::Mutex::new(()),
+            environment_hosts: OnceLock::new(),
         }
     }
 
@@ -358,6 +374,11 @@ impl IngressConnectorService {
         let _ = self.move_guard.set(guard);
     }
 
+    /// Registered by the reachability module (ADR 068 D3).
+    pub fn set_environment_host_sync(&self, sync: Arc<dyn EnvironmentHostSync>) {
+        let _ = self.environment_hosts.set(sync);
+    }
+
     // ----- provider plumbing -------------------------------------------
 
     fn deps(&self) -> ProviderDeps<'_> {
@@ -369,7 +390,10 @@ impl IngressConnectorService {
 
     /// The DNS zone the connector's domain lives in: the domain itself, or
     /// the managed domain above it when the tunnel is on a subdomain.
-    async fn zone_of(&self, connector: &ingress_connectors::Model) -> Result<String, IngressError> {
+    pub(crate) async fn zone_of(
+        &self,
+        connector: &ingress_connectors::Model,
+    ) -> Result<String, IngressError> {
         match self
             .dns_providers
             .find_provider_for_domain(&connector.domain)
@@ -926,6 +950,7 @@ impl IngressConnectorService {
                 ready: c.model.status == "ready",
                 has_nodes: c.has_nodes,
                 auto_publish: c.model.auto_publish,
+                environment_hosts: c.model.environment_hosts,
             })
             .collect();
         let mut choices: Vec<(String, Option<i32>)> = plan
@@ -1155,9 +1180,20 @@ impl IngressConnectorService {
         if let Some(handle) = self.handle_of(&connector)? {
             self.provider_for(&connector).await?.delete(&handle).await?;
         }
+        let generated_hosts = connector.environment_hosts;
+        // Its generated environment hosts go with the row (ADR 068 D3).
         ingress_connectors::Entity::delete_by_id(id)
             .exec(self.db.as_ref())
             .await?;
+        if generated_hosts {
+            if let Err(error) = self
+                .db
+                .execute_unprepared("NOTIFY route_table_changes, 'environment_hosts'")
+                .await
+            {
+                warn!(%error, connector_id = id, "could not notify route table listeners");
+            }
+        }
         info!(connector_id = id, "ingress connector deleted");
         Ok(())
     }
@@ -1619,7 +1655,7 @@ impl IngressConnectorService {
                 model,
             })
             .collect();
-        let choices = ingress_hostname_choices::Entity::find()
+        let mut choices: HashMap<String, Option<i32>> = ingress_hostname_choices::Entity::find()
             .all(self.db.as_ref())
             .await?
             .into_iter()
@@ -1633,6 +1669,27 @@ impl IngressConnectorService {
         )
         .await
         .map_err(|(_, error)| IngressError::Database(error))?;
+        // ADR 068 D3: a host a tunnel generated for an environment, and that
+        // environment's service hosts, go through that tunnel. A choice the
+        // operator made for one of them wins.
+        let generated: HashMap<String, i32> = environment_domains::Entity::find()
+            .filter(environment_domains::Column::GeneratedByConnectorId.is_not_null())
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                row.generated_by_connector_id
+                    .map(|id| (row.domain.trim_end_matches('.').to_ascii_lowercase(), id))
+            })
+            .collect();
+        if !generated.is_empty() {
+            for route in &routes.routes {
+                let host = route.host.trim_end_matches('.').to_ascii_lowercase();
+                if let Some(id) = generated_connector(&generated, &host) {
+                    choices.entry(host).or_insert(Some(id));
+                }
+            }
+        }
         let mut blocking = routes.blocking_policies;
         if gate.is_none() {
             blocking = vec!["the control plane is still starting".into()];
@@ -1652,6 +1709,9 @@ impl IngressConnectorService {
     /// Bring every tunnel's DNS records in line with the plan.
     pub async fn reconcile_all(&self) {
         let _guard = self.reconcile_lock.lock().await;
+        if let Some(sync) = self.environment_hosts.get() {
+            sync.sync().await;
+        }
         if let Err(error) = self.reconcile().await {
             warn!(%error, "ingress connector reconcile failed");
         }
@@ -1992,6 +2052,7 @@ fn connector_view(
         last_error: connector.last_error,
         edge_port: connector.edge_port,
         auto_publish: connector.auto_publish,
+        environment_hosts: connector.environment_hosts,
         nodes: node_rows
             .into_iter()
             .map(|n| ConnectorNodeView {
@@ -2055,6 +2116,17 @@ pub(crate) fn record_label(host: &str, domain: &str, zone: &str) -> Result<Strin
         )));
     }
     Ok(label.to_string())
+}
+
+/// The tunnel that generated `host`, or the environment host a Flat service
+/// host `<label>--<service>.<domain>` belongs to (ADR 068 D3).
+fn generated_connector(generated: &HashMap<String, i32>, host: &str) -> Option<i32> {
+    if let Some(id) = generated.get(host) {
+        return Some(*id);
+    }
+    let (first, rest) = host.split_once('.')?;
+    let (label, _) = first.split_once("--")?;
+    generated.get(&format!("{label}.{rest}")).copied()
 }
 
 /// Whether a tunnel on `domain` (in `zone`) publishes `host`: anything under
@@ -2480,11 +2552,49 @@ mod tests {
             secret_encrypted: None,
             edge_port: 443,
             auto_publish,
+            environment_hosts: false,
             status: "ready".into(),
             last_error: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// ADR 068 D3: a generated environment host, and its Flat service
+    /// hosts, belong to the tunnel that generated it; nothing else does.
+    #[test]
+    fn generated_hosts_and_their_service_hosts_map_to_their_tunnel() {
+        let generated: HashMap<String, i32> = [
+            ("shop-staging.tunnel.example.com".to_string(), 7),
+            ("shop-production-a1b2c3.tunnel.example.com".to_string(), 7),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            generated_connector(&generated, "shop-staging.tunnel.example.com"),
+            Some(7)
+        );
+        assert_eq!(
+            generated_connector(&generated, "shop-staging--api.tunnel.example.com"),
+            Some(7)
+        );
+        assert_eq!(
+            generated_connector(&generated, "shop-production-a1b2c3--web.tunnel.example.com"),
+            Some(7)
+        );
+        assert_eq!(
+            generated_connector(&generated, "shop-staging.other.example.com"),
+            None
+        );
+        assert_eq!(
+            generated_connector(&generated, "blog.tunnel.example.com"),
+            None
+        );
+        assert_eq!(
+            generated_connector(&generated, "api--shop-staging.tunnel.example.com"),
+            None,
+            "the Standard form is not a tunnel service host"
+        );
     }
 
     /// ADR 064 D9: what turning `auto_publish` on would publish, which the

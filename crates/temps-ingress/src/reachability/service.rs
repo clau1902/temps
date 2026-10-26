@@ -59,10 +59,10 @@ use super::model::{
     RunStepStatus, RunView, StepKind,
 };
 use super::plan::{
-    fingerprint, guess_zone, http01_direct, plan, planned_address, planned_record, private_worker,
-    record_type_of, records_to_read, tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for,
-    NamedId, PlanFacts, PrivateWorkerFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER,
-    FIELD_TOKEN,
+    environment_hosts_tunnel, fingerprint, guess_zone, http01_direct, plan, planned_address,
+    planned_record, private_worker, record_type_of, records_to_read, tunnel_domain_for,
+    tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts, PrivateWorkerFact, ZoneFact,
+    FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_TOKEN,
 };
 use super::run::{
     created, decide, execute, reconcile_journal, resume, undo, NewTunnel, RunInput, RunOps,
@@ -445,8 +445,11 @@ impl ReachabilityService {
         for domain in env_domains {
             let audience = Audience::parse(&domain.audience);
             // A label (no dot) is served under the preview domain: it is a
-            // generated host, not one the user chose (ADR 068 D4).
-            let source = if domain.domain.contains('.') {
+            // generated host, not one the user chose (ADR 068 D4). A tunnel
+            // generated the others carrying a connector (D3).
+            let source = if domain.generated_by_connector_id.is_some() {
+                AddressSource::TunnelHost
+            } else if domain.domain.contains('.') {
                 AddressSource::EnvironmentDomain
             } else {
                 AddressSource::Generated
@@ -940,6 +943,7 @@ impl ReachabilityService {
             private_workers,
             suggested_private_worker,
             private_ranges,
+            environment_host_label: Some(self.environment_host_label(scope).await?),
         };
         let mut dns_records = Vec::new();
         // The suggested address is known only now; D9 decides it too.
@@ -971,6 +975,17 @@ impl ReachabilityService {
             dns_records,
             ..facts
         })
+    }
+
+    /// The label a tunnel's environment hosts give `scope`'s environment
+    /// (ADR 068 D3).
+    async fn environment_host_label(&self, scope: &Scope) -> Result<String, ReachabilityError> {
+        let settings = self.settings().await?;
+        Ok(super::environment_hosts::environment_host_label(
+            &scope.project.slug,
+            &scope.environment,
+            settings.production_hostname_template.as_deref(),
+        ))
     }
 
     async fn facts_for(
@@ -1313,6 +1328,18 @@ impl ReachabilityService {
                 })?;
                 input.direct = Some((direct.name.clone(), direct.ips[0]));
                 input.dns_before = planned_record(&facts, &address, record_type_of(direct.ips[0]));
+            }
+            PlanOptionKind::TunnelEnvironmentHosts => {
+                let tunnel = environment_hosts_tunnel(&facts, &address).ok_or_else(|| {
+                    ReachabilityError::Conflict(format!(
+                        "No tunnel can give {} the address {address} any more.",
+                        scope.environment.name
+                    ))
+                })?;
+                input.tunnel = Some(NamedId {
+                    id: tunnel.id,
+                    name: tunnel.name.clone(),
+                });
             }
         }
 
@@ -2138,6 +2165,13 @@ impl RunOps for LiveOps {
                 .map(|_| RunResource::Certificate {
                     domain: domain.clone(),
                 }),
+            Intent::EnvironmentHosts { connector_id, name } => self
+                .environment_hosts(*connector_id)
+                .await?
+                .then(|| RunResource::EnvironmentHosts {
+                    connector_id: *connector_id,
+                    name: name.clone(),
+                }),
         })
     }
 
@@ -2622,6 +2656,36 @@ impl RunOps for LiveOps {
         let mut active: project_custom_domains::ActiveModel = row.into();
         set_address_audience_on(&mut active, audience);
         active.update(self.deps.db.as_ref()).await.map_err(text)?;
+        Ok(())
+    }
+
+    async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String> {
+        Ok(ingress_connectors::Entity::find_by_id(connector_id)
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?
+            .is_some_and(|c| c.environment_hosts))
+    }
+
+    async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String> {
+        let connector = ingress_connectors::Entity::find_by_id(connector_id)
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?;
+        let Some(connector) = connector else {
+            // Gone: its generated hosts went with it.
+            return if on {
+                Err(format!("Tunnel {connector_id} no longer exists."))
+            } else {
+                Ok(())
+            };
+        };
+        super::environment_hosts::set_environment_hosts(self.deps.db.as_ref(), &connector, on)
+            .await
+            .map_err(text)?;
+        // The reconciler generates and publishes (or withdraws) the hosts.
+        let connectors = self.deps.connectors.clone();
+        tokio::spawn(async move { connectors.reconcile_all().await });
         Ok(())
     }
 

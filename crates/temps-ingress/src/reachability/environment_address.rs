@@ -35,6 +35,7 @@ use super::addresses::{
     PreviewDomainFacts, TunnelOffer, WarningFacts,
 };
 use super::compute::{is_local_only, Resolution};
+use super::model::Audience;
 use super::service::{resolve, ReachabilityError, ReachabilityService};
 
 /// How long an environment's address is reused.
@@ -55,6 +56,9 @@ pub struct PreviewDomainStatusResponse {
     pub status: PreviewDomainStatus,
     /// Why, in words.
     pub reason: String,
+    /// The tunnel that gives every environment an address instead, when
+    /// one does (ADR 068 D3): apps are reachable without this domain.
+    pub tunnel_environment_hosts: Option<String>,
     #[schema(value_type = String, format = DateTime)]
     pub checked_at: DateTime<Utc>,
 }
@@ -164,6 +168,10 @@ impl EnvironmentAddressService {
             preview_domain: settings.preview_domain.clone(),
             status,
             reason,
+            tunnel_environment_hosts: connectors
+                .iter()
+                .find(|c| c.environment_hosts && !crate::service::is_deleting(c))
+                .map(|c| c.name.clone()),
             checked_at: Utc::now(),
         };
         info!(
@@ -220,15 +228,31 @@ impl EnvironmentAddressService {
             } else {
                 Vec::new()
             };
+            // The host a tunnel's environment hosts would give it (D3). A
+            // tunnel that already has them on is the only one offered (at
+            // most one may), and an environment with a private or
+            // signed-in address is never offered a public tunnel host.
+            let restricted = addresses.iter().any(|a| a.audience != Audience::Public);
+            let label = super::environment_hosts::environment_host_label(
+                &scope.project.slug,
+                &scope.environment,
+                settings.production_hostname_template.as_deref(),
+            );
+            let connectors: Vec<_> = if restricted {
+                Vec::new()
+            } else if connectors.iter().any(|c| c.environment_hosts) {
+                connectors
+                    .into_iter()
+                    .filter(|c| c.environment_hosts)
+                    .collect()
+            } else {
+                connectors
+            };
             let tunnels: Vec<TunnelOffer> = connectors
                 .into_iter()
                 .map(|c| TunnelOffer {
                     connector_id: c.id,
-                    hostname: format!(
-                        "{}.{}",
-                        scope.environment.subdomain,
-                        c.domain.trim_end_matches('.')
-                    ),
+                    hostname: super::environment_hosts::natural_host(&label, &c.domain),
                     name: c.name,
                 })
                 .collect();

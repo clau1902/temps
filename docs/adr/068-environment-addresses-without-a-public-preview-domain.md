@@ -315,3 +315,56 @@ or the code reads it a particular way, the choice is listed here.
   `bun run spec:check`), and both clients were generated from that file. A
   maintainer should run `bun run spec:update` against a live server before
   release, which should produce no further diff.
+
+### Phase 2
+
+- **The pass runs inside the ADR 058 reconcile.** Generated rows are brought
+  in line with the environments at the start of every reconcile, under its
+  lock: every minute, and whenever the peer table changes. The endpoint and
+  the plan/run step only set the flag and ask for a reconcile. Two passes can
+  never run at once, which matters because `environment_domains.domain` has
+  no unique index. Renames and deletions are therefore picked up within a
+  reconcile tick, not synchronously.
+- **Publication goes through the ADR 058 plan, not a separate path.** A
+  generated row counts as a hostname chosen for its tunnel, and so do its
+  Flat service hosts. A choice the operator made for the same hostname wins.
+- **Ownership (ADR 031) is checked on the CNAME the tunnel would write.** A
+  name with no record, with this install's record, or with only this
+  install's orphaned marker is free. Any other answer gets `<label>-<hash>`
+  (an unmanaged record, another install's record or marker, a registry
+  conflict), and so does a name another address in this install uses. If
+  the lookup itself fails, the natural name is tried and publication reports
+  a conflict if there is one. The listing's `note` says why a host has the
+  hashed name.
+- **New hosts are bounded per pass.** A pass resolves at most 50 new names
+  (each needs a DNS ownership lookup). Larger installs converge over a few
+  ticks; existing hosts are never re-checked.
+- **Service hosts use the Flat form under the tunnel's domain:**
+  `<host label>--<service>.<tunnel domain>`, added to the route table only
+  where no route already claims the name. When `<label>--<service>` is longer
+  than one DNS label, the shortened, hashed form is routed but not mapped
+  back to its tunnel, so it is not published. This is left for a follow-up.
+- **Refusals.** An environment with any `private` or `signed_in` address
+  gets no generated host. The opt-in lists it under "Not published" with the
+  reason, and the D5 warning offers it no tunnel fix. Projects hosted
+  elsewhere and deleted environments are refused the same way.
+- **Opt-out and connector deletion.** `PUT …/environment-hosts` needs
+  `confirm: true` in both directions, after the `GET` listing was shown.
+  Opting out deletes the generated rows in the same transaction as the flag.
+  Deleting a connector removes its rows by foreign-key cascade, and the
+  console's delete confirmation lists them first.
+- **The one-click D5 fix is a plan option,** `tunnel_environment_hosts`,
+  with a `publish_environment_hosts` step journalled as an
+  `environment_hosts/<connector>` intent. Undo turns the flag off, which
+  withdraws every generated host, not only this environment's: the switch is
+  per tunnel. A run that finds the flag already on records nothing, so its
+  undo leaves the hosts to whoever turned them on.
+- **The D5 tunnel offer follows the generated name.** It uses the production
+  template for production, and offers only the tunnel that already has
+  environment hosts on when one does (Q3).
+- **Q2 (branch environments) is implemented as accepted.** They are
+  included, and both the opt-in dialog and the plan's confirmation warn that
+  branch names become public names, with their certificates in
+  Certificate Transparency logs.
+- **Not run here:** the migration test needs Docker and skips at runtime on
+  this machine; CI runs it.

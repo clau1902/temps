@@ -137,6 +137,9 @@ pub struct PlanFacts {
     pub suggested_private_worker: Option<String>,
     /// The environment's private addresses and the range each is bound to.
     pub private_ranges: Vec<(String, Option<String>)>,
+    /// The label a tunnel's environment hosts give this environment
+    /// (ADR 068 D3): its subdomain, or the production template's.
+    pub environment_host_label: Option<String>,
 }
 
 /// The worker a private plan serves through: the first whose private
@@ -251,12 +254,13 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     let canonical = format!(
         "v3|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
          {accounts:?}|{directs:?}|{modes:?}|{intent:?}|{:?}|{records:?}|{private_workers:?}|\
-         {ranges:?}",
+         {ranges:?}|{:?}",
         facts.audience,
         facts.deployed,
         facts.served_by_workers,
         address.is_some_and(|a| facts.taken_elsewhere.contains(a)),
         facts.private_rule,
+        facts.environment_host_label,
     );
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
@@ -508,7 +512,37 @@ pub fn permissions_for(kind: PlanOptionKind) -> Vec<Permission> {
         PlanOptionKind::PrivateWorker => {
             vec![Permission::DnsProvidersWrite, Permission::DomainsCreate]
         }
+        PlanOptionKind::TunnelEnvironmentHosts => vec![Permission::SettingsWrite],
     }
+}
+
+/// What the opt-in to a tunnel's environment hosts says first (ADR 068).
+pub const ENVIRONMENT_HOSTS_WARNING: &str = "Every environment, including preview environments \
+     named after branches, gets a public DNS name under the tunnel's domain: branch names \
+     become public, and each name's certificate appears in Certificate Transparency logs.";
+
+/// The tunnel whose environment hosts would give this environment `host`
+/// (ADR 068 D3): `host` is `<its label>.<tunnel domain>`, the tunnel can
+/// publish, its environment hosts are off, and no other tunnel's are on.
+pub fn environment_hosts_tunnel<'a>(facts: &'a PlanFacts, host: &str) -> Option<&'a TunnelFact> {
+    let label = facts.environment_host_label.as_deref()?;
+    if facts.tunnels.iter().any(|t| t.environment_hosts) {
+        return None;
+    }
+    // Hosts are never generated for an environment with a restricted
+    // address (ADR 068 Security).
+    if facts.audiences.iter().any(|(_, a)| *a != Audience::Public) {
+        return None;
+    }
+    facts.tunnels.iter().find(|t| {
+        usable(t)
+            && t.zone.is_some()
+            && host
+                == format!(
+                    "{label}.{}",
+                    t.domain.trim_end_matches('.').to_ascii_lowercase()
+                )
+    })
 }
 
 fn address_field(suggested: Option<&str>) -> SetupField {
@@ -731,6 +765,39 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         )
     });
     let mut drafts: Vec<OptionDraft> = Vec::new();
+
+    // 0. The address is this environment's host under a tunnel: one switch
+    //    gives every environment its host there (ADR 068 D3, D5's fix).
+    if let (Some(host), true) = (address.as_deref(), tunnels_possible) {
+        if let Some(tunnel) = environment_hosts_tunnel(facts, host) {
+            drafts.push(OptionDraft {
+                kind: PlanOptionKind::TunnelEnvironmentHosts,
+                title: format!("Give every environment an address under {}", tunnel.domain),
+                description: format!(
+                    "Tunnel {} publishes each environment as <environment>.{}, and keeps \
+                     them as environments come, go and are renamed; {host} is this one's. \
+                     Cloudflare serves HTTPS.",
+                    tunnel.name, tunnel.domain
+                ),
+                actions: 1,
+                way_in: format!("tunnel:{}", tunnel.name),
+                steps: vec![
+                    step(
+                        StepKind::PublishEnvironmentHosts,
+                        format!("Publish every environment through tunnel {}", tunnel.name),
+                    ),
+                    step(
+                        StepKind::WaitForPublication,
+                        format!("Wait for tunnel {} to publish {host}", tunnel.name),
+                    ),
+                    step(StepKind::CheckReachability, format!("Check {host}")),
+                ],
+                fields: Vec::new(),
+                warnings: not_deployed_warning.iter().cloned().collect(),
+                confirmation: Some(ENVIRONMENT_HOSTS_WARNING.to_string()),
+            });
+        }
+    }
 
     // 1. A tunnel that would publish the address, or one that covers it
     //    with its hostname choice set (and confirmed).
@@ -1445,6 +1512,7 @@ mod tests {
             ready: true,
             has_nodes: true,
             auto_publish: true,
+            environment_hosts: false,
         }
     }
 
@@ -1549,6 +1617,92 @@ mod tests {
             .iter()
             .any(|s| s.kind == StepKind::RouteHostname));
         assert_eq!(first.fields[0].key, FIELD_ADDRESS);
+    }
+
+    /// ADR 068 D5's tunnel fix: the environment's own host under a tunnel
+    /// is offered first as "every environment gets one", behind the
+    /// public-names warning; the single-host option stays as the alternative.
+    #[test]
+    fn the_environment_host_under_a_tunnel_offers_environment_hosts_first() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            requested: Some("myapp-production.example.com".into()),
+            environment_host_label: Some("myapp-production".into()),
+            ..base()
+        };
+        let plan = plan(&facts);
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                PlanOptionKind::TunnelEnvironmentHosts,
+                PlanOptionKind::ExistingTunnel
+            ]
+        );
+        let first = &plan.options[0];
+        assert_eq!(first.way_in, "tunnel:homelab");
+        assert_eq!(
+            first.confirmation.as_deref(),
+            Some(ENVIRONMENT_HOSTS_WARNING)
+        );
+        assert_eq!(
+            first.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                StepKind::PublishEnvironmentHosts,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability
+            ]
+        );
+        assert_eq!(
+            permissions_for(PlanOptionKind::TunnelEnvironmentHosts),
+            vec![Permission::SettingsWrite]
+        );
+    }
+
+    #[test]
+    fn environment_hosts_are_not_offered_when_they_cannot_apply() {
+        let with = |facts: PlanFacts| {
+            kinds(&plan(&PlanFacts {
+                requested: Some("myapp-production.example.com".into()),
+                environment_host_label: Some("myapp-production".into()),
+                ..facts
+            }))
+        };
+        let homelab = || tunnel("homelab", "example.com", "example.com");
+        // Another address than the environment's own host.
+        assert!(!kinds(&plan(&PlanFacts {
+            tunnels: vec![homelab()],
+            requested: Some("shop.example.com".into()),
+            environment_host_label: Some("myapp-production".into()),
+            ..base()
+        }))
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // Some tunnel already has them on (Q3: at most one).
+        assert!(!with(PlanFacts {
+            tunnels: vec![
+                homelab(),
+                TunnelFact {
+                    id: 4,
+                    environment_hosts: true,
+                    ..tunnel("edge", "other.example.net", "example.net")
+                },
+            ],
+            ..base()
+        })
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // An address that is private or for signed-in people (Security).
+        assert!(!with(PlanFacts {
+            tunnels: vec![homelab()],
+            audiences: vec![("myapp.internal.example.com".into(), Audience::Private)],
+            ..base()
+        })
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // Served by the control plane: no tunnel carries it.
+        assert!(!with(PlanFacts {
+            tunnels: vec![homelab()],
+            served_by_workers: false,
+            ..base()
+        })
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
     }
 
     #[test]

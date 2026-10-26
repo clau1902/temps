@@ -720,6 +720,7 @@ export function ProjectDetail() {
           )}
           <ReachabilityWarningBanner
             warning={project.reachability_warning}
+            projectId={project.id}
             className="mb-4"
           />
           <ProjectTour />

@@ -29,6 +29,10 @@ pub struct Model {
     /// For a `private` address: the listener address DNS points at.
     #[serde(default)]
     pub private_listener: Option<String>,
+    /// The tunnel that generated this row for the environment (ADR 068
+    /// D3). Temps renames and removes only rows carrying it.
+    #[serde(default)]
+    pub generated_by_connector_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -1572,7 +1572,10 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
         <DeployFailureReport project={project} deployment={deployment} />
 
-        <ReachabilityWarningBanner warning={deployment.reachability_warning} />
+        <ReachabilityWarningBanner
+          warning={deployment.reachability_warning}
+          projectId={deployment.project_id}
+        />
 
         <ReachableAfterDeploy
           enabled={

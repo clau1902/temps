@@ -4511,6 +4511,7 @@ mod tests {
                 private_range: None,
                 private_node_id: None,
                 private_listener: None,
+                generated_by_connector_id: None,
             }]]);
         let svc = ingress_config_service(db);
         let problem = validate_public_ingress_url(

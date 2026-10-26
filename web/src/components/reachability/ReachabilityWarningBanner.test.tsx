@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, render } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import type { ReachabilityWarning } from '@/api/client'
@@ -73,4 +74,25 @@ test('says why nobody can reach the environment, with one action per fix', () =>
 test('renders nothing when the environment is reachable', () => {
   const { container } = renderBanner(null)
   expect(container.textContent).toBe('')
+})
+
+test('on a project, the tunnel fix runs in place instead of linking away', () => {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const { container } = render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <ReachabilityWarningBanner warning={warning} projectId={7} />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const hrefs = Array.from(container.querySelectorAll('a')).map((a) =>
+    a.getAttribute('href')
+  )
+  expect(hrefs).toEqual(['/settings#preview-domain'])
+  const buttons = Array.from(container.querySelectorAll('button')).map(
+    (b) => b.textContent
+  )
+  expect(buttons).toContain(warning.fixes[0].label)
 })

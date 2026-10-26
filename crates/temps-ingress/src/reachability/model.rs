@@ -204,6 +204,9 @@ pub enum PlanOptionKind {
     /// as a tailnet (ADR 064 D5): DNS points at its private address and
     /// the certificate comes through DNS-01.
     PrivateWorker,
+    /// Turn on a tunnel's environment hosts (ADR 068 D3): every
+    /// environment, this one included, gets `<label>.<tunnel domain>`.
+    TunnelEnvironmentHosts,
 }
 
 impl PlanOptionKind {
@@ -215,6 +218,7 @@ impl PlanOptionKind {
             PlanOptionKind::DirectManagedDns,
             PlanOptionKind::DirectManualDns,
             PlanOptionKind::PrivateWorker,
+            PlanOptionKind::TunnelEnvironmentHosts,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == value)
@@ -228,6 +232,7 @@ impl PlanOptionKind {
             PlanOptionKind::NewTunnelWithToken => "new_tunnel_with_token",
             PlanOptionKind::DirectManualDns => "direct_manual_dns",
             PlanOptionKind::PrivateWorker => "private_worker",
+            PlanOptionKind::TunnelEnvironmentHosts => "tunnel_environment_hosts",
         }
     }
 }
@@ -250,6 +255,8 @@ pub enum StepKind {
     /// Records who an address is for, and for a private one the network
     /// range and the listener that serve it (ADR 064 D5).
     SetAudience,
+    /// Turns on the tunnel's environment hosts (ADR 068 D3).
+    PublishEnvironmentHosts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -564,6 +571,12 @@ pub enum RunResource {
     Certificate {
         domain: String,
     },
+    /// A tunnel whose environment hosts the run turned on (ADR 068 D3):
+    /// undo turns them off, which withdraws every host it generated.
+    EnvironmentHosts {
+        connector_id: i32,
+        name: String,
+    },
 }
 
 /// Who one address is for, with what bounds a private one (ADR 064 D5).
@@ -627,6 +640,9 @@ impl RunResource {
                 before.describe()
             ),
             RunResource::Certificate { domain } => format!("Certificate for {domain}"),
+            RunResource::EnvironmentHosts { name, .. } => {
+                format!("Environment addresses through tunnel {name}")
+            }
         }
     }
 }
@@ -685,6 +701,11 @@ pub enum Intent {
     },
     Certificate {
         domain: String,
+    },
+    /// Found by the connector's `environment_hosts` flag.
+    EnvironmentHosts {
+        connector_id: i32,
+        name: String,
     },
 }
 
@@ -781,6 +802,9 @@ impl Intent {
             }
             Intent::AddressAudience { hostname, .. } => format!("audience/{hostname}"),
             Intent::Certificate { domain } => format!("certificate/{domain}"),
+            Intent::EnvironmentHosts { connector_id, .. } => {
+                format!("environment_hosts/{connector_id}")
+            }
         };
         format!("run-{run_id}/{what}")
     }
@@ -808,6 +832,9 @@ impl Intent {
                 format!("{hostname} made {}", after.describe())
             }
             Intent::Certificate { domain } => format!("Certificate for {domain}"),
+            Intent::EnvironmentHosts { name, .. } => {
+                format!("Environment addresses through tunnel {name}")
+            }
         }
     }
 }

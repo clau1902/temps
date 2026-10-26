@@ -717,9 +717,9 @@ fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
             | RunResource::AutoManageEnabled { .. }
             | RunResource::DnsRecord { .. }
             | RunResource::DnsChange { .. } => Permission::DnsProvidersWrite,
-            RunResource::Connector { .. } | RunResource::HostnameChoice { .. } => {
-                Permission::SettingsWrite
-            }
+            RunResource::Connector { .. }
+            | RunResource::HostnameChoice { .. }
+            | RunResource::EnvironmentHosts { .. } => Permission::SettingsWrite,
             RunResource::CustomDomain { .. } | RunResource::AddressAudience { .. } => {
                 Permission::ProjectsWrite
             }

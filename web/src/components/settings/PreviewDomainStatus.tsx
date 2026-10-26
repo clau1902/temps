@@ -58,6 +58,25 @@ export function PreviewDomainStatusView({
       </p>
     )
   }
+  if (status.tunnel_environment_hosts) {
+    // ADR 068 D3: a tunnel gives every environment an address, so apps are
+    // reachable whatever this domain resolves to.
+    return (
+      <p className="flex items-center gap-1.5 text-sm text-muted-foreground">
+        <CheckCircle2
+          aria-hidden="true"
+          className="size-4 shrink-0 text-emerald-600"
+        />
+        <span>
+          Tunnel {status.tunnel_environment_hosts} gives every environment an
+          address, so apps are reachable without this domain. {status.reason}{' '}
+          <Link className="underline" to="/settings/nodes/ingress">
+            Manage tunnels
+          </Link>
+        </span>
+      </p>
+    )
+  }
   return (
     <Alert variant="warning">
       {status.status === 'local_only' ? (

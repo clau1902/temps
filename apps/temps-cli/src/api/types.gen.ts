@@ -5884,6 +5884,11 @@ export type ConnectorView = {
     dns_target?: string | null;
     domain: string;
     edge_port: number;
+    /**
+     * Publishes every environment as `<label>.<domain>` (ADR 068 D3).
+     * At most one tunnel does.
+     */
+    environment_hosts: boolean;
     external_id?: string | null;
     id: number;
     last_error?: string | null;
@@ -11568,6 +11573,65 @@ export type EnvironmentDomainResponse = {
      * Full URL for this domain (e.g., https://buildtolearndev-production.example.com)
      */
     url: string;
+};
+
+/**
+ * An environment the tunnel does not publish, and why.
+ */
+export type EnvironmentHostRefusal = {
+    environment_id: number;
+    environment_name: string;
+    project_slug: string;
+    reason: string;
+};
+
+/**
+ * One environment's tunnel host, as the opt-in lists it.
+ */
+export type EnvironmentHostView = {
+    environment_id: number;
+    environment_name: string;
+    /**
+     * The host, or the one it would get.
+     */
+    hostname: string;
+    last_error?: string | null;
+    /**
+     * Why the host is not `<label>.<domain>`, when it is the short-hash
+     * name.
+     */
+    note?: string | null;
+    project_slug: string;
+    /**
+     * `published`, `pending`, `error`, or `planned` before the opt-in.
+     */
+    state: string;
+};
+
+/**
+ * `GET`/`PUT /ingress/connectors/{id}/environment-hosts`.
+ */
+export type EnvironmentHostsResponse = {
+    connector_id: number;
+    connector_name: string;
+    domain: string;
+    enabled: boolean;
+    /**
+     * The tunnel that has environment hosts on instead, if another does:
+     * at most one may.
+     */
+    enabled_elsewhere?: string | null;
+    /**
+     * The hosts it publishes, or would publish once turned on.
+     */
+    hosts: Array<EnvironmentHostView>;
+    /**
+     * The preview domain is usable: existing hosts stay, no new ones are
+     * generated.
+     */
+    preview_domain_usable: boolean;
+    refused: Array<EnvironmentHostRefusal>;
+    warning: string;
 };
 
 export type EnvironmentInfo = {
@@ -21300,6 +21364,11 @@ export type PreviewDomainStatusResponse = {
      */
     reason: string;
     status: PreviewDomainStatus;
+    /**
+     * The tunnel that gives every environment an address instead, when
+     * one does (ADR 068 D3): apps are reachable without this domain.
+     */
+    tunnel_environment_hosts?: string | null;
 };
 
 export type PreviewGatewayLogsResponse = {
@@ -27212,6 +27281,18 @@ export type SetChatWorkspaceRequest = {
 
 export type SetConnectorNodesRequest = {
     node_ids: Array<number>;
+};
+
+/**
+ * `PUT /ingress/connectors/{id}/environment-hosts`.
+ */
+export type SetEnvironmentHostsRequest = {
+    /**
+     * The list was shown and accepted: turning on publishes every host in
+     * it, turning off withdraws them.
+     */
+    confirm?: boolean;
+    enabled: boolean;
 };
 
 export type SetFlagEnvironmentRequest = {
@@ -52628,6 +52709,88 @@ export type UpdateIngressConnectorResponses = {
 };
 
 export type UpdateIngressConnectorResponse = UpdateIngressConnectorResponses[keyof UpdateIngressConnectorResponses];
+
+export type GetConnectorEnvironmentHostsData = {
+    body?: never;
+    path: {
+        /**
+         * Tunnel id
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/environment-hosts';
+};
+
+export type GetConnectorEnvironmentHostsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetConnectorEnvironmentHostsResponses = {
+    200: EnvironmentHostsResponse;
+};
+
+export type GetConnectorEnvironmentHostsResponse = GetConnectorEnvironmentHostsResponses[keyof GetConnectorEnvironmentHostsResponses];
+
+export type SetConnectorEnvironmentHostsData = {
+    body: SetEnvironmentHostsRequest;
+    path: {
+        /**
+         * Tunnel id
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/environment-hosts';
+};
+
+export type SetConnectorEnvironmentHostsErrors = {
+    /**
+     * Not confirmed
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+    /**
+     * Another tunnel publishes environment hosts
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetConnectorEnvironmentHostsResponses = {
+    200: EnvironmentHostsResponse;
+};
+
+export type SetConnectorEnvironmentHostsResponse = SetConnectorEnvironmentHostsResponses[keyof SetConnectorEnvironmentHostsResponses];
 
 export type GetIngressConnectorLinksData = {
     body?: never;

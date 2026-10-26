@@ -12281,6 +12281,10 @@
             "format": "int32",
             "type": "integer"
           },
+          "environment_hosts": {
+            "description": "Publishes every environment as `<label>.<domain>` (ADR 068 D3).\nAt most one tunnel does.",
+            "type": "boolean"
+          },
           "external_id": {
             "type": [
               "string",
@@ -12327,6 +12331,7 @@
           "status",
           "edge_port",
           "auto_publish",
+          "environment_hosts",
           "nodes",
           "publications",
           "created_at"
@@ -24397,6 +24402,132 @@
           "domain",
           "created_at",
           "url"
+        ],
+        "type": "object"
+      },
+      "EnvironmentHostRefusal": {
+        "description": "An environment the tunnel does not publish, and why.",
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "project_slug",
+          "environment_name",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "EnvironmentHostView": {
+        "description": "One environment's tunnel host, as the opt-in lists it.",
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "hostname": {
+            "description": "The host, or the one it would get.",
+            "example": "shop-production.tunnel.example.com",
+            "type": "string"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "description": "Why the host is not `<label>.<domain>`, when it is the short-hash\nname.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "state": {
+            "description": "`published`, `pending`, `error`, or `planned` before the opt-in.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "project_slug",
+          "environment_name",
+          "hostname",
+          "state"
+        ],
+        "type": "object"
+      },
+      "EnvironmentHostsResponse": {
+        "description": "`GET`/`PUT /ingress/connectors/{id}/environment-hosts`.",
+        "properties": {
+          "connector_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "connector_name": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "enabled_elsewhere": {
+            "description": "The tunnel that has environment hosts on instead, if another does:\nat most one may.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hosts": {
+            "description": "The hosts it publishes, or would publish once turned on.",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentHostView"
+            },
+            "type": "array"
+          },
+          "preview_domain_usable": {
+            "description": "The preview domain is usable: existing hosts stay, no new ones are\ngenerated.",
+            "type": "boolean"
+          },
+          "refused": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentHostRefusal"
+            },
+            "type": "array"
+          },
+          "warning": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "connector_name",
+          "domain",
+          "enabled",
+          "hosts",
+          "refused",
+          "preview_domain_usable",
+          "warning"
         ],
         "type": "object"
       },
@@ -45724,6 +45855,13 @@
           },
           "status": {
             "$ref": "#/components/schemas/PreviewDomainStatus"
+          },
+          "tunnel_environment_hosts": {
+            "description": "The tunnel that gives every environment an address instead, when\none does (ADR 068 D3): apps are reachable without this domain.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -58355,6 +58493,22 @@
         },
         "required": [
           "node_ids"
+        ],
+        "type": "object"
+      },
+      "SetEnvironmentHostsRequest": {
+        "description": "`PUT /ingress/connectors/{id}/environment-hosts`.",
+        "properties": {
+          "confirm": {
+            "description": "The list was shown and accepted: turning on publishes every host in\nit, turning off withdraws them.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
         ],
         "type": "object"
       },
@@ -103974,6 +104128,120 @@
         "summary": "Change what a tunnel publishes.",
         "tags": [
           "Ingress"
+        ]
+      }
+    },
+    "/ingress/connectors/{id}/environment-hosts": {
+      "get": {
+        "description": "Every environment's host under the tunnel's domain, its publication\nstate, why one got a short-hash name, and the environments it refuses\n(private, signed-in only, hosted elsewhere).",
+        "operationId": "get_connector_environment_hosts",
+        "parameters": [
+          {
+            "description": "Tunnel id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentHostsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such tunnel"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "What a tunnel publishes for environments, or would once turned on.",
+        "tags": [
+          "Reachability"
+        ]
+      },
+      "put": {
+        "description": "On publishes every listed environment as `<label>.<domain>`; off\nwithdraws every host it generated. Both need `confirm: true`, sent after\nshowing the list from the `GET`. At most one tunnel has it on.",
+        "operationId": "set_connector_environment_hosts",
+        "parameters": [
+          {
+            "description": "Tunnel id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetEnvironmentHostsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentHostsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not confirmed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such tunnel"
+          },
+          "409": {
+            "description": "Another tunnel publishes environment hosts"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn a tunnel's environment hosts on or off.",
+        "tags": [
+          "Reachability"
         ]
       }
     },

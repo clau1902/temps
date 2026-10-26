@@ -255,6 +255,17 @@ pub fn environment_label(
     format!("{}-{hash}", label[..keep].trim_end_matches('-'))
 }
 
+/// `label` with a short hash of `seed`: the fallback name when `label` is
+/// taken under a zone by a record Temps does not own (ADR 068 D3). The
+/// result is one DNS label, `<label>-<hash>`, cut to fit.
+pub fn hashed_label(label: &str, seed: &str) -> String {
+    let label = sanitize_label(label);
+    let hash = short_hash(seed);
+    let keep = DNS_LABEL_MAX_LEN - SHORT_HASH_LEN - 1;
+    let prefix: String = label.chars().take(keep).collect();
+    format!("{}-{hash}", prefix.trim_end_matches('-'))
+}
+
 /// Check a hostname label template. `require_env`: every environment of a
 /// project gets a distinct name only if `{env}` is in it, so the general
 /// template needs it; the production one does not.
@@ -315,6 +326,25 @@ fn short_hash(seed: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hashed_label_is_one_stable_label() {
+        let short = hashed_label("shop-production", "shop-production@example.com#4");
+        assert!(short.starts_with("shop-production-"));
+        assert_eq!(short.len(), "shop-production-".len() + SHORT_HASH_LEN);
+        assert_eq!(
+            short,
+            hashed_label("shop-production", "shop-production@example.com#4"),
+            "the same environment keeps the same fallback name"
+        );
+        assert_ne!(
+            short,
+            hashed_label("shop-production", "shop-production@example.com#5")
+        );
+        let long = hashed_label(&"a".repeat(80), "seed");
+        assert!(long.len() <= DNS_LABEL_MAX_LEN);
+        assert!(!long.contains('.'));
+    }
 
     #[test]
     fn base_domain_strips_wildcard_prefix() {

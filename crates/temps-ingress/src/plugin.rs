@@ -26,7 +26,8 @@ use crate::reachability::handlers::{
     configure_routes as reachability_routes, ReachabilityApiDoc, ReachabilityAppState,
 };
 use crate::reachability::{
-    EnvironmentAddressService, ReachabilityDeps, ReachabilityService, WaysIn,
+    EnvironmentAddressService, EnvironmentHostService, ReachabilityDeps, ReachabilityService,
+    WaysIn,
 };
 use crate::service::IngressConnectorService;
 use temps_config::ConfigService;
@@ -107,7 +108,18 @@ impl TempsPlugin for IngressPlugin {
         context
             .require_service::<temps_core::environment_address::EnvironmentAddressSlot>()
             .set(addresses.clone());
-        let address_state = Arc::new(AddressAppState { service: addresses });
+        // ADR 068 D3: the reconciler keeps tunnel environment hosts in line
+        // with the environments, before every reconcile.
+        let environment_hosts = Arc::new(EnvironmentHostService::new(
+            reachability.clone(),
+            addresses.clone(),
+        ));
+        service.set_environment_host_sync(environment_hosts.clone());
+        let address_state = Arc::new(AddressAppState {
+            service: addresses,
+            environment_hosts,
+            audit_service: audit_service.clone(),
+        });
         let reachability_state = Arc::new(ReachabilityAppState {
             service: reachability,
             audit_service: audit_service.clone(),

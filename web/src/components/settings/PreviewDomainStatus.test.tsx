@@ -11,7 +11,10 @@ import { PreviewDomainStatusView } from './PreviewDomainStatus'
 installBrowserWindow()
 afterEach(cleanup)
 
-function renderStatus(status: PreviewDomainStatusResponse['status']) {
+function renderStatus(
+  status: PreviewDomainStatusResponse['status'],
+  tunnel: string | null = null
+) {
   return render(
     <MemoryRouter>
       <PreviewDomainStatusView
@@ -19,6 +22,7 @@ function renderStatus(status: PreviewDomainStatusResponse['status']) {
           preview_domain: 'localho.st',
           status,
           reason: 'Names under localho.st resolve to 127.0.0.1.',
+          tunnel_environment_hosts: tunnel,
           checked_at: '2026-10-25T10:00:00Z',
         }}
       />
@@ -40,5 +44,13 @@ test('a local-only preview domain warns and points at the fixes', () => {
 test('a usable preview domain is a quiet confirmation, not a warning', () => {
   const { container } = renderStatus('usable')
   expect(container.textContent).toContain('Anyone can open these names')
+  expect(container.querySelector('[role="alert"]')).toBeNull()
+})
+
+test('a tunnel publishing every environment makes the local domain no problem', () => {
+  const { container } = renderStatus('local_only', 'edge')
+  expect(container.textContent).toContain(
+    'Tunnel edge gives every environment an address'
+  )
   expect(container.querySelector('[role="alert"]')).toBeNull()
 })
