@@ -13,6 +13,9 @@
 //! - [`gate_handlers`] is the console's half of the signed-in gate (ADR 065),
 //!   and [`gate_check`] checks that it is in front of an address (D10).
 
+pub mod access;
+pub mod access_handlers;
+pub mod access_service;
 pub mod compute;
 pub mod gate_check;
 pub mod gate_handlers;

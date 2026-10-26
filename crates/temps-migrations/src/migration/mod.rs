@@ -380,6 +380,7 @@ mod m20261023_000002_add_serves_own_temps_api_to_projects;
 mod m20261024_000001_reachability;
 mod m20261025_000001_private_audience;
 mod m20261027_000001_signed_in_gate;
+mod m20261027_000002_cloudflare_access;
 
 pub struct Migrator;
 
@@ -850,6 +851,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261025_000001_private_audience::Migration),
             // ADR 065 D7/D8: the Temps gate for signed-in addresses.
             Box::new(m20261027_000001_signed_in_gate::Migration),
+            Box::new(m20261027_000002_cloudflare_access::Migration),
         ]
     }
 }

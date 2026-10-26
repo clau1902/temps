@@ -183,6 +183,10 @@ pub struct PlanRequest {
     pub audience: Audience,
     /// The hostname to make reachable; Temps suggests one without it.
     pub address: Option<String>,
+    /// For `signed_in`: the gate to put in front of it (ADR 065 D7). The
+    /// Temps sign-in when absent.
+    #[serde(default)]
+    pub gate: Option<GateKind>,
 }
 
 /// One way to make the address reachable.
@@ -249,6 +253,9 @@ pub enum StepKind {
     /// Records who an address is for, and for a private one the network
     /// range and the listener that serve it (ADR 064 D5).
     SetAudience,
+    /// Uses the Cloudflare Access application covering the address, or
+    /// creates one (ADR 065 D9).
+    AccessApp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -304,6 +311,9 @@ pub struct ReachabilityPlan {
     #[schema(value_type = Option<String>, format = DateTime)]
     pub expires_at: Option<temps_core::DBDateTime>,
     pub audience: Audience,
+    /// For `signed_in`: the gate the plan puts in front of the address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateKind>,
     /// The address asked for, or the one Temps suggests.
     pub address: Option<String>,
     /// Why the address cannot be used, when it cannot.
@@ -563,7 +573,37 @@ pub enum RunResource {
     Certificate {
         domain: String,
     },
+    /// A Cloudflare Access application the run created (ADR 065 D9). Undo
+    /// deletes it only while its domain is still `hostname`, and asks
+    /// first when its policies no longer match `policies`.
+    AccessApp {
+        provider_id: i32,
+        id: String,
+        name: String,
+        hostname: String,
+        aud: String,
+        /// The policies' fingerprint when the run created it.
+        policies: String,
+    },
 }
+
+/// The Cloudflare Access application in front of a signed-in address
+/// (ADR 065 D9): its JWTs carry `aud`, from the team of `provider_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AccessBinding {
+    pub provider_id: i32,
+    pub app_id: String,
+    pub aud: String,
+}
+
+/// [`AddressAudience::who`]: the audience, and for a signed-in address its
+/// gate, its list, and the Access application `(provider, app id)`.
+pub type Who = (
+    Audience,
+    Option<GateKind>,
+    Option<GateAllowList>,
+    Option<(i32, String)>,
+);
 
 /// Who one address is for, with what bounds a private one (ADR 064 D5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
@@ -586,6 +626,10 @@ pub struct AddressAudience {
     /// sign in. `None` admits everyone with access to the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_allow: Option<GateAllowList>,
+    /// For `signed_in` with Cloudflare Access: the application in front of
+    /// it (ADR 065 D9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_access: Option<AccessBinding>,
 }
 
 impl AddressAudience {
@@ -609,17 +653,23 @@ impl AddressAudience {
     /// for a signed-in one its gate and list. Changing it is the sensitive
     /// action (ADR 064 Security, ADR 065 D7), and it revokes the address's
     /// gate sessions (D8).
-    pub fn who(&self) -> (Audience, Option<GateKind>, Option<GateAllowList>) {
+    pub fn who(&self) -> Who {
         if self.audience != Audience::SignedIn {
-            return (self.audience, None, None);
+            return (self.audience, None, None, None);
         }
+        let gate = self.gate.unwrap_or_default();
         (
             self.audience,
-            Some(self.gate.unwrap_or_default()),
+            Some(gate),
             self.gate_allow
                 .clone()
                 .map(GateAllowList::normalized)
                 .filter(|list| !list.is_empty()),
+            // Which Access app decides who gets in is part of who it is for.
+            self.gate_access
+                .as_ref()
+                .filter(|_| gate == GateKind::CloudflareAccess)
+                .map(|access| (access.provider_id, access.app_id.clone())),
         )
     }
 
@@ -627,9 +677,9 @@ impl AddressAudience {
     /// `signed_in:cloudflare_access`, `signed_in:temps+list`).
     pub fn who_label(&self) -> String {
         match self.who() {
-            (audience, None, _) => audience.as_str().to_string(),
-            (audience, Some(gate), None) => format!("{}:{}", audience.as_str(), gate.as_str()),
-            (audience, Some(gate), Some(_)) => {
+            (audience, None, _, _) => audience.as_str().to_string(),
+            (audience, Some(gate), None, _) => format!("{}:{}", audience.as_str(), gate.as_str()),
+            (audience, Some(gate), Some(_), _) => {
                 format!("{}:{}+list", audience.as_str(), gate.as_str())
             }
         }
@@ -688,6 +738,9 @@ impl RunResource {
                 before.describe()
             ),
             RunResource::Certificate { domain } => format!("Certificate for {domain}"),
+            RunResource::AccessApp { name, hostname, .. } => {
+                format!("Cloudflare Access app {name} for {hostname}")
+            }
         }
     }
 }
@@ -747,6 +800,13 @@ pub enum Intent {
     Certificate {
         domain: String,
     },
+    /// Found by its name, which the run picks before creating it, and its
+    /// domain (ADR 065 D9).
+    AccessApp {
+        provider_id: i32,
+        name: String,
+        hostname: String,
+    },
 }
 
 /// Whether a lookup that misses proves the resource absent (ADR 064 D4).
@@ -770,10 +830,14 @@ impl Intent {
     pub fn authority(&self) -> LookupAuthority {
         use std::time::Duration;
         match self {
-            Intent::DnsRecord { .. } | Intent::DnsChange { .. } => LookupAuthority::Settled {
-                timeout: Duration::from_secs(30),
-                settle: Duration::from_secs(30),
-            },
+            // Cloudflare documents no read-after-write guarantee for listing
+            // Access applications either.
+            Intent::DnsRecord { .. } | Intent::DnsChange { .. } | Intent::AccessApp { .. } => {
+                LookupAuthority::Settled {
+                    timeout: Duration::from_secs(30),
+                    settle: Duration::from_secs(30),
+                }
+            }
             // A tunnel is found by its Temps row, which is committed
             // before Temps asks Cloudflare for anything: a create refused
             // before the row made nothing at Cloudflare, and one that got
@@ -800,6 +864,10 @@ impl Intent {
                 record_type,
                 ..
             } => format!("Check the {record_type} record for `{hostname}` at your DNS provider."),
+            Intent::AccessApp { name, hostname, .. } => format!(
+                "Check whether an Access application named `{name}` for `{hostname}` exists in \
+                 Cloudflare (Zero Trust → Access → Applications)."
+            ),
             other => format!("Check whether {} exists.", other.describe()),
         }
     }
@@ -842,6 +910,11 @@ impl Intent {
             }
             Intent::AddressAudience { hostname, .. } => format!("audience/{hostname}"),
             Intent::Certificate { domain } => format!("certificate/{domain}"),
+            Intent::AccessApp {
+                provider_id,
+                hostname,
+                ..
+            } => format!("access_app/{provider_id}/{hostname}"),
         };
         format!("run-{run_id}/{what}")
     }
@@ -869,6 +942,9 @@ impl Intent {
                 format!("{hostname} made {}", after.describe())
             }
             Intent::Certificate { domain } => format!("Certificate for {domain}"),
+            Intent::AccessApp { name, hostname, .. } => {
+                format!("Cloudflare Access app {name} for {hostname}")
+            }
         }
     }
 }

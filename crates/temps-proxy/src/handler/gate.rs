@@ -22,6 +22,7 @@ use temps_core::gate::{
     self, GateClaims, GateDecision, GateLogoutRequest, GatePolicy, GateRedeemRequest, GateRequest,
     GateResponse, GATE_COOKIE, IDENTITY_HEADERS,
 };
+use temps_core::gate_access::{self, AccessRejection};
 use temps_routes::gate::{GateService, GateServiceError};
 use temps_routes::CachedPeerTable;
 use tracing::{error, info, warn};
@@ -101,6 +102,22 @@ impl ProxyGate {
             }
             GateDecision::NotFound => {
                 GateOutcome::Respond(GateResponse::not_found(), "gate_not_found")
+            }
+            // Cloudflare Access (D9) only sees tunnel traffic, and tunnels end
+            // at a worker's tunnel origin, never at this proxy: an Access
+            // address is refused here whatever the request carries.
+            GateDecision::AdmitAccess(_) => GateOutcome::Respond(
+                gate_access::access_denied(AccessRejection::NotThroughTunnel),
+                "gate_access_denied",
+            ),
+            GateDecision::AccessDenied(rejection) => {
+                info!(
+                    address_id = %policy.address_id,
+                    host = %request.hostname,
+                    reason = rejection.as_str(),
+                    "Cloudflare Access address refused on the control-plane proxy"
+                );
+                GateOutcome::Respond(gate_access::access_denied(rejection), "gate_access_denied")
             }
             GateDecision::Callback => self.callback(policy, request, now).await,
             GateDecision::Logout => self.logout(policy, request).await,
@@ -326,6 +343,7 @@ mod tests {
             query,
             headers,
             secure: true,
+            via_tunnel: false,
         }
     }
 
@@ -347,6 +365,38 @@ mod tests {
             .filter(|(n, _)| *n == name)
             .map(|(_, v)| v.as_str())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_cloudflare_access_address_is_always_refused_on_the_proxy() {
+        let policy = GatePolicy {
+            address_id: "custom:7".into(),
+            gate: GateKind::CloudflareAccess,
+            temps: None,
+            access: Some(temps_core::gate::AccessGate {
+                issuer: "https://team.cloudflareaccess.com".into(),
+                audience: "aud-1".into(),
+                keys: vec![],
+            }),
+        };
+        let mut headers = HeaderMap::new();
+        // Whatever the request carries: a JWT header here never came
+        // through Access.
+        headers.insert(
+            gate_access::ACCESS_JWT_HEADER,
+            HeaderValue::from_static("a.b.c"),
+        );
+        for path in ["/", "/_temps/gate/callback"] {
+            let outcome = proxy_gate()
+                .evaluate(&policy, &request(&Method::GET, path, None, &headers), 1_000)
+                .await;
+            let GateOutcome::Respond(answer, status) = outcome else {
+                panic!("an Access address was admitted on the proxy");
+            };
+            assert_eq!(status, "gate_access_denied");
+            assert_eq!(answer.status, 403);
+            assert_eq!(header(&answer, GATE_HEADER), vec![gate::GATE_ACCESS]);
+        }
     }
 
     #[tokio::test]

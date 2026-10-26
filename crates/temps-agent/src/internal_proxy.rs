@@ -197,6 +197,10 @@ struct ProxyState {
     /// origin is told `https` by the provider, which terminated TLS, so it
     /// has no server name to check.
     require_sni: bool,
+    /// The loopback origin a tunnel connector forwards to (ADR 058). The
+    /// only listener that may serve a Cloudflare Access address, since
+    /// Access only sees tunnel traffic (ADR 065 D9).
+    tunnel_origin: bool,
     acme: Option<PublicAcmeConfig>,
     acme_relay: Arc<AcmeRelayState>,
 }
@@ -293,6 +297,7 @@ pub async fn spawn(
         public_mode: false,
         private_mode: false,
         require_sni: false,
+        tunnel_origin: false,
         forwarded_proto: "http",
         acme: None,
         acme_relay: Arc::new(AcmeRelayState::new()),
@@ -526,6 +531,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, mut req: Request) -> Respo
                 policy,
                 &host,
                 state.forwarded_proto == "https",
+                state.tunnel_origin,
                 &method,
                 &uri,
                 req.headers_mut(),
@@ -632,7 +638,7 @@ pub(crate) fn public_router(
     forwarded_proto: &'static str,
     acme: Option<PublicAcmeConfig>,
 ) -> std::io::Result<axum::Router> {
-    public_router_with(store, forwarded_proto, acme, true)
+    public_router_with(store, forwarded_proto, acme, true, false)
 }
 
 /// The private listener's router (ADR 064 D5): no ACME relay (a private
@@ -641,7 +647,7 @@ pub(crate) fn private_router(
     store: SharedRouteStore,
     forwarded_proto: &'static str,
 ) -> std::io::Result<axum::Router> {
-    router_with(store, forwarded_proto, None, true, true)
+    router_with(store, forwarded_proto, None, true, true, false)
 }
 
 /// The loopback origin an ingress connector forwards to (ADR 058): serves
@@ -665,8 +671,8 @@ pub async fn spawn_tunnel_origin(
         .map(|name| HeaderName::from_bytes(name.as_bytes()))
         .transpose()
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let app = public_router_with(store, "https", None, false)?.layer(axum::middleware::from_fn(
-        move |mut req: Request, next: axum::middleware::Next| {
+    let app = public_router_with(store, "https", None, false, true)?.layer(
+        axum::middleware::from_fn(move |mut req: Request, next: axum::middleware::Next| {
             let header = header.clone();
             async move {
                 if let Some(name) = &header {
@@ -687,8 +693,8 @@ pub async fn spawn_tunnel_origin(
                 }
                 next.run(req).await
             }
-        },
-    ));
+        }),
+    );
     tokio::spawn(async move {
         let server = axum::serve(
             listener,
@@ -709,8 +715,16 @@ fn public_router_with(
     forwarded_proto: &'static str,
     acme: Option<PublicAcmeConfig>,
     require_sni: bool,
+    tunnel_origin: bool,
 ) -> std::io::Result<axum::Router> {
-    router_with(store, forwarded_proto, acme, require_sni, false)
+    router_with(
+        store,
+        forwarded_proto,
+        acme,
+        require_sni,
+        false,
+        tunnel_origin,
+    )
 }
 
 fn router_with(
@@ -719,6 +733,7 @@ fn router_with(
     acme: Option<PublicAcmeConfig>,
     require_sni: bool,
     private_mode: bool,
+    tunnel_origin: bool,
 ) -> std::io::Result<axum::Router> {
     let client = reqwest::Client::builder()
         .connect_timeout(UPSTREAM_TIMEOUT)
@@ -740,6 +755,7 @@ fn router_with(
         private_mode,
         forwarded_proto,
         require_sni,
+        tunnel_origin,
         acme,
         acme_relay: Arc::new(AcmeRelayState::new()),
     });

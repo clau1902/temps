@@ -41,6 +41,17 @@ pub struct Model {
     /// Gate tokens issued before this time are refused (ADR 065 D8).
     #[serde(default)]
     pub gate_not_before: Option<DBDateTime>,
+    /// For a `cloudflare_access` gate (ADR 065 D9): the Access token
+    /// provider whose app stands in front of the address.
+    #[serde(default)]
+    pub gate_access_provider_id: Option<i32>,
+    /// That Access app's id at Cloudflare.
+    #[serde(default)]
+    pub gate_access_app_id: Option<String>,
+    /// That Access app's AUD tag: what a listener checks a JWT's `aud`
+    /// against.
+    #[serde(default)]
+    pub gate_access_aud: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

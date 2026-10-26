@@ -89,8 +89,11 @@ import {
   conflictSubject,
   conflictsToDecide,
   defaultOption,
+  accessPolicyMissing,
   isActiveRun,
   missingAnswers,
+  planGate,
+  SIGN_IN_GATES,
   planIsCurrent,
   privateDnsWarning,
   resumeNeedsToken,
@@ -101,6 +104,8 @@ import { cn } from '@/lib/utils'
 const schema = z.object({
   /** Who can open the address (ADR 064 D5, ADR 065 D7). */
   audience: z.enum(['public', 'signed_in', 'private']),
+  /** For a signed-in address: which sign-in (ADR 065 D9). */
+  gate: z.enum(['temps', 'cloudflare_access']),
   address: z.string().trim(),
   option: z.string().min(1, 'Pick a way in.'),
   values: z.record(z.string(), z.string()),
@@ -134,6 +139,7 @@ export function MakeReachableDialog({
     resolver: zodResolver(schema),
     defaultValues: {
       audience: 'public',
+      gate: 'temps',
       address: '',
       option: '',
       values: {},
@@ -145,11 +151,14 @@ export function MakeReachableDialog({
   const chosen = useWatch({ control: form.control, name: 'option' })
   const answers = useWatch({ control: form.control, name: 'values' })
   const audience = useWatch({ control: form.control, name: 'audience' })
+  const gateChoice = useWatch({ control: form.control, name: 'gate' })
+  const gate = planGate(audience, gateChoice)
   const planKey = [
     'reachabilityPlan',
     projectId,
     environmentId,
     audience,
+    gate,
     requested,
   ]
 
@@ -180,7 +189,7 @@ export function MakeReachableDialog({
     queryFn: async ({ signal }) => {
       const { data } = await planEnvironmentReachability({
         path,
-        body: { audience, address: requested || null },
+        body: { audience, address: requested || null, gate },
         signal,
         throwOnError: true,
       })
@@ -287,6 +296,11 @@ export function MakeReachableDialog({
       form.setError('values', {
         message: `Still needed: ${missing.join(', ')}.`,
       })
+      return
+    }
+    const noOne = accessPolicyMissing(fields, values.values)
+    if (noOne) {
+      form.setError('values', { message: noOne })
       return
     }
     const planId = planCurrent ? plan.data?.plan_id : undefined
@@ -457,6 +471,54 @@ export function MakeReachableDialog({
                     </FormItem>
                   )}
                 />
+                {audience === 'signed_in' && (
+                  <FormField
+                    control={form.control}
+                    name="gate"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Sign in with</FormLabel>
+                        <FormControl>
+                          <RadioGroup
+                            aria-label="Sign in with"
+                            value={field.value}
+                            onValueChange={(next) => {
+                              field.onChange(next)
+                              form.setValue('option', '')
+                              form.setValue('confirmed', false)
+                            }}
+                            className="grid gap-2 sm:grid-cols-2"
+                          >
+                            {SIGN_IN_GATES.map((choice) => (
+                              <label
+                                key={choice.value}
+                                className={cn(
+                                  'flex cursor-pointer items-start gap-2 rounded-md border p-3',
+                                  field.value === choice.value
+                                    ? 'border-primary'
+                                    : 'border-border hover:border-primary/50'
+                                )}
+                              >
+                                <RadioGroupItem
+                                  value={choice.value}
+                                  className="mt-0.5"
+                                />
+                                <span className="space-y-0.5">
+                                  <span className="block text-sm font-medium">
+                                    {choice.label}
+                                  </span>
+                                  <span className="block text-xs text-muted-foreground">
+                                    {choice.help}
+                                  </span>
+                                </span>
+                              </label>
+                            ))}
+                          </RadioGroup>
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+                )}
                 <FormField
                   control={form.control}
                   name="address"
@@ -609,7 +671,7 @@ const AUDIENCES = [
   {
     value: 'signed_in',
     label: 'People who sign in',
-    help: 'A public address with the Temps sign-in in front: only people with access to this project get in.',
+    help: 'A public address with a sign-in in front: the Temps sign-in, or Cloudflare Access.',
   },
   {
     value: 'private',

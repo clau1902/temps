@@ -29,7 +29,7 @@ use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use temps_core::gate::{GateKind, GatePolicy, TempsGate};
+use temps_core::gate::{AccessGate, GateKind, GatePolicy, TempsGate};
 use temps_core::public_hostname_resolver::match_strategy;
 use temps_core::{
     AppSettings, ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext,
@@ -803,6 +803,9 @@ struct GatedMeta {
     address_id: String,
     gate: GateKind,
     not_before: i64,
+    /// For Cloudflare Access (D9): the Access token whose team signs the
+    /// JWTs, and the app's AUD.
+    access: Option<(i32, String)>,
 }
 
 impl GatedMeta {
@@ -810,13 +813,22 @@ impl GatedMeta {
         address_id: String,
         gate: Option<&str>,
         not_before: Option<chrono::DateTime<chrono::Utc>>,
+        access_provider_id: Option<i32>,
+        access_aud: Option<&str>,
     ) -> GatedMeta {
+        let gate = gate.map_or(GateKind::Unsupported, GateKind::parse);
         GatedMeta {
             address_id,
             // A signed-in row with no gate is not something Temps writes;
             // it reads as unsupported and serves nobody.
-            gate: gate.map_or(GateKind::Unsupported, GateKind::parse),
+            gate,
             not_before: not_before.map_or(0, |t| t.timestamp()),
+            access: match (gate, access_provider_id, access_aud) {
+                (GateKind::CloudflareAccess, Some(provider), Some(aud)) if !aud.is_empty() => {
+                    Some((provider, aud.to_string()))
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -849,12 +861,15 @@ fn console_origin(external_url: &str) -> Option<String> {
 
 /// The gate policy of every signed-in address (ADR 065 D8). Without a gate
 /// key or a console URL the Temps gate cannot run, and the policy carries
-/// no `temps` part: every listener then answers `503`, never the app.
+/// no `temps` part: every listener then answers `503`, never the app. An
+/// Access address whose token or AUD is missing carries no `access` part,
+/// with the same effect (D9).
 fn build_gate_policies(
     gated_meta: HashMap<String, GatedMeta>,
     public_key: Option<&str>,
     authorize_url: Option<&str>,
     mut revoked: HashMap<String, Vec<String>>,
+    access_teams: &HashMap<i32, crate::access_keys::AccessTeam>,
 ) -> HashMap<String, Arc<GatePolicy>> {
     gated_meta
         .into_iter()
@@ -868,11 +883,18 @@ fn build_gate_policies(
                 }),
                 _ => None,
             };
+            let access = meta.access.as_ref().and_then(|(provider, aud)| {
+                access_teams.get(provider).map(|team| AccessGate {
+                    issuer: team.issuer.clone(),
+                    audience: aud.clone(),
+                    keys: team.keys.clone(),
+                })
+            });
             let policy = GatePolicy {
                 address_id: meta.address_id,
                 gate: meta.gate,
                 temps,
-                access: None,
+                access,
             };
             (host, Arc::new(policy))
         })
@@ -1877,6 +1899,8 @@ impl CachedPeerTable {
                         temps_core::worker_ingress::private_address_id(false, env_domain.id),
                         env_domain.gate.as_deref(),
                         env_domain.gate_not_before,
+                        env_domain.gate_access_provider_id,
+                        env_domain.gate_access_aud.as_deref(),
                     ),
                 );
             } else if env_domain.audience != temps_entities::audience::PUBLIC {
@@ -2173,6 +2197,8 @@ impl CachedPeerTable {
                         temps_core::worker_ingress::private_address_id(true, custom_domain.id),
                         custom_domain.gate.as_deref(),
                         custom_domain.gate_not_before,
+                        custom_domain.gate_access_provider_id,
+                        custom_domain.gate_access_aud.as_deref(),
                     ),
                 );
             } else if custom_domain.audience != temps_entities::audience::PUBLIC {
@@ -3301,6 +3327,12 @@ impl CachedPeerTable {
         } else {
             let public_key = crate::gate::current_public_key(self.db.as_ref()).await?;
             let revoked = crate::gate::revoked_sessions(self.db.as_ref()).await?;
+            // Cloudflare Access teams are read only when an address uses one.
+            let access_teams = if gated_meta.values().any(|m| m.access.is_some()) {
+                crate::access_keys::access_teams(self.db.as_ref()).await?
+            } else {
+                HashMap::new()
+            };
             build_gate_policies(
                 gated_meta,
                 public_key.as_deref(),
@@ -3311,6 +3343,7 @@ impl CachedPeerTable {
                     .map(|origin| format!("{origin}{}", temps_core::gate::AUTHORIZE_PATH))
                     .as_deref(),
                 revoked,
+                &access_teams,
             )
         };
 
@@ -5501,6 +5534,9 @@ mod tests {
                             gate: None,
                             gate_allow: None,
                             gate_not_before: None,
+                            gate_access_provider_id: None,
+                            gate_access_app_id: None,
+                            gate_access_aud: None,
                         }]])
                         .append_query_results([vec![environment.clone()]])
                         .append_query_results([vec![deployment.clone()]])
@@ -7057,6 +7093,7 @@ mod gate_tests {
             address_id: address_id.to_string(),
             gate,
             not_before: 100,
+            access: None,
         }
     }
 
@@ -7098,6 +7135,7 @@ mod gate_tests {
             Some("pk"),
             Some("https://c.example.test/_temps/gate/authorize"),
             revoked,
+            &HashMap::new(),
         );
         let a = policies["a.example.test"]
             .temps
@@ -7124,7 +7162,7 @@ mod gate_tests {
                 "a.example.test".to_string(),
                 meta("custom:1", GateKind::Temps),
             );
-            let policies = build_gate_policies(gated, key, url, HashMap::new());
+            let policies = build_gate_policies(gated, key, url, HashMap::new(), &HashMap::new());
             assert!(policies["a.example.test"].temps.is_none());
         }
         // A gate this version does not implement is never given a Temps part.
@@ -7133,12 +7171,77 @@ mod gate_tests {
             "a.example.test".to_string(),
             meta("custom:1", GateKind::Unsupported),
         );
-        let policies = build_gate_policies(gated, Some("pk"), Some("u"), HashMap::new());
+        let policies = build_gate_policies(
+            gated,
+            Some("pk"),
+            Some("u"),
+            HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(policies["a.example.test"].temps.is_none());
         assert_eq!(
-            GatedMeta::from_row("custom:1".into(), None, None).gate,
+            GatedMeta::from_row("custom:1".into(), None, None, None, None).gate,
             GateKind::Unsupported
         );
+    }
+
+    #[test]
+    fn an_access_address_gets_its_teams_keys_and_its_own_aud() {
+        let team = crate::access_keys::AccessTeam {
+            issuer: "https://team.cloudflareaccess.com".into(),
+            keys: vec![temps_core::gate::AccessKey {
+                kid: "k1".into(),
+                n: "n".into(),
+                e: "AQAB".into(),
+            }],
+        };
+        let teams = HashMap::from([(3, team.clone())]);
+        let mut gated = HashMap::new();
+        gated.insert(
+            "a.example.test".to_string(),
+            GatedMeta::from_row(
+                "custom:1".into(),
+                Some("cloudflare_access"),
+                None,
+                Some(3),
+                Some("aud-a"),
+            ),
+        );
+        // A token that is gone, or no AUD: no Access part, so nobody is let in.
+        gated.insert(
+            "b.example.test".to_string(),
+            GatedMeta::from_row(
+                "custom:2".into(),
+                Some("cloudflare_access"),
+                None,
+                Some(9),
+                Some("aud-b"),
+            ),
+        );
+        gated.insert(
+            "c.example.test".to_string(),
+            GatedMeta::from_row(
+                "custom:3".into(),
+                Some("cloudflare_access"),
+                None,
+                Some(3),
+                None,
+            ),
+        );
+        // A Temps gate never picks up Access fields left on its row.
+        gated.insert(
+            "d.example.test".to_string(),
+            GatedMeta::from_row("custom:4".into(), Some("temps"), None, Some(3), Some("x")),
+        );
+        let policies = build_gate_policies(gated, Some("pk"), Some("u"), HashMap::new(), &teams);
+        let a = policies["a.example.test"].access.clone().expect("access");
+        assert_eq!(a.issuer, team.issuer);
+        assert_eq!(a.audience, "aud-a");
+        assert_eq!(a.keys, team.keys);
+        assert!(policies["a.example.test"].temps.is_none());
+        assert!(policies["b.example.test"].access.is_none());
+        assert!(policies["c.example.test"].access.is_none());
+        assert!(policies["d.example.test"].access.is_none());
     }
 
     #[test]

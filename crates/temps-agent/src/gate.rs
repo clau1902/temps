@@ -25,9 +25,10 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use temps_core::gate::{
-    self, GateDecision, GateLogoutRequest, GatePolicy, GateRedeemRequest, GateRedeemResponse,
-    GateRequest, GateResponse, GATE_COOKIE,
+    self, GateAccessKeysRequest, GateDecision, GateLogoutRequest, GatePolicy, GateRedeemRequest,
+    GateRedeemResponse, GateRequest, GateResponse, GATE_COOKIE,
 };
+use temps_core::gate_access::{self, AccessRejection};
 use tracing::{error, info, warn};
 
 pub use temps_core::gate::GATE_CAPABILITY;
@@ -39,6 +40,14 @@ const CONTROL_PLANE_STALE_AFTER_SECS: i64 = 90;
 
 /// Timeout for one redeem or logout call.
 const CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// At most one "fetch the Access keys again" request per this many seconds
+/// from this agent, however many requests carry an unknown key (D9). The
+/// control plane rate-limits the fetch itself as well.
+const ACCESS_KEYS_REQUEST_EVERY_SECS: i64 = 60;
+
+/// Unix seconds of the last Access keys request, or 0.
+static LAST_ACCESS_KEYS_REQUEST: AtomicI64 = AtomicI64::new(0);
 
 /// Unix seconds of the last successful exchange with the control plane, or
 /// 0 before the first one.
@@ -152,6 +161,40 @@ impl GateChannel {
         mark_control_plane_contact();
         Ok(())
     }
+
+    pub async fn access_keys(&self, request: &GateAccessKeysRequest) -> Result<(), ChannelError> {
+        self.post("access-keys", request).await?;
+        mark_control_plane_contact();
+        Ok(())
+    }
+}
+
+/// Whether an Access keys request may go out at `now`, given the last one
+/// at `*last`; claims the slot when it may. Lock-free: one compare-exchange.
+fn claim_access_keys_slot(last: &AtomicI64, now: i64) -> bool {
+    let previous = last.load(Ordering::Acquire);
+    if previous != 0 && now - previous < ACCESS_KEYS_REQUEST_EVERY_SECS {
+        return false;
+    }
+    last.compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Ask the control plane, in the background, to fetch the Access keys of
+/// the team behind `address_id` again. Never delays the visitor's answer.
+fn request_access_keys(channel: &GateChannel, address_id: &str, now: i64) {
+    if !claim_access_keys_slot(&LAST_ACCESS_KEYS_REQUEST, now) {
+        return;
+    }
+    let channel = channel.clone();
+    let request = GateAccessKeysRequest {
+        address_id: address_id.to_string(),
+    };
+    tokio::spawn(async move {
+        if let Err(error) = channel.access_keys(&request).await {
+            warn!(address_id = %request.address_id, ?error, "could not ask the control plane to fetch the Cloudflare Access keys again");
+        }
+    });
 }
 
 /// Install the channel once, at agent start.
@@ -176,11 +219,13 @@ pub enum Enforced {
 
 /// Run the gate for a request to `hostname`, whose route carries `policy`.
 /// `secure` is whether the browser reached this listener over HTTPS
-/// (the HTTPS listener, or a tunnel whose edge terminated TLS).
+/// (the HTTPS listener, or a tunnel whose edge terminated TLS);
+/// `via_tunnel` whether this listener is a tunnel's origin.
 pub async fn enforce(
     policy: &GatePolicy,
     hostname: &str,
     secure: bool,
+    via_tunnel: bool,
     method: &Method,
     uri: &axum::http::Uri,
     headers: &mut HeaderMap,
@@ -189,6 +234,7 @@ pub async fn enforce(
         policy,
         hostname,
         secure,
+        via_tunnel,
         method,
         uri,
         headers,
@@ -204,6 +250,7 @@ async fn enforce_with(
     policy: &GatePolicy,
     hostname: &str,
     secure: bool,
+    via_tunnel: bool,
     method: &Method,
     uri: &axum::http::Uri,
     headers: &mut HeaderMap,
@@ -219,6 +266,7 @@ async fn enforce_with(
         query: uri.query(),
         headers,
         secure,
+        via_tunnel,
     };
     let decision = match gate::decide(policy, &request, now) {
         Ok(decision) => decision,
@@ -248,6 +296,18 @@ async fn enforce_with(
         GateDecision::Unavailable { reason } => {
             warn!(address_id = %policy.address_id, host = hostname, reason, "signed-in route without a usable gate");
             GateResponse::unavailable(reason)
+        }
+        GateDecision::AdmitAccess(identity) => {
+            return Enforced::Admit(gate_access::access_identity_headers(&identity));
+        }
+        GateDecision::AccessDenied(rejection) => {
+            if rejection == AccessRejection::UnknownKey {
+                if let Some(channel) = channel {
+                    request_access_keys(channel, &policy.address_id, now);
+                }
+            }
+            info!(address_id = %policy.address_id, host = hostname, reason = rejection.as_str(), "Cloudflare Access refused a request");
+            gate_access::access_denied(rejection)
         }
         GateDecision::NotFound => GateResponse::not_found(),
         GateDecision::Callback => callback(policy, hostname, uri, headers, channel, now).await,
@@ -409,6 +469,7 @@ mod tests {
             policy,
             "app.example.test",
             true,
+            false,
             &method,
             &uri,
             headers,
@@ -433,7 +494,20 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_redeem = Arc::clone(&seen);
         let seen_logout = Arc::clone(&seen);
+        let seen_keys = Arc::clone(&seen);
         let app = axum::Router::new()
+            .route(
+                "/api/internal/nodes/9/gate/access-keys",
+                post(move |Json(body): Json<GateAccessKeysRequest>| {
+                    let seen = Arc::clone(&seen_keys);
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push(format!("access-keys {}", body.address_id));
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
             .route(
                 "/api/internal/nodes/9/gate/redeem",
                 post(
@@ -674,6 +748,7 @@ mod tests {
                 &policy(&key),
                 "app.example.test",
                 true,
+                false,
                 &Method::GET,
                 &uri,
                 &mut nav,
@@ -760,5 +835,97 @@ mod tests {
         );
         assert_eq!(answer.status(), StatusCode::OK);
         assert_eq!(seen.lock().unwrap().as_slice(), ["logout v1.a.b"]);
+    }
+
+    fn access_policy() -> GatePolicy {
+        GatePolicy {
+            address_id: "custom:5".into(),
+            gate: GateKind::CloudflareAccess,
+            temps: None,
+            access: Some(temps_core::gate::AccessGate {
+                issuer: "https://team.cloudflareaccess.com".into(),
+                audience: "aud-1".into(),
+                keys: vec![],
+            }),
+        }
+    }
+
+    /// A JWT whose header names RS256 and `kid`; the rest is never read
+    /// once the key is unknown.
+    fn jwt_with_kid(kid: &str) -> HeaderValue {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header = b64.encode(format!(r#"{{"alg":"RS256","kid":"{kid}","typ":"JWT"}}"#));
+        let claims = b64.encode(r#"{"aud":["aud-1"]}"#);
+        HeaderValue::from_str(&format!("{header}.{claims}.c2ln")).unwrap()
+    }
+
+    async fn run_access(
+        headers: &mut HeaderMap,
+        via_tunnel: bool,
+        channel: Option<&GateChannel>,
+        now: i64,
+    ) -> Response {
+        let uri: axum::http::Uri = "/".parse().unwrap();
+        response(
+            enforce_with(
+                &access_policy(),
+                "app.example.test",
+                true,
+                via_tunnel,
+                &Method::GET,
+                &uri,
+                headers,
+                channel,
+                now,
+                now,
+            )
+            .await,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_access_address_off_the_tunnel_is_refused_with_x_temps_gate_access() {
+        let mut headers = HeaderMap::new();
+        headers.insert(gate_access::ACCESS_JWT_HEADER, jwt_with_kid("k1"));
+        let answer = run_access(&mut headers, false, None, 1_000).await;
+        assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+        assert_eq!(answer.headers()[GATE_HEADER], gate::GATE_ACCESS);
+        let body = axum::body::to_bytes(answer.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("only through its"));
+        // Through the tunnel with no JWT: refused just the same.
+        let answer = run_access(&mut HeaderMap::new(), true, None, 1_000).await;
+        assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+        assert_eq!(answer.headers()[GATE_HEADER], gate::GATE_ACCESS);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_access_key_asks_for_the_keys_again_at_most_once_a_minute() {
+        let (channel, seen) = control_plane(StatusCode::OK).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(gate_access::ACCESS_JWT_HEADER, jwt_with_kid("rotated"));
+        let now = gate::unix_now();
+        LAST_ACCESS_KEYS_REQUEST.store(0, Ordering::Release);
+        for _ in 0..3 {
+            let answer = run_access(&mut headers, true, Some(&channel), now).await;
+            assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+        }
+        for _ in 0..50 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(seen.lock().unwrap().as_slice(), ["access-keys custom:5"]);
+    }
+
+    #[test]
+    fn the_access_keys_slot_is_claimed_once_per_minute() {
+        let last = AtomicI64::new(0);
+        assert!(claim_access_keys_slot(&last, 1_000));
+        assert!(!claim_access_keys_slot(&last, 1_030));
+        assert!(claim_access_keys_slot(&last, 1_060));
     }
 }

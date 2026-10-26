@@ -63,6 +63,9 @@ pub struct RouteSyncAppState {
     pub request_policy_gate: Arc<temps_core::RequestPolicyGateSlot>,
     /// Redeems sign-in codes and logs out for agents (ADR 065 D8).
     pub gate: Arc<crate::gate::GateService>,
+    /// Fetches Cloudflare Access keys again when an agent meets an unknown
+    /// one (ADR 065 D9).
+    pub access_keys: Arc<crate::access_keys::AccessKeyService>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -509,6 +512,10 @@ pub fn configure_routes() -> axum::Router<Arc<RouteSyncAppState>> {
         .route(
             "/internal/nodes/{node_id}/gate/logout",
             post(crate::gate_sync::post_gate_logout),
+        )
+        .route(
+            "/internal/nodes/{node_id}/gate/access-keys",
+            post(crate::gate_sync::post_gate_access_keys),
         )
 }
 
@@ -1281,6 +1288,9 @@ pub(crate) mod tests {
                     test_db.db.clone(),
                     Arc::clone(&encryption_service),
                 )),
+                access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
+                    test_db.db.clone(),
+                )),
             },
             &node,
             1,
@@ -1314,6 +1324,9 @@ pub(crate) mod tests {
                     gate: Arc::new(crate::gate::GateService::new(
                         test_db.db.clone(),
                         Arc::clone(&encryption_service),
+                    )),
+                    access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
+                        test_db.db.clone(),
                     )),
                 },
                 &node,
@@ -1367,6 +1380,9 @@ pub(crate) mod tests {
                     test_db.db.clone(),
                     Arc::clone(&encryption_service),
                 )),
+                access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
+                    test_db.db.clone(),
+                )),
             },
             &node,
             1,
@@ -1413,6 +1429,9 @@ pub(crate) mod tests {
                     gate: Arc::new(crate::gate::GateService::new(
                         test_db.db.clone(),
                         Arc::clone(&encryption_service),
+                    )),
+                    access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
+                        test_db.db.clone(),
                     )),
                 },
                 &node,

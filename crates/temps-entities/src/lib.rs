@@ -63,6 +63,7 @@ pub mod cloud_telemetry_bulk_jobs;
 pub mod cloud_telemetry_fidelity;
 pub mod cloud_telemetry_outbox;
 pub mod cloud_telemetry_write_mode;
+pub mod cloudflare_access_providers;
 pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;

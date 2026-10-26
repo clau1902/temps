@@ -29,6 +29,8 @@ import {
   audienceLabel,
   privateDnsWarning,
   wayInLabel,
+  planGate,
+  accessPolicyMissing,
 } from './reachability'
 
 const address = (
@@ -403,6 +405,16 @@ describe('conflicts (ADR 064 D4)', () => {
     intent: { type: 'connector', name: 'homelab' },
     conflict: 'other.example.com',
   })
+  const accessApp = entry({
+    key: 'run-1/access_app/3/app.example.com',
+    intent: {
+      type: 'access_app',
+      provider_id: 3,
+      name: 'temps-app.example.com-ab12',
+      hostname: 'app.example.com',
+    },
+    conflict: 'its policies were changed',
+  })
   const view = (state: RunView['state'], journal: JournalEntry[]): RunView => ({
     id: 1,
     audience: 'public',
@@ -443,6 +455,47 @@ describe('conflicts (ADR 064 D4)', () => {
       'keep',
       'overwrite',
     ])
+  })
+
+  test('an edited Access app is kept unless they say delete it (ADR 065 D9)', () => {
+    expect(conflictSubject(accessApp)).toBe(
+      'Cloudflare Access app temps-app.example.com-ab12'
+    )
+    expect(conflictChoices(accessApp, true)).toEqual([
+      { decision: 'keep', label: 'Keep the app' },
+      { decision: 'overwrite', label: 'Delete it anyway' },
+    ])
+  })
+})
+
+describe('signed-in gate choice (ADR 065 D7, D9)', () => {
+  const field = (key: string): SetupField =>
+    ({ key, label: key, kind: { type: 'text' }, required: false }) as SetupField
+
+  test('only a signed-in plan names a gate', () => {
+    expect(planGate('signed_in', 'cloudflare_access')).toBe('cloudflare_access')
+    expect(planGate('signed_in', 'temps')).toBe('temps')
+    expect(planGate('public', 'cloudflare_access')).toBeNull()
+    expect(planGate('private', 'temps')).toBeNull()
+  })
+
+  test('a new Access app needs someone to let in', () => {
+    const fields = [field('access_emails'), field('access_email_domains')]
+    expect(accessPolicyMissing(fields, {})).toMatch(/at least one email/)
+    expect(accessPolicyMissing(fields, { access_emails: ' , ' })).toMatch(
+      /at least one email/
+    )
+    expect(
+      accessPolicyMissing(fields, { access_emails: 'ana@example.com' })
+    ).toBeNull()
+    expect(
+      accessPolicyMissing(fields, { access_email_domains: 'example.com' })
+    ).toBeNull()
+  })
+
+  test('an option that uses an existing app asks nothing', () => {
+    expect(accessPolicyMissing([field('access_provider_id')], {})).toBeNull()
+    expect(accessPolicyMissing([], {})).toBeNull()
   })
 })
 

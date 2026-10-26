@@ -3760,6 +3760,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         encryption_service.clone(),
     ));
     service_context.register_service(gate_service.clone());
+    // Cloudflare Access signing keys (ADR 065 D9): fetched again every hour
+    // for the tokens in use, and when an agent meets an unknown key. The
+    // hourly loop reads nothing and fetches nothing while no address uses
+    // Access.
+    let access_key_service = Arc::new(temps_routes::access_keys::AccessKeyService::new(db.clone()));
+    service_context.register_service(access_key_service.clone());
+    tokio::spawn(access_key_service.clone().run_hourly());
 
     // Register TemplateService - provides project templates from YAML configuration
     // Bundled templates are loaded automatically; external file in data_dir can override them
@@ -5125,6 +5132,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         encryption_service: encryption_service.clone(),
         request_policy_gate: request_policy_gate_slot.clone(),
         gate: gate_service.clone(),
+        access_keys: access_key_service.clone(),
     });
     let route_sync_routes =
         temps_routes::route_sync::configure_routes().with_state(route_sync_state);

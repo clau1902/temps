@@ -1,6 +1,159 @@
 {
   "components": {
     "schemas": {
+      "AccessPermission": {
+        "enum": [
+          "apps_edit",
+          "organizations_read"
+        ],
+        "type": "string"
+      },
+      "AccessPermissionCheck": {
+        "properties": {
+          "detail": {
+            "description": "Why, and what to change on the token when it is not present.",
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "permission": {
+            "$ref": "#/components/schemas/AccessPermission"
+          },
+          "state": {
+            "$ref": "#/components/schemas/PermissionState"
+          }
+        },
+        "required": [
+          "permission",
+          "label",
+          "state",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "AccessProviderResponse": {
+        "description": "A saved Access token. The token itself is never returned.",
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "addresses": {
+            "description": "How many addresses it protects.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "api_token": {
+            "description": "Always `***`.",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "key_count": {
+            "description": "How many signing keys listeners have for it now.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "keys_fetched_at": {
+            "description": "When the team's signing keys were last fetched.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "team_domain": {
+            "description": "`<team>.cloudflareaccess.com`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "account_id",
+          "team_domain",
+          "api_token",
+          "key_count",
+          "addresses",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AccessTokenCheckRequest": {
+        "properties": {
+          "account_id": {
+            "description": "The Cloudflare account the Access applications live in (32 hex\ncharacters, from the dashboard URL or the account's overview page).",
+            "type": "string"
+          },
+          "token": {
+            "description": "The token, as pasted. Used for this check only; not stored.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "account_id"
+        ],
+        "type": "object"
+      },
+      "AccessTokenCheckResult": {
+        "properties": {
+          "error": {
+            "description": "Why it did not, or why the account could not be checked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/AccessPermissionCheck"
+            },
+            "type": "array"
+          },
+          "ready": {
+            "description": "Every permission is present and the team domain is known.",
+            "type": "boolean"
+          },
+          "team_domain": {
+            "description": "`<team>.cloudflareaccess.com`, when Organizations Read is present.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "token_url": {
+            "description": "Where to create a token.",
+            "type": "string"
+          },
+          "valid": {
+            "description": "Cloudflare accepted the token at all.",
+            "type": "boolean"
+          },
+          "warning": {
+            "description": "What the token can do beyond Temps' own apps.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "valid",
+          "permissions",
+          "ready",
+          "warning",
+          "token_url"
+        ],
+        "type": "object"
+      },
       "AcmeOrderResponse": {
         "properties": {
           "authorizations": {},
@@ -14261,6 +14414,27 @@
           "rustfs"
         ],
         "type": "string"
+      },
+      "CreateAccessProviderRequest": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "name": {
+            "description": "A name to tell tokens apart.",
+            "type": "string"
+          },
+          "token": {
+            "description": "Checked, then sealed; never returned.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "account_id",
+          "token"
+        ],
+        "type": "object"
       },
       "CreateAlertRuleRequest": {
         "properties": {
@@ -44856,6 +45030,14 @@
           "input"
         ],
         "type": "object"
+      },
+      "PermissionState": {
+        "enum": [
+          "present",
+          "missing",
+          "unverified"
+        ],
+        "type": "string"
       },
       "PgUpgradeLogResponse": {
         "properties": {
@@ -90727,6 +90909,253 @@
         ],
         "tags": [
           "Cloud"
+        ]
+      }
+    },
+    "/cloudflare-access/providers": {
+      "get": {
+        "operationId": "list_access_providers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AccessProviderResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The saved Cloudflare Access tokens. Tokens are never returned.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      },
+      "post": {
+        "operationId": "create_access_provider",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccessProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessProviderResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The token is missing a permission"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Check a Cloudflare Access token, then save it sealed. Refused, with the\ncheck in the detail, unless every permission is there.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
+    "/cloudflare-access/providers/check": {
+      "post": {
+        "operationId": "check_access_provider",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessTokenCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessTokenCheckResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Check which Cloudflare Access permissions a pasted token has: Access:\nApps and Policies Edit (probed with an app body Cloudflare rejects, so\nnothing is created) and Access: Organizations, Identity Providers, and\nGroups Read. The token is used for this check only and is not stored.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
+    "/cloudflare-access/providers/{provider_id}": {
+      "delete": {
+        "operationId": "delete_access_provider",
+        "parameters": [
+          {
+            "description": "Saved token",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "An address uses it"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a saved Cloudflare Access token. Refused while an address uses it.",
+        "tags": [
+          "Signed-in addresses"
         ]
       }
     },

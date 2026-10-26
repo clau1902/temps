@@ -158,6 +158,8 @@ export function conflictSubject(entry: JournalEntry): string {
       return `The ${intent.record_type} record for ${intent.hostname}`
     case 'connector':
       return `Tunnel ${intent.name}`
+    case 'access_app':
+      return `Cloudflare Access app ${intent.name}`
     default:
       return 'This step'
   }
@@ -186,6 +188,12 @@ export function conflictChoices(
     return [
       { decision: 'keep', label: 'Keep the tunnel' },
       { decision: 'overwrite', label: 'Remove it anyway' },
+    ]
+  // ADR 065 D9: an Access app someone edited is kept unless they say so.
+  if (type === 'access_app')
+    return [
+      { decision: 'keep', label: 'Keep the app' },
+      { decision: 'overwrite', label: 'Delete it anyway' },
     ]
   if (type === 'dns_record') return [{ decision: 'keep', label: 'Leave it' }]
   return [
@@ -371,4 +379,53 @@ export function certificateChoices({
         ? 'Temps does not see a public listener on port 80. HTTP-01 works only if port 80 reaches this server, for example through port forwarding; otherwise use DNS-01 or a tunnel.'
         : null,
   }
+}
+
+/** The gate in front of a signed-in address (ADR 065 D7, D9). */
+export type SignInGate = 'temps' | 'cloudflare_access'
+
+export const SIGN_IN_GATES: ReadonlyArray<{
+  value: SignInGate
+  label: string
+  help: string
+}> = [
+  {
+    value: 'temps',
+    label: 'Temps sign-in',
+    help: 'People with access to this project sign in with their Temps account.',
+  },
+  {
+    value: 'cloudflare_access',
+    label: 'Cloudflare Access',
+    help: 'Your Cloudflare Access policies decide who gets in. Works only through a Cloudflare tunnel.',
+  },
+]
+
+/** The gate a plan asks for: only a signed-in address has one. */
+export function planGate(
+  audience: string,
+  gate: SignInGate
+): SignInGate | null {
+  return audience === 'signed_in' ? gate : null
+}
+
+/**
+ * Why a Cloudflare Access option cannot be applied yet: a new Access app
+ * needs at least one email address or domain to let in. `null` when the
+ * option creates no app, or when someone is named.
+ */
+export function accessPolicyMissing(
+  fields: SetupField[],
+  answers: Record<string, string>
+): string | null {
+  const asks = fields.some(
+    (f) => f.key === 'access_emails' || f.key === 'access_email_domains'
+  )
+  if (!asks) return null
+  if (
+    textList(answers.access_emails).length > 0 ||
+    textList(answers.access_email_domains).length > 0
+  )
+    return null
+  return 'Say who Cloudflare Access lets in: at least one email address or email domain.'
 }

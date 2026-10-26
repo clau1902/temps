@@ -1035,6 +1035,59 @@ from their letter:
   with the container health checks as what watches the app: the gate
   answering means the address is up, and an outage alert for every gated
   address would be noise.
+- **Access addresses stay in every snapshot and fail closed off the
+  tunnel.** D9 says the route table withdraws an Access address from direct
+  listeners and the control-plane proxy. It keeps the route, and every
+  listener that is not a tunnel's origin answers it with `403` and
+  `x-temps-gate: access` ("only sees traffic through the tunnel"); the
+  control-plane proxy, which a tunnel never reaches, always does. Withdrawn,
+  a direct listener would fall through to whatever else matches the host;
+  refused, it cannot serve the app by any route.
+- **Nothing known means refused, never open.** A listener whose snapshot
+  has no Access app for an Access address (its binding missing, its token
+  deleted) answers `503` "Sign-in is unavailable" and serves nothing. A team
+  whose keys are not fetched yet has no key a JWT can match, so requests get
+  the `403`. An unknown `kid` asks the control plane to refetch the team's
+  keys at most once a minute per agent, and the control plane fetches at
+  most once every five minutes per team, besides the hourly refresh and the
+  fetch when a token is saved.
+- **`/_temps/gate/*` is not Temps' on an Access host.** The Temps gate's
+  paths answer `404` there; Access has its own (`/cdn-cgi/access/*`), which
+  Cloudflare serves at its edge.
+- **No HTTPS upgrade on an Access host.** Cloudflare's edge ends TLS and the
+  tunnel carries plain HTTP to the node, so the Temps gate's `308` to HTTPS
+  does not apply; the JWT, not the scheme, is what is checked.
+- **The app is created before the address is attached.** The plan puts the
+  Access app step before attaching, and the gate in the step right after
+  attaching, as for the Temps sign-in: a Cloudflare call never sits between
+  the two. The app names the hostname as its domain, so it protects it as
+  soon as the tunnel publishes it.
+- **A create that timed out is found by name and domain.** D9 says it is
+  resolved by listing apps by domain. The run picks the name
+  (`temps-<hostname>-<install>`) before creating, and the lookup requires
+  both, so an app someone else made for the hostname is never mistaken for
+  the run's own (and then deleted by undo). Undo still checks the domain
+  before deleting, and an app that now protects another domain is left.
+- **An existing app is re-read when the run starts.** One deleted, or
+  moved to another domain, since planning fails the run before anything is
+  attached.
+- **Unreadable accounts block the plan.** If any saved Access token cannot
+  list its account's apps, the plan cannot tell whether one already covers
+  the address, so it offers nothing rather than risk a second app.
+- **cloudflared's own check (`originRequest.access`) is built but off.**
+  Whether remotely managed tunnels accept it in the configuration API could
+  not be confirmed when this was built. The rule builder and its test are in
+  `crates/temps-ingress/src/cloudflare.rs` behind `CLOUDFLARED_ORIGIN_ACCESS
+  = false`; the tunnel keeps its single catch-all rule. Nothing depends on
+  it: the listener verifies the JWT on every request. Turning it on also
+  needs tunnels reconfigured when an address's Access app changes.
+- **Moving an Access address off its tunnel is refused where Temps moves
+  it**: a hostname choice of "off tunnels", and an apply that would put it on
+  a direct way in, answer with D9's sentence. Plans for an Access address
+  offer only tunnel options.
+- **Creating or using an Access app needs `dns_providers:write`** on top of
+  the option's own permissions, as saving the token does; so does undoing a
+  run that created one.
 
 ## Sources
 

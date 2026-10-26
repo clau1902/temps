@@ -1349,6 +1349,8 @@ impl LoadBalancer {
                 query: header.uri.query(),
                 headers: &header.headers,
                 secure,
+                // Tunnels end at a worker's tunnel origin, never here.
+                via_tunnel: false,
             };
             gate.evaluate(&policy, &request, temps_core::gate::unix_now())
                 .await

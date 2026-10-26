@@ -710,6 +710,12 @@ pub enum GateDecision {
     /// The gate cannot run here (no key in the snapshot, unknown gate):
     /// `503`, never the app.
     Unavailable { reason: &'static str },
+    /// Cloudflare Access (D9): a valid Access JWT for this address, through
+    /// the tunnel. Forward with the email header.
+    AdmitAccess(crate::gate_access::AccessIdentity),
+    /// Cloudflare Access (D9): `403` with `x-temps-gate: access`, never the
+    /// app. An unknown key also asks for the team's keys again.
+    AccessDenied(crate::gate_access::AccessRejection),
 }
 
 /// The parts of a request the gate decides on.
@@ -724,6 +730,10 @@ pub struct GateRequest<'a> {
     /// The browser reached this listener over HTTPS (directly or through a
     /// tunnel's edge).
     pub secure: bool,
+    /// The request came in through a tunnel's origin listener. Cloudflare
+    /// Access only sees tunnel traffic, so an Access-gated address is
+    /// refused anywhere else (D9).
+    pub via_tunnel: bool,
 }
 
 /// Decide what to do with a request to a gated host (D8). Pure, so both
@@ -733,6 +743,9 @@ pub fn decide(
     request: &GateRequest<'_>,
     now: i64,
 ) -> Result<GateDecision, GateError> {
+    if policy.gate == GateKind::CloudflareAccess {
+        return Ok(decide_access(policy, request, now));
+    }
     let GateRequest {
         hostname,
         method,
@@ -740,6 +753,7 @@ pub fn decide(
         query,
         headers,
         secure,
+        via_tunnel: _,
     } = *request;
     let Some(gate) = (match policy.gate {
         GateKind::Temps => policy.temps.as_ref(),
@@ -782,6 +796,29 @@ pub fn decide(
         state_cookie: state_cookie(&state),
         navigation,
     })
+}
+
+/// The Cloudflare Access decision (D9): tunnel only, then the JWT. There is
+/// no sign-in to send anyone to (Access does that at Cloudflare's edge), no
+/// HTTPS upgrade (the tunnel's edge is HTTPS), and `/_temps/gate/*` is
+/// Temps' own, so it is not found here.
+fn decide_access(policy: &GatePolicy, request: &GateRequest<'_>, now: i64) -> GateDecision {
+    use crate::gate_access::{verify_access_request, AccessRejection};
+    let Some(access) = policy.access.as_ref() else {
+        return GateDecision::Unavailable {
+            reason: "the Cloudflare Access app for this address is not configured on this listener",
+        };
+    };
+    if !request.via_tunnel {
+        return GateDecision::AccessDenied(AccessRejection::NotThroughTunnel);
+    }
+    if is_gate_path(request.path) {
+        return GateDecision::NotFound;
+    }
+    match verify_access_request(request.headers, access, now) {
+        Ok(identity) => GateDecision::AdmitAccess(identity),
+        Err(rejection) => GateDecision::AccessDenied(rejection),
+    }
 }
 
 /// A callback's inputs, checked against the state cookie.
@@ -883,6 +920,14 @@ pub struct GateRedeemResponse {
 pub struct GateLogoutRequest {
     pub address_id: String,
     pub token: String,
+}
+
+/// A listener met a Cloudflare Access JWT signed with a key it does not
+/// have, and asks the control plane to fetch the team's keys again (D9).
+/// The control plane rate-limits the fetch per team.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GateAccessKeysRequest {
+    pub address_id: String,
 }
 
 /// Minimal HTML page for a gate answer a person will read.
@@ -1241,6 +1286,7 @@ mod tests {
                 query: Some("a=b"),
                 headers: &nav,
                 secure: true,
+                via_tunnel: false,
             },
             10,
         )
@@ -1270,7 +1316,8 @@ mod tests {
                     path: "/api",
                     query: None,
                     headers: &api,
-                    secure: true
+                    secure: true,
+                    via_tunnel: false,
                 },
                 10
             )
@@ -1289,7 +1336,8 @@ mod tests {
                     path: "/",
                     query: None,
                     headers: &nav,
-                    secure: true
+                    secure: true,
+                    via_tunnel: false,
                 },
                 10
             )
@@ -1314,7 +1362,8 @@ mod tests {
                     path: "/",
                     query: None,
                     headers: &h,
-                    secure: true
+                    secure: true,
+                    via_tunnel: false,
                 },
                 10
             )
@@ -1332,7 +1381,8 @@ mod tests {
                     path: "/",
                     query: None,
                     headers: &h,
-                    secure: true
+                    secure: true,
+                    via_tunnel: false,
                 },
                 10
             )
@@ -1354,6 +1404,7 @@ mod tests {
                     query: None,
                     headers: &h,
                     secure: true,
+                    via_tunnel: false,
                 },
                 10,
             )
@@ -1379,7 +1430,8 @@ mod tests {
                     path: "/a",
                     query: None,
                     headers: &h,
-                    secure: false
+                    secure: false,
+                    via_tunnel: false,
                 },
                 10
             )
@@ -1399,7 +1451,8 @@ mod tests {
                     path: "/",
                     query: None,
                     headers: &h,
-                    secure: true
+                    secure: true,
+                    via_tunnel: false,
                 },
                 10
             )
@@ -1417,7 +1470,8 @@ mod tests {
                     path: "/",
                     query: None,
                     headers: &h,
-                    secure: true
+                    secure: true,
+                    via_tunnel: false,
                 },
                 10
             )

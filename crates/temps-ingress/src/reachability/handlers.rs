@@ -27,6 +27,8 @@ use temps_core::{
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
+use temps_core::gate::GateKind;
+
 use super::model::{
     ActionKind, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
     DecideRequest, Decision, DnsRecordState, EnvironmentReachability, Intent, JournalEntry,
@@ -346,18 +348,29 @@ async fn apply_environment_reachability(
     // Changing who an existing address is for is a sensitive action, both
     // ways (ADR 064 Security), and so is its gate or sign-in list (ADR 065
     // D7).
-    if let Some(action) = audience_action(
-        state
-            .service
-            .audience_change(
-                project_id,
-                environment_id,
-                &request.plan_id,
-                request.option,
-                &request.answers,
-            )
-            .await?,
-    ) {
+    let change = state
+        .service
+        .audience_change(
+            project_id,
+            environment_id,
+            &request.plan_id,
+            request.option,
+            &request.answers,
+        )
+        .await?;
+    // ADR 065 D9: a Cloudflare Access plan creates or uses an Access app
+    // with a saved token.
+    if change
+        .as_ref()
+        .is_some_and(|(_, _, after)| after.gate == Some(GateKind::CloudflareAccess))
+    {
+        require_all(
+            &auth,
+            &[Permission::DnsProvidersWrite],
+            "Putting Cloudflare Access in front of it",
+        )?;
+    }
+    if let Some(action) = audience_action(change) {
         require_sensitive_action(state.sensitive_action_authorizer.as_ref(), &auth, action).await?;
     }
     let option = request.option;
@@ -722,6 +735,7 @@ fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
                 Permission::ProjectsWrite
             }
             RunResource::Certificate { .. } => Permission::DomainsDelete,
+            RunResource::AccessApp { .. } => Permission::DnsProvidersWrite,
         };
         if !needed.contains(&permission) {
             needed.push(permission);

@@ -6,8 +6,9 @@
 //! Reaching the address is not enough: what answers must be the gate. The
 //! control plane asks for the address the way a browser would, without a
 //! cookie, and expects the gate's own answer (`302` with
-//! `x-temps-gate: sign-in` for the Temps gate). An answer from the app
-//! instead means anyone can open it, and is shown as a failure.
+//! `x-temps-gate: sign-in` for the Temps gate; for Cloudflare Access, a
+//! redirect to the team's `*.cloudflareaccess.com` sign-in). An answer from
+//! the app instead means anyone can open it, and is shown as a failure.
 //!
 //! The probe dials only addresses the shared outbound policy accepts, pinned
 //! so a rebinding answer cannot slip in, follows no redirect, uses no proxy
@@ -15,7 +16,7 @@
 
 use std::time::Duration;
 
-use temps_core::gate::{GateKind, GATE_HEADER, GATE_SIGN_IN, GATE_UNAVAILABLE};
+use temps_core::gate::{GateKind, GATE_ACCESS, GATE_HEADER, GATE_SIGN_IN, GATE_UNAVAILABLE};
 use temps_core::url_validation::{resolve_and_validate_domain, UrlValidationError};
 
 use super::model::{AddressReachability, ReachState};
@@ -37,8 +38,23 @@ pub enum GateProbe {
     Unchecked(String),
 }
 
-/// Classify an answer for `gate`.
-pub fn classify(gate: GateKind, status: u16, gate_header: Option<&str>) -> GateProbe {
+/// Whether `location` sends the browser to a Cloudflare Access sign-in:
+/// an `https` URL on a `<team>.cloudflareaccess.com` host.
+fn is_access_sign_in(location: Option<&str>) -> bool {
+    let Some(rest) = location.and_then(|l| l.trim().strip_prefix("https://")) else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    temps_routes::access_keys::team_domain(host).is_some()
+}
+
+/// Classify an answer for `gate`. `location` is the redirect's target.
+pub fn classify(
+    gate: GateKind,
+    status: u16,
+    gate_header: Option<&str>,
+    location: Option<&str>,
+) -> GateProbe {
     match (gate, gate_header) {
         (GateKind::Temps, Some(value)) if value.eq_ignore_ascii_case(GATE_SIGN_IN) => {
             if status == 302 {
@@ -59,7 +75,23 @@ pub fn classify(gate: GateKind, status: u16, gate_header: Option<&str>) -> GateP
             )
         }
         (GateKind::Temps, _) => GateProbe::Open { status },
-        (GateKind::CloudflareAccess, _) | (GateKind::Unsupported, _) => {
+        (GateKind::CloudflareAccess, _)
+            if matches!(status, 302 | 303) && is_access_sign_in(location) =>
+        {
+            GateProbe::InFront
+        }
+        // Temps refused it itself: safe, but Access did not stop the visitor,
+        // so nobody can sign in through it.
+        (GateKind::CloudflareAccess, Some(value)) if value.eq_ignore_ascii_case(GATE_ACCESS) => {
+            GateProbe::Unavailable(
+                "Cloudflare Access is not in front of it: requests reach Temps without an \
+                 Access sign-in, and Temps refuses them. Check the Access app for this \
+                 hostname in Cloudflare Zero Trust"
+                    .to_string(),
+            )
+        }
+        (GateKind::CloudflareAccess, _) => GateProbe::Open { status },
+        (GateKind::Unsupported, _) => {
             GateProbe::Unchecked("Temps cannot check this gate from here".to_string())
         }
     }
@@ -103,6 +135,10 @@ pub async fn probe(host: &str, gate: GateKind) -> GateProbe {
             response
                 .headers()
                 .get(GATE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok()),
         ),
         Err(error) => GateProbe::Unchecked(format!("https://{host}/ did not answer: {error}")),
@@ -161,31 +197,74 @@ mod tests {
     #[test]
     fn only_the_gates_own_redirect_passes() {
         assert_eq!(
-            classify(GateKind::Temps, 302, Some("sign-in")),
+            classify(GateKind::Temps, 302, Some("sign-in"), None),
             GateProbe::InFront
         );
         // The app's own login redirect is not the gate.
         assert_eq!(
-            classify(GateKind::Temps, 302, None),
+            classify(GateKind::Temps, 302, None, None),
             GateProbe::Open { status: 302 }
         );
         assert_eq!(
-            classify(GateKind::Temps, 200, None),
+            classify(GateKind::Temps, 200, None, None),
             GateProbe::Open { status: 200 }
         );
         // The password wall or a 403 from the app is not the gate either.
         assert_eq!(
-            classify(GateKind::Temps, 403, Some("access")),
+            classify(GateKind::Temps, 403, Some("access"), None),
             GateProbe::Open { status: 403 }
         );
         assert!(matches!(
-            classify(GateKind::Temps, 503, Some("unavailable")),
+            classify(GateKind::Temps, 503, Some("unavailable"), None),
             GateProbe::Unavailable(_)
         ));
         assert!(matches!(
-            classify(GateKind::Temps, 401, Some("sign-in")),
+            classify(GateKind::Temps, 401, Some("sign-in"), None),
             GateProbe::Unchecked(_)
         ));
+    }
+
+    #[test]
+    fn only_a_redirect_to_the_access_sign_in_passes_for_access() {
+        let login =
+            Some("https://team.cloudflareaccess.com/cdn-cgi/access/login/app.example.test?kid=x");
+        assert_eq!(
+            classify(GateKind::CloudflareAccess, 302, None, login),
+            GateProbe::InFront
+        );
+        // A redirect anywhere else is the app's own.
+        assert_eq!(
+            classify(
+                GateKind::CloudflareAccess,
+                302,
+                None,
+                Some("https://team.cloudflareaccess.com.evil.example/login")
+            ),
+            GateProbe::Open { status: 302 }
+        );
+        assert_eq!(
+            classify(
+                GateKind::CloudflareAccess,
+                302,
+                None,
+                Some("http://team.cloudflareaccess.com/")
+            ),
+            GateProbe::Open { status: 302 }
+        );
+        assert_eq!(
+            classify(GateKind::CloudflareAccess, 200, None, None),
+            GateProbe::Open { status: 200 }
+        );
+        // Temps refused it: Access is not in front of it.
+        assert!(matches!(
+            classify(GateKind::CloudflareAccess, 403, Some("access"), None),
+            GateProbe::Unavailable(_)
+        ));
+        // The Temps gate's header never passes for Access.
+        assert_eq!(
+            classify(GateKind::CloudflareAccess, 302, Some("sign-in"), None),
+            GateProbe::Open { status: 302 }
+        );
     }
 
     #[test]

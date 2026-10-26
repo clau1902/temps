@@ -9,6 +9,10 @@
 //!   state cookie *and* the token of a node that serves the address.
 //! - `POST /internal/nodes/{id}/gate/logout`: an agent revokes the session
 //!   behind a token a visitor logged out with.
+//! - `POST /internal/nodes/{id}/gate/access-keys`: an agent met a Cloudflare
+//!   Access JWT signed with a key it does not have (ADR 065 D9), and asks
+//!   for the team's keys again. Rate-limited per team by
+//!   [`AccessKeyService`](crate::access_keys::AccessKeyService).
 
 use std::sync::Arc;
 
@@ -16,7 +20,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use temps_core::gate::{GateLogoutRequest, GateRedeemRequest};
+use temps_core::gate::{GateAccessKeysRequest, GateLogoutRequest, GateRedeemRequest};
 use temps_entities::nodes;
 use tracing::{error, warn};
 
@@ -122,6 +126,54 @@ pub async fn post_gate_logout(
     }
     state.gate.logout(&request).await.map_err(refusal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn post_gate_access_keys(
+    State(state): State<Arc<RouteSyncAppState>>,
+    headers: HeaderMap,
+    Path(node_id): Path<i32>,
+    Json(request): Json<GateAccessKeysRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let node = authenticate_node(&state.db, &headers, node_id).await?;
+    if !node_serves_address(&state, &node, &request.address_id).await? {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "Node {node_id} does not serve address {}, so it cannot ask for its Access keys",
+                request.address_id
+            ),
+        ));
+    }
+    let provider_id = state
+        .access_keys
+        .provider_of_address(&request.address_id)
+        .await
+        .map_err(|error| {
+            error!(node_id, address_id = %request.address_id, %error, "could not find the Access token of an address");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to find the Cloudflare Access token of address {}: {error}",
+                    request.address_id
+                ),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                format!(
+                    "Address {} is not protected by Cloudflare Access",
+                    request.address_id
+                ),
+            )
+        })?;
+    match state.access_keys.refresh(provider_id, false).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(error) => {
+            warn!(node_id, provider_id, %error, "could not fetch Cloudflare Access keys an agent asked for");
+            Err((StatusCode::BAD_GATEWAY, error.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]

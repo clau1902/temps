@@ -188,13 +188,13 @@ impl Answer {
         }
     }
 
-    fn denied(&self) -> bool {
+    pub(crate) fn denied(&self) -> bool {
         self.status == 401
             || self.status == 403
             || self.codes.iter().any(|code| DENIED_CODES.contains(code))
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         if self.messages.is_empty() {
             format!("HTTP {}", self.status)
         } else {
@@ -425,7 +425,7 @@ fn zone_field<'a>(answer: &'a Answer, zone: &str, path: &[&str]) -> Option<&'a s
         })
 }
 
-async fn call(
+pub(crate) async fn call(
     http: &reqwest::Client,
     token: &str,
     method: reqwest::Method,

@@ -246,6 +246,13 @@ pub trait TunnelMoveGuard: Send + Sync {
     /// `Err` with the refusal, naming the rule, when an IP allow list of
     /// only private ranges applies to the environment serving `host`.
     async fn check_move(&self, host: &str, tunnel: &str) -> Result<(), String>;
+
+    /// `Err` with the refusal when `host` must stay on a tunnel: a
+    /// Cloudflare Access address (ADR 065 D9), which Access only sees
+    /// through one.
+    async fn check_move_off(&self, _host: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// One page of tunnels, newest first.
@@ -1001,7 +1008,15 @@ impl IngressConnectorService {
                 self.reconcile_all().await;
                 return self.hostname(&host).await;
             }
-            HostnameMode::Off => None,
+            HostnameMode::Off => {
+                if let Some(guard) = self.move_guard.get() {
+                    guard
+                        .check_move_off(&host)
+                        .await
+                        .map_err(IngressError::Validation)?;
+                }
+                None
+            }
             HostnameMode::Tunnel => {
                 let id = request.connector_id.ok_or_else(|| {
                     IngressError::Validation("Pick the tunnel to publish it through.".into())

@@ -42,13 +42,15 @@ use sha2::{Digest, Sha256};
 use temps_core::ways_in::{private_allow_list_message, PrivateAllowList};
 
 use temps_auth::permissions::Permission;
+use temps_core::gate::GateKind;
 
+use super::access::{AccessApp, AccessPolicyAnswer};
 use super::compute::{is_local_only, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND};
 use super::model::{
     ActionKind, AddressAudience, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep,
     PlannedRecord, ReachAction, ReachabilityPlan, StepKind,
 };
-use crate::registry::{FieldKind, SetupField};
+use crate::registry::{FieldChoice, FieldKind, SetupField};
 use crate::service::{covers, normalize_host, record_label, PublicationIntent, TunnelFact};
 
 /// Field keys of the apply request.
@@ -59,6 +61,61 @@ pub const FIELD_TOKEN: &str = "cloudflare_api_token";
 pub const FIELD_GATE_TEAMS: &str = "gate_teams";
 /// The users that may sign in to a signed-in address (ADR 065 D7).
 pub const FIELD_GATE_USERS: &str = "gate_users";
+/// The Cloudflare Access token whose account gets the app (ADR 065 D9).
+pub const FIELD_ACCESS_PROVIDER: &str = "access_provider_id";
+/// Who a new Access app lets in: email addresses, and email domains.
+pub const FIELD_ACCESS_EMAILS: &str = "access_emails";
+pub const FIELD_ACCESS_EMAIL_DOMAINS: &str = "access_email_domains";
+/// Where a Cloudflare Access token is added.
+pub const ACCESS_SETUP_PATH: &str = "/dns-providers#cloudflare-access";
+
+/// A saved Cloudflare Access token, and the apps in its account that
+/// protect the planned address (ADR 065 D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessProviderFact {
+    pub id: i32,
+    pub name: String,
+    /// Its apps covering the address; why they could not be read.
+    pub covering: Result<Vec<AccessApp>, String>,
+}
+
+/// What a Cloudflare Access plan does about the app in front of an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessChoice<'a> {
+    /// No Access token is saved.
+    NoProvider,
+    /// An account's apps could not be read, so Temps cannot tell whether
+    /// one already covers the address.
+    Unreadable {
+        provider: &'a AccessProviderFact,
+        error: &'a str,
+    },
+    /// An existing app covers it: used as found, never edited or deleted.
+    Existing {
+        provider: &'a AccessProviderFact,
+        app: &'a AccessApp,
+    },
+    /// None does: the run creates one in one of these accounts.
+    Create(Vec<&'a AccessProviderFact>),
+}
+
+/// The app a Cloudflare Access plan for an address uses or creates.
+pub fn access_choice(facts: &PlanFacts) -> AccessChoice<'_> {
+    if facts.access_providers.is_empty() {
+        return AccessChoice::NoProvider;
+    }
+    for provider in &facts.access_providers {
+        match &provider.covering {
+            Err(error) => return AccessChoice::Unreadable { provider, error },
+            Ok(apps) => {
+                if let Some(app) = apps.iter().min_by(|a, b| a.name.cmp(&b.name)) {
+                    return AccessChoice::Existing { provider, app };
+                }
+            }
+        }
+    }
+    AccessChoice::Create(facts.access_providers.iter().collect())
+}
 
 /// A zone a DNS provider of the cluster manages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +201,11 @@ pub struct PlanFacts {
     /// Whether the environment or its project has password protection on,
     /// which applies on top of a sign-in (ADR 065 D7).
     pub password_protected: bool,
+    /// For `signed_in`: the gate asked for.
+    pub gate: GateKind,
+    /// For Cloudflare Access: the saved tokens and the apps covering the
+    /// planned address. Read only for such a plan.
+    pub access_providers: Vec<AccessProviderFact>,
 }
 
 /// The worker a private plan serves through: the first whose private
@@ -216,6 +278,10 @@ pub fn planned_address(facts: &PlanFacts) -> Result<Option<String>, String> {
     }
 }
 
+/// The `(id, aud)` of the Access apps an account has for the address, in
+/// the fingerprint; `None` stands for an account that could not be read.
+type AppIds<'a> = Vec<(&'a str, &'a str)>;
+
 /// A hash of everything a plan for `address` depends on (ADR 064 D4).
 pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     let mut tunnels = facts.tunnels.clone();
@@ -255,15 +321,37 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     private_workers.sort();
     let mut ranges = facts.private_ranges.clone();
     ranges.sort();
+    // An app created or removed in Cloudflare since planning changes what
+    // an Access plan does.
+    let mut access: Vec<(i32, Option<AppIds<'_>>)> = facts
+        .access_providers
+        .iter()
+        .map(|p| {
+            let apps = p.covering.as_ref().ok().map(|apps| {
+                let mut ids: Vec<(&str, &str)> = apps
+                    .iter()
+                    .map(|a| (a.id.as_str(), a.aud.as_str()))
+                    .collect();
+                ids.sort();
+                ids
+            });
+            (p.id, apps)
+        })
+        .collect();
+    access.sort_by_key(|(id, _)| *id);
+    let gate = (facts.audience == Audience::SignedIn).then_some(facts.gate);
     let canonical = format!(
         "v3|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
          {accounts:?}|{directs:?}|{modes:?}|{intent:?}|{:?}|{records:?}|{private_workers:?}|\
-         {ranges:?}",
+         {ranges:?}{}",
         facts.audience,
         facts.deployed,
         facts.served_by_workers,
         address.is_some_and(|a| facts.taken_elsewhere.contains(a)),
         facts.private_rule,
+        // Only signed-in plans gain a part, so other plans hash as before.
+        gate.map(|gate| format!("|{gate:?}|{access:?}"))
+            .unwrap_or_default(),
     );
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
@@ -614,11 +702,13 @@ pub fn http01_direct(facts: &PlanFacts) -> Option<&DirectIngress> {
 /// The plan for `facts`.
 pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     let mut blocked_reasons: Vec<PlanBlocked> = Vec::new();
+    let gate = (facts.audience == Audience::SignedIn).then_some(facts.gate);
     let empty = |audience, address, address_error, blocked| ReachabilityPlan {
         plan_id: None,
         fingerprint: None,
         expires_at: None,
         audience,
+        gate,
         address,
         address_error,
         options: Vec::new(),
@@ -1066,6 +1156,11 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         }
     }
     if facts.audience == Audience::SignedIn {
+        if facts.gate == GateKind::CloudflareAccess {
+            if let Err(blocked) = access_drafts(facts, &shown, &mut drafts) {
+                return empty(facts.audience, address, None, blocked);
+            }
+        }
         signed_in_drafts(facts, address.as_deref(), &shown, &mut drafts);
     }
     let options: Vec<PlanOption> = drafts
@@ -1115,10 +1210,188 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         fingerprint: None,
         expires_at: None,
         audience: facts.audience,
+        gate,
         address,
         address_error: None,
         options,
         blocked,
+    }
+}
+
+/// What a Cloudflare Access plan changes in the drafts (ADR 065 D9): only
+/// ways in through a tunnel stay, since Access sees nothing else, and the
+/// app in front of the address is used as found or created before the
+/// address is attached. `Err` when no option can be offered.
+fn access_drafts(
+    facts: &PlanFacts,
+    shown: &str,
+    drafts: &mut Vec<OptionDraft>,
+) -> Result<(), PlanBlocked> {
+    let before = drafts.len();
+    drafts.retain(|d| d.way_in.starts_with("tunnel"));
+    let dropped = before - drafts.len();
+    if drafts.is_empty() {
+        return Err(PlanBlocked {
+            reason: format!(
+                "Cloudflare Access only sees traffic that comes through a Cloudflare tunnel, \
+                 and no tunnel can carry {shown} here. Add a worker that allows a tunnel, or \
+                 use the Temps sign-in instead."
+            ),
+            action: Some(
+                ReachAction::new(ActionKind::OpenIngress, "Set up ingress")
+                    .with_href(INGRESS_SETUP_PATH),
+            ),
+        });
+    }
+    let (step_label, fields, warning) = match access_choice(facts) {
+        AccessChoice::NoProvider => {
+            return Err(PlanBlocked {
+                reason: "No Cloudflare Access token is saved. Add one with Access: Apps and \
+                         Policies Edit and Access: Organizations, Identity Providers, and Groups \
+                         Read, then plan again."
+                    .to_string(),
+                action: Some(
+                    ReachAction::new(ActionKind::OpenIngress, "Add a Cloudflare Access token")
+                        .with_href(ACCESS_SETUP_PATH),
+                ),
+            })
+        }
+        AccessChoice::Unreadable { provider, error } => {
+            return Err(PlanBlocked {
+                reason: format!(
+                    "Temps could not read the Access applications of {}, so it cannot tell \
+                     whether one already protects {shown}: {error} Try again.",
+                    provider.name
+                ),
+                action: Some(
+                    ReachAction::new(ActionKind::OpenIngress, "Check the Access token")
+                        .with_href(ACCESS_SETUP_PATH),
+                ),
+            })
+        }
+        AccessChoice::Existing { provider, app } => (
+            format!(
+                "Use Cloudflare Access app {} ({}) in front of {shown}",
+                app.name, provider.name
+            ),
+            Vec::new(),
+            format!(
+                "Access app {} already protects {shown}: Temps uses it as it is and never \
+                 edits or deletes it. Its policies decide who gets in.",
+                app.name
+            ),
+        ),
+        AccessChoice::Create(providers) => {
+            let mut fields = Vec::new();
+            if providers.len() > 1 {
+                fields.push(SetupField {
+                    key: FIELD_ACCESS_PROVIDER.to_string(),
+                    label: "Cloudflare Access account".to_string(),
+                    help: Some("The account the Access app is created in.".to_string()),
+                    kind: FieldKind::Choice {
+                        choices: providers
+                            .iter()
+                            .map(|p| FieldChoice {
+                                value: p.id.to_string(),
+                                label: p.name.clone(),
+                                help: None,
+                            })
+                            .collect(),
+                    },
+                    required: true,
+                    placeholder: None,
+                });
+            }
+            fields.extend(access_policy_fields());
+            (
+                format!("Create a Cloudflare Access app for {shown}"),
+                fields,
+                format!(
+                    "Cloudflare Access decides who can open {shown}: only the email addresses \
+                     and domains you give get in. Undo deletes the app again unless someone \
+                     edited it in Cloudflare."
+                ),
+            )
+        }
+    };
+    for draft in drafts.iter_mut() {
+        let at = draft
+            .steps
+            .iter()
+            .position(|s| s.kind == StepKind::AttachDomain)
+            .unwrap_or(0);
+        draft
+            .steps
+            .insert(at, step(StepKind::AccessApp, step_label.clone()));
+        draft.fields.extend(fields.iter().cloned());
+        draft.warnings.insert(0, warning.clone());
+        if dropped > 0 {
+            draft.warnings.push(
+                "Ways in that reach Temps directly are not offered: Cloudflare Access only \
+                 sees traffic that comes through a Cloudflare tunnel."
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Who a new Access app lets in.
+fn access_policy_fields() -> Vec<SetupField> {
+    vec![
+        SetupField {
+            key: FIELD_ACCESS_EMAILS.to_string(),
+            label: "Email addresses".to_string(),
+            help: Some("People who may open it, one email address each.".to_string()),
+            kind: FieldKind::TextList,
+            required: false,
+            placeholder: Some("ana@example.com".to_string()),
+        },
+        SetupField {
+            key: FIELD_ACCESS_EMAIL_DOMAINS.to_string(),
+            label: "Email domains".to_string(),
+            help: Some(
+                "Everyone with an email address at these domains. Give at least one address \
+                 or domain."
+                    .to_string(),
+            ),
+            kind: FieldKind::TextList,
+            required: false,
+            placeholder: Some("example.com".to_string()),
+        },
+    ]
+}
+
+/// Who a new Access app lets in, from an apply's answers: lists of
+/// strings (or one comma-separated string).
+pub fn access_policy_answer(
+    answers: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<AccessPolicyAnswer, String> {
+    let list = |key: &str| -> Result<Vec<String>, String> {
+        match answers.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::String(text)) => {
+                Ok(text.split([',', '\n']).map(str::to_string).collect())
+            }
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("{key} must be a list of text values."))
+                })
+                .collect(),
+            Some(_) => Err(format!("{key} must be a list of text values.")),
+        }
+    };
+    let answer = AccessPolicyAnswer {
+        emails: list(FIELD_ACCESS_EMAILS)?,
+        email_domains: list(FIELD_ACCESS_EMAIL_DOMAINS)?,
+    }
+    .normalized();
+    match answer.problem() {
+        Some(problem) => Err(problem),
+        None => Ok(answer),
     }
 }
 
@@ -1162,11 +1435,20 @@ fn signed_in_drafts(
             .find(|(a, _)| a.eq_ignore_ascii_case(host))
             .map(|(_, audience)| *audience)
     });
-    let mut warnings = vec![format!(
-        "Only people who sign in to Temps, with access to this project (and on the list, \
-         if you give one), can open {shown}. Everyone else gets the Temps sign-in. Changing \
-         who can open it needs a recent password or passkey confirmation."
-    )];
+    let access = facts.gate == GateKind::CloudflareAccess;
+    let mut warnings = vec![if access {
+        format!(
+            "Only people Cloudflare Access lets in can open {shown}, and only through the \
+             tunnel. Changing who can open it needs a recent password or passkey \
+             confirmation."
+        )
+    } else {
+        format!(
+            "Only people who sign in to Temps, with access to this project (and on the list, \
+             if you give one), can open {shown}. Everyone else gets the Temps sign-in. \
+             Changing who can open it needs a recent password or passkey confirmation."
+        )
+    }];
     if current == Some(Audience::Private) {
         warnings.push(format!(
             "{shown} is private now. This puts it on a public way in behind the sign-in: \
@@ -1181,20 +1463,23 @@ fn signed_in_drafts(
             facts.environment_name
         ));
     }
+    let label = if access {
+        format!("Let only people Cloudflare Access admits open {shown}")
+    } else {
+        format!("Put the Temps sign-in in front of {shown}")
+    };
     for draft in drafts.iter_mut() {
         let at = draft
             .steps
             .iter()
             .position(|s| s.kind == StepKind::AttachDomain)
             .map_or(0, |i| i + 1);
-        draft.steps.insert(
-            at,
-            step(
-                StepKind::SetAudience,
-                format!("Put the Temps sign-in in front of {shown}"),
-            ),
-        );
-        draft.fields.extend(gate_list_fields());
+        draft
+            .steps
+            .insert(at, step(StepKind::SetAudience, label.clone()));
+        if !access {
+            draft.fields.extend(gate_list_fields());
+        }
         for (index, warning) in warnings.iter().enumerate() {
             draft.warnings.insert(index, warning.clone());
         }
@@ -1296,6 +1581,7 @@ fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
         fingerprint: None,
         expires_at: None,
         audience: Audience::Private,
+        gate: None,
         address,
         address_error,
         options: Vec::new(),
@@ -1559,6 +1845,7 @@ fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
         fingerprint: None,
         expires_at: None,
         audience: Audience::Private,
+        gate: None,
         address,
         address_error: None,
         options: vec![option],
@@ -2391,5 +2678,202 @@ mod tests {
             .options
             .iter()
             .all(|o| o.steps.iter().all(|s| s.kind != StepKind::SetAudience)));
+    }
+
+    fn access_app(id: &str, name: &str) -> AccessApp {
+        AccessApp {
+            id: id.into(),
+            name: name.into(),
+            domain: "myapp.example.com".into(),
+            aud: format!("aud-{id}"),
+            domains: vec!["myapp.example.com".into()],
+            policies: "p".into(),
+        }
+    }
+
+    fn access_facts(providers: Vec<AccessProviderFact>) -> PlanFacts {
+        PlanFacts {
+            audience: Audience::SignedIn,
+            gate: GateKind::CloudflareAccess,
+            requested: Some("myapp.example.com".into()),
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            access_providers: providers,
+            ..base()
+        }
+    }
+
+    fn provider(id: i32, covering: Result<Vec<AccessApp>, String>) -> AccessProviderFact {
+        AccessProviderFact {
+            id,
+            name: format!("Access {id}"),
+            covering,
+        }
+    }
+
+    /// ADR 065 D9: Access only sees tunnel traffic, so direct ways in go;
+    /// the app is made before the address is attached, and the gate set
+    /// right after attaching, as for the Temps sign-in.
+    #[test]
+    fn an_access_plan_offers_only_tunnels_and_creates_the_app_before_attaching() {
+        let plan = plan(&access_facts(vec![provider(4, Ok(vec![]))]));
+        assert_eq!(plan.gate, Some(GateKind::CloudflareAccess));
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        assert!(!plan.options.is_empty());
+        for option in &plan.options {
+            assert!(option.way_in.starts_with("tunnel"), "{}", option.way_in);
+            let kinds: Vec<StepKind> = option.steps.iter().map(|s| s.kind).collect();
+            let app = kinds
+                .iter()
+                .position(|k| *k == StepKind::AccessApp)
+                .expect("an AccessApp step");
+            let attach = kinds
+                .iter()
+                .position(|k| *k == StepKind::AttachDomain)
+                .expect("attach");
+            let gate = kinds
+                .iter()
+                .position(|k| *k == StepKind::SetAudience)
+                .expect("gate");
+            assert!(app < attach && gate == attach + 1, "{kinds:?}");
+            let keys: Vec<&str> = option.fields.iter().map(|f| f.key.as_str()).collect();
+            assert!(keys.contains(&FIELD_ACCESS_EMAILS));
+            assert!(keys.contains(&FIELD_ACCESS_EMAIL_DOMAINS));
+            // One account: nothing to pick. No Temps sign-in list.
+            assert!(!keys.contains(&FIELD_ACCESS_PROVIDER));
+            assert!(!keys.contains(&FIELD_GATE_TEAMS));
+            assert!(option
+                .warnings
+                .iter()
+                .any(|w| w.contains("reach Temps directly are not offered")));
+        }
+    }
+
+    #[test]
+    fn an_access_plan_uses_an_app_that_already_covers_the_address() {
+        let plan = plan(&access_facts(vec![
+            provider(4, Ok(vec![])),
+            provider(5, Ok(vec![access_app("a1", "team app")])),
+        ]));
+        let option = &plan.options[0];
+        let step = option
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::AccessApp)
+            .expect("step");
+        assert!(step.label.contains("team app"), "{}", step.label);
+        assert!(option.fields.iter().all(|f| f.key != FIELD_ACCESS_EMAILS));
+        assert!(option
+            .warnings
+            .iter()
+            .any(|w| w.contains("never edits or deletes it")));
+    }
+
+    #[test]
+    fn several_access_accounts_ask_which_one_creates_the_app() {
+        let plan = plan(&access_facts(vec![
+            provider(4, Ok(vec![])),
+            provider(5, Ok(vec![])),
+        ]));
+        let field = plan.options[0]
+            .fields
+            .iter()
+            .find(|f| f.key == FIELD_ACCESS_PROVIDER)
+            .expect("a provider choice");
+        assert!(field.required);
+        assert!(matches!(&field.kind, FieldKind::Choice { choices } if choices.len() == 2));
+    }
+
+    #[test]
+    fn an_access_plan_without_a_token_points_at_where_one_is_added() {
+        let plan = plan(&access_facts(vec![]));
+        assert!(plan.options.is_empty());
+        let blocked = plan.blocked.expect("blocked");
+        assert!(blocked.reason.contains("No Cloudflare Access token"));
+        assert_eq!(
+            blocked.action.and_then(|a| a.href).as_deref(),
+            Some(ACCESS_SETUP_PATH)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_access_account_blocks_rather_than_risk_a_second_app() {
+        let plan = plan(&access_facts(vec![provider(
+            4,
+            Err("token revoked".into()),
+        )]));
+        assert!(plan.options.is_empty());
+        assert!(plan
+            .blocked
+            .expect("blocked")
+            .reason
+            .contains("token revoked"));
+    }
+
+    #[test]
+    fn an_access_plan_with_no_tunnel_possible_says_why() {
+        let facts = PlanFacts {
+            tunnels: vec![],
+            zones: vec![],
+            tunnel_workers: vec![],
+            served_by_workers: false,
+            ..access_facts(vec![provider(4, Ok(vec![]))])
+        };
+        let plan = plan(&facts);
+        assert!(plan.options.is_empty());
+        assert!(plan
+            .blocked
+            .expect("blocked")
+            .reason
+            .contains("only sees traffic that comes through a Cloudflare tunnel"));
+    }
+
+    #[test]
+    fn a_new_covering_access_app_changes_the_fingerprint_and_others_hash_as_before() {
+        let before = access_facts(vec![provider(4, Ok(vec![]))]);
+        let after = access_facts(vec![provider(4, Ok(vec![access_app("a1", "x")]))]);
+        let host = Some("myapp.example.com");
+        assert_ne!(fingerprint(&before, host), fingerprint(&after, host));
+        // A public plan carries no gate part at all.
+        let public = PlanFacts {
+            audience: Audience::Public,
+            ..before.clone()
+        };
+        let public_other_gate = PlanFacts {
+            gate: GateKind::Temps,
+            access_providers: vec![],
+            ..public.clone()
+        };
+        assert_eq!(
+            fingerprint(&public, host),
+            fingerprint(&public_other_gate, host)
+        );
+    }
+
+    #[test]
+    fn access_policy_answers_take_lists_or_text_and_need_someone() {
+        let answers = |pairs: Vec<(&str, serde_json::Value)>| {
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let policy = access_policy_answer(&answers(vec![
+            (FIELD_ACCESS_EMAILS, serde_json::json!(["Ana@Example.com"])),
+            (
+                FIELD_ACCESS_EMAIL_DOMAINS,
+                serde_json::json!("@example.org, example.net"),
+            ),
+        ]))
+        .expect("valid");
+        assert_eq!(policy.emails, vec!["ana@example.com"]);
+        assert_eq!(policy.email_domains, vec!["example.net", "example.org"]);
+        assert!(access_policy_answer(&answers(vec![])).is_err());
+        assert!(access_policy_answer(&answers(vec![(
+            FIELD_ACCESS_EMAILS,
+            serde_json::json!([1])
+        )]))
+        .is_err());
     }
 }
