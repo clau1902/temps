@@ -96,8 +96,8 @@
             "type": "string"
           },
           "token": {
-            "description": "The token, as pasted. Used for this check only; not stored.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "The token, as pasted. Used for this check only; not stored."
           }
         },
         "required": [
@@ -14425,8 +14425,8 @@
             "type": "string"
           },
           "token": {
-            "description": "Checked, then sealed; never returned.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Checked, then sealed; never returned."
           }
         },
         "required": [

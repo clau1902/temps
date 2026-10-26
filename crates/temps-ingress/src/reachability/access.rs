@@ -44,7 +44,7 @@ pub const ACCOUNT_WIDE_WARNING: &str = "Both permissions are account-wide: this 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct AccessTokenCheckRequest {
     /// The token, as pasted. Used for this check only; not stored.
-    pub token: String,
+    pub token: temps_core::secret_string::SecretString,
     /// The Cloudflare account the Access applications live in (32 hex
     /// characters, from the dashboard URL or the account's overview page).
     pub account_id: String,

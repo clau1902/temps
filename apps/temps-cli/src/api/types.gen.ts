@@ -58,7 +58,7 @@ export type AccessTokenCheckRequest = {
     /**
      * The token, as pasted. Used for this check only; not stored.
      */
-    token: string;
+    token: SecretString;
 };
 
 export type AccessTokenCheckResult = {
@@ -6889,7 +6889,7 @@ export type CreateAccessProviderRequest = {
     /**
      * Checked, then sealed; never returned.
      */
-    token: string;
+    token: SecretString;
 };
 
 export type CreateAlertRuleRequest = {

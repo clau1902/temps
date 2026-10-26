@@ -108,7 +108,7 @@ pub struct CreateAccessProviderRequest {
     pub name: String,
     pub account_id: String,
     /// Checked, then sealed; never returned.
-    pub token: String,
+    pub token: temps_core::secret_string::SecretString,
 }
 
 /// A saved Access token. The token itself is never returned.
@@ -275,7 +275,7 @@ impl AccessProviderService {
             });
         }
         let account_id = request.account_id.trim().to_ascii_lowercase();
-        let check = self.check(&request.token, &account_id).await;
+        let check = self.check(request.token.expose(), &account_id).await;
         if let Some(reason) = check.refusal() {
             return Err(AccessProviderError::TokenRefused {
                 reason,
@@ -289,7 +289,7 @@ impl AccessProviderService {
         };
         let sealed = self
             .encryption
-            .encrypt_string(request.token.trim())
+            .encrypt_string(request.token.expose().trim())
             .map_err(|e| AccessProviderError::Encryption {
                 operation: "seal",
                 provider_id: None,

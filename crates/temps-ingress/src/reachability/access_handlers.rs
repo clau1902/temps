@@ -190,7 +190,7 @@ async fn check_access_provider(
     Ok(Json(
         state
             .service
-            .check(&request.token, request.account_id.trim())
+            .check(request.token.expose(), request.account_id.trim())
             .await,
     ))
 }
