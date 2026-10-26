@@ -94,7 +94,7 @@ pub fn record_failure(error: impl Into<String>) {
 /// Routes this worker's listener serves: the public ones, or on a private
 /// listener (ADR 064 D5) the private ones; each needs a prepared certificate.
 fn served_route_count(snapshot: &crate::route_store::PublicIngressSnapshot) -> usize {
-    snapshot.routes.len() + snapshot.private_routes.len()
+    snapshot.routes.len() + snapshot.private_routes.len() + snapshot.identity_private_routes.len()
 }
 
 fn missing_certificates_error(missing: usize) -> String {

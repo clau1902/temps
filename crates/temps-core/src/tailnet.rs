@@ -33,6 +33,17 @@ pub const TAILSCALE_SERVE_COMMAND: &str =
 /// D6). A route with that audience is never sent to an agent without it.
 pub const CAPABILITY_TAILNET_IDENTITY: &str = "tailnet_identity.v1";
 
+/// The header an agent names its capabilities in on every route snapshot
+/// request, comma-separated. The control plane decides what the snapshot may
+/// carry from this request alone, never from an earlier report: a worker
+/// rolled back to an older binary stops sending it on its next request.
+pub const AGENT_CAPABILITIES_HEADER: &str = "x-temps-agent-capabilities";
+
+/// Whether a capabilities header value names `capability`, exactly.
+pub fn header_names_capability(value: Option<&str>, capability: &str) -> bool {
+    value.is_some_and(|value| value.split(',').any(|item| item.trim() == capability))
+}
+
 /// The port every tailnet name is served on.
 pub const SERVE_HTTPS_PORT: u16 = 443;
 
@@ -484,6 +495,11 @@ pub mod messages {
     pub const IDENTITY_UNREADABLE: &str = "This app admits only listed tailnet users, and \
          Temps could not tell who this request is from, so it is not admitted.";
 
+    /// A request from the worker's own tailnet node: a process on the worker
+    /// is not a tailnet user, whoever owns the machine.
+    pub const SELF_NOT_ADMITTED: &str = "This app admits only listed tailnet users, and this \
+         request came from the worker that serves it, which is not a tailnet user.";
+
     /// A route held back from an agent without `tailnet_identity.v1`.
     pub fn update_agent(host: &str, node: &str) -> String {
         format!(
@@ -838,6 +854,20 @@ mod tests {
         }
         assert!(forwards_header("accept", false));
         assert!(forwards_header("x-tailscale-thing", false));
+    }
+
+    #[test]
+    fn a_capability_counts_only_when_the_request_names_it_exactly() {
+        let cap = CAPABILITY_TAILNET_IDENTITY;
+        assert!(!header_names_capability(None, cap));
+        assert!(!header_names_capability(Some(""), cap));
+        assert!(!header_names_capability(Some("tailnet_identity.v2"), cap));
+        assert!(!header_names_capability(Some("tailnet_identity.v1x"), cap));
+        assert!(header_names_capability(Some("tailnet_identity.v1"), cap));
+        assert!(header_names_capability(
+            Some("other.v3, tailnet_identity.v1"),
+            cap
+        ));
     }
 
     fn login(value: &str) -> TailnetPrincipal {

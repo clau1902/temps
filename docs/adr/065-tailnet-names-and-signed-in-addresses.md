@@ -1111,10 +1111,39 @@ Open, found in review of 3b:
   it runs this version, but asks tailscaled only with `--tailscale-serve`;
   without that flag every `tailnet_users` request is refused (fail closed),
   and the plan refuses a worker without consent up front.
-- **Where the capability is kept.** The agent's capabilities travel in its
-  ingress report and are stored in `node_public_ingress.listening`
-  (`capabilities`, at most 16), next to what it listens on, rather than in
-  a column of their own.
+- **Where the capability is kept, and what it decides.** The agent's
+  capabilities travel in its ingress report and are stored in
+  `node_public_ingress.listening` (`capabilities`, at most 16). That stored
+  copy only feeds the plan's "update the agent" refusal. What a snapshot
+  carries is decided from the snapshot request alone: the agent names its
+  capabilities in `x-temps-agent-capabilities` on every request, because an
+  earlier report says nothing about the binary asking now. A worker rolled
+  back to an older agent stops sending it, and its next snapshot has no
+  `tailnet_users` route.
+- **`tailnet_users` routes travel apart.** A stored capability alone could
+  not keep the promise above. `tailnet_users` private routes ride in
+  `identity_private_routes`, and the routes of their Serve entries in
+  `identity_serve_routes`. They are never sent as `private_routes` with a
+  list, and their entry in `serve_entries` keeps no route. The agent keeps
+  them apart the same way in `routes.json`. An older agent ignores fields it
+  does not know, so it serves none of them by construction. That covers the
+  wire, and the file it loads after a rollback for the rest of its 300 s
+  lease. A test reads both with the 3b agent's types.
+- **Who is never admitted.**
+  - **The worker's own node**, by its Tailscale addresses or its stable node
+    id. Otherwise a process on the worker, or a host-network workload,
+    would arrive as the machine's owner on an untagged worker.
+  - **Anyone, until the agent has read tailscaled's `status`** and so knows
+    which node it is.
+  - **A node shared in from another tailnet**, by any tag: whois reports a
+    non-zero `Sharer` for such a node, and its tags are named by the other
+    tailnet's admins. Its user's login can still be listed. Whether whois
+    reports a shared node's tags at all could not be checked without a live
+    tailnet; ignoring them is the safe reading either way.
+- **Withdrawn consent is not outlived by the cache.** Every cached whois
+  answer carries the epoch it was asked in, and a change of LocalAPI access
+  starts a new one. A question asked before consent was withdrawn is
+  neither used nor cached when its answer arrives after.
 - **The console types** for `tailnet_users` and its list were written by
   hand into the generated client, to be regenerated from a running server.
 

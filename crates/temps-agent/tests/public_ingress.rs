@@ -53,6 +53,8 @@ impl IngressHarness {
             listen: None,
             private_routes: Vec::new(),
             serve_entries: Vec::new(),
+            identity_private_routes: Vec::new(),
+            identity_serve_routes: Vec::new(),
         });
 
         let shutdown = Arc::new(Notify::new());
@@ -151,6 +153,8 @@ fn enabled_public_store(snapshot_dir: &TempDir) -> SharedRouteStore {
         listen: None,
         private_routes: Vec::new(),
         serve_entries: Vec::new(),
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
     });
     store
 }
@@ -397,6 +401,8 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
             listen: None,
             private_routes: Vec::new(),
             serve_entries: Vec::new(),
+            identity_private_routes: Vec::new(),
+            identity_serve_routes: Vec::new(),
         });
         let mut persisted: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&snapshot_path).expect("read persisted ingress snapshot"),
@@ -596,6 +602,8 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
         listen: None,
         private_routes: Vec::new(),
         serve_entries: Vec::new(),
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
     });
 
     let shutdown = Arc::new(Notify::new());
@@ -743,6 +751,8 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
         listen: None,
         private_routes: Vec::new(),
         serve_entries: Vec::new(),
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
     });
     let ingress_shutdown = Arc::new(Notify::new());
     let ingress = public_ingress::spawn(
@@ -1277,6 +1287,8 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
             private_route("tailnet.example.test", backend_address, "100.64.0.0/10"),
         ],
         serve_entries: Vec::new(),
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
     });
     let shutdown = Arc::new(Notify::new());
     let private = public_ingress::spawn(
@@ -1453,6 +1465,8 @@ fn serve_snapshot(
             addrs: Vec::new(),
             principals,
         }],
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
     }
 }
 
@@ -1612,11 +1626,17 @@ async fn test_serve_socket_admits_only_listed_tailnet_users() {
     let path = dir.path().join("custom-9.sock");
     let stop = Arc::new(Notify::new());
     // No LocalAPI: whois is unavailable, as without the owner's consent.
+    // The worker knows its own node, as after the Serve manager's first pass.
+    let identity = Arc::new(TailnetIdentity::new());
+    identity.set_self(Some(temps_agent::tailnet_identity::SelfNode {
+        stable_id: "n123CNTRL".to_string(),
+        ips: vec!["100.101.102.103".parse().expect("an IP")],
+    }));
     let _task = spawn_serve_socket(
         &path,
         Arc::clone(&store),
         Arc::new(ServeSocket::new("custom:9")),
-        Arc::new(TailnetIdentity::new()),
+        identity,
         Arc::clone(&stop),
     )
     .await

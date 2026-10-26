@@ -328,6 +328,19 @@ impl ServeManager {
                 return report;
             }
         };
+        // Who the worker itself is, so identity checks never admit it.
+        self.identity
+            .set_self(status.self_node.as_ref().map(|node| {
+                crate::tailnet_identity::SelfNode {
+                    stable_id: node.id.clone(),
+                    ips: node
+                        .tailscale_ips
+                        .iter()
+                        .flatten()
+                        .filter_map(|ip| ip.parse().ok())
+                        .collect(),
+                }
+            }));
         report.version = Some(status.version.clone()).filter(|v| !v.is_empty());
         report.backend_state = Some(status.backend_state.clone());
         if !tailnet::version_supported(&status.version) {

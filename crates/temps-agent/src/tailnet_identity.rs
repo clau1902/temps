@@ -19,10 +19,18 @@
 //!
 //! Answers are cached for [`WHOIS_TTL`] per visitor address, in a bounded
 //! map read without a lock; a miss costs one LocalAPI call. Failures are not
-//! cached, and every failure refuses.
+//! cached, and every failure refuses. Each answer carries the epoch it was
+//! asked in; [`TailnetIdentity::set_api`] starts a new one, so an answer to
+//! a question asked before consent was withdrawn is never used after it.
+//!
+//! Two visitors are never admitted, whatever the list says: the worker's own
+//! node (a process on the worker, or a host-network workload, would
+//! otherwise arrive as the machine's owner), and a tag of a node shared in
+//! from another tailnet (its tags are named by that tailnet's admins).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +51,18 @@ pub const MAX_CACHED: usize = 4096;
 pub struct Visitor {
     /// The user, for an untagged device.
     pub login: Option<String>,
+    /// Only tags of this tailnet's own nodes: a node shared in from another
+    /// tailnet has none here.
     pub tags: Vec<String>,
+    /// The stable node id, to recognise the worker itself.
+    pub node_id: String,
+}
+
+/// The worker's own tailnet node, from tailscaled's `status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfNode {
+    pub stable_id: String,
+    pub ips: Vec<IpAddr>,
 }
 
 /// Whether to serve the request.
@@ -59,6 +78,7 @@ pub enum Verdict {
 struct Cached {
     visitor: Option<Visitor>,
     at: Instant,
+    epoch: u64,
 }
 
 struct ApiSlot(Arc<dyn LocalApi>);
@@ -67,6 +87,12 @@ struct ApiSlot(Arc<dyn LocalApi>);
 pub struct TailnetIdentity {
     api: ArcSwapOption<ApiSlot>,
     cache: ArcSwap<HashMap<IpAddr, Cached>>,
+    /// Bumped by every change of `api`; cached answers of an older epoch
+    /// are never used.
+    epoch: AtomicU64,
+    /// Who the worker itself is. Unknown until tailscaled was asked, and
+    /// until then nobody is admitted.
+    self_node: ArcSwapOption<SelfNode>,
 }
 
 impl Default for TailnetIdentity {
@@ -80,7 +106,21 @@ impl TailnetIdentity {
         Self {
             api: ArcSwapOption::empty(),
             cache: ArcSwap::from_pointee(HashMap::new()),
+            epoch: AtomicU64::new(0),
+            self_node: ArcSwapOption::empty(),
         }
+    }
+
+    /// The worker's own node, from the Serve manager's latest `status`.
+    pub fn set_self(&self, node: Option<SelfNode>) {
+        self.self_node.store(node.map(Arc::new));
+    }
+
+    /// Whether the request comes from the worker's own node; `None` while
+    /// that is not known yet.
+    fn is_the_worker(&self, ip: IpAddr, node_id: Option<&str>) -> Option<bool> {
+        let me = self.self_node.load_full()?;
+        Some(me.ips.contains(&ip) || node_id.is_some_and(|id| !id.is_empty() && id == me.stable_id))
     }
 
     /// The LocalAPI to ask, or `None` when the agent may not (no consent,
@@ -95,14 +135,16 @@ impl TailnetIdentity {
         if same {
             return;
         }
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.api.store(api.map(|api| Arc::new(ApiSlot(api))));
         self.cache.store(Arc::new(HashMap::new()));
     }
 
     /// `whois` of `ip`, cached. `Ok(None)` when tailscaled does not know it.
     async fn whois(&self, ip: IpAddr) -> Result<Option<Visitor>, String> {
+        let epoch = self.epoch.load(Ordering::Acquire);
         if let Some(cached) = self.cache.load().get(&ip) {
-            if cached.at.elapsed() < WHOIS_TTL {
+            if cached.epoch == epoch && cached.at.elapsed() < WHOIS_TTL {
                 return Ok(cached.visitor.clone());
             }
         }
@@ -114,18 +156,28 @@ impl TailnetIdentity {
             .whois(&ip.to_string())
             .await
             .map_err(|e| e.to_string())?;
+        if self.epoch.load(Ordering::Acquire) != epoch {
+            // Consent changed while asking: this answer is not to be used.
+            return Err("tailscaled access changed while asking".to_string());
+        }
         let visitor = who.map(|who| Visitor {
             login: who.login().map(str::to_ascii_lowercase),
-            tags: who.tags().iter().map(|t| t.to_ascii_lowercase()).collect(),
+            tags: if who.shared_in() {
+                Vec::new()
+            } else {
+                who.tags().iter().map(|t| t.to_ascii_lowercase()).collect()
+            },
+            node_id: who.node.stable_id.clone(),
         });
         let entry = Cached {
             visitor: visitor.clone(),
             at: Instant::now(),
+            epoch,
         };
         self.cache.rcu(|map| {
             let mut next: HashMap<IpAddr, Cached> = map
                 .iter()
-                .filter(|(_, c)| c.at.elapsed() < WHOIS_TTL)
+                .filter(|(_, c)| c.epoch == epoch && c.at.elapsed() < WHOIS_TTL)
                 .map(|(ip, c)| (*ip, c.clone()))
                 .collect();
             if next.len() < MAX_CACHED {
@@ -147,6 +199,11 @@ impl TailnetIdentity {
         if principals.is_empty() {
             return Verdict::Refuse(messages::NOBODY_LISTED.to_string());
         }
+        match self.is_the_worker(visitor, None) {
+            None => return Verdict::Refuse(messages::IDENTITY_UNREADABLE.to_string()),
+            Some(true) => return Verdict::Refuse(messages::SELF_NOT_ADMITTED.to_string()),
+            Some(false) => {}
+        }
         if let Some(raw) = login_header {
             let Some(login) = tailnet::decode_login_header(raw.as_bytes()) else {
                 return Verdict::Refuse(messages::IDENTITY_UNREADABLE.to_string());
@@ -161,6 +218,9 @@ impl TailnetIdentity {
         }
         // No user: a tagged device, admitted only by an explicit tag entry.
         match self.whois(visitor).await {
+            Ok(Some(found)) if self.is_the_worker(visitor, Some(&found.node_id)) != Some(false) => {
+                Verdict::Refuse(messages::SELF_NOT_ADMITTED.to_string())
+            }
             Ok(Some(found)) if found.login.is_none() && !found.tags.is_empty() => {
                 let listed = principals.iter().any(|p| p.kind == PrincipalKind::Tag);
                 if listed && tailnet::admits(principals, None, &found.tags) {
@@ -182,7 +242,15 @@ impl TailnetIdentity {
         if principals.is_empty() {
             return Verdict::Refuse(messages::NOBODY_LISTED.to_string());
         }
+        match self.is_the_worker(peer, None) {
+            None => return Verdict::Refuse(messages::IDENTITY_UNREADABLE.to_string()),
+            Some(true) => return Verdict::Refuse(messages::SELF_NOT_ADMITTED.to_string()),
+            Some(false) => {}
+        }
         match self.whois(peer).await {
+            Ok(Some(found)) if self.is_the_worker(peer, Some(&found.node_id)) != Some(false) => {
+                Verdict::Refuse(messages::SELF_NOT_ADMITTED.to_string())
+            }
             Ok(Some(found)) => {
                 if tailnet::admits(principals, found.login.as_deref(), &found.tags) {
                     Verdict::Admit { login: found.login }
@@ -234,7 +302,16 @@ mod tests {
         let (socket, shared) = fake::start(dir.path(), state).await;
         let identity = TailnetIdentity::new();
         identity.set_api(Some(Arc::new(UnixLocalApi::new(socket))));
+        identity.set_self(Some(worker()));
         (dir, identity, shared)
+    }
+
+    /// The worker, as the recorded `status` names `Self`.
+    fn worker() -> SelfNode {
+        SelfNode {
+            stable_id: "n123CNTRL".into(),
+            ips: vec![ip("100.101.102.103"), ip("fd7a:115c:a1e0::5")],
+        }
     }
 
     fn ip(value: &str) -> IpAddr {
@@ -393,6 +470,131 @@ mod tests {
             identity
                 .admit_serve(&principals, None, ip("100.64.0.10"))
                 .await,
+            Verdict::Refuse(messages::IDENTITY_UNREADABLE.to_string())
+        );
+    }
+
+    /// A process on the worker, or a host-network workload, reaching the
+    /// worker's own tailnet address arrives as the worker's node: on an
+    /// untagged worker that is its owner's login. It is never admitted.
+    #[tokio::test]
+    async fn the_worker_itself_is_never_admitted() {
+        let owner = json!({"Node": {"StableID": "n123CNTRL", "Name": "master.example.ts.net."}, "UserProfile": {"LoginName": "owner@example.com"}});
+        let (_dir, identity, _) = identity_with(&[
+            ("100.101.102.103", owner.clone()),
+            // The same node by an address `status` did not list.
+            ("100.101.102.104", owner),
+        ])
+        .await;
+        let principals = list(&["owner@example.com"]);
+        let refused = Verdict::Refuse(messages::SELF_NOT_ADMITTED.to_string());
+        assert_eq!(
+            identity
+                .admit_peer(&principals, ip("100.101.102.103"))
+                .await,
+            refused
+        );
+        assert_eq!(
+            identity
+                .admit_peer(&principals, ip("100.101.102.104"))
+                .await,
+            refused
+        );
+        assert_eq!(
+            identity
+                .admit_serve(
+                    &principals,
+                    Some(&HeaderValue::from_static("owner@example.com")),
+                    ip("100.101.102.103")
+                )
+                .await,
+            refused
+        );
+        assert_eq!(
+            identity
+                .admit_peer(&principals, ip("fd7a:115c:a1e0::5"))
+                .await,
+            refused
+        );
+    }
+
+    /// Until tailscaled said who the worker is, nobody is admitted.
+    #[tokio::test]
+    async fn nobody_is_admitted_before_the_worker_knows_itself() {
+        let (_dir, identity, _) =
+            identity_with(&[("100.64.0.10", user("alice@example.com"))]).await;
+        identity.set_self(None);
+        let principals = list(&["alice@example.com"]);
+        let unknown = Verdict::Refuse(messages::IDENTITY_UNREADABLE.to_string());
+        assert_eq!(
+            identity.admit_peer(&principals, ip("100.64.0.10")).await,
+            unknown
+        );
+        assert_eq!(
+            identity
+                .admit_serve(
+                    &principals,
+                    Some(&HeaderValue::from_static("alice@example.com")),
+                    ip("100.64.0.10")
+                )
+                .await,
+            unknown
+        );
+    }
+
+    /// A node shared in from another tailnet carries that tailnet's tags;
+    /// they never match here. Its user's login still can.
+    #[tokio::test]
+    async fn tags_of_a_node_shared_in_never_match() {
+        let shared_tagged = json!({"Node": {"Name": "ci.other.ts.net.", "Tags": ["tag:ci"], "Sharer": 42}, "UserProfile": {"LoginName": "tagged-devices"}});
+        let shared_user = json!({"Node": {"Name": "laptop.other.ts.net.", "Sharer": 42}, "UserProfile": {"LoginName": "carol@example.org"}});
+        let (_dir, identity, _) =
+            identity_with(&[("100.64.0.20", shared_tagged), ("100.64.0.21", shared_user)]).await;
+        let principals = list(&["tag:ci", "carol@example.org"]);
+        assert!(matches!(
+            identity.admit_peer(&principals, ip("100.64.0.20")).await,
+            Verdict::Refuse(_)
+        ));
+        assert!(matches!(
+            identity
+                .admit_serve(&principals, None, ip("100.64.0.20"))
+                .await,
+            Verdict::Refuse(_)
+        ));
+        assert_eq!(
+            identity.admit_peer(&principals, ip("100.64.0.21")).await,
+            Verdict::Admit {
+                login: Some("carol@example.org".into())
+            }
+        );
+    }
+
+    /// A whois asked before consent was withdrawn, answered after, is not
+    /// used and not cached.
+    #[tokio::test]
+    async fn an_answer_to_a_question_asked_before_consent_was_withdrawn_is_dropped() {
+        let (_dir, identity, shared) =
+            identity_with(&[("100.64.0.10", user("alice@example.com"))]).await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        shared.lock().whois_gate = Some(Arc::clone(&gate));
+        let identity = Arc::new(identity);
+        let principals = list(&["alice@example.com"]);
+        let asking = {
+            let identity = Arc::clone(&identity);
+            let principals = principals.clone();
+            tokio::spawn(async move { identity.admit_peer(&principals, ip("100.64.0.10")).await })
+        };
+        // Let the question reach the fake, then withdraw consent.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        identity.set_api(None);
+        gate.notify_one();
+        assert_eq!(
+            asking.await.unwrap(),
+            Verdict::Refuse(messages::IDENTITY_UNREADABLE.to_string())
+        );
+        assert!(identity.cache.load().is_empty());
+        assert_eq!(
+            identity.admit_peer(&principals, ip("100.64.0.10")).await,
             Verdict::Refuse(messages::IDENTITY_UNREADABLE.to_string())
         );
     }

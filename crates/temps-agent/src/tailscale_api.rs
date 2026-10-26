@@ -131,13 +131,26 @@ pub struct WhoIs {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct WhoIsNode {
+    /// The stable node id (`nXXXXCNTRL`), as `status` names `Self`.
+    #[serde(rename = "StableID", default)]
+    pub stable_id: String,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// The user who shared this node in from another tailnet; absent or 0
+    /// for a node of this tailnet.
+    #[serde(default)]
+    pub sharer: Option<i64>,
 }
 
 impl WhoIs {
+    /// Shared in from another tailnet: its tags are that tailnet's, not
+    /// this one's.
+    pub fn shared_in(&self) -> bool {
+        self.node.sharer.is_some_and(|sharer| sharer != 0)
+    }
+
     pub fn tags(&self) -> &[String] {
         self.node.tags.as_deref().unwrap_or_default()
     }
@@ -767,6 +780,8 @@ pub(crate) mod fake {
         /// prefs write, one per write, oldest first.
         pub advertise_after_write: std::collections::VecDeque<Value>,
         pub prefs_writes: u32,
+        /// When set, whois answers only once this is notified.
+        pub whois_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     pub type Shared = Arc<parking_lot::Mutex<FakeState>>;
@@ -882,8 +897,15 @@ pub(crate) mod fake {
             .filter(|(host, _)| !host.contains(':'))
             .map(|(host, _)| host.to_string())
             .unwrap_or(addr);
-        match state.lock().whois.get(&ip) {
-            Some(answer) => axum::Json(answer.clone()).into_response(),
+        let (answer, gate) = {
+            let state = state.lock();
+            (state.whois.get(&ip).cloned(), state.whois_gate.clone())
+        };
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        match answer {
+            Some(answer) => axum::Json(answer).into_response(),
             None => (StatusCode::NOT_FOUND, "no match for IP:port").into_response(),
         }
     }
