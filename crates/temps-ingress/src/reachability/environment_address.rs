@@ -197,7 +197,7 @@ impl EnvironmentAddressService {
         let scope = reach.scope(project_id, environment_id).await?;
         let settings = reach.settings().await?;
         let gathered = reach
-            .gather(&scope.environment, &settings.preview_domain)
+            .gather(&scope.project, &scope.environment, &settings.preview_domain)
             .await?;
         let directs = reach.directs(&settings).await;
         let addresses = reach

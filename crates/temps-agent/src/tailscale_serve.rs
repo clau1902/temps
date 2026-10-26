@@ -1057,6 +1057,7 @@ mod tests {
                 deployment_id: Some(1),
                 project_id: Some(1),
                 environment_id: Some(1),
+                gate: None,
             }),
             addrs: Vec::new(),
             principals: None,

@@ -603,6 +603,9 @@ fn strip_proxy_owned_response_headers(response: &mut ResponseHeader) {
     // used by managed monitors to decide whether a local TLS follow-up is safe.
     response.remove_header("X-Temps-Proxy-Https-Redirect");
     response.remove_header("X-Temps-Proxy-Probe-Capable");
+    // Monitors read `x-temps-gate` as the gate's own answer (ADR 065 D10),
+    // so no app, gated or not, may send it.
+    response.remove_header(temps_core::gate::GATE_HEADER);
 }
 
 fn deployment_asset_scope(
@@ -1100,6 +1103,11 @@ pub struct ProxyContext {
     /// project context, static serving and the upstream peer all follow the
     /// target instead of the host's own service.
     pub path_route: Option<temps_routes::PathRoute>,
+    /// The host is a signed-in address (ADR 065 D8): the app's response may
+    /// not set the gate's cookies or pass for the gate.
+    pub gated_host: bool,
+    /// Who the gate admitted, for a signed-in address.
+    pub gate_identity: Option<temps_core::gate::GateClaims>,
     /// What the Shield reputation lists say about the client (ADR 066 D1),
     /// when one holds it. Phase 2 only records it with the request log.
     pub shield: Option<temps_shield::Verdict>,
@@ -1236,6 +1244,9 @@ pub struct LoadBalancer {
     /// `crate::console_unavailable`. `None` in split topology (`temps proxy`),
     /// where the console is another process this one cannot observe.
     console_unavailable: Option<Arc<crate::console_unavailable::ConsoleUnavailableResponder>>,
+    /// The signed-in gate (ADR 065 D8). `None` only in test harnesses that
+    /// never serve a signed-in address; `setup_proxy_server` always sets it.
+    gate: Option<Arc<crate::handler::gate::ProxyGate>>,
 }
 
 /// Status recorded in proxy logs when the client disconnected before a
@@ -1345,6 +1356,90 @@ impl LoadBalancer {
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
             upstream_failures: Default::default(),
             console_unavailable: None,
+            gate: None,
+        }
+    }
+
+    /// Enforce the signed-in gate (ADR 065 D8) for hosts the route table
+    /// marks `signed_in`. Hosts without a gate are not affected.
+    pub fn with_gate(mut self, gate: Arc<crate::handler::gate::ProxyGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Run the signed-in gate for this request. `Some(true)` when the gate
+    /// answered it; `None` when the host has no gate or the visitor is
+    /// admitted (identity headers set, gate cookies removed).
+    async fn enforce_gate(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<Option<bool>> {
+        let Some(gate) = self.gate.as_ref() else {
+            return Ok(None);
+        };
+        let hostname = crate::handler::gate::gate_hostname(&ctx.host);
+        let Some(policy) = gate.policy_for(&hostname) else {
+            return Ok(None);
+        };
+        ctx.gated_host = true;
+        // ACME HTTP-01 first, as on the agent: a signed-in address must still
+        // get and renew its certificate, and Let's Encrypt never signs in.
+        // Only a challenge stored for this host is answered; any other path
+        // under the prefix meets the gate, so the prefix is no way past it.
+        if ctx.path.starts_with(ACME_HTTP01_PREFIX) {
+            if let Some(key_authorization) = self
+                .handle_acme_http_challenge(&ctx.host, &ctx.path)
+                .await?
+            {
+                let body = Bytes::from(key_authorization);
+                let mut resp = ResponseHeader::build(200, None)?;
+                resp.insert_header("Content-Type", "text/plain")?;
+                resp.insert_header("Cache-Control", "no-cache")?;
+                resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                resp.insert_header("Content-Length", body.len().to_string())?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(Some(body), true).await?;
+                ctx.routing_status = "acme_challenge".to_string();
+                return Ok(Some(true));
+            }
+        }
+        // An operator who turned the HTTPS redirect off terminates TLS in
+        // front of this listener; sending the visitor to HTTPS again would
+        // loop. Either way the gate runs: this only picks the redirect.
+        let secure = self.is_https_request(session) || self.disable_https_redirect;
+        let outcome = {
+            let header = session.req_header();
+            let request = temps_core::gate::GateRequest {
+                hostname: &hostname,
+                method: &header.method,
+                path: header.uri.path(),
+                query: header.uri.query(),
+                headers: &header.headers,
+                secure,
+                // Tunnels end at a worker's tunnel origin, never here.
+                via_tunnel: false,
+            };
+            gate.evaluate(&policy, &request, temps_core::gate::unix_now())
+                .await
+        };
+        match outcome {
+            crate::handler::gate::GateOutcome::Admit(claims) => {
+                crate::handler::gate::admit(session.req_header_mut(), &claims)?;
+                ctx.gate_identity = Some(claims);
+                Ok(None)
+            }
+            crate::handler::gate::GateOutcome::Respond(answer, routing_status) => {
+                let (response, body) = crate::handler::gate::render(&answer, &ctx.request_id)?;
+                session
+                    .write_response_header(Box::new(response), body.is_none())
+                    .await?;
+                if let Some(body) = body {
+                    session.write_response_body(Some(body), true).await?;
+                }
+                ctx.routing_status = routing_status.to_string();
+                Ok(Some(true))
+            }
         }
     }
 
@@ -4959,6 +5054,26 @@ mod https_redirect_tests {
             .is_none());
     }
 
+    /// ADR 065 D10: a monitor takes `x-temps-gate` for the gate's own
+    /// answer, so an app on any host, gated or not, cannot send it.
+    #[test]
+    fn application_cannot_pass_for_the_gate() {
+        let mut response = ResponseHeader::build(500, None).expect("build application response");
+        response
+            .insert_header(
+                temps_core::gate::GATE_HEADER,
+                temps_core::gate::GATE_SIGN_IN,
+            )
+            .expect("insert spoofed gate answer");
+
+        strip_proxy_owned_response_headers(&mut response);
+
+        assert!(response
+            .headers
+            .get(temps_core::gate::GATE_HEADER)
+            .is_none());
+    }
+
     #[test]
     fn default_behaviour_follows_certificate_presence() {
         // No per-environment override → the pre-existing heuristic is unchanged:
@@ -5166,6 +5281,8 @@ impl ProxyHttp for LoadBalancer {
             upstream_response_time_ms: None,
             preview_route: None,
             path_route: None,
+            gated_host: false,
+            gate_identity: None,
             shield: None,
             client_fingerprint: None,
             public_surface_only: false,
@@ -5402,6 +5519,10 @@ impl ProxyHttp for LoadBalancer {
         // has been removed; clients sending this header should never have it
         // honored by downstream auth middleware.
         let _ = session.req_header_mut().remove_header("X-Temps-Demo-Mode");
+
+        // SECURITY: only the signed-in gate tells an app who is signed in
+        // (ADR 065 D8); a client's own identity headers never get through.
+        crate::handler::gate::strip_client_identity(session.req_header_mut());
 
         // SECURITY: only the status-host branch below may tag a request with
         // the custom hostname it was served for (#1412).
@@ -5939,6 +6060,12 @@ impl ProxyHttp for LoadBalancer {
                     }
                 }
             }
+        }
+
+        // Signed-in addresses (ADR 065 D8): the gate answers before anything
+        // can reach the app, including waking a sleeping environment.
+        if let Some(handled) = self.enforce_gate(session, ctx).await? {
+            return Ok(handled);
         }
 
         // On-demand: check if this host maps to a sleeping environment.
@@ -7666,6 +7793,9 @@ impl ProxyHttp for LoadBalancer {
         debug!("Upstream response filter headers: {:?}", upstream_response);
 
         strip_proxy_owned_response_headers(upstream_response);
+        if ctx.gated_host {
+            crate::handler::gate::strip_gate_from_app_response(upstream_response)?;
+        }
         upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
 
         // First upstream header = backend latency (connect + upstream time).
@@ -7933,6 +8063,10 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        // ADR 065 D8: no app receives the gate's cookies, admitted or not,
+        // gated host or not. A cookie left from before an address stopped
+        // being signed-in is still a token.
+        crate::handler::gate::strip_gate_cookies(upstream_request)?;
         // A stripping path route forwards `/api/users` as `/users` and tells
         // the target where it is mounted, for apps that build absolute URLs.
         // Only the platform sets that header on routed requests: a client
@@ -8896,6 +9030,8 @@ mod markdown_tests {
             upstream_response_time_ms: None,
             preview_route: None,
             path_route: None,
+            gated_host: false,
+            gate_identity: None,
             shield: None,
             client_fingerprint: None,
             public_surface_only: false,
@@ -9435,6 +9571,8 @@ mod markdown_pipeline_tests {
             upstream_response_time_ms: None,
             preview_route: None,
             path_route: None,
+            gated_host: false,
+            gate_identity: None,
             shield: None,
             client_fingerprint: None,
             public_surface_only: false,
@@ -11822,6 +11960,105 @@ mod status_page_host_tests {
             send(&h, &get("/api/projects", "pending.example.com")).await?,
             false,
         );
+        Ok(())
+    }
+
+    /// A signed-in address served by this proxy still gets and renews its
+    /// certificate (ADR 065 D8): Let's Encrypt never signs in, so a stored
+    /// HTTP-01 challenge is answered before the gate. Any other path under
+    /// the prefix still meets the gate.
+    #[tokio::test]
+    async fn a_signed_in_host_still_answers_its_acme_challenge_over_http() -> Result<()> {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_core::gate::{GateKind, GatePolicy, TempsGate};
+
+        const GATED: &str = "app.example.com";
+        let Some(mut h) = harness(None, false).await? else {
+            return Ok(());
+        };
+        let db = h._db.connection_arc().clone();
+        let now = chrono::Utc::now();
+        temps_entities::domains::ActiveModel {
+            domain: Set(GATED.to_string()),
+            status: Set("pending".to_string()),
+            http_challenge_token: Set(Some("challenge-token".to_string())),
+            http_challenge_key_authorization: Set(Some("challenge-token.thumbprint".to_string())),
+            is_wildcard: Set(false),
+            verification_method: Set("http-01".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        h.route_table.insert_route_for_test(
+            GATED,
+            temps_routes::RouteInfo {
+                backend: temps_routes::BackendType::Upstream {
+                    backends: vec![temps_routes::BackendEntry {
+                        address: "127.0.0.1:2".to_string(),
+                        container_id: None,
+                        container_name: None,
+                    }],
+                    round_robin_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: None,
+                environment: None,
+                deployment: None,
+                cert_eligible: true,
+            },
+        );
+        let key = temps_core::gate::generate_signing_key()?;
+        h.route_table.insert_gate_policy_for_test(
+            GATED,
+            GatePolicy {
+                address_id: "custom:7".into(),
+                gate: GateKind::Temps,
+                temps: Some(TempsGate {
+                    public_key: temps_core::gate::encode_public_key(&key.verifying_key()),
+                    authorize_url: "https://console.example.com/_temps/gate/authorize".into(),
+                    not_before: 0,
+                    revoked: vec![],
+                }),
+                access: None,
+            },
+        );
+        let service = Arc::new(temps_routes::gate::GateService::new(
+            db,
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "gate-test",
+            )),
+        ));
+        h.lb =
+            h.lb.with_gate(Arc::new(crate::handler::gate::ProxyGate::new(
+                h.route_table.clone(),
+                service,
+            )));
+
+        match send(
+            &h,
+            &get("/.well-known/acme-challenge/challenge-token", GATED),
+        )
+        .await?
+        {
+            Outcome::Answered { head, body } => {
+                assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+                assert_eq!(body, "challenge-token.thumbprint");
+            }
+            Outcome::Forwarded { path, .. } => panic!("the challenge must be answered: {path}"),
+        }
+        // No stored challenge: the gate answers, never the app.
+        for path in ["/.well-known/acme-challenge/other-token", "/"] {
+            match send(&h, &get(path, GATED)).await? {
+                Outcome::Answered { head, body } => {
+                    assert!(!head.starts_with("HTTP/1.1 200"), "{path}: {head}");
+                    assert!(!body.contains("thumbprint"), "{path}: {body}");
+                }
+                Outcome::Forwarded { path, .. } => panic!("{path} must meet the gate"),
+            }
+        }
         Ok(())
     }
 

@@ -7,6 +7,98 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}/api` | (string & {});
 };
 
+/**
+ * The Cloudflare Access application in front of a signed-in address
+ * (ADR 065 D9): its JWTs carry `aud`, from the team of `provider_id`.
+ */
+export type AccessBinding = {
+    app_id: string;
+    aud: string;
+    provider_id: number;
+};
+
+export type AccessPermission = 'apps_edit' | 'organizations_read';
+
+export type AccessPermissionCheck = {
+    /**
+     * Why, and what to change on the token when it is not present.
+     */
+    detail: string;
+    label: string;
+    permission: AccessPermission;
+    state: PermissionState;
+};
+
+/**
+ * A saved Access token. The token itself is never returned.
+ */
+export type AccessProviderResponse = {
+    account_id: string;
+    /**
+     * How many addresses it protects.
+     */
+    addresses: number;
+    /**
+     * Always `***`.
+     */
+    api_token: string;
+    created_at: string;
+    id: number;
+    /**
+     * How many signing keys listeners have for it now.
+     */
+    key_count: number;
+    /**
+     * When the team's signing keys were last fetched.
+     */
+    keys_fetched_at?: string | null;
+    name: string;
+    /**
+     * `<team>.cloudflareaccess.com`.
+     */
+    team_domain: string;
+};
+
+export type AccessTokenCheckRequest = {
+    /**
+     * The Cloudflare account the Access applications live in (32 hex
+     * characters, from the dashboard URL or the account's overview page).
+     */
+    account_id: string;
+    /**
+     * The token, as pasted. Used for this check only; not stored.
+     */
+    token: SecretString;
+};
+
+export type AccessTokenCheckResult = {
+    /**
+     * Why it did not, or why the account could not be checked.
+     */
+    error?: string | null;
+    permissions: Array<AccessPermissionCheck>;
+    /**
+     * Every permission is present and the team domain is known.
+     */
+    ready: boolean;
+    /**
+     * `<team>.cloudflareaccess.com`, when Organizations Read is present.
+     */
+    team_domain?: string | null;
+    /**
+     * Where to create a token.
+     */
+    token_url: string;
+    /**
+     * Cloudflare accepted the token at all.
+     */
+    valid: boolean;
+    /**
+     * What the token can do beyond Temps' own apps.
+     */
+    warning: string;
+};
+
 export type AcmeOrderResponse = {
     authorizations?: unknown;
     certificate_url?: string | null;
@@ -407,10 +499,18 @@ export type AddStatusPageDomainRequest = {
  */
 export type AddressAudience = {
     audience: Audience;
+    gate?: GateKind | null;
+    gate_access?: AccessBinding | null;
+    gate_allow?: GateAllowList | null;
     /**
      * For `private`: the network range a visitor must come from.
      */
     network_range?: string | null;
+    /**
+     * For `tailnet_users`: who it admits (ADR 065 D6), normalized. Undo
+     * puts the earlier list back with the audience.
+     */
+    principals?: Array<TailnetPrincipal>;
     /**
      * For `private`: that listener's address, which DNS points at and the
      * inside check dials.
@@ -420,6 +520,16 @@ export type AddressAudience = {
      * For `private`: the worker whose private listener serves it.
      */
     private_node_id?: number | null;
+    /**
+     * For `tailscale_service`: the `svc:` name.
+     */
+    private_service?: string | null;
+    /**
+     * For `private`: how it is served (ADR 065 D1), `tailscale_serve` or
+     * `tailscale_service`. `None` is phase 2's listener, so runs journaled
+     * before this column compare equal to what they set.
+     */
+    private_via?: string | null;
 };
 
 /**
@@ -2645,7 +2755,7 @@ export type AttributeKeysResponse = {
 /**
  * Who an address is for.
  */
-export type Audience = 'public' | 'private' | 'signed_in' | 'unsupported';
+export type Audience = 'public' | 'private' | 'signed_in' | 'tailnet_users' | 'unsupported';
 
 /**
  * IP address information in audit log
@@ -6988,6 +7098,18 @@ export type CostAnalysis = {
 };
 
 export type CreatableServiceTypeRoute = 'mariadb' | 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob' | 'rustfs';
+
+export type CreateAccessProviderRequest = {
+    account_id: string;
+    /**
+     * A name to tell tokens apart.
+     */
+    name: string;
+    /**
+     * Checked, then sealed; never returned.
+     */
+    token: SecretString;
+};
 
 export type CreateAlertRuleRequest = {
     /**
@@ -13236,6 +13358,15 @@ export type FeedbackView = {
     url?: string | null;
 };
 
+/**
+ * One answer a [`FieldKind::Choice`] field offers.
+ */
+export type FieldChoice = {
+    help?: string | null;
+    label: string;
+    value: string;
+};
+
 export type FieldKind = {
     type: 'text';
 } | {
@@ -13247,6 +13378,15 @@ export type FieldKind = {
     allow_subdomain?: boolean;
     provider_field: string;
     type: 'managed_domain';
+} | {
+    type: 'teams';
+} | {
+    type: 'users';
+} | {
+    choices: Array<FieldChoice>;
+    type: 'choice';
+} | {
+    type: 'text_list';
 };
 
 export type FieldResponse = {
@@ -13558,6 +13698,21 @@ export type FunnelResponse = {
     name: string;
     updated_at: string;
 };
+
+/**
+ * Who may sign in to a Temps-gated address besides being able to see the
+ * project (ADR 065 D7): stored in `gate_allow`. Empty lists mean no list.
+ */
+export type GateAllowList = {
+    teams?: Array<number>;
+    users?: Array<number>;
+};
+
+/**
+ * Which gate an address has (D7). Unknown values read as `Unsupported`, and
+ * an unsupported gate admits nobody.
+ */
+export type GateKind = 'temps' | 'cloudflare_access' | 'unsupported';
 
 /**
  * Detailed gateway container status surfaced to the settings UI.
@@ -16646,6 +16801,32 @@ export type Intent = {
 } | {
     domain: string;
     type: 'certificate';
+} | {
+    hostname: string;
+    name: string;
+    provider_id: number;
+    type: 'access_app';
+} | {
+    address_id: string;
+    hostname: string;
+    node_id: number;
+    node_name: string;
+    /**
+     * The `svc:` name, for a Service.
+     */
+    service?: string | null;
+    type: 'tailscale_serve';
+} | {
+    name: string;
+    type: 'tailscale_credential';
+} | {
+    /**
+     * `temps:<install>:<this run>`.
+     */
+    marker: string;
+    name: string;
+    tailnet: string;
+    type: 'tailscale_service';
 };
 
 /**
@@ -16759,6 +16940,7 @@ export type JournalEntry = {
      */
     pending_since?: string | null;
     resource?: RunResource | null;
+    shown_service?: ServiceDefinition | null;
     state: JournalState;
     /**
      * The provider tunnel id the connector had when it was marked.
@@ -21551,7 +21733,7 @@ export type PlanOption = {
 /**
  * One way to make the address reachable.
  */
-export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker';
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve' | 'tailscale_service' | 'tailscale_service_with_credential';
 
 /**
  * `POST …/reachability/plan`.
@@ -21562,6 +21744,12 @@ export type PlanRequest = {
      */
     address?: string | null;
     audience?: Audience;
+    gate?: GateKind | null;
+    /**
+     * For `tailnet_users`: the tailnet logins and tags it admits (ADR 065
+     * D6). At least one; checked and lower-cased.
+     */
+    principals?: Array<TailnetPrincipal>;
 };
 
 export type PlanSourceBackup = {
@@ -22089,6 +22277,11 @@ export type PreviousChoice = {
 export type PricingResponse = {
     models: Array<ModelPricing>;
 };
+
+/**
+ * What a `tailnet_users` entry names (ADR 065 D6).
+ */
+export type PrincipalKind = 'login' | 'tag';
 
 /**
  * Information about private/local IP addresses
@@ -24196,6 +24389,7 @@ export type ReachabilityPlan = {
      * moved on from.
      */
     fingerprint?: string | null;
+    gate?: GateKind | null;
     /**
      * In the order Temps prefers them; the first is recommended.
      */
@@ -24206,6 +24400,11 @@ export type ReachabilityPlan = {
      * `GET …/reachability`, which is not stored.
      */
     plan_id?: string | null;
+    /**
+     * For `tailnet_users`: who the address will admit, as the plan was
+     * made for them (ADR 065 D6). Apply sets exactly this list.
+     */
+    principals?: Array<TailnetPrincipal>;
 };
 
 /**
@@ -25859,6 +26058,54 @@ export type RunResource = {
 } | {
     domain: string;
     type: 'certificate';
+} | {
+    aud: string;
+    hostname: string;
+    id: string;
+    name: string;
+    /**
+     * The policies' fingerprint when the run created it.
+     */
+    policies: string;
+    provider_id: number;
+    type: 'access_app';
+} | {
+    address_id: string;
+    /**
+     * This run created the entry, rather than finding it.
+     */
+    created: boolean;
+    entry_id: number;
+    hostname: string;
+    node_id: number;
+    node_name: string;
+    type: 'tailscale_serve';
+} | {
+    id: number;
+    name: string;
+    type: 'tailscale_credential';
+} | {
+    /**
+     * This run created it (`created`), rather than finding it.
+     */
+    created: boolean;
+    /**
+     * The run whose marker it carries.
+     */
+    creator_run_id: number;
+    /**
+     * As read back once the step was done, with its addresses.
+     */
+    definition: ServiceDefinition;
+    /**
+     * `svc:myapp`.
+     */
+    name: string;
+    /**
+     * The tailnet's MagicDNS suffix, for the Service's lock and messages.
+     */
+    tailnet: string;
+    type: 'tailscale_service';
 };
 
 export type RunState = 'running' | 'succeeded' | 'waiting' | 'failed' | 'interrupted' | 'recovering' | 'conflict' | 'undoing' | 'undo_paused' | 'undone';
@@ -27461,6 +27708,23 @@ export type ServiceCreateAlertRuleRequest = {
 };
 
 /**
+ * A Tailscale Service as the API returns it, with the fields D4 compares.
+ */
+export type ServiceDefinition = {
+    /**
+     * The TailVIPs Tailscale assigned.
+     */
+    addrs?: Array<string>;
+    comment?: string;
+    /**
+     * `svc:myapp`.
+     */
+    name: string;
+    ports?: Array<string>;
+    tags?: Array<string>;
+};
+
+/**
  * Alerting state for a service whose health checks keep failing.
  */
 export type ServiceDownAlertResponse = {
@@ -28448,6 +28712,13 @@ export type SiblingRef = {
      * URL slug used to link into the sibling project's single-project trace view.
      */
     project_slug: string;
+};
+
+export type SignOutOfAppsResponse = {
+    /**
+     * Gate sessions revoked.
+     */
+    revoked: number;
 };
 
 /**
@@ -29608,7 +29879,7 @@ export type StepConversionResponse = {
     step_order: number;
 };
 
-export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience';
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'access_app' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval';
 
 /**
  * What kind of resource a migration step operates on
@@ -29871,6 +30142,15 @@ export type TailLogsRequest = {
     project_id: number;
     service: string;
     text?: string | null;
+};
+
+/**
+ * One person or tag a `tailnet_users` address admits. `value` is always
+ * ASCII-lower-cased: it is compared that way (D6).
+ */
+export type TailnetPrincipal = {
+    kind: PrincipalKind;
+    value: string;
 };
 
 /**
@@ -44672,6 +44952,134 @@ export type GetCloudStatusResponses = {
 
 export type GetCloudStatusResponse = GetCloudStatusResponses[keyof GetCloudStatusResponses];
 
+export type ListAccessProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloudflare-access/providers';
+};
+
+export type ListAccessProvidersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type ListAccessProvidersError = ListAccessProvidersErrors[keyof ListAccessProvidersErrors];
+
+export type ListAccessProvidersResponses = {
+    200: Array<AccessProviderResponse>;
+};
+
+export type ListAccessProvidersResponse = ListAccessProvidersResponses[keyof ListAccessProvidersResponses];
+
+export type CreateAccessProviderData = {
+    body: CreateAccessProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/cloudflare-access/providers';
+};
+
+export type CreateAccessProviderErrors = {
+    /**
+     * The token is missing a permission
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateAccessProviderError = CreateAccessProviderErrors[keyof CreateAccessProviderErrors];
+
+export type CreateAccessProviderResponses = {
+    201: AccessProviderResponse;
+};
+
+export type CreateAccessProviderResponse = CreateAccessProviderResponses[keyof CreateAccessProviderResponses];
+
+export type CheckAccessProviderData = {
+    body: AccessTokenCheckRequest;
+    path?: never;
+    query?: never;
+    url: '/cloudflare-access/providers/check';
+};
+
+export type CheckAccessProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type CheckAccessProviderError = CheckAccessProviderErrors[keyof CheckAccessProviderErrors];
+
+export type CheckAccessProviderResponses = {
+    200: AccessTokenCheckResult;
+};
+
+export type CheckAccessProviderResponse = CheckAccessProviderResponses[keyof CheckAccessProviderResponses];
+
+export type DeleteAccessProviderData = {
+    body?: never;
+    path: {
+        /**
+         * Saved token
+         */
+        provider_id: number;
+    };
+    query?: never;
+    url: '/cloudflare-access/providers/{provider_id}';
+};
+
+export type DeleteAccessProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Not found
+     */
+    404: ProblemDetails;
+    /**
+     * An address uses it
+     */
+    409: ProblemDetails;
+};
+
+export type DeleteAccessProviderError = DeleteAccessProviderErrors[keyof DeleteAccessProviderErrors];
+
+export type DeleteAccessProviderResponses = {
+    /**
+     * Deleted
+     */
+    204: void;
+};
+
+export type DeleteAccessProviderResponse = DeleteAccessProviderResponses[keyof DeleteAccessProviderResponses];
+
 export type ClusterDnsStatusData = {
     body?: never;
     path?: never;
@@ -51542,6 +51950,34 @@ export type GetFlagSnapshotResponses = {
 };
 
 export type GetFlagSnapshotResponse = GetFlagSnapshotResponses[keyof GetFlagSnapshotResponses];
+
+export type SignOutOfAppsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/gate/sign-out-of-apps';
+};
+
+export type SignOutOfAppsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Not a user
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SignOutOfAppsResponses = {
+    200: SignOutOfAppsResponse;
+};
+
+export type SignOutOfAppsResponse2 = SignOutOfAppsResponses[keyof SignOutOfAppsResponses];
 
 export type GetGeoDatabaseStatusData = {
     body?: never;
@@ -72655,6 +73091,54 @@ export type GetFunnelMetricsResponses = {
 };
 
 export type GetFunnelMetricsResponse = GetFunnelMetricsResponses[keyof GetFunnelMetricsResponses];
+
+export type SignEveryoneOutOfAddressData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * `custom:<id>` or `environment:<id>`
+         */
+        address_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/gate/addresses/{address_id}/sign-everyone-out';
+};
+
+export type SignEveryoneOutOfAddressErrors = {
+    /**
+     * Malformed address id
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Address not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SignEveryoneOutOfAddressResponses = {
+    /**
+     * Everyone signed out
+     */
+    204: void;
+};
+
+export type SignEveryoneOutOfAddressResponse = SignEveryoneOutOfAddressResponses[keyof SignEveryoneOutOfAddressResponses];
 
 export type UpdateGitSettingsData = {
     body: UpdateGitSettingsRequest;

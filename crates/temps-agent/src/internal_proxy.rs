@@ -118,7 +118,18 @@ const HOP_BY_HOP: &[&str] = &[
     "x-forwarded-proto",
     "x-real-ip",
     "x-temps-deployment-id",
+    // Only the signed-in gate says who is signed in (ADR 065 D8): a client's
+    // own copies are dropped on every listener, and an admitted request gets
+    // the gate's from `GateIdentity`.
+    "x-temps-user",
+    "x-temps-user-email",
 ];
+
+/// Who the signed-in gate admitted, attached to the request so both
+/// forwarding paths (plain and upgrade) add the identity headers after
+/// stripping the client's.
+#[derive(Clone)]
+struct GateIdentity(Vec<(&'static str, HeaderValue)>);
 
 /// The JA4 headers of ADR 066 D4. A worker reads none of them from a
 /// visitor, so none reaches an app, where it could pass for one the
@@ -199,6 +210,10 @@ struct ProxyState {
     /// origin is told `https` by the provider, which terminated TLS, so it
     /// has no server name to check.
     require_sni: bool,
+    /// The loopback origin a tunnel connector forwards to (ADR 058). The
+    /// only listener that may serve a Cloudflare Access address, since
+    /// Access only sees tunnel traffic (ADR 065 D9).
+    tunnel_origin: bool,
     acme: Option<PublicAcmeConfig>,
     acme_relay: Arc<AcmeRelayState>,
     /// A Serve socket (ADR 065 D3): serves its one address, and is the only
@@ -330,6 +345,7 @@ pub async fn spawn(
         public_mode: false,
         private_mode: false,
         require_sni: false,
+        tunnel_origin: false,
         forwarded_proto: "http",
         acme: None,
         acme_relay: Arc::new(AcmeRelayState::new()),
@@ -642,7 +658,12 @@ async fn handle_serve(state: &ProxyState, socket: &ServeSocket, mut req: Request
     proxy_with_retries(state, &route, req).await
 }
 
-async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
+async fn handle(State(state): State<Arc<ProxyState>>, mut req: Request) -> Response {
+    // ADR 065 D8: the gate's identity headers are set only for a request it
+    // admitted, never taken from a client, on every listener including a
+    // Serve socket. Tailnet identity is filtered where requests are
+    // forwarded (`forwards_header`, D3).
+    temps_core::gate::strip_identity_headers(req.headers_mut());
     if let Some(socket) = state.serve.clone() {
         return handle_serve(&state, &socket, req).await;
     }
@@ -712,13 +733,41 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
                 "public request"
             );
         }
+        // Signed-in addresses (ADR 065 D8): the gate answers before anything
+        // reaches the app. Routes without a gate are not affected.
+        if let Some(policy) = entry.gate.as_ref() {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+            match crate::gate::enforce(
+                policy,
+                &host,
+                state.forwarded_proto == "https",
+                state.tunnel_origin,
+                &method,
+                &uri,
+                req.headers_mut(),
+            )
+            .await
+            {
+                crate::gate::Enforced::Respond(response) => return response,
+                crate::gate::Enforced::Admit(identity) => {
+                    req.extensions_mut().insert(GateIdentity(identity));
+                }
+            }
+        }
         if entry.backends.is_empty() {
             return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
         }
-        if is_upgrade_request(req.headers()) {
-            return proxy_upgrade(&entry, req, state.forwarded_proto, false).await;
+        let mut response = if is_upgrade_request(req.headers()) {
+            proxy_upgrade(&entry, req, state.forwarded_proto, false).await
+        } else {
+            proxy_with_retries(&state, &entry, req).await
+        };
+        if entry.gate.is_some() {
+            // The app may neither pass for the gate nor touch its cookies.
+            temps_core::gate::strip_gate_response_headers(response.headers_mut());
         }
-        return proxy_with_retries(&state, &entry, req).await;
+        return response;
     }
 
     // Reject non-temps.local up front. The proxy is not a generic
@@ -800,7 +849,7 @@ pub(crate) fn public_router(
     forwarded_proto: &'static str,
     acme: Option<PublicAcmeConfig>,
 ) -> std::io::Result<axum::Router> {
-    public_router_with(store, forwarded_proto, acme, true)
+    public_router_with(store, forwarded_proto, acme, true, false)
 }
 
 /// The private listener's router (ADR 064 D5): no ACME relay (a private
@@ -810,7 +859,7 @@ pub(crate) fn private_router(
     forwarded_proto: &'static str,
     tailnet: Option<Arc<crate::tailnet_identity::TailnetIdentity>>,
 ) -> std::io::Result<axum::Router> {
-    router_with(store, forwarded_proto, None, true, true, tailnet)
+    router_with(store, forwarded_proto, None, true, true, false, tailnet)
 }
 
 /// The headers a tunnel origin trusts from its loopback connector. The
@@ -882,8 +931,8 @@ pub async fn spawn_tunnel_origin(
     }
     let listener = TcpListener::bind(address).await?;
     let bound = listener.local_addr()?;
-    let app = public_router_with(store, "https", None, false)?.layer(axum::middleware::from_fn(
-        move |mut req: Request, next: axum::middleware::Next| {
+    let app = public_router_with(store, "https", None, false, true)?.layer(
+        axum::middleware::from_fn(move |mut req: Request, next: axum::middleware::Next| {
             let trusted = headers.load_full();
             async move {
                 let from_loopback = req
@@ -911,8 +960,8 @@ pub async fn spawn_tunnel_origin(
                 }
                 next.run(req).await
             }
-        },
-    ));
+        }),
+    );
     tokio::spawn(async move {
         let server = axum::serve(
             listener,
@@ -971,6 +1020,7 @@ pub async fn spawn_serve_socket(
         private_mode: false,
         forwarded_proto: "https",
         require_sni: false,
+        tunnel_origin: false,
         acme: None,
         acme_relay: Arc::new(AcmeRelayState::new()),
         serve: Some(socket),
@@ -995,8 +1045,17 @@ fn public_router_with(
     forwarded_proto: &'static str,
     acme: Option<PublicAcmeConfig>,
     require_sni: bool,
+    tunnel_origin: bool,
 ) -> std::io::Result<axum::Router> {
-    router_with(store, forwarded_proto, acme, require_sni, false, None)
+    router_with(
+        store,
+        forwarded_proto,
+        acme,
+        require_sni,
+        false,
+        tunnel_origin,
+        None,
+    )
 }
 
 fn router_with(
@@ -1005,6 +1064,7 @@ fn router_with(
     acme: Option<PublicAcmeConfig>,
     require_sni: bool,
     private_mode: bool,
+    tunnel_origin: bool,
     tailnet: Option<Arc<crate::tailnet_identity::TailnetIdentity>>,
 ) -> std::io::Result<axum::Router> {
     let client = reqwest::Client::builder()
@@ -1027,6 +1087,7 @@ fn router_with(
         private_mode,
         forwarded_proto,
         require_sni,
+        tunnel_origin,
         acme,
         acme_relay: Arc::new(AcmeRelayState::new()),
         serve: None,
@@ -1385,10 +1446,14 @@ fn is_upgrade_request(headers: &HeaderMap) -> bool {
 /// side closes.
 async fn proxy_upgrade(
     entry: &RouteEntry,
-    req: Request,
+    mut req: Request,
     forwarded_proto: &'static str,
     serve_socket: bool,
 ) -> Response {
+    // The gate's cookies never reach an app, admitted or not, gated host or
+    // not: a cookie left from before an address stopped being signed-in is
+    // still a token (ADR 065 D8).
+    temps_core::gate::strip_gate_cookies(req.headers_mut());
     use rand::prelude::IndexedRandom;
     let backend = {
         let mut rng = rand::rng();
@@ -1406,6 +1471,7 @@ async fn proxy_upgrade(
         .unwrap_or("/")
         .to_string();
     let headers = req.headers().clone();
+    let identity = req.extensions().get::<GateIdentity>().cloned();
     let public_peer = req.extensions().get::<PublicPeer>().copied().or_else(|| {
         req.extensions()
             .get::<ConnectInfo<SocketAddr>>()
@@ -1487,6 +1553,12 @@ async fn proxy_upgrade(
     }
     if let Some(h) = &original_host {
         wire.extend_from_slice(format!("host: {}\r\n", h).as_bytes());
+    }
+    for (name, value) in identity.iter().flat_map(|identity| identity.0.iter()) {
+        wire.extend_from_slice(name.as_bytes());
+        wire.extend_from_slice(b": ");
+        wire.extend_from_slice(value.as_bytes());
+        wire.extend_from_slice(b"\r\n");
     }
     if let Some(deployment_id) = entry.deployment_id {
         wire.extend_from_slice(format!("x-temps-deployment-id: {}\r\n", deployment_id).as_bytes());
@@ -1582,7 +1654,7 @@ async fn proxy_upgrade(
         let mut resp = Response::new(Body::from(leftover));
         *resp.status_mut() = status;
         for (name, value) in headers_out.iter() {
-            if HOP_BY_HOP.contains(&name.as_str()) {
+            if HOP_BY_HOP.contains(&name.as_str()) || !app_may_send(name) {
                 continue;
             }
             resp.headers_mut().insert(name.clone(), value.clone());
@@ -1601,7 +1673,7 @@ async fn proxy_upgrade(
     // there and must round-trip unchanged.
     let mut client_resp = Response::new(Body::empty());
     *client_resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    for (name, value) in response_bytes.iter() {
+    for (name, value) in response_bytes.iter().filter(|(name, _)| app_may_send(name)) {
         client_resp
             .headers_mut()
             .insert(name.clone(), value.clone());
@@ -1800,13 +1872,16 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
     // the body issue is moot. Methods with bodies get one shot.
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let headers = req.headers().clone();
+    let mut headers = req.headers().clone();
+    // As in `proxy_upgrade`: no app ever receives the gate's cookies.
+    temps_core::gate::strip_gate_cookies(&mut headers);
     let public_peer = req.extensions().get::<PublicPeer>().copied().or_else(|| {
         req.extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|peer| PublicPeer(peer.0))
     });
     let recorder = req.extensions().get::<RequestRecorder>().cloned();
+    let identity = req.extensions().get::<GateIdentity>().cloned();
     let login = req
         .extensions()
         .get::<AdmittedLogin>()
@@ -1817,6 +1892,7 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
         headers,
         public_peer,
         recorder,
+        identity,
         login,
     };
     let retryable = metadata.method == axum::http::Method::GET
@@ -1909,6 +1985,8 @@ struct ForwardRequestMetadata {
     public_peer: Option<PublicPeer>,
     /// Public listeners only (ADR 061).
     recorder: Option<RequestRecorder>,
+    /// Who the signed-in gate admitted (ADR 065 D8).
+    identity: Option<GateIdentity>,
     /// An admitted tailnet login (ADR 065 D6).
     login: Option<String>,
 }
@@ -1940,8 +2018,11 @@ async fn forward_once(
     let mut builder = state.client.request(metadata.method.clone(), &upstream_url);
 
     for (name, value) in metadata.headers.iter() {
-        // Tailnet identity is trusted only from a Serve socket (ADR 065 D3).
+        // Every `x-temps-*` header is Temps' to set, below; a client's copy
+        // never passes, as on the upgrade path. Tailnet identity is trusted
+        // only from a Serve socket (ADR 065 D3).
         if HOP_BY_HOP.contains(&name.as_str())
+            || name.as_str().starts_with("x-temps-")
             || is_forwarded_ja4_header(name.as_str())
             || !temps_core::tailnet::forwards_header(name.as_str(), state.serve.is_some())
         {
@@ -1966,6 +2047,13 @@ async fn forward_once(
     }
     if let Some(deployment_id) = entry.deployment_id {
         builder = builder.header("x-temps-deployment-id", deployment_id.to_string());
+    }
+    for (name, value) in metadata
+        .identity
+        .iter()
+        .flat_map(|identity| identity.0.iter())
+    {
+        builder = builder.header(*name, value.clone());
     }
     if let Some(login) = metadata
         .login
@@ -2023,12 +2111,19 @@ async fn forward_once(
     let mut out = Response::new(Body::from_stream(upstream.bytes_stream()));
     *out.status_mut() = status;
     for (name, value) in upstream_headers_owned.iter() {
-        if HOP_BY_HOP.contains(&name.as_str()) {
+        if HOP_BY_HOP.contains(&name.as_str()) || !app_may_send(name) {
             continue;
         }
         out.headers_mut().insert(name.clone(), value.clone());
     }
     out
+}
+
+/// Whether an app's response may carry `name` to the client. No app, gated
+/// or not, may send `x-temps-gate`: monitors read it as the gate's own
+/// answer (ADR 065 D10), so an app could pass for a gate that is up.
+fn app_may_send(name: &axum::http::HeaderName) -> bool {
+    name.as_str() != temps_core::gate::GATE_HEADER
 }
 
 /// Convert axum's `Body` into a stream of `Result<Bytes, _>` that
@@ -2128,6 +2223,7 @@ mod tests {
             deployment_id: Some(project_id * 10),
             project_id: Some(project_id),
             environment_id: Some(project_id * 100),
+            gate: None,
         }
     }
 
@@ -2372,6 +2468,7 @@ mod tests {
                 deployment_id: Some(1),
                 project_id: Some(1),
                 environment_id: Some(1),
+                gate: None,
             };
             let service = hyper::service::service_fn(move |mut request| {
                 request
