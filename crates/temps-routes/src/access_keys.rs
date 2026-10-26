@@ -183,6 +183,28 @@ pub struct AccessKeyService {
     last_fetch: Mutex<HashMap<i32, Instant>>,
 }
 
+/// Read `response`'s body, refusing one over `max` bytes: by its
+/// `Content-Length` before reading anything, and while it streams when it
+/// has none, so a broken or hostile server never makes Temps hold more
+/// than `max` bytes of it.
+pub async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, String> {
+    let too_large = || format!("the answer is larger than the {max} bytes allowed");
+    if response
+        .content_length()
+        .is_some_and(|length| length > max as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > max {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 impl AccessKeyService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         let http = reqwest::Client::builder()
@@ -229,8 +251,7 @@ impl AccessKeyService {
                 response.status().as_u16()
             )));
         }
-        let body = response
-            .bytes()
+        let body = read_capped(response, MAX_CERTS_BYTES)
             .await
             .map_err(|e| fetch_error(format!("could not read the answer from {url} ({e})")))?;
         parse_keys(&body).map_err(fetch_error)
@@ -406,6 +427,63 @@ mod tests {
         let keys = parse_keys(body.to_string().as_bytes()).expect("keys");
         let kids: Vec<&str> = keys.iter().map(|k| k.kid.as_str()).collect();
         assert_eq!(kids, vec!["a", "b"]);
+    }
+
+    /// Serve `head` then `body` once on a loopback port; its URL.
+    async fn serve_once(head: String, body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+        });
+        format!("http://{address}/")
+    }
+
+    #[tokio::test]
+    async fn an_answer_over_the_cap_is_refused_before_it_is_all_read() {
+        let client = reqwest::Client::new();
+        // Announced too large: refused on the header alone.
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n".into(),
+            Vec::new(),
+        )
+        .await;
+        let response = client.get(&url).send().await.unwrap();
+        assert!(read_capped(response, 1024)
+            .await
+            .unwrap_err()
+            .contains("larger"));
+        // No length given: cut off once it streams past the cap.
+        let mut chunked = Vec::new();
+        for _ in 0..8 {
+            chunked.extend_from_slice(format!("{:x}\r\n", 512).as_bytes());
+            chunked.extend_from_slice(&[b'x'; 512]);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n\r\n");
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".into(),
+            chunked,
+        )
+        .await;
+        let response = client.get(&url).send().await.unwrap();
+        assert!(read_capped(response, 1024)
+            .await
+            .unwrap_err()
+            .contains("larger"));
+        // Within the cap: read whole.
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".into(),
+            b"hello".to_vec(),
+        )
+        .await;
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(read_capped(response, 1024).await.unwrap(), b"hello");
     }
 
     #[test]

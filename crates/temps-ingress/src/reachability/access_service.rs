@@ -9,12 +9,14 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
 use temps_core::EncryptionService;
-use temps_entities::{cloudflare_access_providers, environment_domains, project_custom_domains};
+use temps_entities::{
+    cloudflare_access_providers, environment_domains, project_custom_domains, reachability_runs,
+};
 use temps_routes::access_keys::AccessKeyService;
 use thiserror::Error;
 use tracing::warn;
@@ -23,6 +25,7 @@ use utoipa::ToSchema;
 use super::access::{
     self, check_access_token, AccessApp, AccessPolicyAnswer, AccessTokenCheckResult, CreateAppError,
 };
+use super::model::{Intent, JournalEntry, JournalState};
 
 #[derive(Debug, Error)]
 pub enum AccessProviderError {
@@ -40,6 +43,13 @@ pub enum AccessProviderError {
          the Temps sign-in or remove them before deleting it"
     )]
     InUse { provider_id: i32, addresses: u64 },
+    #[error(
+        "Cloudflare Access token {provider_id} is still needed to undo run(s) {}, which created \
+         an Access app with it; undo them first (or delete the app in Cloudflare, then undo \
+         them) before deleting the token",
+        run_list(.runs)
+    )]
+    NeededToUndo { provider_id: i32, runs: Vec<i32> },
     #[error("Failed to {operation} the Cloudflare Access token {provider_id:?}: {reason}")]
     Encryption {
         operation: &'static str,
@@ -52,6 +62,40 @@ pub enum AccessProviderError {
         #[source]
         source: sea_orm::DbErr,
     },
+}
+
+fn run_list(runs: &[i32]) -> String {
+    runs.iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether undo may still have to delete an Access app of `provider_id`
+/// that this entry recorded: everything but an app found never made or
+/// already gone, and a conflict found before anything was written.
+fn holds_access_app(entry: &JournalEntry, provider_id: i32) -> bool {
+    let Intent::AccessApp {
+        provider_id: id, ..
+    } = &entry.intent
+    else {
+        return false;
+    };
+    *id == provider_id
+        && match entry.state {
+            JournalState::Absent => false,
+            JournalState::Conflict => !entry.unwritten,
+            JournalState::Pending | JournalState::Done => true,
+        }
+}
+
+/// Whether a run's journal still holds an Access app of `provider_id`. A
+/// journal that does not decode counts as holding one: refusing a delete
+/// is recoverable, stranding an app is not.
+fn journal_holds_access_app(journal: &serde_json::Value, provider_id: i32) -> bool {
+    serde_json::from_value::<Vec<JournalEntry>>(journal.clone())
+        .map(|entries| entries.iter().any(|e| holds_access_app(e, provider_id)))
+        .unwrap_or(true)
 }
 
 fn db(operation: &'static str) -> impl FnOnce(sea_orm::DbErr) -> AccessProviderError {
@@ -147,6 +191,30 @@ impl AccessProviderService {
             .await
             .map_err(db("count the environment domains using a token"))?;
         Ok(custom + environment)
+    }
+
+    /// The runs whose undo still needs the token to delete an Access app
+    /// they created. Only journals mentioning an app of this token are
+    /// read (a `jsonb` containment on the intent), so this is bounded by
+    /// the runs that used it, not by every run.
+    async fn runs_needing(&self, provider_id: i32) -> Result<Vec<i32>, AccessProviderError> {
+        let needle = serde_json::json!([
+            { "intent": { "type": "access_app", "provider_id": provider_id } }
+        ]);
+        let rows = reachability_runs::Entity::find()
+            .filter(Expr::cust_with_values(
+                "journal @> $1::jsonb",
+                [needle.to_string()],
+            ))
+            .order_by_asc(reachability_runs::Column::Id)
+            .all(self.db.as_ref())
+            .await
+            .map_err(db("find the runs that created an Access app with a token"))?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| journal_holds_access_app(&row.journal, provider_id))
+            .map(|row| row.id)
+            .collect())
     }
 
     async fn respond(
@@ -257,7 +325,9 @@ impl AccessProviderService {
         self.respond(model).await
     }
 
-    /// Delete a token no address uses.
+    /// Delete a token no address uses and no run still needs to undo an
+    /// Access app it created: once the token is gone, that undo could
+    /// never reach the app again.
     pub async fn delete(
         &self,
         provider_id: i32,
@@ -274,10 +344,26 @@ impl AccessProviderService {
                 addresses,
             });
         }
+        let runs = self.runs_needing(provider_id).await?;
+        if !runs.is_empty() {
+            return Err(AccessProviderError::NeededToUndo { provider_id, runs });
+        }
         cloudflare_access_providers::Entity::delete_by_id(provider_id)
             .exec(self.db.as_ref())
             .await
-            .map_err(db("delete the token"))?;
+            .map_err(|source| match source.sql_err() {
+                // An address was bound to it since the count above.
+                Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_)) => {
+                    AccessProviderError::InUse {
+                        provider_id,
+                        addresses: 1,
+                    }
+                }
+                _ => AccessProviderError::Database {
+                    operation: "delete the token",
+                    source,
+                },
+            })?;
         Ok(model)
     }
 
@@ -320,10 +406,7 @@ impl AccessProviderService {
             .map_err(|e| e.to_string())?;
         let apps =
             access::list_apps(&self.http, &credentials.token, &credentials.account_id).await?;
-        Ok(apps
-            .into_iter()
-            .filter(|app| access::covers(app, host))
-            .collect())
+        Ok(access::covering(apps, host))
     }
 
     /// The app named `name` protecting `host`: how a run finds the app it
@@ -429,30 +512,134 @@ mod tests {
         ));
     }
 
+    fn token_row(id: i32) -> cloudflare_access_providers::Model {
+        let now = Utc::now();
+        cloudflare_access_providers::Model {
+            id,
+            name: "access".into(),
+            account_id: "a".into(),
+            team_domain: "team.cloudflareaccess.com".into(),
+            api_token_encrypted: "sealed".into(),
+            jwks: None,
+            jwks_fetched_at: None,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn count(n: i64) -> Vec<std::collections::BTreeMap<String, sea_orm::Value>> {
+        vec![std::collections::BTreeMap::from([(
+            "num_items".to_string(),
+            sea_orm::Value::BigInt(Some(n)),
+        )])]
+    }
+
+    fn app_entry(provider_id: i32, state: JournalState) -> JournalEntry {
+        let intent = Intent::AccessApp {
+            provider_id,
+            name: "temps-app.example.com-abc".into(),
+            hostname: "app.example.com".into(),
+        };
+        JournalEntry {
+            state,
+            ..JournalEntry::pending(intent.key(0), intent, Utc::now())
+        }
+    }
+
+    fn run_row(id: i32, journal: &[JournalEntry]) -> reachability_runs::Model {
+        let now = Utc::now();
+        reachability_runs::Model {
+            id,
+            project_id: Some(1),
+            environment_id: Some(1),
+            kind: "apply".into(),
+            audience: "signed_in".into(),
+            address: Some("app.example.com".into()),
+            option: "tunnel".into(),
+            plan_id: None,
+            state: "succeeded".into(),
+            steps: serde_json::json!([]),
+            journal: serde_json::to_value(journal).expect("journal"),
+            context: serde_json::json!({}),
+            undo: None,
+            error: None,
+            live_url: None,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+            finished_at: Some(now),
+        }
+    }
+
+    #[test]
+    fn the_containment_needle_matches_how_an_access_app_is_journaled() {
+        let entry = serde_json::to_value(app_entry(4, JournalState::Done)).expect("entry");
+        assert_eq!(entry["intent"]["type"], "access_app");
+        assert_eq!(entry["intent"]["provider_id"], 4);
+    }
+
+    #[test]
+    fn only_an_app_undo_may_still_delete_holds_the_token() {
+        assert!(holds_access_app(&app_entry(4, JournalState::Done), 4));
+        assert!(holds_access_app(&app_entry(4, JournalState::Pending), 4));
+        assert!(holds_access_app(&app_entry(4, JournalState::Conflict), 4));
+        assert!(!holds_access_app(&app_entry(4, JournalState::Absent), 4));
+        assert!(!holds_access_app(&app_entry(5, JournalState::Done), 4));
+        let unwritten = JournalEntry {
+            unwritten: true,
+            ..app_entry(4, JournalState::Conflict)
+        };
+        assert!(!holds_access_app(&unwritten, 4));
+        // A journal that does not decode is assumed to hold one.
+        assert!(journal_holds_access_app(&serde_json::json!({"x": 1}), 4));
+    }
+
+    #[tokio::test]
+    async fn a_token_a_run_still_needs_for_undo_is_not_deleted() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![token_row(4)]])
+            .append_query_results([count(0)])
+            .append_query_results([count(0)])
+            .append_query_results([vec![
+                run_row(7, &[app_entry(4, JournalState::Done)]),
+                run_row(8, &[app_entry(4, JournalState::Absent)]),
+            ]])
+            .into_connection();
+        let result = service(db).delete(4).await;
+        match result {
+            Err(error @ AccessProviderError::NeededToUndo { .. }) => {
+                assert!(matches!(
+                    &error,
+                    AccessProviderError::NeededToUndo { provider_id: 4, runs } if runs == &vec![7]
+                ));
+                assert!(error.to_string().contains("undo run(s) 7"));
+            }
+            other => panic!("expected NeededToUndo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_whose_apps_are_all_undone_is_deleted() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![token_row(4)]])
+            .append_query_results([count(0)])
+            .append_query_results([count(0)])
+            .append_query_results([vec![run_row(8, &[app_entry(4, JournalState::Absent)])]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        assert_eq!(service(db).delete(4).await.expect("deleted").id, 4);
+    }
+
     #[tokio::test]
     async fn a_token_that_protects_an_address_is_not_deleted() {
-        let now = Utc::now();
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
-            .append_query_results([vec![cloudflare_access_providers::Model {
-                id: 4,
-                name: "access".into(),
-                account_id: "a".into(),
-                team_domain: "team.cloudflareaccess.com".into(),
-                api_token_encrypted: "sealed".into(),
-                jwks: None,
-                jwks_fetched_at: None,
-                created_by: None,
-                created_at: now,
-                updated_at: now,
-            }]])
-            .append_query_results([vec![std::collections::BTreeMap::from([(
-                "num_items".to_string(),
-                sea_orm::Value::BigInt(Some(1)),
-            )])]])
-            .append_query_results([vec![std::collections::BTreeMap::from([(
-                "num_items".to_string(),
-                sea_orm::Value::BigInt(Some(0)),
-            )])]])
+            .append_query_results([vec![token_row(4)]])
+            .append_query_results([count(1)])
+            .append_query_results([count(0)])
             .into_connection();
         let result = service(db).delete(4).await;
         assert!(matches!(

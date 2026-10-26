@@ -15,6 +15,9 @@
 //! - `cloudflare_access_keys_notify`: a key rotation reaches listeners with
 //!   the next route snapshot, which is rebuilt on `route_table_changes`.
 //!
+//! `gate_access_provider_id` references its token `ON DELETE RESTRICT`, so
+//! a token is never deleted from under an address bound to it.
+//!
 //! Every new column is nullable and nothing is backfilled (D11).
 
 use sea_orm_migration::prelude::*;
@@ -37,12 +40,14 @@ CREATE TABLE IF NOT EXISTS cloudflare_access_providers (
 );
 
 ALTER TABLE project_custom_domains
-    ADD COLUMN IF NOT EXISTS gate_access_provider_id INTEGER,
+    ADD COLUMN IF NOT EXISTS gate_access_provider_id INTEGER
+        REFERENCES cloudflare_access_providers(id) ON DELETE RESTRICT,
     ADD COLUMN IF NOT EXISTS gate_access_app_id VARCHAR(64),
     ADD COLUMN IF NOT EXISTS gate_access_aud VARCHAR(128);
 
 ALTER TABLE environment_domains
-    ADD COLUMN IF NOT EXISTS gate_access_provider_id INTEGER,
+    ADD COLUMN IF NOT EXISTS gate_access_provider_id INTEGER
+        REFERENCES cloudflare_access_providers(id) ON DELETE RESTRICT,
     ADD COLUMN IF NOT EXISTS gate_access_app_id VARCHAR(64),
     ADD COLUMN IF NOT EXISTS gate_access_aud VARCHAR(128);
 
@@ -162,6 +167,21 @@ mod tests {
             .await?
             .ok_or_else(|| DbErr::RecordNotFound("pg_trigger".to_string()))?;
         assert_eq!(triggers.try_get::<i32>("", "n")?, 1);
+
+        // A token an address is bound to cannot be deleted under it.
+        db.execute_unprepared(
+            "UPDATE environment_domains SET gate_access_provider_id = \
+                 (SELECT id FROM cloudflare_access_providers LIMIT 1);",
+        )
+        .await?;
+        assert!(
+            db.execute_unprepared("DELETE FROM cloudflare_access_providers;")
+                .await
+                .is_err(),
+            "a token bound to an address was deleted"
+        );
+        db.execute_unprepared("UPDATE environment_domains SET gate_access_provider_id = NULL;")
+            .await?;
 
         Migration.down(&manager).await?;
         Migration.up(&manager).await?;

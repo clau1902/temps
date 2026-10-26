@@ -75,7 +75,8 @@ pub const ACCESS_SETUP_PATH: &str = "/dns-providers#cloudflare-access";
 pub struct AccessProviderFact {
     pub id: i32,
     pub name: String,
-    /// Its apps covering the address; why they could not be read.
+    /// Its apps covering the address, ranked by [`super::access::covering`]
+    /// (the one Cloudflare enforces first); why they could not be read.
     pub covering: Result<Vec<AccessApp>, String>,
 }
 
@@ -108,7 +109,8 @@ pub fn access_choice(facts: &PlanFacts) -> AccessChoice<'_> {
         match &provider.covering {
             Err(error) => return AccessChoice::Unreadable { provider, error },
             Ok(apps) => {
-                if let Some(app) = apps.iter().min_by(|a, b| a.name.cmp(&b.name)) {
+                // `covering` comes ranked: the app Cloudflare enforces first.
+                if let Some(app) = apps.first() {
                     return AccessChoice::Existing { provider, app };
                 }
             }
@@ -2767,6 +2769,7 @@ mod tests {
         AccessApp {
             id: id.into(),
             name: name.into(),
+            app_type: super::super::access::SELF_HOSTED.into(),
             domain: "myapp.example.com".into(),
             aud: format!("aud-{id}"),
             domains: vec!["myapp.example.com".into()],

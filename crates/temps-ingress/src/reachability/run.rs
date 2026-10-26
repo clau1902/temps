@@ -2854,6 +2854,7 @@ mod tests {
         AccessApp {
             id: id.into(),
             name: name.into(),
+            app_type: super::super::access::SELF_HOSTED.into(),
             domain: host.into(),
             aud: format!("aud-{id}"),
             domains: vec![host.into()],

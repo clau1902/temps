@@ -780,23 +780,29 @@ impl ReachabilityService {
         // answers there is its gate.
         let gates = self.signed_in_gates(&hosts).await;
         for verdict in &mut verdicts {
-            let Some(gate) = gates.get(&verdict.address) else {
+            let Some((gate, team_domain)) = gates.get(&verdict.address) else {
                 continue;
             };
             if verdict.audience == Audience::SignedIn
                 && verdict.state == super::model::ReachState::Reachable
             {
-                let probe = super::gate_check::probe(&verdict.address, *gate).await;
+                let probe =
+                    super::gate_check::probe(&verdict.address, *gate, team_domain.as_deref()).await;
                 *verdict = super::gate_check::judged(verdict.clone(), probe);
             }
         }
         verdicts
     }
 
-    /// The gate of each of `hosts` that is a signed-in address.
-    async fn signed_in_gates(&self, hosts: &[String]) -> HashMap<String, GateKind> {
+    /// The gate of each of `hosts` that is a signed-in address, with the
+    /// team domain of the Access account an Access address is bound to.
+    async fn signed_in_gates(
+        &self,
+        hosts: &[String],
+    ) -> HashMap<String, (GateKind, Option<String>)> {
         let db = self.deps.db.as_ref();
         let mut gates = HashMap::new();
+        let mut bound: HashMap<String, i32> = HashMap::new();
         match project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::Domain.is_in(hosts.to_vec()))
             .filter(
@@ -805,10 +811,15 @@ impl ReachabilityService {
             .all(db)
             .await
         {
-            Ok(rows) => gates.extend(rows.into_iter().map(|row| {
-                let gate = row.gate.as_deref().map(GateKind::parse).unwrap_or_default();
-                (row.domain, gate)
-            })),
+            Ok(rows) => {
+                for row in rows {
+                    let gate = row.gate.as_deref().map(GateKind::parse).unwrap_or_default();
+                    if let Some(provider_id) = row.gate_access_provider_id {
+                        bound.insert(row.domain.clone(), provider_id);
+                    }
+                    gates.insert(row.domain, (gate, None));
+                }
+            }
             Err(error) => warn!(%error, "could not read the gates of signed-in custom domains"),
         }
         match environment_domains::Entity::find()
@@ -817,12 +828,40 @@ impl ReachabilityService {
             .all(db)
             .await
         {
-            Ok(rows) => gates.extend(rows.into_iter().map(|row| {
-                let gate = row.gate.as_deref().map(GateKind::parse).unwrap_or_default();
-                (row.domain, gate)
-            })),
+            Ok(rows) => {
+                for row in rows {
+                    let gate = row.gate.as_deref().map(GateKind::parse).unwrap_or_default();
+                    if let Some(provider_id) = row.gate_access_provider_id {
+                        bound.insert(row.domain.clone(), provider_id);
+                    }
+                    gates.insert(row.domain, (gate, None));
+                }
+            }
             Err(error) => {
                 warn!(%error, "could not read the gates of signed-in environment domains")
+            }
+        }
+        if !bound.is_empty() {
+            let ids: BTreeSet<i32> = bound.values().copied().collect();
+            match temps_entities::cloudflare_access_providers::Entity::find()
+                .filter(temps_entities::cloudflare_access_providers::Column::Id.is_in(ids))
+                .all(db)
+                .await
+            {
+                Ok(providers) => {
+                    let teams: HashMap<i32, String> = providers
+                        .into_iter()
+                        .map(|p| (p.id, p.team_domain))
+                        .collect();
+                    for (host, provider_id) in bound {
+                        if let Some(entry) = gates.get_mut(&host) {
+                            entry.1 = teams.get(&provider_id).cloned();
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "could not read the Access accounts of signed-in addresses")
+                }
             }
         }
         gates

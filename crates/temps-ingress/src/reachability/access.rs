@@ -334,6 +334,10 @@ pub const ACCESS_TUNNEL_ONLY: &str = "This address is protected by Cloudflare Ac
 pub struct AccessApp {
     pub id: String,
     pub name: String,
+    /// Cloudflare's app type. Only a `self_hosted` app puts a sign-in in
+    /// front of a hostname; a bookmark or SaaS app protects nothing here.
+    #[serde(default)]
+    pub app_type: String,
     /// The app's primary domain (`host` or `host/path`).
     pub domain: String,
     /// The AUD tag its JWTs carry.
@@ -399,6 +403,7 @@ pub fn parse_app(value: &Value) -> Option<AccessApp> {
     Some(AccessApp {
         id: text("id")?,
         name: text("name").unwrap_or_default(),
+        app_type: text("type").unwrap_or_default(),
         domain,
         aud: text("aud")?,
         domains,
@@ -406,30 +411,71 @@ pub fn parse_app(value: &Value) -> Option<AccessApp> {
     })
 }
 
-/// Whether one of an app's domains protects every path of `host`: the host
+/// The app type that puts a sign-in in front of a hostname.
+pub const SELF_HOSTED: &str = "self_hosted";
+
+/// How an app's domain matches a host. Cloudflare enforces the most
+/// specific app for a request, so an exact one wins over a wildcard, and
+/// only its AUD is in the tokens the address receives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Coverage {
+    Exact,
+    Wildcard,
+}
+
+/// Whether `app` is a `self_hosted` app protecting every path of `host`.
+pub fn covers(app: &AccessApp, host: &str) -> bool {
+    coverage(app, host).is_some()
+}
+
+/// How a `self_hosted` app's domains cover every path of `host`: the host
 /// itself (optionally with `/` or `/*`), or a wildcard one label above it.
 /// A path-scoped domain (`host/admin`) protects only part of the address,
-/// so it does not count.
-pub fn covers(app: &AccessApp, host: &str) -> bool {
+/// so it does not count; neither does an app of any other type.
+pub fn coverage(app: &AccessApp, host: &str) -> Option<Coverage> {
+    if app.app_type != SELF_HOSTED {
+        return None;
+    }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    app.domains.iter().any(|domain| {
-        let domain = domain.trim().to_ascii_lowercase();
-        let domain = domain
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        let domain = domain
-            .strip_suffix("/*")
-            .or_else(|| domain.strip_suffix('/'))
-            .unwrap_or(domain);
-        if domain.contains('/') {
-            return false;
-        }
-        domain == host
-            || domain.strip_prefix("*.").is_some_and(|parent| {
-                host.split_once('.')
-                    .is_some_and(|(label, rest)| !label.is_empty() && rest == parent)
-            })
-    })
+    app.domains
+        .iter()
+        .filter_map(|domain| domain_coverage(domain, &host))
+        .min()
+}
+
+/// The apps covering `host`, the one Cloudflare enforces first: exact
+/// before wildcard, then by name and id so a plan is stable.
+pub fn covering(apps: Vec<AccessApp>, host: &str) -> Vec<AccessApp> {
+    let mut ranked: Vec<(Coverage, AccessApp)> = apps
+        .into_iter()
+        .filter_map(|app| coverage(&app, host).map(|c| (c, app)))
+        .collect();
+    ranked.sort_by(|(a, x), (b, y)| (a, &x.name, &x.id).cmp(&(b, &y.name, &y.id)));
+    ranked.into_iter().map(|(_, app)| app).collect()
+}
+
+fn domain_coverage(domain: &str, host: &str) -> Option<Coverage> {
+    let domain = domain.trim().to_ascii_lowercase();
+    let domain = domain
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let domain = domain
+        .strip_suffix("/*")
+        .or_else(|| domain.strip_suffix('/'))
+        .unwrap_or(domain);
+    if domain.contains('/') {
+        return None;
+    }
+    if domain == host {
+        return Some(Coverage::Exact);
+    }
+    domain
+        .strip_prefix("*.")
+        .is_some_and(|parent| {
+            host.split_once('.')
+                .is_some_and(|(label, rest)| !label.is_empty() && rest == parent)
+        })
+        .then_some(Coverage::Wildcard)
 }
 
 /// The name of an app Temps creates for `host` on this install: the install
@@ -773,6 +819,7 @@ mod tests {
         AccessApp {
             id: "a1".into(),
             name: "Grafana".into(),
+            app_type: SELF_HOSTED.into(),
             domain: domains.first().map(|d| d.to_string()).unwrap_or_default(),
             aud: "aud".into(),
             domains: domains.iter().map(|d| d.to_string()).collect(),
@@ -793,6 +840,43 @@ mod tests {
             &app(&["other.example.com", "app.example.com"]),
             "app.example.com"
         ));
+    }
+
+    /// ADR 065 D9: the app bound is the one Cloudflare enforces for the
+    /// hostname, or every request would carry another app's AUD.
+    #[test]
+    fn only_self_hosted_apps_count_and_the_exact_one_wins() {
+        let typed = |id: &str, name: &str, kind: &str, domain: &str| AccessApp {
+            id: id.into(),
+            name: name.into(),
+            app_type: kind.into(),
+            ..app(&[domain])
+        };
+        assert!(!covers(
+            &typed("b", "Links", "bookmark", "app.example.com"),
+            "app.example.com"
+        ));
+        assert!(!covers(
+            &typed("s", "SaaS", "saas", "app.example.com"),
+            "app.example.com"
+        ));
+        let ranked = covering(
+            vec![
+                typed("w", "A wildcard", SELF_HOSTED, "*.example.com"),
+                typed("b", "A bookmark", "bookmark", "app.example.com"),
+                typed("e", "Zed exact", SELF_HOSTED, "app.example.com/*"),
+            ],
+            "app.example.com",
+        );
+        let ids: Vec<&str> = ranked.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["e", "w"]);
+        assert_eq!(
+            coverage(
+                &typed("w", "W", SELF_HOSTED, "*.example.com"),
+                "app.example.com"
+            ),
+            Some(Coverage::Wildcard)
+        );
     }
 
     #[test]

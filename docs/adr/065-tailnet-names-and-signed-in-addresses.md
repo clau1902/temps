@@ -1122,6 +1122,30 @@ from their letter:
   address. Redeeming still needs the code and its PKCE verifier, which only
   the listener that started the sign-in holds. This must move to per-node
   snapshots when they exist.
+- **An existing app is the most specific `self_hosted` one.** Only
+  `self_hosted` apps protect a hostname (bookmark, SaaS and SSH apps do
+  not), and Cloudflare enforces the most specific app for a request, so an
+  app for the exact hostname is used before a wildcard one. Using a
+  wildcard's AUD while an exact app is in front would turn every visitor
+  away.
+- **The check accepts only the address's own team's sign-in.** The
+  reachability check passes an Access address only on a redirect to the
+  team domain of the token it is bound to, not to any
+  `*.cloudflareaccess.com`; with no bound token it is "not checked".
+- **Signing-key refetches are rate-limited per team.** An agent asks for a
+  refetch at most once per 60 s per team (a fixed array of slots keyed by
+  a per-process hash of the issuer), so one team's unknown `kid` never
+  holds back another's. Two teams sharing a slot share its limit; that only
+  slows a refetch.
+- **Cloudflare's answers are capped as they are read.** The certs answer
+  and the API answers the token check reads are refused on a
+  `Content-Length` over the cap, and otherwise read in chunks that stop at
+  it, never read whole first.
+- **A token is not deleted while a run may still have to undo an app it
+  created.** Besides the addresses bound to it, a token stays while any run
+  journal holds an Access app of it that is not yet gone; without the
+  token, that undo could never reach the app. The answer names the runs.
+  `gate_access_provider_id` also references its token `ON DELETE RESTRICT`.
 
 ## Sources
 

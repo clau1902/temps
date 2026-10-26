@@ -29,6 +29,9 @@ use utoipa::ToSchema;
 use super::plan::cloudflare_token_url;
 
 const API: &str = "https://api.cloudflare.com/client/v4";
+/// The most of one API answer Temps reads: a page of 100 Access apps with
+/// their policies is well under it.
+const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Cloudflare's codes for "this token may not do that".
 const DENIED_CODES: [i64; 3] = [10000, 10001, 9109];
@@ -452,8 +455,22 @@ pub(crate) async fn call(
         },
         Ok(response) => {
             let status = response.status().as_u16();
-            let body: Value = response.json().await.unwrap_or(Value::Null);
-            Answer::from_body(status, &body)
+            match temps_routes::access_keys::read_capped(response, MAX_ANSWER_BYTES).await {
+                Ok(bytes) => {
+                    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                    Answer::from_body(status, &body)
+                }
+                Err(error) => Answer {
+                    status,
+                    success: false,
+                    codes: Vec::new(),
+                    messages: vec![format!(
+                        "could not read api.cloudflare.com's answer to {path}: {error}"
+                    )],
+                    result: None,
+                    total_count: None,
+                },
+            }
         }
     }
 }

@@ -41,13 +41,34 @@ const CONTROL_PLANE_STALE_AFTER_SECS: i64 = 90;
 /// Timeout for one redeem or logout call.
 const CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// At most one "fetch the Access keys again" request per this many seconds
-/// from this agent, however many requests carry an unknown key (D9). The
-/// control plane rate-limits the fetch itself as well.
+/// At most one "fetch the Access keys again" request per team per this many
+/// seconds from this agent, however many requests carry an unknown key
+/// (D9). The control plane rate-limits the fetch itself as well.
 const ACCESS_KEYS_REQUEST_EVERY_SECS: i64 = 60;
 
-/// Unix seconds of the last Access keys request, or 0.
-static LAST_ACCESS_KEYS_REQUEST: AtomicI64 = AtomicI64::new(0);
+/// How many teams get a request slot of their own. Teams share a slot only
+/// when their hashes collide, so a bogus key sent to one team's address
+/// cannot hold back a real rotation of another's; memory stays fixed.
+const ACCESS_KEYS_SLOTS: usize = 64;
+
+/// Unix seconds of the last Access keys request of the teams in each slot,
+/// or 0.
+static ACCESS_KEYS_REQUESTS: [AtomicI64; ACCESS_KEYS_SLOTS] =
+    [const { AtomicI64::new(0) }; ACCESS_KEYS_SLOTS];
+
+/// Seeded per process, so which teams share a slot cannot be predicted.
+static ACCESS_KEYS_SLOT_SEED: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
+
+/// The request slot of the team whose JWTs carry `issuer`.
+fn access_keys_slot(issuer: &str) -> &'static AtomicI64 {
+    &ACCESS_KEYS_REQUESTS[access_keys_slot_index(issuer)]
+}
+
+fn access_keys_slot_index(issuer: &str) -> usize {
+    use std::hash::BuildHasher;
+    let seed = ACCESS_KEYS_SLOT_SEED.get_or_init(std::collections::hash_map::RandomState::new);
+    (seed.hash_one(issuer) % ACCESS_KEYS_SLOTS as u64) as usize
+}
 
 /// Unix seconds of the last successful exchange with the control plane, or
 /// 0 before the first one.
@@ -181,9 +202,10 @@ fn claim_access_keys_slot(last: &AtomicI64, now: i64) -> bool {
 }
 
 /// Ask the control plane, in the background, to fetch the Access keys of
-/// the team behind `address_id` again. Never delays the visitor's answer.
-fn request_access_keys(channel: &GateChannel, address_id: &str, now: i64) {
-    if !claim_access_keys_slot(&LAST_ACCESS_KEYS_REQUEST, now) {
+/// the team behind `address_id` (whose JWTs carry `issuer`) again. Never
+/// delays the visitor's answer.
+fn request_access_keys(channel: &GateChannel, issuer: &str, address_id: &str, now: i64) {
+    if !claim_access_keys_slot(access_keys_slot(issuer), now) {
         return;
     }
     let channel = channel.clone();
@@ -302,8 +324,8 @@ async fn enforce_with(
         }
         GateDecision::AccessDenied(rejection) => {
             if rejection == AccessRejection::UnknownKey {
-                if let Some(channel) = channel {
-                    request_access_keys(channel, &policy.address_id, now);
+                if let (Some(channel), Some(access)) = (channel, policy.access.as_ref()) {
+                    request_access_keys(channel, &access.issuer, &policy.address_id, now);
                 }
             }
             info!(address_id = %policy.address_id, host = hostname, reason = rejection.as_str(), "Cloudflare Access refused a request");
@@ -907,7 +929,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(gate_access::ACCESS_JWT_HEADER, jwt_with_kid("rotated"));
         let now = gate::unix_now();
-        LAST_ACCESS_KEYS_REQUEST.store(0, Ordering::Release);
+        access_keys_slot("https://team.cloudflareaccess.com").store(0, Ordering::Release);
         for _ in 0..3 {
             let answer = run_access(&mut headers, true, Some(&channel), now).await;
             assert_eq!(answer.status(), StatusCode::FORBIDDEN);
@@ -919,6 +941,33 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(seen.lock().unwrap().as_slice(), ["access-keys custom:5"]);
+    }
+
+    /// A bogus key sent to one team's address every minute never holds back
+    /// the request a real rotation of another team needs.
+    #[test]
+    fn each_team_has_its_own_access_keys_slot() {
+        // Clear of the slot the other Access test uses, as tests run at once.
+        let taken = access_keys_slot_index("https://team.cloudflareaccess.com");
+        let free = |team: &String| access_keys_slot_index(team) != taken;
+        let first = (0..)
+            .map(|n| format!("https://one{n}.cloudflareaccess.com"))
+            .find(free)
+            .expect("some team hashes to a free slot");
+        let first = first.as_str();
+        let other = (0..)
+            .map(|n| format!("https://team{n}.cloudflareaccess.com"))
+            .find(|team| {
+                free(team) && access_keys_slot_index(team) != access_keys_slot_index(first)
+            })
+            .expect("some team hashes to another slot");
+        assert_eq!(access_keys_slot_index(first), access_keys_slot_index(first));
+        let now = 5_000_000;
+        access_keys_slot(first).store(0, Ordering::Release);
+        access_keys_slot(&other).store(0, Ordering::Release);
+        assert!(claim_access_keys_slot(access_keys_slot(first), now));
+        assert!(!claim_access_keys_slot(access_keys_slot(first), now + 59));
+        assert!(claim_access_keys_slot(access_keys_slot(&other), now + 59));
     }
 
     #[test]

@@ -84,7 +84,7 @@ fn access_problem(error: AccessProviderError) -> Problem {
         AccessProviderError::Validation { .. } | AccessProviderError::TokenRefused { .. } => {
             (StatusCode::BAD_REQUEST, "Cloudflare Access Token Refused")
         }
-        AccessProviderError::InUse { .. } => {
+        AccessProviderError::InUse { .. } | AccessProviderError::NeededToUndo { .. } => {
             (StatusCode::CONFLICT, "Cloudflare Access Token In Use")
         }
         AccessProviderError::Encryption { .. } | AccessProviderError::Database { .. } => (
@@ -299,6 +299,13 @@ mod tests {
                 AccessProviderError::InUse {
                     provider_id: 3,
                     addresses: 2,
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                AccessProviderError::NeededToUndo {
+                    provider_id: 3,
+                    runs: vec![7],
                 },
                 StatusCode::CONFLICT,
             ),
