@@ -1058,6 +1058,27 @@ Open, found while implementing 3a:
   verdict (through the 30-second cache): an unreadable read is `unknown`,
   a host none of the address's Serve entries accounts for fails with D4's
   message, and a worker not approved yet shows the not-approved message.
+- **Undo checks the marker, not only the journal.** A Service whose
+  comment is no longer the exact marker its creating run gave it (no
+  marker, another install's, or another run's) is kept with that reason
+  and never offered for deletion, even when this install's journal records
+  creating the name: someone may have deleted Temps' Service and made their
+  own. The confirmed delete checks the marker again under the (tailnet,
+  name) lock, immediately before the `DELETE`.
+- **No redirects.** The Tailscale API client never follows a redirect; a
+  307/308 would re-send the token exchange's body, `client_secret`
+  included. A tailnet name made only of dots is refused.
+
+Open, found in review of 3b:
+
+- Nothing checks that the worker hosting a Service is a device of the
+  credential's tailnet. It fails closed (the host check never matches),
+  but the conflict and ownership reads then run against the credential's
+  tailnet rather than the worker's. Checking the worker's node id against
+  the tailnet's devices (`devices:core:read`) would say so plainly.
+- The outside check reads a Service's hosts but not its definition; it
+  could also compare the definition with the fixed one and check the
+  marker, through the same 30-second cache.
 
 ## Open questions
 

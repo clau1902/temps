@@ -112,7 +112,10 @@ impl TailscaleCredential {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_TAILNET.to_string());
+        // Only dots would be `.` or `..` in the API path, which URL
+        // normalisation resolves out of `/tailnet/`.
         if tailnet.len() > 253
+            || tailnet.bytes().all(|b| b == b'.')
             || !tailnet
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'@'))
@@ -717,23 +720,48 @@ pub trait TailnetApi: Send + Sync {
 
 /// Tailscale's API over HTTPS.
 pub struct TailscaleClient {
-    http: reqwest::Client,
+    /// Its own client, which never follows a redirect: a 307/308 would
+    /// re-send the token exchange's body, `client_secret` included, to
+    /// wherever it points. `Err` when it could not be built, and then every
+    /// call fails with why.
+    http: Result<reqwest::Client, String>,
     base: String,
     tokens: TokenCache,
 }
 
+impl Default for TailscaleClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TailscaleClient {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self::with_base(http, API.to_string())
+    pub fn new() -> Self {
+        Self::with_base(API.to_string())
     }
 
     /// Against another server, for tests.
-    pub fn with_base(http: reqwest::Client, base: String) -> Self {
+    pub fn with_base(base: String) -> Self {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| format!("the HTTPS client for Tailscale's API could not be built: {e}"));
         Self {
             http,
             base,
             tokens: TokenCache::default(),
         }
+    }
+
+    fn http(&self, operation: &str) -> Result<&reqwest::Client, TailscaleApiError> {
+        self.http
+            .as_ref()
+            .map_err(|reason| TailscaleApiError::Transport {
+                operation: operation.into(),
+                reason: reason.clone(),
+                maybe_applied: false,
+            })
     }
 
     fn tailnet_url(&self, credential: &TailscaleCredential, rest: &str) -> String {
@@ -777,7 +805,7 @@ impl TailscaleClient {
             .append_pair("grant_type", "client_credentials")
             .finish();
         let response = self
-            .http
+            .http(operation)?
             .post(format!("{}/oauth/token", self.base))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(form)
@@ -812,7 +840,7 @@ impl TailscaleClient {
         let write = method != reqwest::Method::GET;
         let token = self.token(credential).await?;
         let mut request = self
-            .http
+            .http(operation)?
             .request(method, &url)
             .bearer_auth(&token)
             .timeout(REQUEST_TIMEOUT);
@@ -1082,13 +1110,12 @@ impl crate::registry::CredentialFactory for TailscaleFactory {
 
     async fn validate(
         &self,
-        deps: &ProviderDeps<'_>,
+        _deps: &ProviderDeps<'_>,
         setup: &ProviderSetup,
     ) -> Result<(), IngressError> {
         let credential = TailscaleCredential::from_answers(&setup.settings, &setup.secrets)?;
-        let check = TailscaleClient::new(deps.http.clone())
-            .check_scopes(&credential)
-            .await;
+        // Not `deps.http`: the Tailscale client never follows redirects.
+        let check = TailscaleClient::new().check_scopes(&credential).await;
         match check.refusal() {
             None => Ok(()),
             Some(reason) => Err(IngressError::Validation(reason)),
@@ -1358,6 +1385,16 @@ mod tests {
         assert!(!format!("{credential:?}").contains("tskey-client-secret"));
         settings.insert(FIELD_TAILNET.to_string(), "example.com/../x".to_string());
         assert!(TailscaleCredential::from_answers(&settings, &secrets).is_err());
+        // `.` and `..` would be resolved out of `/tailnet/` in the API path.
+        for dots in [".", "..", "..."] {
+            settings.insert(FIELD_TAILNET.to_string(), dots.to_string());
+            assert!(
+                TailscaleCredential::from_answers(&settings, &secrets).is_err(),
+                "{dots}"
+            );
+        }
+        settings.insert(FIELD_TAILNET.to_string(), "example.com".to_string());
+        assert!(TailscaleCredential::from_answers(&settings, &secrets).is_ok());
     }
 
     #[test]
@@ -1443,7 +1480,7 @@ mod tests {
     #[tokio::test]
     async fn the_token_is_exchanged_once_and_kept_in_memory() {
         let (base, exchanges) = fake_api().await;
-        let client = TailscaleClient::with_base(reqwest::Client::new(), base);
+        let client = TailscaleClient::with_base(base);
         let right = credential("right");
         let found = client.get_service(&right, "myapp").await.expect("read");
         assert_eq!(found.expect("present").comment, "temps:inst-1:7");
@@ -1464,5 +1501,48 @@ mod tests {
             matches!(error, TailscaleApiError::Credential { .. }),
             "{error}"
         );
+    }
+
+    /// A redirect is never followed: on a 307/308 the token exchange's
+    /// body, `client_secret` included, would be sent to wherever it points.
+    #[tokio::test]
+    async fn a_redirect_from_the_token_exchange_is_never_followed() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let followed = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = followed.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/v2/oauth/token",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::PERMANENT_REDIRECT,
+                        [(axum::http::header::LOCATION, "/elsewhere")],
+                    )
+                }),
+            )
+            .route(
+                "/elsewhere",
+                post(move |_body: String| {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"access_token": "tskey-api-1", "expires_in": 3600}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = TailscaleClient::with_base(format!("http://{address}/api/v2"));
+        let error = client
+            .get_service(&credential("right"), "myapp")
+            .await
+            .expect_err("a redirect is not a token");
+        assert_eq!(followed.load(Ordering::SeqCst), 0, "{error}");
     }
 }

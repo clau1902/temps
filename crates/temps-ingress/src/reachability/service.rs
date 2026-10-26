@@ -234,7 +234,7 @@ impl ReachabilityService {
             .unwrap_or_default();
         Self {
             deps: Arc::new(deps),
-            tailnet: Arc::new(TailscaleClient::new(http.clone())),
+            tailnet: Arc::new(TailscaleClient::new()),
             http,
             scopes: Arc::new(Mutex::new(None)),
             hosts: Arc::new(Mutex::new(HashMap::new())),
@@ -3320,6 +3320,7 @@ impl RunOps for LiveOps {
         &self,
         tailnet: &str,
         name: &str,
+        creator_run_id: i32,
         shown: &ServiceDefinition,
     ) -> Result<ServiceDeletion, String> {
         use sea_orm::TransactionTrait;
@@ -3357,6 +3358,12 @@ impl RunOps for LiveOps {
             None => return Ok(ServiceDeletion::Gone),
             Some(current) => current,
         };
+        // Still this run's, by this install's marker, immediately before
+        // the DELETE: never a Service someone else made at the name.
+        let install = self.deps.records.instance_id().await.map_err(text)?;
+        if let Err(why) = super::run::still_ours(&current, name, &install, creator_run_id) {
+            return Ok(ServiceDeletion::Kept(why));
+        }
         if let Some(why) = current.differs_from(shown) {
             return Ok(ServiceDeletion::Kept(format!(
                 "{why} since you were asked, so Temps did not delete it"

@@ -383,11 +383,13 @@ pub trait RunOps: Send + Sync {
     ) -> Result<Option<(ServiceDefinition, temps_core::DBDateTime)>, String>;
     /// The confirmed delete (ADR 065 D4): under the Service's lock, no
     /// Serve entry names it, no host advertises it, and a read made just
-    /// before the `DELETE` still equals `shown`; else it is kept.
+    /// before the `DELETE` still carries this install's marker for
+    /// `creator_run_id` and equals `shown`; else it is kept.
     async fn delete_service(
         &self,
         tailnet: &str,
         name: &str,
+        creator_run_id: i32,
         shown: &ServiceDefinition,
     ) -> Result<ServiceDeletion, String>;
     async fn sleep(&self, duration: Duration);
@@ -2876,6 +2878,32 @@ fn pause(entry: &mut JournalEntry, current: String, now: temps_core::DBDateTime)
     Stop::Conflict(undo_conflict_message(entry))
 }
 
+/// Whether `current` still carries the marker run `creator_run_id` of
+/// `install` gave it (ADR 065 D4): no marker, another install's or another
+/// run's is never written to or deleted. Why not, when it is not.
+pub(crate) fn still_ours(
+    current: &ServiceDefinition,
+    name: &str,
+    install: &str,
+    creator_run_id: i32,
+) -> Result<(), String> {
+    let ours = !install.is_empty()
+        && tailscale::ownership(current, install) == Ownership::Ours { creator_run_id };
+    if ours {
+        return Ok(());
+    }
+    let now = current.comment.trim();
+    Err(if now.is_empty() {
+        format!("`{name}` no longer carries the marker this Temps install gave it, so it is not Temps' to delete")
+    } else {
+        format!(
+            "`{name}` now carries `{now}`, not the marker this Temps install gave it (`{}`), so it \
+             is not Temps' to delete",
+            tailscale::marker(install, creator_run_id)
+        )
+    })
+}
+
 /// Where undoing a Tailscale Service left the undo.
 enum ServiceUndo {
     /// Carry on, with what to report (boxed: it is much larger than a stop).
@@ -2924,7 +2952,10 @@ async fn undo_service(
         let Some(shown) = entry.shown_service.clone() else {
             return kept(entry, "nothing was shown to confirm".to_string());
         };
-        return match ops.delete_service(tailnet, name, &shown).await {
+        return match ops
+            .delete_service(tailnet, name, *creator_run_id, &shown)
+            .await
+        {
             Ok(ServiceDeletion::Deleted) => {
                 entry.state = JournalState::Absent;
                 entry.at = now;
@@ -2975,6 +3006,15 @@ async fn undo_service(
         }
         Err(error) => return failed("read", error),
     };
+    // A Service that no longer carries the marker this run gave it is not
+    // Temps' any more, whatever the journal says (D4): never offered for
+    // deletion.
+    let owner = tailscale::parse_marker(&creation.0.comment)
+        .map(|(install, _)| install)
+        .unwrap_or_default();
+    if let Err(why) = still_ours(&current, name, &owner, *creator_run_id) {
+        return kept(entry, why);
+    }
     let changed = if creation.0.addrs.is_empty() {
         current.differs_from(&ServiceDefinition {
             addrs: current.addrs.clone(),
@@ -4016,6 +4056,7 @@ mod tests {
             &self,
             tailnet: &str,
             name: &str,
+            _creator_run_id: i32,
             shown: &ServiceDefinition,
         ) -> Result<ServiceDeletion, String> {
             self.log(format!("delete_service {tailnet} {name} {}", shown.comment));
@@ -5872,6 +5913,77 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// ADR 065 D4: a Service whose marker is no longer this run's (someone
+    /// deleted Temps' and made their own at the name) is kept, and undo
+    /// never offers to delete it, even with this run's creation journal.
+    #[tokio::test]
+    async fn undo_never_offers_to_delete_a_service_that_lost_this_runs_marker() {
+        let ops = approved_service();
+        let record = execute(&service_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        let created = ops.service.lock().expect("lock").clone().expect("created");
+        for (case, comment) in [
+            ("a foreign comment", "the media server".to_string()),
+            ("no marker", String::new()),
+            (
+                "another run of this install",
+                tailscale::marker(INSTALL, 99),
+            ),
+            ("another install", tailscale::marker("another-install", 0)),
+        ] {
+            let replaced = ServiceDefinition {
+                comment: comment.clone(),
+                ..created.clone()
+            };
+            let ops = Fake {
+                creation: Some((created.clone(), chrono::Utc::now())),
+                service: Mutex::new(Some(replaced)),
+                serve_release: Some(ServeRelease::Gone),
+                reachable: true,
+                serve_status: Mutex::new(Some(applied())),
+                ..Default::default()
+            };
+            let mut journal = record.journal.clone();
+            let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+            assert_eq!(outcome.stopped, None, "{case}: {:?}", outcome);
+            assert!(
+                outcome
+                    .results
+                    .iter()
+                    .any(|r| r.label.starts_with("Kept `svc:myapp`: `svc:myapp`")
+                        && r.label.contains("not Temps' to delete")),
+                "{case}: {:?}",
+                outcome.results
+            );
+            assert!(
+                !ops.calls().iter().any(|c| c.starts_with("delete_service")),
+                "{case}"
+            );
+            assert!(
+                journal.iter().all(|e| e.shown_service.is_none()),
+                "{case}: nothing is shown to confirm"
+            );
+        }
+    }
+
+    #[test]
+    fn only_this_runs_own_marker_is_temps_to_delete() {
+        let ours =
+            ServiceDefinition::fixed("svc:myapp", "tag:temps", &tailscale::marker(INSTALL, 7));
+        assert!(still_ours(&ours, "svc:myapp", INSTALL, 7).is_ok());
+        assert!(still_ours(&ours, "svc:myapp", INSTALL, 8).is_err());
+        assert!(still_ours(&ours, "svc:myapp", "another-install", 7).is_err());
+        // An unknown install owns nothing.
+        assert!(still_ours(&ours, "svc:myapp", "", 7).is_err());
+        let unmarked = ServiceDefinition {
+            comment: String::new(),
+            ..ours.clone()
+        };
+        assert!(still_ours(&unmarked, "svc:myapp", INSTALL, 7)
+            .unwrap_err()
+            .contains("no longer carries the marker"));
     }
 
     /// ADR 065 D4: undo keeps a Service any Serve entry still names, and
