@@ -191,7 +191,17 @@ struct ProxyState {
     /// A Serve socket (ADR 065 D3): serves its one address, and is the only
     /// listener that passes tailnet identity headers on.
     serve: Option<Arc<ServeSocket>>,
+    /// Who a tailnet visitor is (ADR 065 D6): on a Serve socket and the
+    /// private listener, for `tailnet_users` addresses. `None` elsewhere,
+    /// and a `tailnet_users` route without it admits nobody.
+    tailnet: Option<Arc<crate::tailnet_identity::TailnetIdentity>>,
 }
+
+/// The tailnet login an admitted `tailnet_users` request is from (ADR 065
+/// D6), passed to the app as `x-temps-user-login` after every client copy
+/// of it is dropped.
+#[derive(Clone, Debug)]
+pub(crate) struct AdmittedLogin(pub String);
 
 /// One address's Serve socket (ADR 065 D3). The socket names the address;
 /// nothing in the request can name another.
@@ -311,6 +321,7 @@ pub async fn spawn(
         acme: None,
         acme_relay: Arc::new(AcmeRelayState::new()),
         serve: None,
+        tailnet: None,
     });
     let app = axum::Router::new().fallback(handle).with_state(state);
 
@@ -409,11 +420,29 @@ fn private_refusal(status: StatusCode, reason: &'static str, message: &str) -> R
     response
 }
 
+/// Mark an admitted `tailnet_users` request with its login, or give the
+/// `403 not-allowed` answer, with why, for a refused one (ADR 065 D6).
+fn admit(req: &mut Request, verdict: crate::tailnet_identity::Verdict) -> Option<Response> {
+    match verdict {
+        crate::tailnet_identity::Verdict::Admit { login } => {
+            if let Some(login) = login {
+                req.extensions_mut().insert(AdmittedLogin(login));
+            }
+            None
+        }
+        crate::tailnet_identity::Verdict::Refuse(message) => Some(private_refusal(
+            StatusCode::FORBIDDEN,
+            "not-allowed",
+            &message,
+        )),
+    }
+}
+
 /// The private listener (ADR 064 D5). Only addresses whose audience is
 /// private, each only to a TCP peer inside its range: the peer comes from
 /// the accepted connection, never from a forwarded header. Port 80 only
 /// redirects to HTTPS.
-async fn handle_private(state: &ProxyState, req: Request) -> Response {
+async fn handle_private(state: &ProxyState, mut req: Request) -> Response {
     let Some(host) = extract_host(req.headers()) else {
         return error_body(StatusCode::BAD_REQUEST, "missing or malformed Host header");
     };
@@ -457,6 +486,18 @@ async fn handle_private(state: &ProxyState, req: Request) -> Response {
                 .insert(axum::http::header::LOCATION, location);
         }
         return response;
+    }
+    // ADR 065 D6: `tailnet_users` asks tailscaled who the TCP peer is.
+    if let Some(principals) = &private.principals {
+        let verdict = match (&state.tailnet, peer) {
+            (Some(identity), Some(peer)) => identity.admit_peer(principals, peer).await,
+            _ => crate::tailnet_identity::Verdict::Refuse(
+                temps_core::tailnet::messages::IDENTITY_UNREADABLE.to_string(),
+            ),
+        };
+        if let Some(response) = admit(&mut req, verdict) {
+            return response;
+        }
     }
     if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
         recorder.mark_project();
@@ -555,6 +596,27 @@ async fn handle_serve(state: &ProxyState, socket: &ServeSocket, mut req: Request
     }
     req.extensions_mut()
         .insert(PublicPeer(SocketAddr::new(visitor, 0)));
+    // ADR 065 D6: `tailnet_users` reads tailscaled's login header here,
+    // and only here.
+    if let Some(principals) = &entry.principals {
+        let verdict = match &state.tailnet {
+            Some(identity) => {
+                identity
+                    .admit_serve(
+                        principals,
+                        req.headers().get("tailscale-user-login"),
+                        visitor,
+                    )
+                    .await
+            }
+            None => crate::tailnet_identity::Verdict::Refuse(
+                temps_core::tailnet::messages::IDENTITY_UNREADABLE.to_string(),
+            ),
+        };
+        if let Some(response) = admit(&mut req, verdict) {
+            return response;
+        }
+    }
     if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
         recorder.mark_project();
     }
@@ -725,8 +787,9 @@ pub(crate) fn public_router(
 pub(crate) fn private_router(
     store: SharedRouteStore,
     forwarded_proto: &'static str,
+    tailnet: Option<Arc<crate::tailnet_identity::TailnetIdentity>>,
 ) -> std::io::Result<axum::Router> {
-    router_with(store, forwarded_proto, None, true, true)
+    router_with(store, forwarded_proto, None, true, true, tailnet)
 }
 
 /// The loopback origin an ingress connector forwards to (ADR 058): serves
@@ -796,6 +859,7 @@ pub async fn spawn_serve_socket(
     path: &std::path::Path,
     store: SharedRouteStore,
     socket: Arc<ServeSocket>,
+    tailnet: Arc<crate::tailnet_identity::TailnetIdentity>,
     stop: Arc<Notify>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -834,6 +898,7 @@ pub async fn spawn_serve_socket(
         acme: None,
         acme_relay: Arc::new(AcmeRelayState::new()),
         serve: Some(socket),
+        tailnet: Some(tailnet),
     });
     let app = crate::worker_metrics::recorded(
         axum::Router::new().fallback(handle).with_state(state),
@@ -855,7 +920,7 @@ fn public_router_with(
     acme: Option<PublicAcmeConfig>,
     require_sni: bool,
 ) -> std::io::Result<axum::Router> {
-    router_with(store, forwarded_proto, acme, require_sni, false)
+    router_with(store, forwarded_proto, acme, require_sni, false, None)
 }
 
 fn router_with(
@@ -864,6 +929,7 @@ fn router_with(
     acme: Option<PublicAcmeConfig>,
     require_sni: bool,
     private_mode: bool,
+    tailnet: Option<Arc<crate::tailnet_identity::TailnetIdentity>>,
 ) -> std::io::Result<axum::Router> {
     let client = reqwest::Client::builder()
         .connect_timeout(UPSTREAM_TIMEOUT)
@@ -888,6 +954,7 @@ fn router_with(
         acme,
         acme_relay: Arc::new(AcmeRelayState::new()),
         serve: None,
+        tailnet,
     });
     // ADR 061: public edge traffic is counted like the control plane's proxy.
     Ok(crate::worker_metrics::recorded(
@@ -1274,6 +1341,12 @@ async fn proxy_upgrade(
         .map(|permit| Arc::clone(&permit.0));
     // Held by the tunnel task, so the session is recorded when it ends.
     let recorder = req.extensions().get::<RequestRecorder>().cloned();
+    // ADR 065 D6: one header line, so no control character may pass.
+    let login = req
+        .extensions()
+        .get::<AdmittedLogin>()
+        .map(|login| login.0.clone())
+        .filter(|login| !login.chars().any(char::is_control));
     let dialled = Instant::now();
     let original_host = headers
         .get("host")
@@ -1340,6 +1413,11 @@ async fn proxy_upgrade(
     }
     if let Some(deployment_id) = entry.deployment_id {
         wire.extend_from_slice(format!("x-temps-deployment-id: {}\r\n", deployment_id).as_bytes());
+    }
+    if let Some(login) = &login {
+        wire.extend_from_slice(
+            format!("{}: {login}\r\n", temps_core::tailnet::TAILNET_LOGIN_HEADER).as_bytes(),
+        );
     }
     if let Some(h) = &original_host {
         wire.extend_from_slice(format!("x-forwarded-host: {}\r\n", h).as_bytes());
@@ -1652,12 +1730,17 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
             .map(|peer| PublicPeer(peer.0))
     });
     let recorder = req.extensions().get::<RequestRecorder>().cloned();
+    let login = req
+        .extensions()
+        .get::<AdmittedLogin>()
+        .map(|login| login.0.clone());
     let metadata = ForwardRequestMetadata {
         method,
         uri,
         headers,
         public_peer,
         recorder,
+        login,
     };
     let retryable = metadata.method == axum::http::Method::GET
         || metadata.method == axum::http::Method::HEAD
@@ -1749,6 +1832,8 @@ struct ForwardRequestMetadata {
     public_peer: Option<PublicPeer>,
     /// Public listeners only (ADR 061).
     recorder: Option<RequestRecorder>,
+    /// An admitted tailnet login (ADR 065 D6).
+    login: Option<String>,
 }
 
 async fn forward_once(
@@ -1803,6 +1888,13 @@ async fn forward_once(
     }
     if let Some(deployment_id) = entry.deployment_id {
         builder = builder.header("x-temps-deployment-id", deployment_id.to_string());
+    }
+    if let Some(login) = metadata
+        .login
+        .as_deref()
+        .and_then(|login| HeaderValue::from_bytes(login.as_bytes()).ok())
+    {
+        builder = builder.header(temps_core::tailnet::TAILNET_LOGIN_HEADER, login);
     }
 
     // Stream the request body. reqwest accepts a `Body` built from a

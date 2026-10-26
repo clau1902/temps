@@ -260,6 +260,7 @@ async fn run(
                                 node_id: config.node_id,
                                 node_token: config.node_token.clone(),
                                 private,
+                                tailnet: Some(tailscale.identity()),
                             };
                             match public_ingress::spawn(ingress, store.clone(), shutdown.clone())
                                 .await
@@ -334,6 +335,8 @@ async fn run(
                     .await,
             )
         } else {
+            // D11: without consent tailscaled is never asked who anyone is.
+            tailscale.identity().set_api(None);
             None
         };
 
@@ -345,7 +348,8 @@ async fn run(
             error: error.clone(),
             private_checks: private_checks.clone(),
             tailscale: tailscale_report,
-            capabilities: Vec::new(),
+            // ADR 065 D6: this agent checks who a tailnet visitor is.
+            capabilities: vec![temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY.to_string()],
         };
         if last_reported.as_ref() != Some(&report) || last_report_at.elapsed() >= REPORT_INTERVAL {
             match send_report(&client, &base, &config, &report).await {
@@ -739,6 +743,7 @@ mod tests {
                 address_id: format!("a{i}"),
                 range: "100.64.0.0/10".into(),
                 listener: "not-an-address".into(),
+                principals: None,
             })
             .collect();
         let checks = check_private_routes(&routes).await;

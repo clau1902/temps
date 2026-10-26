@@ -175,6 +175,8 @@ pub struct ServeManager {
     reconciled_at: Option<tokio::time::Instant>,
     checked_at: Option<tokio::time::Instant>,
     report: TailscaleReport,
+    /// Who tailnet visitors are (ADR 065 D6), asked through `api` only.
+    identity: Arc<crate::tailnet_identity::TailnetIdentity>,
 }
 
 impl ServeManager {
@@ -191,7 +193,14 @@ impl ServeManager {
             reconciled_at: None,
             checked_at: None,
             report: TailscaleReport::default(),
+            identity: Arc::new(crate::tailnet_identity::TailnetIdentity::new()),
         }
+    }
+
+    /// Shared with the private listener, which asks it for `tailnet_users`
+    /// addresses (ADR 065 D6).
+    pub fn identity(&self) -> Arc<crate::tailnet_identity::TailnetIdentity> {
+        Arc::clone(&self.identity)
     }
 
     #[cfg(test)]
@@ -263,6 +272,7 @@ impl ServeManager {
             // D11: without consent tailscaled's socket is never opened.
             self.close_all();
             self.api = None;
+            self.identity.set_api(None);
             report.checks.clear();
             report.state = TailscaleState::NoConsent;
             report.error = Some(messages::no_consent(&input.node));
@@ -272,6 +282,7 @@ impl ServeManager {
         report.root = root;
         report.user = Some(user.clone());
         if !root {
+            self.identity.set_api(None);
             self.close_all();
             report.checks.clear();
             report.state = TailscaleState::NotRoot;
@@ -282,6 +293,7 @@ impl ServeManager {
             .api
             .get_or_insert_with(|| Arc::new(UnixLocalApi::new(&self.tailscaled_socket)))
             .clone();
+        self.identity.set_api(Some(Arc::clone(&api)));
 
         let status = match api.status().await {
             Ok(status) => status,
@@ -468,6 +480,7 @@ impl ServeManager {
                 &path,
                 self.store.clone(),
                 socket.clone(),
+                self.identity(),
                 stop.clone(),
             )
             .await
@@ -958,6 +971,7 @@ mod tests {
                 environment_id: Some(1),
             }),
             addrs: Vec::new(),
+            principals: None,
         }
     }
 

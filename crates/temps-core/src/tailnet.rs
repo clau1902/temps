@@ -451,6 +451,239 @@ pub mod messages {
              you own."
         )
     }
+
+    /// A tagged device whose tags are not listed (D6, word for word).
+    pub fn tagged_not_allowed(tags: &[String]) -> String {
+        let tags = if tags.is_empty() {
+            "untagged".to_string()
+        } else {
+            tags.iter()
+                .map(|tag| format!("`{tag}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "This app admits only listed tailnet users. Requests from tagged devices ({tags}) \
+             carry no user; ask the owner to add the tag."
+        )
+    }
+
+    /// A signed-in tailnet user who is not listed.
+    pub fn user_not_allowed(login: &str) -> String {
+        format!(
+            "This app admits only listed tailnet users, and `{login}` is not one of them. Ask \
+             the owner to add you."
+        )
+    }
+
+    /// A `tailnet_users` route with nobody on it: refused, never widened.
+    pub const NOBODY_LISTED: &str = "This app admits only listed tailnet users, and nobody is \
+         listed. Its owner can add people in Make it reachable.";
+
+    /// The login header did not decode, or whois could not say who it is.
+    pub const IDENTITY_UNREADABLE: &str = "This app admits only listed tailnet users, and \
+         Temps could not tell who this request is from, so it is not admitted.";
+
+    /// A route held back from an agent without `tailnet_identity.v1`.
+    pub fn update_agent(host: &str, node: &str) -> String {
+        format!(
+            "{host}: it admits only listed tailnet users, and the agent on `{node}` cannot \
+             check who they are; update the agent on `{node}`"
+        )
+    }
+
+    /// The plan, for `tailnet_users` on a listener that is not on Tailscale.
+    pub fn users_need_tailnet(listener: &str) -> String {
+        format!(
+            "Only tailnet users can be listed, and the private listener on {listener} is not on \
+             Tailscale. Bind it with `--listen tailscale`, or serve the app through a tailnet \
+             name."
+        )
+    }
+
+    /// The plan, for `tailnet_users` on a listener whose agent may not ask
+    /// tailscaled who a visitor is.
+    pub fn users_need_consent(node: &str) -> String {
+        format!(
+            "Temps asks Tailscale who each visitor is, which needs the worker owner's consent. \
+             Run `{}` on `{node}`.",
+            super::TAILSCALE_SERVE_COMMAND
+        )
+    }
+
+    pub const NO_PRINCIPALS: &str =
+        "List at least one tailnet user (`alice@example.com`) or tag (`tag:ci`).";
+}
+
+/// Most people and tags one address can list (D6).
+pub const MAX_PRINCIPALS: usize = 64;
+
+/// What a `tailnet_users` entry names (ADR 065 D6).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalKind {
+    /// A Tailscale login name: `alice@example.com`, `alice@github`.
+    Login,
+    /// A tag a tagged device carries: `tag:ci`.
+    Tag,
+}
+
+impl PrincipalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrincipalKind::Login => "login",
+            PrincipalKind::Tag => "tag",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "login" => Some(PrincipalKind::Login),
+            "tag" => Some(PrincipalKind::Tag),
+            _ => None,
+        }
+    }
+}
+
+/// One person or tag a `tailnet_users` address admits. `value` is always
+/// ASCII-lower-cased: it is compared that way (D6).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+pub struct TailnetPrincipal {
+    pub kind: PrincipalKind,
+    #[schema(example = "alice@example.com")]
+    pub value: String,
+}
+
+impl TailnetPrincipal {
+    /// What a person typed: `tag:<name>` is a tag, `<user>@<domain>` a login.
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let value = input.trim().to_ascii_lowercase();
+        if let Some(name) = value.strip_prefix("tag:") {
+            let valid = !name.is_empty()
+                && name.len() <= 64
+                && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+            return if valid {
+                Ok(Self {
+                    kind: PrincipalKind::Tag,
+                    value,
+                })
+            } else {
+                Err(format!(
+                    "`{}` is not a Tailscale tag: a tag is `tag:` and letters, digits or dashes",
+                    input.trim()
+                ))
+            };
+        }
+        let valid = value.len() <= 320
+            && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+            && value
+                .split_once('@')
+                .is_some_and(|(user, domain)| !user.is_empty() && !domain.is_empty());
+        if valid {
+            Ok(Self {
+                kind: PrincipalKind::Login,
+                value,
+            })
+        } else {
+            Err(format!(
+                "`{}` is not a Tailscale login (`alice@example.com`) or tag (`tag:ci`)",
+                input.trim()
+            ))
+        }
+    }
+
+    /// Check a stored or requested entry the same way [`Self::parse`] does.
+    pub fn normalized(&self) -> Result<Self, String> {
+        let parsed = Self::parse(&self.value)?;
+        if parsed.kind != self.kind {
+            return Err(format!(
+                "`{}` is a {}, not a {}",
+                self.value,
+                parsed.kind.as_str(),
+                self.kind.as_str()
+            ));
+        }
+        Ok(parsed)
+    }
+}
+
+/// A list as stored: each entry checked, sorted, without duplicates, and no
+/// longer than [`MAX_PRINCIPALS`]. Empty is allowed here; the plan refuses it.
+pub fn normalize_principals(list: &[TailnetPrincipal]) -> Result<Vec<TailnetPrincipal>, String> {
+    let mut out = list
+        .iter()
+        .map(TailnetPrincipal::normalized)
+        .collect::<Result<Vec<_>, _>>()?;
+    out.sort();
+    out.dedup();
+    if out.len() > MAX_PRINCIPALS {
+        return Err(format!(
+            "An address can list at most {MAX_PRINCIPALS} tailnet users and tags"
+        ));
+    }
+    Ok(out)
+}
+
+/// Whether `principals` admits a visitor with this login (an untagged
+/// device's user) or these tags. Exact compare after ASCII lower-casing; an
+/// empty list admits nobody (D6).
+pub fn admits(principals: &[TailnetPrincipal], login: Option<&str>, tags: &[String]) -> bool {
+    principals.iter().any(|principal| match principal.kind {
+        PrincipalKind::Login => login.is_some_and(|login| {
+            !login.is_empty() && login.to_ascii_lowercase() == principal.value
+        }),
+        PrincipalKind::Tag => tags
+            .iter()
+            .any(|tag| tag.to_ascii_lowercase() == principal.value),
+    })
+}
+
+/// `Tailscale-User-Login` as tailscaled sets it: plain ASCII, or RFC 2047
+/// Q-encoded words (`=?utf-8?q?...?=`) when the login is not. `None` for
+/// anything else, which is refused rather than guessed at (D6).
+pub fn decode_login_header(raw: &[u8]) -> Option<String> {
+    if raw.is_empty() || !raw.is_ascii() {
+        return None;
+    }
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    if text.is_empty() || text.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    if !text.contains("=?") {
+        return Some(text.to_string());
+    }
+    let mut bytes = Vec::with_capacity(text.len());
+    for word in text.split_ascii_whitespace() {
+        let inner = word.strip_prefix("=?")?.strip_suffix("?=")?;
+        let mut parts = inner.splitn(3, '?');
+        let charset = parts.next()?;
+        let encoding = parts.next()?;
+        let encoded = parts.next()?;
+        if !charset.eq_ignore_ascii_case("utf-8") || !encoding.eq_ignore_ascii_case("q") {
+            return None;
+        }
+        let mut chars = encoded.bytes();
+        while let Some(byte) = chars.next() {
+            match byte {
+                b'_' => bytes.push(b' '),
+                b'=' => {
+                    let hex = [chars.next()?, chars.next()?];
+                    let hex = std::str::from_utf8(&hex).ok()?;
+                    bytes.push(u8::from_str_radix(hex, 16).ok()?);
+                }
+                b'?' => return None,
+                other => bytes.push(other),
+            }
+        }
+    }
+    let decoded = String::from_utf8(bytes).ok()?;
+    if decoded.is_empty() || decoded.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(decoded)
 }
 
 #[cfg(test)]
@@ -605,5 +838,110 @@ mod tests {
         }
         assert!(forwards_header("accept", false));
         assert!(forwards_header("x-tailscale-thing", false));
+    }
+
+    fn login(value: &str) -> TailnetPrincipal {
+        TailnetPrincipal::parse(value).unwrap()
+    }
+
+    #[test]
+    fn principals_parse_lower_cased_and_refuse_what_is_neither() {
+        assert_eq!(
+            TailnetPrincipal::parse(" Alice@Example.COM ").unwrap(),
+            TailnetPrincipal {
+                kind: PrincipalKind::Login,
+                value: "alice@example.com".into()
+            }
+        );
+        assert_eq!(login("alice@github").kind, PrincipalKind::Login);
+        assert_eq!(
+            TailnetPrincipal::parse("tag:CI").unwrap(),
+            TailnetPrincipal {
+                kind: PrincipalKind::Tag,
+                value: "tag:ci".into()
+            }
+        );
+        for bad in [
+            "",
+            "alice",
+            "@example.com",
+            "alice@",
+            "tag:",
+            "tag:-x",
+            "tag:a b",
+            "a b@c",
+        ] {
+            assert!(TailnetPrincipal::parse(bad).is_err(), "{bad}");
+        }
+        // A stored login that is really a tag is not taken as a login.
+        let wrong = TailnetPrincipal {
+            kind: PrincipalKind::Login,
+            value: "tag:ci".into(),
+        };
+        assert!(wrong.normalized().is_err());
+    }
+
+    #[test]
+    fn a_list_is_sorted_deduplicated_and_bounded() {
+        let list = vec![
+            login("tag:ci"),
+            login("Bob@example.com"),
+            login("bob@example.com"),
+        ];
+        let normalized = normalize_principals(&list).unwrap();
+        assert_eq!(normalized, vec![login("bob@example.com"), login("tag:ci")]);
+        let many: Vec<_> = (0..=MAX_PRINCIPALS)
+            .map(|i| login(&format!("user{i}@example.com")))
+            .collect();
+        assert!(normalize_principals(&many).is_err());
+        assert_eq!(normalize_principals(&[]).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn admission_is_exact_after_ascii_lower_casing_and_empty_admits_nobody() {
+        let list = vec![login("alice@example.com"), login("tag:ci")];
+        assert!(admits(&list, Some("Alice@Example.com"), &[]));
+        assert!(!admits(&list, Some("alice@example.co"), &[]));
+        assert!(!admits(&list, Some("alice@example.com.evil"), &[]));
+        assert!(!admits(&list, Some(""), &[]));
+        assert!(admits(&list, None, &["tag:CI".to_string()]));
+        assert!(!admits(&list, None, &["tag:server".to_string()]));
+        // A login never matches a tag entry, nor a tag a login entry.
+        assert!(!admits(&list, Some("tag:ci"), &[]));
+        assert!(!admits(
+            &[],
+            Some("alice@example.com"),
+            &["tag:ci".to_string()]
+        ));
+    }
+
+    #[test]
+    fn the_login_header_is_q_decoded_or_refused() {
+        assert_eq!(
+            decode_login_header(b"alice@example.com").as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            decode_login_header(b"=?utf-8?q?j=C3=B6rg@example.com?=").as_deref(),
+            Some("j\u{f6}rg@example.com")
+        );
+        // Encoded words split by whitespace join without it.
+        assert_eq!(
+            decode_login_header(b"=?UTF-8?Q?j=C3=B6?= =?utf-8?q?rg@example.com?=").as_deref(),
+            Some("j\u{f6}rg@example.com")
+        );
+        for bad in [
+            &b""[..],
+            b"=?utf-8?b?am9yZw==?=",
+            b"=?iso-8859-1?q?j=F6rg?=",
+            b"=?utf-8?q?j=C3?=",
+            b"=?utf-8?q?j=ZZ?=",
+            b"=?utf-8?q?a?= plain",
+            b"=?utf-8?q?a=0Ab?=",
+            b"j\xc3\xb6rg@example.com",
+            b"=?utf-8?q?unterminated",
+        ] {
+            assert_eq!(decode_login_header(bad), None, "{bad:?}");
+        }
     }
 }

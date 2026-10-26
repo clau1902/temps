@@ -210,6 +210,14 @@ pub struct PlanFacts {
     pub service_seen: Option<(String, ServiceSeen)>,
     /// ADR 031's install id: a Service whose marker carries it is Temps'.
     pub install_id: String,
+    /// For `tailnet_users`: who the address is to admit, normalized (ADR
+    /// 065 D6).
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
+    /// Who the requested address admits now, when it is `tailnet_users`.
+    pub principals_now: Vec<temps_core::tailnet::TailnetPrincipal>,
+    /// Workers whose agent reports `tailnet_identity.v1`: the only ones a
+    /// `tailnet_users` address is sent to.
+    pub identity_workers: Vec<String>,
 }
 
 /// The worker a private plan serves through: the first whose private
@@ -237,7 +245,7 @@ pub fn records_to_read(facts: &PlanFacts, address: &str) -> Vec<(String, String)
         return Vec::new();
     }
     let mut out: Vec<(String, String)> = Vec::new();
-    if facts.audience == Audience::Private {
+    if facts.audience.is_private() {
         if let Some((_, ip)) = private_worker(facts) {
             out.push((address.to_string(), record_type_of(ip).to_string()));
         }
@@ -285,7 +293,7 @@ pub fn planned_address(facts: &PlanFacts) -> Result<Option<String>, String> {
 /// The address the plan for `facts.audience` is for: what the stored plan
 /// records and the fingerprint covers.
 pub fn address_for_audience(facts: &PlanFacts) -> Result<Option<String>, String> {
-    if facts.audience == Audience::Private {
+    if facts.audience.is_private() {
         planned_private_address(facts)
     } else {
         planned_address(facts)
@@ -384,6 +392,18 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
         address.is_some_and(|a| facts.taken_elsewhere.contains(a)),
         facts.private_rule,
     );
+    // ADR 065 D6: who it admits, asked for and now, and which agents can
+    // check it. Only for `tailnet_users`, so other plans hash as before.
+    let canonical = if facts.audience == Audience::TailnetUsers {
+        let mut identity = facts.identity_workers.clone();
+        identity.sort();
+        format!(
+            "{canonical}|{:?}|{:?}|{identity:?}",
+            facts.principals, facts.principals_now
+        )
+    } else {
+        canonical
+    };
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
@@ -750,6 +770,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         address_error,
         options: Vec::new(),
         blocked: Some(blocked),
+        principals: Vec::new(),
     };
 
     if let Some(blocked) = facts
@@ -762,6 +783,9 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     }
     if facts.audience == Audience::Private {
         return plan_private(facts);
+    }
+    if facts.audience == Audience::TailnetUsers {
+        return plan_tailnet_users(facts);
     }
     if facts.audience != Audience::Public {
         return empty(
@@ -1236,6 +1260,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         address_error: None,
         options,
         blocked,
+        principals: Vec::new(),
     }
 }
 
@@ -1301,6 +1326,7 @@ fn private_blocked(
         address_error,
         options: Vec::new(),
         blocked: Some(blocked),
+        principals: Vec::new(),
     }
 }
 
@@ -1577,6 +1603,116 @@ fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
     }
 }
 
+/// The plan for `tailnet_users` (ADR 065 D6): a private plan, kept to the
+/// ways in that can tell who a visitor is, on agents that check it.
+fn plan_tailnet_users(facts: &PlanFacts) -> ReachabilityPlan {
+    let blocked = |address: Option<String>, reason: String, action: Option<ReachAction>| {
+        let mut plan = private_blocked(address, None, PlanBlocked { reason, action });
+        plan.audience = Audience::TailnetUsers;
+        plan.principals = facts.principals.clone();
+        plan
+    };
+    if facts.principals.is_empty() {
+        return blocked(
+            facts.requested.clone(),
+            tailnet_messages::NO_PRINCIPALS.to_string(),
+            None,
+        );
+    }
+    let mut planned = plan_private(facts);
+    planned.audience = Audience::TailnetUsers;
+    planned.principals = facts.principals.clone();
+    let who = AddressAudience {
+        audience: Audience::TailnetUsers,
+        principals: facts.principals.clone(),
+        ..AddressAudience::default()
+    }
+    .describe();
+    let listed = facts
+        .principals
+        .iter()
+        .map(|p| p.value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shown = planned
+        .address
+        .clone()
+        .unwrap_or_else(|| "the address".to_string());
+    let mut refusals: Vec<(String, Option<ReachAction>)> = Vec::new();
+    planned.options.retain_mut(|option| {
+        let node = option
+            .way_in
+            .strip_prefix("private:")
+            .unwrap_or_default()
+            .to_string();
+        if option.kind == PlanOptionKind::PrivateWorker {
+            let Some((worker, ip)) = private_worker(facts) else {
+                return false;
+            };
+            // D6: whois answers only for Tailscale peers, and asking it
+            // needs the worker owner's consent.
+            if !worker.tailscale {
+                refusals.push((tailnet_messages::users_need_tailnet(&ip.to_string()), None));
+                return false;
+            }
+            let consent = facts
+                .tailnet_workers
+                .iter()
+                .any(|w| w.id == worker.id && w.report.consent);
+            if !consent {
+                refusals.push((
+                    tailnet_messages::users_need_consent(&worker.name),
+                    Some(
+                        ReachAction::new(
+                            ActionKind::RunCommand,
+                            format!("On {}, as root, run", worker.name),
+                        )
+                        .with_command(temps_core::tailnet::TAILSCALE_SERVE_COMMAND),
+                    ),
+                ));
+                return false;
+            }
+        }
+        if !facts.identity_workers.contains(&node) {
+            refusals.push((
+                format!(
+                    "{shown} admits only listed tailnet users, and the agent on `{node}` cannot \
+                     check who they are. Update the agent on `{node}`, then plan again."
+                ),
+                None,
+            ));
+            return false;
+        }
+        for step in &mut option.steps {
+            if step.kind == StepKind::SetAudience {
+                step.label = format!("Make {shown} private to your tailnet, {who}");
+            }
+        }
+        option.warnings.insert(
+            0,
+            format!(
+                "Only {listed} can open {shown}. Anyone else on your tailnet gets a page that \
+                 says it admits only listed tailnet users. Changing who is listed needs a \
+                 recent password or passkey confirmation."
+            ),
+        );
+        true
+    });
+    for (index, option) in planned.options.iter_mut().enumerate() {
+        option.recommended = index == 0;
+    }
+    if planned.options.is_empty() && planned.blocked.is_none() {
+        let (reason, action) = refusals.into_iter().next().unwrap_or_else(|| {
+            (
+                "No way in that can tell who a tailnet visitor is is available.".to_string(),
+                None,
+            )
+        });
+        return blocked(planned.address.clone(), reason, action);
+    }
+    planned
+}
+
 /// The plan for a worker's own tailnet name (ADR 065 D1 option 3):
 /// tailscaled serves it and gets its certificate, so nothing is written to
 /// DNS or `domains`.
@@ -1679,6 +1815,7 @@ fn plan_machine_name(
         address_error: None,
         options: vec![option],
         blocked: None,
+        principals: Vec::new(),
     }
 }
 
@@ -1891,6 +2028,7 @@ fn plan_service(facts: &PlanFacts, address: Option<String>) -> ReachabilityPlan 
         address_error: None,
         options: vec![option],
         blocked: None,
+        principals: Vec::new(),
     }
 }
 
@@ -2159,6 +2297,7 @@ fn plan_listener(
         address_error: None,
         options: vec![option],
         blocked: None,
+        principals: Vec::new(),
     }
 }
 
@@ -2233,7 +2372,10 @@ mod tests {
                 audience: requested,
                 requested: Some("app.example.com".into()),
                 attached_here: vec!["app.example.com".into()],
-                audiences: vec![("app.example.com".into(), Audience::parse("tailnet_users"))],
+                audiences: vec![(
+                    "app.example.com".into(),
+                    Audience::parse("a_future_audience"),
+                )],
                 zones: vec![zone("example.com", "cloudflare")],
                 ..base()
             };
@@ -3281,5 +3423,111 @@ mod tests {
             message: String::new(),
         }];
         assert_eq!(fingerprint(&facts, name), fingerprint(&checked, name));
+    }
+
+    fn alice() -> Vec<temps_core::tailnet::TailnetPrincipal> {
+        vec![temps_core::tailnet::TailnetPrincipal::parse("alice@example.com").expect("a login")]
+    }
+
+    fn users_facts() -> PlanFacts {
+        PlanFacts {
+            audience: Audience::TailnetUsers,
+            principals: alice(),
+            identity_workers: vec!["homelab".into()],
+            ..serve_facts()
+        }
+    }
+
+    /// ADR 065 D6: an empty list is refused by the plan; nothing is made
+    /// reachable to nobody.
+    #[test]
+    fn a_tailnet_users_plan_needs_someone_listed() {
+        let plan = plan_of(&PlanFacts {
+            principals: Vec::new(),
+            ..users_facts()
+        });
+        assert!(plan.options.is_empty());
+        assert_eq!(plan.audience, Audience::TailnetUsers);
+        assert_eq!(
+            plan.blocked.expect("blocked").reason,
+            tailnet_messages::NO_PRINCIPALS
+        );
+    }
+
+    #[test]
+    fn a_tailnet_users_plan_serves_the_machine_name_and_says_who_is_admitted() {
+        let plan = plan_of(&users_facts());
+        assert_eq!(kinds(&plan), vec![PlanOptionKind::TailscaleServe]);
+        assert_eq!(plan.audience, Audience::TailnetUsers);
+        assert_eq!(plan.principals, alice());
+        let option = &plan.options[0];
+        assert!(option.recommended);
+        assert!(
+            option.warnings[0]
+                .starts_with("Only alice@example.com can open homelab.example.ts.net"),
+            "{:?}",
+            option.warnings
+        );
+        let audience = option
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::SetAudience)
+            .expect("an audience step");
+        assert!(
+            audience.label.contains("only for alice@example.com"),
+            "{}",
+            audience.label
+        );
+    }
+
+    /// D6: an agent that cannot check who a visitor is never gets the
+    /// address; the plan says which agent to update.
+    #[test]
+    fn a_tailnet_users_plan_refuses_a_worker_whose_agent_cannot_check_identity() {
+        let plan = plan_of(&PlanFacts {
+            identity_workers: Vec::new(),
+            ..users_facts()
+        });
+        assert!(plan.options.is_empty());
+        let reason = plan.blocked.expect("blocked").reason;
+        assert!(reason.contains("Update the agent on `homelab`"), "{reason}");
+    }
+
+    /// D6: on the private listener whois needs a Tailscale listener and
+    /// the owner's consent; without either the plan says what to do.
+    #[test]
+    fn a_tailnet_users_listener_needs_tailscale_and_the_owners_consent() {
+        let listener = || PlanFacts {
+            audience: Audience::TailnetUsers,
+            principals: alice(),
+            identity_workers: vec!["homelab".into()],
+            ..private_facts()
+        };
+        let plan = plan_of(&listener());
+        assert!(plan.options.is_empty());
+        let blocked = plan.blocked.expect("blocked");
+        assert_eq!(
+            blocked.reason,
+            tailnet_messages::users_need_consent("homelab")
+        );
+        let action = blocked.action.expect("action");
+        assert_eq!(action.kind, ActionKind::RunCommand);
+        assert_eq!(
+            action.command.as_deref(),
+            Some(temps_core::tailnet::TAILSCALE_SERVE_COMMAND)
+        );
+
+        let mut off_tailnet = private_worker_fact(None);
+        off_tailnet.tailscale = false;
+        off_tailnet.listener = Some("192.168.1.20".parse().expect("ip"));
+        let plan = plan_of(&PlanFacts {
+            private_workers: vec![off_tailnet],
+            ..listener()
+        });
+        assert!(plan.options.is_empty());
+        assert_eq!(
+            plan.blocked.expect("blocked").reason,
+            tailnet_messages::users_need_tailnet("192.168.1.20")
+        );
     }
 }

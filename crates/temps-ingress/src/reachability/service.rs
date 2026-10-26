@@ -555,7 +555,7 @@ impl ReachabilityService {
                 audience,
                 AddressSource::CustomDomain,
                 Some(custom.id),
-                (audience == Audience::Private).then(|| PrivateBinding {
+                audience.is_private().then(|| PrivateBinding {
                     address_id: private_address_id(true, custom.id),
                     range: custom.private_range.clone(),
                     node_id: custom.private_node_id,
@@ -577,7 +577,7 @@ impl ReachabilityService {
                 audience,
                 AddressSource::EnvironmentDomain,
                 None,
-                (audience == Audience::Private).then(|| PrivateBinding {
+                audience.is_private().then(|| PrivateBinding {
                     address_id: private_address_id(false, domain.id),
                     range: domain.private_range.clone(),
                     node_id: domain.private_node_id,
@@ -845,6 +845,67 @@ impl ReachabilityService {
                 Some((input.address.clone(), facts))
             })
             .collect();
+        // ADR 065 D6: who a `tailnet_users` address admits, and whether its
+        // worker is sent it at all. One query for every listed address.
+        let users_ids: Vec<String> = addresses
+            .iter()
+            .filter(|a| a.audience == Audience::TailnetUsers)
+            .filter_map(|a| Some(a.private.as_ref()?.address_id.clone()))
+            .collect();
+        let listed: Result<Vec<temps_entities::address_tailnet_principals::Model>, String> =
+            if users_ids.is_empty() {
+                Ok(Vec::new())
+            } else {
+                temps_entities::address_tailnet_principals::Entity::find()
+                    .filter(
+                        temps_entities::address_tailnet_principals::Column::AddressId
+                            .is_in(users_ids),
+                    )
+                    .all(db)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+        for input in addresses
+            .iter()
+            .filter(|a| a.audience == Audience::TailnetUsers)
+        {
+            let Some(binding) = input.private.as_ref() else {
+                continue;
+            };
+            let Some(fact) = facts.get_mut(&input.address) else {
+                continue;
+            };
+            let node = binding
+                .node_id
+                .and_then(|id| nodes.get(&id))
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| "the worker".to_string());
+            let identity = temps_routes::route_sync::reports_capability(
+                binding.node_id.and_then(|id| rows.get(&id)),
+                temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+            );
+            fact.tailnet_users = if !identity {
+                Some(format!(
+                    "{} admits only listed tailnet users, and the agent on `{node}` cannot check \
+                     who they are, so it is not given the address. Update the agent on `{node}`.",
+                    input.address
+                ))
+            } else {
+                match &listed {
+                    Ok(rows) => {
+                        let list = temps_entities::address_tailnet_principals::principals(
+                            rows.iter().filter(|r| r.address_id == binding.address_id),
+                        );
+                        list.is_empty()
+                            .then(|| temps_core::tailnet::messages::NOBODY_LISTED.to_string())
+                    }
+                    Err(error) => Some(format!(
+                        "Temps could not read who {} admits: {error}",
+                        input.address
+                    )),
+                }
+            };
+        }
         // ADR 065 D5: every host advertising a Service matches one of its
         // Serve entries, read with the cluster's credential.
         for input in addresses {
@@ -993,7 +1054,14 @@ impl ReachabilityService {
             None
         } else {
             let facts = self
-                .plan_facts(&scope, &gathered, directs, Audience::Public, None)
+                .plan_facts(
+                    &scope,
+                    &gathered,
+                    directs,
+                    Audience::Public,
+                    None,
+                    Vec::new(),
+                )
                 .await?;
             Some(plan(&facts))
         };
@@ -1024,6 +1092,7 @@ impl ReachabilityService {
         directs: Vec<DirectIngress>,
         audience: Audience,
         requested: Option<String>,
+        principals: Vec<temps_core::tailnet::TailnetPrincipal>,
     ) -> Result<PlanFacts, ReachabilityError> {
         let db = self.deps.db.as_ref();
         let mut hosts: Vec<String> = gathered
@@ -1084,6 +1153,17 @@ impl ReachabilityService {
         let modes: HashMap<i32, Option<String>> = ingress_rows
             .iter()
             .map(|row| (row.node_id, row.mode.clone()))
+            .collect();
+        // ADR 065 D6: the agents that check who a tailnet visitor is.
+        let identity_workers: Vec<String> = workers
+            .iter()
+            .filter(|worker| {
+                temps_routes::route_sync::reports_capability(
+                    ingress_rows.iter().find(|r| r.node_id == worker.id),
+                    temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+                )
+            })
+            .map(|worker| worker.name.clone())
             .collect();
         // ADR 064 D5: workers whose owner put them in private mode.
         let private_workers: Vec<PrivateWorkerFact> = workers
@@ -1227,11 +1307,28 @@ impl ReachabilityService {
             tailscale_credential,
             service_seen: None,
             install_id,
+            principals: if audience == Audience::TailnetUsers {
+                principals
+            } else {
+                Vec::new()
+            },
+            principals_now: Vec::new(),
+            identity_workers,
         };
         let mut dns_records = Vec::new();
         let mut service_seen = None;
+        let mut principals_now = Vec::new();
         // The suggested address is known only now; D9 decides it too.
         if let Ok(Some(address)) = address_for_audience(&facts) {
+            // ADR 065 D6: who it admits now, which the plan is held to.
+            if let Some(binding) = gathered
+                .addresses
+                .iter()
+                .find(|a| a.address == address && a.audience == Audience::TailnetUsers)
+                .and_then(|a| a.private.as_ref())
+            {
+                principals_now = super::principals::load(db, &binding.address_id).await?;
+            }
             // What a run would change is shown, and held to (D4).
             let ops = self.ops(None, None);
             for (host, record_type) in records_to_read(&facts, &address) {
@@ -1282,6 +1379,7 @@ impl ReachabilityService {
             intents,
             dns_records,
             service_seen,
+            principals_now,
             ..facts
         })
     }
@@ -1291,6 +1389,7 @@ impl ReachabilityService {
         scope: &Scope,
         audience: Audience,
         requested: Option<String>,
+        principals: Vec<temps_core::tailnet::TailnetPrincipal>,
     ) -> Result<(PlanFacts, temps_core::AppSettings), ReachabilityError> {
         let settings = self.settings().await?;
         let gathered = self
@@ -1298,7 +1397,7 @@ impl ReachabilityService {
             .await?;
         let directs = self.directs(&settings).await;
         let facts = self
-            .plan_facts(scope, &gathered, directs, audience, requested)
+            .plan_facts(scope, &gathered, directs, audience, requested, principals)
             .await?;
         Ok((facts, settings))
     }
@@ -1346,8 +1445,16 @@ impl ReachabilityService {
         user_id: Option<i32>,
     ) -> Result<ReachabilityPlan, ReachabilityError> {
         let scope = self.scope(project_id, environment_id).await?;
+        // ADR 065 D6: who a `tailnet_users` address admits, checked and
+        // lower-cased before anything is planned with it.
+        let principals = if request.audience == Audience::TailnetUsers {
+            temps_core::tailnet::normalize_principals(&request.principals)
+                .map_err(ReachabilityError::Validation)?
+        } else {
+            Vec::new()
+        };
         let (facts, _) = self
-            .facts_for(&scope, request.audience, request.address)
+            .facts_for(&scope, request.audience, request.address, principals)
             .await?;
         self.store_plan(&scope, &facts, user_id).await
     }
@@ -1404,7 +1511,15 @@ impl ReachabilityService {
             .as_ref()
             .map(|p| Audience::parse(&p.audience))
             .unwrap_or_default();
-        let (facts, settings) = self.facts_for(&scope, audience, requested).await?;
+        // ADR 065 D6: the list the plan was made for, and only that one.
+        let principals = stored
+            .as_ref()
+            .and_then(|p| serde_json::from_value::<ReachabilityPlan>(p.plan.clone()).ok())
+            .map(|p| p.principals)
+            .unwrap_or_default();
+        let (facts, settings) = self
+            .facts_for(&scope, audience, requested, principals)
+            .await?;
         let address = match address_for_audience(&facts) {
             Ok(Some(address)) => address,
             Ok(None) => {
@@ -1615,12 +1730,13 @@ impl ReachabilityService {
                 input.certificate_challenge = Some("dns-01".to_string());
                 input.audience = Some((
                     AddressAudience {
-                        audience: Audience::Private,
+                        audience: facts.audience,
                         network_range: Some(range.to_string()),
                         private_node_id: Some(worker.id),
                         private_listener: Some(ip.to_string()),
                         private_via: None,
                         private_service: None,
+                        principals: facts.principals.clone(),
                     },
                     self.current_audience(&address).await?,
                 ));
@@ -1645,12 +1761,13 @@ impl ReachabilityService {
                 });
                 input.audience = Some((
                     AddressAudience {
-                        audience: Audience::Private,
+                        audience: facts.audience,
                         network_range: None,
                         private_node_id: Some(worker.id),
                         private_listener: None,
                         private_via: Some(via::TAILSCALE_SERVE.to_string()),
                         private_service: None,
+                        principals: facts.principals.clone(),
                     },
                     self.current_audience(&address).await?,
                 ));
@@ -1714,12 +1831,13 @@ impl ReachabilityService {
                 });
                 input.audience = Some((
                     AddressAudience {
-                        audience: Audience::Private,
+                        audience: facts.audience,
                         network_range: None,
                         private_node_id: Some(worker.id),
                         private_listener: None,
                         private_via: Some(via::TAILSCALE_SERVICE.to_string()),
                         private_service: Some(service),
+                        principals: facts.principals.clone(),
                     },
                     self.current_audience(&address).await?,
                 ));
@@ -1824,12 +1942,15 @@ impl ReachabilityService {
 
     /// Who `host` is for now, as stored: public when it is not attached.
     async fn current_audience(&self, host: &str) -> Result<AddressAudience, ReachabilityError> {
-        Ok(project_custom_domains::Entity::find()
+        let db = self.deps.db.as_ref();
+        let Some(row) = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::Domain.eq(host))
-            .one(self.deps.db.as_ref())
+            .one(db)
             .await?
-            .map(|row| address_audience_of(&row))
-            .unwrap_or_default())
+        else {
+            return Ok(AddressAudience::default());
+        };
+        Ok(with_principals(db, &row, address_audience_of(&row)).await?)
     }
 
     /// The audience change a stored plan's option makes, for the step-up
@@ -1842,7 +1963,15 @@ impl ReachabilityService {
         plan_id: &str,
         option: PlanOptionKind,
         answered_address: Option<&str>,
-    ) -> Result<Option<(String, AddressAudience, Audience)>, ReachabilityError> {
+    ) -> Result<
+        Option<(
+            String,
+            AddressAudience,
+            Audience,
+            Vec<temps_core::tailnet::TailnetPrincipal>,
+        )>,
+        ReachabilityError,
+    > {
         let Some(stored) = reachability_plans::Entity::find_by_id(plan_id.to_string())
             .filter(reachability_plans::Column::ProjectId.eq(project_id))
             .filter(reachability_plans::Column::EnvironmentId.eq(environment_id))
@@ -1866,7 +1995,12 @@ impl ReachabilityService {
         match (changes, address) {
             (true, Some(address)) => {
                 let before = self.current_audience(&address).await?;
-                Ok(Some((address, before, Audience::parse(&stored.audience))))
+                Ok(Some((
+                    address,
+                    before,
+                    Audience::parse(&stored.audience),
+                    planned.principals,
+                )))
             }
             _ => Ok(None),
         }
@@ -3119,7 +3253,7 @@ impl RunOps for LiveOps {
             custom_domain_id: row.as_ref().map(|r| r.id),
             private: row
                 .as_ref()
-                .filter(|_| audience == Audience::Private)
+                .filter(|_| audience.is_private())
                 .map(|r| PrivateBinding {
                     address_id: private_address_id(true, r.id),
                     range: r.private_range.clone(),
@@ -3148,10 +3282,13 @@ impl RunOps for LiveOps {
     }
 
     async fn address_audience(&self, host: &str) -> Result<Option<AddressAudience>, String> {
-        Ok(self
-            .own_address(host)
-            .await?
-            .map(|d| address_audience_of(&d)))
+        let Some(row) = self.own_address(host).await? else {
+            return Ok(None);
+        };
+        with_principals(self.deps.db.as_ref(), &row, address_audience_of(&row))
+            .await
+            .map(Some)
+            .map_err(text)
     }
 
     async fn set_address_audience(
@@ -3163,9 +3300,22 @@ impl RunOps for LiveOps {
             .own_address(host)
             .await?
             .ok_or_else(|| format!("{host} is not attached to this environment any more."))?;
+        use sea_orm::TransactionTrait;
+        // ADR 065 D6: the audience and who it admits change together.
+        let address_id = private_address_id(true, row.id);
+        let txn = self.deps.db.begin().await.map_err(text)?;
         let mut active: project_custom_domains::ActiveModel = row.into();
         set_address_audience_on(&mut active, audience);
-        active.update(self.deps.db.as_ref()).await.map_err(text)?;
+        active.update(&txn).await.map_err(text)?;
+        let list = if audience.audience == Audience::TailnetUsers {
+            audience.principals.as_slice()
+        } else {
+            &[]
+        };
+        super::principals::replace(&txn, &address_id, list)
+            .await
+            .map_err(text)?;
+        txn.commit().await.map_err(text)?;
         Ok(())
     }
 
@@ -3393,7 +3543,7 @@ fn dns_record_type(record_type: &str) -> DnsRecordType {
 /// Who a custom domain is for, as stored.
 pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudience {
     let audience = Audience::parse(&row.audience);
-    let private = audience == Audience::Private;
+    let private = audience.is_private();
     AddressAudience {
         audience,
         network_range: row.private_range.clone().filter(|_| private),
@@ -3405,7 +3555,21 @@ pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudien
             .clone()
             .filter(|v| private && v != via::LISTENER),
         private_service: row.private_service.clone().filter(|_| private),
+        principals: Vec::new(),
     }
+}
+
+/// `audience` with the list a `tailnet_users` row admits (ADR 065 D6).
+async fn with_principals<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    row: &project_custom_domains::Model,
+    mut audience: AddressAudience,
+) -> Result<AddressAudience, sea_orm::DbErr> {
+    if audience.audience == Audience::TailnetUsers {
+        audience.principals =
+            super::principals::load(db, &private_address_id(true, row.id)).await?;
+    }
+    Ok(audience)
 }
 
 /// Write `audience` with what bounds it; a public one clears the private
@@ -3414,7 +3578,7 @@ fn set_address_audience_on(
     active: &mut project_custom_domains::ActiveModel,
     audience: &AddressAudience,
 ) {
-    let private = audience.audience == Audience::Private;
+    let private = audience.audience.is_private();
     active.audience = Set(audience.audience.as_str().to_string());
     active.private_range = Set(audience.network_range.clone().filter(|_| private));
     active.private_node_id = Set(audience.private_node_id.filter(|_| private));
@@ -3545,6 +3709,7 @@ pub fn private_facts_of(
             })
         });
     PrivateFacts {
+        tailnet_users: None,
         worker,
         bound,
         tailscale,
@@ -3595,6 +3760,7 @@ pub fn tailnet_facts_of(
     };
     let (report, minutes_ago) = report.unwrap_or_default();
     PrivateFacts {
+        tailnet_users: None,
         worker,
         bound,
         tailscale: true,

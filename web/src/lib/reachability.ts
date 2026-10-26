@@ -15,6 +15,7 @@ import type {
   RunState,
   RunView,
   SetupField,
+  TailnetPrincipal,
 } from '@/api/client'
 
 export type ReachabilityHeadline =
@@ -114,6 +115,7 @@ export const AUDIENCE_LABELS: Record<AddressReachability['audience'], string> =
     public: 'Anyone',
     private: 'My network',
     signed_in: 'Signed-in people',
+    tailnet_users: 'Listed tailnet users',
     unsupported: 'Set by a newer Temps',
   }
 
@@ -382,4 +384,66 @@ export function certificateChoices({
         ? 'Temps does not see a public listener on port 80. HTTP-01 works only if port 80 reaches this server, for example through port forwarding; otherwise use DNS-01 or a tunnel.'
         : null,
   }
+}
+
+/** The most entries one address may list, as the server bounds it. */
+export const MAX_PRINCIPALS = 64
+
+/**
+ * Who a `tailnet_users` address admits, from what the user typed: entries
+ * separated by commas, spaces or new lines; `tag:<name>` is a tag and
+ * `<user>@<domain>` a login (ADR 065 D6). Values are ASCII-lower-cased,
+ * sorted and deduplicated the way the server stores them; anything that is
+ * neither is returned in `invalid` rather than guessed at. The server
+ * checks the list again.
+ */
+export function parsePrincipals(text: string): {
+  principals: TailnetPrincipal[]
+  invalid: string[]
+} {
+  const seen = new Set<string>()
+  const principals: TailnetPrincipal[] = []
+  const invalid: string[] = []
+  for (const entry of text.split(/[\s,]+/)) {
+    if (!entry) continue
+    const value = entry.replace(/[A-Z]/g, (c) => c.toLowerCase())
+    const principal = principalOf(value)
+    if (!principal) {
+      invalid.push(entry)
+      continue
+    }
+    const key = `${principal.kind}:${principal.value}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    principals.push(principal)
+  }
+  principals.sort((a, b) =>
+    a.kind === b.kind
+      ? a.value < b.value
+        ? -1
+        : a.value > b.value
+          ? 1
+          : 0
+      : a.kind === 'login'
+        ? -1
+        : 1
+  )
+  return { principals, invalid }
+}
+
+function principalOf(value: string): TailnetPrincipal | null {
+  if (value.startsWith('tag:')) {
+    const name = value.slice(4)
+    return name.length <= 64 && /^[a-z0-9][a-z0-9-]*$/.test(name)
+      ? { kind: 'tag', value }
+      : null
+  }
+  const at = value.indexOf('@')
+  const ok =
+    value.length <= 320 &&
+    at > 0 &&
+    at < value.length - 1 &&
+    // eslint-disable-next-line no-control-regex
+    !/[\u0000-\u001f\u007f]/.test(value)
+  return ok ? { kind: 'login', value } : null
 }

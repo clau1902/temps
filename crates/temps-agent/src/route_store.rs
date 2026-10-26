@@ -114,6 +114,10 @@ pub struct ServeEntry {
     /// answers the inside check accepts for its name.
     #[serde(default)]
     pub addrs: Vec<String>,
+    /// For `tailnet_users` (ADR 065 D6): who the socket admits. `None` is
+    /// the whole tailnet; an empty list admits nobody.
+    #[serde(default)]
+    pub principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 /// A private address and what bounds it (ADR 064 D5).
@@ -126,6 +130,11 @@ pub struct PrivateRouteEntry {
     pub range: String,
     /// The listener address DNS points at.
     pub listener: String,
+    /// For `tailnet_users` (ADR 065 D6): who the listener admits, by whois
+    /// of the TCP peer. `None` is the whole range; an empty list admits
+    /// nobody.
+    #[serde(default)]
+    pub principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

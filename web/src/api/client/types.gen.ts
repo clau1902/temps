@@ -83591,7 +83591,21 @@ export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponse
 /**
  * Who an address is for.
  */
-export type Audience = 'public' | 'private' | 'signed_in' | 'unsupported';
+export type Audience = 'public' | 'private' | 'signed_in' | 'tailnet_users' | 'unsupported';
+
+/**
+ * Which kind of tailnet principal an entry names (ADR 065 D6).
+ */
+export type PrincipalKind = 'login' | 'tag';
+
+/**
+ * One entry of a `tailnet_users` address's list: a login or a `tag:`,
+ * ASCII-lower-cased: it is compared that way (D6).
+ */
+export type TailnetPrincipal = {
+    kind: PrincipalKind;
+    value: string;
+};
 
 export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
 
@@ -83711,6 +83725,10 @@ export type ReachabilityPlan = {
     address_error?: string | null;
     audience: Audience;
     /**
+     * For `tailnet_users`: who it admits, as the plan will set it.
+     */
+    principals?: Array<TailnetPrincipal>;
+    /**
      * Set when `options` is empty.
      */
     blocked?: null | PlanBlocked;
@@ -83771,6 +83789,10 @@ export type PlanRequest = {
      */
     address?: string | null;
     audience?: Audience;
+    /**
+     * For `tailnet_users`: who it admits. An empty list is refused.
+     */
+    principals?: Array<TailnetPrincipal>;
 };
 
 /**
@@ -83958,6 +83980,10 @@ export type AddressAudience = {
      * For `tailscale_service`: the `svc:` name.
      */
     private_service?: string | null;
+    /**
+     * For `tailnet_users`: who it admits (ADR 065 D6).
+     */
+    principals?: Array<TailnetPrincipal>;
 };
 
 /**

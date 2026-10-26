@@ -1080,6 +1080,30 @@ Open, found in review of 3b:
   could also compare the definition with the fixed one and check the
   marker, through the same 30-second cache.
 
+3c (only these tailnet users):
+
+- **Where the list lives.** `address_tailnet_principals` holds one row per
+  login or tag, keyed by the address id (`custom:<id>`,
+  `environment:<id>`) rather than a foreign key to either domain table.
+  Rows that no longer parse are dropped when read, so a bad row narrows
+  the list and never widens it. Rows of a domain that is deleted are not
+  removed yet.
+- **Where each header is read.** On a Serve socket the login comes only
+  from tailscaled's `Tailscale-User-Login` (Q-decoded), and whois of the
+  `X-Forwarded-For` visitor is asked only for its tags, never for a login.
+  On the private `tailscale0` listener both come from whois of the TCP
+  peer. A request admitted by a tag carries no `x-temps-user-login`.
+- **Whois needs consent.** The agent reports `tailnet_identity.v1` whenever
+  it runs this version, but asks tailscaled only with `--tailscale-serve`;
+  without that flag every `tailnet_users` request is refused (fail closed),
+  and the plan refuses a worker without consent up front.
+- **Where the capability is kept.** The agent's capabilities travel in its
+  ingress report and are stored in `node_public_ingress.listening`
+  (`capabilities`, at most 16), next to what it listens on, rather than in
+  a column of their own.
+- **The console types** for `tailnet_users` and its list were written by
+  hand into the generated client, to be regenerated from a running server.
+
 ## Open questions
 
 1. Several hosts for one Service: Tailscale routes to any approved host, so

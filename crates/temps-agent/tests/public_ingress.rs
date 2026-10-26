@@ -16,6 +16,7 @@ use temps_agent::route_store::{
     RouteBackend, RouteEntry, RouteStore, ServeEntry, SharedRouteStore,
 };
 use temps_agent::route_sync_client::RouteSyncClient;
+use temps_agent::tailnet_identity::TailnetIdentity;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
@@ -129,6 +130,7 @@ async fn spawn_acme_test_ingress(
             node_id: 7,
             node_token: "test-node-token".to_string(),
             private: false,
+            tailnet: None,
         },
         store,
         Arc::clone(&shutdown),
@@ -607,6 +609,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
             node_id: 7,
             node_token: "test-node-token".to_string(),
             private: false,
+            tailnet: None,
         },
         store,
         Arc::clone(&shutdown),
@@ -752,6 +755,7 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
             node_id: 7,
             node_token: "test-node-token".to_string(),
             private: false,
+            tailnet: None,
         },
         Arc::clone(&store),
         Arc::clone(&ingress_shutdown),
@@ -1229,6 +1233,7 @@ fn private_route(host: &str, backend: std::net::SocketAddr, range: &str) -> Priv
         address_id: "custom:9".to_string(),
         range: range.to_string(),
         listener: "127.0.0.1".to_string(),
+        principals: None,
     }
 }
 
@@ -1284,6 +1289,7 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
             node_id: 7,
             node_token: "test-node-token".to_string(),
             private: true,
+            tailnet: None,
         },
         Arc::clone(&store),
         Arc::clone(&shutdown),
@@ -1400,8 +1406,24 @@ async fn test_tailnet_identity_headers_are_stripped_on_every_tcp_listener() {
 }
 
 fn serve_store(snapshot_dir: &TempDir, backend: std::net::SocketAddr) -> SharedRouteStore {
+    serve_store_for(snapshot_dir, backend, None)
+}
+
+fn serve_store_for(
+    snapshot_dir: &TempDir,
+    backend: std::net::SocketAddr,
+    principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
+) -> SharedRouteStore {
     let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
-    store.apply_public_snapshot(PublicIngressSnapshot {
+    store.apply_public_snapshot(serve_snapshot(backend, principals));
+    store
+}
+
+fn serve_snapshot(
+    backend: std::net::SocketAddr,
+    principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
+) -> PublicIngressSnapshot {
+    PublicIngressSnapshot {
         enabled: true,
         routes: Vec::new(),
         certificates: None,
@@ -1429,9 +1451,9 @@ fn serve_store(snapshot_dir: &TempDir, backend: std::net::SocketAddr) -> SharedR
                 environment_id: Some(63),
             }),
             addrs: Vec::new(),
+            principals,
         }],
-    });
-    store
+    }
 }
 
 async fn socket_request(path: &std::path::Path, request: &str) -> String {
@@ -1467,6 +1489,7 @@ async fn test_serve_socket_serves_only_its_address_to_tailnet_visitors() {
         &path,
         Arc::clone(&store),
         Arc::clone(&socket),
+        Arc::new(TailnetIdentity::new()),
         Arc::clone(&stop),
     )
     .await
@@ -1570,6 +1593,89 @@ async fn test_serve_socket_serves_only_its_address_to_tailnet_visitors() {
             .await
             .is_err(),
         "nothing else reached the backend"
+    );
+    stop.notify_waiters();
+    backend_shutdown.notify_waiters();
+}
+
+/// ADR 065 D6: a `tailnet_users` address on its Serve socket admits only a
+/// listed login, read from tailscaled's header, and hands it to the app as
+/// `x-temps-user-login` in place of any client copy. Anyone else, an
+/// empty list, and a visitor with no login tailscaled can vouch for are
+/// refused before the app is reached.
+#[tokio::test]
+async fn test_serve_socket_admits_only_listed_tailnet_users() {
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let dir = TempDir::new().expect("socket dir");
+    let alice = temps_core::tailnet::TailnetPrincipal::parse("Alice@Example.com").expect("a login");
+    let store = serve_store_for(&dir, backend_address, Some(vec![alice]));
+    let path = dir.path().join("custom-9.sock");
+    let stop = Arc::new(Notify::new());
+    // No LocalAPI: whois is unavailable, as without the owner's consent.
+    let _task = spawn_serve_socket(
+        &path,
+        Arc::clone(&store),
+        Arc::new(ServeSocket::new("custom:9")),
+        Arc::new(TailnetIdentity::new()),
+        Arc::clone(&stop),
+    )
+    .await
+    .expect("bind the Serve socket");
+
+    let admitted = socket_request(
+        &path,
+        "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.200\r\nTailscale-User-Login: ALICE@example.com\r\nX-Temps-User-Login: mallory@example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(admitted.starts_with("HTTP/1.1 200 OK"), "{admitted}");
+    let seen = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed")
+        .to_ascii_lowercase();
+    assert!(
+        seen.contains("x-temps-user-login: alice@example.com"),
+        "{seen}"
+    );
+    assert!(!seen.contains("mallory"), "{seen}");
+
+    for (who, request) in [
+        (
+            "an unlisted login",
+            "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.201\r\nTailscale-User-Login: bob@example.com\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "a login that cannot be decoded",
+            "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.201\r\nTailscale-User-Login: =?utf-8?b?YWxpY2U=?=\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "no login and no whois",
+            "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.201\r\nX-Temps-User-Login: alice@example.com\r\nConnection: close\r\n\r\n",
+        ),
+    ] {
+        let refused = socket_request(&path, request).await;
+        assert!(refused.starts_with("HTTP/1.1 403"), "{who}: {refused}");
+        assert!(
+            refused
+                .to_ascii_lowercase()
+                .contains("x-temps-private-ingress: not-allowed"),
+            "{who}: {refused}"
+        );
+    }
+
+    // An empty list admits nobody, even a login that was listed before.
+    store.apply_public_snapshot(serve_snapshot(backend_address, Some(Vec::new())));
+    let refused = socket_request(
+        &path,
+        "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.200\r\nTailscale-User-Login: alice@example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+    assert!(
+        timeout(Duration::from_millis(150), requests.recv())
+            .await
+            .is_err(),
+        "nothing refused reached the backend"
     );
     stop.notify_waiters();
     backend_shutdown.notify_waiters();

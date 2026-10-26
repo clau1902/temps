@@ -154,6 +154,10 @@ pub struct ServeEntryDto {
     /// created it: what the inside check accepts for the name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addrs: Vec<String>,
+    /// For `tailnet_users` (ADR 065 D6): who the socket admits. Sent only
+    /// to an agent reporting `tailnet_identity.v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 /// A private address on a worker's private listener (ADR 064 D5).
@@ -168,6 +172,11 @@ pub struct PrivateRouteEntryDto {
     /// The listener address DNS points at: what the inside check compares
     /// the hostname's answer with and dials.
     pub listener: String,
+    /// For `tailnet_users` (ADR 065 D6): who the listener admits, by whois
+    /// of the TCP peer. Sent only to an agent reporting
+    /// `tailnet_identity.v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -675,6 +684,53 @@ pub fn private_listener_of(
     Some(ip)
 }
 
+/// Whether the worker's last listener report names `capability` (ADR 065
+/// D6). Agents that predate capabilities report none.
+pub fn reports_capability(
+    row: Option<&temps_entities::node_public_ingress::Model>,
+    capability: &str,
+) -> bool {
+    row.and_then(|r| r.listening.as_ref())
+        .and_then(|l| l.get("capabilities"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some(capability)))
+}
+
+/// ADR 065 D6: an agent that does not check who a tailnet visitor is never
+/// gets a `tailnet_users` address, so it cannot serve one to everyone on
+/// the tailnet. Its private routes are dropped and its Serve entries kept
+/// without a route (the socket answers 404); why, for each.
+pub fn hold_back_tailnet_users(
+    private_routes: &mut Vec<PrivateRouteEntryDto>,
+    serve_entries: &mut [ServeEntryDto],
+    identity: bool,
+    node_name: &str,
+) -> Vec<String> {
+    if identity {
+        return Vec::new();
+    }
+    let mut held_back = Vec::new();
+    private_routes.retain(|route| {
+        if route.principals.is_none() {
+            return true;
+        }
+        held_back.push(temps_core::tailnet::messages::update_agent(
+            &route.route.host,
+            node_name,
+        ));
+        false
+    });
+    for entry in serve_entries.iter_mut() {
+        if entry.principals.take().is_some() && entry.route.take().is_some() {
+            held_back.push(temps_core::tailnet::messages::update_agent(
+                &entry.hostname,
+                node_name,
+            ));
+        }
+    }
+    held_back
+}
+
 /// The private addresses `node_id` serves (ADR 064 D5), and why any it was
 /// given are held back.
 pub fn worker_private_routes(
@@ -722,6 +778,7 @@ pub fn worker_private_routes(
                 address_id: private.address.address_id.clone(),
                 range,
                 listener,
+                principals: private.address.principals.clone(),
             }),
         }
     }
@@ -743,6 +800,7 @@ pub fn worker_serve_entries(
     let mut held_back = Vec::new();
     for row in rows {
         let removing = row.state == STATE_REMOVING;
+        let mut principals = None;
         let route = if removing {
             None
         } else {
@@ -792,7 +850,10 @@ pub fn worker_serve_entries(
                             ));
                             None
                         }
-                        (None, Some(route)) => Some(route),
+                        (None, Some(route)) => {
+                            principals = private.address.principals.clone();
+                            Some(route)
+                        }
                     }
                 }
             }
@@ -811,6 +872,7 @@ pub fn worker_serve_entries(
                 .as_ref()
                 .and_then(|addrs| serde_json::from_value::<Vec<String>>(addrs.clone()).ok())
                 .unwrap_or_default(),
+            principals,
         });
     }
     entries.sort_by(|a, b| a.address_id.cmp(&b.address_id));
@@ -846,18 +908,20 @@ async fn build_snapshot(
     };
     // A worker in private mode (ADR 064 D5) gets the private addresses
     // recorded for it, and only while it is bound on a private address.
-    let private_listener = {
-        let row = temps_entities::node_public_ingress::Entity::find_by_id(node.id)
-            .one(state.db.as_ref())
-            .await
-            .map_err(|source| SnapshotBuildError::Database {
-                node_id: node.id,
-                operation: "load private ingress state",
-                source,
-            })?;
-        private_listener_of(row.as_ref())
-    };
-    let (private_routes, private_held_back) = if private_listener.is_some() {
+    let ingress_row = temps_entities::node_public_ingress::Entity::find_by_id(node.id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|source| SnapshotBuildError::Database {
+            node_id: node.id,
+            operation: "load private ingress state",
+            source,
+        })?;
+    let private_listener = private_listener_of(ingress_row.as_ref());
+    let tailnet_identity = reports_capability(
+        ingress_row.as_ref(),
+        temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+    );
+    let (mut private_routes, mut private_held_back) = if private_listener.is_some() {
         let policy = worker_route_policy(
             state.db.as_ref(),
             !state.request_policy_gate.supports_worker_ingress(),
@@ -886,7 +950,7 @@ async fn build_snapshot(
                 source,
             })?
     };
-    let (serve_entries, serve_held_back) = if serve_rows.is_empty() {
+    let (mut serve_entries, mut serve_held_back) = if serve_rows.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         let policy = worker_route_policy(
@@ -901,6 +965,18 @@ async fn build_snapshot(
         })?;
         worker_serve_entries(&state.peer_table, &policy, node.id, serve_rows)
     };
+    private_held_back.extend(hold_back_tailnet_users(
+        &mut private_routes,
+        &mut [],
+        tailnet_identity,
+        &node.name,
+    ));
+    serve_held_back.extend(hold_back_tailnet_users(
+        &mut Vec::new(),
+        &mut serve_entries,
+        tailnet_identity,
+        &node.name,
+    ));
     let mut public_ingress =
         if !private_routes.is_empty() && !node.public_ingress_enabled && !runs_connector {
             let hosts: std::collections::HashSet<String> = private_routes
@@ -1251,6 +1327,122 @@ pub(crate) mod tests {
     use super::*;
     use crate::route_table::BackendEntry;
     use crate::test_utils::TestDBMockOperations;
+
+    fn ingress_row(
+        listening: Option<serde_json::Value>,
+    ) -> temps_entities::node_public_ingress::Model {
+        let now = chrono::Utc::now();
+        temps_entities::node_public_ingress::Model {
+            node_id: 3,
+            listen_address: None,
+            http_port: 80,
+            https_port: 443,
+            public_address: None,
+            interfaces: None,
+            listening,
+            mode: Some("private".to_string()),
+            last_check: None,
+            private_checks: None,
+            tailscale: None,
+            checked_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn a_capability_counts_only_when_the_agent_reported_it() {
+        let cap = temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY;
+        assert!(!reports_capability(None, cap));
+        assert!(!reports_capability(Some(&ingress_row(None)), cap));
+        assert!(!reports_capability(
+            Some(&ingress_row(Some(
+                serde_json::json!({"http": "100.64.0.3:80"})
+            ))),
+            cap
+        ));
+        assert!(!reports_capability(
+            Some(&ingress_row(Some(
+                serde_json::json!({"capabilities": ["tailnet_identity.v2"]})
+            ))),
+            cap
+        ));
+        assert!(reports_capability(
+            Some(&ingress_row(Some(
+                serde_json::json!({"capabilities": [cap]})
+            ))),
+            cap
+        ));
+    }
+
+    fn held_route(host: &str) -> RouteEntryDto {
+        RouteEntryDto {
+            host: host.to_string(),
+            backends: Vec::new(),
+            deployment_id: None,
+            project_id: None,
+            environment_id: None,
+        }
+    }
+
+    /// ADR 065 D6: an agent that cannot check who a visitor is never gets a
+    /// `tailnet_users` address; everything else it serves is unchanged.
+    #[test]
+    fn tailnet_users_addresses_are_held_back_from_agents_without_identity() {
+        let alice = vec![
+            temps_core::tailnet::TailnetPrincipal::parse("alice@example.com").expect("a login"),
+        ];
+        let private = |host: &str, principals: Option<Vec<_>>| PrivateRouteEntryDto {
+            route: held_route(host),
+            address_id: "custom:1".to_string(),
+            range: "100.64.0.0/10".to_string(),
+            listener: "100.64.0.3".to_string(),
+            principals,
+        };
+        let serve = |host: &str, principals: Option<Vec<_>>| ServeEntryDto {
+            entry_id: 1,
+            address_id: "custom:2".to_string(),
+            hostname: host.to_string(),
+            via: "tailscale_serve".to_string(),
+            service: None,
+            removing: false,
+            applied_etag: None,
+            route: Some(held_route(host)),
+            addrs: Vec::new(),
+            principals,
+        };
+        let routes = || {
+            vec![
+                private("range.example.test", None),
+                private("users.example.test", Some(alice.clone())),
+                private("nobody.example.test", Some(Vec::new())),
+            ]
+        };
+        let entries = || {
+            vec![
+                serve("homelab.example.ts.net", None),
+                serve("users.example.ts.net", Some(alice.clone())),
+            ]
+        };
+
+        let (mut kept, mut served) = (routes(), entries());
+        assert!(hold_back_tailnet_users(&mut kept, &mut served, true, "homelab").is_empty());
+        assert_eq!(kept, routes());
+        assert_eq!(served, entries());
+
+        let (mut kept, mut served) = (routes(), entries());
+        let why = hold_back_tailnet_users(&mut kept, &mut served, false, "homelab");
+        assert_eq!(kept, vec![private("range.example.test", None)]);
+        assert_eq!(served[0], serve("homelab.example.ts.net", None));
+        assert_eq!(served[1].route, None);
+        assert_eq!(served[1].principals, None);
+        assert_eq!(why.len(), 3);
+        assert!(
+            why.iter()
+                .all(|w| w.contains("update the agent on `homelab`")),
+            "{why:?}"
+        );
+    }
 
     pub(crate) fn test_node(public_ingress_enabled: bool) -> nodes::Model {
         let now = chrono::Utc::now();

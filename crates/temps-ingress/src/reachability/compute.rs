@@ -80,6 +80,10 @@ pub struct PrivateFacts {
     pub inside: Option<InsideCheck>,
     /// For an address served through tailscaled (ADR 065 D5).
     pub tailnet: Option<TailnetFacts>,
+    /// For `tailnet_users` (ADR 065 D6): why the worker cannot serve it to
+    /// the people listed (nobody is, or its agent cannot check who they
+    /// are). `None` when it can, and for every other audience.
+    pub tailnet_users: Option<String>,
 }
 
 /// What the control plane knows of a tailnet name's worker and its Serve
@@ -264,8 +268,24 @@ pub fn address_reachability(
             Some(ReachAction::new(ActionKind::Deploy, "Deploy it")),
         );
     }
-    if input.audience == Audience::Private {
-        return private_reachability(facts, environment_name);
+    if input.audience.is_private() {
+        let judged = private_reachability(facts, environment_name);
+        // ADR 065 D6: a worker that cannot tell who a visitor is is never
+        // sent the address, so nobody can open it there.
+        if input.audience == Audience::TailnetUsers && judged.state != ReachState::NotReachable {
+            if let Some(why) = facts.private.as_ref().and_then(|p| p.tailnet_users.clone()) {
+                return AddressReachability {
+                    state: ReachState::NotReachable,
+                    reason: why,
+                    action: Some(
+                        ReachAction::new(ActionKind::OpenIngress, "Open the worker")
+                            .with_href("/settings/nodes"),
+                    ),
+                    ..judged
+                };
+            }
+        }
+        return judged;
     }
 
     let mut tunnel_reason = None;
@@ -1047,6 +1067,9 @@ pub fn summary(
                 format!("Private at {} ({network})", address.address)
             }
             (Audience::Private, None) => format!("Private at {}", address.address),
+            (Audience::TailnetUsers, _) => {
+                format!("Only for listed tailnet users at {}", address.address)
+            }
             _ => format!("Public at {}", address.address),
         };
     }
@@ -1118,7 +1141,10 @@ mod tests {
     /// nobody, and the verdict says so instead of judging a public way in.
     #[test]
     fn an_audience_this_version_cannot_serve_is_not_reachable() {
-        for (stored, words) in [("signed_in", "sign in"), ("tailnet_users", "newer version")] {
+        for (stored, words) in [
+            ("signed_in", "sign in"),
+            ("a_future_audience", "newer version"),
+        ] {
             let mut facts = facts("app.example.com", Resolution::Ips(vec![ip("203.0.113.10")]));
             facts.input.audience = Audience::parse(stored);
             let verdict = address_reachability(&facts, &[control_plane()], true, "production");
@@ -1129,7 +1155,9 @@ mod tests {
                 verdict.reason
             );
         }
-        assert_eq!(Audience::parse("tailnet_users"), Audience::Unsupported);
+        assert_eq!(Audience::parse("tailnet_users"), Audience::TailnetUsers);
+        assert!(Audience::TailnetUsers.is_served());
+        assert_eq!(Audience::parse("tailnet-users"), Audience::Unsupported);
         assert_eq!(Audience::parse("private"), Audience::Private);
         assert!(!Audience::Unsupported.is_served());
     }
@@ -1367,6 +1395,7 @@ mod tests {
             resolution,
             temps_managed_dns: true,
             private: Some(PrivateFacts {
+                tailnet_users: None,
                 worker: "homelab".into(),
                 bound,
                 tailscale: true,
@@ -1531,6 +1560,7 @@ mod tests {
             resolution,
             temps_managed_dns: false,
             private: Some(PrivateFacts {
+                tailnet_users: None,
                 worker: "homelab".into(),
                 bound: Ok(()),
                 tailscale: true,

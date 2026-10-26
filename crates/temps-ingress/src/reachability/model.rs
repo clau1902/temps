@@ -19,6 +19,9 @@ pub enum Audience {
     Private,
     /// Anyone who signs in. Reserved (phase 4).
     SignedIn,
+    /// Private, and only the tailnet users and tags listed for the address
+    /// (ADR 065 D6). Served only by an agent that checks who they are.
+    TailnetUsers,
     /// A stored value this version does not know, written by a newer one.
     /// Served to nobody and never changed by a run, so a rolled-back
     /// control plane cannot widen it to a whole network (ADR 065 D6).
@@ -31,14 +34,24 @@ impl Audience {
             Audience::Public => temps_entities::audience::PUBLIC,
             Audience::Private => temps_entities::audience::PRIVATE,
             Audience::SignedIn => temps_entities::audience::SIGNED_IN,
+            Audience::TailnetUsers => temps_entities::audience::TAILNET_USERS,
             Audience::Unsupported => "unsupported",
         }
+    }
+
+    /// Served only on private ways in (ADR 064 D5): `private`, and
+    /// `tailnet_users`, which is private and narrower.
+    pub fn is_private(self) -> bool {
+        matches!(self, Audience::Private | Audience::TailnetUsers)
     }
 
     /// Whether this version can serve the audience (`signed_in` arrives in
     /// phase 4). Anything else is served to nobody.
     pub fn is_served(self) -> bool {
-        matches!(self, Audience::Public | Audience::Private)
+        matches!(
+            self,
+            Audience::Public | Audience::Private | Audience::TailnetUsers
+        )
     }
 
     /// The stored value. An unknown one is [`Audience::Unsupported`], never
@@ -49,6 +62,7 @@ impl Audience {
             temps_entities::audience::PUBLIC => Audience::Public,
             temps_entities::audience::PRIVATE => Audience::Private,
             temps_entities::audience::SIGNED_IN => Audience::SignedIn,
+            temps_entities::audience::TAILNET_USERS => Audience::TailnetUsers,
             _ => Audience::Unsupported,
         }
     }
@@ -179,6 +193,10 @@ pub struct PlanRequest {
     pub audience: Audience,
     /// The hostname to make reachable; Temps suggests one without it.
     pub address: Option<String>,
+    /// For `tailnet_users`: the tailnet logins and tags it admits (ADR 065
+    /// D6). At least one; checked and lower-cased.
+    #[serde(default)]
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
 }
 
 /// One way to make the address reachable.
@@ -335,6 +353,10 @@ pub struct ReachabilityPlan {
     pub options: Vec<PlanOption>,
     /// Set when `options` is empty.
     pub blocked: Option<PlanBlocked>,
+    /// For `tailnet_users`: who the address will admit, as the plan was
+    /// made for them (ADR 065 D6). Apply sets exactly this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
 }
 
 /// `POST …/reachability/apply`.
@@ -641,6 +663,10 @@ pub struct AddressAudience {
     /// For `tailscale_service`: the `svc:` name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_service: Option<String>,
+    /// For `tailnet_users`: who it admits (ADR 065 D6), normalized. Undo
+    /// puts the earlier list back with the audience.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
 }
 
 impl AddressAudience {
@@ -650,7 +676,11 @@ impl AddressAudience {
 
     /// Served through tailscaled (ADR 065 D1), not a listener.
     pub fn on_tailscale(&self) -> bool {
-        self.audience == Audience::Private && self.private_via.is_some()
+        self.audience.is_private()
+            && self.private_via.as_deref().is_some_and(|via| {
+                via == temps_entities::audience::via::TAILSCALE_SERVE
+                    || via == temps_entities::audience::via::TAILSCALE_SERVICE
+            })
     }
 
     pub fn describe(&self) -> String {
@@ -660,6 +690,10 @@ impl AddressAudience {
             (Audience::Private, None) => "private".to_string(),
             (Audience::Public, _) => "public".to_string(),
             (Audience::SignedIn, _) => "for people who sign in".to_string(),
+            (Audience::TailnetUsers, _) => match self.principals.len() {
+                1 => format!("only for {}", self.principals[0].value),
+                n => format!("only for {n} tailnet users and tags"),
+            },
             (Audience::Unsupported, _) => "set by a newer version of Temps".to_string(),
         }
     }

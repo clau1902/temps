@@ -11,9 +11,12 @@ pub const PUBLIC: &str = "public";
 pub const PRIVATE: &str = "private";
 /// Anyone who signs in to Temps. Reserved for phase 4.
 pub const SIGNED_IN: &str = "signed_in";
+/// Private, and only for the tailnet logins and tags listed in
+/// `address_tailnet_principals` (ADR 065 D6).
+pub const TAILNET_USERS: &str = "tailnet_users";
 
 /// Every value the database accepts.
-pub const ALL: [&str; 3] = [PUBLIC, PRIVATE, SIGNED_IN];
+pub const ALL: [&str; 4] = [PUBLIC, PRIVATE, SIGNED_IN, TAILNET_USERS];
 
 /// Serde default for rows serialized before the column existed.
 pub fn default_audience() -> String {

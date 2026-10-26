@@ -87,6 +87,9 @@ struct SnapshotServeEntry {
     route: Option<SnapshotRoute>,
     #[serde(default)]
     addrs: Vec<String>,
+    /// ADR 065 D6: who the socket admits, for `tailnet_users`.
+    #[serde(default)]
+    principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 /// A private address for the private listener (ADR 064 D5).
@@ -97,6 +100,9 @@ struct SnapshotPrivateRoute {
     address_id: String,
     range: String,
     listener: String,
+    /// ADR 065 D6: who the listener admits, for `tailnet_users`.
+    #[serde(default)]
+    principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -366,6 +372,7 @@ impl RouteSyncClient {
                     address_id: private.address_id,
                     range: private.range,
                     listener: private.listener,
+                    principals: private.principals,
                 })
                 .collect(),
             serve_entries: body
@@ -382,6 +389,7 @@ impl RouteSyncClient {
                     applied_etag: entry.applied_etag,
                     route: entry.route.map(snapshot_route_into_entry),
                     addrs: entry.addrs,
+                    principals: entry.principals,
                 })
                 .collect(),
         };

@@ -702,13 +702,25 @@ async fn decide_reachability_conflict(
 
 /// The step-up an apply needs when its option changes an existing
 /// address's audience.
-fn audience_action(change: Option<(String, AddressAudience, Audience)>) -> Option<SensitiveAction> {
-    let (hostname, before, after) = change?;
-    (before.audience != after).then(|| SensitiveAction::ChangeAddressAudience {
-        hostname,
-        from: before.audience.as_str().to_string(),
-        to: after.as_str().to_string(),
-    })
+fn audience_action(
+    change: Option<(
+        String,
+        AddressAudience,
+        Audience,
+        Vec<temps_core::tailnet::TailnetPrincipal>,
+    )>,
+) -> Option<SensitiveAction> {
+    let (hostname, before, after, principals) = change?;
+    if before.audience != after {
+        return Some(SensitiveAction::ChangeAddressAudience {
+            hostname,
+            from: before.audience.as_str().to_string(),
+            to: after.as_str().to_string(),
+        });
+    }
+    // ADR 065 D6: editing who a `tailnet_users` address admits.
+    (after == Audience::TailnetUsers && before.principals != principals)
+        .then_some(SensitiveAction::ChangeTailnetPrincipals { hostname })
 }
 
 /// The step-up an undo needs when it puts an address back to another
@@ -729,6 +741,16 @@ fn undo_audience_action(pending: &[RunResource]) -> Option<SensitiveAction> {
                 hostname: hostname.clone(),
                 from: after.audience.as_str().to_string(),
                 to: before.audience.as_str().to_string(),
+            })
+        }
+        // ADR 065 D6: undo puts an earlier list back.
+        RunResource::AddressAudience {
+            hostname,
+            before,
+            after,
+        } if before.audience == Audience::TailnetUsers && before.principals != after.principals => {
+            Some(SensitiveAction::ChangeTailnetPrincipals {
+                hostname: hostname.clone(),
             })
         }
         _ => None,
@@ -809,4 +831,77 @@ async fn get_certificate_methods(
     Ok(Json(CertificateMethods {
         http01_available: state.service.http01_available().await?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temps_core::tailnet::TailnetPrincipal;
+
+    fn users(values: &[&str]) -> AddressAudience {
+        AddressAudience {
+            audience: Audience::TailnetUsers,
+            private_via: Some("tailscale_serve".into()),
+            principals: values
+                .iter()
+                .map(|v| TailnetPrincipal::parse(v).unwrap())
+                .collect(),
+            ..AddressAudience::default()
+        }
+    }
+
+    #[test]
+    fn editing_who_a_tailnet_users_address_admits_needs_step_up() {
+        let host = "homelab.example.ts.net".to_string();
+        let before = users(&["alice@example.com"]);
+        let wider = users(&["alice@example.com", "bob@example.com"]).principals;
+        assert_eq!(
+            audience_action(Some((
+                host.clone(),
+                before.clone(),
+                Audience::TailnetUsers,
+                wider
+            ))),
+            Some(SensitiveAction::ChangeTailnetPrincipals {
+                hostname: host.clone()
+            })
+        );
+        // The same list again changes nothing.
+        assert_eq!(
+            audience_action(Some((
+                host.clone(),
+                before.clone(),
+                Audience::TailnetUsers,
+                before.principals.clone()
+            ))),
+            None
+        );
+        // Another audience is the audience change it always was.
+        assert!(matches!(
+            audience_action(Some((host, before, Audience::Private, Vec::new()))),
+            Some(SensitiveAction::ChangeAddressAudience { ref from, ref to, .. })
+                if from == "tailnet_users" && to == "private"
+        ));
+    }
+
+    #[test]
+    fn undo_putting_an_earlier_list_back_needs_step_up() {
+        let pending = vec![RunResource::AddressAudience {
+            hostname: "homelab.example.ts.net".into(),
+            before: users(&["alice@example.com", "bob@example.com"]),
+            after: users(&["alice@example.com"]),
+        }];
+        assert_eq!(
+            undo_audience_action(&pending),
+            Some(SensitiveAction::ChangeTailnetPrincipals {
+                hostname: "homelab.example.ts.net".into()
+            })
+        );
+        let unchanged = vec![RunResource::AddressAudience {
+            hostname: "homelab.example.ts.net".into(),
+            before: users(&["alice@example.com"]),
+            after: users(&["alice@example.com"]),
+        }];
+        assert_eq!(undo_audience_action(&unchanged), None);
+    }
 }

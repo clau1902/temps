@@ -26,6 +26,7 @@ import {
   reachabilityHeadline,
   audienceLabel,
   privateDnsWarning,
+  parsePrincipals,
   wayInLabel,
 } from './reachability'
 
@@ -571,5 +572,41 @@ describe('plan for the typed address', () => {
         placeholder: true,
       })
     ).toBe(false)
+  })
+})
+
+describe('tailnet users (ADR 065 D6)', () => {
+  test('logins and tags are split, lower-cased, sorted and deduplicated', () => {
+    expect(
+      parsePrincipals(
+        'Bob@Example.com, tag:CI\nalice@example.com  bob@example.com'
+      )
+    ).toEqual({
+      principals: [
+        { kind: 'login', value: 'alice@example.com' },
+        { kind: 'login', value: 'bob@example.com' },
+        { kind: 'tag', value: 'tag:ci' },
+      ],
+      invalid: [],
+    })
+  })
+
+  test('what is neither a login nor a tag is reported, never guessed', () => {
+    expect(
+      parsePrincipals('alice, tag:, tag:-x, tag:a_b, @example.com, a@')
+    ).toEqual({
+      principals: [],
+      invalid: ['alice', 'tag:', 'tag:-x', 'tag:a_b', '@example.com', 'a@'],
+    })
+  })
+
+  test('nothing typed is an empty list', () => {
+    expect(parsePrincipals('  \n ,')).toEqual({ principals: [], invalid: [] })
+  })
+
+  test('the label names who it is for', () => {
+    expect(audienceLabel({ audience: 'tailnet_users', network: null })).toBe(
+      'Listed tailnet users'
+    )
   })
 })

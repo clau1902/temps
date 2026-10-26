@@ -21,6 +21,8 @@ const MAX_INTERFACES: usize = 64;
 const MAX_PRIVATE_CHECKS: usize = 256;
 /// Most Serve entry reports and tailnet checks kept from one report (ADR 065).
 const MAX_SERVE_ENTRIES: usize = 256;
+/// Most capabilities one report may name (ADR 065 D6).
+const MAX_CAPABILITIES: usize = 16;
 
 fn clip(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
@@ -172,10 +174,28 @@ impl<'a> PublicIngressStore<'a> {
                     }))
                     .collect::<Vec<_>>())
             });
+        // ADR 065 D6: what the agent enforces decides which routes it gets,
+        // so a change rebuilds its snapshot.
+        let mut capabilities: Vec<String> = report
+            .capabilities
+            .iter()
+            .take(MAX_CAPABILITIES)
+            .map(|c| c.chars().take(64).collect())
+            .collect();
+        capabilities.sort();
+        capabilities.dedup();
+        let capabilities_before: Vec<String> = node_public_ingress::Entity::find_by_id(node_id)
+            .one(self.db)
+            .await?
+            .and_then(|row| row.listening)
+            .and_then(|l| l.get("capabilities").cloned())
+            .and_then(|c| serde_json::from_value(c).ok())
+            .unwrap_or_default();
         let listening = serde_json::json!({
             "http": clip(report.http, 64),
             "https": clip(report.https, 64),
             "error": clip(report.error, 1000),
+            "capabilities": capabilities,
         });
         let row = node_public_ingress::ActiveModel {
             node_id: Set(node_id),
@@ -208,12 +228,14 @@ impl<'a> PublicIngressStore<'a> {
             )
             .exec(self.db)
             .await?;
+        let mut changed = capabilities_before != capabilities;
         if let Some(tailscale) = tailscale {
             let mut entries = tailscale.entries;
             entries.truncate(MAX_SERVE_ENTRIES);
-            if self.record_serve_reports(node_id, &entries, now).await? {
-                self.announce_change().await?;
-            }
+            changed |= self.record_serve_reports(node_id, &entries, now).await?;
+        }
+        if changed {
+            self.announce_change().await?;
         }
         Ok(())
     }

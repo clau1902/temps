@@ -67,6 +67,7 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { Textarea } from '@/components/ui/textarea'
 import {
   Select,
   SelectContent,
@@ -90,6 +91,7 @@ import {
   isActiveRun,
   missingAnswers,
   planIsCurrent,
+  parsePrincipals,
   privateDnsWarning,
   resumeNeedsTailscaleCredential,
   resumeNeedsToken,
@@ -100,8 +102,10 @@ import { cn } from '@/lib/utils'
 
 const schema = z.object({
   /** Who can open the address (ADR 064 D5). */
-  audience: z.enum(['public', 'private']),
+  audience: z.enum(['public', 'private', 'tailnet_users']),
   address: z.string().trim(),
+  /** For `tailnet_users`: logins and tags, as typed (ADR 065 D6). */
+  principals: z.string(),
   option: z.string().min(1, 'Pick a way in.'),
   values: z.record(z.string(), z.string()),
   /** The user accepted the option's `confirmation`. */
@@ -135,6 +139,7 @@ export function MakeReachableDialog({
     defaultValues: {
       audience: 'public',
       address: '',
+      principals: '',
       option: '',
       values: {},
       confirmed: false,
@@ -145,12 +150,19 @@ export function MakeReachableDialog({
   const chosen = useWatch({ control: form.control, name: 'option' })
   const answers = useWatch({ control: form.control, name: 'values' })
   const audience = useWatch({ control: form.control, name: 'audience' })
+  const typedPrincipals = useWatch({
+    control: form.control,
+    name: 'principals',
+  })
+  const listed = parsePrincipals(useDebounce(typedPrincipals, 500))
+  const principals = audience === 'tailnet_users' ? listed.principals : []
   const planKey = [
     'reachabilityPlan',
     projectId,
     environmentId,
     audience,
     requested,
+    principals.map((p) => p.value).join(','),
   ]
 
   // A run already going on this environment is picked up, not duplicated.
@@ -180,7 +192,11 @@ export function MakeReachableDialog({
     queryFn: async ({ signal }) => {
       const { data } = await planEnvironmentReachability({
         path,
-        body: { audience, address: requested || null },
+        body: {
+          audience,
+          address: requested || null,
+          ...(audience === 'tailnet_users' ? { principals } : {}),
+        },
         signal,
         throwOnError: true,
       })
@@ -288,6 +304,25 @@ export function MakeReachableDialog({
         message: `Still needed: ${missing.join(', ')}.`,
       })
       return
+    }
+    if (values.audience === 'tailnet_users') {
+      // Apply only the list the user sees: nothing they typed is dropped,
+      // and the plan was made for exactly this list.
+      const typed = parsePrincipals(values.principals)
+      if (typed.invalid.length > 0) {
+        form.setError('values', {
+          message: `Not a login or a tag: ${typed.invalid.join(', ')}.`,
+        })
+        return
+      }
+      const key = (list: { kind: string; value: string }[]) =>
+        list.map((p) => `${p.kind}:${p.value}`).join(',')
+      if (key(typed.principals) !== key(plan.data?.principals ?? [])) {
+        form.setError('values', {
+          message: 'The plan is still being worked out. Try again in a moment.',
+        })
+        return
+      }
     }
     const planId = planCurrent ? plan.data?.plan_id : undefined
     if (!planId) {
@@ -424,7 +459,7 @@ export function MakeReachableDialog({
                             form.setValue('option', '')
                             form.setValue('confirmed', false)
                           }}
-                          className="grid gap-2 sm:grid-cols-2"
+                          className="grid gap-2 sm:grid-cols-3"
                         >
                           {AUDIENCES.map((choice) => (
                             <label
@@ -455,6 +490,35 @@ export function MakeReachableDialog({
                     </FormItem>
                   )}
                 />
+                {audience === 'tailnet_users' && (
+                  <FormField
+                    control={form.control}
+                    name="principals"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Tailnet users and tags</FormLabel>
+                        <FormControl>
+                          <Textarea
+                            autoComplete="off"
+                            rows={2}
+                            placeholder="alice@example.com, tag:ci"
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          Logins as Tailscale shows them, or a device tag such
+                          as <code>tag:server</code>, separated by commas or new
+                          lines. Everyone else on the tailnet is refused.
+                        </FormDescription>
+                        {listed.invalid.length > 0 && (
+                          <p className="text-sm text-destructive">
+                            Not a login or a tag: {listed.invalid.join(', ')}
+                          </p>
+                        )}
+                      </FormItem>
+                    )}
+                  />
+                )}
                 <FormField
                   control={form.control}
                   name="address"
@@ -608,6 +672,11 @@ const AUDIENCES = [
     value: 'private',
     label: 'Only my private network',
     help: 'Served by a worker on your tailnet or LAN, or at its own tailnet name with Tailscale Serve; nobody else can connect.',
+  },
+  {
+    value: 'tailnet_users',
+    label: 'Only these tailnet users',
+    help: 'Private on your tailnet, and admitted only for the logins and tags you list.',
   },
 ] as const
 
