@@ -2863,6 +2863,9 @@ fn ai_read_allowlist() -> Vec<String> {
         // before responding — the actual provider API key is replaced with "***".
         "get_dns_provider",
         "list_dns_providers",
+        // Cloudflare Access tokens (ADR 065 D9): the token is never returned,
+        // `api_token` is always "***".
+        "list_access_providers",
         // Domain lookups — metadata only, no signing secrets.
         "get_domain_by_host",
         "get_domain_by_id",
