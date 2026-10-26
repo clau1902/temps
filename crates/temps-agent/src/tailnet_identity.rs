@@ -54,6 +54,8 @@ pub struct Visitor {
     /// Only tags of this tailnet's own nodes: a node shared in from another
     /// tailnet has none here.
     pub tags: Vec<String>,
+    /// A tagged node shared in from another tailnet: no tag entry admits it.
+    pub shared_tagged: bool,
     /// The stable node id, to recognise the worker itself.
     pub node_id: String,
 }
@@ -167,6 +169,7 @@ impl TailnetIdentity {
             } else {
                 who.tags().iter().map(|t| t.to_ascii_lowercase()).collect()
             },
+            shared_tagged: who.shared_in() && !who.tags().is_empty(),
             node_id: who.node.stable_id.clone(),
         });
         let entry = Cached {
@@ -221,6 +224,9 @@ impl TailnetIdentity {
             Ok(Some(found)) if self.is_the_worker(visitor, Some(&found.node_id)) != Some(false) => {
                 Verdict::Refuse(messages::SELF_NOT_ADMITTED.to_string())
             }
+            Ok(Some(found)) if found.shared_tagged => {
+                Verdict::Refuse(messages::SHARED_TAGGED_NOT_ADMITTED.to_string())
+            }
             Ok(Some(found)) if found.login.is_none() && !found.tags.is_empty() => {
                 let listed = principals.iter().any(|p| p.kind == PrincipalKind::Tag);
                 if listed && tailnet::admits(principals, None, &found.tags) {
@@ -256,6 +262,8 @@ impl TailnetIdentity {
                     Verdict::Admit { login: found.login }
                 } else if let Some(login) = &found.login {
                     Verdict::Refuse(messages::user_not_allowed(login))
+                } else if found.shared_tagged {
+                    Verdict::Refuse(messages::SHARED_TAGGED_NOT_ADMITTED.to_string())
                 } else {
                     Verdict::Refuse(messages::tagged_not_allowed(&found.tags))
                 }
@@ -551,16 +559,18 @@ mod tests {
         let (_dir, identity, _) =
             identity_with(&[("100.64.0.20", shared_tagged), ("100.64.0.21", shared_user)]).await;
         let principals = list(&["tag:ci", "carol@example.org"]);
-        assert!(matches!(
+        // Refused with why, not with advice to list a tag that cannot work.
+        let shared = Verdict::Refuse(messages::SHARED_TAGGED_NOT_ADMITTED.to_string());
+        assert_eq!(
             identity.admit_peer(&principals, ip("100.64.0.20")).await,
-            Verdict::Refuse(_)
-        ));
-        assert!(matches!(
+            shared
+        );
+        assert_eq!(
             identity
                 .admit_serve(&principals, None, ip("100.64.0.20"))
                 .await,
-            Verdict::Refuse(_)
-        ));
+            shared
+        );
         assert_eq!(
             identity.admit_peer(&principals, ip("100.64.0.21")).await,
             Verdict::Admit {

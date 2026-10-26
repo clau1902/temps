@@ -500,6 +500,12 @@ pub mod messages {
     pub const SELF_NOT_ADMITTED: &str = "This app admits only listed tailnet users, and this \
          request came from the worker that serves it, which is not a tailnet user.";
 
+    /// A tagged device shared in from another tailnet: its tags are named by
+    /// that tailnet's admins, so no tag entry here can admit it.
+    pub const SHARED_TAGGED_NOT_ADMITTED: &str = "This app admits only listed tailnet users, \
+         and devices shared in from another tailnet are not admitted by tag. Use a device \
+         signed in as a listed user instead.";
+
     /// A route held back from an agent without `tailnet_identity.v1`.
     pub fn update_agent(host: &str, node: &str) -> String {
         format!(
