@@ -763,6 +763,10 @@ pub(crate) mod fake {
         pub writes: u32,
         /// Answer every call with this body instead.
         pub garbage: Option<String>,
+        /// What another writer sets `AdvertiseServices` to right after each
+        /// prefs write, one per write, oldest first.
+        pub advertise_after_write: std::collections::VecDeque<Value>,
+        pub prefs_writes: u32,
     }
 
     pub type Shared = Arc<parking_lot::Mutex<FakeState>>;
@@ -859,8 +863,13 @@ pub(crate) mod fake {
         let mut state = state.lock();
         if body["AdvertiseServicesSet"] == Value::Bool(true) {
             state.prefs["AdvertiseServices"] = body["AdvertiseServices"].clone();
+            state.prefs_writes += 1;
         }
-        axum::Json(state.prefs.clone()).into_response()
+        let answer = axum::Json(state.prefs.clone()).into_response();
+        if let Some(other) = state.advertise_after_write.pop_front() {
+            state.prefs["AdvertiseServices"] = other;
+        }
+        answer
     }
 
     async fn whois(

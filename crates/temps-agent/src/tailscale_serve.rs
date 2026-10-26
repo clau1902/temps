@@ -51,6 +51,11 @@ const MAX_WRITE_ATTEMPTS: usize = 3;
 /// Most entries applied on one worker.
 const MAX_ENTRIES: usize = 256;
 
+/// Every write this agent makes to `AdvertiseServices` holds this lock, so
+/// two of its own writers can never lose each other's update. Prefs have no
+/// `Etag`, so it cannot stop another tool's write landing in between.
+static ADVERTISE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Asks MagicDNS for a name.
 #[async_trait]
 pub trait MagicDns: Send + Sync {
@@ -128,6 +133,26 @@ fn service_key(name: &str) -> String {
     } else {
         format!("svc:{name}")
     }
+}
+
+/// `current` with `drop` taken out and `add` appended, every other name kept
+/// in its place.
+fn merge_advertised(
+    current: &[String],
+    add: &BTreeSet<String>,
+    drop: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut next: Vec<String> = current
+        .iter()
+        .filter(|name| !drop.contains(*name))
+        .cloned()
+        .collect();
+    for service in add {
+        if !next.contains(service) {
+            next.push(service.clone());
+        }
+    }
+    next
 }
 
 struct Bound {
@@ -474,6 +499,9 @@ impl ServeManager {
             let Some(path) = self.socket_path(address_id) else {
                 continue;
             };
+            // A finished task's `Bound` must go before the replacement binds
+            // the same path: dropping it removes the socket file there.
+            self.sockets.remove(address_id);
             let socket = Arc::new(ServeSocket::new(address_id));
             let stop = Arc::new(Notify::new());
             match crate::internal_proxy::spawn_serve_socket(
@@ -629,8 +657,15 @@ impl ServeManager {
 
     /// Add the Services this worker serves to `AdvertiseServices`, and drop
     /// the ones whose last handler it removed. Every other name is kept.
-    /// Prefs have no `Etag`: a change made between this read and write is
-    /// lost, which the next pass corrects for Temps' own names.
+    ///
+    /// Prefs have no `Etag`, so this is a read-merge-write under
+    /// [`ADVERTISE_LOCK`], followed by a read back. When the read back lacks
+    /// a name this pass added, another writer overwrote the list after this
+    /// write; the list is merged again from what it now says, up to
+    /// [`MAX_WRITE_ATTEMPTS`] times. A name another writer removed is never
+    /// put back: the agent cannot tell that from a deliberate removal. What
+    /// remains is a write landing between this read and this write, which
+    /// can lose the other writer's change without leaving a trace here.
     async fn advertise(
         &self,
         api: &dyn LocalApi,
@@ -661,21 +696,29 @@ impl ServeManager {
             return;
         }
         let result = async {
-            let current = api.prefs().await?.advertise_services.unwrap_or_default();
-            let mut next: Vec<String> = current
-                .iter()
-                .filter(|name| !drop.contains(*name))
-                .cloned()
-                .collect();
-            for service in &add {
-                if !next.contains(service) {
-                    next.push(service.clone());
+            let _writer = ADVERTISE_LOCK.lock().await;
+            let mut current = api.prefs().await?.advertise_services.unwrap_or_default();
+            for _ in 0..MAX_WRITE_ATTEMPTS {
+                let next = merge_advertised(&current, &add, &drop);
+                if next == current {
+                    return Ok(());
                 }
-            }
-            if next != current {
                 api.set_advertise_services(&next).await?;
+                current = api.prefs().await?.advertise_services.unwrap_or_default();
+                if add.iter().all(|service| current.contains(service)) {
+                    return Ok(());
+                }
+                warn!(
+                    advertised = ?current,
+                    "another writer replaced AdvertiseServices after this write; merging again"
+                );
             }
-            Ok::<(), LocalApiError>(())
+            Err(LocalApiError::Transport {
+                call: "prefs write",
+                reason: format!(
+                    "AdvertiseServices kept changing; {MAX_WRITE_ATTEMPTS} writes were overwritten"
+                ),
+            })
         }
         .await;
         if let Err(error) = result {
@@ -1304,6 +1347,104 @@ mod tests {
             report.checks[0].message,
             messages::https_off("example.ts.net", "master.example.ts.net")
         );
+    }
+
+    #[tokio::test]
+    async fn a_finished_socket_task_is_replaced_and_its_socket_file_kept() {
+        use std::os::unix::fs::FileTypeExt;
+        let entries = vec![entry(1, "custom:12", "master.example.ts.net")];
+        let (mut manager, _shared, _dir) = manager(fake::running(), entries.clone()).await;
+        std::fs::create_dir_all(&manager.serve_dir).unwrap();
+        manager.bind_sockets(&entries).await;
+        let path = manager.socket_path("custom:12").expect("a socket path");
+        manager.sockets["custom:12"].task.abort();
+        while !manager.sockets["custom:12"].task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        manager.bind_sockets(&entries).await;
+
+        let bound = &manager.sockets["custom:12"];
+        assert!(!bound.task.is_finished());
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_socket()),
+            "the replacement socket file is gone"
+        );
+        tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("the replacement socket accepts connections");
+    }
+
+    fn service_entry() -> ServeEntry {
+        let mut service = entry(1, "custom:12", "myapp.example.ts.net");
+        service.via = "tailscale_service".into();
+        service.service = Some("svc:myapp".into());
+        service.addrs = vec!["100.100.50.1".into()];
+        service
+    }
+
+    /// Another writer that read the list before this write and wrote after
+    /// it drops `svc:myapp`; the read back sees that and merges again,
+    /// keeping the other writer's names.
+    #[tokio::test]
+    async fn an_advertise_overwritten_after_the_write_is_merged_again() {
+        let mut state = fake::running();
+        state.prefs["AdvertiseServices"] = serde_json::json!(["svc:someone-else"]);
+        state
+            .advertise_after_write
+            .push_back(serde_json::json!(["svc:someone-else", "svc:operator"]));
+        let (mut manager, shared, _dir) = manager(state, vec![service_entry()]).await;
+        let report = manager.pass(&input()).await;
+        assert_eq!(report.entries[0].outcome, ServeOutcome::Applied);
+        let shared = shared.lock();
+        assert_eq!(
+            shared.prefs["AdvertiseServices"],
+            serde_json::json!(["svc:someone-else", "svc:operator", "svc:myapp"])
+        );
+        assert_eq!(shared.prefs_writes, 2);
+    }
+
+    /// A list that keeps being overwritten is given up on after a bound,
+    /// reported as an error, and no name the agent did not add is removed.
+    #[tokio::test]
+    async fn an_advertise_that_keeps_being_overwritten_is_an_error() {
+        let mut state = fake::running();
+        state.prefs["AdvertiseServices"] = serde_json::json!(["svc:someone-else"]);
+        for _ in 0..MAX_WRITE_ATTEMPTS {
+            state
+                .advertise_after_write
+                .push_back(serde_json::json!(["svc:someone-else"]));
+        }
+        let (mut manager, shared, _dir) = manager(state, vec![service_entry()]).await;
+        let report = manager.pass(&input()).await;
+        assert_eq!(report.entries[0].outcome, ServeOutcome::Error);
+        let detail = report.entries[0].detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("kept changing"), "{detail}");
+        let shared = shared.lock();
+        assert_eq!(shared.prefs_writes, MAX_WRITE_ATTEMPTS as u32);
+        assert_eq!(
+            shared.prefs["AdvertiseServices"],
+            serde_json::json!(["svc:someone-else"])
+        );
+    }
+
+    /// A name another writer removed after this write is not put back.
+    #[tokio::test]
+    async fn a_name_another_writer_removed_is_not_put_back() {
+        let mut state = fake::running();
+        state.prefs["AdvertiseServices"] = serde_json::json!(["svc:someone-else"]);
+        state
+            .advertise_after_write
+            .push_back(serde_json::json!(["svc:myapp"]));
+        let (mut manager, shared, _dir) = manager(state, vec![service_entry()]).await;
+        let report = manager.pass(&input()).await;
+        assert_eq!(report.entries[0].outcome, ServeOutcome::Applied);
+        let shared = shared.lock();
+        assert_eq!(
+            shared.prefs["AdvertiseServices"],
+            serde_json::json!(["svc:myapp"])
+        );
+        assert_eq!(shared.prefs_writes, 1);
     }
 
     #[tokio::test]

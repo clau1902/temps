@@ -978,10 +978,24 @@ or depart from their letter. Phase 3a:
   `unix:` proxy target. Ownership is still "a target under
   `/run/temps/serve/`" (D2).
 - **`AdvertiseServices` has no `Etag`.** The prefs endpoint takes no
-  `If-Match`, so a change another tool makes between the agent's read and
-  its write can be lost. The agent re-reads after writing and only ever
-  adds or removes its own Service names; the Serve config itself keeps the
-  `Etag`/`If-Match`/412 discipline.
+  `If-Match`, so the agent cannot make its update conditional the way the
+  Serve config's `Etag`/`If-Match`/412 discipline does. What it does:
+  - Every write it makes holds one process-wide lock, so its own writers
+    never lose each other's update.
+  - It only adds the Service names it serves and removes the ones whose
+    last handler it removed. Every other name is kept where it is.
+  - It reads the list back after writing. If a name it added is missing,
+    another writer replaced the list after this write, so it merges again
+    from what the list now says, at most three times, then reports the
+    entry as an `error`. A name another writer removed is never put back,
+    because the agent cannot tell a lost update from a deliberate removal.
+
+  This does not close the race. If another tool (`tailscale set
+  --advertise-services`, say) writes between the agent's read and its
+  write, that tool's change is lost, and nothing the agent can read
+  afterwards shows that it happened. The window is one LocalAPI round trip.
+  The agent's own names come back on the next pass; an operator's change
+  lost in that window has to be made again.
 - **A changed `Etag` on an entry already applied.** The agent re-verifies
   the handler (still its socket, no `AllowFunnel`) and reports `applied`
   with the new `Etag`, rather than treating any foreign write elsewhere in
