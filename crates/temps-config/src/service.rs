@@ -6664,6 +6664,8 @@ mod tests {
                 private_range: None,
                 private_node_id: None,
                 private_listener: None,
+                private_via: None,
+                private_service: None,
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
@@ -6685,6 +6687,8 @@ mod tests {
                 private_range: None,
                 private_node_id: None,
                 private_listener: None,
+                private_via: None,
+                private_service: None,
                 generated_by_connector_id: None,
             }]])
             .into_connection();
@@ -6720,6 +6724,8 @@ mod tests {
                     private_range: None,
                     private_node_id: None,
                     private_listener: None,
+                    private_via: None,
+                    private_service: None,
                 }]])
                 .into_connection(),
         );

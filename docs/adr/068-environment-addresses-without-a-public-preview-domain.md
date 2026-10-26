@@ -135,7 +135,10 @@ first reachable one, in this order:
 1. a custom domain;
 2. a tunnel environment host (D3);
 3. the generated preview-domain host;
-4. a private address (ADR 064 D5, ADR 065), for people on that network.
+4. a private address (ADR 064 D5, ADR 065), for people on that network:
+   any address that is not public, whatever serves it -- a private
+   listener, a tailnet name through Tailscale Serve or a Tailscale Service,
+   or a `tailnet_users` address that admits only the people listed.
 
 Every surface that means "the app's address" uses it: the header, the
 open-in-new-tab button, the deployment page, notifications, and the uptime
@@ -240,8 +243,9 @@ reachable". It is done when the preview domain is `usable` or a tunnel has
   needs a recent MFA verification, and the confirmation is bound to the
   exact list of hosts that was shown.
 - A tunnel environment host is public. Turning it on for an environment whose
-  addresses are `private` or `signed_in` (ADR 064, ADR 065) is refused: those
-  audiences are set per address, and a generated host must not widen them.
+  addresses are not public -- `private` (including tailnet names), `signed_in`
+  or `tailnet_users` (ADR 064, ADR 065) -- is refused: those audiences are
+  set per address, and a generated host must not widen them.
 - The D4 monitor change removes a probe; it adds no outbound request. The
   monitor probes through Temps' own proxy when it can; `no_address` is only
   recorded when there is nothing to probe: no way in was ever set up for any
@@ -370,7 +374,7 @@ or the code reads it a particular way, the choice is listed here.
   in line with the environments at the start of every reconcile, under its
   lock: every minute, and whenever the peer table changes. The endpoint and
   the plan/run step only set the flag and ask for a reconcile, and so does
-  turning an address `private` or `signed_in`, so a newly restricted
+  turning an address anything but `public`, so a newly restricted
   environment loses its public host at once. Two passes can never run at
   once. Other renames and deletions are picked up within a reconcile tick,
   not synchronously.
@@ -419,8 +423,10 @@ or the code reads it a particular way, the choice is listed here.
   where no route already claims the name. When `<label>--<service>` is longer
   than one DNS label, the shortened, hashed form is routed but not mapped
   back to its tunnel, so it is not published. This is left for a follow-up.
-- **Refusals.** An environment with any `private` or `signed_in` address
-  gets no generated host. The opt-in lists it under "Not published" with the
+- **Refusals.** An environment with any address that is not `public`
+  (`private`, including tailnet names through Serve or a Tailscale Service,
+  `signed_in`, `tailnet_users`, or an audience a newer version wrote) gets no
+  generated host. The opt-in lists it under "Not published" with the
   reason, and the D5 warning offers it no tunnel fix. Projects hosted
   elsewhere and deleted environments are refused the same way.
 - **Confirmation is bound to the list shown.** The `GET` listing carries a

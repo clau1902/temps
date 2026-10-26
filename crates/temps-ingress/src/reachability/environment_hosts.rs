@@ -39,8 +39,8 @@ pub struct EnvironmentFacts {
     /// The environment's hostname label (`environments.subdomain`).
     pub label: String,
     pub is_production: bool,
-    /// Gone, hosted elsewhere, or restricted to `private`/`signed_in`
-    /// audiences: no generated host.
+    /// Gone, hosted elsewhere, or restricted to a non-public audience
+    /// (`private`, `signed_in`, `tailnet_users`): no generated host.
     pub excluded: Option<Exclusion>,
 }
 
@@ -49,8 +49,10 @@ pub struct EnvironmentFacts {
 pub enum Exclusion {
     Deleted,
     HostedElsewhere,
-    /// Its addresses are `private` or `signed_in` (ADR 064, ADR 065): a
-    /// public tunnel host would widen who can reach it, so it is refused.
+    /// An address of it is not public: `private` (a listener, a tailnet name
+    /// through Serve or a Tailscale Service), `signed_in` or `tailnet_users`
+    /// (ADR 064, ADR 065). A public tunnel host would widen who can reach
+    /// it, so it is refused.
     Restricted,
 }
 
@@ -60,11 +62,27 @@ impl Exclusion {
             Exclusion::Deleted => "the environment was deleted",
             Exclusion::HostedElsewhere => "the project is hosted elsewhere",
             Exclusion::Restricted => {
-                "its addresses are private or for signed-in people; a public tunnel host would \
-                 widen who can reach it"
+                "its addresses are private, for signed-in people or for listed tailnet users; a \
+                 public tunnel host would widen who can reach it"
             }
         }
     }
+}
+
+/// The environments any of whose own addresses (`environment_domains`
+/// rows Temps did not generate, and custom domains) is not public.
+fn restricted_environments<'a>(
+    own: impl Iterator<Item = (i32, &'a str, bool)>,
+    custom: impl Iterator<Item = (i32, &'a str)>,
+) -> HashSet<i32> {
+    own.filter(|(_, audience, generated)| !generated && *audience != PUBLIC)
+        .map(|(environment_id, _, _)| environment_id)
+        .chain(
+            custom
+                .filter(|(_, audience)| *audience != PUBLIC)
+                .map(|(environment_id, _)| environment_id),
+        )
+        .collect()
 }
 
 /// A generated `environment_domains` row.
@@ -552,21 +570,19 @@ impl EnvironmentHostService {
             .collect();
         rows.sort_by_key(|r| r.id);
         let holder = holders(&rows);
-        let restricted: HashSet<i32> = all_rows
-            .iter()
-            .filter(|r| r.generated_by_connector_id.is_none() && r.audience != PUBLIC)
-            .map(|r| r.environment_id)
-            .collect();
         let custom = project_custom_domains::Entity::find().all(db).await?;
-        let restricted: HashSet<i32> = restricted
-            .into_iter()
-            .chain(
-                custom
-                    .iter()
-                    .filter(|d| d.audience != PUBLIC)
-                    .map(|d| d.environment_id),
-            )
-            .collect();
+        let restricted = restricted_environments(
+            all_rows.iter().map(|r| {
+                (
+                    r.environment_id,
+                    r.audience.as_str(),
+                    r.generated_by_connector_id.is_some(),
+                )
+            }),
+            custom
+                .iter()
+                .map(|d| (d.environment_id, d.audience.as_str())),
+        );
         let mut taken: HashSet<String> = all_rows
             .iter()
             .filter(|r| r.generated_by_connector_id != Some(connector.id))
@@ -1301,6 +1317,26 @@ mod tests {
     }
 
     #[test]
+    fn any_non_public_address_keeps_the_environment_off_the_tunnel() {
+        let restricted = restricted_environments(
+            [
+                // A tailnet name for listed people only (ADR 065 D6).
+                (1, "tailnet_users", false),
+                // A tailnet name through Serve is `private`.
+                (2, "private", false),
+                (3, "public", false),
+                // Temps' own generated row says nothing about the audience.
+                (4, "public", true),
+                (5, "signed_in", false),
+                (6, "unsupported", false),
+            ]
+            .into_iter(),
+            [(7, "tailnet_users"), (8, "public")].into_iter(),
+        );
+        assert_eq!(restricted, HashSet::from([1, 2, 5, 6, 7]));
+    }
+
+    #[test]
     fn a_usable_preview_domain_keeps_existing_hosts_and_stops_new_ones() {
         let envs = [env(1, "shop-production"), env(2, "shop-staging")];
         let rows = [row(10, 1, "shop-production.t.example.com")];
@@ -1522,6 +1558,8 @@ mod tests {
             private_node_id: None,
             private_listener: None,
             generated_by_connector_id: None,
+            private_via: None,
+            private_service: None,
         };
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
             .append_query_results([Vec::<project_custom_domains::Model>::new()])

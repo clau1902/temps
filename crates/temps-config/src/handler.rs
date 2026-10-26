@@ -4511,6 +4511,8 @@ mod tests {
                 private_range: None,
                 private_node_id: None,
                 private_listener: None,
+                private_via: None,
+                private_service: None,
                 generated_by_connector_id: None,
             }]]);
         let svc = ingress_config_service(db);

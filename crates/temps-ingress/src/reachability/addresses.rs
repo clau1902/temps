@@ -21,9 +21,12 @@ pub const PREVIEW_DOMAIN_SETTINGS_PATH: &str = "/settings#preview-domain";
 /// What a worker runs to take public traffic, with Temps choosing how.
 pub const WORKER_INGRESS_COMMAND: &str = "temps agent ingress delegated";
 
-/// D4's rank of an address: lower is better.
+/// D4's rank of an address: lower is better. Anything not for the public
+/// is a private address, whatever serves it: a listener, a tailnet name
+/// through Serve or a Tailscale Service (ADR 065), or a `tailnet_users`
+/// address that admits only the people listed.
 pub(super) fn rank(address: &AddressReachability) -> u8 {
-    if address.audience == Audience::Private {
+    if address.audience != Audience::Public {
         return 3;
     }
     match address.source {
@@ -339,8 +342,21 @@ mod tests {
 
         // An unreachable custom domain never wins over a reachable host.
         let down = public("down.example.org", CustomDomain, NotReachable);
-        let primary = primary_address(&[down, generated]).expect("primary");
+        let primary = primary_address(&[down, generated.clone()]).expect("primary");
         assert_eq!(primary.address, "app-production.example.dev");
+
+        // A tailnet name for listed people only is a private address too
+        // (ADR 065 D6): it never outranks a public one.
+        let tailnet_users = address(
+            "app.tail.ts.net",
+            EnvironmentDomain,
+            Audience::TailnetUsers,
+            Reachable,
+        );
+        let primary = primary_address(&[tailnet_users.clone(), generated]).expect("primary");
+        assert_eq!(primary.address, "app-production.example.dev");
+        let primary = primary_address(&[tailnet_users]).expect("primary");
+        assert_eq!(primary.kind, AddressKind::Private);
     }
 
     #[test]

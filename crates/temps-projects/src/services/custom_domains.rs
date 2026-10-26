@@ -1344,6 +1344,8 @@ mod tests {
             private_node_id: None,
             private_listener: None,
             generated_by_connector_id: generated,
+            private_via: None,
+            private_service: None,
         }
     }
 

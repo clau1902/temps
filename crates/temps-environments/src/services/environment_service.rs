@@ -2370,6 +2370,8 @@ mod tests {
             private_node_id: None,
             private_listener: None,
             generated_by_connector_id: Some(4),
+            private_via: None,
+            private_service: None,
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![env.clone()]])
@@ -2796,6 +2798,8 @@ mod tests {
             private_range: None,
             private_node_id: None,
             private_listener: None,
+            private_via: None,
+            private_service: None,
             generated_by_connector_id: None,
         };
         let db = Arc::new(
