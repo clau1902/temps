@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#[allow(clippy::module_inception)]
-pub mod captcha;
 pub mod gate;
 #[allow(clippy::module_inception)]
 pub mod handler;
