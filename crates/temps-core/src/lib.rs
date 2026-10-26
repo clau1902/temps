@@ -244,7 +244,8 @@ pub mod drop_entries;
 /// never calls. Likewise `bincode` (RUSTSEC-2025-0141) is ignored only
 /// because the microsandbox SDK requires it. An ignore covers the whole
 /// advisory, so it would also hide anything else starting to depend on these
-/// crates; these tests fail on that instead. `Cargo.lock` is embedded at
+/// crates; these tests fail on that instead. `ttf-parser` (RUSTSEC-2026-0192)
+/// is not ignored at all: it is kept out of the lockfile entirely. `Cargo.lock` is embedded at
 /// compile time, so they also run from prebuilt nextest archives.
 #[cfg(test)]
 mod unmaintained_dependency_guard_tests {
@@ -328,6 +329,18 @@ mod unmaintained_dependency_guard_tests {
             "{unexpected:?} depend on bincode, which is unmaintained (RUSTSEC-2025-0141). \
              The dependency-scan.yml exception only covers the microsandbox SDK's crates; \
              use postcard or serde_json instead of adding a new bincode user."
+        );
+    }
+
+    #[test]
+    fn workspace_does_not_depend_on_unmaintained_ttf_parser() {
+        let dependents = dependents_of(CARGO_LOCK, "ttf-parser");
+        assert!(
+            dependents.is_empty(),
+            "{dependents:?} depend on ttf-parser, which is unmaintained (RUSTSEC-2026-0192). \
+             lopdf 0.42 required it; lopdf 0.46+ only uses the maintained skrifa behind its \
+             `font_embedding` feature. PDF text is read with lopdf directly in \
+             temps-ai-chat's attachments.rs, not through pdf-extract, which pins lopdf 0.42."
         );
     }
 }
