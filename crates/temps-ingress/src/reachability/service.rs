@@ -68,11 +68,12 @@ use super::plan::{
     access_choice, access_policy_answer, AccessChoice, AccessProviderFact, FIELD_ACCESS_PROVIDER,
 };
 use super::plan::{
-    address_for_audience, fingerprint, gate_allow_answer, guess_zone, http01_direct, plan,
-    planned_record, private_worker, record_type_of, records_to_read, service_of, service_tag,
-    service_worker, tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for, NamedId,
-    PlanFacts, PrivateWorkerFact, ServeEntryFact, ServiceSeen, TailnetWorkerFact,
-    TailscaleCredentialFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_TOKEN,
+    address_for_audience, environment_hosts_tunnel, fingerprint, gate_allow_answer, guess_zone,
+    http01_direct, plan, planned_record, private_worker, record_type_of, records_to_read,
+    service_of, service_tag, service_worker, tunnel_domain_for, tunnel_route, unique_tunnel_name,
+    zone_for, NamedId, PlanFacts, PrivateWorkerFact, ServeEntryFact, ServiceSeen,
+    TailnetWorkerFact, TailscaleCredentialFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER,
+    FIELD_TOKEN,
 };
 use super::run::{
     created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, worker_approval,
@@ -180,7 +181,7 @@ pub struct ReachabilityDeps {
 }
 
 pub struct ReachabilityService {
-    deps: Arc<ReachabilityDeps>,
+    pub(super) deps: Arc<ReachabilityDeps>,
     http: reqwest::Client,
     /// Tailscale's API, its access tokens in memory only (ADR 065 D2).
     tailnet: Arc<dyn TailnetApi>,
@@ -222,20 +223,23 @@ async fn load_tailscale_credential(
 }
 
 /// The environment and project a request is about.
-struct Scope {
-    project: projects::Model,
-    environment: environments::Model,
+pub(super) struct Scope {
+    pub(super) project: projects::Model,
+    pub(super) environment: environments::Model,
 }
 
 /// What the service knows about an environment's addresses.
-struct Gathered {
-    addresses: Vec<AddressInput>,
+pub(super) struct Gathered {
+    pub(super) addresses: Vec<AddressInput>,
     /// Public hostnames that reach one Compose service of the environment:
     /// its generated `<service>--<env>` names and service custom domains.
     /// Not addresses Make it reachable manages, but they open the same app.
-    service_addresses: Vec<String>,
-    running_on: Vec<String>,
-    deployed: bool,
+    pub(super) service_addresses: Vec<String>,
+    pub(super) running_on: Vec<String>,
+    /// Every container of the current deployment runs on a worker, which is
+    /// what a tunnel can carry (ADR 058).
+    pub(super) on_workers: bool,
+    pub(super) deployed: bool,
 }
 
 impl ReachabilityService {
@@ -484,7 +488,7 @@ impl ReachabilityService {
 
     // ----- scope and facts ----------------------------------------------
 
-    async fn scope(
+    pub(super) async fn scope(
         &self,
         project_id: i32,
         environment_id: i32,
@@ -512,7 +516,7 @@ impl ReachabilityService {
         })
     }
 
-    async fn settings(&self) -> Result<temps_core::AppSettings, ReachabilityError> {
+    pub(super) async fn settings(&self) -> Result<temps_core::AppSettings, ReachabilityError> {
         self.deps
             .config
             .get_settings()
@@ -523,7 +527,7 @@ impl ReachabilityService {
     /// Every address attached to the environment: the generated hostname,
     /// environment domains and custom domains (redirects and wildcards left
     /// out: nobody lands on those to use the app).
-    async fn gather(
+    pub(super) async fn gather(
         &self,
         project: &projects::Model,
         environment: &environments::Model,
@@ -587,10 +591,20 @@ impl ReachabilityService {
             .await?;
         for domain in env_domains {
             let audience = Audience::parse(&domain.audience);
+            // A label (no dot) is served under the preview domain: it is a
+            // generated host, not one the user chose (ADR 068 D4). A tunnel
+            // generated the others carrying a connector (D3).
+            let source = if domain.generated_by_connector_id.is_some() {
+                AddressSource::TunnelHost
+            } else if domain.domain.contains('.') {
+                AddressSource::EnvironmentDomain
+            } else {
+                AddressSource::Generated
+            };
             push(
                 expand(&domain.domain),
                 audience,
-                AddressSource::EnvironmentDomain,
+                source,
                 None,
                 audience.is_private().then(|| PrivateBinding {
                     address_id: private_address_id(false, domain.id),
@@ -643,6 +657,7 @@ impl ReachabilityService {
         }
 
         let mut running_on = Vec::new();
+        let mut on_workers = false;
         if let Some(deployment_id) = environment.current_deployment_id {
             let containers = deployment_containers::Entity::find()
                 .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
@@ -668,18 +683,20 @@ impl ReachabilityService {
                 });
             }
             running_on = place.into_iter().collect();
+            on_workers = !containers.is_empty() && containers.iter().all(|c| c.node_id.is_some());
         }
         Ok(Gathered {
             addresses,
             service_addresses: service_addresses.into_iter().collect(),
             running_on,
+            on_workers,
             deployed: environment.current_deployment_id.is_some(),
         })
     }
 
     /// The control plane's proxy and every worker's direct ingress, with the
     /// public addresses DNS would point at.
-    async fn directs(&self, settings: &temps_core::AppSettings) -> Vec<DirectIngress> {
+    pub(super) async fn directs(&self, settings: &temps_core::AppSettings) -> Vec<DirectIngress> {
         let mut directs = Vec::new();
         let server = self.deps.config.get_server_config();
         let takes_port_80 = server
@@ -1026,7 +1043,7 @@ impl ReachabilityService {
         }
     }
 
-    async fn judge(
+    pub(super) async fn judge(
         &self,
         addresses: &[AddressInput],
         directs: &[DirectIngress],
@@ -1204,6 +1221,7 @@ impl ReachabilityService {
         Ok(EnvironmentReachability {
             project_id,
             environment_id,
+            primary_address: super::addresses::primary_address(&addresses),
             environment_name: scope.environment.name.clone(),
             deployed: gathered.deployed,
             summary: summary(
@@ -1458,6 +1476,7 @@ impl ReachabilityService {
             },
             principals_now: Vec::new(),
             identity_workers,
+            environment_host_label: Some(self.environment_host_label(scope).await?),
         };
         let mut dns_records = Vec::new();
         let mut access_providers = Vec::new();
@@ -1532,6 +1551,17 @@ impl ReachabilityService {
             principals_now,
             ..facts
         })
+    }
+
+    /// The label a tunnel's environment hosts give `scope`'s environment
+    /// (ADR 068 D3).
+    async fn environment_host_label(&self, scope: &Scope) -> Result<String, ReachabilityError> {
+        let settings = self.settings().await?;
+        Ok(super::environment_hosts::environment_host_label(
+            &scope.project.slug,
+            &scope.environment,
+            settings.production_hostname_template.as_deref(),
+        ))
     }
 
     /// Every saved Access token, with its apps covering `host`.
@@ -2089,6 +2119,18 @@ impl ReachabilityService {
                 })?;
                 input.direct = Some((direct.name.clone(), direct.ips[0]));
                 input.dns_before = planned_record(&facts, &address, record_type_of(direct.ips[0]));
+            }
+            PlanOptionKind::TunnelEnvironmentHosts => {
+                let tunnel = environment_hosts_tunnel(&facts, &address).ok_or_else(|| {
+                    ReachabilityError::Conflict(format!(
+                        "No tunnel can give {} the address {address} any more.",
+                        scope.environment.name
+                    ))
+                })?;
+                input.tunnel = Some(NamedId {
+                    id: tunnel.id,
+                    name: tunnel.name.clone(),
+                });
             }
         }
 
@@ -2946,7 +2988,7 @@ pub async fn private_rule(
 }
 
 /// Look up `host`. `Ok(empty)` when it has no address record.
-async fn resolve(host: &str) -> Result<Vec<IpAddr>, String> {
+pub(super) async fn resolve(host: &str) -> Result<Vec<IpAddr>, String> {
     if let Some(ip) = parse_reported_ip(host) {
         return Ok(vec![ip]);
     }
@@ -3222,6 +3264,13 @@ impl RunOps for LiveOps {
             Intent::TailscaleService { .. } => {
                 return Err("Tailscale Services are looked up by their marker.".to_string())
             }
+            Intent::EnvironmentHosts { connector_id, name } => self
+                .environment_hosts(*connector_id)
+                .await?
+                .then(|| RunResource::EnvironmentHosts {
+                    connector_id: *connector_id,
+                    name: name.clone(),
+                }),
         })
     }
 
@@ -3708,6 +3757,7 @@ impl RunOps for LiveOps {
                 reason: "Not checked.".into(),
                 action: None,
                 network: None,
+                nothing_set_up: false,
             })
     }
 
@@ -3748,6 +3798,42 @@ impl RunOps for LiveOps {
             .await
             .map_err(text)?;
         txn.commit().await.map_err(text)?;
+        if audience.audience != Audience::Public {
+            // ADR 068 D3: a restricted environment loses its public tunnel
+            // host now, not at the next reconcile a minute later.
+            let connectors = self.deps.connectors.clone();
+            tokio::spawn(async move { connectors.reconcile_all().await });
+        }
+        Ok(())
+    }
+
+    async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String> {
+        Ok(ingress_connectors::Entity::find_by_id(connector_id)
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?
+            .is_some_and(|c| c.environment_hosts))
+    }
+
+    async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String> {
+        let connector = ingress_connectors::Entity::find_by_id(connector_id)
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?;
+        let Some(connector) = connector else {
+            // Gone: its generated hosts went with it.
+            return if on {
+                Err(format!("Tunnel {connector_id} no longer exists."))
+            } else {
+                Ok(())
+            };
+        };
+        super::environment_hosts::set_environment_hosts(self.deps.db.as_ref(), &connector, on)
+            .await
+            .map_err(text)?;
+        // The reconciler generates and publishes (or withdraws) the hosts.
+        let connectors = self.deps.connectors.clone();
+        tokio::spawn(async move { connectors.reconcile_all().await });
         Ok(())
     }
 

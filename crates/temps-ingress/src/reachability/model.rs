@@ -90,6 +90,8 @@ pub enum AddressSource {
     EnvironmentDomain,
     /// A project custom domain.
     CustomDomain,
+    /// The environment domain under a tunnel's zone (ADR 068 D3).
+    TunnelHost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -166,6 +168,13 @@ pub struct AddressReachability {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "Tailscale")]
     pub network: Option<String>,
+    /// ADR 068 D4: no way in was ever set up for it -- it is local-only,
+    /// for an audience routing does not serve, not deployed, or the
+    /// generated host with no DNS record and no tunnel covering it. A way
+    /// in that was set up and broke is `false`, so an outage is never read
+    /// as "nothing to check". Not part of the API.
+    #[serde(skip)]
+    pub nothing_set_up: bool,
 }
 
 /// Everything about one environment's addresses.
@@ -185,6 +194,9 @@ pub struct EnvironmentReachability {
     pub addresses: Vec<AddressReachability>,
     /// What *Make it reachable* would do, while no address is reachable.
     pub plan: Option<ReachabilityPlan>,
+    /// The address every surface means by "the app's address" (ADR 068
+    /// D4); `None` while no address is reachable.
+    pub primary_address: Option<temps_core::environment_address::PrimaryAddress>,
 }
 
 /// `POST …/reachability/plan`.
@@ -231,6 +243,9 @@ pub enum PlanOptionKind {
     TailscaleService,
     /// A Tailscale Service, after saving a pasted Tailscale OAuth client.
     TailscaleServiceWithCredential,
+    /// Turn on a tunnel's environment hosts (ADR 068 D3): every
+    /// environment, this one included, gets `<label>.<tunnel domain>`.
+    TunnelEnvironmentHosts,
 }
 
 impl PlanOptionKind {
@@ -245,6 +260,7 @@ impl PlanOptionKind {
             PlanOptionKind::TailscaleServe,
             PlanOptionKind::TailscaleService,
             PlanOptionKind::TailscaleServiceWithCredential,
+            PlanOptionKind::TunnelEnvironmentHosts,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == value)
@@ -261,6 +277,7 @@ impl PlanOptionKind {
             PlanOptionKind::TailscaleServe => "tailscale_serve",
             PlanOptionKind::TailscaleService => "tailscale_service",
             PlanOptionKind::TailscaleServiceWithCredential => "tailscale_service_with_credential",
+            PlanOptionKind::TunnelEnvironmentHosts => "tunnel_environment_hosts",
         }
     }
 }
@@ -298,6 +315,8 @@ pub enum StepKind {
     /// Waits for the tailnet admin to approve the worker as the Service's
     /// host; never approves it.
     WaitForServiceApproval,
+    /// Turns on the tunnel's environment hosts (ADR 068 D3).
+    PublishEnvironmentHosts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -666,6 +685,12 @@ pub enum RunResource {
         /// As read back once the step was done, with its addresses.
         definition: crate::tailscale::ServiceDefinition,
     },
+    /// A tunnel whose environment hosts the run turned on (ADR 068 D3):
+    /// undo turns them off, which withdraws every host it generated.
+    EnvironmentHosts {
+        connector_id: i32,
+        name: String,
+    },
 }
 
 /// The Cloudflare Access application in front of a signed-in address
@@ -867,6 +892,9 @@ impl RunResource {
             RunResource::TailscaleService { name, tailnet, .. } => {
                 format!("Tailscale Service `{name}` in {tailnet}")
             }
+            RunResource::EnvironmentHosts { name, .. } => {
+                format!("Environment addresses through tunnel {name}")
+            }
         }
     }
 }
@@ -958,6 +986,11 @@ pub enum Intent {
         name: String,
         /// `temps:<install>:<this run>`.
         marker: String,
+    },
+    /// Found by the connector's `environment_hosts` flag.
+    EnvironmentHosts {
+        connector_id: i32,
+        name: String,
     },
 }
 
@@ -1086,6 +1119,9 @@ impl Intent {
             Intent::TailscaleService { tailnet, name, .. } => {
                 format!("tailscale_service/{tailnet}/{name}")
             }
+            Intent::EnvironmentHosts { connector_id, .. } => {
+                format!("environment_hosts/{connector_id}")
+            }
         };
         format!("run-{run_id}/{what}")
     }
@@ -1124,6 +1160,9 @@ impl Intent {
             Intent::TailscaleCredential { name } => format!("Tailscale OAuth client {name}"),
             Intent::TailscaleService { name, tailnet, .. } => {
                 format!("Tailscale Service `{name}` in {tailnet}")
+            }
+            Intent::EnvironmentHosts { name, .. } => {
+                format!("Environment addresses through tunnel {name}")
             }
         }
     }

@@ -1354,6 +1354,16 @@
         ],
         "type": "object"
       },
+      "AddressKind": {
+        "description": "What kind of address the primary one is, in D4's order.",
+        "enum": [
+          "custom_domain",
+          "tunnel_host",
+          "generated",
+          "private"
+        ],
+        "type": "string"
+      },
       "AddressReachability": {
         "description": "One address of an environment and whether its audience can reach it.",
         "properties": {
@@ -1433,7 +1443,8 @@
         "enum": [
           "generated",
           "environment_domain",
-          "custom_domain"
+          "custom_domain",
+          "tunnel_host"
         ],
         "type": "string"
       },
@@ -4276,6 +4287,14 @@
               "environment": "production"
             }
           },
+          "loopback_ja4_header": {
+            "default": null,
+            "description": "The header a trusted loopback proxy puts the visitor's JA4 TLS\nfingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer\n`trust_loopback_forwarded_ip` trusts, and removed from every request\nbefore it goes upstream. `None` records no JA4 behind such a proxy.\nSet through [`normalize_loopback_ja4_header`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mcp_server": {
             "$ref": "#/components/schemas/McpServerSettings",
             "default": {
@@ -4584,6 +4603,14 @@
           },
           "letsencrypt": {
             "$ref": "#/components/schemas/LetsEncryptSettings"
+          },
+          "loopback_ja4_header": {
+            "description": "The header a trusted loopback proxy sends the visitor's JA4 in.\n`None` records no JA4 behind such a proxy.",
+            "example": "x-ja4",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mcp_server": {
             "$ref": "#/components/schemas/McpServerSettings",
@@ -12768,6 +12795,10 @@
             "format": "int32",
             "type": "integer"
           },
+          "environment_hosts": {
+            "description": "Publishes every environment as `<label>.<domain>` (ADR 068 D3).\nAt most one tunnel does.",
+            "type": "boolean"
+          },
           "external_id": {
             "type": [
               "string",
@@ -12814,6 +12845,7 @@
           "status",
           "edge_port",
           "auto_publish",
+          "environment_hosts",
           "nodes",
           "publications",
           "created_at"
@@ -19889,6 +19921,7 @@
       "DeploymentEnvironmentResponse": {
         "properties": {
           "domains": {
+            "description": "Best first: the primary address (ADR 068 D4) leads when it is known.",
             "items": {
               "type": "string"
             },
@@ -19900,6 +19933,20 @@
           },
           "name": {
             "type": "string"
+          },
+          "no_address_reason": {
+            "description": "Why nobody can reach the environment; set only when Temps is sure.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_url": {
+            "description": "The environment's primary address as a URL. `null` while it is not\nknown, or when nobody can reach the environment.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "service_urls": {
             "description": "Public URLs of this environment's Docker Compose services, one per\nconfigured public port. Empty for non-Compose projects.",
@@ -20515,6 +20562,17 @@
           "project_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "reachability_warning": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachabilityWarning",
+                "description": "ADR 068 D5: set on the environment's current, completed deployment\nwhen nobody can open it, with the fixes that fit this install. The\ndeployment itself stays successful."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "screenshot_location": {
             "type": [
@@ -25004,6 +25062,138 @@
         ],
         "type": "object"
       },
+      "EnvironmentHostRefusal": {
+        "description": "An environment the tunnel does not publish, and why.",
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "project_slug",
+          "environment_name",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "EnvironmentHostView": {
+        "description": "One environment's tunnel host, as the opt-in lists it.",
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "hostname": {
+            "description": "The host, or the one it would get.",
+            "example": "shop-production.tunnel.example.com",
+            "type": "string"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "description": "Why the host is not `<label>.<domain>`, when it is the short-hash\nname.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "state": {
+            "description": "`published`, `pending`, `error`, or `planned` before the opt-in.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "project_slug",
+          "environment_name",
+          "hostname",
+          "state"
+        ],
+        "type": "object"
+      },
+      "EnvironmentHostsResponse": {
+        "description": "`GET`/`PUT /ingress/connectors/{id}/environment-hosts`.",
+        "properties": {
+          "confirm_token": {
+            "description": "Send back as `confirm` to turn it on or off. It names exactly the\nhosts listed here, so a list that changed since it was shown is not\naccepted.",
+            "example": "3f2a9c1e0b7d4a65",
+            "type": "string"
+          },
+          "connector_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "connector_name": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "enabled_elsewhere": {
+            "description": "The tunnel that has environment hosts on instead, if another does:\nat most one may.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hosts": {
+            "description": "The hosts it publishes, or would publish once turned on.",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentHostView"
+            },
+            "type": "array"
+          },
+          "preview_domain_usable": {
+            "description": "The preview domain is usable: existing hosts stay, no new ones are\ngenerated.",
+            "type": "boolean"
+          },
+          "refused": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentHostRefusal"
+            },
+            "type": "array"
+          },
+          "warning": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "connector_name",
+          "domain",
+          "enabled",
+          "hosts",
+          "refused",
+          "preview_domain_usable",
+          "warning",
+          "confirm_token"
+        ],
+        "type": "object"
+      },
       "EnvironmentInfo": {
         "properties": {
           "current_deployment_id": {
@@ -25056,6 +25246,17 @@
               {
                 "$ref": "#/components/schemas/ReachabilityPlan",
                 "description": "What *Make it reachable* would do, while no address is reachable."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "primary_address": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PrimaryAddress",
+                "description": "The address every surface means by \"the app's address\" (ADR 068\nD4); `None` while no address is reachable."
               },
               {
                 "type": "null"
@@ -35949,6 +36150,30 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "Found by the connector's `environment_hosts` flag.",
+            "properties": {
+              "connector_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "environment_hosts"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "connector_id",
+              "name",
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -46703,7 +46928,8 @@
           "private_worker",
           "tailscale_serve",
           "tailscale_service",
-          "tailscale_service_with_credential"
+          "tailscale_service_with_credential",
+          "tunnel_environment_hosts"
         ],
         "type": "string"
       },
@@ -47329,6 +47555,50 @@
         ],
         "type": "object"
       },
+      "PreviewDomainStatus": {
+        "description": "D2: whether the preview domain can be reached at all.",
+        "enum": [
+          "local_only",
+          "unresolved",
+          "no_way_in",
+          "usable"
+        ],
+        "type": "string"
+      },
+      "PreviewDomainStatusResponse": {
+        "description": "`GET /settings/preview-domain/status` (ADR 068 D2).",
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "preview_domain": {
+            "example": "apps.example.com",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why, in words.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PreviewDomainStatus"
+          },
+          "tunnel_environment_hosts": {
+            "description": "The tunnel that gives every environment an address instead, when\none does (ADR 068 D3): apps are reachable without this domain.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "preview_domain",
+          "status",
+          "reason",
+          "checked_at"
+        ],
+        "type": "object"
+      },
       "PreviewGatewayLogsResponse": {
         "properties": {
           "lines": {
@@ -47576,6 +47846,32 @@
         },
         "required": [
           "models"
+        ],
+        "type": "object"
+      },
+      "PrimaryAddress": {
+        "description": "The address every surface means by \"the app's address\".",
+        "properties": {
+          "address": {
+            "description": "The hostname, without a scheme.",
+            "example": "myapp.example.com",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AddressKind"
+          },
+          "way_in": {
+            "description": "How traffic gets in, as ADR 064 D3 names it (`tunnel:<name>`,\n`direct:<node>`, `private:<node>`).",
+            "example": "tunnel:homelab",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "address",
+          "kind"
         ],
         "type": "object"
       },
@@ -48817,6 +49113,17 @@
           "pull_only_root_directory": {
             "description": "When true, deploy clones only `directory` via git sparse-checkout.",
             "type": "boolean"
+          },
+          "reachability_warning": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachabilityWarning",
+                "description": "ADR 068 D5: nobody can open the production environment's current\ndeployment, and how to fix it. Computed on the single-project detail\nresponses only; `null` there means there is nothing to warn about."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "repo_name": {
             "type": [
@@ -50558,6 +50865,22 @@
           "is_system_request": {
             "type": "boolean"
           },
+          "ja4": {
+            "description": "The client's JA4 TLS fingerprint, when its source gives one.",
+            "example": "t13d1516h2_8daaf6152771_e5627efa2ab1",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ja4_source": {
+            "description": "Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or\n`edge`.",
+            "example": "direct",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "method": {
             "type": "string"
           },
@@ -51952,6 +52275,62 @@
         ],
         "type": "string"
       },
+      "ReachabilityFix": {
+        "properties": {
+          "command": {
+            "description": "The command to run, when that is the fix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "connector_id": {
+            "description": "For the tunnel fix: the connector that would carry it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "hostname": {
+            "description": "For the tunnel fix: the hostname it would get.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "href": {
+            "description": "The console page that applies it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ReachabilityFixKind"
+          },
+          "label": {
+            "description": "What the button and the log line say.",
+            "example": "Publish it through tunnel 'homelab' as myapp-production.example.com",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "label"
+        ],
+        "type": "object"
+      },
+      "ReachabilityFixKind": {
+        "description": "One way to fix a [`ReachabilityWarning`], in the order D5 lists them.",
+        "enum": [
+          "tunnel_environment_hosts",
+          "preview_domain",
+          "custom_domain",
+          "worker_ingress"
+        ],
+        "type": "string"
+      },
       "ReachabilityPlan": {
         "properties": {
           "address": {
@@ -52044,6 +52423,43 @@
           "unknown"
         ],
         "type": "string"
+      },
+      "ReachabilityWarning": {
+        "description": "D5: a successful deploy nobody can open. Computed, never stored.",
+        "properties": {
+          "environment": {
+            "description": "The environment's label, as visitors would see it in a hostname.",
+            "example": "myapp-production",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "fixes": {
+            "description": "The fixes that fit this install, best first.",
+            "items": {
+              "$ref": "#/components/schemas/ReachabilityFix"
+            },
+            "type": "array"
+          },
+          "headline": {
+            "description": "`Deployed, but nobody can reach <label> yet`.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why, about the address visitors would try first.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "environment",
+          "headline",
+          "reason",
+          "fixes"
+        ],
+        "type": "object"
       },
       "ReadFileResponse": {
         "properties": {
@@ -55696,6 +56112,30 @@
               "created",
               "creator_run_id",
               "definition",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A tunnel whose environment hosts the run turned on (ADR 068 D3):\nundo turns them off, which withdraws every host it generated.",
+            "properties": {
+              "connector_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "environment_hosts"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "connector_id",
+              "name",
               "type"
             ],
             "type": "object"
@@ -60797,6 +61237,25 @@
         ],
         "type": "object"
       },
+      "SetEnvironmentHostsRequest": {
+        "description": "`PUT /ingress/connectors/{id}/environment-hosts`.",
+        "properties": {
+          "confirm": {
+            "description": "The `confirm_token` of the list that was shown and accepted: turning\non publishes every host in it, turning off withdraws them.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
       "SetFlagEnvironmentRequest": {
         "properties": {
           "enabled": {
@@ -63926,7 +64385,8 @@
           "configure_tailscale_serve",
           "save_tailscale_credential",
           "define_tailscale_service",
-          "wait_for_service_approval"
+          "wait_for_service_approval",
+          "publish_environment_hosts"
         ],
         "type": "string"
       },
@@ -107118,6 +107578,123 @@
         ]
       }
     },
+    "/ingress/connectors/{id}/environment-hosts": {
+      "get": {
+        "description": "Every environment's host under the tunnel's domain, its publication\nstate, why one got a short-hash name, and the environments it refuses\n(private, signed-in only, hosted elsewhere).",
+        "operationId": "get_connector_environment_hosts",
+        "parameters": [
+          {
+            "description": "Tunnel id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentHostsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such tunnel"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "What a tunnel publishes for environments, or would once turned on.",
+        "tags": [
+          "Reachability"
+        ]
+      },
+      "put": {
+        "description": "On publishes every listed environment as `<label>.<domain>`; off\nwithdraws every host it generated. Both need `confirm`: the\n`confirm_token` of the list from the `GET` that was shown. Turning it on\nis a sensitive action (it widens every environment to public). At most\none tunnel has it on.",
+        "operationId": "set_connector_environment_hosts",
+        "parameters": [
+          {
+            "description": "Tunnel id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetEnvironmentHostsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentHostsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not confirmed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such tunnel"
+          },
+          "409": {
+            "description": "Another tunnel publishes environment hosts, or the list changed since it was shown"
+          },
+          "428": {
+            "description": "Turning it on needs a recent MFA verification"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn a tunnel's environment hosts on or off.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
     "/ingress/connectors/{id}/links": {
       "get": {
         "description": "Read from the provider on request: each link's data centre, when it\nopened, whether it is reconnecting, and the worker holding it.",
@@ -134913,6 +135490,9 @@
           },
           "409": {
             "description": "The plan changed (the body's `plan` is the new one), or a run is in progress"
+          },
+          "428": {
+            "description": "Changing who an address is for, or publishing every environment under a tunnel, needs a recent MFA verification"
           }
         },
         "security": [
@@ -149776,6 +150356,41 @@
         ],
         "tags": [
           "Agents"
+        ]
+      }
+    },
+    "/settings/preview-domain/status": {
+      "get": {
+        "description": "`local_only` (`localhost`, `localho.st`), `unresolved` (a name under it\ndoes not resolve), `no_way_in` (it resolves, but to nothing this install\nserves publicly) or `usable`. Recomputed when the setting, the tunnels or\nthe nodes' public ingress change, and every 30 minutes.",
+        "operationId": "get_preview_domain_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewDomainStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether the preview domain can be reached.",
+        "tags": [
+          "Reachability"
         ]
       }
     },

@@ -232,6 +232,13 @@ pub fn address_reachability(
         reason,
         action,
         network: None,
+        nothing_set_up: false,
+    };
+    // ADR 068 D4: only these verdicts may read as "no address"; every other
+    // not-reachable one is a way in that broke.
+    let never_set_up = |mut verdict: AddressReachability| {
+        verdict.nothing_set_up = true;
+        verdict
     };
 
     if !input.audience.is_served() {
@@ -247,10 +254,10 @@ pub fn address_reachability(
                  does not know, so nobody can open it until Temps is upgraded again."
             ),
         };
-        return verdict(ReachState::NotReachable, None, reason, None);
+        return never_set_up(verdict(ReachState::NotReachable, None, reason, None));
     }
     if is_local_only(address) {
-        return verdict(
+        return never_set_up(verdict(
             ReachState::NotReachable,
             None,
             format!(
@@ -258,15 +265,15 @@ pub fn address_reachability(
                  reach it."
             ),
             Some(make_reachable()),
-        );
+        ));
     }
     if !deployed {
-        return verdict(
+        return never_set_up(verdict(
             ReachState::NotReachable,
             None,
             format!("Nothing is deployed to {environment_name} yet."),
             Some(ReachAction::new(ActionKind::Deploy, "Deploy it")),
-        );
+        ));
     }
     if input.audience.is_private() {
         let judged = private_reachability(facts, environment_name);
@@ -343,6 +350,10 @@ pub fn address_reachability(
             )
         }
         Resolution::Ips(_) | Resolution::NoRecord => {
+            // The generated host with no record and no tunnel covering it
+            // was never given a way in. A custom or environment domain
+            // without a record was set up by someone, so it is an outage.
+            let never = input.source == AddressSource::Generated && tunnel_reason.is_none();
             let reason =
                 tunnel_reason.unwrap_or_else(|| format!("No DNS record for {address} exists yet."));
             let target = directs
@@ -358,7 +369,12 @@ pub fn address_reachability(
                 )),
                 None => Some(make_reachable()),
             };
-            return verdict(ReachState::NotReachable, None, reason, action);
+            let verdict = verdict(ReachState::NotReachable, None, reason, action);
+            return if never {
+                never_set_up(verdict)
+            } else {
+                verdict
+            };
         }
     };
 
@@ -541,6 +557,7 @@ fn private_reachability(facts: &AddressFacts, environment_name: &str) -> Address
         reason,
         action,
         network,
+        nothing_set_up: false,
     };
     let listener = binding
         .listener
@@ -812,6 +829,9 @@ fn tailnet_reachability(facts: &AddressFacts, environment_name: &str) -> Address
         reason,
         action,
         network: network.clone(),
+        // A tailnet name exists once a run made it: set up, so never
+        // `no_address` (ADR 068 D4), like a private listener.
+        nothing_set_up: false,
     };
     let (Some(private), Some(tailnet)) = (
         &facts.private,
@@ -1042,19 +1062,17 @@ pub fn overall_state(addresses: &[AddressReachability]) -> ReachState {
     }
 }
 
-/// The header's line. Custom domains come before the generated hostname,
-/// which is usually the less memorable one.
+/// The header's line. It names the address D4 would pick (ADR 068), so the
+/// header and the primary address never disagree: custom and environment
+/// domains first, then a tunnel host, then the generated hostname, which is
+/// usually the less memorable one.
 pub fn summary(
     addresses: &[AddressReachability],
     deployed: bool,
     environment_name: &str,
     running_on: &[String],
 ) -> String {
-    let rank = |a: &AddressReachability| match a.source {
-        AddressSource::CustomDomain => 0,
-        AddressSource::EnvironmentDomain => 1,
-        AddressSource::Generated => 2,
-    };
+    let rank = super::addresses::rank;
     let best = |state: ReachState| {
         addresses
             .iter()
@@ -1352,6 +1370,7 @@ mod tests {
             reason: String::new(),
             action: None,
             network: None,
+            nothing_set_up: false,
         };
         let both = vec![
             reachable("app-production.example.com", AddressSource::Generated),
@@ -1361,6 +1380,24 @@ mod tests {
         assert_eq!(
             summary(&both, true, "production", &[]),
             "Public at myapp.example.com"
+        );
+
+        // The same address D4 picks: an environment domain ahead of a tunnel
+        // host, whichever was gathered first.
+        let tunnel_first = vec![
+            reachable(
+                "app-production.tunnel.example.com",
+                AddressSource::TunnelHost,
+            ),
+            reachable("app.example.com", AddressSource::EnvironmentDomain),
+        ];
+        assert_eq!(
+            summary(&tunnel_first, true, "production", &[]),
+            "Public at app.example.com"
+        );
+        assert_eq!(
+            super::super::addresses::primary_address(&tunnel_first).map(|p| p.address),
+            Some("app.example.com".to_string())
         );
 
         let local = vec![AddressReachability {

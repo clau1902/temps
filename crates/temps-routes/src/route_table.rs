@@ -233,6 +233,20 @@ fn select_public_route_containers<'a>(
 /// configured public port, in `public_ports` order. Empty for non-Compose
 /// projects. Sleeping on-demand environments register these alongside the
 /// environment hostname so a request to any public service URL wakes them.
+/// ADR 068 D3: a public Compose service beside each host a tunnel generated
+/// for its environment, `<label>--<service>.<tunnel domain>` (the Flat form:
+/// one level under the tunnel's zone).
+fn tunnel_service_hostnames(hosts: Option<&Vec<String>>, route_label: &str) -> Vec<String> {
+    hosts
+        .into_iter()
+        .flatten()
+        .filter_map(|host| host.split_once('.'))
+        .map(|(label, domain)| {
+            PublicHostnameStrategy::Flat.service_hostname(domain, label, route_label)
+        })
+        .collect()
+}
+
 fn compose_public_service_hostnames(
     preset_config: Option<&temps_entities::preset::PresetConfig>,
     preview_domain: &str,
@@ -1943,6 +1957,21 @@ impl CachedPeerTable {
             env_domains.len()
         );
 
+        // ADR 068 D3: the hosts a tunnel generated for each environment. Its
+        // public Compose services are served as `<label>--<service>` beside
+        // each one (section 4).
+        let mut tunnel_environment_hosts: HashMap<i32, Vec<String>> = HashMap::new();
+        for env_domain in &env_domains {
+            if env_domain.generated_by_connector_id.is_some()
+                && env_domain.audience == temps_entities::audience::PUBLIC
+            {
+                tunnel_environment_hosts
+                    .entry(env_domain.environment_id)
+                    .or_default()
+                    .push(env_domain.domain.to_ascii_lowercase());
+            }
+        }
+
         for env_domain in env_domains {
             if env_domain.audience == temps_entities::audience::SIGNED_IN {
                 gated_meta.insert(
@@ -2920,6 +2949,18 @@ impl CachedPeerTable {
                                     // environment+route, certable (ADR-018 §2).
                                     cert_eligible: true,
                                 };
+
+                                // ADR 068 D3: the same service beside each
+                                // tunnel host, in the Flat form the tunnel's
+                                // zone takes. Never displaces a route.
+                                for tunnel_svc_domain in tunnel_service_hostnames(
+                                    tunnel_environment_hosts.get(&env.id),
+                                    route_label,
+                                ) {
+                                    routes
+                                        .entry(tunnel_svc_domain)
+                                        .or_insert_with(|| svc_route_info.clone());
+                                }
 
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     routes.entry(svc_domain.clone())
@@ -5689,6 +5730,7 @@ mod tests {
                             gate_access_aud: None,
                             private_via: None,
                             private_service: None,
+                            generated_by_connector_id: None,
                         }]])
                         .append_query_results([vec![environment.clone()]])
                         .append_query_results([vec![deployment.clone()]])
@@ -5852,6 +5894,22 @@ mod tests {
         ];
 
         assert!(select_public_route_containers(&containers, None).is_none());
+    }
+
+    #[test]
+    fn tunnel_environment_hosts_get_flat_service_hostnames() {
+        let hosts = vec![
+            "shop-staging.tunnel.example.com".to_string(),
+            "shop-production-a1b2c3.tunnel.example.com".to_string(),
+        ];
+        assert_eq!(
+            tunnel_service_hostnames(Some(&hosts), "api"),
+            vec![
+                "shop-staging--api.tunnel.example.com".to_string(),
+                "shop-production-a1b2c3--api.tunnel.example.com".to_string(),
+            ]
+        );
+        assert!(tunnel_service_hostnames(None, "api").is_empty());
     }
 
     #[test]

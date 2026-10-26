@@ -6704,6 +6704,7 @@ mod tests {
                 gate_access_aud: None,
                 private_via: None,
                 private_service: None,
+                generated_by_connector_id: None,
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));

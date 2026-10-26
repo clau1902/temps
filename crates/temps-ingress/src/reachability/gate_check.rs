@@ -194,6 +194,7 @@ mod tests {
             reason: "It resolves to edge.".into(),
             action: None,
             network: None,
+            nothing_set_up: false,
         }
     }
 

@@ -533,6 +533,11 @@ export type AddressAudience = {
 };
 
 /**
+ * What kind of address the primary one is, in D4's order.
+ */
+export type AddressKind = 'custom_domain' | 'tunnel_host' | 'generated' | 'private';
+
+/**
  * One address of an environment and whether its audience can reach it.
  */
 export type AddressReachability = {
@@ -567,7 +572,7 @@ export type AddressScope = 'public' | 'private' | 'cgnat' | 'local';
 /**
  * Where an address comes from.
  */
-export type AddressSource = 'generated' | 'environment_domain' | 'custom_domain';
+export type AddressSource = 'generated' | 'environment_domain' | 'custom_domain' | 'tunnel_host';
 
 export type AdminGateResponse = {
     /**
@@ -6178,6 +6183,11 @@ export type ConnectorView = {
     dns_target?: string | null;
     domain: string;
     edge_port: number;
+    /**
+     * Publishes every environment as `<label>.<domain>` (ADR 068 D3).
+     * At most one tunnel does.
+     */
+    environment_hosts: boolean;
     external_id?: string | null;
     id: number;
     last_error?: string | null;
@@ -9661,9 +9671,21 @@ export type DeploymentContainerLogsListResponse = {
 };
 
 export type DeploymentEnvironmentResponse = {
+    /**
+     * Best first: the primary address (ADR 068 D4) leads when it is known.
+     */
     domains: Array<string>;
     id: number;
     name: string;
+    /**
+     * Why nobody can reach the environment; set only when Temps is sure.
+     */
+    no_address_reason?: string | null;
+    /**
+     * The environment's primary address as a URL. `null` while it is not
+     * known, or when nobody can reach the environment.
+     */
+    primary_url?: string | null;
     /**
      * Public URLs of this environment's Docker Compose services, one per
      * configured public port. Empty for non-Compose projects.
@@ -9900,6 +9922,7 @@ export type DeploymentResponse = {
     is_current: boolean;
     metadata?: DeploymentMetadata | null;
     project_id: number;
+    reachability_warning?: ReachabilityWarning | null;
     screenshot_location?: string | null;
     started_at?: number | null;
     status: string;
@@ -11938,6 +11961,71 @@ export type EnvironmentDomainResponse = {
     url: string;
 };
 
+/**
+ * An environment the tunnel does not publish, and why.
+ */
+export type EnvironmentHostRefusal = {
+    environment_id: number;
+    environment_name: string;
+    project_slug: string;
+    reason: string;
+};
+
+/**
+ * One environment's tunnel host, as the opt-in lists it.
+ */
+export type EnvironmentHostView = {
+    environment_id: number;
+    environment_name: string;
+    /**
+     * The host, or the one it would get.
+     */
+    hostname: string;
+    last_error?: string | null;
+    /**
+     * Why the host is not `<label>.<domain>`, when it is the short-hash
+     * name.
+     */
+    note?: string | null;
+    project_slug: string;
+    /**
+     * `published`, `pending`, `error`, or `planned` before the opt-in.
+     */
+    state: string;
+};
+
+/**
+ * `GET`/`PUT /ingress/connectors/{id}/environment-hosts`.
+ */
+export type EnvironmentHostsResponse = {
+    /**
+     * Send back as `confirm` to turn it on or off. It names exactly the
+     * hosts listed here, so a list that changed since it was shown is not
+     * accepted.
+     */
+    confirm_token: string;
+    connector_id: number;
+    connector_name: string;
+    domain: string;
+    enabled: boolean;
+    /**
+     * The tunnel that has environment hosts on instead, if another does:
+     * at most one may.
+     */
+    enabled_elsewhere?: string | null;
+    /**
+     * The hosts it publishes, or would publish once turned on.
+     */
+    hosts: Array<EnvironmentHostView>;
+    /**
+     * The preview domain is usable: existing hosts stay, no new ones are
+     * generated.
+     */
+    preview_domain_usable: boolean;
+    refused: Array<EnvironmentHostRefusal>;
+    warning: string;
+};
+
 export type EnvironmentInfo = {
     current_deployment_id?: number | null;
     id: number;
@@ -11957,6 +12045,7 @@ export type EnvironmentReachability = {
     environment_id: number;
     environment_name: string;
     plan?: ReachabilityPlan | null;
+    primary_address?: PrimaryAddress | null;
     project_id: number;
     /**
      * The nodes its containers run on (`control plane` for the local one).
@@ -16770,6 +16859,10 @@ export type Intent = {
     name: string;
     tailnet: string;
     type: 'tailscale_service';
+} | {
+    connector_id: number;
+    name: string;
+    type: 'environment_hosts';
 };
 
 /**
@@ -21714,7 +21807,7 @@ export type PlanOption = {
 /**
  * One way to make the address reachable.
  */
-export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve' | 'tailscale_service' | 'tailscale_service_with_credential';
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve' | 'tailscale_service' | 'tailscale_service_with_credential' | 'tunnel_environment_hosts';
 
 /**
  * `POST …/reachability/plan`.
@@ -22248,6 +22341,29 @@ export type PreviewDomainDeliveryBindingRequest = {
     zone: string;
 };
 
+/**
+ * D2: whether the preview domain can be reached at all.
+ */
+export type PreviewDomainStatus = 'local_only' | 'unresolved' | 'no_way_in' | 'usable';
+
+/**
+ * `GET /settings/preview-domain/status` (ADR 068 D2).
+ */
+export type PreviewDomainStatusResponse = {
+    checked_at: string;
+    preview_domain: string;
+    /**
+     * Why, in words.
+     */
+    reason: string;
+    status: PreviewDomainStatus;
+    /**
+     * The tunnel that gives every environment an address instead, when
+     * one does (ADR 068 D3): apps are reachable without this domain.
+     */
+    tunnel_environment_hosts?: string | null;
+};
+
 export type PreviewGatewayLogsResponse = {
     lines: Array<string>;
 };
@@ -22402,6 +22518,22 @@ export type PreviousChoice = {
 
 export type PricingResponse = {
     models: Array<ModelPricing>;
+};
+
+/**
+ * The address every surface means by "the app's address".
+ */
+export type PrimaryAddress = {
+    /**
+     * The hostname, without a scheme.
+     */
+    address: string;
+    kind: AddressKind;
+    /**
+     * How traffic gets in, as ADR 064 D3 names it (`tunnel:<name>`,
+     * `direct:<node>`, `private:<node>`).
+     */
+    way_in?: string | null;
 };
 
 /**
@@ -23070,6 +23202,7 @@ export type ProjectResponse = {
      * When true, deploy clones only `directory` via git sparse-checkout.
      */
     pull_only_root_directory: boolean;
+    reachability_warning?: ReachabilityWarning | null;
     repo_name?: string | null;
     repo_owner?: string | null;
     /**
@@ -24490,6 +24623,35 @@ export type ReachAction = {
 
 export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
 
+export type ReachabilityFix = {
+    /**
+     * The command to run, when that is the fix.
+     */
+    command?: string | null;
+    /**
+     * For the tunnel fix: the connector that would carry it.
+     */
+    connector_id?: number | null;
+    /**
+     * For the tunnel fix: the hostname it would get.
+     */
+    hostname?: string | null;
+    /**
+     * The console page that applies it.
+     */
+    href?: string | null;
+    kind: ReachabilityFixKind;
+    /**
+     * What the button and the log line say.
+     */
+    label: string;
+};
+
+/**
+ * One way to fix a [`ReachabilityWarning`], in the order D5 lists them.
+ */
+export type ReachabilityFixKind = 'tunnel_environment_hosts' | 'preview_domain' | 'custom_domain' | 'worker_ingress';
+
 export type ReachabilityPlan = {
     /**
      * The address asked for, or the one Temps suggests.
@@ -24532,6 +24694,29 @@ export type ReachabilityPlan = {
  * Email reachability status
  */
 export type ReachabilityStatus = 'safe' | 'risky' | 'invalid' | 'unknown';
+
+/**
+ * D5: a successful deploy nobody can open. Computed, never stored.
+ */
+export type ReachabilityWarning = {
+    /**
+     * The environment's label, as visitors would see it in a hostname.
+     */
+    environment: string;
+    environment_id: number;
+    /**
+     * The fixes that fit this install, best first.
+     */
+    fixes: Array<ReachabilityFix>;
+    /**
+     * `Deployed, but nobody can reach <label> yet`.
+     */
+    headline: string;
+    /**
+     * Why, about the address visitors would try first.
+     */
+    reason: string;
+};
 
 export type ReadFileResponse = {
     /**
@@ -26298,6 +26483,10 @@ export type RunResource = {
      */
     tailnet: string;
     type: 'tailscale_service';
+} | {
+    connector_id: number;
+    name: string;
+    type: 'environment_hosts';
 };
 
 export type RunState = 'running' | 'succeeded' | 'waiting' | 'failed' | 'interrupted' | 'recovering' | 'conflict' | 'undoing' | 'undo_paused' | 'undone';
@@ -28571,6 +28760,18 @@ export type SetConnectorNodesRequest = {
     node_ids: Array<number>;
 };
 
+/**
+ * `PUT /ingress/connectors/{id}/environment-hosts`.
+ */
+export type SetEnvironmentHostsRequest = {
+    /**
+     * The `confirm_token` of the list that was shown and accepted: turning
+     * on publishes every host in it, turning off withdraws them.
+     */
+    confirm?: string | null;
+    enabled: boolean;
+};
+
 export type SetFlagEnvironmentRequest = {
     /**
      * The kill switch. `false` makes the flag serve its default regardless of
@@ -30059,7 +30260,7 @@ export type StepConversionResponse = {
     step_order: number;
 };
 
-export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'access_app' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval';
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'access_app' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval' | 'publish_environment_hosts';
 
 /**
  * What kind of resource a migration step operates on
@@ -54412,6 +54613,92 @@ export type UpdateIngressConnectorResponses = {
 
 export type UpdateIngressConnectorResponse = UpdateIngressConnectorResponses[keyof UpdateIngressConnectorResponses];
 
+export type GetConnectorEnvironmentHostsData = {
+    body?: never;
+    path: {
+        /**
+         * Tunnel id
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/environment-hosts';
+};
+
+export type GetConnectorEnvironmentHostsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetConnectorEnvironmentHostsResponses = {
+    200: EnvironmentHostsResponse;
+};
+
+export type GetConnectorEnvironmentHostsResponse = GetConnectorEnvironmentHostsResponses[keyof GetConnectorEnvironmentHostsResponses];
+
+export type SetConnectorEnvironmentHostsData = {
+    body: SetEnvironmentHostsRequest;
+    path: {
+        /**
+         * Tunnel id
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/environment-hosts';
+};
+
+export type SetConnectorEnvironmentHostsErrors = {
+    /**
+     * Not confirmed
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+    /**
+     * Another tunnel publishes environment hosts, or the list changed since it was shown
+     */
+    409: unknown;
+    /**
+     * Turning it on needs a recent MFA verification
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetConnectorEnvironmentHostsResponses = {
+    200: EnvironmentHostsResponse;
+};
+
+export type SetConnectorEnvironmentHostsResponse = SetConnectorEnvironmentHostsResponses[keyof SetConnectorEnvironmentHostsResponses];
+
 export type GetIngressConnectorLinksData = {
     body?: never;
     path: {
@@ -71120,6 +71407,10 @@ export type ApplyEnvironmentReachabilityErrors = {
      * The plan changed (the body's `plan` is the new one), or a run is in progress
      */
     409: unknown;
+    /**
+     * Changing who an address is for, or publishing every environment under a tunnel, needs a recent MFA verification
+     */
+    428: unknown;
 };
 
 export type ApplyEnvironmentReachabilityResponses = {
@@ -80180,6 +80471,34 @@ export type RevealGlobalMcpConfigResponses = {
 };
 
 export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
+
+export type GetPreviewDomainStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/preview-domain/status';
+};
+
+export type GetPreviewDomainStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPreviewDomainStatusResponses = {
+    200: PreviewDomainStatusResponse;
+};
+
+export type GetPreviewDomainStatusResponse = GetPreviewDomainStatusResponses[keyof GetPreviewDomainStatusResponses];
 
 export type GetPublicIngressStatusData = {
     body?: never;

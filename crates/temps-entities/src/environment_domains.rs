@@ -60,6 +60,10 @@ pub struct Model {
     /// For `tailscale_service`: the Service's `svc:` name.
     #[serde(default)]
     pub private_service: Option<String>,
+    /// The tunnel that generated this row for the environment (ADR 068
+    /// D3). Temps renames and removes only rows carrying it.
+    #[serde(default)]
+    pub generated_by_connector_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

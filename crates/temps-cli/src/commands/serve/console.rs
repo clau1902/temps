@@ -2906,6 +2906,10 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_ingress_connector_links",
         "list_ingress_hostnames",
         "get_ingress_hostname",
+        // ADR 068: whether the preview domain is reachable and why, and the
+        // hosts a tunnel publishes for environments (names and states only).
+        "get_preview_domain_status",
+        "get_connector_environment_hosts",
         // ── User preferences + cluster metadata ──
         // Notification preferences for the current user — no credentials.
         "get_preferences",

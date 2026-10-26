@@ -426,6 +426,11 @@ pub trait RunOps: Send + Sync {
         creator_run_id: i32,
         shown: &ServiceDefinition,
     ) -> Result<ServiceDeletion, String>;
+    /// Whether connector `id` publishes every environment's host
+    /// (ADR 068 D3).
+    async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String>;
+    /// Turns it on or off; off withdraws every host it generated.
+    async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String>;
     async fn sleep(&self, duration: Duration);
 }
 
@@ -2713,6 +2718,51 @@ impl Runner<'_> {
                     Err(error) => Outcome::Failed(error),
                 }
             }
+            StepKind::PublishEnvironmentHosts => {
+                let Some(tunnel) = input.tunnel.clone() else {
+                    return Outcome::Failed("No tunnel to publish environments through.".into());
+                };
+                let intent = Intent::EnvironmentHosts {
+                    connector_id: tunnel.id,
+                    name: tunnel.name.clone(),
+                };
+                if !self.known(&intent) {
+                    match self.ops.environment_hosts(tunnel.id).await {
+                        Ok(true) => {
+                            return Outcome::Skipped(format!(
+                                "Tunnel {} already publishes every environment.",
+                                tunnel.name
+                            ))
+                        }
+                        Ok(false) => {}
+                        Err(error) => return Outcome::Failed(error),
+                    }
+                }
+                match self.begin(&intent).await {
+                    Err(hold) => hold.into(),
+                    Ok(Begin::Have(_)) => Outcome::Done(None),
+                    Ok(Begin::Go) => match self.ops.set_environment_hosts(tunnel.id, true).await {
+                        Ok(()) => {
+                            self.finish(
+                                &intent.key(input.run_id),
+                                Some(RunResource::EnvironmentHosts {
+                                    connector_id: tunnel.id,
+                                    name: tunnel.name.clone(),
+                                }),
+                            )
+                            .await;
+                            Outcome::Done(Some(format!(
+                                "Every environment gets an address under tunnel {}.",
+                                tunnel.name
+                            )))
+                        }
+                        Err(error) => {
+                            self.finish_failed(&intent, true).await;
+                            Outcome::Failed(error)
+                        }
+                    },
+                }
+            }
             StepKind::WaitForPublication => {
                 let mut waited = Duration::ZERO;
                 loop {
@@ -3787,10 +3837,16 @@ pub async fn undo(
             RunResource::TailscaleServe { .. }
             | RunResource::TailscaleService { .. }
             | RunResource::TailscaleCredential { .. } => Ok(()),
+            RunResource::EnvironmentHosts { connector_id, .. } => {
+                ops.set_environment_hosts(*connector_id, false).await
+            }
         };
         let label = match &resource {
             RunResource::AutoManageEnabled { domain, .. } => {
                 format!("Turned automatic DNS for {domain} back off")
+            }
+            RunResource::EnvironmentHosts { name, .. } => {
+                format!("Withdrew the environment addresses from tunnel {name}")
             }
             RunResource::HostnameChoice {
                 hostname,
@@ -3925,6 +3981,8 @@ mod tests {
         /// Reads of the Service so far, and after how many it is gone.
         service_reads: Mutex<usize>,
         vanish_after: Option<usize>,
+        /// Whether the tunnel publishes every environment's host.
+        environment_hosts: Mutex<bool>,
     }
 
     impl Fake {
@@ -4204,6 +4262,7 @@ mod tests {
                 reason: "checked".into(),
                 action: None,
                 network: None,
+                nothing_set_up: false,
             }
         }
         async fn address_audience(&self, _host: &str) -> Result<Option<AddressAudience>, String> {
@@ -4388,6 +4447,16 @@ mod tests {
         ) -> Result<ServiceDeletion, String> {
             self.log(format!("delete_service {tailnet} {name} {}", shown.comment));
             Ok(self.deletion.clone().unwrap_or(ServiceDeletion::Deleted))
+        }
+        async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String> {
+            self.log(format!("environment_hosts {connector_id}"));
+            Ok(*self.environment_hosts.lock().expect("lock"))
+        }
+        async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String> {
+            self.result("set_environment_hosts")?;
+            self.log(format!("set_environment_hosts {connector_id} {on}"));
+            *self.environment_hosts.lock().expect("lock") = on;
+            Ok(())
         }
         async fn sleep(&self, _duration: Duration) {}
     }
@@ -6103,6 +6172,83 @@ mod tests {
         .await;
         assert_eq!(record.state, RunState::Failed);
         assert!(!ops.calls().iter().any(|c| c.starts_with("route_hostname")));
+    }
+
+    /// ADR 068 D5's tunnel fix: one run turns the tunnel's environment
+    /// hosts on, and undo turns them off again.
+    #[tokio::test]
+    async fn environment_hosts_are_turned_on_by_a_run_and_off_by_its_undo() {
+        let ops = Fake {
+            reachable: true,
+            ..Default::default()
+        };
+        let input = RunInput {
+            option: PlanOptionKind::TunnelEnvironmentHosts,
+            address: "myapp-production.example.com".into(),
+            steps: steps(&[
+                StepKind::PublishEnvironmentHosts,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]),
+            tunnel: Some(NamedId {
+                id: 41,
+                name: "homelab".into(),
+            }),
+            new_tunnel: None,
+            token: None,
+            ..token_input()
+        };
+        let mut record = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded);
+        assert!(ops
+            .calls()
+            .contains(&"set_environment_hosts 41 true".to_string()));
+        assert!(record.created().contains(&RunResource::EnvironmentHosts {
+            connector_id: 41,
+            name: "homelab".into(),
+        }));
+        let results = undo(&mut record.journal, &ops, 0, &Journaled::default())
+            .await
+            .results;
+        assert!(results.iter().all(|r| r.ok), "{results:?}");
+        assert!(ops
+            .calls()
+            .contains(&"set_environment_hosts 41 false".to_string()));
+        assert!(record.created().is_empty());
+    }
+
+    /// Already on (another run, or the tunnel page): nothing is recorded,
+    /// so undoing this run never turns off what it did not turn on.
+    #[tokio::test]
+    async fn environment_hosts_already_on_are_left_to_whoever_turned_them_on() {
+        let ops = Fake {
+            reachable: true,
+            environment_hosts: Mutex::new(true),
+            ..Default::default()
+        };
+        let input = RunInput {
+            option: PlanOptionKind::TunnelEnvironmentHosts,
+            address: "myapp-production.example.com".into(),
+            steps: steps(&[
+                StepKind::PublishEnvironmentHosts,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability,
+            ]),
+            tunnel: Some(NamedId {
+                id: 41,
+                name: "homelab".into(),
+            }),
+            new_tunnel: None,
+            token: None,
+            ..token_input()
+        };
+        let record = execute(&input, &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded);
+        assert!(record.created().is_empty());
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("set_environment_hosts")));
     }
 
     #[test]

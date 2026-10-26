@@ -326,7 +326,8 @@ async fn plan_environment_reachability(
         (status = 400, description = "An answer is missing or invalid"),
         (status = 403, description = "A permission the option needs is missing"),
         (status = 404, description = "Project or environment not found"),
-        (status = 409, description = "The plan changed (the body's `plan` is the new one), or a run is in progress")
+        (status = 409, description = "The plan changed (the body's `plan` is the new one), or a run is in progress"),
+        (status = 428, description = "Changing who an address is for, or publishing every environment under a tunnel, needs a recent MFA verification")
     ),
     security(("bearer_auth" = []))
 )]
@@ -348,6 +349,16 @@ async fn apply_environment_reachability(
     // Changing who an existing address is for is a sensitive action, both
     // ways (ADR 064 Security), and so is its gate or sign-in list (ADR 065
     // D7).
+    // Publishing every environment under a tunnel widens all of them to
+    // public at once (ADR 068 D3).
+    if request.option == PlanOptionKind::TunnelEnvironmentHosts {
+        require_sensitive_action(
+            state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            SensitiveAction::PublishEnvironmentHosts { connector_id: None },
+        )
+        .await?;
+    }
     let change = state
         .service
         .audience_change(
@@ -778,9 +789,9 @@ fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
             | RunResource::AutoManageEnabled { .. }
             | RunResource::DnsRecord { .. }
             | RunResource::DnsChange { .. } => Permission::DnsProvidersWrite,
-            RunResource::Connector { .. } | RunResource::HostnameChoice { .. } => {
-                Permission::SettingsWrite
-            }
+            RunResource::Connector { .. }
+            | RunResource::HostnameChoice { .. }
+            | RunResource::EnvironmentHosts { .. } => Permission::SettingsWrite,
             RunResource::CustomDomain { .. }
             | RunResource::AddressAudience { .. }
             | RunResource::TailscaleServe { .. }

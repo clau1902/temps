@@ -15,6 +15,7 @@ pub mod console_startup;
 pub mod deployment;
 pub mod dns_automation;
 pub mod env_vars_provider;
+pub mod environment_address;
 pub mod error;
 pub mod error_builder;
 pub mod error_metrics;

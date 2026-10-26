@@ -28,6 +28,7 @@ import {
   planEnvironmentReachability,
   type Decision,
   type PlanOption,
+  type PlanOptionKind,
   type ReachabilityPlan,
   type RunStep,
   type RunView,
@@ -125,6 +126,10 @@ export interface MakeReachableDialogProps {
   projectId: number
   environmentId: number
   environmentName?: string
+  /** An address to plan for straight away (ADR 068 D5's tunnel fix). */
+  initialAddress?: string
+  /** The option to pick when the plan offers it. */
+  initialOption?: PlanOptionKind
 }
 
 export function MakeReachableDialog({
@@ -133,6 +138,8 @@ export function MakeReachableDialog({
   projectId,
   environmentId,
   environmentName,
+  initialAddress,
+  initialOption,
 }: MakeReachableDialogProps) {
   const queryClient = useQueryClient()
   const path = { project_id: projectId, environment_id: environmentId }
@@ -229,16 +236,21 @@ export function MakeReachableDialog({
   // the plan's recommendation unless the user picked one that still fits.
   const suggested = plan.data?.address
   useEffect(() => {
+    if (open && initialAddress && !form.getValues('address'))
+      form.setValue('address', initialAddress)
+  }, [open, initialAddress, form])
+  useEffect(() => {
     if (suggested && !form.getValues('address'))
       form.setValue('address', suggested)
   }, [suggested, form])
   const options = useMemo(() => plan.data?.options ?? [], [plan.data])
   useEffect(() => {
     if (!options.some((o) => o.kind === form.getValues('option'))) {
-      form.setValue('option', defaultOption(options)?.kind ?? '')
+      const preferred = options.find((o) => o.kind === initialOption)
+      form.setValue('option', (preferred ?? defaultOption(options))?.kind ?? '')
       form.setValue('confirmed', false)
     }
-  }, [options, form])
+  }, [options, form, initialOption])
   const option = options.find((o) => o.kind === chosen)
   const fields = (option?.fields ?? []).filter((f) => f.key !== 'address')
 
