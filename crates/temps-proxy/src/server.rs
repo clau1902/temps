@@ -550,6 +550,11 @@ pub fn setup_proxy_server(
 
     let challenge_gate = Arc::new(crate::shield::challenge_gate(&encryption_service));
 
+    // ADR 066: the reputation lists, the built-in baseline until the loader
+    // finds a compiled snapshot in `shield_snapshots`.
+    let shield_lists = Arc::new(crate::shield::ShieldLists::default());
+    shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
+
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
 
@@ -622,6 +627,7 @@ pub fn setup_proxy_server(
     .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
     .with_proxy_metrics(proxy_metrics.clone())
     .with_request_policy_gate(request_policy_gate)
+    .with_shield_lists(shield_lists)
     // Signed-in addresses (ADR 065 D8). The proxy redeems sign-in codes in
     // process, so it needs the database and the gate key's sealing key; in
     // split topology both are available here as they are to the console.
@@ -976,6 +982,8 @@ pub fn create_proxy_service(
     let challenge_gate = Arc::new(crate::shield::challenge_gate(
         &temps_core::EncryptionService::new(&config.encryption_key)?,
     ));
+    let shield_lists = Arc::new(crate::shield::ShieldLists::default());
+    shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
 
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
@@ -1000,7 +1008,8 @@ pub fn create_proxy_service(
         disable_https_redirect,
     )
     .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
-    .with_proxy_metrics(proxy_metrics);
+    .with_proxy_metrics(proxy_metrics)
+    .with_shield_lists(shield_lists);
 
     Ok(lb)
 }

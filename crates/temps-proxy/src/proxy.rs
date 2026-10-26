@@ -1108,6 +1108,25 @@ pub struct ProxyContext {
     pub gated_host: bool,
     /// Who the gate admitted, for a signed-in address.
     pub gate_identity: Option<temps_core::gate::GateClaims>,
+    /// What the Shield reputation lists say about the client (ADR 066 D1),
+    /// when one holds it. Phase 2 only records it with the request log.
+    pub shield: Option<temps_shield::Verdict>,
+}
+
+impl ProxyContext {
+    /// The verdict as the request log stores it.
+    fn shield_verdict(&self) -> Option<String> {
+        self.shield
+            .as_ref()
+            .map(|verdict| verdict.action.as_str().to_string())
+    }
+
+    fn shield_reasons(&self) -> Vec<String> {
+        self.shield
+            .as_ref()
+            .map(temps_shield::Verdict::reason_strings)
+            .unwrap_or_default()
+    }
 }
 
 /// Main load balancer proxy implementation using traits
@@ -1131,6 +1150,9 @@ pub struct LoadBalancer {
     /// Attack-mode challenges and clearances (ADR 066). Verifies without a
     /// database; its only state is in memory.
     challenge_gate: Arc<temps_shield::ChallengeGate>,
+    /// The Shield reputation lists (ADR 066 D2). The built-in baseline until
+    /// a loader swaps in a compiled snapshot; checked without locks or I/O.
+    shield_lists: Arc<crate::shield::ShieldLists>,
     /// In-memory snapshot of domains that have a TLS certificate. Used by the
     /// HTTP→HTTPS redirect check instead of issuing 2 DB queries per request.
     /// Refreshed every 30 s by `CertHostCache::run_refresh_loop`. See WS3.
@@ -1298,6 +1320,7 @@ impl LoadBalancer {
             project_ip_gate,
             request_policy_gate: Arc::new(temps_core::OpenRequestPolicyGate),
             challenge_gate,
+            shield_lists: Arc::new(crate::shield::ShieldLists::default()),
             cert_host_cache,
             disable_https_redirect,
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
@@ -1413,6 +1436,13 @@ impl LoadBalancer {
             crate::console_unavailable::ConsoleUnavailableResponder::new(state, console_address)
                 .with_ingress_address(console_ingress_address),
         ));
+        self
+    }
+
+    /// Check requests against `lists`, which a loader keeps current, instead
+    /// of the built-in baseline alone.
+    pub fn with_shield_lists(mut self, lists: Arc<crate::shield::ShieldLists>) -> Self {
+        self.shield_lists = lists;
         self
     }
 
@@ -1747,6 +1777,8 @@ impl LoadBalancer {
                     .and_then(|h| serde_json::to_value(h).ok()),
                 trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
                 error_group_id: None,
+                shield_verdict: ctx.shield_verdict(),
+                shield_reasons: ctx.shield_reasons(),
             };
 
             // Non-blocking enqueue; shed with rate-limited accounting when full.
@@ -2798,6 +2830,8 @@ impl LoadBalancer {
                     .and_then(|h| serde_json::to_value(h).ok()),
                 trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
                 error_group_id: None,
+                shield_verdict: ctx.shield_verdict(),
+                shield_reasons: ctx.shield_reasons(),
             };
 
             // Stash rather than send: the `logging` hook fires after the
@@ -2921,6 +2955,8 @@ impl LoadBalancer {
             response_headers: None,
             trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
             error_group_id: None,
+            shield_verdict: ctx.shield_verdict(),
+            shield_reasons: ctx.shield_reasons(),
         };
 
         // Non-blocking enqueue; shed with rate-limited accounting when full.
@@ -5134,6 +5170,7 @@ impl ProxyHttp for LoadBalancer {
             path_route: None,
             gated_host: false,
             gate_identity: None,
+            shield: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -6418,6 +6455,17 @@ impl ProxyHttp for LoadBalancer {
                 .as_deref()
                 .and_then(|s| s.parse::<std::net::IpAddr>().ok())
                 .map(normalize_client_ip);
+            // ADR 066 D1, phase 2: what the reputation lists would do with
+            // this client, recorded with the request log before any gate
+            // below answers it. Nothing acts on it yet.
+            if let Some(client_ip) = parsed_ip {
+                let verdict = self
+                    .shield_lists
+                    .evaluate(client_ip, temps_shield::unix_now() as i64);
+                if verdict.action != temps_shield::Action::Pass {
+                    ctx.shield = Some(verdict);
+                }
+            }
             let decision = evaluate_request_policy(
                 self.request_policy_gate.as_ref(),
                 session.req_header(),
@@ -8785,12 +8833,33 @@ mod on_demand_http_tests {
 }
 
 #[cfg(test)]
+mod shield_log_tests {
+    /// ADR 066 phase 2: a listed client's verdict and reasons are what the
+    /// request log stores; an unlisted one stores neither.
+    #[test]
+    fn the_verdict_is_recorded_with_the_request() {
+        let lists = crate::shield::ShieldLists::default();
+        let now = temps_shield::unix_now() as i64;
+        let mut ctx = super::markdown_tests::make_ctx();
+        assert_eq!(ctx.shield_verdict(), None);
+        assert!(ctx.shield_reasons().is_empty());
+
+        let unlisted = lists.evaluate("8.8.8.8".parse().unwrap(), now);
+        assert_eq!(unlisted.action, temps_shield::Action::Pass);
+
+        ctx.shield = Some(lists.evaluate("192.0.2.7".parse().unwrap(), now));
+        assert_eq!(ctx.shield_verdict().as_deref(), Some("log"));
+        assert_eq!(ctx.shield_reasons(), ["iana_reserved (192.0.2.0/24)"]);
+    }
+}
+
+#[cfg(test)]
 mod markdown_tests {
     use super::*;
     use bytes::Bytes;
 
     // ── Helper: build a minimal ProxyContext for testing ──────────────────────
-    fn make_ctx() -> ProxyContext {
+    pub(super) fn make_ctx() -> ProxyContext {
         ProxyContext {
             response_modified: false,
             response_compressed: false,
@@ -8842,6 +8911,7 @@ mod markdown_tests {
             path_route: None,
             gated_host: false,
             gate_identity: None,
+            shield: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -9381,6 +9451,7 @@ mod markdown_pipeline_tests {
             path_route: None,
             gated_host: false,
             gate_identity: None,
+            shield: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
