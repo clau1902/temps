@@ -278,8 +278,17 @@ fn behind_sign_in(response: &reqwest::Response) -> Option<String> {
     )
 }
 
+/// Only an answer that is the gate doing its job counts: the Temps sign-in
+/// or a Cloudflare Access refusal at the origin. `unavailable` means the
+/// gate itself cannot run, so the address is down, and an unknown value is
+/// not trusted either.
 fn gate_note(gate_header: Option<&str>) -> Option<String> {
-    gate_header?;
+    let value = gate_header?;
+    if !value.eq_ignore_ascii_case(temps_core::gate::GATE_SIGN_IN)
+        && !value.eq_ignore_ascii_case(temps_core::gate::GATE_ACCESS)
+    {
+        return None;
+    }
     Some(
         "Behind sign-in: this address only lets in people who sign in, so the monitor sees \
          the sign-in, not the app. Temps offers no way past it. Container health checks \
@@ -1795,6 +1804,15 @@ mod tests {
         assert!(gate_note(Some("sign-in")).is_some_and(|note| note.starts_with("Behind sign-in")));
         assert!(gate_note(Some("access")).is_some());
         assert!(gate_note(None).is_none());
+    }
+
+    /// A gate that cannot run is an outage, not "behind sign-in", and a
+    /// value the gate never sends is not taken for it.
+    #[test]
+    fn an_unavailable_gate_is_not_reported_behind_sign_in() {
+        assert!(gate_note(Some(temps_core::gate::GATE_UNAVAILABLE)).is_none());
+        assert!(gate_note(Some("anything-else")).is_none());
+        assert!(gate_note(Some("")).is_none());
     }
 
     #[test]

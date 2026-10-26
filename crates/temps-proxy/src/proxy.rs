@@ -603,6 +603,9 @@ fn strip_proxy_owned_response_headers(response: &mut ResponseHeader) {
     // used by managed monitors to decide whether a local TLS follow-up is safe.
     response.remove_header("X-Temps-Proxy-Https-Redirect");
     response.remove_header("X-Temps-Proxy-Probe-Capable");
+    // Monitors read `x-temps-gate` as the gate's own answer (ADR 065 D10),
+    // so no app, gated or not, may send it.
+    response.remove_header(temps_core::gate::GATE_HEADER);
 }
 
 fn deployment_asset_scope(
@@ -4899,6 +4902,26 @@ mod https_redirect_tests {
         assert!(response
             .headers
             .get("x-temps-proxy-probe-capable")
+            .is_none());
+    }
+
+    /// ADR 065 D10: a monitor takes `x-temps-gate` for the gate's own
+    /// answer, so an app on any host, gated or not, cannot send it.
+    #[test]
+    fn application_cannot_pass_for_the_gate() {
+        let mut response = ResponseHeader::build(500, None).expect("build application response");
+        response
+            .insert_header(
+                temps_core::gate::GATE_HEADER,
+                temps_core::gate::GATE_SIGN_IN,
+            )
+            .expect("insert spoofed gate answer");
+
+        strip_proxy_owned_response_headers(&mut response);
+
+        assert!(response
+            .headers
+            .get(temps_core::gate::GATE_HEADER)
             .is_none());
     }
 

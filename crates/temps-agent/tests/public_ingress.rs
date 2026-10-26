@@ -238,6 +238,45 @@ async fn test_public_ingress_known_host_forwards_request_to_published_backend() 
     backend_shutdown.notify_waiters();
 }
 
+/// ADR 065 D10: monitors take `x-temps-gate` for the gate's own answer, so
+/// an app on an ordinary (not signed-in) host cannot pass a failing answer
+/// off as one.
+#[tokio::test]
+async fn test_public_ingress_app_cannot_send_the_gate_header() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test backend");
+    let backend_address = listener.local_addr().expect("read test backend address");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = vec![0; 8192];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nx-temps-gate: sign-in\r\n\
+                          Content-Length: 6\r\nConnection: close\r\n\r\nbroken",
+                    )
+                    .await;
+            });
+        }
+    });
+    let ingress = IngressHarness::start(backend_address, true).await;
+
+    let response = ingress
+        .request("GET / HTTP/1.1\r\nHost: app.example.test\r\nConnection: close\r\n\r\n")
+        .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("x-temps-gate"),
+        "{response}"
+    );
+}
+
 #[tokio::test]
 async fn test_public_ingress_unknown_host_returns_not_found_without_backend_access() {
     let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;

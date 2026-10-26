@@ -1095,20 +1095,17 @@ async fn build_snapshot(
                 operation,
                 source,
             })?;
-            // A node gets keys only for what it terminates itself: its public
-            // routes when it listens publicly, and its private routes. A
-            // connector-only node terminates none of the public ones.
-            let allowed_certificate_hosts: std::collections::HashSet<String> = public_routes
-                .iter()
-                .filter(|_| node.public_ingress_enabled)
-                .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
-                .chain(private_hosts.iter().cloned())
-                .collect();
             // ADR 065 D7: a signed-in address goes only to an agent that
             // declared it enforces the gate, and only in `gated_routes`. An
             // older agent would serve it open.
             let (public_routes, gated_routes, gate_held_back) =
                 split_gated(public_routes, enforces_gate, &node.name);
+            let allowed_certificate_hosts = certificate_hosts(
+                &public_routes,
+                &gated_routes,
+                node.public_ingress_enabled,
+                &private_hosts,
+            );
             let unsupported_route_count = unsupported_route_count + gate_held_back.len();
             let mut unsupported_reasons = unsupported_reasons;
             unsupported_reasons.extend(gate_held_back);
@@ -1201,6 +1198,28 @@ pub fn split_gated(
         })
         .collect();
     (open, Vec::new(), held_back)
+}
+
+/// The hosts a node gets certificate keys for: only what it terminates
+/// itself. That is its public and signed-in routes when it listens publicly,
+/// and its private routes. A connector-only node terminates none of the
+/// public ones. Takes the routes after [`split_gated`], so a signed-in host
+/// held back from an agent that does not enforce the gate gets no key
+/// either: that agent cannot serve it, and the key would let it impersonate
+/// the host (ADR 065 D7).
+pub fn certificate_hosts(
+    public_routes: &[RouteEntryDto],
+    gated_routes: &[RouteEntryDto],
+    public_ingress_enabled: bool,
+    private_hosts: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    public_routes
+        .iter()
+        .chain(gated_routes)
+        .filter(|_| public_ingress_enabled)
+        .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
+        .chain(private_hosts.iter().cloned())
+        .collect()
 }
 
 async fn public_listen(
@@ -2250,6 +2269,35 @@ mod gate_hold_back_tests {
         assert_eq!(gated.len(), 1);
         assert_eq!(gated[0].host, "team.example.test");
         assert!(held.is_empty());
+    }
+
+    /// A signed-in host withheld from an agent that does not enforce the
+    /// gate gets no certificate key on that node either.
+    #[test]
+    fn a_withheld_signed_in_host_gets_no_certificate_key() {
+        let routes = vec![
+            route("open.example.test", false),
+            route("Team.example.test.", true),
+        ];
+        let private = std::collections::HashSet::from(["lan.example.test".to_string()]);
+
+        let (open, gated, _) = split_gated(routes.clone(), false, "worker-1");
+        let hosts = certificate_hosts(&open, &gated, true, &private);
+        assert!(!hosts.contains("team.example.test"), "{hosts:?}");
+        assert!(hosts.contains("open.example.test"));
+        assert!(hosts.contains("lan.example.test"));
+
+        let (open, gated, _) = split_gated(routes.clone(), true, "worker-1");
+        let hosts = certificate_hosts(&open, &gated, true, &private);
+        assert!(hosts.contains("team.example.test"), "{hosts:?}");
+
+        // A connector-only node terminates no public host, gated or not.
+        let (open, gated, _) = split_gated(routes, true, "worker-1");
+        let hosts = certificate_hosts(&open, &gated, false, &private);
+        assert_eq!(
+            hosts,
+            std::collections::HashSet::from(["lan.example.test".to_string()])
+        );
     }
 
     #[test]

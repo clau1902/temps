@@ -1573,7 +1573,7 @@ async fn proxy_upgrade(
         let mut resp = Response::new(Body::from(leftover));
         *resp.status_mut() = status;
         for (name, value) in headers_out.iter() {
-            if HOP_BY_HOP.contains(&name.as_str()) {
+            if HOP_BY_HOP.contains(&name.as_str()) || !app_may_send(name) {
                 continue;
             }
             resp.headers_mut().insert(name.clone(), value.clone());
@@ -1592,7 +1592,7 @@ async fn proxy_upgrade(
     // there and must round-trip unchanged.
     let mut client_resp = Response::new(Body::empty());
     *client_resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    for (name, value) in response_bytes.iter() {
+    for (name, value) in response_bytes.iter().filter(|(name, _)| app_may_send(name)) {
         client_resp
             .headers_mut()
             .insert(name.clone(), value.clone());
@@ -2024,12 +2024,19 @@ async fn forward_once(
     let mut out = Response::new(Body::from_stream(upstream.bytes_stream()));
     *out.status_mut() = status;
     for (name, value) in upstream_headers_owned.iter() {
-        if HOP_BY_HOP.contains(&name.as_str()) {
+        if HOP_BY_HOP.contains(&name.as_str()) || !app_may_send(name) {
             continue;
         }
         out.headers_mut().insert(name.clone(), value.clone());
     }
     out
+}
+
+/// Whether an app's response may carry `name` to the client. No app, gated
+/// or not, may send `x-temps-gate`: monitors read it as the gate's own
+/// answer (ADR 065 D10), so an app could pass for a gate that is up.
+fn app_may_send(name: &axum::http::HeaderName) -> bool {
+    name.as_str() != temps_core::gate::GATE_HEADER
 }
 
 /// Convert axum's `Body` into a stream of `Result<Bytes, _>` that
