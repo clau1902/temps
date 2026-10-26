@@ -263,10 +263,9 @@ pub async fn extract_pdf_text(name: &str, bytes: Vec<u8>) -> Result<String, Stri
         PDF_READER_WAIT,
         PDF_EXTRACTION_TIMEOUT,
         move || {
-            let outcome = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes));
+            let outcome = std::panic::catch_unwind(|| read_pdf_text(&bytes));
             match outcome {
-                Ok(Ok(text)) => Ok(text),
-                Ok(Err(error)) => Err(error.to_string()),
+                Ok(result) => result,
                 Err(_) => Err("the PDF parser failed on this document".to_string()),
             }
         },
@@ -290,6 +289,355 @@ pub async fn extract_pdf_text(name: &str, bytes: Vec<u8>) -> Result<String, Stri
         }
         Ok(Err(reason)) => Err(format!("'{name}' could not be read as a PDF: {reason}")),
         Ok(Ok(text)) => Ok(tidy_pdf_text(&text)),
+    }
+}
+
+/// Largest size one stream of an uploaded PDF may inflate to. The upload is
+/// capped at [`MAX_DOCUMENT_BYTES`], but deflate lets a stream that small
+/// inflate to gigabytes.
+const MAX_PDF_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// Raw text read from one PDF before its remaining pages are skipped. Above
+/// [`MAX_PDF_TEXT_BYTES`] so tidying has whitespace to collapse before the cut.
+const MAX_PDF_RAW_TEXT_BYTES: usize = 4 * MAX_PDF_TEXT_BYTES;
+/// Form XObjects (reusable drawings, often headers and footers) read per
+/// document, and how deeply they may nest. A form may draw itself or others
+/// many times over, so both bound the work a small file can demand.
+const MAX_PDF_FORMS: usize = 1_000;
+const MAX_PDF_FORM_DEPTH: usize = 8;
+/// Saved graphics states (`q`) tracked per content stream.
+const MAX_PDF_STATE_DEPTH: usize = 64;
+/// A `TJ` adjustment, in thousandths of an em, wider than this to the right is
+/// read as the gap between two words rather than as kerning.
+const PDF_WORD_GAP: f32 = 150.0;
+
+/// A PDF transformation matrix `[a b c d e f]`.
+type PdfMatrix = [f32; 6];
+const PDF_IDENTITY: PdfMatrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// `m` applied after `n`, as the PDF operators compose them (`m × n`).
+fn pdf_multiply(m: &PdfMatrix, n: &PdfMatrix) -> PdfMatrix {
+    [
+        m[0] * n[0] + m[1] * n[2],
+        m[0] * n[1] + m[1] * n[3],
+        m[2] * n[0] + m[3] * n[2],
+        m[2] * n[1] + m[3] * n[3],
+        m[4] * n[0] + m[5] * n[2] + n[4],
+        m[4] * n[1] + m[5] * n[3] + n[5],
+    ]
+}
+
+fn pdf_number(operand: Option<&lopdf::Object>) -> f32 {
+    operand.and_then(|o| o.as_float().ok()).unwrap_or(0.0)
+}
+
+/// Six numeric operands as a matrix; `None` when there are not six.
+fn pdf_matrix(operands: &[lopdf::Object]) -> Option<PdfMatrix> {
+    let numbers: Vec<f32> = operands.iter().filter_map(|o| o.as_float().ok()).collect();
+    <PdfMatrix>::try_from(numbers.as_slice()).ok()
+}
+
+/// The text layer of a PDF, untidied: each page's text in content-stream
+/// order, one line per text line, pages separated by a blank line. A page
+/// that cannot be read is skipped; `Err` only when no page could be read or
+/// the document itself cannot be opened.
+///
+/// Read with lopdf directly. Glyph widths are not consulted, so a gap between
+/// two words is inferred from how the text is positioned (`Td`, `Tm`, wide
+/// `TJ` adjustments) rather than measured.
+fn read_pdf_text(bytes: &[u8]) -> Result<String, String> {
+    let document = lopdf::Document::load_mem_with_options(
+        bytes,
+        lopdf::LoadOptions::with_max_decompressed_size(MAX_PDF_STREAM_BYTES),
+    )
+    .map_err(|error| error.to_string())?;
+    // Loading already decrypts a PDF whose user password is empty and drops
+    // its /Encrypt entry, so one still encrypted needs a password we lack.
+    if document.is_encrypted() {
+        return Err("it is encrypted and needs a password to open".to_string());
+    }
+    let pages = document.get_pages();
+    let mut reader = PdfTextReader::new(&document);
+    let mut first_error = None;
+    let mut pages_read = 0usize;
+    for (&number, &page_id) in &pages {
+        if reader.text.len() > MAX_PDF_RAW_TEXT_BYTES {
+            reader.text.push_str(&format!(
+                "[Text cut here: pages {number} to {} were not read.]\n",
+                pages.len()
+            ));
+            break;
+        }
+        match reader.read_page(page_id) {
+            Ok(()) => pages_read += 1,
+            Err(error) => {
+                first_error.get_or_insert_with(|| format!("page {number}: {error}"));
+            }
+        }
+        reader.text.push_str("\n\n");
+    }
+    match first_error {
+        Some(error) if pages_read == 0 => Err(error),
+        _ => Ok(reader.text),
+    }
+}
+
+/// Walks content streams, writing the text they show into `text`.
+struct PdfTextReader<'a> {
+    document: &'a lopdf::Document,
+    text: String,
+    /// Forms read so far, against [`MAX_PDF_FORMS`].
+    forms_read: usize,
+    /// Forms being read, innermost last, so a form that draws itself is skipped.
+    forms_open: Vec<lopdf::ObjectId>,
+    /// Device-space origin of the last text shown, and the distance either
+    /// way from it that still counts as the same line.
+    last_shown: Option<(f32, f32, f32)>,
+}
+
+impl<'a> PdfTextReader<'a> {
+    fn new(document: &'a lopdf::Document) -> Self {
+        Self {
+            document,
+            text: String::new(),
+            forms_read: 0,
+            forms_open: Vec::new(),
+            last_shown: None,
+        }
+    }
+
+    fn read_page(&mut self, page_id: lopdf::ObjectId) -> Result<(), lopdf::Error> {
+        let (inline, inherited) = self.document.get_page_resources(page_id)?;
+        let mut resources: Vec<&'a lopdf::Dictionary> = inline.into_iter().collect();
+        resources.extend(
+            inherited
+                .iter()
+                .filter_map(|id| self.document.get_dictionary(*id).ok()),
+        );
+        let content = self
+            .document
+            .get_page_content_with_limit(page_id, MAX_PDF_STREAM_BYTES)?;
+        self.last_shown = None;
+        self.read_content(&resources, &content, PDF_IDENTITY, 0)
+    }
+
+    /// Font encodings by resource name. The first scope naming a font wins,
+    /// as in lopdf's own page font lookup.
+    fn encodings(
+        &self,
+        resources: &[&'a lopdf::Dictionary],
+    ) -> std::collections::BTreeMap<Vec<u8>, lopdf::Encoding<'a>> {
+        let document = self.document;
+        let mut encodings = std::collections::BTreeMap::new();
+        for scope in resources {
+            let Ok(fonts) = scope
+                .get_deref(b"Font", document)
+                .and_then(lopdf::Object::as_dict)
+            else {
+                continue;
+            };
+            for (name, font) in fonts.iter() {
+                if encodings.contains_key(name) {
+                    continue;
+                }
+                let encoding = document
+                    .dereference(font)
+                    .and_then(|(_, font)| font.as_dict())
+                    .and_then(|font| {
+                        font.get_font_encoding_with_limit(document, MAX_PDF_STREAM_BYTES)
+                    });
+                if let Ok(encoding) = encoding {
+                    encodings.insert(name.clone(), encoding);
+                }
+            }
+        }
+        encodings
+    }
+
+    /// The form XObject `name` refers to, if it is one.
+    fn form(
+        &self,
+        resources: &[&'a lopdf::Dictionary],
+        name: &[u8],
+    ) -> Option<(lopdf::ObjectId, &'a lopdf::Stream)> {
+        let document = self.document;
+        resources.iter().find_map(|scope| {
+            let id = scope
+                .get_deref(b"XObject", document)
+                .and_then(lopdf::Object::as_dict)
+                .and_then(|xobjects| xobjects.get(name))
+                .and_then(lopdf::Object::as_reference)
+                .ok()?;
+            let stream = document
+                .get_object(id)
+                .and_then(lopdf::Object::as_stream)
+                .ok()?;
+            let is_form = stream
+                .dict
+                .get(b"Subtype")
+                .and_then(lopdf::Object::as_name)
+                .is_ok_and(|subtype| subtype == b"Form");
+            is_form.then_some((id, stream))
+        })
+    }
+
+    fn read_content(
+        &mut self,
+        resources: &[&'a lopdf::Dictionary],
+        content: &[u8],
+        ctm: PdfMatrix,
+        depth: usize,
+    ) -> Result<(), lopdf::Error> {
+        let content = lopdf::content::Content::decode(content)?;
+        let encodings = self.encodings(resources);
+        let mut ctm = ctm;
+        let mut saved: Vec<PdfMatrix> = Vec::new();
+        let mut line = PDF_IDENTITY;
+        let mut leading = 0.0f32;
+        let mut font_size = 0.0f32;
+        let mut encoding = None;
+        for operation in &content.operations {
+            if self.text.len() > MAX_PDF_RAW_TEXT_BYTES {
+                break;
+            }
+            let operands = operation.operands.as_slice();
+            match operation.operator.as_str() {
+                "q" if saved.len() < MAX_PDF_STATE_DEPTH => saved.push(ctm),
+                "Q" => ctm = saved.pop().unwrap_or(ctm),
+                "cm" => {
+                    if let Some(matrix) = pdf_matrix(operands) {
+                        ctm = pdf_multiply(&matrix, &ctm);
+                    }
+                }
+                "BT" => line = PDF_IDENTITY,
+                "Tm" => line = pdf_matrix(operands).unwrap_or(line),
+                "Td" | "TD" => {
+                    let (tx, ty) = (pdf_number(operands.first()), pdf_number(operands.get(1)));
+                    if operation.operator == "TD" {
+                        leading = -ty;
+                    }
+                    line = pdf_multiply(&[1.0, 0.0, 0.0, 1.0, tx, ty], &line);
+                }
+                "TL" => leading = pdf_number(operands.first()),
+                "T*" => line = pdf_multiply(&[1.0, 0.0, 0.0, 1.0, 0.0, -leading], &line),
+                "Tf" => {
+                    encoding = operands
+                        .first()
+                        .and_then(|name| name.as_name().ok())
+                        .and_then(|name| encodings.get(name));
+                    font_size = pdf_number(operands.get(1));
+                }
+                "Tj" | "'" | "\"" | "TJ" => {
+                    if operation.operator == "'" || operation.operator == "\"" {
+                        line = pdf_multiply(&[1.0, 0.0, 0.0, 1.0, 0.0, -leading], &line);
+                    }
+                    let shown = match operation.operator.as_str() {
+                        "\"" => operands.get(2..3).unwrap_or_default(),
+                        "TJ" => operands
+                            .first()
+                            .and_then(|array| array.as_array().ok())
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        _ => operands.get(..1).unwrap_or_default(),
+                    };
+                    if let Some(encoding) = encoding {
+                        self.place(&pdf_multiply(&line, &ctm), font_size);
+                        self.show(encoding, shown);
+                    }
+                }
+                "Do" if depth < MAX_PDF_FORM_DEPTH && self.forms_read < MAX_PDF_FORMS => {
+                    let Some((id, form)) = operands
+                        .first()
+                        .and_then(|name| name.as_name().ok())
+                        .and_then(|name| self.form(resources, name))
+                    else {
+                        continue;
+                    };
+                    if self.forms_open.contains(&id) {
+                        continue;
+                    }
+                    self.forms_read += 1;
+                    let Ok(form_content) =
+                        form.decompressed_content_with_limit(MAX_PDF_STREAM_BYTES)
+                    else {
+                        continue;
+                    };
+                    let form_resources: Vec<&'a lopdf::Dictionary> = match form
+                        .dict
+                        .get_deref(b"Resources", self.document)
+                        .and_then(lopdf::Object::as_dict)
+                    {
+                        Ok(own) => vec![own],
+                        Err(_) => resources.to_vec(),
+                    };
+                    let matrix = form
+                        .dict
+                        .get_deref(b"Matrix", self.document)
+                        .and_then(lopdf::Object::as_array)
+                        .ok()
+                        .and_then(|matrix| pdf_matrix(matrix))
+                        .unwrap_or(PDF_IDENTITY);
+                    self.forms_open.push(id);
+                    // A broken form costs its own text, not the page's.
+                    let _ = self.read_content(
+                        &form_resources,
+                        &form_content,
+                        pdf_multiply(&matrix, &ctm),
+                        depth + 1,
+                    );
+                    self.forms_open.pop();
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Separate the text about to be shown at `position` from what came
+    /// before: a line break when it starts on another line, a space when it
+    /// was moved along the same one.
+    fn place(&mut self, position: &PdfMatrix, font_size: f32) {
+        let (x, y) = (position[4], position[5]);
+        let tolerance = (0.5 * font_size * (position[3]).abs()).max(1.0);
+        match self.last_shown {
+            Some((last_x, last_y, last_tolerance)) => {
+                if (y - last_y).abs() > last_tolerance.max(tolerance) {
+                    self.break_line();
+                } else if x != last_x {
+                    self.space();
+                }
+            }
+            None => self.break_line(),
+        }
+        self.last_shown = Some((x, y, tolerance));
+    }
+
+    fn show(&mut self, encoding: &lopdf::Encoding<'a>, shown: &[lopdf::Object]) {
+        for item in shown {
+            match item {
+                lopdf::Object::String(bytes, _) => {
+                    // A string the font cannot decode costs only itself.
+                    let _ = encoding.write_to_string(bytes, &mut self.text);
+                }
+                lopdf::Object::Integer(_) | lopdf::Object::Real(_)
+                    if pdf_number(Some(item)) < -PDF_WORD_GAP =>
+                {
+                    self.space();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn break_line(&mut self) {
+        if !self.text.is_empty() && !self.text.ends_with('\n') {
+            self.text.push('\n');
+        }
+    }
+
+    fn space(&mut self) {
+        if !self.text.is_empty() && !self.text.ends_with(char::is_whitespace) {
+            self.text.push(' ');
+        }
     }
 }
 
@@ -885,24 +1233,73 @@ mod tests {
     /// A one-page PDF with `text` drawn on it, with a correct cross-reference
     /// table, so the parser takes the ordinary path.
     fn pdf_with_text(text: &str) -> Vec<u8> {
-        let stream = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
-        let objects = [
-            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
-             /Resources << /Font << /F1 5 0 R >> >> >>"
-                .to_string(),
+        pdf_with_pages(&[format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET").as_bytes()])
+    }
+
+    /// A stream object holding `content`, with any extra dictionary entries.
+    fn stream_object(extra: &str, content: &[u8]) -> Vec<u8> {
+        let mut object = format!("<< /Length {} {extra} >>\nstream\n", content.len()).into_bytes();
+        object.extend_from_slice(content);
+        object.extend_from_slice(b"\nendstream");
+        object
+    }
+
+    /// A PDF with one page per content stream, all sharing font `/F1` and the
+    /// form XObjects `/Fm0` (object 4) and `/Fm1` (object 5), whose content
+    /// is given by `forms`.
+    fn pdf_with_pages_and_forms(pages: &[&[u8]], forms: [&[u8]; 2]) -> Vec<u8> {
+        let streams: Vec<Vec<u8>> = pages
+            .iter()
+            .map(|content| stream_object("", content))
+            .collect();
+        pdf_with_page_streams(&streams, forms)
+    }
+
+    /// As [`pdf_with_pages_and_forms`], with each page's content stream
+    /// object given whole, so a test can choose its filters.
+    fn pdf_with_page_streams(pages: &[Vec<u8>], forms: [&[u8]; 2]) -> Vec<u8> {
+        let first_page = 6;
+        let kids: Vec<String> = (0..pages.len())
+            .map(|index| format!("{} 0 R", first_page + 2 * index))
+            .collect();
+        let resources = "/Resources << /Font << /F1 3 0 R >> \
+                         /XObject << /Fm0 4 0 R /Fm1 5 0 R >> >>";
+        let mut objects: Vec<Vec<u8>> = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
             format!(
-                "<< /Length {} >>\nstream\n{stream}\nendstream",
-                stream.len()
+                "<< /Type /Pages /Kids [{}] /Count {} >>",
+                kids.join(" "),
+                pages.len()
+            )
+            .into_bytes(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            stream_object(
+                &format!("/Type /XObject /Subtype /Form {resources}"),
+                forms[0],
             ),
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            stream_object(
+                &format!("/Type /XObject /Subtype /Form {resources}"),
+                forms[1],
+            ),
         ];
+        for (index, content) in pages.iter().enumerate() {
+            objects.push(
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R \
+                     {resources} >>",
+                    first_page + 2 * index + 1
+                )
+                .into_bytes(),
+            );
+            objects.push(content.clone());
+        }
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
         for (index, body) in objects.iter().enumerate() {
             offsets.push(pdf.len());
-            pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
         }
         let xref = pdf.len();
         pdf.extend_from_slice(
@@ -919,6 +1316,10 @@ mod tests {
             .as_bytes(),
         );
         pdf
+    }
+
+    fn pdf_with_pages(pages: &[&[u8]]) -> Vec<u8> {
+        pdf_with_pages_and_forms(pages, [b"", b""])
     }
 
     fn model_row(modalities: serde_json::Value) -> ai_provider_models::Model {
@@ -1043,6 +1444,90 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("bad.pdf"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn pdf_lines_words_and_pages_stay_apart() {
+        // Lines placed with Td, TD/T*, Tm and `'`, the second line built from
+        // two Tj runs with a word gap in a TJ array and a same-line move.
+        let first: &[u8] = b"BT /F1 12 Tf 72 720 Td (Invoice 7) Tj \
+            0 -14 Td [(Total) -250 (due:)] TJ 60 0 Td (42.00) Tj \
+            0 -14 TD (Third line) Tj T* (Fourth line) Tj ET \
+            BT /F1 12 Tf 1 0 0 1 72 600 Tm (Fifth line) Tj 14 TL (Sixth line) ' ET";
+        let second: &[u8] =
+            b"q 1 0 0 1 72 700 cm BT /F1 12 Tf (Kerned) Tj [(Wo) -20 (rd)] TJ ET Q \
+            q 1 0 0 1 72 680 cm BT /F1 12 Tf (Next) Tj ET Q";
+        let text = extract_pdf_text("lines.pdf", pdf_with_pages(&[first, second]))
+            .await
+            .unwrap();
+        assert_eq!(
+            text,
+            "Invoice 7\nTotal due: 42.00\nThird line\nFourth line\nFifth line\nSixth line\n\n\
+             KernedWord\nNext"
+        );
+    }
+
+    #[tokio::test]
+    async fn pdf_text_inside_forms_is_read_and_self_drawing_forms_end() {
+        // /Fm0 is a footer drawn by the page; /Fm1 draws itself and /Fm0.
+        let page: &[u8] = b"BT /F1 12 Tf 72 720 Td (Body) Tj ET /Fm0 Do /Fm1 Do";
+        let footer: &[u8] = b"BT /F1 9 Tf 72 40 Td (Footer) Tj ET";
+        let recursive: &[u8] = b"/Fm1 Do 1 0 0 1 0 20 cm /Fm0 Do";
+        let text = extract_pdf_text(
+            "forms.pdf",
+            pdf_with_pages_and_forms(&[page], [footer, recursive]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "Body\nFooter\nFooter");
+    }
+
+    #[tokio::test]
+    async fn a_pdf_decompression_bomb_is_refused_not_inflated() {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let chunk = vec![b' '; 1024 * 1024];
+        for _ in 0..(MAX_PDF_STREAM_BYTES / chunk.len() + 1) {
+            encoder.write_all(&chunk).unwrap();
+        }
+        let bomb = encoder.finish().unwrap();
+        assert!(bomb.len() < MAX_DOCUMENT_BYTES);
+        let pdf =
+            pdf_with_page_streams(&[stream_object("/Filter /FlateDecode", &bomb)], [b"", b""]);
+        let error = extract_pdf_text("bomb.pdf", pdf).await.unwrap_err();
+        assert!(error.contains("bomb.pdf"), "{error}");
+    }
+
+    #[test]
+    fn a_pdf_that_needs_a_password_is_reported() {
+        let mut pdf = pdf_with_text("secret");
+        let previous_xref: usize = std::str::from_utf8(&pdf)
+            .unwrap()
+            .rsplit("startxref\n")
+            .next()
+            .and_then(|tail| tail.lines().next())
+            .and_then(|offset| offset.parse().ok())
+            .unwrap();
+        // An incremental update adding an /Encrypt dictionary whose empty user
+        // password does not verify, so the PDF cannot be opened without one.
+        let encrypt_at = pdf.len();
+        pdf.extend_from_slice(
+            b"99 0 obj\n<< /Filter /Standard /V 1 /R 2 /Length 40 /P -4 \
+              /O <0000000000000000000000000000000000000000000000000000000000000000> \
+              /U <0000000000000000000000000000000000000000000000000000000000000000> >>\n\
+              endobj\n",
+        );
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n99 1\n{encrypt_at:010} 00000 n \ntrailer\n<< /Size 100 /Root 1 0 R \
+                 /Prev {previous_xref} /Encrypt 99 0 R /ID [<00> <00>] >>\nstartxref\n{xref}\n\
+                 %%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let error = read_pdf_text(&pdf).unwrap_err();
+        assert!(error.contains("password"), "{error}");
     }
 
     #[test]
