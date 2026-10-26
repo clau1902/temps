@@ -905,11 +905,11 @@ impl HealthCheckService {
             monitor_updated_at: monitor.updated_at,
         };
 
-        // ADR 068 D4: probe the environment's primary address. With none
-        // anyone can reach, a managed monitor still probes through Temps' own
-        // proxy, which serves the app whether or not anyone else can reach
-        // it; only a probe with no such path records `no_address`, never an
-        // outage. Without an answer, probe as before.
+        // ADR 068 D4: probe the environment's primary address when it has a
+        // reachable one; otherwise probe exactly as before. `no_address` only
+        // replaces the one failure that means nothing was ever set up: the
+        // target hostname does not resolve and the environment has no
+        // address at all. Without an answer, probe as before.
         let address = match &addresses {
             Some(addresses) => match addresses.address(environment.project_id, env_id).await {
                 Ok(address) => Some(address),
@@ -934,45 +934,12 @@ impl HealthCheckService {
         // This ensures we're testing the actual user-facing endpoint, not internal container networking
         let public_url = match primary_url {
             Some(url) => Ok((url, true)),
-            // A monitor that would dial out publicly has nowhere to go.
-            None if no_address && !monitor.is_managed => Err(None),
-            None => config_service
-                .get_deployment_url_by_slug_with_source(&environment.subdomain)
-                .await
-                .map_err(Some),
-        };
-        // No path: a URL that would be dialled publicly, or none at all. A
-        // failed lookup is a configuration error, reported as before.
-        let no_path = match &public_url {
-            Ok((_, uses_external_url)) => {
-                !should_route_probe_locally(monitor.is_managed, *uses_external_url)
+            None => {
+                config_service
+                    .get_deployment_url_by_slug_with_source(&environment.subdomain)
+                    .await
             }
-            Err(error) => error.is_none(),
         };
-        if no_address && no_path {
-            debug!(
-                monitor_id = monitor.id,
-                environment_id = env_id,
-                "Not probing: the environment has no reachable address and no local proxy path"
-            );
-            Self::record_check(
-                &db,
-                probe.clone(),
-                NO_ADDRESS_STATUS.to_string(),
-                None,
-                Some(NO_ADDRESS_MESSAGE.to_string()),
-                &job_queue,
-            )
-            .await?;
-            return Ok(());
-        }
-        if no_address {
-            debug!(
-                monitor_id = monitor.id,
-                environment_id = env_id,
-                "No reachable address; probing through the local proxy"
-            );
-        }
         let (health_url, uses_external_url) = match public_url {
             Ok((public_url, uses_external_url)) => {
                 debug!("Using public URL for health check: {}", public_url);
@@ -998,8 +965,7 @@ impl HealthCheckService {
                 (health_url, uses_external_url)
             }
             Err(e) => {
-                // `None` only goes with `no_address`, recorded above.
-                let e = e.map_or_else(|| "no address".to_string(), |e| format!("{e:?}"));
+                let e = format!("{e:?}");
                 error!(
                     "Failed to get public URL for deployment {}: {}",
                     environment.subdomain, e
@@ -1040,15 +1006,29 @@ impl HealthCheckService {
                     );
                 }
                 Ok(PublicProbeTarget::Unresolved(reason)) => {
-                    Self::record_check(
-                        &db,
-                        probe.clone(),
-                        "major_outage".to_string(),
-                        None,
-                        Some(format!("DNS resolution failed: {reason}")),
-                        &job_queue,
-                    )
-                    .await?;
+                    // A name that does not resolve for an environment nobody
+                    // was ever given a way into is not an outage: there is
+                    // nothing to check yet. Any address that was once set up
+                    // keeps the outage.
+                    let (status, message) = if no_address {
+                        debug!(
+                            monitor_id = monitor.id,
+                            environment_id = env_id,
+                            %reason,
+                            "Health URL does not resolve and the environment has no address"
+                        );
+                        (
+                            NO_ADDRESS_STATUS.to_string(),
+                            NO_ADDRESS_MESSAGE.to_string(),
+                        )
+                    } else {
+                        (
+                            "major_outage".to_string(),
+                            format!("DNS resolution failed: {reason}"),
+                        )
+                    };
+                    Self::record_check(&db, probe.clone(), status, None, Some(message), &job_queue)
+                        .await?;
                     return Ok(());
                 }
                 Err(error) => {
@@ -2875,75 +2855,6 @@ mod tests {
         .is_none());
     }
 
-    #[tokio::test]
-    async fn health_probe_without_an_address_records_no_address_and_never_probes() {
-        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
-        struct ExpectNoAddress;
-        #[async_trait::async_trait]
-        impl JobQueue for ExpectNoAddress {
-            async fn send(&self, job: Job) -> Result<(), QueueError> {
-                match job {
-                    Job::StatusCheckCompleted(job) => {
-                        assert_eq!(job.status, NO_ADDRESS_STATUS);
-                        assert_eq!(job.error_message.as_deref(), Some(NO_ADDRESS_MESSAGE));
-                    }
-                    _ => panic!("only the no_address check is emitted"),
-                }
-                Ok(())
-            }
-            fn subscribe(&self) -> Box<dyn JobReceiver> {
-                panic!("not used")
-            }
-        }
-        let monitor = make_monitor(1, Some(1));
-        let now = Utc::now();
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![make_env(1, false)]])
-                .append_query_results([vec![health_probe_deployment()]])
-                .append_query_results([vec![health_probe_counts(1, 1)]])
-                // persist_check_if_current
-                .append_query_results([vec![monitor.clone()]])
-                .append_query_results([vec![make_env(1, false)]])
-                .append_query_results([vec![health_probe_deployment()]])
-                .append_query_results([vec![monitor.clone()]])
-                .append_query_results([vec![status_checks::Model {
-                    id: 1,
-                    monitor_id: 1,
-                    status: NO_ADDRESS_STATUS.into(),
-                    checked_at: now,
-                    created_at: now,
-                    response_time_ms: None,
-                    error_message: Some(NO_ADDRESS_MESSAGE.into()),
-                }]])
-                .append_exec_results([MockExecResult {
-                    last_insert_id: 1,
-                    rows_affected: 1,
-                }])
-                .into_connection(),
-        );
-        let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(
-            None,
-            Some("proj-env-1.localho.st only resolves to this computer"),
-        )));
-        HealthCheckService::check_monitor_with(
-            db.clone(),
-            test_config_service(&db, "postgres://localhost/test"),
-            monitor,
-            Arc::new(ExpectNoAddress),
-            Some(addresses),
-        )
-        .await
-        .expect("no_address is recorded");
-        let log = format!(
-            "{:?}",
-            Arc::try_unwrap(db)
-                .expect("one owner")
-                .into_transaction_log()
-        );
-        assert!(log.contains("no_address"), "{log}");
-    }
-
     struct ExpectStatus(&'static str);
     #[async_trait::async_trait]
     impl JobQueue for ExpectStatus {
@@ -2997,10 +2908,28 @@ mod tests {
 
     #[tokio::test]
     async fn a_managed_monitor_without_a_public_address_probes_through_the_local_proxy() {
-        // A plain local install: the preview domain is `localho.st`, so
-        // nobody else can reach the app, but Temps' own proxy serves it. The
-        // managed monitor probes there and reports the app's health, as it
-        // did before ADR 068.
+        probe_on_a_local_install(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_monitor_created_by_hand_without_a_public_address_probes_through_the_local_proxy() {
+        // Not managed, so the probe dials the public name first. It resolves
+        // to this computer, which is not public, so the probe falls back to
+        // the local proxy as before ADR 068 -- never to `no_address`.
+        if tokio::net::lookup_host("proj-env-1.localho.st:80")
+            .await
+            .is_err()
+        {
+            println!("proj-env-1.localho.st does not resolve here, skipping");
+            return;
+        }
+        probe_on_a_local_install(false).await;
+    }
+
+    /// A plain local install: the preview domain is `localho.st`, so nobody
+    /// else can reach the app, but Temps' own proxy serves it. The monitor
+    /// probes there and reports the app's health, as it did before ADR 068.
+    async fn probe_on_a_local_install(is_managed: bool) {
         use sea_orm::{DatabaseBackend, MockDatabase};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3018,7 +2947,7 @@ mod tests {
             request
         });
         let mut monitor = make_monitor(1, Some(1));
-        monitor.is_managed = true;
+        monitor.is_managed = is_managed;
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![make_env(1, false)]])
             .append_query_results([vec![health_probe_deployment()]])
@@ -3071,35 +3000,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_managed_monitor_that_would_dial_out_records_no_address() {
-        // With an external URL the probe would go out over the public
-        // internet, where nobody can reach the environment: nothing to probe.
+    async fn an_unresolved_name_with_nothing_set_up_records_no_address() {
+        // The probe goes where it always went: out over the public internet
+        // for a monitor created by hand, or for a managed one behind an
+        // external URL. The name does not resolve (`.invalid` never does,
+        // RFC 6761) and the environment was never given an address, so the
+        // failure is `no_address` rather than an outage.
         use sea_orm::{DatabaseBackend, MockDatabase};
-        let mut monitor = make_monitor(1, Some(1));
-        monitor.is_managed = true;
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![make_env(1, false)]])
-            .append_query_results([vec![health_probe_deployment()]])
-            .append_query_results([vec![health_probe_counts(1, 1)]])
-            .append_query_results([vec![settings_row(temps_core::AppSettings {
-                preview_domain: "apps.example.invalid".into(),
-                external_url: Some("https://temps.example.invalid".into()),
-                ..temps_core::AppSettings::default()
-            })]]);
-        let db = Arc::new(persisted_check(db, &monitor, NO_ADDRESS_STATUS).into_connection());
-        let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(
-            None,
-            Some("proj-env-1.apps.example.invalid does not resolve"),
-        )));
-        HealthCheckService::check_monitor_with(
-            db.clone(),
-            test_config_service(&db, "postgres://localhost/test"),
-            monitor,
-            Arc::new(ExpectStatus(NO_ADDRESS_STATUS)),
-            Some(addresses),
-        )
-        .await
-        .expect("no_address is recorded");
+        for (is_managed, external_url) in [
+            (false, None),
+            (true, Some("https://temps.example.invalid".to_string())),
+        ] {
+            let mut monitor = make_monitor(1, Some(1));
+            monitor.is_managed = is_managed;
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![health_probe_counts(1, 1)]])
+                .append_query_results([vec![settings_row(temps_core::AppSettings {
+                    preview_domain: "apps.example.invalid".into(),
+                    external_url,
+                    ..temps_core::AppSettings::default()
+                })]]);
+            let db = Arc::new(persisted_check(db, &monitor, NO_ADDRESS_STATUS).into_connection());
+            let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(
+                None,
+                Some("proj-env-1.apps.example.invalid does not resolve"),
+            )));
+            HealthCheckService::check_monitor_with(
+                db.clone(),
+                test_config_service(&db, "postgres://localhost/test"),
+                monitor,
+                Arc::new(ExpectStatus(NO_ADDRESS_STATUS)),
+                Some(addresses),
+            )
+            .await
+            .expect("no_address is recorded");
+            let log = format!(
+                "{:?}",
+                Arc::try_unwrap(db)
+                    .expect("one owner")
+                    .into_transaction_log()
+            );
+            assert!(log.contains("no_address"), "managed={is_managed}: {log}");
+        }
     }
 
     #[tokio::test]

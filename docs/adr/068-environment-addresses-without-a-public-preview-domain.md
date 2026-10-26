@@ -150,22 +150,25 @@ covers it, its audience is one routing does not serve, or nothing is
 deployed:
 
 - the open button is disabled with the reason;
-- the uptime monitor probes through Temps' own proxy when it can: a managed
-  monitor whose URL is not an external one is served by this install's proxy
-  whether or not anyone else can reach the app, so it keeps probing there
-  and reports the app's health as before (a plain local install on
-  `localho.st` stays green when the app is up);
-- `no_address` is only for a monitor with nothing to probe: one that would
-  have to dial the address publicly (a monitor created by hand, or an
-  external URL). It reports `no_address` ("nothing to check: nobody can
-  reach this environment yet"), drawn grey, never `down`;
+- the uptime monitor probes exactly as it did before this ADR, managed or
+  created by hand: through this install's own proxy when the name resolves
+  to this machine or the monitor is managed, out over the public internet
+  otherwise. A plain local install on `localho.st` stays green when the app
+  is up;
+- `no_address` only replaces one failure: the probe's hostname does not
+  resolve, and the environment was never given an address. That probe
+  would have recorded a "DNS resolution failed" outage; it reports
+  `no_address` ("nothing to check: nobody can reach this environment yet")
+  instead, drawn grey, never `down`. Every check that succeeded before still
+  succeeds, and every other failure (refused, timeout, 5xx) is still one;
 - the monitor resumes on the next primary address without being recreated.
 
 A way in that was set up and broke is an outage, not `no_address`: a tunnel
 whose publication is in error, a worker or the control plane failing its
 direct check, a custom or environment domain whose DNS record went away. The
 monitor then probes the generated URL as before and records `down` or
-`major_outage`.
+`major_outage`, including a "DNS resolution failed" outage for a name that
+no longer resolves.
 
 A monitor whose check path was set by the user keeps that path on the new
 address. A monitor created by hand with an explicit URL is not changed.
@@ -246,11 +249,11 @@ reachable". It is done when the preview domain is `usable` or a tunnel has
   addresses are not public -- `private` (including tailnet names), `signed_in`
   or `tailnet_users` (ADR 064, ADR 065) -- is refused: those audiences are
   set per address, and a generated host must not widen them.
-- The D4 monitor change removes a probe; it adds no outbound request. The
-  monitor probes through Temps' own proxy when it can; `no_address` is only
-  recorded when there is nothing to probe: no way in was ever set up for any
-  of the environment's addresses, and the probe could not go through this
-  install's proxy (a monitor created by hand, or an external URL). It is not
+- The D4 monitor change adds no outbound request and removes none. The
+  monitor probes exactly as before (through Temps' own proxy when it can);
+  `no_address` only relabels a probe whose hostname did not resolve, and
+  only when no way in was ever set up for any of the environment's
+  addresses. It is not
   a way to silence a real outage: a way in that broke (a tunnel in error, a
   failed direct check, a custom domain losing its DNS record) keeps the
   probe and is recorded as an outage, and a local-proxy probe that fails is
@@ -313,13 +316,18 @@ or the code reads it a particular way, the choice is listed here.
   address is used. There is no per-monitor explicit URL in the schema today
   (only `check_path`), so "a monitor created with an explicit URL is not
   changed" has nothing to apply to yet.
-- **A local install keeps its health signal.** With no reachable address, a
-  managed monitor whose URL is not an external one still probes through the
-  local proxy (`should_route_probe_locally`), exactly as before ADR 068, so
+- **A local install keeps its health signal.** With no reachable address,
+  every monitor probes exactly as before ADR 068: a managed one through the
+  local proxy (`should_route_probe_locally`), one created by hand through
+  the local proxy too once its name resolves to a non-public address. So
   "nobody else can reach it" never hides "the app is down" or "the app is
-  up". The red dot that motivated D4 came from probes that dial out
-  publicly, which is the only case that records `no_address`. A failure to
-  build the generated URL is still `degraded`, as before.
+  up". The first cut of this change stopped probing instead, which turned a
+  working local install's monitors grey; it now only relabels the outcome
+  that was already a failure. The red dot that motivated D4 was a probe
+  whose name did not resolve (an external URL, or a host with no record),
+  and that `PublicProbeTarget::Unresolved` result, with `has_no_address()`,
+  is the only case that records `no_address`. A failure to build the
+  generated URL is still `degraded`, as before.
 - **`no_address` is neutral everywhere.** It is excluded from uptime coverage
   and status buckets like the bootstrap `unknown` row, is skipped by outage
   detection (an open incident is neither resolved nor escalated by it, in
