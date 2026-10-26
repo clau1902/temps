@@ -31,14 +31,27 @@ export function addressUrl(address: string): string {
   return /^https?:\/\//.test(address) ? address : `https://${address}`
 }
 
-/** The best address to show: reachable custom domains before generated ones. */
+/**
+ * The best address to show. The backend names the environment's primary
+ * address (ADR 068 D4: custom domain, tunnel host, generated host, private
+ * address); without one the console falls back to the same order itself.
+ */
 export function bestAddress(
-  addresses: AddressReachability[]
+  addresses: AddressReachability[],
+  primary?: string | null
 ): AddressReachability | undefined {
   const reachable = addresses.filter((a) => a.state === 'reachable')
+  const named = primary
+    ? reachable.find(
+        (a) => a.address.toLowerCase() === primary.toLowerCase()
+      )
+    : undefined
   return (
+    named ??
     reachable.find((a) => a.source === 'custom_domain') ??
     reachable.find((a) => a.source === 'environment_domain') ??
+    reachable.find((a) => a.source === 'tunnel_host') ??
+    reachable.find((a) => a.audience !== 'private') ??
     reachable[0]
   )
 }
@@ -47,7 +60,10 @@ export function bestAddress(
 export function reachabilityHeadline(
   reachability: EnvironmentReachability
 ): ReachabilityHeadline {
-  const best = bestAddress(reachability.addresses)
+  const best = bestAddress(
+    reachability.addresses,
+    reachability.primary_address?.address
+  )
   if (best?.audience === 'private')
     return {
       kind: 'private',

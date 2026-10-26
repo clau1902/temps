@@ -19349,6 +19349,7 @@
       "DeploymentEnvironmentResponse": {
         "properties": {
           "domains": {
+            "description": "Best first: the primary address (ADR 068 D4) leads when it is known.",
             "items": {
               "type": "string"
             },
@@ -19360,6 +19361,20 @@
           },
           "name": {
             "type": "string"
+          },
+          "no_address_reason": {
+            "description": "Why nobody can reach the environment; set only when Temps is sure.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_url": {
+            "description": "The environment's primary address as a URL. `null` while it is not\nknown, or when nobody can reach the environment.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "service_urls": {
             "description": "Public URLs of this environment's Docker Compose services, one per\nconfigured public port. Empty for non-Compose projects.",
@@ -19975,6 +19990,17 @@
           "project_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "reachability_warning": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachabilityWarning",
+                "description": "ADR 068 D5: set on the environment's current, completed deployment\nwhen nobody can open it, with the fixes that fit this install. The\ndeployment itself stays successful."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "screenshot_location": {
             "type": [
@@ -45671,6 +45697,43 @@
         ],
         "type": "object"
       },
+      "PreviewDomainStatus": {
+        "description": "D2: whether the preview domain can be reached at all.",
+        "enum": [
+          "local_only",
+          "unresolved",
+          "no_way_in",
+          "usable"
+        ],
+        "type": "string"
+      },
+      "PreviewDomainStatusResponse": {
+        "description": "`GET /settings/preview-domain/status` (ADR 068 D2).",
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "preview_domain": {
+            "example": "apps.example.com",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why, in words.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PreviewDomainStatus"
+          }
+        },
+        "required": [
+          "preview_domain",
+          "status",
+          "reason",
+          "checked_at"
+        ],
+        "type": "object"
+      },
       "PreviewGatewayLogsResponse": {
         "properties": {
           "lines": {
@@ -47074,6 +47137,17 @@
           "pull_only_root_directory": {
             "description": "When true, deploy clones only `directory` via git sparse-checkout.",
             "type": "boolean"
+          },
+          "reachability_warning": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachabilityWarning",
+                "description": "ADR 068 D5: nobody can open the production environment's current\ndeployment, and how to fix it. Computed on the single-project detail\nresponses only; `null` there means there is nothing to warn about."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "repo_name": {
             "type": [
@@ -50110,6 +50184,62 @@
         },
         "type": "object"
       },
+      "ReachabilityFix": {
+        "properties": {
+          "command": {
+            "description": "The command to run, when that is the fix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "connector_id": {
+            "description": "For the tunnel fix: the connector that would carry it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "hostname": {
+            "description": "For the tunnel fix: the hostname it would get.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "href": {
+            "description": "The console page that applies it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ReachabilityFixKind"
+          },
+          "label": {
+            "description": "What the button and the log line say.",
+            "example": "Publish it through tunnel 'homelab' as myapp-production.example.com",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "label"
+        ],
+        "type": "object"
+      },
+      "ReachabilityFixKind": {
+        "description": "One way to fix a [`ReachabilityWarning`], in the order D5 lists them.",
+        "enum": [
+          "tunnel_environment_hosts",
+          "preview_domain",
+          "custom_domain",
+          "worker_ingress"
+        ],
+        "type": "string"
+      },
       "ReachabilityStatus": {
         "description": "Email reachability status",
         "enum": [
@@ -50119,6 +50249,43 @@
           "unknown"
         ],
         "type": "string"
+      },
+      "ReachabilityWarning": {
+        "description": "D5: a successful deploy nobody can open. Computed, never stored.",
+        "properties": {
+          "environment": {
+            "description": "The environment's label, as visitors would see it in a hostname.",
+            "example": "myapp-production",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "fixes": {
+            "description": "The fixes that fit this install, best first.",
+            "items": {
+              "$ref": "#/components/schemas/ReachabilityFix"
+            },
+            "type": "array"
+          },
+          "headline": {
+            "description": "`Deployed, but nobody can reach <label> yet`.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why, about the address visitors would try first.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "environment",
+          "headline",
+          "reason",
+          "fixes"
+        ],
+        "type": "object"
       },
       "ReadFileResponse": {
         "properties": {
@@ -145640,6 +145807,41 @@
         ],
         "tags": [
           "Agents"
+        ]
+      }
+    },
+    "/settings/preview-domain/status": {
+      "get": {
+        "description": "`local_only` (`localhost`, `localho.st`), `unresolved` (a name under it\ndoes not resolve), `no_way_in` (it resolves, but to nothing this install\nserves publicly) or `usable`. Recomputed when the setting, the tunnels or\nthe nodes' public ingress change, and every 30 minutes.",
+        "operationId": "get_preview_domain_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewDomainStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether the preview domain can be reached.",
+        "tags": [
+          "Reachability"
         ]
       }
     },

@@ -31,7 +31,10 @@ export function LastDeployment({
   projectName,
   screenshotsEnabled,
 }: LastDeploymentProps) {
-  const primaryUrl = deployment.environment.domains[0] ?? deployment.url
+  const primaryUrl =
+    deployment.environment.primary_url ??
+    deployment.environment.domains[0] ??
+    deployment.url
   const primaryHref = normalizeUrl(primaryUrl)
   // Additional public Docker Compose service ports each have their own URL;
   // the first is normally the environment URL shown above.

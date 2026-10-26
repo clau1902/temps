@@ -2157,8 +2157,64 @@ impl NotificationService {
     }
 
     pub async fn send_notification(&self, notification: Notification) -> Result<()> {
+        let batch_key = Self::get_batch_key(&notification);
+        self.send_with_batch_key(notification, batch_key).await
+    }
+
+    /// The marker an episode's row carries once its condition cleared
+    /// (ADR 068 D5).
+    const EPISODE_CLEARED_AT: &'static str = "episode_cleared_at";
+
+    /// The newest row under `batch_key`, when its episode is still open.
+    async fn open_episode_row(&self, batch_key: &str) -> Result<Option<notifications::Model>> {
+        let latest = notifications::Entity::find()
+            .filter(notifications::Column::BatchKey.eq(batch_key))
+            .order_by_desc(notifications::Column::CreatedAt)
+            .one(self.db.as_ref())
+            .await?;
+        Ok(latest.filter(|row| !episode_cleared(&row.metadata)))
+    }
+
+    /// Send once per episode under `batch_key`; see
+    /// [`temps_core::notifications::NotificationService::open_episode`].
+    pub async fn open_episode(&self, batch_key: &str, notification: Notification) -> Result<bool> {
+        if self.open_episode_row(batch_key).await?.is_some() {
+            return Ok(false);
+        }
+        let notification = Notification {
+            bypass_throttling: true,
+            ..notification
+        };
+        self.send_with_batch_key(notification, batch_key.to_string())
+            .await?;
+        info!(batch_key, "opened a notification episode");
+        Ok(true)
+    }
+
+    /// Mark the open episode under `batch_key` cleared, if there is one.
+    pub async fn close_episode(&self, batch_key: &str) -> Result<()> {
+        let Some(row) = self.open_episode_row(batch_key).await? else {
+            return Ok(());
+        };
+        let mut metadata: std::collections::HashMap<String, String> =
+            serde_json::from_str(&row.metadata).unwrap_or_default();
+        metadata.insert(
+            Self::EPISODE_CLEARED_AT.to_string(),
+            Utc::now().to_rfc3339(),
+        );
+        let mut update: notifications::ActiveModel = row.into();
+        update.metadata = Set(serde_json::to_string(&metadata)?);
+        update.update(self.db.as_ref()).await?;
+        info!(batch_key, "closed a notification episode");
+        Ok(())
+    }
+
+    async fn send_with_batch_key(
+        &self,
+        notification: Notification,
+        batch_key_str: String,
+    ) -> Result<()> {
         let now = Utc::now();
-        let batch_key_str = Self::get_batch_key(&notification);
 
         // Check for existing similar notifications
         let existing = notifications::Entity::find()
@@ -2925,39 +2981,33 @@ impl CoreNotificationService for NotificationService {
         &self,
         notification_data: NotificationData,
     ) -> Result<(), CoreNotificationError> {
-        // Convert NotificationData to our internal Notification format
-        let notification = Notification {
-            id: notification_data.id,
-            title: notification_data.title,
-            message: notification_data.message,
-            notification_type: match notification_data.notification_type {
-                temps_core::notifications::NotificationType::Info => NotificationType::Info,
-                temps_core::notifications::NotificationType::Warning => NotificationType::Warning,
-                temps_core::notifications::NotificationType::Error => NotificationType::Error,
-                temps_core::notifications::NotificationType::Alert => NotificationType::Alert,
-            },
-            priority: match notification_data.priority {
-                temps_core::notifications::NotificationPriority::Low => NotificationPriority::Low,
-                temps_core::notifications::NotificationPriority::Normal => {
-                    NotificationPriority::Normal
-                }
-                temps_core::notifications::NotificationPriority::High => NotificationPriority::High,
-                temps_core::notifications::NotificationPriority::Critical => {
-                    NotificationPriority::Critical
-                }
-            },
-            severity: notification_data
-                .severity
-                .and_then(|s| NotificationSeverity::from_str(&s)),
-            timestamp: notification_data.timestamp,
-            metadata: notification_data.metadata,
-            bypass_throttling: notification_data.bypass_throttling,
-        };
-
+        let notification = notification_from_core(notification_data);
         match self.send_notification(notification).await {
             Ok(_) => Ok(()),
             Err(e) => Err(CoreNotificationError::SendError(e.to_string())),
         }
+    }
+
+    async fn open_episode(
+        &self,
+        batch_key: &str,
+        notification: NotificationData,
+    ) -> Result<bool, CoreNotificationError> {
+        self.open_episode(batch_key, notification_from_core(notification))
+            .await
+            .map_err(|e| {
+                CoreNotificationError::SendError(format!(
+                    "Could not open notification episode '{batch_key}': {e}"
+                ))
+            })
+    }
+
+    async fn close_episode(&self, batch_key: &str) -> Result<(), CoreNotificationError> {
+        self.close_episode(batch_key).await.map_err(|e| {
+            CoreNotificationError::SendError(format!(
+                "Could not close notification episode '{batch_key}': {e}"
+            ))
+        })
     }
 
     async fn is_configured(&self) -> Result<bool, CoreNotificationError> {
@@ -2977,6 +3027,42 @@ impl CoreNotificationService for NotificationService {
             .await
             .map(Some)
             .map_err(|e| CoreNotificationError::ConfigurationError(e.to_string()))
+    }
+}
+
+/// Whether an episode row's metadata says its condition cleared.
+fn episode_cleared(metadata: &str) -> bool {
+    serde_json::from_str::<std::collections::HashMap<String, String>>(metadata)
+        .map(|m| m.contains_key(NotificationService::EPISODE_CLEARED_AT))
+        .unwrap_or(false)
+}
+
+/// The core trait's notification as this crate's.
+fn notification_from_core(notification_data: NotificationData) -> Notification {
+    Notification {
+        id: notification_data.id,
+        title: notification_data.title,
+        message: notification_data.message,
+        notification_type: match notification_data.notification_type {
+            temps_core::notifications::NotificationType::Info => NotificationType::Info,
+            temps_core::notifications::NotificationType::Warning => NotificationType::Warning,
+            temps_core::notifications::NotificationType::Error => NotificationType::Error,
+            temps_core::notifications::NotificationType::Alert => NotificationType::Alert,
+        },
+        priority: match notification_data.priority {
+            temps_core::notifications::NotificationPriority::Low => NotificationPriority::Low,
+            temps_core::notifications::NotificationPriority::Normal => NotificationPriority::Normal,
+            temps_core::notifications::NotificationPriority::High => NotificationPriority::High,
+            temps_core::notifications::NotificationPriority::Critical => {
+                NotificationPriority::Critical
+            }
+        },
+        severity: notification_data
+            .severity
+            .and_then(|s| NotificationSeverity::from_str(&s)),
+        timestamp: notification_data.timestamp,
+        metadata: notification_data.metadata,
+        bypass_throttling: notification_data.bypass_throttling,
     }
 }
 
@@ -3330,6 +3416,108 @@ mod tests {
             encryption_service,
             cloud: Some(cloud),
         }
+    }
+
+    fn episode_row(metadata: &str) -> notifications::Model {
+        notifications::Model {
+            id: 7,
+            notification_id: "n-7".to_string(),
+            title: "Nobody can reach production yet".to_string(),
+            message: "m".to_string(),
+            notification_type: "warning".to_string(),
+            priority: "normal".to_string(),
+            metadata: metadata.to_string(),
+            created_at: Utc::now(),
+            sent_at: None,
+            batch_key: "reachability:4".to_string(),
+            occurrence_count: 1,
+            next_allowed_at: Utc::now(),
+            is_read: false,
+            read_at: None,
+        }
+    }
+
+    fn episode_service(db: Arc<DatabaseConnection>) -> NotificationService {
+        NotificationService {
+            routing_service: NotificationRoutingService::new(db.clone()),
+            db,
+            encryption_service: Arc::new(temps_core::EncryptionService::new_from_password(
+                "notification-episode-test",
+            )),
+            cloud: None,
+        }
+    }
+
+    #[test]
+    fn an_episode_is_cleared_only_by_its_marker() {
+        assert!(!episode_cleared("{}"));
+        assert!(!episode_cleared("not json"));
+        assert!(episode_cleared(
+            r#"{"episode_cleared_at":"2026-10-25T10:00:00Z","kind":"reachability"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_open_episode_is_not_sent_again() {
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![episode_row(r#"{"kind":"reachability"}"#)]])
+                .into_connection(),
+        );
+        let service = episode_service(db.clone());
+        let sent = service
+            .open_episode("reachability:4", create_test_notification())
+            .await
+            .unwrap();
+        assert!(!sent, "a warning that persists must notify once");
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 1, "only the lookup runs: nothing is inserted");
+    }
+
+    #[tokio::test]
+    async fn closing_an_episode_marks_the_newest_row() {
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![episode_row(r#"{"kind":"reachability"}"#)]])
+                .append_query_results([vec![episode_row(
+                    r#"{"episode_cleared_at":"2026-10-25T10:00:00Z","kind":"reachability"}"#,
+                )]])
+                .into_connection(),
+        );
+        let service = episode_service(db.clone());
+        service.close_episode("reachability:4").await.unwrap();
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 2);
+        let update = &log[1].statements()[0];
+        assert!(update.sql.starts_with("UPDATE"));
+        assert!(
+            format!("{:?}", update.values).contains("episode_cleared_at"),
+            "the marker is written into the row's metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cleared_episode_is_not_closed_twice() {
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![episode_row(
+                    r#"{"episode_cleared_at":"2026-10-25T10:00:00Z"}"#,
+                )]])
+                .into_connection(),
+        );
+        let service = episode_service(db.clone());
+        service.close_episode("reachability:4").await.unwrap();
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 1, "no update for an episode already closed");
     }
 
     #[tokio::test]

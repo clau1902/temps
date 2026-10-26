@@ -158,7 +158,7 @@ pub struct ReachabilityDeps {
 }
 
 pub struct ReachabilityService {
-    deps: Arc<ReachabilityDeps>,
+    pub(super) deps: Arc<ReachabilityDeps>,
     http: reqwest::Client,
     /// Environments with a run in progress: one at a time each.
     active: Arc<Mutex<HashSet<i32>>>,
@@ -166,16 +166,19 @@ pub struct ReachabilityService {
 }
 
 /// The environment and project a request is about.
-struct Scope {
-    project: projects::Model,
-    environment: environments::Model,
+pub(super) struct Scope {
+    pub(super) project: projects::Model,
+    pub(super) environment: environments::Model,
 }
 
 /// What the service knows about an environment's addresses.
-struct Gathered {
-    addresses: Vec<AddressInput>,
-    running_on: Vec<String>,
-    deployed: bool,
+pub(super) struct Gathered {
+    pub(super) addresses: Vec<AddressInput>,
+    pub(super) running_on: Vec<String>,
+    /// Every container of the current deployment runs on a worker, which is
+    /// what a tunnel can carry (ADR 058).
+    pub(super) on_workers: bool,
+    pub(super) deployed: bool,
 }
 
 impl ReachabilityService {
@@ -343,7 +346,7 @@ impl ReachabilityService {
 
     // ----- scope and facts ----------------------------------------------
 
-    async fn scope(
+    pub(super) async fn scope(
         &self,
         project_id: i32,
         environment_id: i32,
@@ -371,7 +374,7 @@ impl ReachabilityService {
         })
     }
 
-    async fn settings(&self) -> Result<temps_core::AppSettings, ReachabilityError> {
+    pub(super) async fn settings(&self) -> Result<temps_core::AppSettings, ReachabilityError> {
         self.deps
             .config
             .get_settings()
@@ -382,7 +385,7 @@ impl ReachabilityService {
     /// Every address attached to the environment: the generated hostname,
     /// environment domains and custom domains (redirects and wildcards left
     /// out: nobody lands on those to use the app).
-    async fn gather(
+    pub(super) async fn gather(
         &self,
         environment: &environments::Model,
         preview_domain: &str,
@@ -441,10 +444,17 @@ impl ReachabilityService {
             .await?;
         for domain in env_domains {
             let audience = Audience::parse(&domain.audience);
+            // A label (no dot) is served under the preview domain: it is a
+            // generated host, not one the user chose (ADR 068 D4).
+            let source = if domain.domain.contains('.') {
+                AddressSource::EnvironmentDomain
+            } else {
+                AddressSource::Generated
+            };
             push(
                 expand(&domain.domain),
                 audience,
-                AddressSource::EnvironmentDomain,
+                source,
                 None,
                 (audience == Audience::Private).then(|| PrivateBinding {
                     address_id: private_address_id(false, domain.id),
@@ -466,6 +476,7 @@ impl ReachabilityService {
         }
 
         let mut running_on = Vec::new();
+        let mut on_workers = false;
         if let Some(deployment_id) = environment.current_deployment_id {
             let containers = deployment_containers::Entity::find()
                 .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
@@ -491,17 +502,19 @@ impl ReachabilityService {
                 });
             }
             running_on = place.into_iter().collect();
+            on_workers = !containers.is_empty() && containers.iter().all(|c| c.node_id.is_some());
         }
         Ok(Gathered {
             addresses,
             running_on,
+            on_workers,
             deployed: environment.current_deployment_id.is_some(),
         })
     }
 
     /// The control plane's proxy and every worker's direct ingress, with the
     /// public addresses DNS would point at.
-    async fn directs(&self, settings: &temps_core::AppSettings) -> Vec<DirectIngress> {
+    pub(super) async fn directs(&self, settings: &temps_core::AppSettings) -> Vec<DirectIngress> {
         let mut directs = Vec::new();
         let server = self.deps.config.get_server_config();
         let takes_port_80 = server
@@ -689,7 +702,7 @@ impl ReachabilityService {
             .collect()
     }
 
-    async fn judge(
+    pub(super) async fn judge(
         &self,
         addresses: &[AddressInput],
         directs: &[DirectIngress],
@@ -761,6 +774,7 @@ impl ReachabilityService {
         Ok(EnvironmentReachability {
             project_id,
             environment_id,
+            primary_address: super::addresses::primary_address(&addresses),
             environment_name: scope.environment.name.clone(),
             deployed: gathered.deployed,
             summary: summary(
@@ -1896,7 +1910,7 @@ pub async fn private_rule(
 }
 
 /// Look up `host`. `Ok(empty)` when it has no address record.
-async fn resolve(host: &str) -> Result<Vec<IpAddr>, String> {
+pub(super) async fn resolve(host: &str) -> Result<Vec<IpAddr>, String> {
     if let Some(ip) = parse_reported_ip(host) {
         return Ok(vec![ip]);
     }

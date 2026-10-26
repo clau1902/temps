@@ -9374,9 +9374,21 @@ export type DeploymentContainerLogsListResponse = {
 };
 
 export type DeploymentEnvironmentResponse = {
+    /**
+     * Best first: the primary address (ADR 068 D4) leads when it is known.
+     */
     domains: Array<string>;
     id: number;
     name: string;
+    /**
+     * Why nobody can reach the environment; set only when Temps is sure.
+     */
+    no_address_reason?: string | null;
+    /**
+     * The environment's primary address as a URL. `null` while it is not
+     * known, or when nobody can reach the environment.
+     */
+    primary_url?: string | null;
     /**
      * Public URLs of this environment's Docker Compose services, one per
      * configured public port. Empty for non-Compose projects.
@@ -9613,6 +9625,7 @@ export type DeploymentResponse = {
     is_current: boolean;
     metadata?: DeploymentMetadata | null;
     project_id: number;
+    reachability_warning?: ReachabilityWarning | null;
     screenshot_location?: string | null;
     started_at?: number | null;
     status: string;
@@ -21573,6 +21586,24 @@ export type PreviewDomainDeliveryBindingRequest = {
     zone: string;
 };
 
+/**
+ * D2: whether the preview domain can be reached at all.
+ */
+export type PreviewDomainStatus = 'local_only' | 'unresolved' | 'no_way_in' | 'usable';
+
+/**
+ * `GET /settings/preview-domain/status` (ADR 068 D2).
+ */
+export type PreviewDomainStatusResponse = {
+    checked_at: string;
+    preview_domain: string;
+    /**
+     * Why, in words.
+     */
+    reason: string;
+    status: PreviewDomainStatus;
+};
+
 export type PreviewGatewayLogsResponse = {
     lines: Array<string>;
 };
@@ -21714,6 +21745,22 @@ export type PreviewShareLinkResponse = {
 
 export type PricingResponse = {
     models: Array<ModelPricing>;
+};
+
+/**
+ * The address every surface means by "the app's address".
+ */
+export type PrimaryAddress = {
+    /**
+     * The hostname, without a scheme.
+     */
+    address: string;
+    kind: AddressKind;
+    /**
+     * How traffic gets in, as ADR 064 D3 names it (`tunnel:<name>`,
+     * `direct:<node>`, `private:<node>`).
+     */
+    way_in?: string | null;
 };
 
 /**
@@ -22367,6 +22414,7 @@ export type ProjectResponse = {
      * When true, deploy clones only `directory` via git sparse-checkout.
      */
     pull_only_root_directory: boolean;
+    reachability_warning?: ReachabilityWarning | null;
     repo_name?: string | null;
     repo_owner?: string | null;
     /**
@@ -23737,6 +23785,29 @@ export type RateLimitSettings = {
  * Email reachability status
  */
 export type ReachabilityStatus = 'safe' | 'risky' | 'invalid' | 'unknown';
+
+/**
+ * D5: a successful deploy nobody can open. Computed, never stored.
+ */
+export type ReachabilityWarning = {
+    /**
+     * The environment's label, as visitors would see it in a hostname.
+     */
+    environment: string;
+    environment_id: number;
+    /**
+     * The fixes that fit this install, best first.
+     */
+    fixes: Array<ReachabilityFix>;
+    /**
+     * `Deployed, but nobody can reach <label> yet`.
+     */
+    headline: string;
+    /**
+     * Why, about the address visitors would try first.
+     */
+    reason: string;
+};
 
 export type ReadFileResponse = {
     /**
@@ -78405,6 +78476,34 @@ export type RevealGlobalMcpConfigResponses = {
 
 export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
 
+export type GetPreviewDomainStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/preview-domain/status';
+};
+
+export type GetPreviewDomainStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPreviewDomainStatusResponses = {
+    200: PreviewDomainStatusResponse;
+};
+
+export type GetPreviewDomainStatusResponse = GetPreviewDomainStatusResponses[keyof GetPreviewDomainStatusResponses];
+
 export type GetPublicIngressStatusData = {
     body?: never;
     path?: never;
@@ -83595,10 +83694,39 @@ export type Audience = 'public' | 'private' | 'signed_in' | 'unsupported';
 
 export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
 
+export type ReachabilityFix = {
+    /**
+     * The command to run, when that is the fix.
+     */
+    command?: string | null;
+    /**
+     * For the tunnel fix: the connector that would carry it.
+     */
+    connector_id?: number | null;
+    /**
+     * For the tunnel fix: the hostname it would get.
+     */
+    hostname?: string | null;
+    /**
+     * The console page that applies it.
+     */
+    href?: string | null;
+    kind: ReachabilityFixKind;
+    /**
+     * What the button and the log line say.
+     */
+    label: string;
+};
+
+/**
+ * One way to fix a [`ReachabilityWarning`], in the order D5 lists them.
+ */
+export type ReachabilityFixKind = 'tunnel_environment_hosts' | 'preview_domain' | 'custom_domain' | 'worker_ingress';
+
 /**
  * Where an address comes from.
  */
-export type AddressSource = 'generated' | 'environment_domain' | 'custom_domain';
+export type AddressSource = 'generated' | 'environment_domain' | 'custom_domain' | 'tunnel_host';
 
 export type ActionKind = 'make_reachable' | 'deploy' | 'set_dns_record' | 'open_ingress' | 'open_worker' | 'wait' | 'run_command';
 
@@ -83747,6 +83875,7 @@ export type EnvironmentReachability = {
      * What *Make it reachable* would do, while no address is reachable.
      */
     plan?: null | ReachabilityPlan;
+    primary_address?: PrimaryAddress | null;
     project_id: number;
     /**
      * The nodes its containers run on (`control plane` for the local one).
@@ -83904,6 +84033,11 @@ export type AddressAudience = {
     private_node_id?: number | null;
     private_listener?: string | null;
 };
+
+/**
+ * What kind of address the primary one is, in D4's order.
+ */
+export type AddressKind = 'custom_domain' | 'tunnel_host' | 'generated' | 'private';
 
 /**
  * A hostname's ADR 058 D9 choice before a run changed it, so undo puts it

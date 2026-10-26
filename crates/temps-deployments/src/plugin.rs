@@ -141,6 +141,11 @@ impl TempsPlugin for DeploymentsPlugin {
             ));
             // Wire telemetry for deploy-funnel events (rollback_triggered).
             deployment_service.set_telemetry(telemetry.clone());
+            let environment_addresses =
+                context.get_service::<temps_core::environment_address::EnvironmentAddressSlot>();
+            if let Some(slot) = environment_addresses.clone() {
+                deployment_service.set_environment_addresses(slot);
+            }
             context.register_service(deployment_service.clone());
             let runtime_resolver =
                 deployment_service.clone() as Arc<dyn temps_monitoring::ContainerRuntimeResolver>;
@@ -475,6 +480,9 @@ impl TempsPlugin for DeploymentsPlugin {
             // deploy_succeeded, deploy_failed, first_deploy_succeeded).
             workflow_execution_service.set_telemetry(telemetry.clone());
             tracing::debug!("Telemetry wired into workflow execution service");
+            if let Some(slot) = environment_addresses.clone() {
+                workflow_execution_service.set_environment_addresses(slot);
+            }
 
             // The audit sink is wired in `initialize_plugin_services`, which is
             // the first phase where every plugin has registered.

@@ -591,7 +591,7 @@ pub fn summary(
 ) -> String {
     let rank = |a: &AddressReachability| match a.source {
         AddressSource::CustomDomain => 0,
-        AddressSource::EnvironmentDomain => 1,
+        AddressSource::EnvironmentDomain | AddressSource::TunnelHost => 1,
         AddressSource::Generated => 2,
     };
     let best = |state: ReachState| {

@@ -75,6 +75,8 @@ pub enum AddressSource {
     EnvironmentDomain,
     /// A project custom domain.
     CustomDomain,
+    /// The environment domain under a tunnel's zone (ADR 068 D3).
+    TunnelHost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -170,6 +172,9 @@ pub struct EnvironmentReachability {
     pub addresses: Vec<AddressReachability>,
     /// What *Make it reachable* would do, while no address is reachable.
     pub plan: Option<ReachabilityPlan>,
+    /// The address every surface means by "the app's address" (ADR 068
+    /// D4); `None` while no address is reachable.
+    pub primary_address: Option<temps_core::environment_address::PrimaryAddress>,
 }
 
 /// `POST …/reachability/plan`.

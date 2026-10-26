@@ -9332,9 +9332,21 @@ export type DeploymentContainerLogsListResponse = {
 };
 
 export type DeploymentEnvironmentResponse = {
+    /**
+     * Best first: the primary address (ADR 068 D4) leads when it is known.
+     */
     domains: Array<string>;
     id: number;
     name: string;
+    /**
+     * Why nobody can reach the environment; set only when Temps is sure.
+     */
+    no_address_reason?: string | null;
+    /**
+     * The environment's primary address as a URL. `null` while it is not
+     * known, or when nobody can reach the environment.
+     */
+    primary_url?: string | null;
     /**
      * Public URLs of this environment's Docker Compose services, one per
      * configured public port. Empty for non-Compose projects.
@@ -9571,6 +9583,7 @@ export type DeploymentResponse = {
     is_current: boolean;
     metadata?: DeploymentMetadata | null;
     project_id: number;
+    reachability_warning?: ReachabilityWarning | null;
     screenshot_location?: string | null;
     started_at?: number | null;
     status: string;
@@ -17520,6 +17533,7 @@ export type MeshEnrollApiRequest = {
      * The name the worker will register under.
      */
     name: string;
+    rejoin_proof?: SecretString | null;
     /**
      * The worker's base64 WireGuard public key. The private key never
      * leaves the worker.
@@ -17550,8 +17564,8 @@ export type MeshEnrollResponse = {
      */
     expires_at: string;
     /**
-     * Single-use join token bound to `name`, accepted only over the mesh
-     * node API from `node_address`.
+     * Single-use join token bound to `name`. A new pairing's is accepted
+     * only over the mesh node API from `node_address`.
      */
     join_token: string;
     /**
@@ -17559,7 +17573,7 @@ export type MeshEnrollResponse = {
      */
     listen_port: number;
     /**
-     * The name the pairing's join token is bound to.
+     * The name the join token is bound to.
      */
     name: string;
     /**
@@ -17571,10 +17585,17 @@ export type MeshEnrollResponse = {
      */
     node_api_port: number;
     /**
-     * The pairing created for the worker.
+     * The pairing created for the worker; `None` when it joins again as the
+     * node it already is (`rejoined_node_id`).
      */
-    pairing_id: number;
+    pairing_id?: number | null;
     prefix_len: number;
+    /**
+     * The node this worker already is on this control plane, when it proved
+     * it and joins again (ADR 060): it keeps its mesh key and address, and
+     * registering with `join_token` updates that node in place.
+     */
+    rejoined_node_id?: number | null;
 };
 
 export type MessageContent = string | Array<ContentPart>;
@@ -18795,6 +18816,12 @@ export type NodeInfoResponse = {
     id: number;
     labels: unknown;
     last_heartbeat?: string | null;
+    /**
+     * Sandboxes (any owner) not destroyed on this node (ADR-048). Draining
+     * does not move them: a node with any cannot be removed. `None` for the
+     * control plane, or when they could not be counted.
+     */
+    live_sandboxes?: number | null;
     name: string;
     /**
      * Why the overlay is unavailable: the colliding range, its owner and the
@@ -18819,6 +18846,12 @@ export type NodeInfoResponse = {
     public_ingress_unsupported_reasons: Array<string>;
     public_ingress_unsupported_route_count?: number | null;
     role: string;
+    /**
+     * Containers on this node that a deployment still uses: a node with
+     * any is drained before it is removed; one with none is removed in one
+     * step. `None` for the control plane, or when it could not be counted.
+     */
+    serving_containers?: number | null;
     status: string;
 };
 
@@ -20966,6 +20999,24 @@ export type PlanTarget = {
 };
 
 /**
+ * What identifies this control plane to a worker that already joined one
+ * (ADR 060). Both values are public keys' digests or public keys, so they
+ * are served without authentication.
+ */
+export type PlaneIdentityResponse = {
+    /**
+     * SHA-256 fingerprint (hex) of the cluster CA every worker of this
+     * control plane pins. `None` before the first worker joined.
+     */
+    ca_fingerprint?: string | null;
+    /**
+     * The control plane's WireGuard mesh public key. `None` while the mesh
+     * is off or not up yet.
+     */
+    control_plane_wg_public_key?: string | null;
+};
+
+/**
  * Which capabilities this server process actually provides.
  *
  * A client cannot tell "this build has no sandboxes" from "this process was
@@ -21231,6 +21282,24 @@ export type PreviewDomainDeliveryBindingRequest = {
     hostname: string;
     origin_target: string;
     zone: string;
+};
+
+/**
+ * D2: whether the preview domain can be reached at all.
+ */
+export type PreviewDomainStatus = 'local_only' | 'unresolved' | 'no_way_in' | 'usable';
+
+/**
+ * `GET /settings/preview-domain/status` (ADR 068 D2).
+ */
+export type PreviewDomainStatusResponse = {
+    checked_at: string;
+    preview_domain: string;
+    /**
+     * Why, in words.
+     */
+    reason: string;
+    status: PreviewDomainStatus;
 };
 
 export type PreviewGatewayLogsResponse = {
@@ -22006,6 +22075,7 @@ export type ProjectResponse = {
      * When true, deploy clones only `directory` via git sparse-checkout.
      */
     pull_only_root_directory: boolean;
+    reachability_warning?: ReachabilityWarning | null;
     repo_name?: string | null;
     repo_owner?: string | null;
     /**
@@ -23359,10 +23429,62 @@ export type RateLimitSettings = {
     whitelist_ips?: Array<string>;
 };
 
+export type ReachabilityFix = {
+    /**
+     * The command to run, when that is the fix.
+     */
+    command?: string | null;
+    /**
+     * For the tunnel fix: the connector that would carry it.
+     */
+    connector_id?: number | null;
+    /**
+     * For the tunnel fix: the hostname it would get.
+     */
+    hostname?: string | null;
+    /**
+     * The console page that applies it.
+     */
+    href?: string | null;
+    kind: ReachabilityFixKind;
+    /**
+     * What the button and the log line say.
+     */
+    label: string;
+};
+
+/**
+ * One way to fix a [`ReachabilityWarning`], in the order D5 lists them.
+ */
+export type ReachabilityFixKind = 'tunnel_environment_hosts' | 'preview_domain' | 'custom_domain' | 'worker_ingress';
+
 /**
  * Email reachability status
  */
 export type ReachabilityStatus = 'safe' | 'risky' | 'invalid' | 'unknown';
+
+/**
+ * D5: a successful deploy nobody can open. Computed, never stored.
+ */
+export type ReachabilityWarning = {
+    /**
+     * The environment's label, as visitors would see it in a hostname.
+     */
+    environment: string;
+    environment_id: number;
+    /**
+     * The fixes that fit this install, best first.
+     */
+    fixes: Array<ReachabilityFix>;
+    /**
+     * `Deployed, but nobody can reach <label> yet`.
+     */
+    headline: string;
+    /**
+     * Why, about the address visitors would try first.
+     */
+    reason: string;
+};
 
 export type ReadFileResponse = {
     /**
@@ -53014,7 +53136,7 @@ export type MeshEnrollErrors = {
      */
     403: unknown;
     /**
-     * Mesh off or not ready, control plane not dialable, key in use, or too many pairings
+     * Mesh off or not ready, control plane not dialable, key in use (including a node's own key and name without its current agent credential), or too many pairings
      */
     409: unknown;
     /**
@@ -53029,12 +53151,39 @@ export type MeshEnrollErrors = {
 
 export type MeshEnrollResponses = {
     /**
-     * Pairing created; register over the mesh next
+     * Pairing created, or the worker proved it is the node it joins again as; register over the mesh next
      */
     201: MeshEnrollResponse;
 };
 
 export type MeshEnrollResponse2 = MeshEnrollResponses[keyof MeshEnrollResponses];
+
+export type PlaneIdentityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/internal/nodes/plane-identity';
+};
+
+export type PlaneIdentityErrors = {
+    /**
+     * Rate limited
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type PlaneIdentityResponses = {
+    /**
+     * This control plane's identity
+     */
+    200: PlaneIdentityResponse;
+};
+
+export type PlaneIdentityResponse2 = PlaneIdentityResponses[keyof PlaneIdentityResponses];
 
 export type RegisterNodeData = {
     body: RegisterNodeApiRequest;
@@ -77783,6 +77932,34 @@ export type RevealGlobalMcpConfigResponses = {
 };
 
 export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
+
+export type GetPreviewDomainStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/preview-domain/status';
+};
+
+export type GetPreviewDomainStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPreviewDomainStatusResponses = {
+    200: PreviewDomainStatusResponse;
+};
+
+export type GetPreviewDomainStatusResponse = GetPreviewDomainStatusResponses[keyof GetPreviewDomainStatusResponses];
 
 export type GetPublicIngressStatusData = {
     body?: never;

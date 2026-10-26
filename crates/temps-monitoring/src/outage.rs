@@ -1020,6 +1020,16 @@ WHERE NOT EXISTS (
                         }
                         continue;
                     }
+                    // ADR 068 D4: nothing was probed because nobody can
+                    // reach the environment. Neither an outage nor a
+                    // recovery: an open incident stays as it was.
+                    if job.status == "no_address" {
+                        debug!(
+                            monitor_id = job.monitor_id,
+                            "monitor has no address to check; outage state unchanged"
+                        );
+                        continue;
+                    }
                     let status = MonitorStatus::from_str(&job.status);
                     match self
                         .process_check(job.monitor_id, status, job.error_message)

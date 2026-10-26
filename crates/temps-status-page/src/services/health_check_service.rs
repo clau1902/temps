@@ -11,6 +11,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use temps_config::ConfigService;
+use temps_core::environment_address::{
+    https_url, AddressKind, EnvironmentAddress, EnvironmentAddressSlot, EnvironmentAddresses,
+};
 use temps_core::log_transitions::{FailureLog, KeyedFailureLatch};
 use temps_core::url_validation::{
     resolve_and_validate_domain, validate_outbound_ip, UrlValidationError,
@@ -370,6 +373,10 @@ fn report_check_outcome(
     status: &str,
     error_message: Option<&str>,
 ) -> Option<FailureLog> {
+    if status == NO_ADDRESS_STATUS {
+        // Nothing was probed (ADR 068 D4): neither a failure nor a recovery.
+        return None;
+    }
     if status == "operational" {
         if let Some(failures) = latch.record_success(&monitor_id) {
             info!(
@@ -449,6 +456,25 @@ pub struct HealthCheckService {
     http_client: reqwest::Client,
     config_service: Arc<ConfigService>,
     job_queue: Arc<dyn JobQueue>,
+    /// ADR 068 D4: which address to probe, if any. Empty without the
+    /// ingress plugin, where every monitor probes as before.
+    environment_addresses: Option<Arc<EnvironmentAddressSlot>>,
+}
+
+/// What a monitor records when its environment has no address anyone can
+/// reach (ADR 068 D4): it does not probe, and it is never `down`.
+pub const NO_ADDRESS_STATUS: &str = "no_address";
+pub const NO_ADDRESS_MESSAGE: &str = "Nothing to check: nobody can reach this environment yet";
+
+/// The URL a monitor probes for the environment's primary address, and
+/// whether it is a public address to dial (not the local proxy). `None`
+/// keeps today's URL: the generated host, a private address, or no answer.
+fn primary_probe_url(address: Option<&EnvironmentAddress>) -> Option<String> {
+    let primary = address?.primary.as_ref()?;
+    match primary.kind {
+        AddressKind::CustomDomain | AddressKind::TunnelHost => Some(https_url(&primary.address)),
+        AddressKind::Generated | AddressKind::Private => None,
+    }
 }
 
 impl HealthCheckService {
@@ -481,7 +507,18 @@ impl HealthCheckService {
             http_client,
             config_service,
             job_queue,
+            environment_addresses: None,
         })
+    }
+
+    /// Probe each environment's primary address (ADR 068 D4).
+    pub fn with_environment_addresses(mut self, slot: Arc<EnvironmentAddressSlot>) -> Self {
+        self.environment_addresses = Some(slot);
+        self
+    }
+
+    fn addresses(&self) -> Option<Arc<dyn EnvironmentAddresses>> {
+        self.environment_addresses.as_ref().and_then(|s| s.get())
     }
 
     /// Resolve a monitor's configured interval into the value the scheduler
@@ -664,6 +701,7 @@ impl HealthCheckService {
             let db = self.db.clone();
             let config_service = self.config_service.clone();
             let job_queue = self.job_queue.clone();
+            let addresses = self.addresses();
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
                 Err(error) => {
@@ -678,7 +716,9 @@ impl HealthCheckService {
             let monitor_id = monitor.id;
             let task = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
-                match Self::check_monitor(db, config_service, monitor, job_queue).await {
+                match Self::check_monitor_with(db, config_service, monitor, job_queue, addresses)
+                    .await
+                {
                     Ok(()) => {
                         if MONITOR_CHECK_ERRORS.record_success(&monitor_id).is_some() {
                             info!(monitor_id, "Monitor can be checked again");
@@ -729,11 +769,12 @@ impl HealthCheckService {
             // probe still consumes the monitor's slot, so push the due time
             // out before running it.
             Self::schedule_next_check(self.db.as_ref(), &monitor).await;
-            Self::check_monitor(
+            Self::check_monitor_with(
                 self.db.clone(),
                 self.config_service.clone(),
                 monitor,
                 self.job_queue.clone(),
+                self.addresses(),
             )
             .await?;
         }
@@ -741,12 +782,24 @@ impl HealthCheckService {
         Ok(monitor_count)
     }
 
-    /// Check a single monitor
+    /// Check a single monitor, without knowing environment addresses.
+    #[cfg(test)]
     async fn check_monitor(
         db: Arc<DatabaseConnection>,
         config_service: Arc<ConfigService>,
         monitor: status_monitors::Model,
         job_queue: Arc<dyn JobQueue>,
+    ) -> Result<(), StatusPageError> {
+        Self::check_monitor_with(db, config_service, monitor, job_queue, None).await
+    }
+
+    /// Check a single monitor
+    async fn check_monitor_with(
+        db: Arc<DatabaseConnection>,
+        config_service: Arc<ConfigService>,
+        monitor: status_monitors::Model,
+        job_queue: Arc<dyn JobQueue>,
+        addresses: Option<Arc<dyn EnvironmentAddresses>>,
     ) -> Result<(), StatusPageError> {
         // NOTE: the monitor's slot is claimed by the *caller*, before this is
         // dispatched — `run_all_checks` via `claim_due_monitor` (a CAS that
@@ -852,12 +905,57 @@ impl HealthCheckService {
             monitor_updated_at: monitor.updated_at,
         };
 
+        // ADR 068 D4: probe the environment's primary address. With none
+        // anyone can reach there is nothing to probe: record `no_address`,
+        // never an outage. Without an answer, probe as before.
+        let address = match &addresses {
+            Some(addresses) => match addresses.address(environment.project_id, env_id).await {
+                Ok(address) => Some(address),
+                Err(error) => {
+                    warn!(
+                        monitor_id = monitor.id,
+                        environment_id = env_id,
+                        %error,
+                        "Could not tell the primary address; probing the generated URL"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        if address
+            .as_ref()
+            .is_some_and(EnvironmentAddress::has_no_address)
+        {
+            debug!(
+                monitor_id = monitor.id,
+                environment_id = env_id,
+                "Not probing: the environment has no reachable address"
+            );
+            Self::record_check(
+                &db,
+                probe.clone(),
+                NO_ADDRESS_STATUS.to_string(),
+                None,
+                Some(NO_ADDRESS_MESSAGE.to_string()),
+                &job_queue,
+            )
+            .await?;
+            return Ok(());
+        }
+        let primary_url = primary_probe_url(address.as_ref());
+
         // IMPORTANT: Always use the public URL for health checks
         // This ensures we're testing the actual user-facing endpoint, not internal container networking
-        let (health_url, uses_external_url) = match config_service
-            .get_deployment_url_by_slug_with_source(&environment.subdomain)
-            .await
-        {
+        let public_url = match primary_url {
+            Some(url) => Ok((url, true)),
+            None => {
+                config_service
+                    .get_deployment_url_by_slug_with_source(&environment.subdomain)
+                    .await
+            }
+        };
+        let (health_url, uses_external_url) = match public_url {
             Ok((public_url, uses_external_url)) => {
                 debug!("Using public URL for health check: {}", public_url);
                 // Use custom check_path if set, otherwise fall back to monitor_type logic.
@@ -1602,11 +1700,12 @@ impl HealthCheckService {
                                 // claim the slot before probing so the sweep
                                 // does not immediately re-probe this monitor.
                                 Self::schedule_next_check(service.db.as_ref(), &monitor).await;
-                                if let Err(e) = Self::check_monitor(
+                                if let Err(e) = Self::check_monitor_with(
                                     service.db.clone(),
                                     service.config_service.clone(),
                                     monitor,
                                     service.job_queue.clone(),
+                                    service.addresses(),
                                 )
                                 .await
                                 {
@@ -2674,6 +2773,155 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// An environment whose reachability is settled.
+    struct FixedAddress(EnvironmentAddress);
+
+    #[async_trait::async_trait]
+    impl EnvironmentAddresses for FixedAddress {
+        async fn address(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+        ) -> Result<EnvironmentAddress, temps_core::environment_address::EnvironmentAddressError>
+        {
+            Ok(self.0.clone())
+        }
+        fn cached(&self, _environment_id: i32) -> Option<EnvironmentAddress> {
+            Some(self.0.clone())
+        }
+        async fn deployment_completed(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+        ) -> Option<temps_core::environment_address::ReachabilityWarning> {
+            None
+        }
+    }
+
+    fn settled(
+        primary: Option<(&str, AddressKind)>,
+        no_address: Option<&str>,
+    ) -> EnvironmentAddress {
+        EnvironmentAddress {
+            environment_id: 1,
+            primary: primary.map(|(address, kind)| {
+                temps_core::environment_address::PrimaryAddress {
+                    address: address.into(),
+                    kind,
+                    way_in: None,
+                }
+            }),
+            no_address_reason: no_address.map(str::to_string),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn the_probe_follows_the_primary_address() {
+        // A custom domain or tunnel host is dialled on https.
+        assert_eq!(
+            primary_probe_url(Some(&settled(
+                Some(("app.example.com", AddressKind::CustomDomain)),
+                None
+            )))
+            .as_deref(),
+            Some("https://app.example.com")
+        );
+        assert_eq!(
+            primary_probe_url(Some(&settled(
+                Some(("app-production.example.org", AddressKind::TunnelHost)),
+                None
+            )))
+            .as_deref(),
+            Some("https://app-production.example.org")
+        );
+        // The generated host and private addresses keep today's URL and
+        // routing, as does no answer at all.
+        for kind in [AddressKind::Generated, AddressKind::Private] {
+            assert_eq!(
+                primary_probe_url(Some(&settled(Some(("x.example.dev", kind)), None))),
+                None
+            );
+        }
+        assert_eq!(primary_probe_url(None), None);
+        assert!(report_check_outcome(
+            &KeyedFailureLatch::default(),
+            1,
+            NO_ADDRESS_STATUS,
+            Some(NO_ADDRESS_MESSAGE)
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn health_probe_without_an_address_records_no_address_and_never_probes() {
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+        struct ExpectNoAddress;
+        #[async_trait::async_trait]
+        impl JobQueue for ExpectNoAddress {
+            async fn send(&self, job: Job) -> Result<(), QueueError> {
+                match job {
+                    Job::StatusCheckCompleted(job) => {
+                        assert_eq!(job.status, NO_ADDRESS_STATUS);
+                        assert_eq!(job.error_message.as_deref(), Some(NO_ADDRESS_MESSAGE));
+                    }
+                    _ => panic!("only the no_address check is emitted"),
+                }
+                Ok(())
+            }
+            fn subscribe(&self) -> Box<dyn JobReceiver> {
+                panic!("not used")
+            }
+        }
+        let monitor = make_monitor(1, Some(1));
+        let now = Utc::now();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![health_probe_counts(1, 1)]])
+                // persist_check_if_current
+                .append_query_results([vec![monitor.clone()]])
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![monitor.clone()]])
+                .append_query_results([vec![status_checks::Model {
+                    id: 1,
+                    monitor_id: 1,
+                    status: NO_ADDRESS_STATUS.into(),
+                    checked_at: now,
+                    created_at: now,
+                    response_time_ms: None,
+                    error_message: Some(NO_ADDRESS_MESSAGE.into()),
+                }]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(
+            None,
+            Some("proj-env-1.localho.st only resolves to this computer"),
+        )));
+        HealthCheckService::check_monitor_with(
+            db.clone(),
+            test_config_service(&db, "postgres://localhost/test"),
+            monitor,
+            Arc::new(ExpectNoAddress),
+            Some(addresses),
+        )
+        .await
+        .expect("no_address is recorded");
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("one owner")
+                .into_transaction_log()
+        );
+        assert!(log.contains("no_address"), "{log}");
     }
 
     struct RejectHealthProbeJobs;

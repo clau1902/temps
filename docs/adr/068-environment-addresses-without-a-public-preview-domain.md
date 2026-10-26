@@ -252,3 +252,66 @@ reachable". It is done when the preview domain is `usable` or a tunnel has
    should a project choose its tunnel?
 4. Should the D5 warning also fire when the only way in is private (a tailnet
    name), for an environment whose audience is `public`?
+
+## Implementation notes
+
+Recorded with the code that implements them. Where the text above is silent
+or the code reads it a particular way, the choice is listed here.
+
+### Phase 1
+
+- **Only a sure answer warns.** The D5 warning and the D4 `no_address` state
+  are set only when reachability settles on "not reachable". While it is
+  still checking, or cannot tell (a DNS lookup failed), the environment keeps
+  today's behaviour: the open button links the stored domain, the monitor
+  probes as before, and no warning is written.
+- **The monitor dials the primary address only when it differs from today.**
+  A custom-domain or tunnel-host primary is probed over `https` through the
+  public probe; a generated or private primary keeps the URL and routing the
+  monitor already used, so an install that opts into nothing probes exactly
+  what it probed before. The user's check path is appended to whichever
+  address is used. There is no per-monitor explicit URL in the schema today
+  (only `check_path`), so "a monitor created with an explicit URL is not
+  changed" has nothing to apply to yet.
+- **`no_address` is neutral everywhere.** It is excluded from uptime coverage
+  and status buckets like the bootstrap `unknown` row, is skipped by outage
+  detection (an open incident is neither resolved nor escalated by it), and
+  the project dot draws it grey with "Nothing to check".
+- **The notification episode lives on the notification row.** No new table:
+  the newest notification under `reachability:<environment_id>` is the open
+  episode until it is marked with `episode_cleared_at` in its metadata. The
+  episode closes when a deploy completion finds the environment reachable,
+  so a warning that clears and comes back notifies again on the next deploy.
+- **D2 counts a tunnel zone.** A preview domain under the zone of a ready
+  tunnel that resolves is `usable`: the tunnel carries it.
+- **Which environment the project API warns about.** `ProjectResponse` has
+  one `reachability_warning`: production when it is deployed, otherwise the
+  lowest-id deployed non-preview environment. The deployment API carries the
+  warning of the deployment's own environment, only for the current,
+  completed deployment.
+- **Lists use cached answers.** The deployment list attaches the primary
+  address and warning only when reachability has a cached answer (one minute
+  per environment, at most 1024 entries); single-deployment and project reads
+  compute it. A list page never runs DNS lookups per row.
+- **Generated rows.** An `environment_domains` row without a dot (a label) is
+  reported with source `generated`, so the ordering can tell the generated
+  host from a user-entered full hostname.
+- **The console banner sits under the project header**, not inside its single
+  row, next to the existing ADR 064 summary in the header. On the deployment
+  page it replaces the ADR 064 "nobody can open it yet" alert when present,
+  so the two never stack.
+- **Notifications (D4 list).** Existing notifications that mention an address
+  are not rewritten in this phase; the new reachability notification names
+  the environment and its fixes.
+- **The tunnel fix is offered only for worker-served environments.** A tunnel
+  carries only what workers serve (ADR 058), so an environment whose
+  containers run on the control plane is never offered "publish it through
+  tunnel …"; it gets the preview-domain, custom-domain and worker-ingress
+  fixes.
+- **Generated API clients were refreshed offline.** No database or Docker was
+  available while this was written, so the new and changed schemas were
+  dumped from the plugins' OpenAPI documents, merged into the committed
+  `apps/temps-cli/openapi.json` (canonical form checked with
+  `bun run spec:check`), and both clients were generated from that file. A
+  maintainer should run `bun run spec:update` against a live server before
+  release, which should produce no further diff.

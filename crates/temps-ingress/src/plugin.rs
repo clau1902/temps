@@ -19,10 +19,15 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{configure_routes, IngressApiDoc, IngressAppState};
+use crate::reachability::address_handlers::{
+    configure_routes as address_routes, AddressApiDoc, AddressAppState,
+};
 use crate::reachability::handlers::{
     configure_routes as reachability_routes, ReachabilityApiDoc, ReachabilityAppState,
 };
-use crate::reachability::{ReachabilityDeps, ReachabilityService, WaysIn};
+use crate::reachability::{
+    EnvironmentAddressService, ReachabilityDeps, ReachabilityService, WaysIn,
+};
 use crate::service::IngressConnectorService;
 use temps_config::ConfigService;
 
@@ -66,6 +71,11 @@ impl TempsPlugin for IngressPlugin {
             let ways_in: Arc<dyn temps_core::ways_in::EnvironmentWaysIn> = ways;
             context.register_service(ways_in);
             context.register_service(service);
+            // Filled in `configure_routes`, once the projects plugin has
+            // registered what reachability reads (ADR 068 D4).
+            context.register_service(Arc::new(
+                temps_core::environment_address::EnvironmentAddressSlot::new(),
+            ));
             Ok(())
         })
     }
@@ -90,6 +100,14 @@ impl TempsPlugin for IngressPlugin {
         }));
         // Runs a restart left behind are reconciled now and every minute.
         reachability.clone().start_reconciler();
+        let addresses = Arc::new(EnvironmentAddressService::new(
+            reachability.clone(),
+            context.require_service::<dyn temps_core::notifications::NotificationService>(),
+        ));
+        context
+            .require_service::<temps_core::environment_address::EnvironmentAddressSlot>()
+            .set(addresses.clone());
+        let address_state = Arc::new(AddressAppState { service: addresses });
         let reachability_state = Arc::new(ReachabilityAppState {
             service: reachability,
             audit_service: audit_service.clone(),
@@ -104,13 +122,15 @@ impl TempsPlugin for IngressPlugin {
         Some(PluginRoutes::new(
             configure_routes()
                 .with_state(state)
-                .merge(reachability_routes().with_state(reachability_state)),
+                .merge(reachability_routes().with_state(reachability_state))
+                .merge(address_routes().with_state(address_state)),
         ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
         let mut doc = <IngressApiDoc as OpenApiTrait>::openapi();
         doc.merge(<ReachabilityApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<AddressApiDoc as OpenApiTrait>::openapi());
         Some(doc)
     }
 }
