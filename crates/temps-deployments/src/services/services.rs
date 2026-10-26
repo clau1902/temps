@@ -887,18 +887,19 @@ fn primary_first(
             .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
     };
     let wanted = primary.address.to_ascii_lowercase();
-    let url = links
-        .iter()
-        .find(|link| host_of(link).as_deref() == Some(wanted.as_str()))
-        .cloned()
-        .unwrap_or_else(|| match primary.kind {
-            AddressKind::TunnelHost => https_url(&primary.address),
-            AddressKind::CustomDomain | AddressKind::Generated | AddressKind::Private => {
-                on_listener_of(generated_url, &primary.address)
-            }
-        });
+    let is_primary = |link: &String| host_of(link).as_deref() == Some(wanted.as_str());
+    let url = match primary.kind {
+        // A bound tunnel host is listed on the generated listener's scheme
+        // and port, which is not how the tunnel serves it.
+        AddressKind::TunnelHost => https_url(&primary.address),
+        AddressKind::CustomDomain | AddressKind::Generated | AddressKind::Private => links
+            .iter()
+            .find(|link| is_primary(link))
+            .cloned()
+            .unwrap_or_else(|| on_listener_of(generated_url, &primary.address)),
+    };
     let mut domains = vec![url.clone()];
-    domains.extend(links.into_iter().filter(|l| !l.eq_ignore_ascii_case(&url)));
+    domains.extend(links.into_iter().filter(|l| !is_primary(l)));
     OrderedLinks {
         domains,
         primary_url: Some(url),
@@ -7213,6 +7214,33 @@ mod environment_link_tests {
         );
         assert_eq!(ordered.domains[0], "https://shop-production.example.org");
         assert_eq!(ordered.domains.len(), links.len() + 1);
+
+        // A bound tunnel host is listed on the listener's http; it is still
+        // advertised on https, and only once.
+        let bound = environment_links(
+            generated,
+            "shop-production",
+            &s(&["shop.example.com"]),
+            &s(&["Shop-Production.example.org"]),
+        );
+        assert!(bound.contains(&"http://shop-production.example.org:8080".to_string()));
+        let ordered = primary_first(
+            bound.clone(),
+            generated,
+            Some(&address(
+                Some(("shop-production.example.org", AddressKind::TunnelHost)),
+                None,
+            )),
+        );
+        assert_eq!(
+            ordered.primary_url.as_deref(),
+            Some("https://shop-production.example.org")
+        );
+        assert_eq!(ordered.domains[0], "https://shop-production.example.org");
+        assert_eq!(ordered.domains.len(), bound.len());
+        assert!(!ordered
+            .domains
+            .contains(&"http://shop-production.example.org:8080".to_string()));
 
         // Nobody can reach it: the links stay, the reason is reported.
         let none = primary_first(

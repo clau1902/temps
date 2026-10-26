@@ -300,13 +300,18 @@ or the code reads it a particular way, the choice is listed here.
   changed" has nothing to apply to yet.
 - **`no_address` is neutral everywhere.** It is excluded from uptime coverage
   and status buckets like the bootstrap `unknown` row, is skipped by outage
-  detection (an open incident is neither resolved nor escalated by it), and
-  the project dot draws it grey with "Nothing to check".
+  detection (an open incident is neither resolved nor escalated by it, in
+  the per-check path and in the periodic monitor scan alike), and the
+  project dot draws it grey with "Nothing to check".
 - **The notification episode lives on the notification row.** No new table:
   the newest notification under `reachability:<environment_id>` is the open
   episode until it is marked with `episode_cleared_at` in its metadata. The
   episode closes when a deploy completion finds the environment reachable,
   so a warning that clears and comes back notifies again on the next deploy.
+  An episode no destination accepted (no provider configured, or every one
+  refused it) is marked `episode_undelivered_at` and does not count as open:
+  the next deploy that finds the environment unreachable sends it again, so
+  "once per episode" never silently becomes "never".
 - **D2 counts a tunnel zone.** A preview domain under the zone of a ready
   tunnel that resolves is `usable`: the tunnel carries it.
 - **Which environment the project API warns about.** `ProjectResponse` has

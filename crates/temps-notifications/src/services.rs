@@ -2164,6 +2164,9 @@ impl NotificationService {
     /// The marker an episode's row carries once its condition cleared
     /// (ADR 068 D5).
     const EPISODE_CLEARED_AT: &'static str = "episode_cleared_at";
+    /// The marker an episode's row carries when no destination accepted it,
+    /// so the next open sends it again instead of staying silent.
+    const EPISODE_UNDELIVERED_AT: &'static str = "episode_undelivered_at";
 
     /// The newest row under `batch_key`, when its episode is still open.
     async fn open_episode_row(&self, batch_key: &str) -> Result<Option<notifications::Model>> {
@@ -2172,7 +2175,7 @@ impl NotificationService {
             .order_by_desc(notifications::Column::CreatedAt)
             .one(self.db.as_ref())
             .await?;
-        Ok(latest.filter(|row| !episode_cleared(&row.metadata)))
+        Ok(latest.filter(|row| episode_open(&row.metadata)))
     }
 
     /// Send once per episode under `batch_key`; see
@@ -2185,10 +2188,36 @@ impl NotificationService {
             bypass_throttling: true,
             ..notification
         };
-        self.send_with_batch_key(notification, batch_key.to_string())
+        let delivery = self
+            .deliver_with_batch_key(notification, batch_key.to_string())
             .await?;
+        if let Delivery::Sent { row, accepted: 0 } = delivery {
+            // Nobody got it: leave the episode closed so the next open
+            // retries, rather than "once per episode" becoming never.
+            Self::mark_episode_row(self.db.as_ref(), *row, Self::EPISODE_UNDELIVERED_AT).await?;
+            warn!(
+                batch_key,
+                "no notification destination accepted the episode; it will be sent again"
+            );
+            return Ok(false);
+        }
         info!(batch_key, "opened a notification episode");
         Ok(true)
+    }
+
+    /// Add `marker` (now) to an episode row's metadata.
+    async fn mark_episode_row(
+        db: &DatabaseConnection,
+        row: notifications::Model,
+        marker: &str,
+    ) -> Result<()> {
+        let mut metadata: std::collections::HashMap<String, String> =
+            serde_json::from_str(&row.metadata).unwrap_or_default();
+        metadata.insert(marker.to_string(), Utc::now().to_rfc3339());
+        let mut update: notifications::ActiveModel = row.into();
+        update.metadata = Set(serde_json::to_string(&metadata)?);
+        update.update(db).await?;
+        Ok(())
     }
 
     /// Mark the open episode under `batch_key` cleared, if there is one.
@@ -2196,15 +2225,7 @@ impl NotificationService {
         let Some(row) = self.open_episode_row(batch_key).await? else {
             return Ok(());
         };
-        let mut metadata: std::collections::HashMap<String, String> =
-            serde_json::from_str(&row.metadata).unwrap_or_default();
-        metadata.insert(
-            Self::EPISODE_CLEARED_AT.to_string(),
-            Utc::now().to_rfc3339(),
-        );
-        let mut update: notifications::ActiveModel = row.into();
-        update.metadata = Set(serde_json::to_string(&metadata)?);
-        update.update(self.db.as_ref()).await?;
+        Self::mark_episode_row(self.db.as_ref(), row, Self::EPISODE_CLEARED_AT).await?;
         info!(batch_key, "closed a notification episode");
         Ok(())
     }
@@ -2214,6 +2235,16 @@ impl NotificationService {
         notification: Notification,
         batch_key_str: String,
     ) -> Result<()> {
+        self.deliver_with_batch_key(notification, batch_key_str)
+            .await
+            .map(|_| ())
+    }
+
+    async fn deliver_with_batch_key(
+        &self,
+        notification: Notification,
+        batch_key_str: String,
+    ) -> Result<Delivery> {
         let now = Utc::now();
 
         // Check for existing similar notifications
@@ -2240,7 +2271,7 @@ impl NotificationService {
                     existing.occurrence_count + 1,
                     existing.next_allowed_at,
                 );
-                return Ok(());
+                return Ok(Delivery::Batched);
             }
         }
 
@@ -2274,7 +2305,7 @@ impl NotificationService {
         };
 
         // Insert the new notification record
-        let _inserted = new_notification.insert(self.db.as_ref()).await?;
+        let inserted = new_notification.insert(self.db.as_ref()).await?;
 
         // Get the occurrence count for the message modification
         let occurrence_count_val = if let Some(existing) = existing {
@@ -2297,13 +2328,18 @@ impl NotificationService {
             .get_enabled_providers(&notification)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get providers {}", e))?;
+        let mut accepted = 0;
         for provider in &providers {
-            if let Err(e) = provider.send(&notification).await {
-                error!("Failed to send notification via provider: {}", e);
+            match provider.send(&notification).await {
+                Ok(()) => accepted += 1,
+                Err(e) => error!("Failed to send notification via provider: {}", e),
             }
         }
 
-        Ok(())
+        Ok(Delivery::Sent {
+            row: Box::new(inserted),
+            accepted,
+        })
     }
 
     pub async fn is_configured(&self) -> Result<bool> {
@@ -3030,10 +3066,32 @@ impl CoreNotificationService for NotificationService {
     }
 }
 
+/// What became of a notification sent under a batch key.
+enum Delivery {
+    /// Throttled: counted on the previous row, not sent.
+    Batched,
+    /// Recorded as `row`; `accepted` destinations took it.
+    Sent {
+        row: Box<notifications::Model>,
+        accepted: usize,
+    },
+}
+
 /// Whether an episode row's metadata says its condition cleared.
 fn episode_cleared(metadata: &str) -> bool {
+    episode_marked(metadata, NotificationService::EPISODE_CLEARED_AT)
+}
+
+/// Whether an episode row still holds its episode open: its condition has
+/// not cleared, and some destination accepted it.
+fn episode_open(metadata: &str) -> bool {
+    !episode_cleared(metadata)
+        && !episode_marked(metadata, NotificationService::EPISODE_UNDELIVERED_AT)
+}
+
+fn episode_marked(metadata: &str, marker: &str) -> bool {
     serde_json::from_str::<std::collections::HashMap<String, String>>(metadata)
-        .map(|m| m.contains_key(NotificationService::EPISODE_CLEARED_AT))
+        .map(|m| m.contains_key(marker))
         .unwrap_or(false)
 }
 
@@ -3499,6 +3557,53 @@ mod tests {
         assert!(
             format!("{:?}", update.values).contains("episode_cleared_at"),
             "the marker is written into the row's metadata"
+        );
+    }
+
+    #[test]
+    fn an_undelivered_episode_is_not_open() {
+        assert!(episode_open(r#"{"kind":"reachability"}"#));
+        assert!(!episode_open(
+            r#"{"episode_undelivered_at":"2026-10-25T10:00:00Z"}"#
+        ));
+        assert!(!episode_open(
+            r#"{"episode_cleared_at":"2026-10-25T10:00:00Z"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_episode_nobody_received_is_sent_again() {
+        let undelivered = r#"{"episode_undelivered_at":"2026-10-25T10:00:00Z"}"#;
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                // The previous open reached nobody: not an open episode.
+                .append_query_results([vec![episode_row(undelivered)]])
+                // send: the throttle lookup, then the inserted row.
+                .append_query_results([vec![episode_row(undelivered)]])
+                .append_query_results([vec![episode_row("{}")]])
+                // No route is enabled: no destination.
+                .append_query_results([Vec::<temps_entities::notification_routes::Model>::new()])
+                // The row is marked undelivered again.
+                .append_query_results([vec![episode_row(undelivered)]])
+                .into_connection(),
+        );
+        let service = episode_service(db.clone());
+        let sent = service
+            .open_episode("reachability:4", create_test_notification())
+            .await
+            .unwrap();
+        assert!(!sent, "nobody received it, so the episode is not open");
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the mock database")
+            .into_transaction_log();
+        assert_eq!(log.len(), 5, "{log:?}");
+        assert!(log[2].statements()[0].sql.starts_with("INSERT"));
+        let update = &log[4].statements()[0];
+        assert!(update.sql.starts_with("UPDATE"));
+        assert!(
+            format!("{:?}", update.values).contains("episode_undelivered_at"),
+            "the row is left retryable"
         );
     }
 

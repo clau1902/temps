@@ -844,9 +844,6 @@ impl CustomDomainService {
                     )));
                 }
             }
-            if !new_domain.eq_ignore_ascii_case(&custom_domain.domain) {
-                Self::ensure_not_environment_address(self.db.as_ref(), new_domain).await?;
-            }
             active_model.domain = Set(new_domain.clone());
             new_domain.as_str()
         } else {
@@ -927,6 +924,31 @@ impl CustomDomainService {
                             domain_id: id,
                             source_project_id,
                         });
+                    }
+
+                    // A new name is claimed under the hostname lock, as on
+                    // create, so a tunnel environment host or a status page
+                    // cannot take it between this check and the update.
+                    if let Some(new_domain) = requested_domain
+                        .as_deref()
+                        .filter(|new_domain| !new_domain.eq_ignore_ascii_case(&locked.domain))
+                    {
+                        temps_entities::status_page_domains::lock_hostname_claim(
+                            transaction,
+                            new_domain,
+                        )
+                        .await?;
+                        if temps_entities::status_page_domains::attached_hostname_conflict(
+                            transaction,
+                            new_domain,
+                        )
+                        .await?
+                        {
+                            return Err(CustomDomainError::DuplicateDomain(format!(
+                                "'{new_domain}' is attached to a status page; remove it there first"
+                            )));
+                        }
+                        Self::ensure_not_environment_address(transaction, new_domain).await?;
                     }
 
                     let renames = requested_domain

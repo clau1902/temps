@@ -463,7 +463,7 @@ pub struct HealthCheckService {
 
 /// What a monitor records when its environment has no address anyone can
 /// reach (ADR 068 D4): it does not probe, and it is never `down`.
-pub const NO_ADDRESS_STATUS: &str = "no_address";
+pub const NO_ADDRESS_STATUS: &str = temps_core::environment_address::NO_ADDRESS_CHECK_STATUS;
 pub const NO_ADDRESS_MESSAGE: &str = "Nothing to check: nobody can reach this environment yet";
 
 /// The URL a monitor probes for the environment's primary address, and

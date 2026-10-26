@@ -22,7 +22,7 @@ pub const PREVIEW_DOMAIN_SETTINGS_PATH: &str = "/settings#preview-domain";
 pub const WORKER_INGRESS_COMMAND: &str = "temps agent ingress delegated";
 
 /// D4's rank of an address: lower is better.
-fn rank(address: &AddressReachability) -> u8 {
+pub(super) fn rank(address: &AddressReachability) -> u8 {
     if address.audience == Audience::Private {
         return 3;
     }

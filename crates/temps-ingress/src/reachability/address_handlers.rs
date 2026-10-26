@@ -166,7 +166,7 @@ async fn set_connector_environment_hosts(
     permission_guard!(auth, SettingsWrite);
     // Turning it off withdraws what it listed before: record those.
     let before = state.environment_hosts.list(id).await?;
-    if request.enabled && !before.enabled {
+    if publishing_needs_step_up(before.enabled, request.enabled) {
         require_sensitive_action(
             state.sensitive_action_authorizer.as_ref(),
             &auth,
@@ -193,6 +193,12 @@ async fn set_connector_environment_hosts(
         error!(%error, connector_id = id, "environment hosts changed but audit record failed");
     }
     Ok(Json(view))
+}
+
+/// Only turning it on widens access, so only that needs a recent MFA
+/// verification; turning it off, or a repeat of the current state, does not.
+fn publishing_needs_step_up(enabled_before: bool, enable: bool) -> bool {
+    enable && !enabled_before
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -225,5 +231,18 @@ impl AuditOperation for EnvironmentHostsAudit {
     fn serialize(&self) -> anyhow::Result<String> {
         serde_json::to_string(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_turning_environment_hosts_on_needs_step_up() {
+        assert!(publishing_needs_step_up(false, true), "off -> on");
+        assert!(!publishing_needs_step_up(true, true), "on -> on");
+        assert!(!publishing_needs_step_up(true, false), "on -> off");
+        assert!(!publishing_needs_step_up(false, false), "off -> off");
     }
 }

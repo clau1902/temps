@@ -158,6 +158,11 @@ fn lower_first(text: &str) -> String {
     }
 }
 
+/// The status a monitor's check records when its environment has no address
+/// anyone can reach (D4): nothing was probed, so it is neither up nor down.
+/// Every reader of `status_checks.status` must skip it.
+pub const NO_ADDRESS_CHECK_STATUS: &str = "no_address";
+
 /// What an environment's address is right now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnvironmentAddress {

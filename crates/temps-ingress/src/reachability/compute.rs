@@ -598,19 +598,17 @@ pub fn overall_state(addresses: &[AddressReachability]) -> ReachState {
     }
 }
 
-/// The header's line. Custom domains come before the generated hostname,
-/// which is usually the less memorable one.
+/// The header's line. It names the address D4 would pick (ADR 068), so the
+/// header and the primary address never disagree: custom and environment
+/// domains first, then a tunnel host, then the generated hostname, which is
+/// usually the less memorable one.
 pub fn summary(
     addresses: &[AddressReachability],
     deployed: bool,
     environment_name: &str,
     running_on: &[String],
 ) -> String {
-    let rank = |a: &AddressReachability| match a.source {
-        AddressSource::CustomDomain => 0,
-        AddressSource::EnvironmentDomain | AddressSource::TunnelHost => 1,
-        AddressSource::Generated => 2,
-    };
+    let rank = super::addresses::rank;
     let best = |state: ReachState| {
         addresses
             .iter()
@@ -903,6 +901,24 @@ mod tests {
         assert_eq!(
             summary(&both, true, "production", &[]),
             "Public at myapp.example.com"
+        );
+
+        // The same address D4 picks: an environment domain ahead of a tunnel
+        // host, whichever was gathered first.
+        let tunnel_first = vec![
+            reachable(
+                "app-production.tunnel.example.com",
+                AddressSource::TunnelHost,
+            ),
+            reachable("app.example.com", AddressSource::EnvironmentDomain),
+        ];
+        assert_eq!(
+            summary(&tunnel_first, true, "production", &[]),
+            "Public at app.example.com"
+        );
+        assert_eq!(
+            super::super::addresses::primary_address(&tunnel_first).map(|p| p.address),
+            Some("app.example.com".to_string())
         );
 
         let local = vec![AddressReachability {
