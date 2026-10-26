@@ -785,8 +785,11 @@ pub fn environment_hosts_tunnel<'a>(facts: &'a PlanFacts, host: &str) -> Option<
         return None;
     }
     // Hosts are never generated for an environment with a restricted
-    // address (ADR 068 Security).
-    if facts.audiences.iter().any(|(_, a)| *a != Audience::Public) {
+    // address (ADR 068 Security), nor offered as the way to make one: they
+    // are public, and a signed-in plan would publish them without a gate.
+    if facts.audience != Audience::Public
+        || facts.audiences.iter().any(|(_, a)| *a != Audience::Public)
+    {
         return None;
     }
     facts.tunnels.iter().find(|t| {
@@ -3183,6 +3186,14 @@ mod tests {
         assert!(!with(PlanFacts {
             tunnels: vec![homelab()],
             audiences: vec![("myapp.internal.example.com".into(), Audience::Private)],
+            ..base()
+        })
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // A plan to make the address signed-in (ADR 065): environment hosts
+        // are public.
+        assert!(!with(PlanFacts {
+            tunnels: vec![homelab()],
+            audience: Audience::SignedIn,
             ..base()
         })
         .contains(&PlanOptionKind::TunnelEnvironmentHosts));
