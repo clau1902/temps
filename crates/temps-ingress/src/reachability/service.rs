@@ -69,10 +69,10 @@ use super::plan::{
     ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_TOKEN,
 };
 use super::run::{
-    created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, NewTunnel,
-    RunInput, RunOps, RunRecord, RunSink, ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget,
-    ServeWish, ServiceDeletion, ServiceEntryHost, ServicePlan, Stop, Timing, TunnelStatus,
-    WriteError, ZoneState,
+    created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, worker_approval,
+    NewTunnel, RunInput, RunOps, RunRecord, RunSink, ServeClaim, ServeEntryStatus, ServeRelease,
+    ServeTarget, ServeWish, ServiceDeletion, ServiceEntryHost, ServicePlan, Stop, Timing,
+    TunnelStatus, WriteError, ZoneState,
 };
 use super::serve_entries;
 use super::token_check::{check_token, TokenCheckRequest, TokenCheckResult};
@@ -972,15 +972,7 @@ impl ReachabilityService {
                 }
             }
         };
-        let approved = entries
-            .iter()
-            .find(|e| e.node_id == node_id && e.address_id == address_id)
-            .and_then(|mine| {
-                hosts
-                    .iter()
-                    .find(|h| h.is(mine.tailscale_node_id.as_deref(), mine.dns_name.as_deref()))
-            })
-            .map(|host| host.approved.unwrap_or(false));
+        let approved = worker_approval(&hosts, &entries, node_id, address_id);
         ServiceHostsState {
             name: service.to_string(),
             tag,
