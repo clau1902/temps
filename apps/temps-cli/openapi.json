@@ -1,6 +1,180 @@
 {
   "components": {
     "schemas": {
+      "AccessBinding": {
+        "description": "The Cloudflare Access application in front of a signed-in address\n(ADR 065 D9): its JWTs carry `aud`, from the team of `provider_id`.",
+        "properties": {
+          "app_id": {
+            "type": "string"
+          },
+          "aud": {
+            "type": "string"
+          },
+          "provider_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "provider_id",
+          "app_id",
+          "aud"
+        ],
+        "type": "object"
+      },
+      "AccessPermission": {
+        "enum": [
+          "apps_edit",
+          "organizations_read"
+        ],
+        "type": "string"
+      },
+      "AccessPermissionCheck": {
+        "properties": {
+          "detail": {
+            "description": "Why, and what to change on the token when it is not present.",
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "permission": {
+            "$ref": "#/components/schemas/AccessPermission"
+          },
+          "state": {
+            "$ref": "#/components/schemas/PermissionState"
+          }
+        },
+        "required": [
+          "permission",
+          "label",
+          "state",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "AccessProviderResponse": {
+        "description": "A saved Access token. The token itself is never returned.",
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "addresses": {
+            "description": "How many addresses it protects.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "api_token": {
+            "description": "Always `***`.",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "key_count": {
+            "description": "How many signing keys listeners have for it now.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "keys_fetched_at": {
+            "description": "When the team's signing keys were last fetched.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "team_domain": {
+            "description": "`<team>.cloudflareaccess.com`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "account_id",
+          "team_domain",
+          "api_token",
+          "key_count",
+          "addresses",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AccessTokenCheckRequest": {
+        "properties": {
+          "account_id": {
+            "description": "The Cloudflare account the Access applications live in (32 hex\ncharacters, from the dashboard URL or the account's overview page).",
+            "type": "string"
+          },
+          "token": {
+            "$ref": "#/components/schemas/SecretString",
+            "description": "The token, as pasted. Used for this check only; not stored."
+          }
+        },
+        "required": [
+          "token",
+          "account_id"
+        ],
+        "type": "object"
+      },
+      "AccessTokenCheckResult": {
+        "properties": {
+          "error": {
+            "description": "Why it did not, or why the account could not be checked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/AccessPermissionCheck"
+            },
+            "type": "array"
+          },
+          "ready": {
+            "description": "Every permission is present and the team domain is known.",
+            "type": "boolean"
+          },
+          "team_domain": {
+            "description": "`<team>.cloudflareaccess.com`, when Organizations Read is present.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "token_url": {
+            "description": "Where to create a token.",
+            "type": "string"
+          },
+          "valid": {
+            "description": "Cloudflare accepted the token at all.",
+            "type": "boolean"
+          },
+          "warning": {
+            "description": "What the token can do beyond Temps' own apps.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "valid",
+          "permissions",
+          "ready",
+          "warning",
+          "token_url"
+        ],
+        "type": "object"
+      },
       "AcmeOrderResponse": {
         "properties": {
           "authorizations": {},
@@ -1098,12 +1272,52 @@
           "audience": {
             "$ref": "#/components/schemas/Audience"
           },
+          "gate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GateKind",
+                "description": "For `signed_in`: the gate in front of it (ADR 065 D7)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "gate_access": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AccessBinding",
+                "description": "For `signed_in` with Cloudflare Access: the application in front of\nit (ADR 065 D9)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "gate_allow": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GateAllowList",
+                "description": "For `signed_in` with the Temps gate: the teams and users that may\nsign in. `None` admits everyone with access to the project."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "network_range": {
             "description": "For `private`: the network range a visitor must come from.",
             "type": [
               "string",
               "null"
             ]
+          },
+          "principals": {
+            "description": "For `tailnet_users`: who it admits (ADR 065 D6), normalized. Undo\nputs the earlier list back with the audience.",
+            "items": {
+              "$ref": "#/components/schemas/TailnetPrincipal"
+            },
+            "type": "array"
           },
           "private_listener": {
             "description": "For `private`: that listener's address, which DNS points at and the\ninside check dials.",
@@ -1119,12 +1333,36 @@
               "integer",
               "null"
             ]
+          },
+          "private_service": {
+            "description": "For `tailscale_service`: the `svc:` name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "private_via": {
+            "description": "For `private`: how it is served (ADR 065 D1), `tailscale_serve` or\n`tailscale_service`. `None` is phase 2's listener, so runs journaled\nbefore this column compare equal to what they set.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "audience"
         ],
         "type": "object"
+      },
+      "AddressKind": {
+        "description": "What kind of address the primary one is, in D4's order.",
+        "enum": [
+          "custom_domain",
+          "tunnel_host",
+          "generated",
+          "private"
+        ],
+        "type": "string"
       },
       "AddressReachability": {
         "description": "One address of an environment and whether its audience can reach it.",
@@ -1205,7 +1443,8 @@
         "enum": [
           "generated",
           "environment_domain",
-          "custom_domain"
+          "custom_domain",
+          "tunnel_host"
         ],
         "type": "string"
       },
@@ -4048,6 +4287,14 @@
               "environment": "production"
             }
           },
+          "loopback_ja4_header": {
+            "default": null,
+            "description": "The header a trusted loopback proxy puts the visitor's JA4 TLS\nfingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer\n`trust_loopback_forwarded_ip` trusts, and removed from every request\nbefore it goes upstream. `None` records no JA4 behind such a proxy.\nSet through [`normalize_loopback_ja4_header`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mcp_server": {
             "$ref": "#/components/schemas/McpServerSettings",
             "default": {
@@ -4356,6 +4603,14 @@
           },
           "letsencrypt": {
             "$ref": "#/components/schemas/LetsEncryptSettings"
+          },
+          "loopback_ja4_header": {
+            "description": "The header a trusted loopback proxy sends the visitor's JA4 in.\n`None` records no JA4 behind such a proxy.",
+            "example": "x-ja4",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mcp_server": {
             "$ref": "#/components/schemas/McpServerSettings",
@@ -5433,6 +5688,7 @@
           "public",
           "private",
           "signed_in",
+          "tailnet_users",
           "unsupported"
         ],
         "type": "string"
@@ -14524,6 +14780,27 @@
           "rustfs"
         ],
         "type": "string"
+      },
+      "CreateAccessProviderRequest": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "name": {
+            "description": "A name to tell tokens apart.",
+            "type": "string"
+          },
+          "token": {
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Checked, then sealed; never returned."
+          }
+        },
+        "required": [
+          "name",
+          "account_id",
+          "token"
+        ],
+        "type": "object"
       },
       "CreateAlertRuleRequest": {
         "properties": {
@@ -24975,6 +25252,17 @@
               }
             ]
           },
+          "primary_address": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PrimaryAddress",
+                "description": "The address every surface means by \"the app's address\" (ADR 068\nD4); `None` while no address is reachable."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "project_id": {
             "format": "int32",
             "type": "integer"
@@ -27955,6 +28243,28 @@
         ],
         "type": "object"
       },
+      "FieldChoice": {
+        "description": "One answer a [`FieldKind::Choice`] field offers.",
+        "properties": {
+          "help": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "label"
+        ],
+        "type": "object"
+      },
       "FieldKind": {
         "oneOf": [
           {
@@ -28025,6 +28335,73 @@
             },
             "required": [
               "provider_field",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Teams of this instance, answered as a list of team ids.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "teams"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Users of this instance, answered as a list of user ids.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "users"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One of `choices`, answered as its `value`.",
+            "properties": {
+              "choices": {
+                "items": {
+                  "$ref": "#/components/schemas/FieldChoice"
+                },
+                "type": "array"
+              },
+              "type": {
+                "enum": [
+                  "choice"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "choices",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A list of text values, answered as an array of strings.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "text_list"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
               "type"
             ],
             "type": "object"
@@ -28810,6 +29187,35 @@
           "updated_at"
         ],
         "type": "object"
+      },
+      "GateAllowList": {
+        "description": "Who may sign in to a Temps-gated address besides being able to see the\nproject (ADR 065 D7): stored in `gate_allow`. Empty lists mean no list.",
+        "properties": {
+          "teams": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "users": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "GateKind": {
+        "description": "Which gate an address has (D7). Unknown values read as `Unsupported`, and\nan unsupported gate admits nobody.",
+        "enum": [
+          "temps",
+          "cloudflare_access",
+          "unsupported"
+        ],
+        "type": "string"
       },
       "GatewayStatus": {
         "description": "Detailed gateway container status surfaced to the settings UI.",
@@ -35630,6 +36036,144 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "Found by its name, which the run picks before creating it, and its\ndomain (ADR 065 D9).",
+            "properties": {
+              "hostname": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "provider_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "access_app"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider_id",
+              "name",
+              "hostname",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by the `tailnet_serve_entries` row and this run's reference to\nit (ADR 065 D4); the step is done only on the agent's report.",
+            "properties": {
+              "address_id": {
+                "type": "string"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "node_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "node_name": {
+                "type": "string"
+              },
+              "service": {
+                "description": "The `svc:` name, for a Service.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "tailscale_serve"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "node_id",
+              "node_name",
+              "address_id",
+              "hostname",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by its Temps row's name.",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_credential"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by `GET …/services/{name}` and the marker in its `comment`.",
+            "properties": {
+              "marker": {
+                "description": "`temps:<install>:<this run>`.",
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "tailnet": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_service"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "tailnet",
+              "name",
+              "marker",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by the connector's `environment_hosts` flag.",
+            "properties": {
+              "connector_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "environment_hosts"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "connector_id",
+              "name",
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -35872,6 +36416,17 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/RunResource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "shown_service": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceDefinition",
+                "description": "The Tailscale Service as shown to the user when undo asked whether\nto delete it (ADR 065 D4): the delete goes ahead only while a read\nmade immediately before it still equals this."
               },
               {
                 "type": "null"
@@ -46370,7 +46925,11 @@
           "new_tunnel",
           "new_tunnel_with_token",
           "direct_manual_dns",
-          "private_worker"
+          "private_worker",
+          "tailscale_serve",
+          "tailscale_service",
+          "tailscale_service_with_credential",
+          "tunnel_environment_hosts"
         ],
         "type": "string"
       },
@@ -46386,6 +46945,24 @@
           },
           "audience": {
             "$ref": "#/components/schemas/Audience"
+          },
+          "gate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GateKind",
+                "description": "For `signed_in`: the gate to put in front of it (ADR 065 D7). The\nTemps sign-in when absent."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "principals": {
+            "description": "For `tailnet_users`: the tailnet logins and tags it admits (ADR 065\nD6). At least one; checked and lower-cased.",
+            "items": {
+              "$ref": "#/components/schemas/TailnetPrincipal"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -47271,6 +47848,40 @@
           "models"
         ],
         "type": "object"
+      },
+      "PrimaryAddress": {
+        "description": "The address every surface means by \"the app's address\".",
+        "properties": {
+          "address": {
+            "description": "The hostname, without a scheme.",
+            "example": "myapp.example.com",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AddressKind"
+          },
+          "way_in": {
+            "description": "How traffic gets in, as ADR 064 D3 names it (`tunnel:<name>`,\n`direct:<node>`, `private:<node>`).",
+            "example": "tunnel:homelab",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "address",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "PrincipalKind": {
+        "description": "What a `tailnet_users` entry names (ADR 065 D6).",
+        "enum": [
+          "login",
+          "tag"
+        ],
+        "type": "string"
       },
       "PrivateIpInfo": {
         "description": "Information about private/local IP addresses",
@@ -50254,6 +50865,22 @@
           "is_system_request": {
             "type": "boolean"
           },
+          "ja4": {
+            "description": "The client's JA4 TLS fingerprint, when its source gives one.",
+            "example": "t13d1516h2_8daaf6152771_e5627efa2ab1",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ja4_source": {
+            "description": "Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or\n`edge`.",
+            "example": "direct",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "method": {
             "type": "string"
           },
@@ -50348,6 +50975,24 @@
               "null"
             ]
           },
+          "shield_reasons": {
+            "description": "The lists that hold the client, and the range on each.",
+            "example": [
+              "spamhaus_drop (192.0.2.0/24)"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "shield_verdict": {
+            "description": "What Shield would have done with the request: `log`, `challenge` or\n`block`. `None` when no reputation list holds the client.",
+            "example": "block",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "status_code": {
             "format": "int32",
             "type": "integer"
@@ -50385,7 +51030,8 @@
           "request_source",
           "is_system_request",
           "routing_status",
-          "request_id"
+          "request_id",
+          "shield_reasons"
         ],
         "type": "object"
       },
@@ -51729,6 +52375,17 @@
               "null"
             ]
           },
+          "gate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GateKind",
+                "description": "For `signed_in`: the gate the plan puts in front of the address."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "options": {
             "description": "In the order Temps prefers them; the first is recommended.",
             "items": {
@@ -51742,6 +52399,13 @@
               "string",
               "null"
             ]
+          },
+          "principals": {
+            "description": "For `tailnet_users`: who the address will admit, as the plan was\nmade for them (ADR 065 D6). Apply sets exactly this list.",
+            "items": {
+              "$ref": "#/components/schemas/TailnetPrincipal"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -55303,6 +55967,178 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "A Cloudflare Access application the run created (ADR 065 D9). Undo\ndeletes it only while its domain is still `hostname`, and asks\nfirst when its policies no longer match `policies`.",
+            "properties": {
+              "aud": {
+                "type": "string"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "policies": {
+                "description": "The policies' fingerprint when the run created it.",
+                "type": "string"
+              },
+              "provider_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "access_app"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider_id",
+              "id",
+              "name",
+              "hostname",
+              "aud",
+              "policies",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "This run's reference to a worker's Serve entry (ADR 065 D4). Undo\ndrops the reference; the entry goes with its last one.",
+            "properties": {
+              "address_id": {
+                "type": "string"
+              },
+              "created": {
+                "description": "This run created the entry, rather than finding it.",
+                "type": "boolean"
+              },
+              "entry_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "node_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "node_name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_serve"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "node_id",
+              "node_name",
+              "address_id",
+              "hostname",
+              "entry_id",
+              "created",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A Tailscale OAuth client the run saved (ADR 065 D2).",
+            "properties": {
+              "id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_credential"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A Tailscale Service the run created or found (ADR 065 D4). Undo\ndeletes it only once nothing uses it, and only when a person\nconfirms.",
+            "properties": {
+              "created": {
+                "description": "This run created it (`created`), rather than finding it.",
+                "type": "boolean"
+              },
+              "creator_run_id": {
+                "description": "The run whose marker it carries.",
+                "format": "int32",
+                "type": "integer"
+              },
+              "definition": {
+                "$ref": "#/components/schemas/ServiceDefinition",
+                "description": "As read back once the step was done, with its addresses."
+              },
+              "name": {
+                "description": "`svc:myapp`.",
+                "type": "string"
+              },
+              "tailnet": {
+                "description": "The tailnet's MagicDNS suffix, for the Service's lock and messages.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_service"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "tailnet",
+              "name",
+              "created",
+              "creator_run_id",
+              "definition",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A tunnel whose environment hosts the run turned on (ADR 068 D3):\nundo turns them off, which withdraws every host it generated.",
+            "properties": {
+              "connector_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "environment_hosts"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "connector_id",
+              "name",
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -58633,6 +59469,41 @@
         ],
         "type": "object"
       },
+      "ServiceDefinition": {
+        "description": "A Tailscale Service as the API returns it, with the fields D4 compares.",
+        "properties": {
+          "addrs": {
+            "description": "The TailVIPs Tailscale assigned.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "comment": {
+            "type": "string"
+          },
+          "name": {
+            "description": "`svc:myapp`.",
+            "type": "string"
+          },
+          "ports": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "ServiceDownAlertResponse": {
         "description": "Alerting state for a service whose health checks keep failing.",
         "properties": {
@@ -60917,6 +61788,20 @@
           "project_name",
           "project_slug",
           "first_seen"
+        ],
+        "type": "object"
+      },
+      "SignOutOfAppsResponse": {
+        "properties": {
+          "revoked": {
+            "description": "Gate sessions revoked.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revoked"
         ],
         "type": "object"
       },
@@ -63495,7 +64380,13 @@
           "issue_certificate",
           "wait_for_publication",
           "check_reachability",
-          "set_audience"
+          "set_audience",
+          "access_app",
+          "configure_tailscale_serve",
+          "save_tailscale_credential",
+          "define_tailscale_service",
+          "wait_for_service_approval",
+          "publish_environment_hosts"
         ],
         "type": "string"
       },
@@ -64016,6 +64907,23 @@
           "project_id",
           "service",
           "env"
+        ],
+        "type": "object"
+      },
+      "TailnetPrincipal": {
+        "description": "One person or tag a `tailnet_users` address admits. `value` is always\nASCII-lower-cased: it is compared that way (D6).",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/PrincipalKind"
+          },
+          "value": {
+            "example": "alice@example.com",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "value"
         ],
         "type": "object"
       },
@@ -93030,6 +93938,253 @@
         ]
       }
     },
+    "/cloudflare-access/providers": {
+      "get": {
+        "operationId": "list_access_providers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AccessProviderResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The saved Cloudflare Access tokens. Tokens are never returned.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      },
+      "post": {
+        "operationId": "create_access_provider",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccessProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessProviderResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The token is missing a permission"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Check a Cloudflare Access token, then save it sealed. Refused, with the\ncheck in the detail, unless every permission is there.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
+    "/cloudflare-access/providers/check": {
+      "post": {
+        "operationId": "check_access_provider",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessTokenCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessTokenCheckResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Check which Cloudflare Access permissions a pasted token has: Access:\nApps and Policies Edit (probed with an app body Cloudflare rejects, so\nnothing is created) and Access: Organizations, Identity Providers, and\nGroups Read. The token is used for this check only and is not stored.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
+    "/cloudflare-access/providers/{provider_id}": {
+      "delete": {
+        "operationId": "delete_access_provider",
+        "parameters": [
+          {
+            "description": "Saved token",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "An address uses it"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a saved Cloudflare Access token. Refused while an address uses it.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
     "/cluster/dns/status": {
       "get": {
         "description": "Same permission as the other node visibility endpoints in this file\n(`admin_list_nodes`, `admin_get_node`) — this is operational/infra\nvisibility, not a new privilege tier.",
@@ -103151,6 +104306,41 @@
         "summary": "Every flag for the caller's environment, collapsed to what the evaluator\nneeds.",
         "tags": [
           "Feature Flags"
+        ]
+      }
+    },
+    "/gate/sign-out-of-apps": {
+      "post": {
+        "description": "Revokes all of the current user's gate sessions. Listeners refuse them\nas soon as they take the next route snapshot.",
+        "operationId": "sign_out_of_apps",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignOutOfAppsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Not a user"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Sign out of every signed-in address",
+        "tags": [
+          "Signed-in addresses"
         ]
       }
     },
@@ -134300,6 +135490,9 @@
           },
           "409": {
             "description": "The plan changed (the body's `plan` is the new one), or a run is in progress"
+          },
+          "428": {
+            "description": "Changing who an address is for, or publishing every environment under a tunnel, needs a recent MFA verification"
           }
         },
         "security": [
@@ -137740,6 +138933,62 @@
           "Funnels"
         ],
         "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/gate/addresses/{address_id}/sign-everyone-out": {
+      "post": {
+        "description": "Every gate token issued for the address so far is refused; people sign\nin again (and are checked again) on their next visit.",
+        "operationId": "sign_everyone_out_of_address",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`custom:<id>` or `environment:<id>`",
+            "in": "path",
+            "name": "address_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Everyone signed out"
+          },
+          "400": {
+            "description": "Malformed address id"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Address not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Sign everyone out of a signed-in address",
+        "tags": [
+          "Signed-in addresses"
+        ]
       }
     },
     "/projects/{project_id}/git": {
@@ -156595,6 +157844,10 @@
     {
       "description": "Making a project reachable (ADR 064)",
       "name": "Reachability"
+    },
+    {
+      "description": "The Temps sign-in in front of signed-in addresses (ADR 065)",
+      "name": "Signed-in addresses"
     },
     {
       "description": "Environment management operations",

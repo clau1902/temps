@@ -50,3 +50,6 @@ chrono = { workspace = true }
 # Constant-time byte comparison for the per-node bearer-token hash check.
 # Same crate already pulled in by temps-revenue.
 subtle = "2.6"
+
+# Fetches Cloudflare Access signing keys (ADR 065 D9).
+reqwest = { workspace = true }

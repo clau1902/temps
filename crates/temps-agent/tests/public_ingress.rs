@@ -46,12 +46,14 @@ impl IngressHarness {
                 deployment_id: Some(41),
                 project_id: Some(42),
                 environment_id: Some(43),
+                gate: None,
             }],
             certificates: None,
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
@@ -152,6 +154,7 @@ fn enabled_public_store(snapshot_dir: &TempDir) -> SharedRouteStore {
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        gated_routes: Vec::new(),
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
@@ -232,6 +235,84 @@ async fn test_public_ingress_known_host_forwards_request_to_published_backend() 
     assert!(backend_request
         .to_ascii_lowercase()
         .contains("host: app.example.test"));
+    backend_shutdown.notify_waiters();
+}
+
+/// ADR 065 D10: monitors take `x-temps-gate` for the gate's own answer, so
+/// an app on an ordinary (not signed-in) host cannot pass a failing answer
+/// off as one.
+#[tokio::test]
+async fn test_public_ingress_app_cannot_send_the_gate_header() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test backend");
+    let backend_address = listener.local_addr().expect("read test backend address");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = vec![0; 8192];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nx-temps-gate: sign-in\r\n\
+                          Content-Length: 6\r\nConnection: close\r\n\r\nbroken",
+                    )
+                    .await;
+            });
+        }
+    });
+    let ingress = IngressHarness::start(backend_address, true).await;
+
+    let response = ingress
+        .request("GET / HTTP/1.1\r\nHost: app.example.test\r\nConnection: close\r\n\r\n")
+        .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("x-temps-gate"),
+        "{response}"
+    );
+}
+
+/// A host that is not signed-in (any more) never passes the gate's cookies
+/// or a client's `x-temps-*` headers to its app: a gate cookie left from
+/// before is still a token, and only Temps sets `x-temps-*` (ADR 065 D8).
+#[tokio::test]
+async fn test_public_ingress_never_forwards_gate_cookies_or_client_temps_headers() {
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let ingress = IngressHarness::start(backend_address, true).await;
+
+    let response = ingress
+        .request(
+            "GET / HTTP/1.1\r\nHost: app.example.test\r\n\
+             Cookie: a=1; __Host-temps_gate=old-token; __Host-temps_gate_state=s; b=2\r\n\
+             X-Temps-User: 1\r\nX-Temps-User-Role: admin\r\nX-Temps-Anything: x\r\n\
+             Connection: close\r\n\r\n",
+        )
+        .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+    let backend_request = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed")
+        .to_ascii_lowercase();
+    assert!(
+        backend_request.contains("cookie: a=1; b=2\r\n"),
+        "{backend_request}"
+    );
+    assert!(!backend_request.contains("temps_gate"), "{backend_request}");
+    assert!(
+        !backend_request.contains("x-temps-user"),
+        "{backend_request}"
+    );
+    assert!(
+        !backend_request.contains("x-temps-anything"),
+        "{backend_request}"
+    );
     backend_shutdown.notify_waiters();
 }
 
@@ -468,12 +549,14 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
                 deployment_id: None,
                 project_id: None,
                 environment_id: None,
+                gate: None,
             }],
             certificates: None,
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
@@ -654,6 +737,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
             deployment_id: Some(51),
             project_id: Some(52),
             environment_id: Some(53),
+            gate: None,
         }],
         certificates: Some(PublicIngressCertificates {
             ephemeral_public_key: encryption.ephemeral_public_key().to_string(),
@@ -675,6 +759,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        gated_routes: Vec::new(),
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
@@ -824,6 +909,7 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        gated_routes: Vec::new(),
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
@@ -1314,6 +1400,7 @@ fn private_route(host: &str, backend: std::net::SocketAddr, range: &str) -> Priv
             deployment_id: Some(51),
             project_id: Some(52),
             environment_id: Some(53),
+            gate: None,
         },
         address_id: "custom:9".to_string(),
         range: range.to_string(),
@@ -1361,6 +1448,7 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
             // ...and outside this one.
             private_route("tailnet.example.test", backend_address, "100.64.0.0/10"),
         ],
+        gated_routes: Vec::new(),
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
@@ -1536,12 +1624,14 @@ fn serve_snapshot(
                 deployment_id: Some(61),
                 project_id: Some(62),
                 environment_id: Some(63),
+                gate: None,
             }),
             addrs: Vec::new(),
             principals,
         }],
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
+        gated_routes: Vec::new(),
     }
 }
 

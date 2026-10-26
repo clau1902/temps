@@ -427,6 +427,55 @@ impl CustomDomainService {
         branch: Option<String>,
         service_name: Option<String>,
     ) -> Result<project_custom_domains::Model, CustomDomainError> {
+        self.create_custom_domain_with(
+            project_id,
+            environment_id,
+            domain,
+            redirect_to,
+            status_code,
+            branch,
+            service_name,
+            |_| {},
+        )
+        .await
+    }
+
+    /// [`Self::create_custom_domain`] for a plain domain whose row `shape`
+    /// completes before it is inserted, in the same transaction. A caller
+    /// that attaches an address with its gate already set (ADR 065) then
+    /// never has it served open, not even between two writes.
+    pub async fn create_custom_domain_shaped(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        domain: String,
+        shape: impl FnOnce(&mut project_custom_domains::ActiveModel) + Send,
+    ) -> Result<project_custom_domains::Model, CustomDomainError> {
+        self.create_custom_domain_with(
+            project_id,
+            environment_id,
+            domain,
+            None,
+            None,
+            None,
+            None,
+            shape,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_custom_domain_with(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        domain: String,
+        redirect_to: Option<String>,
+        status_code: Option<i32>,
+        branch: Option<String>,
+        service_name: Option<String>,
+        shape: impl FnOnce(&mut project_custom_domains::ActiveModel) + Send,
+    ) -> Result<project_custom_domains::Model, CustomDomainError> {
         info!(
             "Creating custom domain: {} for project: {}",
             domain, project_id
@@ -469,7 +518,7 @@ impl CustomDomainService {
             None
         };
 
-        let new_custom_domain = project_custom_domains::ActiveModel {
+        let mut new_custom_domain = project_custom_domains::ActiveModel {
             project_id: Set(project_id),
             environment_id: Set(environment_id),
             domain: Set(domain.clone()),
@@ -482,6 +531,7 @@ impl CustomDomainService {
             service_name: Set(service_name),
             ..Default::default()
         };
+        shape(&mut new_custom_domain);
 
         // Claim under the shared hostname lock so a status page cannot attach
         // the same name between the checks above and this insert (#1412).
@@ -1346,6 +1396,12 @@ mod tests {
             generated_by_connector_id: generated,
             private_via: None,
             private_service: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
         }
     }
 

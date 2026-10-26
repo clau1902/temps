@@ -1560,6 +1560,12 @@ mod tests {
             generated_by_connector_id: None,
             private_via: None,
             private_service: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
         };
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
             .append_query_results([Vec::<project_custom_domains::Model>::new()])
