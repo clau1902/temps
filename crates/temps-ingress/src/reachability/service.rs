@@ -182,6 +182,10 @@ struct Scope {
 /// What the service knows about an environment's addresses.
 struct Gathered {
     addresses: Vec<AddressInput>,
+    /// Public hostnames that reach one Compose service of the environment:
+    /// its generated `<service>--<env>` names and service custom domains.
+    /// Not addresses Make it reachable manages, but they open the same app.
+    service_addresses: Vec<String>,
     running_on: Vec<String>,
     deployed: bool,
 }
@@ -392,9 +396,11 @@ impl ReachabilityService {
     /// out: nobody lands on those to use the app).
     async fn gather(
         &self,
+        project: &projects::Model,
         environment: &environments::Model,
         preview_domain: &str,
     ) -> Result<Gathered, ReachabilityError> {
+        let mut service_addresses = BTreeSet::new();
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::new();
         let expand = |domain: &str| {
@@ -425,6 +431,13 @@ impl ReachabilityService {
             .all(self.deps.db.as_ref())
             .await?;
         for custom in customs {
+            if custom.service_name.is_some()
+                && custom.redirect_to.is_none()
+                && Audience::parse(&custom.audience) == Audience::Public
+                && !custom.domain.starts_with("*.")
+            {
+                service_addresses.insert(custom.domain.trim_end_matches('.').to_ascii_lowercase());
+            }
             if custom.redirect_to.is_some() || custom.service_name.is_some() {
                 continue;
             }
@@ -471,6 +484,35 @@ impl ReachabilityService {
                 None,
                 None,
             );
+            if let Some(temps_entities::preset::PresetConfig::DockerCompose(config)) =
+                project.preset_config.as_ref()
+            {
+                // The route table names each public Compose service the same
+                // way, with the managed domain's hostname layout.
+                let modes: HashMap<String, PublicHostnameStrategy> =
+                    temps_entities::dns_managed_domains::Entity::find()
+                        .all(self.deps.db.as_ref())
+                        .await?
+                        .into_iter()
+                        .map(|d| {
+                            (
+                                d.domain.to_ascii_lowercase(),
+                                PublicHostnameStrategy::from_db_str(&d.generated_hostname_mode),
+                            )
+                        })
+                        .collect();
+                let strategy =
+                    temps_core::public_hostname_resolver::match_strategy(&modes, preview_domain);
+                for label in
+                    temps_entities::preset::compose_public_route_labels(&config.public_ports)
+                {
+                    service_addresses.insert(strategy.service_hostname(
+                        preview_domain,
+                        &environment.subdomain,
+                        &label,
+                    ));
+                }
+            }
         }
 
         let mut running_on = Vec::new();
@@ -502,6 +544,7 @@ impl ReachabilityService {
         }
         Ok(Gathered {
             addresses,
+            service_addresses: service_addresses.into_iter().collect(),
             running_on,
             deployed: environment.current_deployment_id.is_some(),
         })
@@ -795,7 +838,7 @@ impl ReachabilityService {
         let scope = self.scope(project_id, environment_id).await?;
         let settings = self.settings().await?;
         let gathered = self
-            .gather(&scope.environment, &settings.preview_domain)
+            .gather(&scope.project, &scope.environment, &settings.preview_domain)
             .await?;
         let directs = self.directs(&settings).await;
         let addresses = self
@@ -971,6 +1014,7 @@ impl ReachabilityService {
             choices: tunnel_facts.choices,
             private_rule,
             audiences,
+            service_addresses: gathered.service_addresses.clone(),
             worker_modes,
             audience,
             project_slug: scope.project.slug.clone(),
@@ -1061,7 +1105,7 @@ impl ReachabilityService {
     ) -> Result<(PlanFacts, temps_core::AppSettings), ReachabilityError> {
         let settings = self.settings().await?;
         let gathered = self
-            .gather(&scope.environment, &settings.preview_domain)
+            .gather(&scope.project, &scope.environment, &settings.preview_domain)
             .await?;
         let directs = self.directs(&settings).await;
         let facts = self
@@ -2887,6 +2931,7 @@ impl RunOps for LiveOps {
             .own_address(host)
             .await?
             .ok_or_else(|| format!("{host} is not attached to this environment any more."))?;
+        refuse_signed_in_wildcard(&row.domain, audience)?;
         let current = address_audience_of(&row);
         let mut active: project_custom_domains::ActiveModel = row.into();
         set_address_audience_on(&mut active, &current, audience);
@@ -2975,6 +3020,19 @@ pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudien
             _ => None,
         },
     }
+}
+
+/// ADR 065 D8: a signed-in address sends each visitor back to its own
+/// callback, so it must be one hostname; `*.example.com` has none.
+fn refuse_signed_in_wildcard(domain: &str, audience: &AddressAudience) -> Result<(), String> {
+    if audience.audience == Audience::SignedIn && domain.starts_with("*.") {
+        return Err(format!(
+            "{domain} is a wildcard, which can't be signed-in: sign-in returns each \
+             visitor to one hostname. Attach the hostnames you need and make those \
+             signed-in instead."
+        ));
+    }
+    Ok(())
 }
 
 /// Write `audience` with what bounds it; a public one clears the private
@@ -3382,5 +3440,21 @@ impl TunnelMoveGuard for WaysIn {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wildcard_is_never_made_signed_in() {
+        let signed_in = AddressAudience::signed_in(GateKind::Temps, None);
+        let error = refuse_signed_in_wildcard("*.example.com", &signed_in)
+            .expect_err("a wildcard has no single callback host");
+        assert!(error.contains("*.example.com is a wildcard"), "{error}");
+        assert!(refuse_signed_in_wildcard("app.example.com", &signed_in).is_ok());
+        // Public and private wildcards are unchanged.
+        assert!(refuse_signed_in_wildcard("*.example.com", &AddressAudience::public()).is_ok());
     }
 }

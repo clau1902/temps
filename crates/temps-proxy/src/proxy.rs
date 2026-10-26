@@ -1336,6 +1336,27 @@ impl LoadBalancer {
             return Ok(None);
         };
         ctx.gated_host = true;
+        // ACME HTTP-01 first, as on the agent: a signed-in address must still
+        // get and renew its certificate, and Let's Encrypt never signs in.
+        // Only a challenge stored for this host is answered; any other path
+        // under the prefix meets the gate, so the prefix is no way past it.
+        if ctx.path.starts_with(ACME_HTTP01_PREFIX) {
+            if let Some(key_authorization) = self
+                .handle_acme_http_challenge(&ctx.host, &ctx.path)
+                .await?
+            {
+                let body = Bytes::from(key_authorization);
+                let mut resp = ResponseHeader::build(200, None)?;
+                resp.insert_header("Content-Type", "text/plain")?;
+                resp.insert_header("Cache-Control", "no-cache")?;
+                resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                resp.insert_header("Content-Length", body.len().to_string())?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(Some(body), true).await?;
+                ctx.routing_status = "acme_challenge".to_string();
+                return Ok(Some(true));
+            }
+        }
         // An operator who turned the HTTPS redirect off terminates TLS in
         // front of this listener; sending the visitor to HTTPS again would
         // loop. Either way the gate runs: this only picks the redirect.
@@ -11552,6 +11573,105 @@ mod status_page_host_tests {
             send(&h, &get("/api/projects", "pending.example.com")).await?,
             false,
         );
+        Ok(())
+    }
+
+    /// A signed-in address served by this proxy still gets and renews its
+    /// certificate (ADR 065 D8): Let's Encrypt never signs in, so a stored
+    /// HTTP-01 challenge is answered before the gate. Any other path under
+    /// the prefix still meets the gate.
+    #[tokio::test]
+    async fn a_signed_in_host_still_answers_its_acme_challenge_over_http() -> Result<()> {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_core::gate::{GateKind, GatePolicy, TempsGate};
+
+        const GATED: &str = "app.example.com";
+        let Some(mut h) = harness(None, false).await? else {
+            return Ok(());
+        };
+        let db = h._db.connection_arc().clone();
+        let now = chrono::Utc::now();
+        temps_entities::domains::ActiveModel {
+            domain: Set(GATED.to_string()),
+            status: Set("pending".to_string()),
+            http_challenge_token: Set(Some("challenge-token".to_string())),
+            http_challenge_key_authorization: Set(Some("challenge-token.thumbprint".to_string())),
+            is_wildcard: Set(false),
+            verification_method: Set("http-01".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        h.route_table.insert_route_for_test(
+            GATED,
+            temps_routes::RouteInfo {
+                backend: temps_routes::BackendType::Upstream {
+                    backends: vec![temps_routes::BackendEntry {
+                        address: "127.0.0.1:2".to_string(),
+                        container_id: None,
+                        container_name: None,
+                    }],
+                    round_robin_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: None,
+                environment: None,
+                deployment: None,
+                cert_eligible: true,
+            },
+        );
+        let key = temps_core::gate::generate_signing_key()?;
+        h.route_table.insert_gate_policy_for_test(
+            GATED,
+            GatePolicy {
+                address_id: "custom:7".into(),
+                gate: GateKind::Temps,
+                temps: Some(TempsGate {
+                    public_key: temps_core::gate::encode_public_key(&key.verifying_key()),
+                    authorize_url: "https://console.example.com/_temps/gate/authorize".into(),
+                    not_before: 0,
+                    revoked: vec![],
+                }),
+                access: None,
+            },
+        );
+        let service = Arc::new(temps_routes::gate::GateService::new(
+            db,
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "gate-test",
+            )),
+        ));
+        h.lb =
+            h.lb.with_gate(Arc::new(crate::handler::gate::ProxyGate::new(
+                h.route_table.clone(),
+                service,
+            )));
+
+        match send(
+            &h,
+            &get("/.well-known/acme-challenge/challenge-token", GATED),
+        )
+        .await?
+        {
+            Outcome::Answered { head, body } => {
+                assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+                assert_eq!(body, "challenge-token.thumbprint");
+            }
+            Outcome::Forwarded { path, .. } => panic!("the challenge must be answered: {path}"),
+        }
+        // No stored challenge: the gate answers, never the app.
+        for path in ["/.well-known/acme-challenge/other-token", "/"] {
+            match send(&h, &get(path, GATED)).await? {
+                Outcome::Answered { head, body } => {
+                    assert!(!head.starts_with("HTTP/1.1 200"), "{path}: {head}");
+                    assert!(!body.contains("thumbprint"), "{path}: {body}");
+                }
+                Outcome::Forwarded { path, .. } => panic!("{path} must meet the gate"),
+            }
+        }
         Ok(())
     }
 

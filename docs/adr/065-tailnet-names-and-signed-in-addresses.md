@@ -930,6 +930,13 @@ window in which a phase 2 address is unserved.
   settable by it (D8). Sign-in uses state and PKCE; codes are single use,
   60 seconds, bound to the address and redeemable only by the listener
   serving it. The redirect target comes from the server.
+- The sign-in state cookie is not signed: it binds the callback to the
+  browser that started the sign-in, as OAuth's state does, and is no
+  secret from the address's own origin. Script running on a signed-in
+  address can open `/authorize` in a popup and redeem the code into its own
+  8-hour token, the same exposure OAuth has on the client's origin: an app
+  that runs hostile script has its visitors' sessions anyway. The token
+  still opens only that address.
 - Revocation reaches listeners with the next route snapshot; a worker that
   cannot reach the control plane honours existing gate tokens for at most
   8 hours and admits no one new (D8).
@@ -1088,6 +1095,33 @@ from their letter:
 - **Creating or using an Access app needs `dns_providers:write`** on top of
   the option's own permissions, as saving the token does; so does undoing a
   run that created one.
+- **ACME HTTP-01 is answered before the gate.** Let's Encrypt never signs
+  in, so a signed-in host must still answer its challenge or it could
+  never get or renew a certificate. The control-plane proxy answers a
+  challenge stored for the host before the gate, as agents already do, and
+  only that: any other path under `/.well-known/acme-challenge/` still
+  meets the gate, so the prefix is no way past it.
+- **The sign-in is per address, and the plan says which addresses stay
+  open.** The generated hostname (`<env>.<preview domain>`) and Compose
+  service names (`<service>--<env>`) have no row and are always routed, and
+  service custom domains are not addresses Make it reachable manages. A
+  signed-in plan lists every other public address of the environment that
+  opens the same app, so "only people who sign in can open it" is never
+  read as covering the app. Follow-up: offer to sign in or withdraw the
+  generated hostname and service names in the same run.
+- **Wildcards are never signed-in.** Sign-in returns each visitor to one
+  hostname's callback, and `*.example.com` names none. The reachability
+  service refuses to make a wildcard row signed-in, and the authorize
+  endpoint refuses one written any other way, so it serves no one rather
+  than build a callback to `https://*.example.com`.
+- **Which listener may redeem a code is decided from the shared worker
+  snapshot.** A code is redeemed over a node's token channel only for an
+  address that node serves, and that is read from the worker public
+  routes, which are the same for every node: any `gate.v1` node with public
+  ingress or a connector can redeem a code for any worker-served signed-in
+  address. Redeeming still needs the code and its PKCE verifier, which only
+  the listener that started the sign-in holds. This must move to per-node
+  snapshots when they exist.
 
 ## Sources
 

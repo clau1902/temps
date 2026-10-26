@@ -184,6 +184,10 @@ pub struct PlanFacts {
     pub private_rule: Option<PrivateAllowList>,
     /// The environment's addresses and their audiences.
     pub audiences: Vec<(String, Audience)>,
+    /// Public hostnames that reach one Compose service of the environment
+    /// (generated `<service>--<env>` names, service custom domains). They
+    /// open the same app, and a signed-in plan says so (ADR 065 D8).
+    pub service_addresses: Vec<String>,
     /// Every hostname choice.
     pub choices: Vec<(String, Option<i32>)>,
     /// Active workers and their ingress mode.
@@ -1456,6 +1460,9 @@ fn signed_in_drafts(
              network."
         ));
     }
+    if let Some(warning) = still_open_warning(facts, address, shown) {
+        warnings.push(warning);
+    }
     if facts.password_protected {
         warnings.push(format!(
             "{} also has password protection. Both apply: visitors sign in first, then enter \
@@ -1484,6 +1491,32 @@ fn signed_in_drafts(
             draft.warnings.insert(index, warning.clone());
         }
     }
+}
+
+/// The sign-in is per address: every other public way to the same app
+/// stays open to anyone, and the plan names each one rather than imply the
+/// app is behind the sign-in. `None` when there is no other.
+fn still_open_warning(facts: &PlanFacts, address: Option<&str>, shown: &str) -> Option<String> {
+    let mut open: Vec<&str> = facts
+        .audiences
+        .iter()
+        .filter(|(host, audience)| {
+            *audience == Audience::Public && address.is_none_or(|a| !a.eq_ignore_ascii_case(host))
+        })
+        .map(|(host, _)| host.as_str())
+        .chain(facts.service_addresses.iter().map(String::as_str))
+        .collect();
+    open.sort_unstable();
+    open.dedup();
+    if open.is_empty() {
+        return None;
+    }
+    let list = open.join(", ");
+    Some(format!(
+        "The sign-in covers {shown} only. The same app stays open to anyone at {list}. Make \
+         those signed-in or detach them if they shouldn't be public; the generated address \
+         and Compose service addresses can't be signed-in yet."
+    ))
 }
 
 /// Who may sign in, besides having access to the project: both optional.
@@ -1976,6 +2009,56 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("password protection")));
         }
+    }
+
+    /// The sign-in is per address: a plan never implies the app is behind
+    /// it while the generated hostname or a Compose service name still
+    /// opens it for anyone.
+    #[test]
+    fn a_signed_in_plan_names_every_address_that_stays_open() {
+        let facts = PlanFacts {
+            audience: Audience::SignedIn,
+            requested: Some("app.example.com".into()),
+            attached_here: vec!["app.example.com".into()],
+            audiences: vec![
+                ("app.example.com".into(), Audience::Public),
+                ("shop-prod.apps.example.net".into(), Audience::Public),
+                ("lan.example.com".into(), Audience::Private),
+                ("team.example.com".into(), Audience::SignedIn),
+            ],
+            service_addresses: vec!["api--shop-prod.apps.example.net".into()],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let option = plan.options.first().expect("an option");
+        let warning = option
+            .warnings
+            .iter()
+            .find(|w| w.contains("stays open to anyone"))
+            .unwrap_or_else(|| panic!("{:?}", option.warnings));
+        assert!(
+            warning.contains("api--shop-prod.apps.example.net, shop-prod.apps.example.net"),
+            "{warning}"
+        );
+        // Not the address being signed in, nor ones that are not public.
+        assert!(!warning.contains(" app.example.com,"), "{warning}");
+        assert!(!warning.contains("lan.example.com"), "{warning}");
+        assert!(!warning.contains("team.example.com"), "{warning}");
+
+        let alone = PlanFacts {
+            audiences: vec![("app.example.com".into(), Audience::Public)],
+            service_addresses: vec![],
+            ..facts
+        };
+        let plan = super::plan(&alone);
+        let option = plan.options.first().expect("an option");
+        assert!(
+            !option.warnings.iter().any(|w| w.contains("stays open")),
+            "{:?}",
+            option.warnings
+        );
     }
 
     #[test]

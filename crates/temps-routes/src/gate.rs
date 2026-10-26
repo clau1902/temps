@@ -427,6 +427,18 @@ impl GateService {
                 hostname: address.hostname,
             });
         }
+        // A wildcard row names no one host to send the code back to; the
+        // reachability service refuses to make one signed-in, and a row
+        // written some other way still never gets a callback.
+        if address.hostname.starts_with("*.") {
+            return Err(GateServiceError::Validation {
+                address_id: address.address_id,
+                message: format!(
+                    "{} is a wildcard; sign-in needs a single hostname to return to",
+                    address.hostname
+                ),
+            });
+        }
         let not_allowed = |reason| GateServiceError::NotAllowed {
             address_id: address_id.to_string(),
             user_id: request.user_id,
@@ -824,6 +836,64 @@ fn db_insert(source: DbErr) -> GateServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wildcard row never gets a sign-in callback, however it became
+    /// signed-in: `https://*.example.com/...` names no host to return to.
+    #[tokio::test]
+    async fn a_wildcard_row_is_never_sent_a_code() {
+        let now = Utc::now();
+        let row = project_custom_domains::Model {
+            id: 7,
+            project_id: 3,
+            environment_id: 5,
+            domain: "*.example.com".to_string(),
+            redirect_to: None,
+            status_code: None,
+            branch: None,
+            status: "active".to_string(),
+            message: None,
+            created_at: now,
+            updated_at: now,
+            certificate_id: None,
+            service_name: None,
+            audience: "signed_in".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
+            gate: Some("temps".to_string()),
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
+        };
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![row]])
+            .into_connection();
+        let service = GateService::new(
+            Arc::new(db),
+            Arc::new(EncryptionService::new_from_password("gate-test")),
+        );
+        let state = "s".repeat(43);
+        let error = service
+            .authorize(
+                &AuthorizeRequest {
+                    address_id: "custom:7",
+                    user_id: 1,
+                    console_session_id: 1,
+                    is_admin: true,
+                    state: &state,
+                    code_challenge: &"c".repeat(43),
+                },
+                None,
+            )
+            .await
+            .expect_err("a wildcard must not be authorized");
+        assert!(
+            matches!(&error, GateServiceError::Validation { message, .. } if message.contains("*.example.com")),
+            "{error}"
+        );
+    }
 
     #[test]
     fn address_ids_parse_strictly() {

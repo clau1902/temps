@@ -1746,6 +1746,15 @@ impl CachedPeerTable {
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
+    /// Make `host` a signed-in address for cross-crate tests without
+    /// database setup.
+    #[doc(hidden)]
+    pub fn insert_gate_policy_for_test(&self, host: &str, policy: GatePolicy) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.gated.insert(gate_host_key(host), Arc::new(policy));
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
     /// Attach path routes to a source environment for cross-crate tests
     /// without database setup.
     #[doc(hidden)]
