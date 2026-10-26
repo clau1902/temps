@@ -321,6 +321,9 @@ async fn run(
             mode: Some(local.mode),
             error: error.clone(),
             private_checks: private_checks.clone(),
+            // This agent enforces the signed-in gate on every listener it
+            // runs; without it the control plane holds signed-in routes back.
+            capabilities: vec![crate::gate::GATE_CAPABILITY.to_string()],
         };
         if last_reported.as_ref() != Some(&report) || last_report_at.elapsed() >= REPORT_INTERVAL {
             match send_report(&client, &base, &config, &report).await {
@@ -690,6 +693,7 @@ mod tests {
                     deployment_id: None,
                     project_id: None,
                     environment_id: None,
+                    gate: None,
                 },
                 address_id: format!("a{i}"),
                 range: "100.64.0.0/10".into(),

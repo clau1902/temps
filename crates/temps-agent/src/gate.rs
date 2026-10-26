@@ -1,0 +1,764 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! The signed-in gate on the agent's ingress (ADR 065 D8).
+//!
+//! Decisions are `temps_core::gate::decide`, the same function the
+//! control-plane proxy calls. What is the agent's own is the transport: it
+//! redeems sign-in codes and revokes sessions over its node-token channel
+//! (`/internal/nodes/{id}/gate/*`), and the control plane accepts that only
+//! for addresses in this node's own route snapshot.
+//!
+//! A worker cut off from the control plane keeps admitting the tokens it
+//! can verify, until they expire, and admits nobody new: the sign-in page
+//! then says which node cannot reach the control plane.
+//!
+//! The agent advertises the [`GATE_CAPABILITY`] in its listener report; the
+//! control plane holds signed-in routes back from agents that do not, so an
+//! older agent never serves one without the gate.
+
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::response::Response;
+use temps_core::gate::{
+    self, GateDecision, GateLogoutRequest, GatePolicy, GateRedeemRequest, GateRedeemResponse,
+    GateRequest, GateResponse, GATE_COOKIE,
+};
+use tracing::{error, info, warn};
+
+pub use temps_core::gate::GATE_CAPABILITY;
+
+/// How long after the last successful control-plane round the agent still
+/// sends visitors to sign in. The route long-poll answers within 25 s, so
+/// three missed rounds mean the control plane is out of reach.
+const CONTROL_PLANE_STALE_AFTER_SECS: i64 = 90;
+
+/// Timeout for one redeem or logout call.
+const CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Unix seconds of the last successful exchange with the control plane, or
+/// 0 before the first one.
+static LAST_CONTROL_PLANE_CONTACT: AtomicI64 = AtomicI64::new(0);
+
+static CHANNEL: OnceLock<GateChannel> = OnceLock::new();
+
+/// Record a successful exchange with the control plane (a route round, a
+/// redeemed code).
+pub fn mark_control_plane_contact() {
+    LAST_CONTROL_PLANE_CONTACT.store(gate::unix_now(), Ordering::Release);
+}
+
+fn control_plane_out_of_reach(last_contact: i64, now: i64) -> bool {
+    last_contact != 0 && now - last_contact > CONTROL_PLANE_STALE_AFTER_SECS
+}
+
+/// How the agent reaches the control plane's gate endpoints.
+#[derive(Clone)]
+pub struct GateChannel {
+    control_plane_url: String,
+    node_id: i32,
+    node_token: String,
+    /// This node's name, for "Sign-in is unavailable: `<node>` cannot reach
+    /// the control plane".
+    node_name: String,
+    http: reqwest::Client,
+}
+
+/// Why a call to the control plane did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelError {
+    /// No answer (network, TLS, timeout) or a server error.
+    Unreachable(String),
+    /// The control plane answered and refused (4xx).
+    Refused(u16),
+}
+
+impl GateChannel {
+    pub fn new(
+        control_plane_url: String,
+        node_id: i32,
+        node_token: String,
+        node_name: String,
+        control_plane_ca: Option<crate::ControlPlaneCa>,
+    ) -> Result<GateChannel, reqwest::Error> {
+        let http = crate::with_control_plane_trust(
+            reqwest::Client::builder()
+                .timeout(CHANNEL_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none()),
+            control_plane_ca,
+        )
+        .build()?;
+        Ok(GateChannel {
+            control_plane_url: control_plane_url.trim_end_matches('/').to_string(),
+            node_id,
+            node_token,
+            node_name,
+            http,
+        })
+    }
+
+    pub fn node_name(&self) -> &str {
+        &self.node_name
+    }
+
+    async fn post<T: serde::Serialize>(
+        &self,
+        operation: &str,
+        body: &T,
+    ) -> Result<reqwest::Response, ChannelError> {
+        let url = format!(
+            "{}/api/internal/nodes/{}/gate/{operation}",
+            self.control_plane_url, self.node_id
+        );
+        let response = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.node_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ChannelError::Unreachable(format!("POST {url}: {e}")))?;
+        let status = response.status();
+        if status.is_server_error() {
+            return Err(ChannelError::Unreachable(format!(
+                "control plane answered {status} for POST {url}"
+            )));
+        }
+        if !status.is_success() {
+            return Err(ChannelError::Refused(status.as_u16()));
+        }
+        Ok(response)
+    }
+
+    pub async fn redeem(
+        &self,
+        request: &GateRedeemRequest,
+    ) -> Result<GateRedeemResponse, ChannelError> {
+        let response = self.post("redeem", request).await?;
+        let redeemed = response
+            .json::<GateRedeemResponse>()
+            .await
+            .map_err(|e| ChannelError::Unreachable(format!("unreadable redeem answer: {e}")))?;
+        mark_control_plane_contact();
+        Ok(redeemed)
+    }
+
+    pub async fn logout(&self, request: &GateLogoutRequest) -> Result<(), ChannelError> {
+        self.post("logout", request).await?;
+        mark_control_plane_contact();
+        Ok(())
+    }
+}
+
+/// Install the channel once, at agent start.
+pub fn install(channel: GateChannel) {
+    if CHANNEL.set(channel).is_err() {
+        warn!("signed-in gate channel was already installed; keeping the first");
+    }
+}
+
+fn channel() -> Option<&'static GateChannel> {
+    CHANNEL.get()
+}
+
+/// What the ingress does with a request to a gated host.
+pub enum Enforced {
+    /// Forward it with these identity headers (gate cookies already removed
+    /// from the request).
+    Admit(Vec<(&'static str, HeaderValue)>),
+    /// Answer it here.
+    Respond(Response),
+}
+
+/// Run the gate for a request to `hostname`, whose route carries `policy`.
+/// `secure` is whether the browser reached this listener over HTTPS
+/// (the HTTPS listener, or a tunnel whose edge terminated TLS).
+pub async fn enforce(
+    policy: &GatePolicy,
+    hostname: &str,
+    secure: bool,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &mut HeaderMap,
+) -> Enforced {
+    enforce_with(
+        policy,
+        hostname,
+        secure,
+        method,
+        uri,
+        headers,
+        channel(),
+        LAST_CONTROL_PLANE_CONTACT.load(Ordering::Acquire),
+        gate::unix_now(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enforce_with(
+    policy: &GatePolicy,
+    hostname: &str,
+    secure: bool,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &mut HeaderMap,
+    channel: Option<&GateChannel>,
+    last_contact: i64,
+    now: i64,
+) -> Enforced {
+    let node = channel.map_or("this node", GateChannel::node_name);
+    let request = GateRequest {
+        hostname,
+        method,
+        path: uri.path(),
+        query: uri.query(),
+        headers,
+        secure,
+    };
+    let decision = match gate::decide(policy, &request, now) {
+        Ok(decision) => decision,
+        Err(e) => {
+            error!(address_id = %policy.address_id, host = hostname, error = %e, "could not start a sign-in");
+            return respond(GateResponse::unavailable(
+                "Sign-in could not be started on this server. Try again in a moment.",
+            ));
+        }
+    };
+    let answer = match decision {
+        GateDecision::Admit(claims) => {
+            gate::strip_gate_cookies(headers);
+            return Enforced::Admit(gate::identity_headers(&claims));
+        }
+        GateDecision::SignIn { .. }
+            if control_plane_out_of_reach(last_contact, now) || channel.is_none() =>
+        {
+            GateResponse::unavailable(&gate::unreachable_message(node))
+        }
+        GateDecision::SignIn {
+            location,
+            state_cookie,
+            navigation,
+        } => GateResponse::sign_in(&location, &state_cookie, navigation),
+        GateDecision::UpgradeToHttps { location } => GateResponse::upgrade(&location),
+        GateDecision::Unavailable { reason } => {
+            warn!(address_id = %policy.address_id, host = hostname, reason, "signed-in route without a usable gate");
+            GateResponse::unavailable(reason)
+        }
+        GateDecision::NotFound => GateResponse::not_found(),
+        GateDecision::Callback => callback(policy, hostname, uri, headers, channel, now).await,
+        GateDecision::Logout => logout(policy, hostname, headers, channel).await,
+    };
+    respond(answer)
+}
+
+async fn callback(
+    policy: &GatePolicy,
+    hostname: &str,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    channel: Option<&GateChannel>,
+    now: i64,
+) -> GateResponse {
+    let input = match gate::check_callback(uri.query(), headers, now) {
+        Ok(input) => input,
+        Err(refusal) => {
+            info!(address_id = %policy.address_id, host = hostname, ?refusal, "sign-in callback refused before redeeming");
+            return GateResponse::callback_refused(refusal);
+        }
+    };
+    let Some(channel) = channel else {
+        return GateResponse::unavailable(&gate::unreachable_message("this node"));
+    };
+    let request = GateRedeemRequest {
+        address_id: policy.address_id.clone(),
+        code: input.code,
+        code_verifier: input.verifier,
+    };
+    match channel.redeem(&request).await {
+        Ok(redeemed) => GateResponse::signed_in(&redeemed, &input.return_to, now),
+        Err(ChannelError::Unreachable(reason)) => {
+            warn!(address_id = %policy.address_id, host = hostname, %reason, "could not redeem a sign-in code");
+            GateResponse::unavailable(&gate::unreachable_message(channel.node_name()))
+        }
+        Err(ChannelError::Refused(status)) => {
+            info!(address_id = %policy.address_id, host = hostname, status, "control plane refused a sign-in code");
+            GateResponse::redeem_failed(
+                if status == 404 || status == 409 {
+                    409
+                } else {
+                    400
+                },
+                refused_message(status),
+            )
+        }
+    }
+}
+
+/// What a visitor reads when the control plane refused the code. The
+/// control plane's own message carries ids and stays in its log.
+fn refused_message(status: u16) -> &'static str {
+    match status {
+        403 => {
+            "This server does not serve this address any more. Open the address again to sign in."
+        }
+        404 | 409 => "This address no longer asks for sign-in. Open it again.",
+        _ => "This sign-in link expired or was already used. Open the address again to sign in.",
+    }
+}
+
+async fn logout(
+    policy: &GatePolicy,
+    hostname: &str,
+    headers: &HeaderMap,
+    channel: Option<&GateChannel>,
+) -> GateResponse {
+    if !gate::logout_allowed(headers, hostname) {
+        warn!(address_id = %policy.address_id, host = hostname, "cross-origin sign-out refused");
+        return GateResponse::logout_refused();
+    }
+    let mut revoked = true;
+    for token in gate::cookie_values(headers, GATE_COOKIE) {
+        let Some(channel) = channel else {
+            revoked = false;
+            break;
+        };
+        let request = GateLogoutRequest {
+            address_id: policy.address_id.clone(),
+            token: token.to_string(),
+        };
+        match channel.logout(&request).await {
+            Ok(()) => {}
+            // A token that does not verify has no session to revoke.
+            Err(ChannelError::Refused(400)) => {}
+            Err(error) => {
+                warn!(address_id = %policy.address_id, host = hostname, ?error, "could not revoke a gate session");
+                revoked = false;
+            }
+        }
+    }
+    GateResponse::signed_out(hostname, revoked)
+}
+
+/// Render a gate answer.
+pub fn respond(answer: GateResponse) -> Enforced {
+    Enforced::Respond(into_response(answer))
+}
+
+pub fn into_response(answer: GateResponse) -> Response {
+    let mut response = Response::new(answer.body.map(Body::from).unwrap_or_else(Body::empty));
+    *response.status_mut() =
+        StatusCode::from_u16(answer.status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    for (name, value) in answer.headers {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            response
+                .headers_mut()
+                .append(HeaderName::from_static(name), value);
+        }
+    }
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::post;
+    use axum::Json;
+    use std::sync::Arc;
+    use temps_core::gate::{GateKind, GateState, TempsGate, GATE_HEADER, GATE_SIGN_IN};
+
+    fn policy(key: &gate::SigningKey) -> GatePolicy {
+        GatePolicy {
+            address_id: "environment:4".into(),
+            gate: GateKind::Temps,
+            temps: Some(TempsGate {
+                public_key: gate::encode_public_key(&key.verifying_key()),
+                authorize_url: "https://console.example.test/_temps/gate/authorize".into(),
+                not_before: 0,
+                revoked: vec![],
+            }),
+            access: None,
+        }
+    }
+
+    fn claims(now: i64) -> gate::GateClaims {
+        gate::GateClaims {
+            sid: "x".repeat(43),
+            uid: 11,
+            email: "member@example.test".into(),
+            aid: "environment:4".into(),
+            iat: now - 5,
+            exp: now + 600,
+        }
+    }
+
+    async fn run(
+        policy: &GatePolicy,
+        method: Method,
+        uri: &str,
+        headers: &mut HeaderMap,
+        channel: Option<&GateChannel>,
+        now: i64,
+    ) -> Enforced {
+        let uri: axum::http::Uri = uri.parse().unwrap();
+        enforce_with(
+            policy,
+            "app.example.test",
+            true,
+            &method,
+            &uri,
+            headers,
+            channel,
+            0,
+            now,
+        )
+        .await
+    }
+
+    fn response(outcome: Enforced) -> Response {
+        match outcome {
+            Enforced::Respond(response) => response,
+            Enforced::Admit(_) => panic!("admitted"),
+        }
+    }
+
+    /// A stand-in control plane on loopback that answers redeem/logout.
+    async fn control_plane(
+        redeem_status: StatusCode,
+    ) -> (GateChannel, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_redeem = Arc::clone(&seen);
+        let seen_logout = Arc::clone(&seen);
+        let app = axum::Router::new()
+            .route(
+                "/api/internal/nodes/9/gate/redeem",
+                post(
+                    move |headers: HeaderMap, Json(body): Json<GateRedeemRequest>| {
+                        let seen = Arc::clone(&seen_redeem);
+                        async move {
+                            seen.lock().unwrap().push(format!(
+                                "redeem {} {} {}",
+                                body.address_id,
+                                headers
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or_default(),
+                                body.code_verifier.len()
+                            ));
+                            if redeem_status != StatusCode::OK {
+                                return Err(redeem_status);
+                            }
+                            Ok(Json(GateRedeemResponse {
+                                token: "v1.tok.sig".into(),
+                                expires_at: gate::unix_now() + 600,
+                            }))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/api/internal/nodes/9/gate/logout",
+                post(move |Json(body): Json<GateLogoutRequest>| {
+                    let seen = Arc::clone(&seen_logout);
+                    async move {
+                        seen.lock().unwrap().push(format!("logout {}", body.token));
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let channel = GateChannel::new(
+            format!("http://{address}"),
+            9,
+            "node-token".into(),
+            "worker-1".into(),
+            None,
+        )
+        .unwrap();
+        (channel, seen)
+    }
+
+    fn callback_request(now: i64) -> (String, HeaderMap) {
+        let state = GateState::new("/after?x=1", now).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{}={}", gate::GATE_STATE_COOKIE, state.encode()))
+                .unwrap(),
+        );
+        let code = gate::new_random_value("test").unwrap();
+        (
+            format!("{}?code={code}&state={}", gate::CALLBACK_PATH, state.state),
+            headers,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_valid_token_is_admitted_without_its_cookie_and_with_identity() {
+        let key = gate::generate_signing_key().unwrap();
+        let now = gate::unix_now();
+        let token = gate::sign_token(&key, &claims(now)).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("app=1; {GATE_COOKIE}={token}")).unwrap(),
+        );
+        let outcome = run(&policy(&key), Method::GET, "/", &mut headers, None, now).await;
+        let Enforced::Admit(identity) = outcome else {
+            panic!("a valid token was refused");
+        };
+        assert_eq!(identity[0].0, gate::USER_HEADER);
+        assert_eq!(identity[0].1, "11");
+        assert_eq!(identity[1].1, "member@example.test");
+        assert_eq!(headers.get("cookie").unwrap(), "app=1");
+    }
+
+    #[tokio::test]
+    async fn signed_out_navigation_redirects_and_api_calls_get_401() {
+        let key = gate::generate_signing_key().unwrap();
+        let (channel, _) = control_plane(StatusCode::OK).await;
+        let mut nav = HeaderMap::new();
+        nav.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        let answer = response(
+            run(
+                &policy(&key),
+                Method::GET,
+                "/",
+                &mut nav,
+                Some(&channel),
+                1_000,
+            )
+            .await,
+        );
+        assert_eq!(answer.status(), StatusCode::FOUND);
+        assert_eq!(answer.headers().get(GATE_HEADER).unwrap(), GATE_SIGN_IN);
+
+        let mut api = HeaderMap::new();
+        let answer = response(
+            run(
+                &policy(&key),
+                Method::POST,
+                "/api",
+                &mut api,
+                Some(&channel),
+                1_000,
+            )
+            .await,
+        );
+        assert_eq!(answer.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(answer.headers().get(GATE_HEADER).unwrap(), GATE_SIGN_IN);
+    }
+
+    #[tokio::test]
+    async fn callback_redeems_over_the_node_channel_and_sets_the_cookie() {
+        let key = gate::generate_signing_key().unwrap();
+        let (channel, seen) = control_plane(StatusCode::OK).await;
+        let now = gate::unix_now();
+        let (uri, mut headers) = callback_request(now);
+        let answer = response(
+            run(
+                &policy(&key),
+                Method::GET,
+                &uri,
+                &mut headers,
+                Some(&channel),
+                now,
+            )
+            .await,
+        );
+        assert_eq!(answer.status(), StatusCode::FOUND);
+        assert_eq!(answer.headers().get("location").unwrap(), "/after?x=1");
+        let cookies: Vec<_> = answer.headers().get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies[0]
+            .to_str()
+            .unwrap()
+            .starts_with("__Host-temps_gate=v1.tok.sig; Path=/; Secure; HttpOnly; SameSite=Lax"));
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["redeem environment:4 Bearer node-token 43"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_code_is_a_sign_in_failure_without_the_control_planes_details() {
+        let key = gate::generate_signing_key().unwrap();
+        let (channel, _) = control_plane(StatusCode::BAD_REQUEST).await;
+        let now = gate::unix_now();
+        let (uri, mut headers) = callback_request(now);
+        let answer = response(
+            run(
+                &policy(&key),
+                Method::GET,
+                &uri,
+                &mut headers,
+                Some(&channel),
+                now,
+            )
+            .await,
+        );
+        assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
+        assert!(answer
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .all(|c| c.to_str().unwrap().starts_with("__Host-temps_gate_state=;")));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_control_plane_names_the_node() {
+        let key = gate::generate_signing_key().unwrap();
+        let channel = GateChannel::new(
+            // Nothing listens on port 9 of loopback.
+            "http://127.0.0.1:9".into(),
+            9,
+            "node-token".into(),
+            "worker-1".into(),
+            None,
+        )
+        .unwrap();
+        let now = gate::unix_now();
+        let (uri, mut headers) = callback_request(now);
+        let answer = response(
+            run(
+                &policy(&key),
+                Method::GET,
+                &uri,
+                &mut headers,
+                Some(&channel),
+                now,
+            )
+            .await,
+        );
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(answer.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("Sign-in is unavailable: worker-1 cannot reach the control plane."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_stale_control_plane_contact_is_out_of_reach() {
+        let now = 10_000;
+        assert!(control_plane_out_of_reach(
+            now - CONTROL_PLANE_STALE_AFTER_SECS - 1,
+            now
+        ));
+        assert!(!control_plane_out_of_reach(now - 5, now));
+        // Before the first round there is nothing to judge by.
+        assert!(!control_plane_out_of_reach(0, now));
+    }
+
+    #[tokio::test]
+    async fn a_stale_control_plane_turns_sign_in_into_the_unavailable_page() {
+        let key = gate::generate_signing_key().unwrap();
+        let (channel, _) = control_plane(StatusCode::OK).await;
+        let now = 10_000;
+        let mut nav = HeaderMap::new();
+        nav.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        let uri: axum::http::Uri = "/".parse().unwrap();
+        let answer = response(
+            enforce_with(
+                &policy(&key),
+                "app.example.test",
+                true,
+                &Method::GET,
+                &uri,
+                &mut nav,
+                Some(&channel),
+                now - 600,
+                now,
+            )
+            .await,
+        );
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(answer.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("worker-1 cannot reach the control plane"));
+    }
+
+    #[tokio::test]
+    async fn without_a_channel_nobody_new_is_admitted_but_tokens_still_are() {
+        let key = gate::generate_signing_key().unwrap();
+        let now = gate::unix_now();
+        let mut nav = HeaderMap::new();
+        nav.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        let answer = response(run(&policy(&key), Method::GET, "/", &mut nav, None, now).await);
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let token = gate::sign_token(&key, &claims(now)).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{GATE_COOKIE}={token}")).unwrap(),
+        );
+        assert!(matches!(
+            run(&policy(&key), Method::GET, "/", &mut headers, None, now).await,
+            Enforced::Admit(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn logout_is_same_origin_only_and_revokes_over_the_channel() {
+        let key = gate::generate_signing_key().unwrap();
+        let (channel, seen) = control_plane(StatusCode::OK).await;
+        let mut cross = HeaderMap::new();
+        cross.insert(
+            "origin",
+            HeaderValue::from_static("https://elsewhere.example.test"),
+        );
+        cross.insert(
+            "cookie",
+            HeaderValue::from_static("__Host-temps_gate=v1.a.b"),
+        );
+        let answer = response(
+            run(
+                &policy(&key),
+                Method::POST,
+                gate::LOGOUT_PATH,
+                &mut cross,
+                Some(&channel),
+                1_000,
+            )
+            .await,
+        );
+        assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a cross-site form revoked a session"
+        );
+
+        let mut same = HeaderMap::new();
+        same.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        same.insert(
+            "cookie",
+            HeaderValue::from_static("__Host-temps_gate=v1.a.b"),
+        );
+        let answer = response(
+            run(
+                &policy(&key),
+                Method::POST,
+                gate::LOGOUT_PATH,
+                &mut same,
+                Some(&channel),
+                1_000,
+            )
+            .await,
+        );
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["logout v1.a.b"]);
+    }
+}

@@ -523,6 +523,15 @@ impl IngressConnectorService {
                     }
                     setup.dns_provider = Some(provider);
                 }
+                FieldKind::Teams
+                | FieldKind::Users
+                | FieldKind::Choice { .. }
+                | FieldKind::TextList => {
+                    return Err(IngressError::Validation(format!(
+                        "{} ({}) is not something an ingress provider is set up with.",
+                        field.label, field.key
+                    )));
+                }
                 FieldKind::ManagedDomain {
                     allow_subdomain, ..
                 } => {

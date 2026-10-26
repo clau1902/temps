@@ -59,6 +59,10 @@ pub struct RouteEntry {
     pub deployment_id: Option<i32>,
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
+    /// The signed-in gate in front of this address (ADR 065 D8). Only on
+    /// public routes, and only sent to an agent that enforces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<temps_core::gate::GatePolicy>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -648,6 +652,7 @@ mod tests {
             deployment_id: Some(1),
             project_id,
             environment_id: Some(1),
+            gate: None,
         }
     }
 

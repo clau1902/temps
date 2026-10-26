@@ -61,6 +61,8 @@ pub struct RouteSyncAppState {
     pub peer_table: Arc<CachedPeerTable>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
     pub request_policy_gate: Arc<temps_core::RequestPolicyGateSlot>,
+    /// Redeems sign-in codes and logs out for agents (ADR 065 D8).
+    pub gate: Arc<crate::gate::GateService>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +95,10 @@ pub struct RouteEntryDto {
     pub deployment_id: Option<i32>,
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
+    /// The gate of a signed-in address (ADR 065 D7). Only sent to agents
+    /// that report `gate.v1`; an agent that predates it never gets the route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<temps_core::gate::GatePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -496,6 +502,14 @@ pub fn configure_routes() -> axum::Router<Arc<RouteSyncAppState>> {
             "/internal/nodes/{node_id}/public-ingress/report",
             post(crate::public_ingress_sync::post_listener_report),
         )
+        .route(
+            "/internal/nodes/{node_id}/gate/redeem",
+            post(crate::gate_sync::post_gate_redeem),
+        )
+        .route(
+            "/internal/nodes/{node_id}/gate/logout",
+            post(crate::gate_sync::post_gate_logout),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +626,12 @@ pub async fn worker_public_routes(
                 public_backend_is_registered_worker(&backend.address, &registered_worker_addresses)
             })
         })
+        .map(|mut route| {
+            route.gate = peer_table
+                .gate_for_host(&route.host)
+                .map(|policy| policy.as_ref().clone());
+            route
+        })
         .collect();
     let mut unsupported_reasons = blocking_policies.clone();
     if public_route_count > routes.len() && unsupported_reasons.is_empty() {
@@ -725,17 +745,16 @@ async fn build_snapshot(
     };
     // A worker in private mode (ADR 064 D5) gets the private addresses
     // recorded for it, and only while it is bound on a private address.
-    let private_listener = {
-        let row = temps_entities::node_public_ingress::Entity::find_by_id(node.id)
-            .one(state.db.as_ref())
-            .await
-            .map_err(|source| SnapshotBuildError::Database {
-                node_id: node.id,
-                operation: "load private ingress state",
-                source,
-            })?;
-        private_listener_of(row.as_ref())
-    };
+    let ingress_row = temps_entities::node_public_ingress::Entity::find_by_id(node.id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|source| SnapshotBuildError::Database {
+            node_id: node.id,
+            operation: "load private ingress state",
+            source,
+        })?;
+    let private_listener = private_listener_of(ingress_row.as_ref());
+    let enforces_gate = reports_capability(ingress_row.as_ref(), temps_core::gate::GATE_CAPABILITY);
     let (private_routes, private_held_back) = if private_listener.is_some() {
         let policy = worker_route_policy(
             state.db.as_ref(),
@@ -796,7 +815,13 @@ async fn build_snapshot(
                         .map(|route| route.route.host.trim_end_matches('.').to_ascii_lowercase()),
                 )
                 .collect();
+            // ADR 065 D7: a signed-in address goes only to an agent that
+            // enforces its gate. An older agent would serve it open.
+            let (public_routes, gate_held_back) =
+                hold_back_gated(public_routes, enforces_gate, &node.name);
+            let unsupported_route_count = unsupported_route_count + gate_held_back.len();
             let mut unsupported_reasons = unsupported_reasons;
+            unsupported_reasons.extend(gate_held_back);
             unsupported_reasons.extend(private_held_back.iter().cloned());
             PublicIngressSnapshot {
                 enabled: true,
@@ -826,6 +851,45 @@ async fn build_snapshot(
         routes,
         public_ingress,
     })
+}
+
+/// Whether an agent's last listener report lists `capability`.
+pub fn reports_capability(
+    row: Option<&temps_entities::node_public_ingress::Model>,
+    capability: &str,
+) -> bool {
+    row.and_then(|row| row.capabilities.as_ref())
+        .and_then(|value| value.as_array())
+        .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(capability)))
+}
+
+/// Split off the signed-in routes an agent cannot enforce (ADR 065 D7),
+/// with the reason the console shows for each.
+pub fn hold_back_gated(
+    routes: Vec<RouteEntryDto>,
+    enforces_gate: bool,
+    node_name: &str,
+) -> (Vec<RouteEntryDto>, Vec<String>) {
+    if enforces_gate {
+        return (routes, Vec::new());
+    }
+    let mut held_back = Vec::new();
+    let routes = routes
+        .into_iter()
+        .filter(|route| {
+            if route.gate.is_some() {
+                held_back.push(format!(
+                    "{}: it is for people who sign in, and the agent on {node_name} does not \
+                     enforce sign-in yet; update the agent on {node_name}",
+                    route.host
+                ));
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (routes, held_back)
 }
 
 async fn public_listen(
@@ -998,6 +1062,7 @@ fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
         deployment_id: info.deployment.as_ref().map(|d| d.id),
         project_id: info.project.as_ref().map(|p| p.id),
         environment_id: info.environment.as_ref().map(|e| e.id),
+        gate: None,
     })
 }
 
@@ -1212,6 +1277,10 @@ pub(crate) mod tests {
                 peer_table: Arc::clone(&peer_table),
                 encryption_service: Arc::clone(&encryption_service),
                 request_policy_gate: open_gate,
+                gate: Arc::new(crate::gate::GateService::new(
+                    test_db.db.clone(),
+                    Arc::clone(&encryption_service),
+                )),
             },
             &node,
             1,
@@ -1242,6 +1311,10 @@ pub(crate) mod tests {
                     peer_table: Arc::clone(&peer_table),
                     encryption_service: Arc::clone(&encryption_service),
                     request_policy_gate,
+                    gate: Arc::new(crate::gate::GateService::new(
+                        test_db.db.clone(),
+                        Arc::clone(&encryption_service),
+                    )),
                 },
                 &node,
                 1,
@@ -1290,6 +1363,10 @@ pub(crate) mod tests {
                 peer_table: Arc::clone(&peer_table),
                 encryption_service: Arc::clone(&encryption_service),
                 request_policy_gate: open_gate,
+                gate: Arc::new(crate::gate::GateService::new(
+                    test_db.db.clone(),
+                    Arc::clone(&encryption_service),
+                )),
             },
             &node,
             1,
@@ -1333,6 +1410,10 @@ pub(crate) mod tests {
                     peer_table: Arc::clone(&peer_table),
                     encryption_service: Arc::clone(&encryption_service),
                     request_policy_gate: open_gate,
+                    gate: Arc::new(crate::gate::GateService::new(
+                        test_db.db.clone(),
+                        Arc::clone(&encryption_service),
+                    )),
                 },
                 &node,
                 1,
@@ -1557,5 +1638,88 @@ pub(crate) mod tests {
             &certificate,
             "app.example.test"
         ));
+    }
+}
+
+#[cfg(test)]
+mod gate_hold_back_tests {
+    use super::*;
+
+    fn route(host: &str, gated: bool) -> RouteEntryDto {
+        RouteEntryDto {
+            host: host.to_string(),
+            backends: vec![],
+            deployment_id: None,
+            project_id: None,
+            environment_id: None,
+            gate: gated.then(|| temps_core::gate::GatePolicy {
+                address_id: "custom:1".into(),
+                gate: temps_core::gate::GateKind::Temps,
+                temps: None,
+                access: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn an_agent_without_gate_v1_never_receives_a_signed_in_route() {
+        let routes = vec![
+            route("open.example.test", false),
+            route("team.example.test", true),
+        ];
+        let (kept, held) = hold_back_gated(routes.clone(), false, "worker-1");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].host, "open.example.test");
+        assert_eq!(held.len(), 1);
+        assert!(
+            held[0].contains("update the agent on worker-1"),
+            "{}",
+            held[0]
+        );
+        let (kept, held) = hold_back_gated(routes, true, "worker-1");
+        assert_eq!(kept.len(), 2);
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn capabilities_are_read_from_the_last_report() {
+        let mut row = temps_entities::node_public_ingress::Model {
+            node_id: 1,
+            listen_address: None,
+            http_port: 80,
+            https_port: 443,
+            public_address: None,
+            interfaces: None,
+            listening: None,
+            mode: None,
+            last_check: None,
+            private_checks: None,
+            capabilities: None,
+            checked_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert!(!reports_capability(Some(&row), "gate.v1"));
+        assert!(!reports_capability(None, "gate.v1"));
+        row.capabilities = Some(serde_json::json!(["gate.v1"]));
+        assert!(reports_capability(Some(&row), "gate.v1"));
+        row.capabilities = Some(serde_json::json!("gate.v1"));
+        assert!(!reports_capability(Some(&row), "gate.v1"));
+    }
+
+    #[test]
+    fn an_old_agent_ignores_the_gate_field_so_it_must_never_get_one() {
+        // What an agent that predates the gate deserialises: everything but
+        // the gate, which is exactly why the route is held back instead.
+        #[derive(serde::Deserialize)]
+        struct OldEntry {
+            host: String,
+        }
+        let json = serde_json::to_string(&route("team.example.test", true)).unwrap();
+        assert!(json.contains("\"gate\""));
+        let old: OldEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.host, "team.example.test");
+        let ungated = serde_json::to_string(&route("open.example.test", false)).unwrap();
+        assert!(!ungated.contains("gate"), "{ungated}");
     }
 }

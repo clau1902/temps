@@ -19,6 +19,9 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{configure_routes, IngressApiDoc, IngressAppState};
+use crate::reachability::gate_handlers::{
+    configure_routes as gate_routes, GateApiDoc, GateConsoleState,
+};
 use crate::reachability::handlers::{
     configure_routes as reachability_routes, ReachabilityApiDoc, ReachabilityAppState,
 };
@@ -97,6 +100,13 @@ impl TempsPlugin for IngressPlugin {
             sensitive_action_authorizer: context
                 .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
         });
+        // Signed-in addresses (ADR 065 D8); the server registers the gate
+        // service before plugins configure their routes.
+        let gate_state = Arc::new(GateConsoleState {
+            gate: context.require_service::<temps_routes::gate::GateService>(),
+            audit_service: audit_service.clone(),
+            project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+        });
         let state = Arc::new(IngressAppState {
             service,
             audit_service,
@@ -104,13 +114,15 @@ impl TempsPlugin for IngressPlugin {
         Some(PluginRoutes::new(
             configure_routes()
                 .with_state(state)
-                .merge(reachability_routes().with_state(reachability_state)),
+                .merge(reachability_routes().with_state(reachability_state))
+                .merge(gate_routes().with_state(gate_state)),
         ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
         let mut doc = <IngressApiDoc as OpenApiTrait>::openapi();
         doc.merge(<ReachabilityApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<GateApiDoc as OpenApiTrait>::openapi());
         Some(doc)
     }
 }

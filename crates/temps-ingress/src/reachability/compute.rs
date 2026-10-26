@@ -606,6 +606,7 @@ pub fn summary(
                 format!("Private at {} ({network})", address.address)
             }
             (Audience::Private, None) => format!("Private at {}", address.address),
+            (Audience::SignedIn, _) => format!("Behind sign-in at {}", address.address),
             _ => format!("Public at {}", address.address),
         };
     }
@@ -677,17 +678,25 @@ mod tests {
     /// nobody, and the verdict says so instead of judging a public way in.
     #[test]
     fn an_audience_this_version_cannot_serve_is_not_reachable() {
-        for (stored, words) in [("signed_in", "sign in"), ("tailnet_users", "newer version")] {
-            let mut facts = facts("app.example.com", Resolution::Ips(vec![ip("203.0.113.10")]));
-            facts.input.audience = Audience::parse(stored);
-            let verdict = address_reachability(&facts, &[control_plane()], true, "production");
-            assert_eq!(verdict.state, ReachState::NotReachable, "{stored}");
-            assert!(
-                verdict.reason.contains(words),
-                "{stored}: {}",
-                verdict.reason
-            );
-        }
+        let mut unserved = facts("app.example.com", Resolution::Ips(vec![ip("203.0.113.10")]));
+        unserved.input.audience = Audience::parse("tailnet_users");
+        let verdict = address_reachability(&unserved, &[control_plane()], true, "production");
+        assert_eq!(verdict.state, ReachState::NotReachable);
+        assert!(
+            verdict.reason.contains("newer version"),
+            "{}",
+            verdict.reason
+        );
+        // Served since phase 4a: judged like any address, behind its gate.
+        let mut gated = facts("app.example.com", Resolution::Ips(vec![ip("203.0.113.10")]));
+        gated.input.audience = Audience::parse("signed_in");
+        let verdict = address_reachability(&gated, &[control_plane()], true, "production");
+        assert!(
+            !verdict.reason.contains("newer version"),
+            "{}",
+            verdict.reason
+        );
+        assert!(Audience::SignedIn.is_served());
         assert_eq!(Audience::parse("tailnet_users"), Audience::Unsupported);
         assert_eq!(Audience::parse("private"), Audience::Private);
         assert!(!Audience::Unsupported.is_served());

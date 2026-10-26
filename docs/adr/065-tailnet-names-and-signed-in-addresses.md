@@ -988,6 +988,54 @@ window in which a phase 2 address is unserved.
 6. ADR 064's open question 2 applies here too: do preview environments
    inherit `tailnet_users` and `signed_in`, with the same principals?
 
+## Implementation notes: phase 4 (signed-in addresses)
+
+Where the code had to be more specific than the decisions above, or departs
+from their letter:
+
+- **The token carries the email.** D8 lists session, user, address, issue
+  and expiry. The token also holds the user's email at sign-in, so a
+  listener can send `x-temps-user-email` without asking the control plane.
+  It is signed like the rest and the cookie is host-only.
+- **Plain HTTP on a signed-in host gets `308` to HTTPS**, with
+  `x-temps-gate: sign-in`, before anything else: a `__Host-` cookie is only
+  kept over HTTPS. The exception is a control-plane proxy started with
+  `--disable-https-redirect` (TLS ends in front of it), which treats the
+  connection as secure.
+- **The address's list applies to instance admins too.** Admins skip the
+  project-access check, as everywhere in Temps, but an address limited to
+  listed teams or users admits an admin only if they are on it.
+- **"Cannot reach the control plane" is 90 seconds without a snapshot.** An
+  agent that has had no route snapshot for that long shows "Sign-in is
+  unavailable: `<node>` cannot reach the control plane" to people who are
+  not signed in, and keeps honouring existing tokens until they expire, as
+  D8 says.
+- **Revocation without a route change.** The route snapshot is rebuilt on
+  `route_table_changes`. A console sign-out, a removal from a team or from a
+  project's teams, an admin demoted and a user deleted change no route, so
+  database triggers announce one, and only when the user concerned has a
+  live gate session (any live session for a change to a project's teams).
+  Installs with no signed-in address never have one (D11).
+- **An unauthenticated authorize request gets the console's sign-in page**,
+  which returns to the authorize URL after password and MFA with a full page
+  load, so the server makes the redirect.
+- **Plans set the gate on custom domains.** Runs attach custom domains (ADR
+  064), so that is where a plan sets `signed_in`. Environment domains have
+  the same columns and listeners enforce them, but nothing in the console
+  sets them yet.
+- **Attach, then gate.** A run attaches the address and sets `signed_in` in
+  the next step, before anything publishes it (DNS, tunnel route,
+  certificate), as phase 2 does for private addresses. Only an address
+  whose DNS and certificate already existed before the run could be served
+  open in between, for the moment between the two steps.
+- **The reachability check (D10) dials only addresses the outbound policy
+  accepts**, pinned to them, with no redirect followed. An address it cannot
+  check is shown as unknown, never as a pass.
+- **Monitors of a gated address stay operational** and say "Behind sign-in"
+  with the container health checks as what watches the app: the gate
+  answering means the address is up, and an outage alert for every gated
+  address would be noise.
+
 ## Sources
 
 - [kb/1312] Tailscale Serve: https://tailscale.com/kb/1312/serve

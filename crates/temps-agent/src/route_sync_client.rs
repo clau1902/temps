@@ -102,6 +102,8 @@ struct SnapshotRoute {
     project_id: Option<i32>,
     #[serde(default)]
     environment_id: Option<i32>,
+    #[serde(default)]
+    gate: Option<temps_core::gate::GatePolicy>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -309,6 +311,9 @@ impl RouteSyncClient {
             .json()
             .await
             .map_err(|e| format!("parse snapshot: {e}"))?;
+        // The signed-in gate sends visitors to sign in only while the
+        // control plane answers (ADR 065 D8).
+        crate::gate::mark_control_plane_contact();
 
         let public_ingress = PublicIngressSnapshot {
             enabled: body.public_ingress.enabled,
@@ -432,6 +437,7 @@ fn snapshot_route_into_entry(route: SnapshotRoute) -> RouteEntry {
         deployment_id: route.deployment_id,
         project_id: route.project_id,
         environment_id: route.environment_id,
+        gate: route.gate,
     }
 }
 
@@ -505,6 +511,7 @@ mod tests {
             deployment_id: Some(1),
             project_id: Some(2),
             environment_id: Some(3),
+            gate: None,
         }
     }
 

@@ -66,6 +66,8 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
+import { PeoplePicker } from '@/components/reachability/PeoplePicker'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
   Select,
@@ -97,8 +99,8 @@ import {
 import { cn } from '@/lib/utils'
 
 const schema = z.object({
-  /** Who can open the address (ADR 064 D5). */
-  audience: z.enum(['public', 'private']),
+  /** Who can open the address (ADR 064 D5, ADR 065 D7). */
+  audience: z.enum(['public', 'signed_in', 'private']),
   address: z.string().trim(),
   option: z.string().min(1, 'Pick a way in.'),
   values: z.record(z.string(), z.string()),
@@ -424,7 +426,7 @@ export function MakeReachableDialog({
                             form.setValue('option', '')
                             form.setValue('confirmed', false)
                           }}
-                          className="grid gap-2 sm:grid-cols-2"
+                          className="grid gap-2 sm:grid-cols-3"
                         >
                           {AUDIENCES.map((choice) => (
                             <label
@@ -605,6 +607,11 @@ const AUDIENCES = [
     help: 'A public address with HTTPS.',
   },
   {
+    value: 'signed_in',
+    label: 'People who sign in',
+    help: 'A public address with the Temps sign-in in front: only people with access to this project get in.',
+  },
+  {
     value: 'private',
     label: 'Only my private network',
     help: 'Served by a worker on your tailnet or LAN; nobody else can connect.',
@@ -757,7 +764,49 @@ function SetupFieldInput({
               </span>
             )}
           </FormLabel>
-          {setupField.kind.type === 'dns_provider' ? (
+          {setupField.kind.type === 'teams' ||
+          setupField.kind.type === 'users' ? (
+            <PeoplePicker
+              kind={setupField.kind.type}
+              value={field.value ?? ''}
+              onChange={field.onChange}
+            />
+          ) : setupField.kind.type === 'choice' ? (
+            <FormControl>
+              <RadioGroup
+                aria-label={setupField.label}
+                value={field.value ?? ''}
+                onValueChange={field.onChange}
+                className="grid gap-2"
+              >
+                {setupField.kind.choices.map((choice) => (
+                  <label
+                    key={choice.value}
+                    className="flex cursor-pointer items-start gap-2 text-sm"
+                  >
+                    <RadioGroupItem value={choice.value} className="mt-0.5" />
+                    <span className="space-y-0.5">
+                      <span className="block font-medium">{choice.label}</span>
+                      {choice.help && (
+                        <span className="block text-xs text-muted-foreground">
+                          {choice.help}
+                        </span>
+                      )}
+                    </span>
+                  </label>
+                ))}
+              </RadioGroup>
+            </FormControl>
+          ) : setupField.kind.type === 'text_list' ? (
+            <FormControl>
+              <Textarea
+                rows={3}
+                placeholder={setupField.placeholder ?? undefined}
+                {...field}
+                value={field.value ?? ''}
+              />
+            </FormControl>
+          ) : setupField.kind.type === 'dns_provider' ? (
             providers.isPending ? (
               <Skeleton className="h-9 w-full" />
             ) : (

@@ -252,6 +252,11 @@ pub struct ListenerReport {
     /// it serves (ADR 064 D7).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_checks: Vec<PrivateCheck>,
+    /// What this agent enforces, e.g. `gate.v1` (ADR 065 D7). Routes that
+    /// need a capability go only to agents that report it; an agent that
+    /// predates the field reports none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 /// The port a private listener serves HTTPS on, always (ADR 064 D5): a

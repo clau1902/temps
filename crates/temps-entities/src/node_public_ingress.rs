@@ -33,6 +33,10 @@ pub struct Model {
     /// D7), `[{address_id, hostname, outcome, message, ...}]`.
     #[serde(default)]
     pub private_checks: Option<Json>,
+    /// What the agent reports it enforces, e.g. `["gate.v1"]` (ADR 065).
+    /// Signed-in routes go only to agents that report `gate.v1`.
+    #[serde(default)]
+    pub capabilities: Option<Json>,
     pub checked_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,

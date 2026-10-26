@@ -3131,6 +3131,7 @@ mod tests {
                     network_range: Some("100.64.0.0/10".into()),
                     private_node_id: Some(2),
                     private_listener: Some("100.101.102.103".into()),
+                    ..AddressAudience::default()
                 },
                 AddressAudience::public(),
             )),

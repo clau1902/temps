@@ -1101,6 +1101,11 @@ pub struct ProxyContext {
     /// project context, static serving and the upstream peer all follow the
     /// target instead of the host's own service.
     pub path_route: Option<temps_routes::PathRoute>,
+    /// The host is a signed-in address (ADR 065 D8): the app's response may
+    /// not set the gate's cookies or pass for the gate.
+    pub gated_host: bool,
+    /// Who the gate admitted, for a signed-in address.
+    pub gate_identity: Option<temps_core::gate::GateClaims>,
 }
 
 /// Main load balancer proxy implementation using traits
@@ -1194,6 +1199,9 @@ pub struct LoadBalancer {
     /// `crate::console_unavailable`. `None` in split topology (`temps proxy`),
     /// where the console is another process this one cannot observe.
     console_unavailable: Option<Arc<crate::console_unavailable::ConsoleUnavailableResponder>>,
+    /// The signed-in gate (ADR 065 D8). `None` only in test harnesses that
+    /// never serve a signed-in address; `setup_proxy_server` always sets it.
+    gate: Option<Arc<crate::handler::gate::ProxyGate>>,
 }
 
 /// Status recorded in proxy logs when the client disconnected before a
@@ -1301,6 +1309,67 @@ impl LoadBalancer {
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
             upstream_failures: Default::default(),
             console_unavailable: None,
+            gate: None,
+        }
+    }
+
+    /// Enforce the signed-in gate (ADR 065 D8) for hosts the route table
+    /// marks `signed_in`. Hosts without a gate are not affected.
+    pub fn with_gate(mut self, gate: Arc<crate::handler::gate::ProxyGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Run the signed-in gate for this request. `Some(true)` when the gate
+    /// answered it; `None` when the host has no gate or the visitor is
+    /// admitted (identity headers set, gate cookies removed).
+    async fn enforce_gate(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<Option<bool>> {
+        let Some(gate) = self.gate.as_ref() else {
+            return Ok(None);
+        };
+        let hostname = crate::handler::gate::gate_hostname(&ctx.host);
+        let Some(policy) = gate.policy_for(&hostname) else {
+            return Ok(None);
+        };
+        ctx.gated_host = true;
+        // An operator who turned the HTTPS redirect off terminates TLS in
+        // front of this listener; sending the visitor to HTTPS again would
+        // loop. Either way the gate runs: this only picks the redirect.
+        let secure = self.is_https_request(session) || self.disable_https_redirect;
+        let outcome = {
+            let header = session.req_header();
+            let request = temps_core::gate::GateRequest {
+                hostname: &hostname,
+                method: &header.method,
+                path: header.uri.path(),
+                query: header.uri.query(),
+                headers: &header.headers,
+                secure,
+            };
+            gate.evaluate(&policy, &request, temps_core::gate::unix_now())
+                .await
+        };
+        match outcome {
+            crate::handler::gate::GateOutcome::Admit(claims) => {
+                crate::handler::gate::admit(session.req_header_mut(), &claims)?;
+                ctx.gate_identity = Some(claims);
+                Ok(None)
+            }
+            crate::handler::gate::GateOutcome::Respond(answer, routing_status) => {
+                let (response, body) = crate::handler::gate::render(&answer, &ctx.request_id)?;
+                session
+                    .write_response_header(Box::new(response), body.is_none())
+                    .await?;
+                if let Some(body) = body {
+                    session.write_response_body(Some(body), true).await?;
+                }
+                ctx.routing_status = routing_status.to_string();
+                Ok(Some(true))
+            }
         }
     }
 
@@ -4940,6 +5009,8 @@ impl ProxyHttp for LoadBalancer {
             upstream_response_time_ms: None,
             preview_route: None,
             path_route: None,
+            gated_host: false,
+            gate_identity: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -5174,6 +5245,10 @@ impl ProxyHttp for LoadBalancer {
         // has been removed; clients sending this header should never have it
         // honored by downstream auth middleware.
         let _ = session.req_header_mut().remove_header("X-Temps-Demo-Mode");
+
+        // SECURITY: only the signed-in gate tells an app who is signed in
+        // (ADR 065 D8); a client's own identity headers never get through.
+        crate::handler::gate::strip_client_identity(session.req_header_mut());
 
         // SECURITY: only the status-host branch below may tag a request with
         // the custom hostname it was served for (#1412).
@@ -5711,6 +5786,12 @@ impl ProxyHttp for LoadBalancer {
                     }
                 }
             }
+        }
+
+        // Signed-in addresses (ADR 065 D8): the gate answers before anything
+        // can reach the app, including waking a sleeping environment.
+        if let Some(handled) = self.enforce_gate(session, ctx).await? {
+            return Ok(handled);
         }
 
         // On-demand: check if this host maps to a sleeping environment.
@@ -7403,6 +7484,9 @@ impl ProxyHttp for LoadBalancer {
         debug!("Upstream response filter headers: {:?}", upstream_response);
 
         strip_proxy_owned_response_headers(upstream_response);
+        if ctx.gated_host {
+            crate::handler::gate::strip_gate_from_app_response(upstream_response)?;
+        }
         upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
 
         // First upstream header = backend latency (connect + upstream time).
@@ -8612,6 +8696,8 @@ mod markdown_tests {
             upstream_response_time_ms: None,
             preview_route: None,
             path_route: None,
+            gated_host: false,
+            gate_identity: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -9149,6 +9235,8 @@ mod markdown_pipeline_tests {
             upstream_response_time_ms: None,
             preview_route: None,
             path_route: None,
+            gated_host: false,
+            gate_identity: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,

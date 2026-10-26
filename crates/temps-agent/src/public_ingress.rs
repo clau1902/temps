@@ -513,6 +513,7 @@ mod tests {
             deployment_id: None,
             project_id: None,
             environment_id: None,
+            gate: None,
         }
     }
 

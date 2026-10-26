@@ -3419,6 +3419,9 @@ mod apply_resume_and_progress_tests {
             private_range: None,
             private_node_id: None,
             private_listener: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
         };
         let request = request();
         assert!(DomainDeliveryService::route_unchanged(&route, 1, &request));

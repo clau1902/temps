@@ -27349,6 +27349,28 @@
         ],
         "type": "object"
       },
+      "FieldChoice": {
+        "description": "One answer a [`FieldKind::Choice`] field offers.",
+        "properties": {
+          "help": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "label"
+        ],
+        "type": "object"
+      },
       "FieldKind": {
         "oneOf": [
           {
@@ -27419,6 +27441,73 @@
             },
             "required": [
               "provider_field",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Teams of this instance, answered as a list of team ids.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "teams"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Users of this instance, answered as a list of user ids.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "users"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One of `choices`, answered as its `value`.",
+            "properties": {
+              "choices": {
+                "items": {
+                  "$ref": "#/components/schemas/FieldChoice"
+                },
+                "type": "array"
+              },
+              "type": {
+                "enum": [
+                  "choice"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "choices",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A list of text values, answered as an array of strings.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "text_list"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
               "type"
             ],
             "type": "object"
@@ -58723,6 +58812,20 @@
           "project_name",
           "project_slug",
           "first_seen"
+        ],
+        "type": "object"
+      },
+      "SignOutOfAppsResponse": {
+        "properties": {
+          "revoked": {
+            "description": "Gate sessions revoked.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revoked"
         ],
         "type": "object"
       },
@@ -100638,6 +100741,41 @@
         ]
       }
     },
+    "/gate/sign-out-of-apps": {
+      "post": {
+        "description": "Revokes all of the current user's gate sessions. Listeners refuse them\nas soon as they take the next route snapshot.",
+        "operationId": "sign_out_of_apps",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignOutOfAppsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Not a user"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Sign out of every signed-in address",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
     "/geo/status": {
       "get": {
         "operationId": "get_geo_database_status",
@@ -134275,6 +134413,62 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/gate/addresses/{address_id}/sign-everyone-out": {
+      "post": {
+        "description": "Every gate token issued for the address so far is refused; people sign\nin again (and are checked again) on their next visit.",
+        "operationId": "sign_everyone_out_of_address",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`custom:<id>` or `environment:<id>`",
+            "in": "path",
+            "name": "address_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Everyone signed out"
+          },
+          "400": {
+            "description": "Malformed address id"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Address not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Sign everyone out of a signed-in address",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
     "/projects/{project_id}/git": {
       "post": {
         "operationId": "update_git_settings",
@@ -153267,6 +153461,10 @@
     {
       "description": "External plugin management and discovery",
       "name": "External Plugins"
+    },
+    {
+      "description": "The Temps sign-in in front of signed-in addresses (ADR 065)",
+      "name": "Signed-in addresses"
     }
   ]
 }

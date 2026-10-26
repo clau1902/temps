@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::registry::SetupField;
+pub use temps_core::gate::{GateAllowList, GateKind};
 
 /// Who an address is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
@@ -17,7 +18,7 @@ pub enum Audience {
     Public,
     /// Only devices on the operator's private network. Reserved (phase 2).
     Private,
-    /// Anyone who signs in. Reserved (phase 4).
+    /// People who sign in, behind the address's gate (ADR 065 D7).
     SignedIn,
     /// A stored value this version does not know, written by a newer one.
     /// Served to nobody and never changed by a run, so a rolled-back
@@ -35,10 +36,13 @@ impl Audience {
         }
     }
 
-    /// Whether this version can serve the audience (`signed_in` arrives in
-    /// phase 4). Anything else is served to nobody.
+    /// Whether this version can serve the audience. Anything else is
+    /// served to nobody.
     pub fn is_served(self) -> bool {
-        matches!(self, Audience::Public | Audience::Private)
+        matches!(
+            self,
+            Audience::Public | Audience::Private | Audience::SignedIn
+        )
     }
 
     /// The stored value. An unknown one is [`Audience::Unsupported`], never
@@ -575,6 +579,13 @@ pub struct AddressAudience {
     /// inside check dials.
     #[serde(default)]
     pub private_listener: Option<String>,
+    /// For `signed_in`: the gate in front of it (ADR 065 D7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateKind>,
+    /// For `signed_in` with the Temps gate: the teams and users that may
+    /// sign in. `None` admits everyone with access to the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_allow: Option<GateAllowList>,
 }
 
 impl AddressAudience {
@@ -582,12 +593,67 @@ impl AddressAudience {
         Self::default()
     }
 
+    /// For people who sign in through `gate`, optionally only `allow`.
+    pub fn signed_in(gate: GateKind, allow: Option<GateAllowList>) -> Self {
+        Self {
+            audience: Audience::SignedIn,
+            gate: Some(gate),
+            gate_allow: allow
+                .map(GateAllowList::normalized)
+                .filter(|list| !list.is_empty() && gate == GateKind::Temps),
+            ..Self::default()
+        }
+    }
+
+    /// Who may open the address, as a comparable value: the audience, and
+    /// for a signed-in one its gate and list. Changing it is the sensitive
+    /// action (ADR 064 Security, ADR 065 D7), and it revokes the address's
+    /// gate sessions (D8).
+    pub fn who(&self) -> (Audience, Option<GateKind>, Option<GateAllowList>) {
+        if self.audience != Audience::SignedIn {
+            return (self.audience, None, None);
+        }
+        (
+            self.audience,
+            Some(self.gate.unwrap_or_default()),
+            self.gate_allow
+                .clone()
+                .map(GateAllowList::normalized)
+                .filter(|list| !list.is_empty()),
+        )
+    }
+
+    /// The value a step-up prompt names (`signed_in`, or
+    /// `signed_in:cloudflare_access`, `signed_in:temps+list`).
+    pub fn who_label(&self) -> String {
+        match self.who() {
+            (audience, None, _) => audience.as_str().to_string(),
+            (audience, Some(gate), None) => format!("{}:{}", audience.as_str(), gate.as_str()),
+            (audience, Some(gate), Some(_)) => {
+                format!("{}:{}+list", audience.as_str(), gate.as_str())
+            }
+        }
+    }
+
     pub fn describe(&self) -> String {
         match (self.audience, &self.network_range) {
             (Audience::Private, Some(range)) => format!("private to {range}"),
             (Audience::Private, None) => "private".to_string(),
             (Audience::Public, _) => "public".to_string(),
-            (Audience::SignedIn, _) => "for people who sign in".to_string(),
+            (Audience::SignedIn, _) => match (self.gate.unwrap_or_default(), &self.gate_allow) {
+                (GateKind::CloudflareAccess, _) => {
+                    "for people Cloudflare Access lets in".to_string()
+                }
+                (GateKind::Temps, Some(list)) if !list.is_empty() => {
+                    "for listed people who sign in to Temps".to_string()
+                }
+                (GateKind::Temps, _) => {
+                    "for people who sign in to Temps with access to the project".to_string()
+                }
+                (GateKind::Unsupported, _) => {
+                    "behind a gate set by a newer version of Temps".to_string()
+                }
+            },
             (Audience::Unsupported, _) => "set by a newer version of Temps".to_string(),
         }
     }

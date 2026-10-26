@@ -112,7 +112,18 @@ const HOP_BY_HOP: &[&str] = &[
     "x-forwarded-proto",
     "x-real-ip",
     "x-temps-deployment-id",
+    // Only the signed-in gate says who is signed in (ADR 065 D8): a client's
+    // own copies are dropped on every listener, and an admitted request gets
+    // the gate's from `GateIdentity`.
+    "x-temps-user",
+    "x-temps-user-email",
 ];
+
+/// Who the signed-in gate admitted, attached to the request so both
+/// forwarding paths (plain and upgrade) add the identity headers after
+/// stripping the client's.
+#[derive(Clone)]
+struct GateIdentity(Vec<(&'static str, HeaderValue)>);
 
 /// Per-attempt upstream timeout. Internal-zone calls are between
 /// containers on the same overlay; if 30s isn't enough something is
@@ -445,7 +456,9 @@ async fn handle_private(state: &ProxyState, req: Request) -> Response {
     proxy_with_retries(state, &entry, req).await
 }
 
-async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
+async fn handle(State(state): State<Arc<ProxyState>>, mut req: Request) -> Response {
+    // Defence in depth: the forwarding paths drop these too.
+    temps_core::gate::strip_identity_headers(req.headers_mut());
     if state.private_mode {
         return handle_private(&state, req).await;
     }
@@ -504,13 +517,40 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
             recorder.mark_project();
         }
+        // Signed-in addresses (ADR 065 D8): the gate answers before anything
+        // reaches the app. Routes without a gate are not affected.
+        if let Some(policy) = entry.gate.as_ref() {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+            match crate::gate::enforce(
+                policy,
+                &host,
+                state.forwarded_proto == "https",
+                &method,
+                &uri,
+                req.headers_mut(),
+            )
+            .await
+            {
+                crate::gate::Enforced::Respond(response) => return response,
+                crate::gate::Enforced::Admit(identity) => {
+                    req.extensions_mut().insert(GateIdentity(identity));
+                }
+            }
+        }
         if entry.backends.is_empty() {
             return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
         }
-        if is_upgrade_request(req.headers()) {
-            return proxy_upgrade(&entry, req, state.forwarded_proto).await;
+        let mut response = if is_upgrade_request(req.headers()) {
+            proxy_upgrade(&entry, req, state.forwarded_proto).await
+        } else {
+            proxy_with_retries(&state, &entry, req).await
+        };
+        if entry.gate.is_some() {
+            // The app may neither pass for the gate nor touch its cookies.
+            temps_core::gate::strip_gate_response_headers(response.headers_mut());
         }
-        return proxy_with_retries(&state, &entry, req).await;
+        return response;
     }
 
     // Reject non-temps.local up front. The proxy is not a generic
@@ -1076,6 +1116,7 @@ async fn proxy_upgrade(
         .unwrap_or("/")
         .to_string();
     let headers = req.headers().clone();
+    let identity = req.extensions().get::<GateIdentity>().cloned();
     let public_peer = req.extensions().get::<PublicPeer>().copied().or_else(|| {
         req.extensions()
             .get::<ConnectInfo<SocketAddr>>()
@@ -1150,6 +1191,12 @@ async fn proxy_upgrade(
     }
     if let Some(h) = &original_host {
         wire.extend_from_slice(format!("host: {}\r\n", h).as_bytes());
+    }
+    for (name, value) in identity.iter().flat_map(|identity| identity.0.iter()) {
+        wire.extend_from_slice(name.as_bytes());
+        wire.extend_from_slice(b": ");
+        wire.extend_from_slice(value.as_bytes());
+        wire.extend_from_slice(b"\r\n");
     }
     if let Some(deployment_id) = entry.deployment_id {
         wire.extend_from_slice(format!("x-temps-deployment-id: {}\r\n", deployment_id).as_bytes());
@@ -1465,12 +1512,14 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
             .map(|peer| PublicPeer(peer.0))
     });
     let recorder = req.extensions().get::<RequestRecorder>().cloned();
+    let identity = req.extensions().get::<GateIdentity>().cloned();
     let metadata = ForwardRequestMetadata {
         method,
         uri,
         headers,
         public_peer,
         recorder,
+        identity,
     };
     let retryable = metadata.method == axum::http::Method::GET
         || metadata.method == axum::http::Method::HEAD
@@ -1562,6 +1611,8 @@ struct ForwardRequestMetadata {
     public_peer: Option<PublicPeer>,
     /// Public listeners only (ADR 061).
     recorder: Option<RequestRecorder>,
+    /// Who the signed-in gate admitted (ADR 065 D8).
+    identity: Option<GateIdentity>,
 }
 
 async fn forward_once(
@@ -1613,6 +1664,13 @@ async fn forward_once(
     }
     if let Some(deployment_id) = entry.deployment_id {
         builder = builder.header("x-temps-deployment-id", deployment_id.to_string());
+    }
+    for (name, value) in metadata
+        .identity
+        .iter()
+        .flat_map(|identity| identity.0.iter())
+    {
+        builder = builder.header(*name, value.clone());
     }
 
     // Stream the request body. reqwest accepts a `Body` built from a
@@ -1768,6 +1826,7 @@ mod tests {
             deployment_id: Some(project_id * 10),
             project_id: Some(project_id),
             environment_id: Some(project_id * 100),
+            gate: None,
         }
     }
 
@@ -1979,6 +2038,7 @@ mod tests {
                 deployment_id: Some(1),
                 project_id: Some(1),
                 environment_id: Some(1),
+                gate: None,
             };
             let service = hyper::service::service_fn(move |mut request| {
                 request

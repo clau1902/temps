@@ -344,12 +344,8 @@ async fn apply_environment_reachability(
     );
     require_all(&auth, &permissions_for(request.option), "This way in")?;
     // Changing who an existing address is for is a sensitive action, both
-    // ways (ADR 064 Security).
-    let answered = request
-        .answers
-        .get(super::plan::FIELD_ADDRESS)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
+    // ways (ADR 064 Security), and so is its gate or sign-in list (ADR 065
+    // D7).
     if let Some(action) = audience_action(
         state
             .service
@@ -358,7 +354,7 @@ async fn apply_environment_reachability(
                 environment_id,
                 &request.plan_id,
                 request.option,
-                answered.as_deref(),
+                &request.answers,
             )
             .await?,
     ) {
@@ -674,12 +670,14 @@ async fn decide_reachability_conflict(
 
 /// The step-up an apply needs when its option changes an existing
 /// address's audience.
-fn audience_action(change: Option<(String, AddressAudience, Audience)>) -> Option<SensitiveAction> {
+fn audience_action(
+    change: Option<(String, AddressAudience, AddressAudience)>,
+) -> Option<SensitiveAction> {
     let (hostname, before, after) = change?;
-    (before.audience != after).then(|| SensitiveAction::ChangeAddressAudience {
+    (before.who() != after.who()).then(|| SensitiveAction::ChangeAddressAudience {
         hostname,
-        from: before.audience.as_str().to_string(),
-        to: after.as_str().to_string(),
+        from: before.who_label(),
+        to: after.who_label(),
     })
 }
 
@@ -692,15 +690,15 @@ fn undo_audience_action(pending: &[RunResource]) -> Option<SensitiveAction> {
             hostname,
             before,
             after,
-        } if before.audience != after.audience
+        } if before.who() != after.who()
             && !pending.iter().any(
                 |r| matches!(r, RunResource::CustomDomain { domain, .. } if domain == hostname),
             ) =>
         {
             Some(SensitiveAction::ChangeAddressAudience {
                 hostname: hostname.clone(),
-                from: after.audience.as_str().to_string(),
-                to: before.audience.as_str().to_string(),
+                from: after.who_label(),
+                to: before.who_label(),
             })
         }
         _ => None,
@@ -779,4 +777,78 @@ async fn get_certificate_methods(
     Ok(Json(CertificateMethods {
         http01_available: state.service.http01_available().await?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temps_core::gate::{GateAllowList, GateKind};
+
+    fn change(
+        before: AddressAudience,
+        after: AddressAudience,
+    ) -> Option<(String, AddressAudience, AddressAudience)> {
+        Some(("app.example.com".into(), before, after))
+    }
+
+    fn list(teams: Vec<i32>, users: Vec<i32>) -> Option<GateAllowList> {
+        Some(GateAllowList { teams, users })
+    }
+
+    /// ADR 065 D7: changing the audience, the gate or the list of who may
+    /// sign in is a sensitive action; keeping all three the same is not.
+    #[test]
+    fn changing_who_can_open_an_address_needs_a_step_up() {
+        let signed_in = AddressAudience::signed_in(GateKind::Temps, None);
+        let listed = AddressAudience::signed_in(GateKind::Temps, list(vec![2], vec![]));
+        for (before, after) in [
+            (AddressAudience::public(), signed_in.clone()),
+            (signed_in.clone(), AddressAudience::public()),
+            (signed_in.clone(), listed.clone()),
+            (listed.clone(), signed_in.clone()),
+            (
+                listed.clone(),
+                AddressAudience::signed_in(GateKind::Temps, list(vec![2], vec![9])),
+            ),
+            (
+                signed_in.clone(),
+                AddressAudience::signed_in(GateKind::CloudflareAccess, None),
+            ),
+        ] {
+            let label = format!("{} -> {}", before.who_label(), after.who_label());
+            assert!(
+                matches!(
+                    audience_action(change(before, after)),
+                    Some(SensitiveAction::ChangeAddressAudience { .. })
+                ),
+                "no step-up for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_people_in_another_order_is_not_a_change() {
+        let before = AddressAudience::signed_in(GateKind::Temps, list(vec![3, 1], vec![7]));
+        let after = AddressAudience::signed_in(GateKind::Temps, list(vec![1, 3, 3], vec![7]));
+        assert!(audience_action(change(before, after)).is_none());
+        assert!(
+            audience_action(change(AddressAudience::public(), AddressAudience::public())).is_none()
+        );
+        assert!(audience_action(None).is_none());
+    }
+
+    #[test]
+    fn undoing_a_gate_change_needs_a_step_up_unless_the_run_attached_the_address() {
+        let gate = RunResource::AddressAudience {
+            hostname: "app.example.com".into(),
+            before: AddressAudience::public(),
+            after: AddressAudience::signed_in(GateKind::Temps, list(vec![1], vec![])),
+        };
+        assert!(undo_audience_action(std::slice::from_ref(&gate)).is_some());
+        let attached = RunResource::CustomDomain {
+            id: 4,
+            domain: "app.example.com".into(),
+        };
+        assert!(undo_audience_action(&[attached, gate]).is_none());
+    }
 }

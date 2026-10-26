@@ -13321,6 +13321,7 @@ dependencies = [
  "bollard",
  "chrono",
  "cookie",
+ "ed25519-dalek 3.0.0",
  "futures",
  "hex",
  "hkdf 0.13.0",

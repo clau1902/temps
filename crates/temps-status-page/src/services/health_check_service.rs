@@ -266,6 +266,28 @@ fn local_listener_for_url<'a>(
 const PROXY_HTTPS_REDIRECT_HEADER: &str = "x-temps-proxy-https-redirect";
 const PROXY_PROBE_CAPABILITY_HEADER: &str = "x-temps-proxy-probe-capable";
 
+/// What a monitor reports when the address it checks is behind sign-in
+/// (ADR 065 D10): the gate answered, so the address is up, but the app's
+/// own health is out of the monitor's sight.
+fn behind_sign_in(response: &reqwest::Response) -> Option<String> {
+    gate_note(
+        response
+            .headers()
+            .get(temps_core::gate::GATE_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn gate_note(gate_header: Option<&str>) -> Option<String> {
+    gate_header?;
+    Some(
+        "Behind sign-in: this address only lets in people who sign in, so the monitor sees \
+         the sign-in, not the app. Temps offers no way past it. Container health checks \
+         (restarts, out-of-memory kills, exits) watch the app itself."
+            .to_string(),
+    )
+}
+
 fn proxy_supports_probe_markers(response: &reqwest::Response) -> bool {
     response
         .headers()
@@ -1034,6 +1056,19 @@ impl HealthCheckService {
 
             match check_result {
                 Ok(Ok(response)) => {
+                    // ADR 065 D10: a signed-in address answers with its
+                    // gate, never the app, and Temps offers no way past it.
+                    if let Some(note) = behind_sign_in(&response) {
+                        return Self::record_check(
+                            &db,
+                            probe.clone(),
+                            "operational".to_string(),
+                            Some(total_response_time_ms),
+                            Some(note),
+                            &job_queue,
+                        )
+                        .await;
+                    }
                     // The HTTP proxy can emit its force-HTTPS redirect before
                     // resolving or contacting the application. Counting that
                     // response as healthy would let a dead upstream look
@@ -1754,6 +1789,13 @@ impl HealthCheckService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gated_answer_is_reported_behind_sign_in() {
+        assert!(gate_note(Some("sign-in")).is_some_and(|note| note.starts_with("Behind sign-in")));
+        assert!(gate_note(Some("access")).is_some());
+        assert!(gate_note(None).is_none());
+    }
 
     #[test]
     fn down_monitor_is_logged_on_transitions_only() {

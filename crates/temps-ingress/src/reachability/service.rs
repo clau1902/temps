@@ -41,7 +41,7 @@ use temps_domains::DomainService;
 use temps_entities::{
     deployment_containers, dns_managed_record_states, domains, environment_domains, environments,
     ingress_connectors, node_public_ingress, nodes, project_custom_domains,
-    project_ip_access_rules, projects, reachability_plans, reachability_runs,
+    project_ip_access_rules, projects, reachability_plans, reachability_runs, teams, users,
 };
 use temps_projects::CustomDomainService;
 use thiserror::Error;
@@ -54,15 +54,15 @@ use super::compute::{
 };
 use super::model::{
     AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience, DecideRequest,
-    DnsRecordState, EnvironmentReachability, Intent, JournalEntry, PlanOptionKind, PlanRequest,
-    PlannedRecord, PreviousChoice, ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep,
-    RunStepStatus, RunView, StepKind,
+    DnsRecordState, EnvironmentReachability, GateAllowList, GateKind, Intent, JournalEntry,
+    PlanOptionKind, PlanRequest, PlannedRecord, PreviousChoice, ReachabilityPlan, ResumeRequest,
+    RunResource, RunState, RunStep, RunStepStatus, RunView, StepKind,
 };
 use super::plan::{
-    fingerprint, guess_zone, http01_direct, plan, planned_address, planned_record, private_worker,
-    record_type_of, records_to_read, tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for,
-    NamedId, PlanFacts, PrivateWorkerFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER,
-    FIELD_TOKEN,
+    fingerprint, gate_allow_answer, guess_zone, http01_direct, plan, planned_address,
+    planned_record, private_worker, record_type_of, records_to_read, tunnel_domain_for,
+    tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts, PrivateWorkerFact, ZoneFact,
+    FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_TOKEN,
 };
 use super::run::{
     created, decide, execute, reconcile_journal, resume, undo, NewTunnel, RunInput, RunOps,
@@ -725,7 +725,56 @@ impl ReachabilityService {
                 environment_name,
             ));
         }
+        // ADR 065 D10: a signed-in address is reachable only when what
+        // answers there is its gate.
+        let gates = self.signed_in_gates(&hosts).await;
+        for verdict in &mut verdicts {
+            let Some(gate) = gates.get(&verdict.address) else {
+                continue;
+            };
+            if verdict.audience == Audience::SignedIn
+                && verdict.state == super::model::ReachState::Reachable
+            {
+                let probe = super::gate_check::probe(&verdict.address, *gate).await;
+                *verdict = super::gate_check::judged(verdict.clone(), probe);
+            }
+        }
         verdicts
+    }
+
+    /// The gate of each of `hosts` that is a signed-in address.
+    async fn signed_in_gates(&self, hosts: &[String]) -> HashMap<String, GateKind> {
+        let db = self.deps.db.as_ref();
+        let mut gates = HashMap::new();
+        match project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.is_in(hosts.to_vec()))
+            .filter(
+                project_custom_domains::Column::Audience.eq(temps_entities::audience::SIGNED_IN),
+            )
+            .all(db)
+            .await
+        {
+            Ok(rows) => gates.extend(rows.into_iter().map(|row| {
+                let gate = row.gate.as_deref().map(GateKind::parse).unwrap_or_default();
+                (row.domain, gate)
+            })),
+            Err(error) => warn!(%error, "could not read the gates of signed-in custom domains"),
+        }
+        match environment_domains::Entity::find()
+            .filter(environment_domains::Column::Domain.is_in(hosts.to_vec()))
+            .filter(environment_domains::Column::Audience.eq(temps_entities::audience::SIGNED_IN))
+            .all(db)
+            .await
+        {
+            Ok(rows) => gates.extend(rows.into_iter().map(|row| {
+                let gate = row.gate.as_deref().map(GateKind::parse).unwrap_or_default();
+                (row.domain, gate)
+            })),
+            Err(error) => {
+                warn!(%error, "could not read the gates of signed-in environment domains")
+            }
+        }
+        gates
     }
 
     // ----- D3 ----------------------------------------------------------
@@ -926,6 +975,7 @@ impl ReachabilityService {
             private_workers,
             suggested_private_worker,
             private_ranges,
+            password_protected: password_protected(&scope.project, &scope.environment),
         };
         let mut dns_records = Vec::new();
         // The suggested address is known only now; D9 decides it too.
@@ -1289,6 +1339,7 @@ impl ReachabilityService {
                         network_range: Some(range.to_string()),
                         private_node_id: Some(worker.id),
                         private_listener: Some(ip.to_string()),
+                        ..AddressAudience::default()
                     },
                     self.current_audience(&address).await?,
                 ));
@@ -1300,6 +1351,16 @@ impl ReachabilityService {
                 input.direct = Some((direct.name.clone(), direct.ips[0]));
                 input.dns_before = planned_record(&facts, &address, record_type_of(direct.ips[0]));
             }
+        }
+
+        // ADR 065 D7: a signed-in plan sets the gate (and who may sign in)
+        // right after attaching, before anything publishes the address.
+        if audience == Audience::SignedIn {
+            let allow = self.gate_allow(&request.answers).await?;
+            input.audience = Some((
+                AddressAudience::signed_in(GateKind::Temps, allow),
+                self.current_audience(&address).await?,
+            ));
         }
 
         // B5: an option that turns a private address public says so in a
@@ -1391,6 +1452,47 @@ impl ReachabilityService {
         Ok(view)
     }
 
+    /// The teams and users a signed-in apply was answered with, each one
+    /// checked to exist so a typo is refused rather than locking people out.
+    async fn gate_allow(
+        &self,
+        answers: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<Option<GateAllowList>, ReachabilityError> {
+        let Some(list) = gate_allow_answer(answers).map_err(ReachabilityError::Validation)? else {
+            return Ok(None);
+        };
+        let db = self.deps.db.as_ref();
+        if !list.teams.is_empty() {
+            let found: HashSet<i32> = teams::Entity::find()
+                .filter(teams::Column::Id.is_in(list.teams.clone()))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            if let Some(missing) = list.teams.iter().find(|id| !found.contains(id)) {
+                return Err(ReachabilityError::Validation(format!(
+                    "Team {missing} does not exist; pick the teams that may sign in again."
+                )));
+            }
+        }
+        if !list.users.is_empty() {
+            let found: HashSet<i32> = users::Entity::find()
+                .filter(users::Column::Id.is_in(list.users.clone()))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|u| u.id)
+                .collect();
+            if let Some(missing) = list.users.iter().find(|id| !found.contains(id)) {
+                return Err(ReachabilityError::Validation(format!(
+                    "User {missing} does not exist; pick the people who may sign in again."
+                )));
+            }
+        }
+        Ok(Some(list))
+    }
+
     /// Who `host` is for now, as stored: public when it is not attached.
     async fn current_audience(&self, host: &str) -> Result<AddressAudience, ReachabilityError> {
         Ok(project_custom_domains::Entity::find()
@@ -1410,8 +1512,9 @@ impl ReachabilityService {
         environment_id: i32,
         plan_id: &str,
         option: PlanOptionKind,
-        answered_address: Option<&str>,
-    ) -> Result<Option<(String, AddressAudience, Audience)>, ReachabilityError> {
+        answers: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<Option<(String, AddressAudience, AddressAudience)>, ReachabilityError> {
+        let answered_address = answers.get(FIELD_ADDRESS).and_then(Value::as_str);
         let Some(stored) = reachability_plans::Entity::find_by_id(plan_id.to_string())
             .filter(reachability_plans::Column::ProjectId.eq(project_id))
             .filter(reachability_plans::Column::EnvironmentId.eq(environment_id))
@@ -1435,7 +1538,18 @@ impl ReachabilityService {
         match (changes, address) {
             (true, Some(address)) => {
                 let before = self.current_audience(&address).await?;
-                Ok(Some((address, before, Audience::parse(&stored.audience))))
+                let after = match Audience::parse(&stored.audience) {
+                    // ADR 065 D7: who may sign in is part of who it is for.
+                    Audience::SignedIn => AddressAudience::signed_in(
+                        GateKind::Temps,
+                        gate_allow_answer(answers).map_err(ReachabilityError::Validation)?,
+                    ),
+                    audience => AddressAudience {
+                        audience,
+                        ..AddressAudience::default()
+                    },
+                };
+                Ok(Some((address, before, after)))
             }
             _ => Ok(None),
         }
@@ -1863,6 +1977,19 @@ pub fn run_view(row: &reachability_runs::Model) -> RunView {
 
 /// The IP allow list governing an environment when it lets in only private
 /// ranges (ADR 064 D9): the environment's own policy, else the project's.
+/// Whether password protection is on for the environment or its project.
+fn password_protected(project: &projects::Model, environment: &environments::Model) -> bool {
+    [
+        project.deployment_config.as_ref(),
+        environment.deployment_config.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|config| config.security.as_ref())
+    .filter_map(|security| security.password_protection.as_ref())
+    .any(|password| password.enabled)
+}
+
 pub async fn private_rule(
     db: &DatabaseConnection,
     project_id: i32,
@@ -2605,8 +2732,9 @@ impl RunOps for LiveOps {
             .own_address(host)
             .await?
             .ok_or_else(|| format!("{host} is not attached to this environment any more."))?;
+        let current = address_audience_of(&row);
         let mut active: project_custom_domains::ActiveModel = row.into();
-        set_address_audience_on(&mut active, audience);
+        set_address_audience_on(&mut active, &current, audience);
         active.update(self.deps.db.as_ref()).await.map_err(text)?;
         Ok(())
     }
@@ -2627,18 +2755,29 @@ fn dns_record_type(record_type: &str) -> DnsRecordType {
 pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudience {
     let audience = Audience::parse(&row.audience);
     let private = audience == Audience::Private;
+    let signed_in = audience == Audience::SignedIn;
     AddressAudience {
         audience,
         network_range: row.private_range.clone().filter(|_| private),
         private_node_id: row.private_node_id.filter(|_| private),
         private_listener: row.private_listener.clone().filter(|_| private),
+        gate: signed_in.then(|| row.gate.as_deref().map(GateKind::parse).unwrap_or_default()),
+        gate_allow: row
+            .gate_allow
+            .clone()
+            .filter(|_| signed_in)
+            .and_then(|value| serde_json::from_value::<GateAllowList>(value).ok())
+            .map(GateAllowList::normalized)
+            .filter(|list| !list.is_empty()),
     }
 }
 
 /// Write `audience` with what bounds it; a public one clears the private
-/// fields, so nothing stale routes it later.
+/// and gate fields, so nothing stale routes it later. When who may open it
+/// changes, every gate token issued before now stops working (ADR 065 D8).
 fn set_address_audience_on(
     active: &mut project_custom_domains::ActiveModel,
+    current: &AddressAudience,
     audience: &AddressAudience,
 ) {
     let private = audience.audience == Audience::Private;
@@ -2646,6 +2785,12 @@ fn set_address_audience_on(
     active.private_range = Set(audience.network_range.clone().filter(|_| private));
     active.private_node_id = Set(audience.private_node_id.filter(|_| private));
     active.private_listener = Set(audience.private_listener.clone().filter(|_| private));
+    let (_, gate, allow) = audience.who();
+    active.gate = Set(gate.map(|g| g.as_str().to_string()));
+    active.gate_allow = Set(allow.and_then(|list| serde_json::to_value(list).ok()));
+    if current.who() != audience.who() {
+        active.gate_not_before = Set(Some(Utc::now()));
+    }
 }
 
 /// A worker in private mode as its last report describes it.

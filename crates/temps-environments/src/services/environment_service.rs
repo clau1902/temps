@@ -2736,6 +2736,9 @@ mod tests {
             private_range: None,
             private_node_id: None,
             private_listener: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)

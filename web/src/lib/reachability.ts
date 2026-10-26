@@ -254,25 +254,71 @@ export function defaultOption(options: PlanOption[]): PlanOption | undefined {
 
 /**
  * Answers for the apply request, from the form's text values. DNS provider
- * fields carry the provider id as a number; blank answers are left out.
+ * fields carry the provider id as a number; team and user fields (who may
+ * sign in, ADR 065 D7) are kept in the form as comma-separated ids and sent
+ * as a list of numbers; text list fields as a list of strings. Blank answers
+ * are left out.
  */
 export function applyValues(
   fields: SetupField[],
   answers: Record<string, string>,
   address: string | null | undefined
-): Record<string, string | number> {
-  const values: Record<string, string | number> = {}
+): Record<string, string | number | number[] | string[]> {
+  const values: Record<string, string | number | number[] | string[]> = {}
   const asked = new Set(fields.map((f) => f.key))
   if (!asked.has('address') && address) values.address = address
   for (const field of fields) {
     const answer = answers[field.key]?.trim()
     if (!answer) continue
+    if (field.kind.type === 'teams' || field.kind.type === 'users') {
+      const ids = idList(answer)
+      if (ids.length > 0) values[field.key] = ids
+      continue
+    }
+    if (field.kind.type === 'text_list') {
+      const items = textList(answer)
+      if (items.length > 0) values[field.key] = items
+      continue
+    }
     values[field.key] =
       field.kind.type === 'dns_provider' && /^\d+$/.test(answer)
         ? Number(answer)
         : answer
   }
   return values
+}
+
+/** Comma-separated ids, as the team and user pickers store them. */
+export function idList(value: string | undefined): number[] {
+  return [
+    ...new Set(
+      (value ?? '')
+        .split(',')
+        .map((part) => part.trim())
+        .filter((part) => /^\d+$/.test(part))
+        .map(Number)
+        .filter((id) => id > 0)
+    ),
+  ]
+}
+
+/** One value per line or comma, blanks dropped. */
+export function textList(value: string | undefined): string[] {
+  return [
+    ...new Set(
+      (value ?? '')
+        .split(/[\n,]/)
+        .map((part) => part.trim())
+        .filter(Boolean)
+    ),
+  ]
+}
+
+/** Toggle `id` in a comma-separated id list. */
+export function toggleId(value: string | undefined, id: number): string {
+  const ids = idList(value)
+  const next = ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]
+  return next.join(',')
 }
 
 /** The required fields still unanswered, by label. */

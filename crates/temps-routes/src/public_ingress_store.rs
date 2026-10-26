@@ -18,6 +18,8 @@ use temps_entities::{node_public_ingress, nodes};
 const MAX_INTERFACES: usize = 64;
 /// Most inside checks kept from one report.
 const MAX_PRIVATE_CHECKS: usize = 256;
+/// Agent capabilities this control plane acts on.
+const KNOWN_CAPABILITIES: [&str; 1] = [temps_core::gate::GATE_CAPABILITY];
 
 /// ADR 064 Security: a worker in `private` mode reporting a listener on an
 /// address that is not private. The control plane never routes a private
@@ -127,6 +129,14 @@ impl<'a> PublicIngressStore<'a> {
                     }))
                     .collect::<Vec<_>>())
             });
+        // Only capabilities this control plane knows, so the column stays
+        // small whatever an agent sends.
+        let capabilities: Vec<&str> = report
+            .capabilities
+            .iter()
+            .map(String::as_str)
+            .filter(|c| KNOWN_CAPABILITIES.contains(c))
+            .collect();
         let listening = serde_json::json!({
             "http": clip(report.http, 64),
             "https": clip(report.https, 64),
@@ -143,6 +153,7 @@ impl<'a> PublicIngressStore<'a> {
             mode: Set(report.mode.map(|mode| mode.as_str().to_string())),
             last_check: Set(None),
             private_checks: Set(private_checks),
+            capabilities: Set(Some(serde_json::json!(capabilities))),
             checked_at: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
@@ -155,6 +166,7 @@ impl<'a> PublicIngressStore<'a> {
                         node_public_ingress::Column::Listening,
                         node_public_ingress::Column::Mode,
                         node_public_ingress::Column::PrivateChecks,
+                        node_public_ingress::Column::Capabilities,
                         node_public_ingress::Column::UpdatedAt,
                     ])
                     .to_owned(),
@@ -209,6 +221,7 @@ mod tests {
             mode: Some(mode.to_string()),
             last_check: None,
             private_checks: None,
+            capabilities: None,
             checked_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

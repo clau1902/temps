@@ -12,6 +12,7 @@ mod build_admission;
 pub mod build_handler;
 pub mod connectors;
 mod exec_timeout;
+pub mod gate;
 pub mod handlers;
 pub mod internal_proxy;
 pub mod mesh_listener;

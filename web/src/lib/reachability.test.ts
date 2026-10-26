@@ -11,6 +11,9 @@ import type {
 } from '@/api/client'
 import {
   applyValues,
+  idList,
+  textList,
+  toggleId,
   canResumeRun,
   canUndoRun,
   conflictChoices,
@@ -255,6 +258,44 @@ describe('apply answers', () => {
         null
       )
     ).toEqual({ address: 'app.example.com', dns_provider_id: 7 })
+  })
+
+  test('send who may sign in as lists of ids, and no list when empty', () => {
+    const gateFields: SetupField[] = [
+      {
+        key: 'gate_teams',
+        label: 'Only these teams',
+        kind: { type: 'teams' },
+        required: false,
+      },
+      {
+        key: 'gate_users',
+        label: 'Only these people',
+        kind: { type: 'users' },
+        required: false,
+      },
+    ]
+    expect(
+      applyValues(
+        gateFields,
+        { gate_teams: '3, 1,3', gate_users: '' },
+        'team.example.com'
+      )
+    ).toEqual({ address: 'team.example.com', gate_teams: [3, 1] })
+    expect(
+      applyValues(gateFields, { gate_teams: 'x,,' }, 'team.example.com')
+    ).toEqual({ address: 'team.example.com' })
+  })
+
+  test('id and text lists ignore junk and duplicates', () => {
+    expect(idList('1,2,2, 0,-4,abc')).toEqual([1, 2])
+    expect(idList(undefined)).toEqual([])
+    expect(toggleId('1,2', 2)).toBe('1')
+    expect(toggleId('1', 5)).toBe('1,5')
+    expect(textList('a@example.com\n example.org,a@example.com')).toEqual([
+      'a@example.com',
+      'example.org',
+    ])
   })
 
   test('send the planned address when the option does not ask for one', () => {

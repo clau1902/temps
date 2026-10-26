@@ -39,6 +39,18 @@ pub struct Model {
     /// For a `private` address: the listener address DNS points at.
     #[serde(default)]
     pub private_listener: Option<String>,
+    /// For a `signed_in` address (ADR 065 D7): `temps` or
+    /// `cloudflare_access`. Null on every other address.
+    #[serde(default)]
+    pub gate: Option<String>,
+    /// For a `signed_in` address with the Temps gate: the teams and users
+    /// that may sign in, `{"teams": [..], "users": [..]}`. Null means every
+    /// user with access to the project.
+    #[serde(default)]
+    pub gate_allow: Option<Json>,
+    /// Gate tokens issued before this time are refused (ADR 065 D8).
+    #[serde(default)]
+    pub gate_not_before: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

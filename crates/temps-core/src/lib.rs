@@ -20,6 +20,7 @@ pub mod error_builder;
 pub mod error_metrics;
 pub mod external_plugin;
 pub mod feature_maturity;
+pub mod gate;
 pub mod jobs;
 pub mod log_storage_config;
 /// Log recurring conditions on state transitions instead of on every tick.

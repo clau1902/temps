@@ -55,6 +55,10 @@ use crate::service::{covers, normalize_host, record_label, PublicationIntent, Tu
 pub const FIELD_ADDRESS: &str = "address";
 pub const FIELD_DNS_PROVIDER: &str = "dns_provider_id";
 pub const FIELD_TOKEN: &str = "cloudflare_api_token";
+/// The teams that may sign in to a signed-in address (ADR 065 D7).
+pub const FIELD_GATE_TEAMS: &str = "gate_teams";
+/// The users that may sign in to a signed-in address (ADR 065 D7).
+pub const FIELD_GATE_USERS: &str = "gate_users";
 
 /// A zone a DNS provider of the cluster manages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +141,9 @@ pub struct PlanFacts {
     pub suggested_private_worker: Option<String>,
     /// The environment's private addresses and the range each is bound to.
     pub private_ranges: Vec<(String, Option<String>)>,
+    /// Whether the environment or its project has password protection on,
+    /// which applies on top of a sign-in (ADR 065 D7).
+    pub password_protected: bool,
 }
 
 /// The worker a private plan serves through: the first whose private
@@ -629,15 +636,21 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     if facts.audience == Audience::Private {
         return plan_private(facts);
     }
-    if facts.audience != Audience::Public {
+    if !matches!(facts.audience, Audience::Public | Audience::SignedIn) {
         return empty(
             facts.audience,
             facts.requested.clone(),
             None,
             PlanBlocked {
-                reason: "Addresses for people who sign in are not available yet. Choose \
-                         public, or only your private network."
-                    .to_string(),
+                reason: format!(
+                    "Temps cannot plan an address {} here. Choose public, for people who \
+                     sign in, or only your private network.",
+                    AddressAudience {
+                        audience: facts.audience,
+                        ..AddressAudience::default()
+                    }
+                    .describe()
+                ),
                 action: None,
             },
         );
@@ -681,6 +694,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     // B5: an address that is private now becomes public, and says so.
     let made_public = address
         .as_deref()
+        .filter(|_| facts.audience == Audience::Public)
         .and_then(|host| becomes_public(facts, host));
 
     // A tunnel only carries what workers serve, and never into an allow
@@ -1051,6 +1065,9 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
             draft.warnings.insert(0, warning.clone());
         }
     }
+    if facts.audience == Audience::SignedIn {
+        signed_in_drafts(facts, address.as_deref(), &shown, &mut drafts);
+    }
     let options: Vec<PlanOption> = drafts
         .into_iter()
         .enumerate()
@@ -1128,12 +1145,131 @@ fn unchangeable_audience(facts: &PlanFacts, host: &str) -> Option<PlanBlocked> {
     })
 }
 
+/// What a signed-in plan adds to every way in (ADR 065 D7): the gate is
+/// set right after the address is attached, before anything publishes it,
+/// so no listener serves it open; who may sign in is asked; and a password
+/// the environment already has is said to apply as well.
+fn signed_in_drafts(
+    facts: &PlanFacts,
+    address: Option<&str>,
+    shown: &str,
+    drafts: &mut [OptionDraft],
+) {
+    let current = address.and_then(|host| {
+        facts
+            .audiences
+            .iter()
+            .find(|(a, _)| a.eq_ignore_ascii_case(host))
+            .map(|(_, audience)| *audience)
+    });
+    let mut warnings = vec![format!(
+        "Only people who sign in to Temps, with access to this project (and on the list, \
+         if you give one), can open {shown}. Everyone else gets the Temps sign-in. Changing \
+         who can open it needs a recent password or passkey confirmation."
+    )];
+    if current == Some(Audience::Private) {
+        warnings.push(format!(
+            "{shown} is private now. This puts it on a public way in behind the sign-in: \
+             anyone allowed to sign in can open it from anywhere, not only from your private \
+             network."
+        ));
+    }
+    if facts.password_protected {
+        warnings.push(format!(
+            "{} also has password protection. Both apply: visitors sign in first, then enter \
+             the password.",
+            facts.environment_name
+        ));
+    }
+    for draft in drafts.iter_mut() {
+        let at = draft
+            .steps
+            .iter()
+            .position(|s| s.kind == StepKind::AttachDomain)
+            .map_or(0, |i| i + 1);
+        draft.steps.insert(
+            at,
+            step(
+                StepKind::SetAudience,
+                format!("Put the Temps sign-in in front of {shown}"),
+            ),
+        );
+        draft.fields.extend(gate_list_fields());
+        for (index, warning) in warnings.iter().enumerate() {
+            draft.warnings.insert(index, warning.clone());
+        }
+    }
+}
+
+/// Who may sign in, besides having access to the project: both optional.
+fn gate_list_fields() -> Vec<SetupField> {
+    vec![
+        SetupField {
+            key: FIELD_GATE_TEAMS.to_string(),
+            label: "Only these teams".to_string(),
+            help: Some(
+                "Leave empty to let everyone with access to the project sign in.".to_string(),
+            ),
+            kind: FieldKind::Teams,
+            required: false,
+            placeholder: None,
+        },
+        SetupField {
+            key: FIELD_GATE_USERS.to_string(),
+            label: "Only these people".to_string(),
+            help: Some(
+                "People who may sign in even when they are in none of the teams above.".to_string(),
+            ),
+            kind: FieldKind::Users,
+            required: false,
+            placeholder: None,
+        },
+    ]
+}
+
+/// The list a signed-in apply was answered with: team and user ids, as
+/// numbers or numeric strings. `None` for no list.
+pub fn gate_allow_answer(
+    answers: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Option<temps_core::gate::GateAllowList>, String> {
+    let ids = |key: &str, what: &str| -> Result<Vec<i32>, String> {
+        match answers.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .map(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                        .and_then(|id| i32::try_from(id).ok())
+                        .filter(|id| *id > 0)
+                        .ok_or_else(|| format!("{what} must be a list of {what} ids ({key})."))
+                })
+                .collect(),
+            Some(_) => Err(format!("{what} must be a list of {what} ids ({key}).")),
+        }
+    };
+    let list = temps_core::gate::GateAllowList {
+        teams: ids(FIELD_GATE_TEAMS, "teams")?,
+        users: ids(FIELD_GATE_USERS, "users")?,
+    }
+    .normalized();
+    Ok((!list.is_empty()).then_some(list))
+}
+
 /// When `host` is attached here as a private address: what making it
 /// public exposes, in words (ADR 064 Security).
 pub fn becomes_public(facts: &PlanFacts, host: &str) -> Option<String> {
     let (_, audience) = facts.audiences.iter().find(|(a, _)| a == host)?;
     if *audience == Audience::Public {
         return None;
+    }
+    if *audience == Audience::SignedIn {
+        return Some(format!(
+            "{host} is for people who sign in now. This makes it public: the sign-in in \
+             front of it goes, and anyone on the internet can open {host} and everything {} \
+             serves there. It needs a recent password or passkey confirmation.",
+            facts.environment_name
+        ));
     }
     let range = facts
         .private_ranges
@@ -1512,6 +1648,112 @@ mod tests {
                 blocked.reason.contains("newer version"),
                 "{}",
                 blocked.reason
+            );
+        }
+    }
+
+    /// ADR 065 D7: a signed-in plan is a public plan with the sign-in put
+    /// in front of the address right after it is attached, and the
+    /// optional list of who may sign in.
+    #[test]
+    fn a_signed_in_plan_puts_the_sign_in_in_front_after_attaching() {
+        let facts = PlanFacts {
+            audience: Audience::SignedIn,
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        assert!(!plan.options.is_empty());
+        for option in &plan.options {
+            let kinds: Vec<StepKind> = option.steps.iter().map(|s| s.kind).collect();
+            let gate = kinds
+                .iter()
+                .position(|k| *k == StepKind::SetAudience)
+                .expect("a SetAudience step");
+            if let Some(attach) = kinds.iter().position(|k| *k == StepKind::AttachDomain) {
+                assert_eq!(gate, attach + 1, "{kinds:?}");
+            }
+            let keys: Vec<&str> = option.fields.iter().map(|f| f.key.as_str()).collect();
+            assert!(keys.contains(&FIELD_GATE_TEAMS) && keys.contains(&FIELD_GATE_USERS));
+            assert!(option
+                .fields
+                .iter()
+                .filter(|f| f.key == FIELD_GATE_TEAMS || f.key == FIELD_GATE_USERS)
+                .all(|f| !f.required));
+            assert!(option.warnings[0].contains("Only people who sign in"));
+            assert!(!option
+                .warnings
+                .iter()
+                .any(|w| w.contains("password protection")));
+        }
+    }
+
+    #[test]
+    fn a_signed_in_plan_says_password_protection_also_applies() {
+        let facts = PlanFacts {
+            audience: Audience::SignedIn,
+            password_protected: true,
+            requested: Some("app.example.com".into()),
+            attached_here: vec!["app.example.com".into()],
+            audiences: vec![("app.example.com".into(), Audience::Private)],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let option = plan.options.first().expect("an option");
+        assert!(
+            option.warnings.iter().any(|w| w.contains("Both apply")),
+            "{:?}",
+            option.warnings
+        );
+        assert!(
+            option.warnings.iter().any(|w| w.contains("is private now")),
+            "{:?}",
+            option.warnings
+        );
+        // Signed in is not public: no "this makes it public" warning.
+        assert!(!option
+            .warnings
+            .iter()
+            .any(|w| w.contains("This makes it public")));
+    }
+
+    #[test]
+    fn gate_list_answers_take_positive_ids_and_drop_an_empty_list() {
+        use serde_json::json;
+        let answers = |teams: serde_json::Value, users: serde_json::Value| {
+            std::collections::BTreeMap::from([
+                (FIELD_GATE_TEAMS.to_string(), teams),
+                (FIELD_GATE_USERS.to_string(), users),
+            ])
+        };
+        assert_eq!(
+            gate_allow_answer(&std::collections::BTreeMap::new()),
+            Ok(None)
+        );
+        assert_eq!(
+            gate_allow_answer(&answers(json!([]), json!(null))),
+            Ok(None)
+        );
+        let list = gate_allow_answer(&answers(json!([3, "1", 3]), json!(["7"])))
+            .expect("valid")
+            .expect("a list");
+        assert_eq!(list.teams, vec![1, 3]);
+        assert_eq!(list.users, vec![7]);
+        for bad in [
+            json!([0]),
+            json!([-2]),
+            json!(["x"]),
+            json!("1,2"),
+            json!([1.5]),
+        ] {
+            assert!(
+                gate_allow_answer(&answers(bad.clone(), json!([]))).is_err(),
+                "{bad}"
             );
         }
     }
