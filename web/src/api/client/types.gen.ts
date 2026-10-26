@@ -83645,9 +83645,9 @@ export type AddressReachability = {
     network?: string | null;
 };
 
-export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve';
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve' | 'tailscale_service' | 'tailscale_service_with_credential';
 
-export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'configure_tailscale_serve';
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval';
 
 export type PlanStep = {
     kind: StepKind;
@@ -83890,6 +83890,40 @@ export type RunResource = {
      */
     created: boolean;
     type: 'tailscale_serve';
+} | {
+    id: number;
+    name: string;
+    type: 'tailscale_credential';
+} | {
+    /**
+     * The tailnet's MagicDNS suffix, for the Service's lock and messages.
+     */
+    tailnet: string;
+    /**
+     * `svc:myapp`.
+     */
+    name: string;
+    /**
+     * This run created it (`created`), rather than finding it.
+     */
+    created: boolean;
+    /**
+     * The run whose marker it carries.
+     */
+    creator_run_id: number;
+    definition: ServiceDefinition;
+    type: 'tailscale_service';
+};
+
+/**
+ * A Tailscale Service as the API has it (ADR 065 D4).
+ */
+export type ServiceDefinition = {
+    name: string;
+    addrs?: Array<string>;
+    comment?: string;
+    ports?: Array<string>;
+    tags?: Array<string>;
 };
 
 /**
@@ -83996,6 +84030,17 @@ export type Intent = {
      */
     service?: string | null;
     type: 'tailscale_serve';
+} | {
+    name: string;
+    type: 'tailscale_credential';
+} | {
+    tailnet: string;
+    name: string;
+    /**
+     * `temps:<install>:<this run>`.
+     */
+    marker: string;
+    type: 'tailscale_service';
 };
 
 export type JournalState = 'pending' | 'done' | 'absent' | 'conflict';
@@ -84046,6 +84091,11 @@ export type JournalEntry = {
      * A conflict found before the write: Temps wrote nothing.
      */
     unwritten?: boolean;
+    /**
+     * The Tailscale Service as shown to the user when undo asked whether
+     * to delete it (ADR 065 D4).
+     */
+    shown_service?: null | ServiceDefinition;
 };
 
 /**

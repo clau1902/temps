@@ -202,6 +202,12 @@ pub enum PlanOptionKind {
     /// The worker's own tailnet name through tailscaled's Serve (ADR 065
     /// D1): `<machine>.<tailnet>.ts.net`, no DNS record, no ACME.
     TailscaleServe,
+    /// The app's own name in the tailnet as a Tailscale Service (ADR 065
+    /// D1): `<service>.<tailnet>.ts.net`, with the cluster's Tailscale
+    /// credential.
+    TailscaleService,
+    /// A Tailscale Service, after saving a pasted Tailscale OAuth client.
+    TailscaleServiceWithCredential,
 }
 
 impl PlanOptionKind {
@@ -214,6 +220,8 @@ impl PlanOptionKind {
             PlanOptionKind::DirectManualDns,
             PlanOptionKind::PrivateWorker,
             PlanOptionKind::TailscaleServe,
+            PlanOptionKind::TailscaleService,
+            PlanOptionKind::TailscaleServiceWithCredential,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == value)
@@ -228,6 +236,8 @@ impl PlanOptionKind {
             PlanOptionKind::DirectManualDns => "direct_manual_dns",
             PlanOptionKind::PrivateWorker => "private_worker",
             PlanOptionKind::TailscaleServe => "tailscale_serve",
+            PlanOptionKind::TailscaleService => "tailscale_service",
+            PlanOptionKind::TailscaleServiceWithCredential => "tailscale_service_with_credential",
         }
     }
 }
@@ -253,6 +263,15 @@ pub enum StepKind {
     /// Declares the worker's Serve entry for the address and waits for its
     /// agent to apply it (ADR 065 D4).
     ConfigureTailscaleServe,
+    /// Proves a pasted Tailscale OAuth client's scopes and saves it (ADR 065
+    /// D2).
+    SaveTailscaleCredential,
+    /// Creates the Tailscale Service, or finds this install's own, and
+    /// checks its definition and hosts (ADR 065 D4).
+    DefineTailscaleService,
+    /// Waits for the tailnet admin to approve the worker as the Service's
+    /// host; never approves it.
+    WaitForServiceApproval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -578,6 +597,26 @@ pub enum RunResource {
         /// This run created the entry, rather than finding it.
         created: bool,
     },
+    /// A Tailscale OAuth client the run saved (ADR 065 D2).
+    TailscaleCredential {
+        id: i32,
+        name: String,
+    },
+    /// A Tailscale Service the run created or found (ADR 065 D4). Undo
+    /// deletes it only once nothing uses it, and only when a person
+    /// confirms.
+    TailscaleService {
+        /// The tailnet's MagicDNS suffix, for the Service's lock and messages.
+        tailnet: String,
+        /// `svc:myapp`.
+        name: String,
+        /// This run created it (`created`), rather than finding it.
+        created: bool,
+        /// The run whose marker it carries.
+        creator_run_id: i32,
+        /// As read back once the step was done, with its addresses.
+        definition: crate::tailscale::ServiceDefinition,
+    },
 }
 
 /// Who one address is for, with what bounds a private one (ADR 064 D5).
@@ -658,6 +697,12 @@ impl RunResource {
             RunResource::TailscaleServe {
                 node_name, hostname, ..
             } => format!("{node_name} serving {hostname} through Tailscale Serve"),
+            RunResource::TailscaleCredential { name, .. } => {
+                format!("Tailscale OAuth client {name}")
+            }
+            RunResource::TailscaleService { name, tailnet, .. } => {
+                format!("Tailscale Service `{name}` in {tailnet}")
+            }
         }
     }
 }
@@ -728,6 +773,17 @@ pub enum Intent {
         #[serde(default)]
         service: Option<String>,
     },
+    /// Found by its Temps row's name.
+    TailscaleCredential {
+        name: String,
+    },
+    /// Found by `GET …/services/{name}` and the marker in its `comment`.
+    TailscaleService {
+        tailnet: String,
+        name: String,
+        /// `temps:<install>:<this run>`.
+        marker: String,
+    },
 }
 
 /// Whether a lookup that misses proves the resource absent (ADR 064 D4).
@@ -753,6 +809,12 @@ impl Intent {
         match self {
             Intent::DnsRecord { .. } | Intent::DnsChange { .. } => LookupAuthority::Settled {
                 timeout: Duration::from_secs(30),
+                settle: Duration::from_secs(30),
+            },
+            // Tailscale documents no read-after-write guarantee for a
+            // Service either (ADR 065 D4: two misses, as Cloudflare DNS).
+            Intent::TailscaleService { .. } => LookupAuthority::Settled {
+                timeout: Duration::from_secs(20),
                 settle: Duration::from_secs(30),
             },
             // A tunnel is found by its Temps row, which is committed
@@ -781,6 +843,10 @@ impl Intent {
                 record_type,
                 ..
             } => format!("Check the {record_type} record for `{hostname}` at your DNS provider."),
+            Intent::TailscaleService { name, .. } => format!(
+                "Check whether `{name}` exists at login.tailscale.com/admin/services, and what its \
+                 comment says."
+            ),
             other => format!("Check whether {} exists.", other.describe()),
         }
     }
@@ -828,6 +894,10 @@ impl Intent {
                 address_id,
                 ..
             } => format!("tailscale_serve/{node_id}/{address_id}"),
+            Intent::TailscaleCredential { name } => format!("tailscale_credential/{name}"),
+            Intent::TailscaleService { tailnet, name, .. } => {
+                format!("tailscale_service/{tailnet}/{name}")
+            }
         };
         format!("run-{run_id}/{what}")
     }
@@ -860,6 +930,10 @@ impl Intent {
                 hostname,
                 ..
             } => format!("{node_name} serving {hostname} through Tailscale Serve"),
+            Intent::TailscaleCredential { name } => format!("Tailscale OAuth client {name}"),
+            Intent::TailscaleService { name, tailnet, .. } => {
+                format!("Tailscale Service `{name}` in {tailnet}")
+            }
         }
     }
 }
@@ -945,6 +1019,11 @@ pub struct JournalEntry {
     /// nothing to put back for it.
     #[serde(default)]
     pub unwritten: bool,
+    /// The Tailscale Service as shown to the user when undo asked whether
+    /// to delete it (ADR 065 D4): the delete goes ahead only while a read
+    /// made immediately before it still equals this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown_service: Option<crate::tailscale::ServiceDefinition>,
 }
 
 impl JournalEntry {
@@ -965,6 +1044,7 @@ impl JournalEntry {
             deleting: false,
             tunnel_id: None,
             unwritten: false,
+            shown_service: None,
         }
     }
 }

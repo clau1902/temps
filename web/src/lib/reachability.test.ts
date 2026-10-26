@@ -16,6 +16,7 @@ import {
   conflictChoices,
   conflictSubject,
   conflictsToDecide,
+  resumeNeedsTailscaleCredential,
   resumeNeedsToken,
   stalePlan,
   certificateChoices,
@@ -483,6 +484,61 @@ describe('tailnet names (ADR 065)', () => {
     expect(conflictChoices(entry, true)).toEqual([
       { decision: 'keep', label: 'Leave the worker as it is' },
     ])
+  })
+
+  test('undo asks before deleting a Tailscale Service', () => {
+    const entry = {
+      at: '2026-10-25T10:00:00Z',
+      key: 'run-1:tailscale_service/example.ts.net/svc:myapp',
+      state: 'conflict' as const,
+      intent: {
+        type: 'tailscale_service' as const,
+        tailnet: 'example.ts.net',
+        name: 'svc:myapp',
+        marker: 'temps:inst1:1',
+      },
+    }
+    expect(conflictSubject(entry)).toBe('Tailscale Service `svc:myapp`')
+    expect(conflictChoices(entry, true)).toEqual([
+      { decision: 'keep', label: 'Keep it' },
+      { decision: 'overwrite', label: 'Delete it' },
+    ])
+  })
+
+  test('resuming asks for the OAuth client again only before it is saved', () => {
+    const run: RunView = {
+      id: 3,
+      audience: 'private',
+      option: 'tailscale_service_with_credential',
+      state: 'interrupted',
+      steps: [
+        {
+          kind: 'save_tailscale_credential',
+          label: 'Save',
+          status: 'pending',
+        },
+        {
+          kind: 'define_tailscale_service',
+          label: 'Define',
+          status: 'pending',
+        },
+      ],
+      created: [],
+      journal: [],
+      undo: [],
+      created_at: '',
+      updated_at: '',
+    }
+    expect(resumeNeedsTailscaleCredential(run)).toBe(true)
+    expect(resumeNeedsToken(run)).toBe(false)
+    expect(
+      resumeNeedsTailscaleCredential({
+        ...run,
+        steps: [
+          { kind: 'save_tailscale_credential', label: 'Save', status: 'done' },
+        ],
+      })
+    ).toBe(false)
   })
 })
 

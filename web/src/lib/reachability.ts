@@ -160,6 +160,8 @@ export function conflictSubject(entry: JournalEntry): string {
       return `Tunnel ${intent.name}`
     case 'tailscale_serve':
       return `${intent.hostname} on ${intent.node_name}`
+    case 'tailscale_service':
+      return `Tailscale Service \`${intent.name}\``
     default:
       return 'This step'
   }
@@ -194,6 +196,13 @@ export function conflictChoices(
   // ADR 065 D4: Temps never removes Serve configuration it did not write.
   if (type === 'tailscale_serve')
     return [{ decision: 'keep', label: 'Leave the worker as it is' }]
+  // ADR 065 D4: a Service is deleted only when a person confirms what undo
+  // showed; deleting it needs a recent password or passkey confirmation.
+  if (type === 'tailscale_service')
+    return [
+      { decision: 'keep', label: 'Keep it' },
+      { decision: 'overwrite', label: 'Delete it' },
+    ]
   return [
     { decision: 'keep', label: 'Keep their value' },
     { decision: 'overwrite', label: 'Restore what was there before' },
@@ -218,6 +227,48 @@ export function resumeNeedsToken(run: RunView): boolean {
       s.status !== 'skipped'
   )
 }
+
+/**
+ * Whether resuming needs the Tailscale OAuth client again (ADR 065 D2): the
+ * run had not saved it, and it is never stored before that.
+ */
+export function resumeNeedsTailscaleCredential(run: RunView): boolean {
+  return run.steps.some(
+    (s) =>
+      s.kind === 'save_tailscale_credential' &&
+      s.status !== 'done' &&
+      s.status !== 'skipped'
+  )
+}
+
+/** What resuming asks for a Tailscale OAuth client, keyed as the server reads it. */
+export const TAILSCALE_RESUME_FIELDS: ReadonlyArray<{
+  key: string
+  label: string
+  secret: boolean
+  required: boolean
+  placeholder?: string
+}> = [
+  {
+    key: 'tailscale_client_id',
+    label: 'Tailscale OAuth client ID',
+    secret: false,
+    required: true,
+  },
+  {
+    key: 'tailscale_client_secret',
+    label: 'Tailscale OAuth client secret',
+    secret: true,
+    required: true,
+  },
+  {
+    key: 'tailscale_tailnet',
+    label: 'Tailnet',
+    secret: false,
+    required: false,
+    placeholder: "- (the OAuth client's own tailnet)",
+  },
+]
 
 /**
  * The new plan a refused apply carries (409, ADR 064 D4): the cluster

@@ -1025,6 +1025,40 @@ Open, found while implementing 3a:
 - An entry whose runs are all deleted, or whose custom domain is detached
   while another run still references it, is not cleaned up by itself yet.
 
+3b (the Service way in):
+
+- **Reading a Service's hosts.** Tailscale's API spec lists `devices:core`
+  for `GET …/services/{name}/devices`, which Temps never asks for. As D2
+  and D4 require, Temps does not widen the scopes: the scope check also
+  probes that read (a name that exists nowhere, where "not found" proves
+  the read allowed and "forbidden" proves it is not), and a probe that
+  fails keeps the Service way in unavailable with the credential-scope
+  message. Whether `devices:core:read` suffices is decided by the probe on
+  each tailnet, not assumed; no live tailnet was available to confirm it.
+- **Matching a host to its entry.** The agent now reports tailscaled's
+  `Self.ID` (`node_id` in the `tailscale` report). A host matches a Serve
+  entry by that id when both sides have one, else by its MagicDNS name.
+- **One credential per cluster.** Every Service call uses the cluster's
+  single `tailscale` credential row (the oldest if there were several);
+  the plan offers pasting one only when there is none. Scope checks are
+  cached for 5 minutes per row, host reads for 30 seconds (at most 256
+  Services), and access tokens live in memory only.
+- **A Service deleted after the define step.** D4 says a run that waited
+  on the lock and finds the Service deleted creates it afresh. That holds
+  for the define step. A Service deleted *after* it, while the run
+  configures Serve or waits for approval, fails the run instead ("`svc:myapp`
+  is gone from your tailnet…"), so undo takes the run's pieces apart and
+  the user makes the address reachable again. Recreating there would mean a
+  second `PUT` from a step that was not planned to write to the tailnet.
+- **The Service's own lookup.** A pending create is resolved by reading
+  the name and comparing the marker with the run's; a matching marker is
+  the run's own (`created`), anything else is not, and nothing is
+  written.
+- **The outside check** reads the hosts for a Service address on every
+  verdict (through the 30-second cache): an unreadable read is `unknown`,
+  a host none of the address's Serve entries accounts for fails with D4's
+  message, and a worker not approved yet shows the not-approved message.
+
 ## Open questions
 
 1. Several hosts for one Service: Tailscale routes to any approved host, so

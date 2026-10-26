@@ -654,12 +654,40 @@ async fn decide_reachability_conflict(
                 .await?;
         }
     }
+    // ADR 065 D4: deleting a Tailscale Service is confirmed with step-up,
+    // and journaled with the definition the user was shown.
+    let shown = state
+        .service
+        .service_to_delete(project_id, environment_id, run_id, &request)
+        .await?;
+    if let Some((tailnet, name, _)) = &shown {
+        require_sensitive_action(
+            state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            SensitiveAction::DeleteTailscaleService {
+                tailnet: tailnet.clone(),
+                name: name.clone(),
+            },
+        )
+        .await?;
+    }
     let key = request.key.clone();
     let decision = request.decision;
     let run = state
         .service
         .decide(project_id, environment_id, run_id, request)
         .await?;
+    if let Some((tailnet, name, definition)) = shown {
+        audit(
+            &state,
+            "TAILSCALE_SERVICE_DELETE_CONFIRMED",
+            &auth,
+            &metadata,
+            &run,
+            serde_json::json!({ "tailnet": tailnet, "service": name, "shown": definition }),
+        )
+        .await;
+    }
     audit(
         &state,
         "REACHABILITY_CONFLICT_DECIDED",
@@ -722,7 +750,9 @@ fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
             }
             RunResource::CustomDomain { .. }
             | RunResource::AddressAudience { .. }
-            | RunResource::TailscaleServe { .. } => Permission::ProjectsWrite,
+            | RunResource::TailscaleServe { .. }
+            | RunResource::TailscaleService { .. } => Permission::ProjectsWrite,
+            RunResource::TailscaleCredential { .. } => Permission::SettingsWrite,
             RunResource::Certificate { .. } => Permission::DomainsDelete,
         };
         if !needed.contains(&permission) {

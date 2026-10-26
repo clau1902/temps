@@ -17,6 +17,7 @@ use temps_core::worker_ingress::{address_scope, AddressScope, PrivateCheckOutcom
 use super::model::{
     ActionKind, AddressReachability, AddressSource, Audience, ReachAction, ReachState,
 };
+use super::run::unrecorded_message;
 
 /// The ingress setup page, where tunnels and worker ingress are managed.
 pub const INGRESS_SETUP_PATH: &str = "/settings/nodes/ingress";
@@ -45,6 +46,8 @@ pub struct PrivateBinding {
     /// ADR 065 D1: `tailscale_serve` or `tailscale_service`; `None` (or
     /// `listener`) for the phase 2 listener.
     pub via: Option<String>,
+    /// For `tailscale_service`: the `svc:` name.
+    pub service: Option<String>,
 }
 
 impl PrivateBinding {
@@ -89,6 +92,23 @@ pub struct TailnetFacts {
     pub minutes_ago: i64,
     /// The address's `tailnet_serve_entries` row on the worker.
     pub entry: Option<ServeEntryState>,
+    /// For a Service: its hosts, read from the Tailscale API.
+    pub service: Option<ServiceHostsState>,
+}
+
+/// A Service's hosts as the outside check read them (ADR 065 D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceHostsState {
+    /// `svc:myapp`.
+    pub name: String,
+    /// The tag hosts are approved by, for the autoApprovers snippet.
+    pub tag: String,
+    /// Hosts none of the address's Serve entries accounts for, by name;
+    /// `Err` when they could not be read.
+    pub unrecorded: Result<Vec<String>, String>,
+    /// Whether the admin approved the worker as a host; `None` when it
+    /// does not advertise the Service (yet).
+    pub approved: Option<bool>,
 }
 
 /// A Serve entry and what the worker last said about it.
@@ -814,6 +834,37 @@ fn tailnet_reachability(facts: &AddressFacts, environment_name: &str) -> Address
             ),
         );
     }
+    if let Some(service) = &tailnet.service {
+        match &service.unrecorded {
+            Err(why) => {
+                return verdict(
+                    ReachState::Unknown,
+                    way_in,
+                    format!(
+                        "Temps could not read which machines host `{}`, so it cannot tell \
+                         whether only {node} serves {address}: {why}",
+                        service.name
+                    ),
+                    Some(
+                        ReachAction::new(
+                            ActionKind::OpenIngress,
+                            "Check the Tailscale OAuth client",
+                        )
+                        .with_href(INGRESS_SETUP_PATH),
+                    ),
+                )
+            }
+            Ok(foreign) if !foreign.is_empty() => {
+                return verdict(
+                    ReachState::NotReachable,
+                    way_in,
+                    unrecorded_message(&service.name, foreign),
+                    None,
+                )
+            }
+            Ok(_) => {}
+        }
+    }
     if let Err(why) = &private.bound {
         return verdict(
             ReachState::NotReachable,
@@ -888,6 +939,32 @@ fn tailnet_reachability(facts: &AddressFacts, environment_name: &str) -> Address
                 format!("Waiting for {node} to serve {address} with Tailscale Serve."),
                 Some(ReachAction::new(ActionKind::Wait, "Wait a moment")),
             )
+        }
+    }
+    if let Some(service) = &tailnet.service {
+        match service.approved {
+            Some(true) => {}
+            Some(false) => {
+                return verdict(
+                    ReachState::NotReachable,
+                    way_in,
+                    tailnet_messages::not_approved(&service.name, node, &service.tag),
+                    // The message names both ways to approve it.
+                    None,
+                );
+            }
+            None => {
+                return verdict(
+                    ReachState::Checking,
+                    way_in,
+                    format!(
+                        "Waiting for {node} to advertise `{}`; its agent does on its next pass, \
+                         every 30 seconds.",
+                        service.name
+                    ),
+                    Some(ReachAction::new(ActionKind::Wait, "Wait a moment")),
+                )
+            }
         }
     }
     let check = tailnet.report.checks.iter().find(|c| {
@@ -1282,6 +1359,7 @@ mod tests {
                     node_id: Some(2),
                     listener: Some("100.101.102.103".into()),
                     via: None,
+                    service: None,
                 }),
                 ..input("internal.example.com", AddressSource::CustomDomain)
             },
@@ -1445,6 +1523,7 @@ mod tests {
                     node_id: Some(2),
                     listener: None,
                     via: Some("tailscale_serve".into()),
+                    service: None,
                 }),
                 ..input("homelab.example.ts.net", AddressSource::CustomDomain)
             },
@@ -1491,6 +1570,7 @@ mod tests {
                         report: report.map(str::to_string),
                         detail: Some("http://127.0.0.1:3000".into()),
                     }),
+                    service: None,
                 }),
             }),
         }
@@ -1604,5 +1684,58 @@ mod tests {
         let mut nothing = tailnet_facts(Resolution::NoRecord, Some("applied"));
         nothing.private = None;
         assert_eq!(judged(nothing).state, ReachState::NotReachable);
+    }
+
+    /// ADR 065 D5: for a Service, every host advertising it matches one
+    /// of its Serve entries, and the worker is approved; a foreign host
+    /// is named and fails, whatever the inside check says.
+    #[test]
+    fn a_service_is_judged_by_its_hosts_and_approval() {
+        let judged = |facts: AddressFacts| {
+            address_reachability(&facts, &[control_plane()], true, "production")
+        };
+        let service = |unrecorded: Result<Vec<String>, String>, approved: Option<bool>| {
+            let mut facts = tailnet_facts(Resolution::NoRecord, Some("applied"));
+            if let Some(binding) = facts.input.private.as_mut() {
+                binding.via = Some("tailscale_service".into());
+                binding.service = Some("svc:myapp".into());
+            }
+            tailnet_of(&mut facts).service = Some(ServiceHostsState {
+                name: "svc:myapp".into(),
+                tag: "tag:temps".into(),
+                unrecorded,
+                approved,
+            });
+            facts
+        };
+
+        assert_eq!(
+            judged(service(Ok(vec![]), Some(true))).state,
+            ReachState::Reachable
+        );
+
+        let foreign = judged(service(Ok(vec!["nas".into()]), Some(true)));
+        assert_eq!(foreign.state, ReachState::NotReachable);
+        assert!(
+            foreign.reason.contains("advertised by `nas`"),
+            "{}",
+            foreign.reason
+        );
+
+        let unapproved = judged(service(Ok(vec![]), Some(false)));
+        assert_eq!(unapproved.state, ReachState::NotReachable);
+        assert_eq!(
+            unapproved.reason,
+            tailnet_messages::not_approved("svc:myapp", "homelab", "tag:temps")
+        );
+
+        assert_eq!(
+            judged(service(Ok(vec![]), None)).state,
+            ReachState::Checking
+        );
+
+        let unreadable = judged(service(Err("401 Unauthorized".into()), Some(true)));
+        assert_eq!(unreadable.state, ReachState::Unknown);
+        assert!(unreadable.reason.contains("401 Unauthorized"));
     }
 }

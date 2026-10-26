@@ -91,7 +91,9 @@ import {
   missingAnswers,
   planIsCurrent,
   privateDnsWarning,
+  resumeNeedsTailscaleCredential,
   resumeNeedsToken,
+  TAILSCALE_RESUME_FIELDS,
   stalePlan,
 } from '@/lib/reachability'
 import { cn } from '@/lib/utils'
@@ -369,13 +371,11 @@ export function MakeReachableDialog({
                     )
                   : null
               }
-              onResume={(token) =>
+              onResume={(answers) =>
                 run.data &&
                 resumeRun.mutate({
                   path: { ...path, run_id: run.data.id },
-                  body: {
-                    answers: token ? { cloudflare_api_token: token } : {},
-                  },
+                  body: { answers },
                 })
               }
               deciding={decide.isPending}
@@ -843,7 +843,7 @@ function RunProgress({
   onUndo: () => void
   resuming: boolean
   resumeError: string | null
-  onResume: (token: string | null) => void
+  onResume: (answers: Record<string, string>) => void
   deciding: boolean
   decideError: string | null
   onDecide: (key: string, decision: Decision) => void
@@ -852,6 +852,8 @@ function RunProgress({
   // The token, when resuming needs it again; it is never stored before the
   // run saves it.
   const [token, setToken] = useState('')
+  // The same for a pasted Tailscale OAuth client (ADR 065 D2).
+  const [tailscale, setTailscale] = useState<Record<string, string>>({})
   if (loadError)
     return (
       <Alert variant="destructive">
@@ -870,6 +872,22 @@ function RunProgress({
   const undoFailed = run.undo.filter((u) => !u.ok)
   const resumable = canResumeRun(run)
   const needsToken = resumable && resumeNeedsToken(run)
+  const needsTailscale = resumable && resumeNeedsTailscaleCredential(run)
+  const tailscaleMissing =
+    needsTailscale &&
+    TAILSCALE_RESUME_FIELDS.some(
+      (f) => f.required && !(tailscale[f.key] ?? '').trim()
+    )
+  const resumeAnswers = (): Record<string, string> => {
+    const answers: Record<string, string> = {}
+    if (needsToken) answers.cloudflare_api_token = token.trim()
+    if (needsTailscale)
+      for (const f of TAILSCALE_RESUME_FIELDS) {
+        const value = (tailscale[f.key] ?? '').trim()
+        if (value) answers[f.key] = value
+      }
+    return answers
+  }
   const conflicts = conflictsToDecide(run)
   const undoPaused = run.state === 'undo_paused'
   return (
@@ -1042,6 +1060,37 @@ function RunProgress({
           />
         </div>
       )}
+      {needsTailscale && (
+        <div className="space-y-2">
+          {TAILSCALE_RESUME_FIELDS.map((f) => (
+            <div key={f.key} className="space-y-1">
+              <label
+                className="text-sm font-medium"
+                htmlFor={`resume-${f.key}`}
+              >
+                {f.label}
+              </label>
+              <Input
+                id={`resume-${f.key}`}
+                type={f.secret ? 'password' : 'text'}
+                autoComplete="off"
+                placeholder={f.placeholder}
+                value={tailscale[f.key] ?? ''}
+                onChange={(event) =>
+                  setTailscale((current) => ({
+                    ...current,
+                    [f.key]: event.target.value,
+                  }))
+                }
+              />
+            </div>
+          ))}
+          <p className="text-xs text-muted-foreground">
+            Paste the OAuth client again: Temps never stores it until the run
+            saves it.
+          </p>
+        </div>
+      )}
       {resumeError && (
         <Alert variant="destructive">
           <AlertDescription>{resumeError}</AlertDescription>
@@ -1050,8 +1099,10 @@ function RunProgress({
       <div className="flex flex-wrap gap-2">
         {resumable && (
           <Button
-            onClick={() => onResume(needsToken ? token.trim() : null)}
-            disabled={resuming || (needsToken && !token.trim())}
+            onClick={() => onResume(resumeAnswers())}
+            disabled={
+              resuming || (needsToken && !token.trim()) || tailscaleMissing
+            }
           >
             Resume
           </Button>

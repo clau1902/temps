@@ -32,7 +32,7 @@ use temps_core::tailnet::TailscaleReport;
 use temps_entities::{node_public_ingress, nodes, tailnet_serve_entries, tailnet_serve_refs};
 use thiserror::Error;
 
-use super::run::{ServeClaim, ServeEntryStatus, ServeRelease, ServeWish};
+use super::run::{ServeClaim, ServeEntryStatus, ServeRelease, ServeWish, ServiceEntryHost};
 
 #[derive(Debug, Error)]
 pub enum ServeEntryError {
@@ -175,7 +175,9 @@ pub async fn claim(
                 private_via: Set(wish.target.via.clone()),
                 service_name: Set(wish.target.service.clone()),
                 tailnet: Set(wish.target.tailnet.clone()),
-                service_addrs: Set(None),
+                service_addrs: Set(
+                    (!wish.service_addrs.is_empty()).then(|| serde_json::json!(wish.service_addrs))
+                ),
                 state: Set(tailnet_serve_entries::STATE_ACTIVE.to_string()),
                 report: Set(None),
                 report_detail: Set(None),
@@ -270,6 +272,50 @@ pub async fn status(
         .and_then(|r| r.tailscale)
         .and_then(|v| serde_json::from_value(v).ok());
     Ok(Some(status_of(&row, node.is_some(), report.as_ref())))
+}
+
+/// Every entry naming the Service `service`, on any node, with what
+/// identifies its worker in the tailnet (ADR 065 D4): the only hosts the
+/// Service may have. Read on `conn`, so a caller holding the Service's lock
+/// sees what that lock guards.
+pub async fn for_service<C: ConnectionTrait>(
+    conn: &C,
+    service: &str,
+) -> Result<Vec<ServiceEntryHost>, DbErr> {
+    let rows = tailnet_serve_entries::Entity::find()
+        .filter(tailnet_serve_entries::Column::ServiceName.eq(service))
+        .order_by_asc(tailnet_serve_entries::Column::Id)
+        .all(conn)
+        .await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reports: std::collections::HashMap<i32, TailscaleReport> =
+        node_public_ingress::Entity::find()
+            .filter(node_public_ingress::Column::NodeId.is_in(rows.iter().map(|r| r.node_id)))
+            .all(conn)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let report = serde_json::from_value(row.tailscale?).ok()?;
+                Some((row.node_id, report))
+            })
+            .collect();
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let report = reports.get(&row.node_id);
+            ServiceEntryHost {
+                node_id: row.node_id,
+                node_name: row.node_name,
+                address_id: row.address_id,
+                hostname: row.hostname,
+                tailscale_node_id: report.and_then(|r| r.node_id.clone()),
+                dns_name: report.and_then(|r| r.dns_name.clone()),
+                removing: row.state == tailnet_serve_entries::STATE_REMOVING,
+            }
+        })
+        .collect())
 }
 
 /// What the run reads from an entry and its worker's last report.
@@ -550,6 +596,7 @@ mod tests {
             },
             address_id: "custom:12".into(),
             hostname: "master.example.ts.net".into(),
+            service_addrs: Vec::new(),
         }
     }
 

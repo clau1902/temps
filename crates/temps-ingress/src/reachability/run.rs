@@ -49,6 +49,7 @@ use super::model::{
 };
 use super::plan::NamedId;
 use super::token_check::TokenCheckResult;
+use crate::tailscale::{self, Ownership, ServiceDefinition, ServiceHost, TailscaleCredential};
 use temps_core::tailnet::messages as tailnet_messages;
 use temps_entities::tailnet_serve_entries::{REPORT_APPLIED, REPORT_CONFLICT, REPORT_ERROR};
 
@@ -91,6 +92,101 @@ pub struct ServeWish {
     pub target: ServeTarget,
     pub address_id: String,
     pub hostname: String,
+    /// The Service's TailVIPs, as the run journaled them, for the agent's
+    /// MagicDNS check (ADR 065 D5).
+    pub service_addrs: Vec<String>,
+}
+
+/// The Tailscale Service a run defines (ADR 065 D4), resolved from the plan
+/// when the run starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServicePlan {
+    /// `svc:myapp`.
+    pub name: String,
+    /// The MagicDNS suffix (`example.ts.net`): the Service's lock and the
+    /// messages.
+    pub tailnet: String,
+    /// The worker tag its definition is for.
+    pub tag: String,
+    /// ADR 031's install id; the marker is `temps:<install>:<this run>`.
+    pub install_id: String,
+    /// What the plan read at the name; `None` when it was absent.
+    pub seen: Option<ServiceDefinition>,
+    /// The name a pasted OAuth client is saved under.
+    #[serde(default)]
+    pub credential_name: String,
+}
+
+/// A Serve entry naming a Service, with what identifies its worker in the
+/// tailnet (ADR 065 D4): the only hosts that Service may have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEntryHost {
+    pub node_id: i32,
+    pub node_name: String,
+    pub address_id: String,
+    pub hostname: String,
+    /// The worker's `Self.ID`, as it last reported it.
+    pub tailscale_node_id: Option<String>,
+    /// Its `Self.DNSName`.
+    pub dns_name: Option<String>,
+    pub removing: bool,
+}
+
+impl ServiceEntryHost {
+    fn hosts(&self, host: &ServiceHost) -> bool {
+        host.is(self.tailscale_node_id.as_deref(), self.dns_name.as_deref())
+    }
+}
+
+/// What a confirmed Service delete did (ADR 065 D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceDeletion {
+    Deleted,
+    /// It was gone already.
+    Gone,
+    /// A check under the lock no longer held: why it was kept.
+    Kept(String),
+}
+
+/// The hosts advertising `name` that no Serve entry of `address_id` for it
+/// accounts for, by name (ADR 065 D4): never accepted as the new truth.
+pub fn unrecorded_hosts(
+    hosts: &[ServiceHost],
+    entries: &[ServiceEntryHost],
+    address_id: Option<&str>,
+) -> Vec<String> {
+    hosts
+        .iter()
+        .filter(|host| {
+            !entries
+                .iter()
+                .filter(|e| address_id.is_none_or(|a| e.address_id == a))
+                .any(|e| e.hosts(host))
+        })
+        .map(ServiceHost::short_name)
+        .collect()
+}
+
+/// D4's message for hosts no Temps setup configured.
+pub(crate) fn unrecorded_message(service: &str, hosts: &[String]) -> String {
+    format!(
+        "`{service}` is also advertised by {}, which no Temps setup configured. Someone may \
+         have created the same name while Temps did; check it before approving.",
+        hosts
+            .iter()
+            .map(|h| format!("`{h}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Whether `addrs` is non-empty and every one is a Tailscale address.
+fn tailscale_addrs(addrs: &[String]) -> bool {
+    !addrs.is_empty()
+        && addrs.iter().all(|a| {
+            a.parse::<IpAddr>()
+                .is_ok_and(temps_core::tailnet::is_tailscale_ip)
+        })
 }
 
 /// What claiming a Serve entry found under its advisory lock (ADR 065 D4).
@@ -260,6 +356,40 @@ pub trait RunOps: Send + Sync {
     /// Deletes a `removing` entry the user decided to leave on the worker
     /// as it is, so nothing more is asked of the agent.
     async fn forget_serve_entry(&self, entry_id: i32) -> Result<(), String>;
+    /// Proves a pasted Tailscale OAuth client's scopes and saves it, sealed,
+    /// under `name` (ADR 065 D2); returns its row id.
+    async fn save_tailscale_credential(
+        &self,
+        name: &str,
+        credential: &TailscaleCredential,
+    ) -> Result<i32, String>;
+    /// Removes the credential row unless a Service setup still needs it:
+    /// `Some(why)` when it is kept.
+    async fn release_tailscale_credential(&self, id: i32) -> Result<Option<String>, String>;
+    /// The Service `name` in the cluster's tailnet, as the API has it now.
+    async fn read_service(&self, name: &str) -> Result<Option<ServiceDefinition>, String>;
+    /// `PUT`, only ever to create (ADR 065 D4).
+    async fn create_service(&self, definition: &ServiceDefinition) -> Result<(), WriteError>;
+    /// The devices advertising `name`.
+    async fn service_hosts(&self, name: &str) -> Result<Vec<ServiceHost>, String>;
+    /// Every Serve entry naming `name`, on any node.
+    async fn service_entries(&self, name: &str) -> Result<Vec<ServiceEntryHost>, String>;
+    /// The Service run `creator_run_id` of this install journaled as
+    /// `created`, with when: `None` when no journal records creating it.
+    async fn service_creation(
+        &self,
+        name: &str,
+        creator_run_id: i32,
+    ) -> Result<Option<(ServiceDefinition, temps_core::DBDateTime)>, String>;
+    /// The confirmed delete (ADR 065 D4): under the Service's lock, no
+    /// Serve entry names it, no host advertises it, and a read made just
+    /// before the `DELETE` still equals `shown`; else it is kept.
+    async fn delete_service(
+        &self,
+        tailnet: &str,
+        name: &str,
+        shown: &ServiceDefinition,
+    ) -> Result<ServiceDeletion, String>;
     async fn sleep(&self, duration: Duration);
 }
 
@@ -406,6 +536,13 @@ pub struct RunInput {
     /// For a tailnet name: the worker that serves it (ADR 065 D4).
     #[serde(default)]
     pub serve: Option<ServeTarget>,
+    /// For a Tailscale Service: what the run defines (ADR 065 D4).
+    #[serde(default)]
+    pub tailscale_service: Option<ServicePlan>,
+    /// A pasted Tailscale OAuth client, in memory for the run only; never
+    /// stored.
+    #[serde(skip)]
+    pub tailscale_credential: Option<TailscaleCredential>,
 }
 
 /// The run as stored.
@@ -550,6 +687,27 @@ async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, S
                 None => Found::Missing,
             },
         ),
+        // Created by this run only when it carries this run's marker.
+        Intent::TailscaleService {
+            tailnet,
+            name,
+            marker,
+        } => Ok(match ops.read_service(name).await? {
+            None => Found::Missing,
+            Some(definition) if definition.comment == *marker => {
+                Found::Made(Box::new(RunResource::TailscaleService {
+                    tailnet: tailnet.clone(),
+                    name: name.clone(),
+                    created: true,
+                    creator_run_id: run_id,
+                    definition,
+                }))
+            }
+            Some(definition) => Found::Changed(format!(
+                "`{name}` with the comment `{}`, which this run did not write",
+                definition.comment
+            )),
+        }),
         other => Ok(match ops.find(other).await? {
             Some(resource) => Found::Made(Box::new(resource)),
             None => Found::Missing,
@@ -811,6 +969,30 @@ pub fn decide(
         entry.at = chrono::Utc::now();
         entry.undo_decision = Some(Decision::Keep);
         entry.state = JournalState::Done;
+        return Ok(());
+    }
+    if let Intent::TailscaleService { name, tailnet, .. } = &entry.intent {
+        // ADR 065 D4: Temps never updates a Service, so going forward
+        // there is nothing to decide; undo deletes one only when a person
+        // confirms the definition they were shown.
+        if !undoing {
+            return Err(format!(
+                "Temps never changes a Tailscale Service, so it cannot take `{name}` over. Check \
+                 it in the admin console, then plan again with another name or once it is fixed."
+            ));
+        }
+        entry.at = chrono::Utc::now();
+        entry.undo_decision = Some(decision);
+        entry.state = match decision {
+            Decision::Keep => JournalState::Absent,
+            Decision::Overwrite if entry.shown_service.is_some() => JournalState::Done,
+            Decision::Overwrite => {
+                return Err(format!(
+                    "Temps deletes `{name}` from {tailnet} only after showing you what it \
+                     deletes, and nothing was shown for it. Undo again to see it."
+                ))
+            }
+        };
         return Ok(());
     }
     entry.at = chrono::Utc::now();
@@ -1307,6 +1489,10 @@ impl Runner<'_> {
                     target: target.clone(),
                     address_id: address_id.clone(),
                     hostname: host.clone(),
+                    service_addrs: self.service_resource().map_or_else(Vec::new, |r| match r {
+                        RunResource::TailscaleService { definition, .. } => definition.addrs,
+                        _ => Vec::new(),
+                    }),
                 };
                 let key = intent.key(input.run_id);
                 match self.ops.claim_serve_entry(input.run_id, &wish).await {
@@ -1402,6 +1588,406 @@ impl Runner<'_> {
                     }
                 },
                 Err(error) => last = format!("Could not read the Serve entry for {host}: {error}"),
+            }
+            if waited >= self.timing.publish {
+                return Outcome::Stalled(last);
+            }
+            self.ops.sleep(self.timing.poll).await;
+            waited += self.timing.poll.max(Duration::from_millis(1));
+        }
+    }
+
+    /// The Tailscale Service this run defined, as journaled.
+    fn service_resource(&self) -> Option<RunResource> {
+        let name = &self.input.tailscale_service.as_ref()?.name;
+        self.record.journal.iter().find_map(|e| match &e.resource {
+            Some(r @ RunResource::TailscaleService { name: n, .. })
+                if n == name && e.state == JournalState::Done =>
+            {
+                Some(r.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// Record `resource` as done under `intent`'s key without a call: what
+    /// this run found rather than made.
+    async fn record_found(&mut self, intent: &Intent, resource: RunResource) {
+        let key = intent.key(self.input.run_id);
+        let now = chrono::Utc::now();
+        let entry = match self.record.journal.iter().position(|e| e.key == key) {
+            Some(at) => &mut self.record.journal[at],
+            None => {
+                self.record
+                    .journal
+                    .push(JournalEntry::pending(key, intent.clone(), now));
+                let last = self.record.journal.len() - 1;
+                &mut self.record.journal[last]
+            }
+        };
+        entry.state = JournalState::Done;
+        entry.resource = Some(resource);
+        entry.pending_since = None;
+        entry.at = now;
+        self.save().await;
+    }
+
+    /// ADR 065 D2: prove a pasted OAuth client's scopes and save it.
+    async fn save_tailscale_credential(&mut self) -> Outcome {
+        let input = self.input;
+        let Some(plan) = &input.tailscale_service else {
+            return Outcome::Skipped("No Tailscale Service.".into());
+        };
+        let intent = Intent::TailscaleCredential {
+            name: plan.credential_name.clone(),
+        };
+        let key = intent.key(input.run_id);
+        let resource = match self.begin(&intent).await {
+            Err(hold) => return hold.into(),
+            Ok(Begin::Have(resource)) => *resource,
+            Ok(Begin::Go) => {
+                let Some(credential) = &input.tailscale_credential else {
+                    self.finish(&key, None).await;
+                    return Outcome::Failed(
+                        "Paste the Tailscale OAuth client again: Temps never stores it until the \
+                         run saves it."
+                            .into(),
+                    );
+                };
+                match self
+                    .ops
+                    .save_tailscale_credential(&plan.credential_name, credential)
+                    .await
+                {
+                    Ok(id) => {
+                        let resource = RunResource::TailscaleCredential {
+                            id,
+                            name: plan.credential_name.clone(),
+                        };
+                        self.finish(&key, Some(resource.clone())).await;
+                        resource
+                    }
+                    Err(error) => {
+                        self.finish_failed(&intent, true).await;
+                        return Outcome::Failed(error);
+                    }
+                }
+            }
+        };
+        match resource {
+            RunResource::TailscaleCredential { name, .. } => {
+                Outcome::Done(Some(format!("Every scope is there; saved as {name}.")))
+            }
+            _ => Outcome::Failed("The saved Tailscale OAuth client could not be found.".into()),
+        }
+    }
+
+    /// ADR 065 D4: create the Service only when absent, find this install's
+    /// own, and check the whole definition and its hosts back.
+    async fn define_service(&mut self) -> Outcome {
+        let input = self.input;
+        let Some(plan) = input.tailscale_service.clone() else {
+            return Outcome::Skipped("No Tailscale Service.".into());
+        };
+        let name = plan.name.clone();
+        let marker = tailscale::marker(&plan.install_id, input.run_id);
+        let intent = Intent::TailscaleService {
+            tailnet: plan.tailnet.clone(),
+            name: name.clone(),
+            marker: marker.clone(),
+        };
+        let key = intent.key(input.run_id);
+        let resource = match self.service_resource() {
+            Some(resource) => resource,
+            None => {
+                let pending = self
+                    .record
+                    .journal
+                    .iter()
+                    .any(|e| e.key == key && e.state == JournalState::Pending);
+                // A pending create is resolved by its lookup, never by a
+                // second read that could take it for someone else's.
+                let read = if pending {
+                    None
+                } else {
+                    match self.ops.read_service(&name).await {
+                        Ok(read) => Some(read),
+                        Err(error) => {
+                            return Outcome::Failed(format!(
+                                "Temps could not read `{name}` from your tailnet, so it created \
+                                 nothing: {error}"
+                            ))
+                        }
+                    }
+                };
+                match read {
+                    None | Some(None) => match self.begin(&intent).await {
+                        Err(hold) => return hold.into(),
+                        Ok(Begin::Have(resource)) => *resource,
+                        Ok(Begin::Go) => {
+                            let fixed = ServiceDefinition::fixed(&name, &plan.tag, &marker);
+                            match self.ops.create_service(&fixed).await {
+                                Ok(()) => {
+                                    let resource = RunResource::TailscaleService {
+                                        tailnet: plan.tailnet.clone(),
+                                        name: name.clone(),
+                                        created: true,
+                                        creator_run_id: input.run_id,
+                                        definition: fixed,
+                                    };
+                                    self.finish(&key, Some(resource.clone())).await;
+                                    resource
+                                }
+                                Err(error) => {
+                                    self.finish_failed(&intent, error.maybe_applied).await;
+                                    return Outcome::Failed(error.message);
+                                }
+                            }
+                        }
+                    },
+                    // A resumed run whose earlier PUT landed.
+                    Some(Some(found)) if found.comment == marker => {
+                        let resource = RunResource::TailscaleService {
+                            tailnet: plan.tailnet.clone(),
+                            name: name.clone(),
+                            created: true,
+                            creator_run_id: input.run_id,
+                            definition: found,
+                        };
+                        self.record_found(&intent, resource.clone()).await;
+                        resource
+                    }
+                    Some(Some(found)) => {
+                        match tailscale::ownership(&found, &plan.install_id) {
+                            Ownership::Ours { creator_run_id } => {
+                                match plan.seen.as_ref().map(|seen| found.differs_from(seen)) {
+                                    // D1 option 1: this install's, as the plan read it.
+                                    Some(None) => {
+                                        let resource = RunResource::TailscaleService {
+                                            tailnet: plan.tailnet.clone(),
+                                            name: name.clone(),
+                                            created: false,
+                                            creator_run_id,
+                                            definition: found,
+                                        };
+                                        self.record_found(&intent, resource.clone()).await;
+                                        resource
+                                    }
+                                    Some(Some(why)) => {
+                                        return Outcome::Conflict(format!(
+                                            "{why} since this run was planned. Temps wrote \
+                                             nothing to it: check it, then plan again."
+                                        ))
+                                    }
+                                    None => {
+                                        return Outcome::Conflict(format!(
+                                            "`{name}` was created by another setup of this Temps \
+                                             install (run {creator_run_id}) after this run was \
+                                             planned. Temps wrote nothing to it: plan again to \
+                                             use it."
+                                        ))
+                                    }
+                                }
+                            }
+                            Ownership::Foreign => {
+                                return Outcome::Conflict(tailnet_messages::service_taken(&name))
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        self.check_service(resource, &plan, &marker).await
+    }
+
+    /// When the Service step is done (ADR 065 D4): its marker, the fixed
+    /// definition, Tailscale addresses, and only recorded hosts.
+    async fn check_service(
+        &mut self,
+        resource: RunResource,
+        plan: &ServicePlan,
+        marker: &str,
+    ) -> Outcome {
+        let RunResource::TailscaleService {
+            created,
+            creator_run_id,
+            ..
+        } = resource.clone()
+        else {
+            return Outcome::Failed("The Tailscale Service could not be recorded.".into());
+        };
+        let name = plan.name.as_str();
+        // Tailscale assigns the TailVIPs: wait for them to show.
+        let mut waited = Duration::ZERO;
+        let read = loop {
+            match self.ops.read_service(name).await {
+                Ok(Some(read)) if !read.addrs.is_empty() || waited >= self.timing.publish => {
+                    break read
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Outcome::Failed(format!(
+                        "`{name}` is gone from your tailnet: something deleted it while this run \
+                         worked on it."
+                    ))
+                }
+                Err(error) if waited >= self.timing.publish => {
+                    return Outcome::Stalled(format!(
+                        "Could not read `{name}` back from your tailnet: {error}"
+                    ))
+                }
+                Err(_) => {}
+            }
+            self.ops.sleep(self.timing.poll).await;
+            waited += self.timing.poll.max(Duration::from_millis(1));
+        };
+        let owned = if created {
+            (read.comment == marker).then_some(())
+        } else {
+            matches!(
+                tailscale::ownership(&read, &plan.install_id),
+                Ownership::Ours { .. }
+            )
+            .then_some(())
+        };
+        if owned.is_none() {
+            return Outcome::Conflict(format!(
+                "`{name}` now carries the comment `{}`, not this Temps install's marker. Temps \
+                 writes nothing to it: check who changed it.",
+                read.comment
+            ));
+        }
+        if let Some(why) = read.differs_from_fixed(&plan.tag) {
+            return Outcome::Conflict(format!("{why}. Temps never changes a Service: check it."));
+        }
+        if !tailscale_addrs(&read.addrs) {
+            return Outcome::Conflict(format!(
+                "`{name}` has the addresses {:?}, not Tailscale ones, so Temps does not trust it.",
+                read.addrs
+            ));
+        }
+        if !created {
+            match self.ops.service_creation(name, creator_run_id).await {
+                Ok(Some((journaled, _))) if journaled.addrs.is_empty() => {}
+                Ok(Some((journaled, _))) => {
+                    if let Some(why) = read.differs_from(&ServiceDefinition {
+                        comment: read.comment.clone(),
+                        ..journaled
+                    }) {
+                        return Outcome::Conflict(format!("{why}. Temps never changes a Service."));
+                    }
+                }
+                Ok(None) => {
+                    return Outcome::Conflict(format!(
+                        "No setup of this Temps install records creating `{name}` (run \
+                         {creator_run_id}), so Temps does not use it. Pick another name."
+                    ))
+                }
+                Err(error) => return Outcome::Failed(error),
+            }
+        }
+        if let Err(outcome) = self.unrecorded(name).await {
+            return outcome;
+        }
+        // Journal what was read, with the addresses Tailscale assigned.
+        let resource = RunResource::TailscaleService {
+            tailnet: plan.tailnet.clone(),
+            name: name.to_string(),
+            created,
+            creator_run_id,
+            definition: read.clone(),
+        };
+        let key = Intent::TailscaleService {
+            tailnet: plan.tailnet.clone(),
+            name: name.to_string(),
+            marker: marker.to_string(),
+        }
+        .key(self.input.run_id);
+        if let Some(entry) = self.record.journal.iter_mut().find(|e| e.key == key) {
+            entry.resource = Some(resource);
+        }
+        self.save().await;
+        Outcome::Done(Some(format!(
+            "`{name}` is in your tailnet at {}{}.",
+            read.addrs.join(", "),
+            if created {
+                ""
+            } else {
+                ", as this Temps install made it"
+            }
+        )))
+    }
+
+    /// Every host advertising the Service must match one of this address's
+    /// Serve entries for it (ADR 065 D4); `Err` the outcome when one does
+    /// not, or the hosts cannot be read.
+    async fn unrecorded(&self, name: &str) -> Result<Vec<ServiceHost>, Outcome> {
+        let hosts = self.ops.service_hosts(name).await.map_err(|error| {
+            Outcome::Failed(format!(
+                "Temps could not read which machines host `{name}`, which it checks before \
+                 trusting it: {error}"
+            ))
+        })?;
+        let entries = self
+            .ops
+            .service_entries(name)
+            .await
+            .map_err(Outcome::Failed)?;
+        let address_id = match self.address_id().await {
+            Ok(id) => id,
+            Err(error) => return Err(Outcome::Failed(error)),
+        };
+        let foreign = unrecorded_hosts(&hosts, &entries, Some(&address_id));
+        if foreign.is_empty() {
+            Ok(hosts)
+        } else {
+            Err(Outcome::Conflict(unrecorded_message(name, &foreign)))
+        }
+    }
+
+    /// ADR 065 D4: wait for the tailnet admin to approve the worker as the
+    /// Service's host. It never approves; waiting is not a failure.
+    async fn wait_for_approval(&mut self) -> Outcome {
+        let input = self.input;
+        let (Some(plan), Some(target)) = (&input.tailscale_service, &input.serve) else {
+            return Outcome::Skipped("No Tailscale Service.".into());
+        };
+        let name = plan.name.as_str();
+        let node = target.node_name.as_str();
+        let mut waited = Duration::ZERO;
+        let mut last;
+        loop {
+            // Deleted after the define step: no one recreates it behind
+            // the user's back, so the run stops and undo takes it apart.
+            if let Ok(None) = self.ops.read_service(name).await {
+                return Outcome::Failed(format!(
+                    "`{name}` is gone from your tailnet: something deleted it after this run \
+                     defined it. Undo, then make the address reachable again."
+                ));
+            }
+            let hosts = match self.unrecorded(name).await {
+                Ok(hosts) => hosts,
+                Err(outcome) => return outcome,
+            };
+            let mine = match self.ops.service_entries(name).await {
+                Ok(entries) => entries.into_iter().find(|e| e.node_id == target.node_id),
+                Err(error) => return Outcome::Failed(error),
+            };
+            let host = mine
+                .as_ref()
+                .and_then(|e| hosts.iter().find(|h| e.hosts(h)));
+            match host.map(|h| h.approved) {
+                Some(Some(true)) => {
+                    return Outcome::Done(Some(format!("{node} is the approved host of `{name}`.")))
+                }
+                Some(_) => last = tailnet_messages::not_approved(name, node, &plan.tag),
+                None => {
+                    last = format!(
+                        "`{node}` does not advertise `{name}` yet; its agent does on its next \
+                         pass, every 30 seconds. Then {}",
+                        tailnet_messages::not_approved(name, node, &plan.tag)
+                    )
+                }
             }
             if waited >= self.timing.publish {
                 return Outcome::Stalled(last);
@@ -2025,6 +2611,9 @@ impl Runner<'_> {
                 };
                 self.configure_serve(&target).await
             }
+            StepKind::SaveTailscaleCredential => self.save_tailscale_credential().await,
+            StepKind::DefineTailscaleService => self.define_service().await,
+            StepKind::WaitForServiceApproval => self.wait_for_approval().await,
             StepKind::CheckReachability => {
                 let verdict = self.ops.reachability(&address).await;
                 if verdict.state == ReachState::Reachable {
@@ -2245,6 +2834,11 @@ fn undo_conflict_message(entry: &JournalEntry) -> String {
                 .as_deref()
                 .unwrap_or("its Serve config holds something else")
         ),
+        // The question itself: delete it, or what keeps it (ADR 065 D4).
+        Intent::TailscaleService { name, .. } => entry
+            .conflict
+            .clone()
+            .unwrap_or_else(|| format!("Temps stopped at `{name}`. Keep it, or delete it.")),
         _ => format!(
             "{} was changed by someone else after this run set it: it is now {}. Temps did not \
              touch it, nor anything this run did before it. Keep that value, or restore what \
@@ -2280,6 +2874,147 @@ fn pause(entry: &mut JournalEntry, current: String, now: temps_core::DBDateTime)
     entry.conflict = Some(current);
     entry.at = now;
     Stop::Conflict(undo_conflict_message(entry))
+}
+
+/// Where undoing a Tailscale Service left the undo.
+enum ServiceUndo {
+    /// Carry on, with what to report (boxed: it is much larger than a stop).
+    Done(Option<Box<UndoResult>>),
+    Stop(Stop),
+}
+
+/// Undo a Tailscale Service (ADR 065 D4): keep it while any Serve entry
+/// names it, never delete one no journal of this install records as
+/// created, pause on a changed definition or an unrecorded host, and
+/// otherwise ask the user; delete only once they confirmed what they were
+/// shown, with the checks made again under the Service's lock.
+async fn undo_service(
+    entry: &mut JournalEntry,
+    resource: &RunResource,
+    ops: &dyn RunOps,
+    now: temps_core::DBDateTime,
+) -> ServiceUndo {
+    let RunResource::TailscaleService {
+        tailnet,
+        name,
+        creator_run_id,
+        ..
+    } = resource
+    else {
+        return ServiceUndo::Done(None);
+    };
+    let kept = |entry: &mut JournalEntry, why: String| {
+        entry.state = JournalState::Absent;
+        entry.at = now;
+        ServiceUndo::Done(Some(Box::new(UndoResult {
+            label: format!("Kept `{name}`: {why}"),
+            resource: resource.clone(),
+            ok: true,
+            error: None,
+        })))
+    };
+    let failed = |what: &str, error: String| {
+        ServiceUndo::Stop(Stop::Failed(format!(
+            "Temps could not {what} `{name}`, so it left it and everything this run did before \
+             it: {error} Undo again to retry."
+        )))
+    };
+    // A person confirmed the delete of what they were shown.
+    if entry.undo_decision == Some(Decision::Overwrite) {
+        let Some(shown) = entry.shown_service.clone() else {
+            return kept(entry, "nothing was shown to confirm".to_string());
+        };
+        return match ops.delete_service(tailnet, name, &shown).await {
+            Ok(ServiceDeletion::Deleted) => {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                ServiceUndo::Done(Some(Box::new(UndoResult {
+                    label: format!("Deleted `{name}` from {tailnet}"),
+                    resource: resource.clone(),
+                    ok: true,
+                    error: None,
+                })))
+            }
+            Ok(ServiceDeletion::Gone) => {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                ServiceUndo::Done(None)
+            }
+            Ok(ServiceDeletion::Kept(why)) => kept(entry, why),
+            Err(error) => failed("delete", error),
+        };
+    }
+    // Still in use: expected, not a conflict.
+    let entries = match ops.service_entries(name).await {
+        Ok(entries) => entries,
+        Err(error) => return failed("tell what uses", error),
+    };
+    if let Some(user) = entries.first() {
+        return kept(
+            entry,
+            format!("it still serves {} on {}", user.hostname, user.node_name),
+        );
+    }
+    // Never deleted without this install's journal of creating it.
+    let creation = match ops.service_creation(name, *creator_run_id).await {
+        Ok(Some(creation)) => creation,
+        Ok(None) => {
+            return kept(
+                entry,
+                "no setup of this Temps install records creating it".to_string(),
+            )
+        }
+        Err(error) => return failed("find who created", error),
+    };
+    let current = match ops.read_service(name).await {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            entry.state = JournalState::Absent;
+            entry.at = now;
+            return ServiceUndo::Done(None);
+        }
+        Err(error) => return failed("read", error),
+    };
+    let changed = if creation.0.addrs.is_empty() {
+        current.differs_from(&ServiceDefinition {
+            addrs: current.addrs.clone(),
+            ..creation.0.clone()
+        })
+    } else {
+        current.differs_from(&creation.0)
+    };
+    let question = match changed {
+        Some(why) => format!(
+            "{why}, which Temps did not set. Keep it, or delete it anyway? Temps deletes it only \
+             if it still is exactly what you see here."
+        ),
+        None => {
+            let hosts = match ops.service_hosts(name).await {
+                Ok(hosts) => hosts,
+                Err(error) => return failed("read the hosts of", error),
+            };
+            let foreign = unrecorded_hosts(&hosts, &[], None);
+            if foreign.is_empty() {
+                format!(
+                    "Delete `{name}` from tailnet `{tailnet}`? It was created by this Temps \
+                     install on {} and nothing uses it now.",
+                    creation.1.format("%-d %B")
+                )
+            } else {
+                format!(
+                    "`{name}` is now also hosted by {}, which no Temps setup configured. Keep \
+                     it, or delete it anyway?",
+                    foreign
+                        .iter()
+                        .map(|h| format!("`{h}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+    };
+    entry.shown_service = Some(current);
+    ServiceUndo::Stop(pause(entry, question, now))
 }
 
 /// Remove what a run created and put back what it changed, newest first,
@@ -2483,6 +3218,35 @@ pub async fn undo(
                     )
                 }
             }
+            continue;
+        }
+        if let RunResource::TailscaleService { .. } = &resource {
+            match undo_service(entry, &resource, ops, now).await {
+                ServiceUndo::Done(result) => {
+                    if let Some(result) = result {
+                        results.push(*result);
+                    }
+                    continue;
+                }
+                ServiceUndo::Stop(why) => return stop(results, why),
+            }
+        }
+        if let RunResource::TailscaleCredential { id, name } = &resource {
+            let outcome = ops.release_tailscale_credential(*id).await;
+            let label = match &outcome {
+                Ok(Some(why)) => format!("Kept Tailscale OAuth client {name}: {why}"),
+                _ => format!("Removed Tailscale OAuth client {name}"),
+            };
+            if outcome.is_ok() {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+            }
+            results.push(UndoResult {
+                label,
+                resource: resource.clone(),
+                ok: outcome.is_ok(),
+                error: outcome.err(),
+            });
             continue;
         }
         match &resource {
@@ -2707,7 +3471,9 @@ pub async fn undo(
             } => ops.set_address_audience(hostname, before).await,
             RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
             // Handled above, before anything is removed.
-            RunResource::TailscaleServe { .. } => Ok(()),
+            RunResource::TailscaleServe { .. }
+            | RunResource::TailscaleService { .. }
+            | RunResource::TailscaleCredential { .. } => Ok(()),
         };
         let label = match &resource {
             RunResource::AutoManageEnabled { domain, .. } => {
@@ -2831,6 +3597,19 @@ mod tests {
         serve_release: Option<ServeRelease>,
         /// This run's reference to the entry.
         serve_ref: Mutex<Option<(i32, bool)>>,
+        /// The Service in the tailnet now.
+        service: Mutex<Option<ServiceDefinition>>,
+        /// The devices advertising it.
+        service_hosts: Mutex<Vec<ServiceHost>>,
+        /// The Serve entries naming it.
+        service_entries: Mutex<Vec<ServiceEntryHost>>,
+        /// What `service_creation` answers.
+        creation: Option<(ServiceDefinition, temps_core::DBDateTime)>,
+        /// What a confirmed delete finds; `None` deletes.
+        deletion: Option<ServiceDeletion>,
+        /// Reads of the Service so far, and after how many it is gone.
+        service_reads: Mutex<usize>,
+        vanish_after: Option<usize>,
     }
 
     impl Fake {
@@ -3176,6 +3955,72 @@ mod tests {
             self.log(format!("forget_serve_entry {entry_id}"));
             Ok(())
         }
+        async fn save_tailscale_credential(
+            &self,
+            name: &str,
+            _credential: &TailscaleCredential,
+        ) -> Result<i32, String> {
+            self.log(format!("save_tailscale_credential {name}"));
+            if self.fail.contains(&"save_tailscale_credential") {
+                return Err("the OAuth client lacks the `services` scope".into());
+            }
+            Ok(31)
+        }
+        async fn release_tailscale_credential(&self, id: i32) -> Result<Option<String>, String> {
+            self.log(format!("release_tailscale_credential {id}"));
+            Ok(None)
+        }
+        async fn read_service(&self, name: &str) -> Result<Option<ServiceDefinition>, String> {
+            self.log(format!("read_service {name}"));
+            if self.fail.contains(&"read_service") {
+                return Err("403 Forbidden".into());
+            }
+            let mut reads = self.service_reads.lock().expect("lock");
+            *reads += 1;
+            if self.vanish_after.is_some_and(|after| *reads > after) {
+                return Ok(None);
+            }
+            Ok(self.service.lock().expect("lock").clone())
+        }
+        async fn create_service(&self, definition: &ServiceDefinition) -> Result<(), WriteError> {
+            self.log(format!("create_service {}", definition.comment));
+            if self.fail.contains(&"create_service") {
+                return Err(WriteError {
+                    message: "500 from Tailscale".into(),
+                    maybe_applied: false,
+                });
+            }
+            *self.service.lock().expect("lock") = Some(ServiceDefinition {
+                addrs: vec!["100.100.1.5".into()],
+                ..definition.clone()
+            });
+            Ok(())
+        }
+        async fn service_hosts(&self, name: &str) -> Result<Vec<ServiceHost>, String> {
+            self.log(format!("service_hosts {name}"));
+            Ok(self.service_hosts.lock().expect("lock").clone())
+        }
+        async fn service_entries(&self, name: &str) -> Result<Vec<ServiceEntryHost>, String> {
+            self.log(format!("service_entries {name}"));
+            Ok(self.service_entries.lock().expect("lock").clone())
+        }
+        async fn service_creation(
+            &self,
+            name: &str,
+            creator_run_id: i32,
+        ) -> Result<Option<(ServiceDefinition, temps_core::DBDateTime)>, String> {
+            self.log(format!("service_creation {name} {creator_run_id}"));
+            Ok(self.creation.clone())
+        }
+        async fn delete_service(
+            &self,
+            tailnet: &str,
+            name: &str,
+            shown: &ServiceDefinition,
+        ) -> Result<ServiceDeletion, String> {
+            self.log(format!("delete_service {tailnet} {name} {}", shown.comment));
+            Ok(self.deletion.clone().unwrap_or(ServiceDeletion::Deleted))
+        }
         async fn sleep(&self, _duration: Duration) {}
     }
 
@@ -3251,6 +4096,8 @@ mod tests {
             certificate_challenge: None,
             audience: None,
             serve: None,
+            tailscale_service: None,
+            tailscale_credential: None,
         }
     }
 
@@ -4812,5 +5659,353 @@ mod tests {
         let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
         assert_eq!(outcome.stopped, None, "{:?}", outcome.results);
         assert!(ops.calls().contains(&"detach_domain 50".into()));
+    }
+
+    const INSTALL: &str = "inst1";
+
+    fn service_input() -> RunInput {
+        RunInput {
+            option: PlanOptionKind::TailscaleService,
+            address: "myapp.example.ts.net".into(),
+            steps: steps(&[
+                StepKind::AttachDomain,
+                StepKind::SetAudience,
+                StepKind::DefineTailscaleService,
+                StepKind::ConfigureTailscaleServe,
+                StepKind::WaitForServiceApproval,
+                StepKind::CheckReachability,
+            ]),
+            audience: Some((
+                AddressAudience {
+                    audience: Audience::Private,
+                    private_node_id: Some(2),
+                    private_via: Some("tailscale_service".into()),
+                    private_service: Some("svc:myapp".into()),
+                    ..AddressAudience::default()
+                },
+                AddressAudience::public(),
+            )),
+            serve: Some(ServeTarget {
+                node_id: 2,
+                node_name: "homelab".into(),
+                via: "tailscale_service".into(),
+                service: Some("svc:myapp".into()),
+                tailnet: Some("example.ts.net".into()),
+            }),
+            tailscale_service: Some(ServicePlan {
+                name: "svc:myapp".into(),
+                tailnet: "example.ts.net".into(),
+                tag: "tag:temps".into(),
+                install_id: INSTALL.into(),
+                seen: None,
+                credential_name: String::new(),
+            }),
+            ..serve_input()
+        }
+    }
+
+    fn homelab_entry() -> ServiceEntryHost {
+        ServiceEntryHost {
+            node_id: 2,
+            node_name: "homelab".into(),
+            address_id: "custom:50".into(),
+            hostname: "myapp.example.ts.net".into(),
+            tailscale_node_id: Some("nHOMELAB".into()),
+            dns_name: Some("homelab.example.ts.net".into()),
+            removing: false,
+        }
+    }
+
+    fn host(node_id: &str, name: &str, approved: Option<bool>) -> ServiceHost {
+        ServiceHost {
+            node_id: Some(node_id.into()),
+            name: Some(name.into()),
+            approved,
+        }
+    }
+
+    /// A Service run whose worker is the approved host. Its Serve entry
+    /// is released at once on undo, so undo reaches the Service.
+    fn approved_service() -> Fake {
+        Fake {
+            serve_release: Some(ServeRelease::Gone),
+            reachable: true,
+            serve_status: Mutex::new(Some(applied())),
+            service_entries: Mutex::new(vec![homelab_entry()]),
+            service_hosts: Mutex::new(vec![host("nHOMELAB", "homelab.example.ts.net", Some(true))]),
+            ..Default::default()
+        }
+    }
+
+    fn service_resource(record: &RunRecord) -> Option<RunResource> {
+        record
+            .created()
+            .into_iter()
+            .find(|r| matches!(r, RunResource::TailscaleService { .. }))
+    }
+
+    /// ADR 065 D4: absent at the name, the run creates the fixed
+    /// definition with its marker, journals what Tailscale assigned, and
+    /// is done once the admin approved the worker.
+    #[tokio::test]
+    async fn a_service_run_creates_it_only_when_absent_and_waits_for_approval() {
+        let ops = approved_service();
+        let record = execute(&service_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        let marker = tailscale::marker(INSTALL, 0);
+        assert!(ops.calls().contains(&format!("create_service {marker}")));
+        match service_resource(&record) {
+            Some(RunResource::TailscaleService {
+                name,
+                created,
+                definition,
+                ..
+            }) => {
+                assert_eq!(name, "svc:myapp");
+                assert!(created);
+                assert_eq!(definition.addrs, vec!["100.100.1.5".to_string()]);
+                assert_eq!(definition.comment, marker);
+                assert_eq!(definition.ports, vec!["tcp:443".to_string()]);
+                assert_eq!(definition.tags, vec!["tag:temps".to_string()]);
+            }
+            other => panic!("no Service journaled: {other:?}"),
+        }
+        // The Serve entry names the Service, so the worker advertises it.
+        assert!(ops
+            .calls()
+            .contains(&"claim_serve_entry homelab custom:50 myapp.example.ts.net".into()));
+
+        // Not approved yet: waiting with the autoApprovers snippet, never
+        // approving.
+        let waiting = Fake {
+            service_hosts: Mutex::new(vec![host("nHOMELAB", "homelab.example.ts.net", None)]),
+            ..approved_service()
+        };
+        let record = execute(&service_input(), &waiting, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Waiting, "{:?}", record.error);
+        assert_eq!(
+            record.error.as_deref(),
+            Some(
+                temps_core::tailnet::messages::not_approved("svc:myapp", "homelab", "tag:temps")
+                    .as_str()
+            )
+        );
+    }
+
+    /// ADR 065 D4: a Service Temps did not create is never written to:
+    /// the run stops with nothing journaled for it.
+    #[tokio::test]
+    async fn a_foreign_service_at_the_name_is_never_written() {
+        let ops = Fake {
+            service: Mutex::new(Some(ServiceDefinition {
+                name: "svc:myapp".into(),
+                addrs: vec!["100.100.1.9".into()],
+                comment: "the media server".into(),
+                ports: vec!["tcp:443".into()],
+                tags: vec!["tag:media".into()],
+            })),
+            ..approved_service()
+        };
+        let record = execute(&service_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Conflict);
+        assert_eq!(
+            record.error.as_deref(),
+            Some(temps_core::tailnet::messages::service_taken("svc:myapp").as_str())
+        );
+        assert!(!ops.calls().iter().any(|c| c.starts_with("create_service")));
+        assert!(service_resource(&record).is_none());
+        assert!(!ops
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("claim_serve_entry")));
+
+        // Another install's marker is foreign too.
+        let other = Fake {
+            service: Mutex::new(Some(ServiceDefinition::fixed(
+                "svc:myapp",
+                "tag:temps",
+                &tailscale::marker("another-install", 4),
+            ))),
+            ..approved_service()
+        };
+        let record = execute(&service_input(), &other, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Conflict);
+        assert!(!other
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("create_service")));
+    }
+
+    /// ADR 065 D4: a host no Serve entry accounts for is never accepted.
+    #[tokio::test]
+    async fn an_unrecorded_host_stops_the_run() {
+        let ops = Fake {
+            service_hosts: Mutex::new(vec![
+                host("nHOMELAB", "homelab.example.ts.net", Some(true)),
+                host("nNAS", "nas.example.ts.net", Some(true)),
+            ]),
+            ..approved_service()
+        };
+        let record = execute(&service_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Conflict);
+        let error = record.error.unwrap_or_default();
+        assert!(error.contains("`nas`"), "{error}");
+        assert!(!error.contains("`homelab`"), "{error}");
+    }
+
+    /// A Service deleted after the define step is not recreated behind
+    /// the user's back: the run stops so undo can take it apart.
+    #[tokio::test]
+    async fn a_service_deleted_after_it_was_defined_fails_the_run() {
+        let ops = Fake {
+            // The define step reads twice (absent, then the created one).
+            vanish_after: Some(2),
+            ..approved_service()
+        };
+        let record = execute(&service_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Failed, "{:?}", record.error);
+        assert!(record.error.unwrap_or_default().contains("is gone"));
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|c| c.starts_with("create_service"))
+                .count(),
+            1
+        );
+    }
+
+    /// ADR 065 D4: undo keeps a Service any Serve entry still names, and
+    /// never deletes one no journal of this install records creating.
+    #[tokio::test]
+    async fn undo_keeps_a_service_in_use_or_without_its_creation_journal() {
+        let ops = approved_service();
+        let record = execute(&service_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+
+        // Still in use.
+        let mut journal = record.journal.clone();
+        *ops.service_entries.lock().expect("lock") = vec![ServiceEntryHost {
+            node_name: "nas".into(),
+            hostname: "myapp.example.ts.net".into(),
+            ..homelab_entry()
+        }];
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert_eq!(outcome.stopped, None, "{:?}", outcome.results);
+        assert!(outcome
+            .results
+            .iter()
+            .any(|r| r.label == "Kept `svc:myapp`: it still serves myapp.example.ts.net on nas"));
+        assert!(!ops.calls().iter().any(|c| c.starts_with("delete_service")));
+
+        // Nothing uses it, but no journal records creating it.
+        let mut journal = record.journal.clone();
+        ops.service_entries.lock().expect("lock").clear();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        assert_eq!(outcome.stopped, None, "{:?}", outcome.results);
+        assert!(outcome
+            .results
+            .iter()
+            .any(|r| r.label
+                == "Kept `svc:myapp`: no setup of this Temps install records creating it"));
+        assert!(!ops.calls().iter().any(|c| c.starts_with("delete_service")));
+    }
+
+    /// ADR 065 D4: undo never deletes a Service on its own. It asks; a
+    /// confirmed delete names what the user was shown, and a check that no
+    /// longer holds under the lock keeps it. Going forward there is
+    /// nothing to decide.
+    #[tokio::test]
+    async fn undo_deletes_a_service_only_once_a_person_confirms_it() {
+        let ops = approved_service();
+        let record = execute(&service_input(), &ops, &Saved::default(), timing()).await;
+        assert_eq!(record.state, RunState::Succeeded, "{:?}", record.error);
+        let shown = ops.service.lock().expect("lock").clone().expect("created");
+        ops.service_entries.lock().expect("lock").clear();
+        ops.service_hosts.lock().expect("lock").clear();
+        let ops = Fake {
+            creation: Some((shown.clone(), chrono::Utc::now())),
+            service: Mutex::new(Some(shown.clone())),
+            serve_release: Some(ServeRelease::Gone),
+            reachable: true,
+            serve_status: Mutex::new(Some(applied())),
+            ..Default::default()
+        };
+
+        let mut journal = record.journal.clone();
+        let outcome = undo(&mut journal, &ops, 0, &Journaled::default()).await;
+        let Some(Stop::Conflict(question)) = outcome.stopped else {
+            panic!("undo did not ask: {:?}", outcome);
+        };
+        assert!(
+            question.starts_with(
+                "Delete `svc:myapp` from tailnet `example.ts.net`? It was created by this \
+                 Temps install on"
+            ),
+            "{question}"
+        );
+        assert!(!ops.calls().iter().any(|c| c.starts_with("delete_service")));
+        let key = journal
+            .iter()
+            .find(|e| matches!(e.intent, Intent::TailscaleService { .. }))
+            .map(|e| e.key.clone())
+            .expect("the Service's entry");
+        assert_eq!(
+            journal
+                .iter()
+                .find(|e| e.key == key)
+                .and_then(|e| e.shown_service.clone()),
+            Some(shown.clone())
+        );
+
+        // Going forward is refused: Temps never changes a Service.
+        let mut forward = journal.clone();
+        assert!(decide(&mut forward, &key, Decision::Overwrite, false)
+            .unwrap_err()
+            .contains("never changes a Tailscale Service"));
+
+        // Confirmed: deleted, naming what was shown.
+        let mut confirmed = journal.clone();
+        decide(&mut confirmed, &key, Decision::Overwrite, true).expect("decide");
+        let outcome = undo(&mut confirmed, &ops, 0, &Journaled::default()).await;
+        assert_eq!(outcome.stopped, None, "{:?}", outcome.results);
+        assert!(ops.calls().contains(&format!(
+            "delete_service example.ts.net svc:myapp {}",
+            shown.comment
+        )));
+        assert!(outcome
+            .results
+            .iter()
+            .any(|r| r.label == "Deleted `svc:myapp` from example.ts.net"));
+
+        // A check that no longer holds under the lock keeps it.
+        let reused = Fake {
+            deletion: Some(ServiceDeletion::Kept(
+                "`svc:myapp` is used again, by `myapp` on `nas`".into(),
+            )),
+            serve_release: Some(ServeRelease::Gone),
+            ..Default::default()
+        };
+        let mut confirmed = journal.clone();
+        decide(&mut confirmed, &key, Decision::Overwrite, true).expect("decide");
+        let outcome = undo(&mut confirmed, &reused, 0, &Journaled::default()).await;
+        assert_eq!(outcome.stopped, None, "{:?}", outcome.results);
+        assert!(
+            outcome
+                .results
+                .iter()
+                .any(|r| r.label
+                    == "Kept `svc:myapp`: `svc:myapp` is used again, by `myapp` on `nas`")
+        );
+
+        // Declined: kept, nothing deleted.
+        let declined = Fake::default();
+        let mut kept = journal.clone();
+        decide(&mut kept, &key, Decision::Keep, true).expect("decide");
+        let outcome = undo(&mut kept, &declined, 0, &Journaled::default()).await;
+        assert_eq!(outcome.stopped, None, "{:?}", outcome.results);
+        assert!(!declined
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_service")));
     }
 }
