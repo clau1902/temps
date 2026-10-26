@@ -55,9 +55,28 @@ pub const CALLBACK_PATH: &str = "/_temps/gate/callback";
 pub const LOGOUT_PATH: &str = "/_temps/gate/logout";
 /// Console path that starts a sign-in.
 pub const AUTHORIZE_PATH: &str = "/_temps/gate/authorize";
-/// Capability an agent reports when it enforces the gate. An agent without it
-/// never receives a signed-in route.
+/// Capability an agent declares when it enforces the gate. A request that
+/// does not declare it never receives a signed-in route.
 pub const GATE_CAPABILITY: &str = "gate.v1";
+/// The header an agent names its capabilities in on every request it makes
+/// to the control plane, comma-separated (the same header ADR 065 D6's
+/// `tailnet_identity.v1` travels in). What a snapshot may carry is decided
+/// from this request alone, never from an earlier report: a worker rolled
+/// back to an older binary stops sending it on its next request.
+pub const AGENT_CAPABILITIES_HEADER: &str = "x-temps-agent-capabilities";
+
+/// Whether any of a request's [`AGENT_CAPABILITIES_HEADER`] values names
+/// `capability` exactly. Every value is read, so one header per capability
+/// is understood as well as one comma-separated list.
+pub fn declares_capability<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    capability: &str,
+) -> bool {
+    values
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .any(|item| item.trim() == capability)
+}
 
 /// How long a sign-in may take between the redirect and the callback.
 pub const STATE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -1094,6 +1113,25 @@ pub fn strip_gate_response_headers(headers: &mut HeaderMap) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_capability_is_declared_only_by_its_exact_name() {
+        use super::{declares_capability, GATE_CAPABILITY};
+        assert!(declares_capability(["gate.v1"], GATE_CAPABILITY));
+        assert!(declares_capability(
+            ["tailnet_identity.v1, gate.v1"],
+            GATE_CAPABILITY
+        ));
+        assert!(declares_capability(
+            ["tailnet_identity.v1", "gate.v1"],
+            GATE_CAPABILITY
+        ));
+        assert!(!declares_capability(
+            ["gate.v10", "xgate.v1"],
+            GATE_CAPABILITY
+        ));
+        assert!(!declares_capability([], GATE_CAPABILITY));
+    }
+
     use super::*;
 
     fn key() -> SigningKey {

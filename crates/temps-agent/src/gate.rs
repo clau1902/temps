@@ -148,6 +148,12 @@ impl GateChannel {
             .http
             .post(&url)
             .bearer_auth(&self.node_token)
+            // The control plane serves gate requests only to a binary that
+            // declares the gate on the request itself (ADR 065 D7).
+            .header(
+                temps_core::gate::AGENT_CAPABILITIES_HEADER,
+                temps_core::gate::GATE_CAPABILITY,
+            )
             .json(body)
             .send()
             .await

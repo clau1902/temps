@@ -1146,6 +1146,22 @@ from their letter:
   journal holds an Access app of it that is not yet gone; without the
   token, that undo could never reach the app. The answer names the runs.
   `gate_access_provider_id` also references its token `ON DELETE RESTRICT`.
+- **`gate.v1` is declared on each request, and signed-in routes travel in
+  their own field.** D7 says an agent that does not report `gate.v1` never
+  receives a signed-in route. Trusting the capability last stored for the
+  node, with the gate as a subfield of an ordinary public route, fails
+  open on a rollback: an agent that predates the gate ignores the
+  subfield, so it would serve every signed-in address with no gate. It
+  would do that from the `routes.json` it loads at start for the rest of
+  the 300 s lease, and from every snapshot while the stale capability
+  stays stored. So signed-in routes travel only in
+  `public_ingress.gated_routes`, on the wire and in `routes.json`, and
+  `routes` never holds one. The agent names its capabilities in
+  `x-temps-agent-capabilities` on every snapshot and gate request (the
+  header the tailnet identity capability uses), and the control plane
+  decides from that request alone. An older agent finds no signed-in host
+  anywhere it reads; tests check both the snapshot and `routes.json` with
+  the pre-gate agent's types.
 
 ## Sources
 

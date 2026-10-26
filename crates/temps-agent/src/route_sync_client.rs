@@ -66,6 +66,10 @@ struct SnapshotPublicIngress {
     listen: Option<crate::route_store::PublicListen>,
     #[serde(default)]
     private_routes: Vec<SnapshotPrivateRoute>,
+    /// ADR 065 D7: signed-in addresses, sent only because this agent
+    /// declared it enforces the gate.
+    #[serde(default)]
+    gated_routes: Vec<SnapshotRoute>,
 }
 
 /// A private address for the private listener (ADR 064 D5).
@@ -290,6 +294,12 @@ impl RouteSyncClient {
             .http
             .get(&url)
             .bearer_auth(&self.node_token)
+            // ADR 065 D7: what this binary enforces, on every request, so a
+            // rollback stops signed-in routes at the next snapshot.
+            .header(
+                temps_core::gate::AGENT_CAPABILITIES_HEADER,
+                temps_core::gate::GATE_CAPABILITY,
+            )
             .send()
             .await
             .map_err(|e| format!("GET {url}: {e}"))?;
@@ -341,6 +351,12 @@ impl RouteSyncClient {
                 }
             }),
             listen: body.public_ingress.listen,
+            gated_routes: body
+                .public_ingress
+                .gated_routes
+                .into_iter()
+                .map(snapshot_route_into_entry)
+                .collect(),
             private_routes: body
                 .public_ingress
                 .private_routes
@@ -549,6 +565,7 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
         }
     }
 
@@ -671,6 +688,7 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
         });
 
         crate::public_ingress::update_snapshot_health(&store);

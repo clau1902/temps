@@ -98,8 +98,8 @@ pub struct RouteEntryDto {
     pub deployment_id: Option<i32>,
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
-    /// The gate of a signed-in address (ADR 065 D7). Only sent to agents
-    /// that report `gate.v1`; an agent that predates it never gets the route.
+    /// The gate of a signed-in address (ADR 065 D7). Set only on routes in
+    /// `gated_routes`, which an agent that predates the gate never reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<temps_core::gate::GatePolicy>,
 }
@@ -130,6 +130,13 @@ pub struct PublicIngressSnapshot {
     /// private mode ignore the field and serve none of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_routes: Vec<PrivateRouteEntryDto>,
+    /// Signed-in addresses (ADR 065 D7), each with its gate. Never in
+    /// `routes`: an agent that predates the gate ignores this field, so it
+    /// serves none of them, from a snapshot or from the `routes.json` it
+    /// loads after a rollback. Sent only when the snapshot request itself
+    /// declared `gate.v1`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gated_routes: Vec<RouteEntryDto>,
 }
 
 /// A private address on a worker's private listener (ADR 064 D5).
@@ -293,6 +300,10 @@ pub async fn get_routes_snapshot(
     Query(q): Query<RouteSnapshotQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let node = authenticate_node(&app_state.db, &headers, node_id).await?;
+    // ADR 065 D7: what this request's agent enforces, from this request
+    // only. A capability reported earlier says nothing about the binary
+    // asking now (it may have been rolled back).
+    let enforces_gate = request_declares_gate(&headers);
 
     // Arm the notifier BEFORE checking the generation. `Notify::notified()`
     // captures the current notify epoch at construction time, so a reload
@@ -319,7 +330,7 @@ pub async fn get_routes_snapshot(
     let mut current = app_state.peer_table.current_generation();
     if current != q.since {
         return Ok(Json(
-            build_snapshot(&app_state, &node, current)
+            build_snapshot(&app_state, &node, current, enforces_gate)
                 .await
                 .map_err(snapshot_error_response)?,
         ));
@@ -355,7 +366,7 @@ pub async fn get_routes_snapshot(
     // also drops a token revoked while the request was parked.
     let node = authenticate_node(&app_state.db, &headers, node_id).await?;
     Ok(Json(
-        build_snapshot(&app_state, &node, current)
+        build_snapshot(&app_state, &node, current, enforces_gate)
             .await
             .map_err(snapshot_error_response)?,
     ))
@@ -727,6 +738,7 @@ async fn build_snapshot(
     state: &RouteSyncAppState,
     node: &nodes::Model,
     generation: u64,
+    enforces_gate: bool,
 ) -> Result<RouteSnapshot, SnapshotBuildError> {
     let raw = state.peer_table.snapshot_internal_routes();
     let mut routes = Vec::with_capacity(raw.len());
@@ -761,7 +773,6 @@ async fn build_snapshot(
             source,
         })?;
     let private_listener = private_listener_of(ingress_row.as_ref());
-    let enforces_gate = reports_capability(ingress_row.as_ref(), temps_core::gate::GATE_CAPABILITY);
     let (private_routes, private_held_back) = if private_listener.is_some() {
         let policy = worker_route_policy(
             state.db.as_ref(),
@@ -791,6 +802,7 @@ async fn build_snapshot(
                 certificates: encrypt_public_certificates(state, node, &hosts).await?,
                 listen: None,
                 private_routes,
+                gated_routes: Vec::new(),
             }
         } else if node.public_ingress_enabled || runs_connector {
             let WorkerPublicRoutes {
@@ -823,9 +835,10 @@ async fn build_snapshot(
                 )
                 .collect();
             // ADR 065 D7: a signed-in address goes only to an agent that
-            // enforces its gate. An older agent would serve it open.
-            let (public_routes, gate_held_back) =
-                hold_back_gated(public_routes, enforces_gate, &node.name);
+            // declared it enforces the gate, and only in `gated_routes`. An
+            // older agent would serve it open.
+            let (public_routes, gated_routes, gate_held_back) =
+                split_gated(public_routes, enforces_gate, &node.name);
             let unsupported_route_count = unsupported_route_count + gate_held_back.len();
             let mut unsupported_reasons = unsupported_reasons;
             unsupported_reasons.extend(gate_held_back);
@@ -849,6 +862,7 @@ async fn build_snapshot(
                     None
                 },
                 private_routes,
+                gated_routes,
             }
         } else {
             PublicIngressSnapshot::default()
@@ -860,43 +874,44 @@ async fn build_snapshot(
     })
 }
 
-/// Whether an agent's last listener report lists `capability`.
-pub fn reports_capability(
-    row: Option<&temps_entities::node_public_ingress::Model>,
-    capability: &str,
-) -> bool {
-    row.and_then(|row| row.capabilities.as_ref())
-        .and_then(|value| value.as_array())
-        .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(capability)))
+/// Whether this request's agent declared, on the request itself, that it
+/// enforces the signed-in gate (ADR 065 D7). An earlier report is never
+/// trusted: the binary that made it may have been rolled back since.
+pub fn request_declares_gate(headers: &HeaderMap) -> bool {
+    temps_core::gate::declares_capability(
+        headers
+            .get_all(temps_core::gate::AGENT_CAPABILITIES_HEADER)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+        temps_core::gate::GATE_CAPABILITY,
+    )
 }
 
-/// Split off the signed-in routes an agent cannot enforce (ADR 065 D7),
-/// with the reason the console shows for each.
-pub fn hold_back_gated(
+/// ADR 065 D7: take every signed-in route out of `routes`, the field every
+/// agent reads. Returns the open routes, the signed-in ones to send in
+/// `gated_routes` (only when the requesting agent declared `gate.v1`;
+/// otherwise none), and why each signed-in route was held back.
+pub fn split_gated(
     routes: Vec<RouteEntryDto>,
     enforces_gate: bool,
     node_name: &str,
-) -> (Vec<RouteEntryDto>, Vec<String>) {
+) -> (Vec<RouteEntryDto>, Vec<RouteEntryDto>, Vec<String>) {
+    let (gated, open): (Vec<_>, Vec<_>) =
+        routes.into_iter().partition(|route| route.gate.is_some());
     if enforces_gate {
-        return (routes, Vec::new());
+        return (open, gated, Vec::new());
     }
-    let mut held_back = Vec::new();
-    let routes = routes
-        .into_iter()
-        .filter(|route| {
-            if route.gate.is_some() {
-                held_back.push(format!(
-                    "{}: it is for people who sign in, and the agent on {node_name} does not \
-                     enforce sign-in yet; update the agent on {node_name}",
-                    route.host
-                ));
-                false
-            } else {
-                true
-            }
+    let held_back = gated
+        .iter()
+        .map(|route| {
+            format!(
+                "{}: it is for people who sign in, and the agent on {node_name} does not \
+                 enforce sign-in yet; update the agent on {node_name}",
+                route.host
+            )
         })
         .collect();
-    (routes, held_back)
+    (open, Vec::new(), held_back)
 }
 
 async fn public_listen(
@@ -1294,6 +1309,7 @@ pub(crate) mod tests {
             },
             &node,
             1,
+            true,
         )
         .await?;
         assert_eq!(open_snapshot.public_ingress.routes.len(), 1);
@@ -1331,6 +1347,7 @@ pub(crate) mod tests {
                 },
                 &node,
                 1,
+                true,
             )
             .await?;
             assert!(snapshot.public_ingress.routes.is_empty());
@@ -1386,6 +1403,7 @@ pub(crate) mod tests {
             },
             &node,
             1,
+            true,
         )
         .await?;
         assert!(limited_snapshot.public_ingress.routes.is_empty());
@@ -1436,6 +1454,7 @@ pub(crate) mod tests {
                 },
                 &node,
                 1,
+                true,
             )
             .await
         };
@@ -1681,64 +1700,97 @@ mod gate_hold_back_tests {
     }
 
     #[test]
-    fn an_agent_without_gate_v1_never_receives_a_signed_in_route() {
+    fn a_signed_in_route_never_travels_in_routes() {
         let routes = vec![
             route("open.example.test", false),
             route("team.example.test", true),
         ];
-        let (kept, held) = hold_back_gated(routes.clone(), false, "worker-1");
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].host, "open.example.test");
+        let (open, gated, held) = split_gated(routes.clone(), false, "worker-1");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].host, "open.example.test");
+        assert!(gated.is_empty());
         assert_eq!(held.len(), 1);
         assert!(
             held[0].contains("update the agent on worker-1"),
             "{}",
             held[0]
         );
-        let (kept, held) = hold_back_gated(routes, true, "worker-1");
-        assert_eq!(kept.len(), 2);
+        let (open, gated, held) = split_gated(routes, true, "worker-1");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].host, "open.example.test");
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].host, "team.example.test");
         assert!(held.is_empty());
     }
 
     #[test]
-    fn capabilities_are_read_from_the_last_report() {
-        let mut row = temps_entities::node_public_ingress::Model {
-            node_id: 1,
-            listen_address: None,
-            http_port: 80,
-            https_port: 443,
-            public_address: None,
-            interfaces: None,
-            listening: None,
-            mode: None,
-            last_check: None,
-            private_checks: None,
-            capabilities: None,
-            checked_at: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        assert!(!reports_capability(Some(&row), "gate.v1"));
-        assert!(!reports_capability(None, "gate.v1"));
-        row.capabilities = Some(serde_json::json!(["gate.v1"]));
-        assert!(reports_capability(Some(&row), "gate.v1"));
-        row.capabilities = Some(serde_json::json!("gate.v1"));
-        assert!(!reports_capability(Some(&row), "gate.v1"));
+    fn only_the_request_itself_declares_the_gate() {
+        let mut headers = HeaderMap::new();
+        assert!(!request_declares_gate(&headers));
+        headers.append(
+            temps_core::gate::AGENT_CAPABILITIES_HEADER,
+            axum::http::HeaderValue::from_static("tailnet_identity.v1"),
+        );
+        assert!(!request_declares_gate(&headers));
+        // A second header line is read too, not only the first.
+        headers.append(
+            temps_core::gate::AGENT_CAPABILITIES_HEADER,
+            axum::http::HeaderValue::from_static("gate.v1"),
+        );
+        assert!(request_declares_gate(&headers));
     }
 
+    /// A worker rolled back to an agent that predates the gate reads the
+    /// snapshot with its own types: it must find no signed-in host in it.
     #[test]
-    fn an_old_agent_ignores_the_gate_field_so_it_must_never_get_one() {
-        // What an agent that predates the gate deserialises: everything but
-        // the gate, which is exactly why the route is held back instead.
+    fn an_agent_that_predates_the_gate_finds_no_signed_in_host() {
+        #[derive(serde::Deserialize)]
+        struct OldSnapshot {
+            public_ingress: OldPublicIngress,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPublicIngress {
+            routes: Vec<OldEntry>,
+            #[serde(default)]
+            private_routes: Vec<OldPrivate>,
+        }
         #[derive(serde::Deserialize)]
         struct OldEntry {
             host: String,
         }
-        let json = serde_json::to_string(&route("team.example.test", true)).unwrap();
-        assert!(json.contains("\"gate\""));
-        let old: OldEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(old.host, "team.example.test");
-        let ungated = serde_json::to_string(&route("open.example.test", false)).unwrap();
-        assert!(!ungated.contains("gate"), "{ungated}");
+        #[derive(serde::Deserialize)]
+        struct OldPrivate {
+            #[serde(flatten)]
+            route: OldEntry,
+        }
+        let (open, gated, _) = split_gated(
+            vec![
+                route("open.example.test", false),
+                route("team.example.test", true),
+            ],
+            true,
+            "worker-1",
+        );
+        let snapshot = RouteSnapshot {
+            generation: 1,
+            routes: Vec::new(),
+            public_ingress: PublicIngressSnapshot {
+                enabled: true,
+                routes: open,
+                gated_routes: gated,
+                ..PublicIngressSnapshot::default()
+            },
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("team.example.test"), "{json}");
+        let old: OldSnapshot = serde_json::from_str(&json).unwrap();
+        let hosts: Vec<&str> = old
+            .public_ingress
+            .routes
+            .iter()
+            .chain(old.public_ingress.private_routes.iter().map(|p| &p.route))
+            .map(|r| r.host.as_str())
+            .collect();
+        assert_eq!(hosts, vec!["open.example.test"]);
     }
 }

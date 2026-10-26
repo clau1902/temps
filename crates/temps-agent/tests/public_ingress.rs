@@ -50,6 +50,7 @@ impl IngressHarness {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
         });
 
         let shutdown = Arc::new(Notify::new());
@@ -146,6 +147,7 @@ fn enabled_public_store(snapshot_dir: &TempDir) -> SharedRouteStore {
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        gated_routes: Vec::new(),
     });
     store
 }
@@ -392,6 +394,7 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
         });
         let mut persisted: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&snapshot_path).expect("read persisted ingress snapshot"),
@@ -591,6 +594,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        gated_routes: Vec::new(),
     });
 
     let shutdown = Arc::new(Notify::new());
@@ -736,6 +740,7 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        gated_routes: Vec::new(),
     });
     let ingress_shutdown = Arc::new(Notify::new());
     let ingress = public_ingress::spawn(
@@ -1268,6 +1273,7 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
             // ...and outside this one.
             private_route("tailnet.example.test", backend_address, "100.64.0.0/10"),
         ],
+        gated_routes: Vec::new(),
     });
     let shutdown = Arc::new(Notify::new());
     let private = public_ingress::spawn(

@@ -25,7 +25,7 @@ use temps_entities::nodes;
 use tracing::{error, warn};
 
 use crate::gate::GateServiceError;
-use crate::route_sync::{authenticate_node, reports_capability, RouteSyncAppState};
+use crate::route_sync::{authenticate_node, request_declares_gate, RouteSyncAppState};
 
 fn refusal(error: GateServiceError) -> (StatusCode, String) {
     let status =
@@ -37,10 +37,12 @@ fn refusal(error: GateServiceError) -> (StatusCode, String) {
 }
 
 /// Whether `node` is given the signed-in address `address_id` in its
-/// snapshot: it enforces the gate, takes public traffic (directly or
-/// through a connector), and the address is one of the worker routes.
+/// snapshot: the request declares the gate (as a snapshot request must to
+/// receive one), the node takes public traffic (directly or through a
+/// connector), and the address is one of the worker routes.
 async fn node_serves_address(
     state: &RouteSyncAppState,
+    headers: &HeaderMap,
     node: &nodes::Model,
     address_id: &str,
 ) -> Result<bool, (StatusCode, String)> {
@@ -52,11 +54,7 @@ async fn node_serves_address(
             format!("Failed to {operation} for node {}: {error}", node.id),
         )
     };
-    let ingress = temps_entities::node_public_ingress::Entity::find_by_id(node.id)
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| internal("load the node's capabilities", e))?;
-    if !reports_capability(ingress.as_ref(), temps_core::gate::GATE_CAPABILITY) {
+    if !request_declares_gate(headers) {
         return Ok(false);
     }
     let runs_connector = temps_entities::ingress_connector_nodes::Entity::find()
@@ -90,7 +88,7 @@ pub async fn post_gate_redeem(
     Json(request): Json<GateRedeemRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let node = authenticate_node(&state.db, &headers, node_id).await?;
-    if !node_serves_address(&state, &node, &request.address_id).await? {
+    if !node_serves_address(&state, &headers, &node, &request.address_id).await? {
         warn!(
             node_id,
             address_id = %request.address_id,
@@ -115,7 +113,7 @@ pub async fn post_gate_logout(
     Json(request): Json<GateLogoutRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let node = authenticate_node(&state.db, &headers, node_id).await?;
-    if !node_serves_address(&state, &node, &request.address_id).await? {
+    if !node_serves_address(&state, &headers, &node, &request.address_id).await? {
         return Err((
             StatusCode::FORBIDDEN,
             format!(
@@ -135,7 +133,7 @@ pub async fn post_gate_access_keys(
     Json(request): Json<GateAccessKeysRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let node = authenticate_node(&state.db, &headers, node_id).await?;
-    if !node_serves_address(&state, &node, &request.address_id).await? {
+    if !node_serves_address(&state, &headers, &node, &request.address_id).await? {
         return Err((
             StatusCode::FORBIDDEN,
             format!(
