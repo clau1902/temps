@@ -41,10 +41,13 @@ export function LastDeployment({
   const primaryUrl = unavailableReason ? null : (stableUrl ?? deployment.url)
   const primaryHref = primaryUrl ? normalizeUrl(primaryUrl) : null
   // Additional public Docker Compose service ports each have their own URL;
-  // the first is normally the environment URL shown above.
-  const serviceUrls = (deployment.environment.service_urls ?? []).filter(
-    (route) => normalizeUrl(route.url) !== primaryHref
-  )
+  // the first is normally the environment URL shown above. They are served
+  // under the same address, so nobody can open them either without one.
+  const serviceUrls = unavailableReason
+    ? []
+    : (deployment.environment.service_urls ?? []).filter(
+        (route) => normalizeUrl(route.url) !== primaryHref
+      )
   const screenshotLocation = deployment.screenshot_location
   const screenshotUrl = screenshotLocation
     ? `/api/files${screenshotLocation.startsWith('/') ? screenshotLocation : `/${screenshotLocation}`}`

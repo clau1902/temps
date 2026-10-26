@@ -61,3 +61,21 @@ test('an environment nobody can reach shows why, and no URL to open', () => {
   expect(html).not.toContain('localho.st:8080')
   expect(html).toMatch(/<button[^>]*disabled[^>]*>Open site/)
 })
+
+test('public Compose service URLs are hidden too when nobody can reach the environment', () => {
+  const html = render(
+    deployment({
+      no_address_reason: 'nothing serves it publicly',
+      service_urls: [
+        {
+          service: 'api',
+          port: 3001,
+          url: 'http://shop-production--api.localho.st:8080',
+        },
+      ] as DeploymentResponse['environment']['service_urls'],
+    })
+  )
+  expect(html).toContain('Nobody can open it yet: nothing serves it publicly')
+  expect(html).not.toContain('api:3001')
+  expect(html).not.toContain('shop-production--api.localho.st')
+})
