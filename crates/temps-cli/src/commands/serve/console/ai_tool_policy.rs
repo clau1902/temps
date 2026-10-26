@@ -59,8 +59,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "retry_pg_upgrade",
             "rollback_pg_upgrade",
             "rotate_status_page_url",
-            // Publishes every environment publicly at once (behind a step-up),
-            // or withdraws every host; the console lists them first.
+            // Makes every environment publicly reachable under a tunnel's zone
+            // and publishes DNS records; a user decision behind step-up.
             "set_connector_environment_hosts",
             "set_ingress_connector_nodes",
             "set_project_hosting",
